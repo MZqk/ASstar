@@ -226,13 +226,27 @@ def cosmic_clarity_native_denoise_cli_options(pipeline) -> Tuple[Tuple[str, ...]
                 f"{ENV_COSMIC_NATIVE_GPU_KEY} has invalid value; defaulting to GPU/device auto"
             )
 
+    mode = str(
+        getattr(pipeline, "_cosmic_clarity_native_denoise_mode_override", "luminance")
+        or "luminance"
+    ).strip().lower()
+    if mode not in {"full", "luminance", "separate"}:
+        pipeline.log.warn(
+            f"Invalid CosmicClarity Native denoise mode '{mode}', defaulting to luminance"
+        )
+        mode = "luminance"
+    strength = str(
+        getattr(pipeline, "_cosmic_clarity_native_denoise_strength_override", "0.5")
+        or "0.5"
+    )
+
     args: List[str] = [
         "--mode",
         "denoise",
         "--denoise-mode",
-        "luminance",
+        mode,
         "--denoise-strength",
-        "0.5",
+        strength,
     ]
     if not use_gpu:
         args.append("--cpu")
@@ -254,4 +268,3 @@ def run_cosmic_clarity_native_denoise_fallback(pipeline, step_key: str) -> Optio
         timeout_sec=pipeline._final_denoise_cli_timeout_sec(),
         verify_image_change=True,
     )
-

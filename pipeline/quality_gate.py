@@ -1,4 +1,4 @@
-"""Stage 6.5 pre-starless quality gate."""
+"""Compatibility pre-starless quality gate."""
 from __future__ import annotations
 
 from typing import Any, Dict, List
@@ -46,10 +46,10 @@ def evaluate_pre_starless_gate(
     if edge > max_edge:
         reasons.append("edge_black_ratio too high")
 
-    recommendation = "stage6_stretched"
+    recommendation = "stage7_stretched"
     ready = True
     if target_type in {"globular_cluster", "open_cluster"}:
-        recommendation = "stage6_stretched"
+        recommendation = "stage7_stretched"
         ready = True
         if not reasons:
             reasons.append("star-preserve target; standard starless should be optional")

@@ -43,6 +43,16 @@ BUILTIN_CATALOG: List[Dict[str, Any]] = [
         "features": ["reflection_blue", "bright_stars", "halo_risk"],
         "default_policy": "reflection_nebula_halo_protect",
     },
+    {
+        "name": "Horsehead Nebula",
+        "aliases": ["Barnard 33", "B33", "IC 434", "IC434", "Flame Nebula", "NGC 2024"],
+        "type": "dark_nebula_low_contrast",
+        "ra_deg": 85.245,
+        "dec_deg": -2.459,
+        "size_arcmin": [60, 30],
+        "features": ["dark_nebula", "emission_red", "low_contrast"],
+        "default_policy": "dark_nebula_low_contrast",
+    },
 ]
 
 
@@ -199,7 +209,11 @@ def _catalog_coordinate_match(
             radius = max(float(size[0]), float(size[1])) / 120.0
         except Exception:
             radius = 0.5
-        tolerance = max(1.2, radius + 0.35)
+        # Seestar/FITS center coordinates often point at the framed field center,
+        # not the catalog object centroid. Large nebula entries therefore need a
+        # field-aware tolerance so IC 434/Horsehead-like frames are not demoted to
+        # visual-only galaxy guesses.
+        tolerance = max(1.2, radius * 1.35 + 0.35)
         if distance <= tolerance:
             score = max(0.78, min(0.98, 0.98 - distance / max(tolerance, 1e-6) * 0.18))
             if best is None or score > best[1]:
@@ -233,10 +247,14 @@ def _auto_hint_type(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
     if not metadata:
         return None
     hint = str(metadata.get("AUTO_TARGET_TYPE") or metadata.get("auto_target_type") or "").lower()
-    if "emission" in hint or "nebula" in hint:
+    if "dark" in hint and "nebula" in hint:
+        return "dark_nebula_low_contrast"
+    if "bright_emission" in hint or "emission" in hint:
         return "bright_emission_reflection_nebula"
     if "reflection" in hint:
         return "reflection_nebula_cluster"
+    if "nebula" in hint:
+        return "bright_emission_reflection_nebula"
     if "galaxy" in hint:
         return "large_galaxy"
     if "cluster" in hint:
@@ -279,6 +297,19 @@ def build_target_profile(
     warnings: List[str] = []
     if auto_hint:
         warnings.append(f"auto_target_hint={auto_hint}")
+        if (
+            visual_type
+            in {
+                "small_galaxy",
+                "generic_low_snr_safe",
+                "dark_nebula_low_contrast",
+                "emission_nebula_widefield",
+            }
+            and visual_confidence <= 0.66
+        ):
+            visual_type = auto_hint
+            visual_confidence = max(visual_confidence, 0.66)
+            visual_method = "auto_target_hint_plus_visual_features"
 
     if match:
         item, catalog_score = match
@@ -286,7 +317,11 @@ def build_target_profile(
         feature_overlap = 0
         for feature in item.get("features", []):
             key = str(feature)
-            aliases = {"dense_stars": "dense_star_field"}
+            aliases = {
+                "dense_stars": "dense_star_field",
+                "dark_nebula": "faint_outer_cloud",
+                "low_contrast": "faint_outer_cloud",
+            }
             if flags.get(aliases.get(key, key), False):
                 feature_overlap += 1
         if item.get("features"):
@@ -304,6 +339,23 @@ def build_target_profile(
             )
             if match_distance is not None:
                 warnings.append(f"catalog_coordinate_distance_deg={match_distance:.4f}")
+
+    if (
+        auto_hint
+        and auto_hint != target_type
+        and not target_name
+        and target_type
+        in {
+            "generic_low_snr_safe",
+            "dark_nebula_low_contrast",
+            "emission_nebula_widefield",
+        }
+        and target_confidence <= 0.72
+    ):
+        warnings.append(f"auto_target_hint_override: {target_type}->{auto_hint}")
+        target_type = auto_hint
+        target_confidence = max(target_confidence, 0.66)
+        method = "auto_target_hint_plus_visual_features"
 
     if target_confidence < 0.55:
         target_name = None

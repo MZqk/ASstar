@@ -189,7 +189,14 @@ class TargetRuntimeMixin:
             object_signal_ratio = float((float(p99) - float(p50)) / max(float(p50), 0.003))
             safe_preview_visibility = float((float(p99) - float(p50)) / max(float(p99), 0.010))
             core_peak_ratio = float(max_v / max(float(p50), 0.003))
+            visibility_too_low = (
+                global_dark_ratio > 0.985
+                and float(p99) < 0.020
+                and safe_preview_visibility < 0.35
+            )
             nearly_black = (
+                visibility_too_low
+                or
                 (
                     float(p99) <= 0.006
                     and float(p90) <= 0.003
@@ -219,6 +226,7 @@ class TargetRuntimeMixin:
                 "object_signal_ratio": object_signal_ratio,
                 "safe_preview_visibility_score": safe_preview_visibility,
                 "core_peak_ratio": core_peak_ratio,
+                "is_visibility_too_low": bool(visibility_too_low),
                 "is_nearly_black": bool(nearly_black),
                 "is_nearly_white": bool(nearly_white),
                 "invalid_dynamic_range": bool(invalid_dynamic),

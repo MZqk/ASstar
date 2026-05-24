@@ -30,14 +30,41 @@ class PipelineConfig:
     bg_median_drop_ratio_min: float = 0.20  # Reject when bg median drops below this ratio
     bg_object_preserve_ratio_min: float = 0.40  # Reject when object coverage drops too much
     bg_edge_black_rise_max: float = 0.35  # Reject when edge black clipping rises too much
+    bg_star_preserve_ratio_min: float = 0.90  # 阶段3背景提取后星点数量保留率下限
+    bg_nebula_mean_change_max: float = 0.10  # 阶段3星云/弥散信号均值相对变化上限
 
-    # 阶段 5: 降噪
+    # 阶段 5: 线性整理 / 反卷积 / 降噪
     denoise_enabled: bool = False   # 是否启用线性阶段降噪
     denoise_mod: float = 0.35       # 降噪强度参数（0~1），越大降噪越强
     denoise_safety_max: float = 0.55  # 降噪强度安全上限，防止细节被抹平
+    stage5_builtin_denoise_mod: float = 0.50  # Stage5 Siril 内置线性降噪强度，默认 denoise -mod=0.50 -indep
+    stage5_deconvolution_enabled: bool = True  # Stage5 是否在线性降噪前执行 Siril RL 反卷积
+    stage5_rl_maxstars: int = 200  # RL 反卷积 PSF 找星数量上限
+    stage5_rl_psf_kernel_size: int = 33  # RL 反卷积 makepsf kernel size
+    stage5_rl_iters: int = 8  # RL 反卷积迭代次数，过高易放大噪声和星环
+    stage5_rl_alpha: float = 3000.0  # RL TV 正则 alpha，越高越保守
+    stage5_rl_gdstep: float = 0.0005  # RL 梯度下降步长
+    stage5_rl_stop: float = 0.001  # RL 提前停止阈值
+    stage5_graxpert_deconv_strength: float = 0.30  # GraXpert 反卷积建议强度占位；默认不自动调用外部工具
     optional_color_transform_enabled: bool = False  # 是否启用可选转色（Alchemy/Hubble）
     workflow_plugin_probe_enabled: bool = False  # Probe broad workflow plugin commands only when explicitly enabled; stage8 has a narrow safe SASP probe
     spcc_enabled: bool = True  # Prefer SPCC first by default; can be disabled via SEESTAR_SPCC_ENABLE=0
+    stage4_platesolve_enabled: bool = True  # 阶段4默认执行 platesolve -noflip -downscale，保存 stage4_psolved
+    stage4_spcc_sensor_mode: str = "osc"  # SPCC 传感器模式：osc 或 mono_lrgb
+    stage4_spcc_osc_sensor: str = "seestar s30pro"  # OSC/SPCC oscsensor 名称
+    stage4_spcc_osc_filter: str = "seestar s30pro"  # OSC/SPCC oscfilter 名称
+    stage4_spcc_mono_sensor: str = ""  # Mono/LRGB SPCC monosensor 名称；为空时回退 OSC 配置
+    stage4_spcc_r_filter: str = ""  # Mono/LRGB SPCC R filter 名称
+    stage4_spcc_g_filter: str = ""  # Mono/LRGB SPCC G filter 名称
+    stage4_spcc_b_filter: str = ""  # Mono/LRGB SPCC B filter 名称
+    stage4_spcc_white_ref: str = "Average Spiral Galaxy"  # SPCC white reference
+    stage4_spcc_adaptive_white_ref_enabled: bool = True  # 发射星云目标自动切换更适合星光的 SPCC white reference
+    stage4_spcc_nebula_white_ref: str = "Star, type G2(v)"  # 发射/双窄带星云默认 SPCC 星型白参考；可由 env 覆盖
+    stage4_spcc_bgtol: str = "-2.8,2.0"  # SPCC 背景容差参数；默认值不显式传入，PCC 使用 Siril 默认 bgtol
+    stage4_spcc_limitmag: str = "11.5"  # SPCC Gaia 查询极限星等；限制星数以规避 Siril 1.4.x aperture photometry 崩溃
+    stage4_local_star_wb_enabled: bool = True  # SPCC/PCC 都失败时，允许基于未饱和星点做保守白平衡
+    stage4_local_star_wb_min_pixels: int = 80  # 本地星点白平衡所需的最小白参考像素数
+    stage4_local_star_wb_gain_limit: float = 1.25  # 本地星点白平衡单通道增益限制，避免替代光度校准
     aberration_api_enabled: bool = False  # Disabled by default: API path may fail in siril-cli thread ownership context
 
     # 阶段 6: 拉伸
@@ -62,6 +89,9 @@ class PipelineConfig:
     # 阶段 9: 星点混合
     star_intensity: float = 1.0     # 传统回混时星点层主强度
     star_fallback_intensity: float = 0.95  # 主强度失败时的回退星点强度
+    stage9_starmask_stretch_enabled: bool = True  # 阶段9像素回混前默认把线性 starmask 独立 Asinh 拉伸到非线性域
+    stage9_starmask_asinh_stretch: float = 2.0  # 阶段9 starmask 温和 Asinh 拉伸强度，保护星色并避免星核过曝
+    stage9_starmask_asinh_offset: float = 0.001  # 阶段9 starmask Asinh 偏移
     remix_safe_blend: bool = True   # 兼容旧配置；阶段 9 当前固定使用上一阶段 starless + starmask
     remix_nebula_weight: float = 0.18  # 兼容旧自动调参字段；阶段 9 不再用于 stage6/starless 安全混合
 
@@ -113,6 +143,9 @@ class PipelineConfig:
     stage7_starmask_nebula_suppression: float = 0.75  # 阶段7星云主体区域星点层降权强度
     stage7_conservative_repair_enabled: bool = True  # 阶段7质量差时允许用较轻拉伸输入重跑去星
     stage7_skip_unready_starless: bool = True  # Stage6.5 判定不适合去星时，默认跳过去星并进入 review export
+    star_separation_mode: str = "linear_star_separation"  # 星点分离输入模式：linear_star_separation 或 mild_prestretch_star_separation
+    star_separation_fallback_to_mild_prestretch: bool = True  # 线性去星失败时是否自动改用轻微预拉伸输入重试
+    mild_prestretch_strength: float = 1.35  # 轻微预拉伸去星强度；仅用于去星输入，不替代后续主体拉伸
     stage7_conservative_asinh_stretch: float = 2.00  # 阶段7保守去星输入的轻拉伸强度
     stage7_ultra_conservative_asinh_stretch: float = 1.65  # 阶段7更保守去星输入的极轻拉伸强度
     stage7_soft_starless_asinh_stretch: float = 1.35  # 阶段7质量差时追加更低强度去星输入，减少黑洞和彩色残渣
@@ -130,6 +163,7 @@ class PipelineConfig:
     stage8_highlight_clip_ratio_max: float = 0.012  # 阶段8验收：高亮裁剪占比上限
 
     # I/O 控制
+    output_format: str = "all"  # 最终导出格式：all 或逗号分隔 tif/png/fit
     checkpoint_mode: bool = False   # True: 仅保存关键检查点
     debug_mode: bool = False        # True: 保留 stage* 中间文件（lightsrc 序列仍会清理）
     auto_tune_enabled: bool = True  # True: 启用自动识别目标并安全调参

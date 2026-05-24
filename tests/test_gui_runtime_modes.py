@@ -372,6 +372,79 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 gui_module.INPUT_MODE_LINEAR_RESUME,
             )
 
+    def test_pipeline_worker_spcc_crash_retry_env_disables_spcc(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worker = gui_module.PipelineWorker(
+                work_dir=root / "work",
+                config_template=root / "config.ini",
+                pipeline_path=root / "pipeline.py",
+                siril_plugin_dir=root / "plugins",
+                resources=root / "resources",
+                runtime_home=root / "runtime_home",
+                siril_candidates=[],
+            )
+            worker._force_disable_spcc_for_retry = True
+
+            env = worker._build_env(Path("/tmp/siril-cli"))
+
+            self.assertEqual(env.get("SEESTAR_SPCC_ENABLE"), "0")
+
+    def test_pipeline_worker_detects_spcc_command_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worker = gui_module.PipelineWorker(
+                work_dir=root / "work",
+                config_template=root / "config.ini",
+                pipeline_path=root / "pipeline.py",
+                siril_plugin_dir=root / "plugins",
+                resources=root / "resources",
+                runtime_home=root / "runtime_home",
+                siril_candidates=[],
+            )
+
+            worker._inspect_output_for_errors('input command:spcc "-oscsensor=seestar s30pro"')
+
+            self.assertTrue(worker._spcc_seen_in_run)
+
+    def test_normalize_siril_config_blanks_legacy_gaia_photo_file_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            work_dir = root / "work"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            config_template = root / "config.ini"
+            config_template.write_text(
+                "[core]\n"
+                "extension=.fit\n"
+                "catalogue_gaia_photo=/Users/mz/.local/share/siril/gaia_photometric.dat\n",
+                encoding="utf-8",
+            )
+            pipeline_path = root / "pipeline.py"
+            pipeline_path.write_text("# mock\n", encoding="utf-8")
+            pipeline_path.with_name("stage11_ai_postprocess.py").write_text("# mock stage11\n", encoding="utf-8")
+            resources = root / "resources"
+            resources.mkdir(exist_ok=True)
+            plugin_dir = root / "plugins"
+            plugin_dir.mkdir(exist_ok=True)
+
+            worker = gui_module.PipelineWorker(
+                work_dir=work_dir,
+                config_template=config_template,
+                pipeline_path=pipeline_path,
+                siril_plugin_dir=plugin_dir,
+                resources=resources,
+                runtime_home=root / "runtime_home",
+                siril_candidates=[],
+            )
+
+            temp_dir = root / "temp"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            _run_ssf, run_ini, _run_py = worker._prepare_runtime_files(temp_dir)
+            rendered = run_ini.read_text(encoding="utf-8")
+
+        self.assertIn("catalogue_gaia_photo=\n", rendered)
+        self.assertNotIn("gaia_photometric.dat", rendered)
+
     def test_pipeline_worker_normalizes_config_template_without_starnet_keys(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

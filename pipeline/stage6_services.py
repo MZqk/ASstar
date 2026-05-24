@@ -76,6 +76,12 @@ RESULT_BASENAME_TEMPLATE = (
     "_$DATE-OBS:dm12$_processed"
 )
 
+def stage6_effective_bg_median_min(configured_min: float) -> float:
+    """Return the Stage6 dark-floor gate with room for FITS sampling noise."""
+    configured = max(float(configured_min), 1e-4)
+    tolerance = min(0.0005, configured * 0.025)
+    return max(1e-4, configured - tolerance)
+
 class Stage6ServiceMixin:
     def _ai_stage_advisory_enabled(self, attr_name: str) -> bool:
         if not bool(getattr(self.cfg, "ai_post_enabled", False)):
@@ -626,7 +632,8 @@ class Stage6ServiceMixin:
             return True, ["quality sampling unavailable"], None
 
         issues: List[str] = []
-        if metrics.bg_median < self.cfg.stage6_bg_median_min:
+        bg_median_min = stage6_effective_bg_median_min(self.cfg.stage6_bg_median_min)
+        if metrics.bg_median < bg_median_min:
             issues.append(
                 f"bg_median {metrics.bg_median:.4f}<{self.cfg.stage6_bg_median_min:.4f}"
             )
@@ -658,7 +665,7 @@ class Stage6ServiceMixin:
         if metrics is None:
             return 1_000_000.0 + len(issues)
         score = float(len(issues)) * 5.0
-        bg_min = max(float(self.cfg.stage6_bg_median_min), 1e-4)
+        bg_min = stage6_effective_bg_median_min(self.cfg.stage6_bg_median_min)
         if metrics.bg_median < bg_min:
             score += ((bg_min - metrics.bg_median) / bg_min) * 8.0
         if metrics.bg_median < 0.005:
@@ -681,382 +688,228 @@ class Stage6ServiceMixin:
         allow_ai: bool = True,
     ) -> Tuple[bool, bool, List[str], str]:
         messages: List[str] = []
-        baseline_name = "stage6_input"
-        if not self._save_stage_output(baseline_name):
-            messages.append("stage6_input 保存失败，跳过自适应拉伸")
+        source_stem = "stage6_starless"
+        try:
+            self.cmd_with_check("load", source_stem)
+        except (CommandError, SirilError) as e:
+            messages.append(f"stage7 source load failed: {self._short_text(e, 180)}")
             return False, False, messages, ""
 
-        baseline_features = self._measure_current_features()
         baseline_quality = self._measure_current_quality()
-        strategy = self._stage6_strategy_from_features(baseline_features, baseline_quality)
-        messages.append(
-            f"stage6 stretch strategy: {strategy.name} ({strategy.summary})"
-        )
-        if strategy.protection_note:
-            messages.append(strategy.protection_note)
-
-        ai_plan = (
-            self._request_stage6_stretch_plan(baseline_features, baseline_quality)
-            if allow_ai
-            else None
-        )
-        if ai_plan:
-            summary = ai_plan.get("summary", "")
-            message = f"AI stage6 plan: {ai_plan['method']}"
-            if summary:
-                message += f" ({self._short_text(summary, 120)})"
-            messages.append(message)
-        else:
-            if allow_ai:
-                messages.append("AI stage6 plan unavailable, using local stretch strategy")
-
-        attempts: List[Dict[str, Any]] = []
-        best_attempt: Optional[Dict[str, Any]] = None
-        selected_attempt: Optional[Dict[str, Any]] = None
-        selected_method = ""
-        adaptive_stage6 = (
-            bool(getattr(self, "target_profile", None))
-            and callable(candidate_modes)
-            and callable(build_candidate_spec)
-            and callable(score_stretch_candidate)
-            and callable(choose_best_stretch_candidate)
-        )
         baseline_adaptive = (
             self._adaptive_features_current()
-            if adaptive_stage6 and hasattr(self, "_adaptive_features_current")
+            if hasattr(self, "_adaptive_features_current")
             else {}
         )
-        if adaptive_stage6:
-            modes = candidate_modes(
-                getattr(self, "pipeline_policy", {}) or {},
-                self._active_target_type(),
-            )
-            candidate_list = [
-                build_candidate_spec(mode, self.cfg)
-                for mode in modes
-            ]
-            self.log.info(f"[Stage6] Generated {len(candidate_list)} stretch candidates")
-            messages.append(
-                f"stage6 adaptive policy candidates: {', '.join(modes)}"
-            )
-        else:
-            candidate_list = self._stage6_candidate_specs(ai_plan, strategy)
+        messages.append("stage7 stretch candidates: stage7_cand_a, stage7_cand_b; preview=stage7_preview_ref")
+        if allow_ai:
+            messages.append("stage7 stretch ignores AI/policy expansion; fixed compact candidate set")
 
-        for index, candidate in enumerate(candidate_list, start=1):
-            label = self._stage6_candidate_label(candidate)
+        if self.process_dir:
+            for pattern in (
+                "stage6_candidate_*.fit",
+                "stage7_candidate_*.fit",
+                "stage6_selected*.fit",
+                "stage7_selected*.fit",
+                "stage6_stretched.fit",
+            ):
+                for stale_path in self.process_dir.glob(pattern):
+                    try:
+                        stale_path.unlink()
+                    except OSError as e:
+                        self.log.warn(f"[Stage7] stale stretch candidate cleanup failed: {e}")
+
+        preview_saved = False
+        try:
+            self.cmd_with_check("load", source_stem)
+            self.cmd_with_check("autostretch", "-linked")
+            preview_saved = self._save_stage_output("stage7_preview_ref")
+        except (CommandError, SirilError) as e:
+            messages.append(f"stage7 preview_ref failed: {self._short_text(e, 160)}")
+
+        candidate_list: List[Dict[str, Any]] = [
+            {
+                "name": "cand_a",
+                "stem": "stage7_cand_a",
+                "method": "asinh",
+                "params": {"asinh_stretch": 2.2, "asinh_offset": 0.002},
+            },
+            {
+                "name": "cand_b",
+                "stem": "stage7_cand_b",
+                "method": "asinh_ghs",
+                "params": {
+                    "asinh_stretch": 2.1,
+                    "asinh_offset": 0.002,
+                    "ghs_shadowsclip": -2.1,
+                    "ghs_stretchamount": 1.05,
+                },
+            },
+        ]
+        attempts: List[Dict[str, Any]] = []
+        best_attempt: Optional[Dict[str, Any]] = None
+
+        for candidate in candidate_list:
+            stem = str(candidate["stem"])
             try:
-                self.cmd_with_check("load", baseline_name)
+                self.cmd_with_check("load", source_stem)
             except (CommandError, SirilError) as e:
-                attempts.append({"label": label, "status": "failed", "reason": str(e)})
+                attempts.append(
+                    {
+                        "name": candidate["name"],
+                        "file": f"{stem}.fit",
+                        "method": candidate["method"],
+                        "params": candidate["params"],
+                        "status": "failed",
+                        "reason": self._short_text(e, 160),
+                    }
+                )
                 continue
 
             ok, used_or_error = self._execute_stage6_stretch_candidate(candidate)
-            attempt: Dict[str, Any] = {
-                "label": label,
-                "method": candidate.get("method"),
-                "source": candidate.get("source"),
-                "status": "failed",
-                "reason": used_or_error,
-            }
             if not ok:
-                attempts.append(attempt)
+                attempts.append(
+                    {
+                        "name": candidate["name"],
+                        "file": f"{stem}.fit",
+                        "method": candidate["method"],
+                        "params": candidate["params"],
+                        "status": "failed",
+                        "reason": used_or_error,
+                    }
+                )
                 continue
 
             quality_ok, issues, metrics = self._validate_stage6_stretch_quality(baseline_quality)
-            mode_name = str(candidate.get("mode") or candidate.get("method") or f"{index}")
-            safe_mode = re.sub(r"[^A-Za-z0-9_.-]+", "_", mode_name).strip("_") or str(index)
-            candidate_stem = (
-                f"stage6_candidate_{safe_mode}"
-                if adaptive_stage6
-                else f"stage6_candidate_{index}"
-            )
-            candidate_saved = self._save_stage_output(candidate_stem)
-            if not candidate_saved:
-                issues = [*issues, "candidate save failed"]
-            adaptive_metrics = (
-                self._adaptive_features_current()
-                if adaptive_stage6 and hasattr(self, "_adaptive_features_current")
-                else {}
-            )
             pixel_stats = self._current_pixel_distribution_stats()
-            if adaptive_stage6:
-                chroma = float(adaptive_metrics.get("chroma_noise_score", 0.0) or 0.0)
-                baseline_chroma = float(baseline_adaptive.get("chroma_noise_score", chroma) or chroma or 1e-6)
-                adaptive_metrics["chroma_noise_growth"] = chroma / max(baseline_chroma, 1e-6)
-                score_payload = score_stretch_candidate(
-                    safe_mode,
-                    adaptive_metrics,
-                    baseline_adaptive,
-                    getattr(self, "pipeline_policy", {}) or {},
+            invalid_reasons = [
+                reason
+                for key, reason in (
+                    ("is_nearly_black", "nearly_black"),
+                    ("is_visibility_too_low", "visibility_too_low"),
+                    ("is_nearly_white", "nearly_white"),
+                    ("invalid_dynamic_range", "invalid_dynamic_range"),
                 )
-                risk_score = 1.0 - float(score_payload.get("score", 0.0))
-            else:
-                score_payload = {}
-                risk_score = self._stage6_stretch_risk_score(
-                    metrics,
-                    issues,
-                    baseline_quality,
-                )
-            invalid_reasons: List[str] = []
-            for key, reason in (
-                ("is_nearly_black", "nearly_black"),
-                ("is_nearly_white", "nearly_white"),
-                ("invalid_dynamic_range", "invalid_dynamic_range"),
-            ):
-                if pixel_stats.get(key):
-                    invalid_reasons.append(reason)
+                if pixel_stats.get(key)
+            ]
             if invalid_reasons:
                 quality_ok = False
                 issues = [*issues, *invalid_reasons]
-            hard_reject_reasons: List[str] = []
-            if not quality_ok:
-                hard_reject_reasons.extend(str(item) for item in issues if item)
-            if hard_reject_reasons:
-                score_payload["allowed_as_final"] = False
-                existing_reject = str(score_payload.get("reject_reason") or "").strip()
-                combined = []
-                if existing_reject:
-                    combined.append(existing_reject)
-                combined.extend(hard_reject_reasons)
-                score_payload["reject_reason"] = ",".join(dict.fromkeys(combined))
-            attempt.update(
-                {
-                    "name": safe_mode,
-                    "status": "ok" if candidate_saved else "failed",
-                    "used": used_or_error,
-                    "diagnostics": issues,
-                    "metrics": asdict(metrics) if metrics else None,
-                    "adaptive_metrics": adaptive_metrics or None,
-                    "pixel_stats": pixel_stats,
-                    "stem": candidate_stem if candidate_saved else None,
-                    "file": f"{candidate_stem}.fit" if candidate_saved else None,
-                    "quality_ok": quality_ok,
-                    "risk_score": risk_score,
-                    "score": score_payload.get("score"),
-                    "allowed_as_final": score_payload.get("allowed_as_final", True),
-                    "reject_reason": score_payload.get("reject_reason") or None,
-                    "scoring_metrics": score_payload.get("metrics"),
-                }
-            )
+            risk_score = self._stage6_stretch_risk_score(metrics, issues, baseline_quality)
+            candidate_saved = self._save_stage_output(stem)
+            attempt = {
+                "name": candidate["name"],
+                "file": f"{stem}.fit" if candidate_saved else None,
+                "stem": stem if candidate_saved else None,
+                "method": candidate["method"],
+                "params": candidate["params"],
+                "status": "ok" if candidate_saved else "failed",
+                "used": used_or_error,
+                "quality_ok": quality_ok,
+                "diagnostics": issues,
+                "metrics": asdict(metrics) if metrics else None,
+                "adaptive_metrics": (
+                    self._adaptive_features_current()
+                    if hasattr(self, "_adaptive_features_current")
+                    else None
+                ),
+                "pixel_stats": pixel_stats,
+                "risk_score": risk_score,
+                "allowed_as_final": bool(quality_ok),
+            }
             attempts.append(attempt)
-            if candidate_saved:
-                if adaptive_stage6:
-                    if not attempt.get("allowed_as_final"):
-                        self.log.warn(
-                            f"[Stage6] Reject {safe_mode}: {attempt.get('reject_reason')}"
-                        )
-                    best_attempt = choose_best_stretch_candidate(
-                        attempts,
-                        str(
-                            (getattr(self, "pipeline_policy", {}) or {})
-                            .get("stage6_stretch", {})
-                            .get("fallback_candidate", "asinh_core_protect")
-                        ),
-                    )
-                elif (
-                    attempt.get("allowed_as_final", True)
-                    and (best_attempt is None or risk_score < float(best_attempt.get("risk_score", 1_000_000.0)))
-                ):
-                    best_attempt = attempt
+            if candidate_saved and quality_ok and (
+                best_attempt is None
+                or risk_score < float(best_attempt.get("risk_score", 1_000_000.0))
+            ):
+                best_attempt = attempt
 
-        if adaptive_stage6 and best_attempt is None:
-            fallback_name = str(
-                (getattr(self, "pipeline_policy", {}) or {})
-                .get("stage6_stretch", {})
-                .get("fallback_candidate", "asinh_core_protect")
+        if best_attempt is None:
+            best_attempt = next(
+                (
+                    attempt
+                    for attempt in attempts
+                    if attempt.get("status") == "ok" and attempt.get("stem")
+                ),
+                None,
             )
-            try:
-                self.cmd_with_check("load", baseline_name)
-                self.cmd_with_check("asinh", "1.8000", "0.002000")
-                fallback_stem = "stage6_candidate_light_asinh_fallback"
-                fallback_saved = self._save_stage_output(fallback_stem)
-                fallback_reasons = sorted(
-                    {
-                        str(item.get("reject_reason") or ";".join(item.get("diagnostics") or []))
-                        for item in attempts
-                        if item.get("status") == "ok" and "autostretch" not in str(item.get("name", ""))
-                    }
-                )
-                fallback_pixel_stats = self._current_pixel_distribution_stats()
-                fallback_invalid = [
-                    reason
-                    for key, reason in (
-                        ("is_nearly_black", "nearly_black"),
-                        ("is_nearly_white", "nearly_white"),
-                        ("invalid_dynamic_range", "invalid_dynamic_range"),
-                    )
-                    if fallback_pixel_stats.get(key)
-                ]
-                fallback_validity = "degraded_fallback_invalid" if fallback_invalid else "degraded_fallback"
-                fallback_diagnostics = [
-                    "fallback_used=true",
-                    "selected=light_asinh_fallback",
-                    f"validity={fallback_validity}",
-                ]
-                if fallback_invalid:
-                    fallback_diagnostics.extend(fallback_invalid)
-                best_attempt = {
-                    "name": "light_asinh_fallback",
-                    "label": "light Asinh fallback",
-                    "status": "fallback" if fallback_saved else "failed",
-                    "used": f"light_asinh_fallback after all candidates rejected; preferred={fallback_name}",
-                    "diagnostics": fallback_diagnostics,
-                    "metrics": None,
-                    "adaptive_metrics": baseline_adaptive or None,
-                    "pixel_stats": fallback_pixel_stats,
-                    "stem": fallback_stem if fallback_saved else None,
-                    "file": f"{fallback_stem}.fit" if fallback_saved else None,
-                    "quality_ok": False,
-                    "risk_score": 1_000_000.0,
-                    "score": None,
-                    "allowed_as_final": False,
-                    "reject_reason": (
-                        ",".join(fallback_invalid)
-                        if fallback_invalid
-                        else None
-                    ),
-                    "scoring_metrics": None,
-                    "validity": fallback_validity,
-                    "rejected_candidate_reasons": fallback_reasons,
-                    "explicit_fallback": True,
-                }
-                attempts.append(best_attempt)
-                degraded = True
-                self.log.warn("[Stage6] All adaptive candidates rejected; using light_asinh_fallback")
-            except (CommandError, SirilError) as e:
-                self.log.warn(f"[Stage6] Explicit fallback input failed: {e}")
+            if best_attempt is not None:
+                best_attempt["explicit_fallback"] = True
+                messages.append("stage7 selected degraded fallback because no candidate passed quality gate")
 
         self._write_stage_json(
-            "stage6_stretch_quality.json",
+            "stage7_stretch_quality.json",
             {
-                "ai_plan": ai_plan,
-                "strategy": asdict(strategy),
+                "stage": "stage7_stretch",
+                "input": f"{source_stem}.fit",
+                "preview": {
+                    "name": "preview_ref",
+                    "file": "stage7_preview_ref.fit" if preview_saved else None,
+                    "method": "autostretch -linked",
+                    "reference_only": True,
+                },
+                "baseline_adaptive": baseline_adaptive,
                 "attempts": attempts,
-                "selected": selected_attempt or best_attempt,
+                "selected": best_attempt,
             },
         )
-        if adaptive_stage6:
-            selected_for_report = best_attempt
-            self._write_stage_json(
-                "stretch_candidates_report.json",
-                {
-                    "stage": "stage6_stretch",
-                    "policy": self._active_policy_name(),
-                    "target_type": self._active_target_type(),
-                    "candidates": [
-                        {
-                            "name": item.get("name"),
-                            "file": item.get("file"),
-                            "score": item.get("score"),
-                            "metrics": item.get("scoring_metrics"),
-                            "pixel_stats": item.get("pixel_stats"),
-                            "allowed_as_final": item.get("allowed_as_final", True),
-                            "reject_reason": item.get("reject_reason"),
-                            "status": item.get("status"),
-                            "diagnostics": item.get("diagnostics"),
-                        }
-                        for item in attempts
-                    ],
-                    "selected": (
-                        {
-                            "name": selected_for_report.get("name"),
-                            "file": "stage6_selected.fit",
-                            "source_file": selected_for_report.get("file"),
-                            "reason": (
-                                "explicit fallback; no valid candidate"
-                                if selected_for_report.get("explicit_fallback")
-                                else "best risk-adjusted score"
-                            ),
-                            "normal_selected": not bool(selected_for_report.get("explicit_fallback")),
-                        }
-                        if selected_for_report
-                        else None
-                    ),
-                },
-            )
+        self._write_stage_json(
+            "stretch_candidates_report.json",
+            {
+                "stage": "stage7_stretch",
+                "input": f"{source_stem}.fit",
+                "candidates": [
+                    {
+                        "name": item.get("name"),
+                        "file": item.get("file"),
+                        "method": item.get("method"),
+                        "params": item.get("params"),
+                        "quality_ok": item.get("quality_ok"),
+                        "risk_score": item.get("risk_score"),
+                        "pixel_stats": item.get("pixel_stats"),
+                        "status": item.get("status"),
+                        "diagnostics": item.get("diagnostics"),
+                    }
+                    for item in attempts
+                ],
+                "preview": "stage7_preview_ref.fit" if preview_saved else None,
+                "selected": (
+                    {
+                        "name": best_attempt.get("name"),
+                        "source_file": best_attempt.get("file"),
+                        "file": "stage7_stretched.fit",
+                        "normal_selected": not bool(best_attempt.get("explicit_fallback")),
+                    }
+                    if best_attempt
+                    else None
+                ),
+            },
+        )
 
-        degraded = False
-        if best_attempt and best_attempt.get("stem"):
-            selected_attempt = best_attempt
-            degraded = bool(selected_attempt.get("explicit_fallback"))
-            selected_method = str(best_attempt.get("used", best_attempt.get("method", "")))
-            diagnostics = selected_attempt.get("diagnostics") or []
-            validity = str(
-                selected_attempt.get("validity")
-                or ("normal" if not degraded else "degraded_fallback")
-            )
-            fallback_used = bool(selected_attempt.get("explicit_fallback"))
-            reject_reason = selected_attempt.get("reject_reason")
-            pixel_stats = selected_attempt.get("pixel_stats") or {}
-            self.log.info(
-                "[Stage6] selected="
-                f"{selected_attempt.get('name')} "
-                f"validity={validity} "
-                f"fallback_used={str(fallback_used).lower()}"
-            )
-            if reject_reason:
-                self.log.warn(f"[Stage6] selected reject_reason={reject_reason}")
-            messages.append(
-                "stage6_selected="
-                f"{selected_attempt.get('name')}; "
-                f"fallback_used={str(fallback_used).lower()}; "
-                f"validity={validity}"
-            )
-            summary_diagnostics = [str(item) for item in diagnostics if item]
-            if fallback_used:
-                summary_diagnostics = [
-                    item
-                    for item in summary_diagnostics
-                    if not item.startswith(("fallback_used=", "selected=", "validity="))
-                ]
-            if validity == "normal" and not reject_reason:
-                report_only_tokens = ("black_pixel_ratio", "global_dark_ratio", "bg_median")
-                summary_diagnostics = [
-                    item for item in summary_diagnostics
-                    if not any(token in item for token in report_only_tokens)
-                ]
-            if reject_reason:
-                messages.append(f"stage6_selected_reject_reason={reject_reason}")
-            elif summary_diagnostics:
-                messages.append("stage6_selected_diagnostics=" + ", ".join(summary_diagnostics[:3]))
-            if pixel_stats:
-                messages.append(
-                    "stage6_selected_distribution="
-                    f"p50={float(pixel_stats.get('p50', 0.0) or 0.0):.4f}, "
-                    f"p99={float(pixel_stats.get('p99', 0.0) or 0.0):.4f}, "
-                    f"dynamic={float(pixel_stats.get('dynamic_range', 0.0) or 0.0):.4f}, "
-                    f"global_dark={float(pixel_stats.get('global_dark_ratio', 0.0) or 0.0):.3f}"
-                )
-        else:
-            self.cmd_with_check("load", baseline_name)
+        if not best_attempt or not best_attempt.get("stem"):
+            try:
+                self.cmd_with_check("load", source_stem)
+            except (CommandError, SirilError):
+                pass
             return False, False, messages, ""
 
-        self.cmd_with_check("load", str(selected_attempt["stem"]))
-        if adaptive_stage6:
-            self._save_stage_output("stage6_selected")
-            self.log.info(
-                "[Stage6] Selected candidate: "
-                f"{selected_attempt.get('name')} score={selected_attempt.get('score')}"
+        self.cmd_with_check("load", str(best_attempt["stem"]))
+        self.log.info(
+            "[Stage7] selected="
+            f"{best_attempt.get('name')} risk={best_attempt.get('risk_score')}"
+        )
+        messages.append(
+            "stage7_selected="
+            f"{best_attempt.get('name')}; "
+            f"fallback_used={str(bool(best_attempt.get('explicit_fallback'))).lower()}"
+        )
+        pixel_stats = best_attempt.get("pixel_stats") or {}
+        if pixel_stats:
+            messages.append(
+                "stage7_selected_distribution="
+                f"p50={float(pixel_stats.get('p50', 0.0) or 0.0):.4f}, "
+                f"p99={float(pixel_stats.get('p99', 0.0) or 0.0):.4f}, "
+                f"dynamic={float(pixel_stats.get('dynamic_range', 0.0) or 0.0):.4f}"
             )
-        pre_curves_stem = "stage6_selected_precurves"
-        self._save_stage_output(pre_curves_stem)
-        if strategy.use_curves:
-            curves_used = self._run_first_available_command(
-                "曲线/蒙版工具",
-                [
-                    ("VeraLux Curves", ("veralux_curves",)),
-                    ("Curves", ("curves",)),
-                ],
-            )
-            if curves_used:
-                _quality_ok, issues, _metrics = self._validate_stage6_stretch_quality(baseline_quality)
-                curve_note = f"曲线微调使用 {curves_used}"
-                if strategy.curves_label:
-                    curve_note += f" ({strategy.curves_label})"
-                messages.append(curve_note)
-                if issues:
-                    messages.append("stage6_quality diagnostic: " + "; ".join(issues[:3]))
-        else:
-            messages.append("stage6 curves skipped by stretch strategy")
-
-        return True, degraded, messages, selected_method
+        selected_method = str(best_attempt.get("used") or best_attempt.get("method") or "")
+        return True, bool(best_attempt.get("explicit_fallback")), messages, selected_method

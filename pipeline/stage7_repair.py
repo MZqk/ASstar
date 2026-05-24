@@ -49,7 +49,7 @@ def stage7_clean_starmask(
         result["reason"] = "starmask_missing"
         return result
 
-    source_stem = source_stem or pipeline.stretched_name or "stage6_stretched"
+    source_stem = source_stem or pipeline.stretched_name or "stage7_stretched"
     try:
         source_data = pipeline._read_image_by_stem(source_stem)
         if source_data is None:
@@ -239,7 +239,7 @@ def apply_stage7_residual_suppression(
         return None
     try:
         source_data = pipeline._read_image_by_stem(
-            source_stem or pipeline.stretched_name or "stage6_stretched"
+            source_stem or pipeline.stretched_name or "stage7_stretched"
         )
         pipeline.cmd_with_check("load", "starless")
         starless_data = pipeline.siril.get_image_pixeldata(preview=False)

@@ -299,12 +299,28 @@ show_linemarks=false
 """
 
 
+def _normalize_gaia_photo_catalog(value: str) -> str:
+    stripped = value.strip()
+    unquoted = stripped.strip('"').strip("'")
+    if not unquoted:
+        return ""
+
+    path = Path(unquoted).expanduser()
+    if path.name == "gaia_photometric.dat" or not path.is_dir():
+        return ""
+    return stripped
+
+
 def normalize_siril_config_template(config_text: str) -> str:
     removed_keys = {"starnet_exe", "starnet_weights"}
     lines = []
     for raw_line in config_text.splitlines():
         key = raw_line.split("=", 1)[0].strip().lower() if "=" in raw_line else ""
         if key in removed_keys:
+            continue
+        if key == "catalogue_gaia_photo":
+            value = raw_line.split("=", 1)[1]
+            lines.append(f"catalogue_gaia_photo={_normalize_gaia_photo_catalog(value)}")
             continue
         lines.append(raw_line)
 
@@ -334,6 +350,7 @@ COSMIC_CLARITY_REQUIRED_MODEL_FILES = (
 )
 APP_RUNTIME_HOME_REL = Path("Library/Application Support/SeestarSuperimpose/runtime_home")
 AI_ENV_RESOURCE_REL = Path("ai.env")
+DEFAULT_ENV_RESOURCE_REL = Path("default.env")
 AI_ENV_OVERRIDE_NAME = ".seestar_ai.env"
 AI_ENV_ALLOWED_KEYS = frozenset(
     {
@@ -344,16 +361,65 @@ AI_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_AI_TIMEOUT_SEC",
         "SEESTAR_AI_STRENGTH",
         "SEESTAR_AI_PROMPT",
+        "SEESTAR_AI_STAGE6_ENABLE",
+        "SEESTAR_AI_STAGE7_ENABLE",
+        "SEESTAR_AI_STAGE8_ENABLE",
+        "SEESTAR_OUTPUT_FORMAT",
         "SEESTAR_DENOISE_ENABLE",
         "SEESTAR_DENOISE_FORCE",
         "SEESTAR_SYQON_GPU",
         "SEESTAR_SYQON_TIMEOUT_SEC",
+        "SEESTAR_SIRILPY_TIMEOUT_SEC",
         "SEESTAR_WORKFLOW_PLUGIN_PROBE",
         "SEESTAR_SPCC_ENABLE",
+        "SEESTAR_STAGE4_PLATESOLVE_ENABLE",
+        "SEESTAR_STAGE4_SPCC_SENSOR_MODE",
+        "SEESTAR_STAGE4_SPCC_OSC_SENSOR",
+        "SEESTAR_STAGE4_SPCC_OSC_FILTER",
+        "SEESTAR_STAGE4_SPCC_MONO_SENSOR",
+        "SEESTAR_STAGE4_SPCC_R_FILTER",
+        "SEESTAR_STAGE4_SPCC_G_FILTER",
+        "SEESTAR_STAGE4_SPCC_B_FILTER",
+        "SEESTAR_STAGE4_SPCC_WHITE_REF",
+        "SEESTAR_STAGE4_SPCC_ADAPTIVE_WHITE_REF",
+        "SEESTAR_STAGE4_SPCC_NEBULA_WHITE_REF",
+        "SEESTAR_STAGE4_SPCC_BGTOL",
+        "SEESTAR_STAGE4_SPCC_LIMITMAG",
+        "SEESTAR_STAGE4_LOCAL_STAR_WB_ENABLE",
+        "SEESTAR_STAGE4_LOCAL_STAR_WB_MIN_PIXELS",
+        "SEESTAR_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT",
         "SEESTAR_SPCC_ALLOW_LIGHT_PREPROCESS",
+        "SEESTAR_ABERRATION_API_ENABLE",
+        "SEESTAR_ABERRATION_PROVIDER",
+        "SEESTAR_OPTIONAL_COLOR_TRANSFORM",
+        "SEESTAR_COSMIC_CLASSIC_ENABLE",
         "SEESTAR_COSMIC_CLARITY_EXECUTABLE",
         "SEESTAR_COSMIC_CLASSIC_GPU",
         "SEESTAR_COSMIC_NATIVE_GPU",
+        "SEESTAR_STAGE5_BUILTIN_DENOISE_MOD",
+        "SEESTAR_STAGE5_DECONV_ENABLE",
+        "SEESTAR_STAGE5_RL_MAXSTARS",
+        "SEESTAR_STAGE5_RL_PSF_KS",
+        "SEESTAR_STAGE5_RL_ITERS",
+        "SEESTAR_STAGE5_RL_ALPHA",
+        "SEESTAR_STAGE5_RL_GDSTEP",
+        "SEESTAR_STAGE5_RL_STOP",
+        "SEESTAR_STAGE5_GRAXPERT_DECONV_STRENGTH",
+        "SEESTAR_STAGE7_QUALITY_RETRY_MAX",
+        "SEESTAR_STAGE7_SKIP_UNREADY_STARLESS",
+        "SEESTAR_STAR_SEPARATION_MODE",
+        "SEESTAR_STAR_SEPARATION_FALLBACK_TO_MILD_PRESTRETCH",
+        "SEESTAR_MILD_PRESTRETCH_STRENGTH",
+        "SEESTAR_STAGE7_SOFT_STARLESS_ASINH_STRETCH",
+        "SEESTAR_STAGE7_BRIGHT_NEBULA_HALO_RESIDUE_SCORE_MAX",
+        "SEESTAR_STAGE7_STARLESS_REPAIR_STRENGTH",
+        "SEESTAR_STAGE7_STARLESS_HALO_REPAIR_STRENGTH",
+        "SEESTAR_STAGE7_STARLESS_CHROMA_DENOISE_STRENGTH",
+        "SEESTAR_STAGE7_STARLESS_PIXEL_REPAIR_ENABLE",
+        "SEESTAR_STAGE8_FORCE_CONSERVATIVE_AFTER_STAGE7_REPAIR",
+        "SEESTAR_STAGE9_STARMASK_STRETCH_ENABLE",
+        "SEESTAR_STAGE9_STARMASK_ASINH_STRETCH",
+        "SEESTAR_STAGE9_STARMASK_ASINH_OFFSET",
     }
 )
 
@@ -692,7 +758,7 @@ class SeestarGui(QMainWindow):
             "  2. 根据数据状态选择处理模式；如已导出 result_linear.fit，可切到续跑模式。",
             "  3. 点击“开始处理”，应用会先执行预检与磁盘空间估算，再启动处理。",
             "  4. 本区域会同时显示使用说明和运行日志；需要中断时点击“停止”。",
-            "  5. 处理完成后，可用“打开结果目录”查看 *.tif / *.png / result_linear.fit / *_final.fit。",
+            "  5. 处理完成后，可用“打开结果目录”查看 *.tif / *.png / result_linear.fit / *_final.fit；Debug 开启时可查看阶段 6/7 中间产物。",
             "  6. 如需完整运行记录，点击“打开日志文件”。",
         ]))
         lines.extend(self._section_block("应用能力", [
@@ -704,13 +770,18 @@ class SeestarGui(QMainWindow):
             "  - 控件区分为“处理过程”和“可选过程”两组，便于区分主流程与可选能力。",
             f"  - 处理模式: {self._input_mode_label(self.input_mode)}。",
             f"  - AI 阶段开关: {'开启' if self.ai_stage_enabled else '关闭'}（控制阶段 11 是否执行）。",
-            f"  - Debug 模式: {'开启' if self.debug_mode_enabled else '关闭'}（开启后保留 stage* 中间产物，lightsrc 序列仍会清理）。",
+            f"  - Debug 模式: {'开启' if self.debug_mode_enabled else '关闭'}（开启后保留 stage* 中间产物；阶段 6 去星输出为 stage6_starless，阶段 7 拉伸输出为 stage7_stretched）。",
             f"  - 联网模式: {'开启' if self.network_mode_enabled else '关闭'}（开启后允许 platesolve 联网解算）。",
         ]))
         lines.extend(self._section_block("处理阶段总览", [
-            "  线性阶段: 1.前期准备 -> 2.裁切 -> 3.背景提取 -> 4.图像解析+色彩校准 -> 5.矫正/锐化/初步降噪",
-            "  非线性阶段: 6.主体拉伸 -> 7.去星与星点层准备 -> 8.Starless 深加工 -> 9.星点处理与合成 -> 10.最终降噪与导出",
+            "  线性阶段: 1.前期准备 -> 2.裁切 -> 3.背景提取 -> 4.图像解析+色彩校准 -> 5.线性降噪/反卷积",
+            "  非线性阶段: 6.去星与星点层准备 -> 7.主体拉伸 -> 8.Starless 深加工 -> 9.星点处理与合成 -> 10.最终降噪与导出",
             "  可选阶段: 11.AI 后期美化（需 SEESTAR_AI_* 配置）",
+        ]))
+        lines.extend(self._section_block("阶段文件命名", [
+            "  - 阶段 6 去星: stage6_starless.fit / stage6_starless_quality.json。",
+            "  - 阶段 7 拉伸: stage7_stretched.fit / stage7_stretch_quality.json。",
+            "  - 阶段 7 统一使用 stage7_cand_a/b、stage7_preview_ref 与 stage7_stretched 命名。",
         ]))
         lines.extend(self._section_block("当前运行环境", [
             f"  资源根目录: {self._display_path(self.resources)}",

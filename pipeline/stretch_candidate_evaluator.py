@@ -8,6 +8,8 @@ MODE_ALIASES = {
     "asinh_core_protect": "asinh",
     "asinh_mild_ghs": "asinh_ghs",
     "masked_curve_dark_boost": "asinh",
+    "low_contrast_masked_lift": "bright_nebula_hdr_masked",
+    "dark_nebula_masked_lift": "bright_nebula_hdr_masked",
     "bright_nebula_hdr_masked": "bright_nebula_hdr_masked",
     "mild_histogram": "ghs",
     "masked_galaxy_stretch": "asinh_ghs",
@@ -25,12 +27,27 @@ def candidate_modes(policy: Dict[str, Any], target_type: str) -> List[str]:
         return [
             "bright_nebula_hdr_masked",
             "asinh_core_protect",
+            "low_contrast_masked_lift",
             "asinh_mild_ghs",
             "masked_curve_dark_boost",
             "autostretch_reference",
         ]
+    if target_type == "dark_nebula_low_contrast":
+        return [
+            "dark_nebula_masked_lift",
+            "asinh_core_protect",
+            "masked_curve_dark_boost",
+            "asinh_mild_ghs",
+            "autostretch_reference",
+        ]
     if target_type in {"large_galaxy", "small_galaxy"}:
-        return ["masked_galaxy_stretch", "asinh_mild_ghs", "mild_histogram", "autostretch_reference"]
+        return [
+            "masked_galaxy_stretch",
+            "low_contrast_masked_lift",
+            "asinh_mild_ghs",
+            "mild_histogram",
+            "autostretch_reference",
+        ]
     if target_type in {"globular_cluster", "open_cluster"}:
         return ["star_color_preserving_stretch", "asinh_core_protect", "autostretch_reference"]
     return ["asinh_core_protect", "asinh_mild_ghs", "autostretch_reference"]
@@ -54,6 +71,9 @@ def build_candidate_spec(mode: str, cfg: Any) -> Dict[str, Any]:
     elif mode == "masked_curve_dark_boost":
         asinh = min(asinh, 2.05)
         offset = max(offset, 0.0018)
+    elif mode in {"dark_nebula_masked_lift", "low_contrast_masked_lift"}:
+        asinh = min(max(asinh, 2.05), 2.45)
+        offset = max(offset, 0.0018)
     elif mode == "mild_histogram":
         ghs_amount = min(ghs_amount, 1.20)
         shadows = max(shadows, -2.45)
@@ -71,11 +91,41 @@ def build_candidate_spec(mode: str, cfg: Any) -> Dict[str, Any]:
             "asinh_offset": offset,
             "ghs_shadowsclip": shadows,
             "ghs_stretchamount": ghs_amount,
-            "bg_pedestal": 0.024 if mode == "bright_nebula_hdr_masked" else 0.0,
-            "faint_boost": 0.018 if mode == "bright_nebula_hdr_masked" else 0.0,
-            "core_protection": 0.72 if mode == "bright_nebula_hdr_masked" else 0.0,
-            "shadow_chroma_damping": 0.28 if mode == "bright_nebula_hdr_masked" else 0.0,
-            "faint_saturation_boost": 0.026 if mode == "bright_nebula_hdr_masked" else 0.0,
+            "bg_pedestal": (
+                0.020
+                if mode == "low_contrast_masked_lift"
+                else 0.022
+                if mode == "dark_nebula_masked_lift"
+                else 0.024 if mode == "bright_nebula_hdr_masked" else 0.0
+            ),
+            "faint_boost": (
+                0.010
+                if mode == "low_contrast_masked_lift"
+                else 0.012
+                if mode == "dark_nebula_masked_lift"
+                else 0.018 if mode == "bright_nebula_hdr_masked" else 0.0
+            ),
+            "core_protection": (
+                0.80
+                if mode == "low_contrast_masked_lift"
+                else 0.84
+                if mode == "dark_nebula_masked_lift"
+                else 0.72 if mode == "bright_nebula_hdr_masked" else 0.0
+            ),
+            "shadow_chroma_damping": (
+                0.34
+                if mode == "low_contrast_masked_lift"
+                else 0.38
+                if mode == "dark_nebula_masked_lift"
+                else 0.28 if mode == "bright_nebula_hdr_masked" else 0.0
+            ),
+            "faint_saturation_boost": (
+                0.012
+                if mode == "low_contrast_masked_lift"
+                else 0.014
+                if mode == "dark_nebula_masked_lift"
+                else 0.026 if mode == "bright_nebula_hdr_masked" else 0.0
+            ),
         },
         "summary": f"policy candidate {mode}",
     }

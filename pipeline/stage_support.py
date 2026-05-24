@@ -30,9 +30,11 @@ from image_metrics import (
     _box_blur_gray,
     _clamp_float,
     _to_rgb_float_fullres,
+    _to_rgb_float_image,
     format_feature_summary,
     measure_image_features,
     measure_quality_metrics,
+    measure_stage3_signal_preservation,
 )
 from models import ImageFeatures, QualityMetrics, Stage6StretchStrategy, StageResult, TargetType
 from save_utils import save_stage_output, write_ai_raw_response, write_stage_json
@@ -365,7 +367,7 @@ class Stage7ServiceMixin:
 
 
     def _stage7_preflight_check(self) -> Dict[str, Any]:
-        source_stem = self.stretched_name or "stage6_stretched"
+        source_stem = self.stretched_name or "stage7_stretched"
         result: Dict[str, Any] = {
             "source": source_stem,
             "risk_level": "ok",
@@ -696,7 +698,7 @@ class Stage7ServiceMixin:
                 )
                 self.log.warn(f"Stage7 conservative starless input failed ({stem}): {e}")
         try:
-            self.cmd_with_check("load", self.stretched_name or "stage6_stretched")
+            self.cmd_with_check("load", self.stretched_name or "stage7_stretched")
         except Exception:
             pass
         return records
@@ -709,14 +711,11 @@ class Stage7ServiceMixin:
             "stage7_soft_starless_asinh",
             "stage7_ultra_conservative_asinh",
             "stage7_conservative_asinh",
-            "stage6_selected_precurves",
-            "stage6_candidate_1",
-            "stage6_candidate_2",
-            "stage6_candidate_3",
-            "stage6_candidate_4",
+            "stage7_cand_a",
+            "stage7_cand_b",
             "stage6_input",
         ]
-        current = self.stretched_name or "stage6_stretched"
+        current = self.stretched_name or "stage7_stretched"
         candidates: List[str] = []
         for stem in preferred:
             if stem == current:
@@ -1404,6 +1403,8 @@ class StageSupportMixin:
             "stack", r_pp_seq, "rej", "3", "3",
             "-norm=addscale", "-output_norm", "-rgb_equal",
             "-out=working")
+        # Seestar preprocessing scripts flip the stacked output before loading it.
+        self.cmd_with_check("mirrorx_single", "working")
 
         total_frames = len(light_files)
         registered_count = self._count_sequence_products(r_pp_seq)
@@ -1451,6 +1452,7 @@ class StageSupportMixin:
         self,
         before: Optional[ImageFeatures],
         after: Optional[ImageFeatures],
+        preservation: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str]:
         if not self.cfg.bg_quality_gate_enabled:
             return True, "quality gate disabled"
@@ -1487,12 +1489,100 @@ class StageSupportMixin:
                 f"edge_black rise {edge_black_rise:.2f}>{self.cfg.bg_edge_black_rise_max:.2f}"
             )
 
+        preservation_notes: List[str] = []
+        if preservation and preservation.get("available"):
+            star_retention = preservation.get("star_retention_ratio")
+            if star_retention is not None:
+                preservation_notes.append(f"star_retention={float(star_retention):.3f}")
+                if float(star_retention) < self.cfg.bg_star_preserve_ratio_min:
+                    reasons.append(
+                        "star retention ratio "
+                        f"{float(star_retention):.2f}<"
+                        f"{self.cfg.bg_star_preserve_ratio_min:.2f}"
+                    )
+            nebula_change = preservation.get("nebula_mean_change_ratio")
+            if nebula_change is not None:
+                preservation_notes.append(
+                    f"nebula_mean_change={float(nebula_change):.3f}"
+                )
+                if float(nebula_change) > self.cfg.bg_nebula_mean_change_max:
+                    reasons.append(
+                        "nebula mean change "
+                        f"{float(nebula_change):.2f}>"
+                        f"{self.cfg.bg_nebula_mean_change_max:.2f}"
+                    )
+
         if reasons:
             return False, "; ".join(reasons)
-        return True, (
+        message = (
             f"bg_std {before.bg_std:.4f}->{after.bg_std:.4f}, "
             f"bg_median {before.bg_median:.4f}->{after.bg_median:.4f}"
         )
+        if preservation_notes:
+            message += ", " + ", ".join(preservation_notes)
+        return True, message
+
+
+    def _stage3_signal_preservation_metrics(
+        self,
+        before_image: Optional[np.ndarray],
+        after_image: Optional[np.ndarray],
+    ) -> Dict[str, Any]:
+        if before_image is None or after_image is None:
+            return {"available": False, "notes": ["image sampling unavailable"]}
+        return measure_stage3_signal_preservation(before_image, after_image)
+
+
+    def _stage3_plugin_candidates(
+        self,
+        before: Optional[ImageFeatures],
+        adaptive: Optional[Dict[str, Any]] = None,
+    ) -> List[Tuple[str, Tuple[str, ...], str]]:
+        candidates: List[Tuple[str, Tuple[str, ...], str]] = [
+            ("DBE", ("dbe",), "plugin"),
+            ("ADBE", ("adbe",), "plugin"),
+            ("GXP", ("gxp",), "plugin"),
+            ("NOX", ("nox",), "plugin"),
+            ("AutoDBE", ("autodbe",), "plugin"),
+            ("AutoBGE", ("autobge",), "plugin"),
+            ("VeraLux NOX", ("veralux_nox",), "plugin"),
+        ]
+        if before is None:
+            return candidates
+
+        bg_std = float(before.bg_std)
+        star_density = float(before.star_density)
+        object_area = float(before.object_area_ratio)
+        adaptive = adaptive or {}
+        dirty = float(adaptive.get("dirty_background_score", 0.0) or 0.0)
+        gradient = float(adaptive.get("gradient_score", 0.0) or 0.0)
+        high_noise = bg_std >= 0.045 or dirty >= 0.35
+        dense_stars = star_density >= 0.0045
+        low_noise_structured = bg_std <= 0.025 and gradient >= 0.08
+        diffuse_object = object_area >= 0.25
+
+        if high_noise:
+            priority = ["NOX", "VeraLux NOX", "AutoBGE", "GXP", "ADBE", "DBE", "AutoDBE"]
+        elif dense_stars:
+            priority = ["ADBE", "DBE", "AutoDBE", "GXP", "NOX", "AutoBGE", "VeraLux NOX"]
+        elif low_noise_structured:
+            priority = ["DBE", "ADBE", "AutoDBE", "GXP", "AutoBGE", "NOX", "VeraLux NOX"]
+        elif diffuse_object:
+            priority = ["ADBE", "GXP", "DBE", "AutoBGE", "NOX", "AutoDBE", "VeraLux NOX"]
+        else:
+            priority = ["DBE", "ADBE", "GXP", "AutoDBE", "AutoBGE", "NOX", "VeraLux NOX"]
+
+        by_label = {label: (label, command, source) for label, command, source in candidates}
+        ordered = [by_label[label] for label in priority if label in by_label]
+        self.log.info(
+            "[Stage3] Smart plugin order: "
+            + " -> ".join(label for label, _, _ in ordered)
+            + (
+                f" (bg_std={bg_std:.4f}, star_density={star_density:.5f}, "
+                f"object_area={object_area:.3f}, dirty={dirty:.3f}, gradient={gradient:.3f})"
+            )
+        )
+        return ordered
 
 
     def _stage3_subsky_rbf_candidates(self) -> List[Tuple[str, ...]]:
@@ -1500,23 +1590,73 @@ class StageSupportMixin:
         tolerance = _clamp_float(self.cfg.bg_tolerance, 0.6, 1.8)
         smooth = _clamp_float(self.cfg.bg_smooth, 0.2, 1.2)
 
+        try:
+            image_data = self.siril.get_image_pixeldata(preview=False)
+            feat = measure_image_features(image_data)
+        except Exception:
+            feat = None
+
+        bg_std = float(feat.bg_std) if feat is not None else 0.03
+        star_density = float(feat.star_density) if feat is not None else 0.002
+        object_area = float(feat.object_area_ratio) if feat is not None else 0.20
+        high_noise = bg_std >= 0.045
+        low_noise = bg_std <= 0.020
+        complex_field = star_density >= 0.0045 or object_area >= 0.35
+        variant_budget = 5 if (high_noise or complex_field) else 4 if low_noise else 3
+
         variants = [
             (samples, tolerance, smooth),
-            (
-                _clamp_int(samples - 4, 12, 32),
-                _clamp_float(tolerance + 0.20, 0.6, 1.8),
-                _clamp_float(smooth + 0.20, 0.2, 1.2),
-            ),
+        ]
+        if high_noise:
+            variants.extend(
+                [
+                    (
+                        _clamp_int(samples - 4, 12, 32),
+                        _clamp_float(tolerance - 0.20, 0.6, 1.8),
+                        _clamp_float(smooth * 2.0, 0.2, 1.2),
+                    ),
+                    (
+                        _clamp_int(samples - 6, 12, 32),
+                        _clamp_float(tolerance - 0.30, 0.6, 1.8),
+                        _clamp_float(smooth * 1.6, 0.2, 1.2),
+                    ),
+                ]
+            )
+        else:
+            variants.append(
+                (
+                    _clamp_int(samples - 4, 12, 32),
+                    _clamp_float(tolerance + 0.20, 0.6, 1.8),
+                    _clamp_float(smooth + 0.20, 0.2, 1.2),
+                )
+            )
+        variants.append(
             (
                 _clamp_int(samples + 4, 12, 32),
                 _clamp_float(tolerance - 0.10, 0.6, 1.8),
                 _clamp_float(smooth - 0.10, 0.2, 1.2),
-            ),
-        ]
+            )
+        )
+        if complex_field:
+            variants.append(
+                (
+                    _clamp_int(samples + 6, 12, 32),
+                    _clamp_float(tolerance + 0.10, 0.6, 1.8),
+                    _clamp_float(smooth + 0.35, 0.2, 1.2),
+                )
+            )
+        if low_noise:
+            variants.append(
+                (
+                    _clamp_int(samples + 8, 12, 32),
+                    _clamp_float(tolerance + 0.25, 0.6, 1.8),
+                    _clamp_float(smooth - 0.15, 0.2, 1.2),
+                )
+            )
 
         seen = set()
         commands: List[Tuple[str, ...]] = []
-        for s_count, tol, sm in variants:
+        for s_count, tol, sm in variants[:variant_budget]:
             key = (int(s_count), round(float(tol), 3), round(float(sm), 3))
             if key in seen:
                 continue
@@ -1530,6 +1670,11 @@ class StageSupportMixin:
                     f"-smooth={sm:.3f}",
                 )
             )
+        self.log.info(
+            "[Stage3] Dynamic RBF candidates: "
+            f"count={len(commands)}, bg_std={bg_std:.4f}, "
+            f"star_density={star_density:.5f}, object_area={object_area:.3f}"
+        )
         return commands
 
 
@@ -1622,10 +1767,10 @@ class StageSupportMixin:
 
     def _stage9_review_safe_source(self) -> str:
         candidates = [
-            self.stretched_name or "stage6_stretched",
-            "stage6_stretched",
-            "stage6_selected",
-            "stage6_selected_precurves",
+            self.stretched_name or "stage7_stretched",
+            "stage7_stretched",
+            "stage7_cand_a",
+            "stage7_cand_b",
         ]
         seen = set()
         for stem in candidates:
@@ -1634,7 +1779,7 @@ class StageSupportMixin:
             seen.add(stem)
             if self.process_dir and (self.process_dir / f"{stem}.fit").exists():
                 return stem
-        return self.stretched_name or "stage6_stretched"
+        return self.stretched_name or "stage7_stretched"
 
 
     def _cleanup_lightsrc_intermediates(self):

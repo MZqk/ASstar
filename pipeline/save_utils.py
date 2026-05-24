@@ -9,6 +9,31 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 
+STAGE_OUTPUT_ALIASES = {
+    "stage4_color": ("stage4_colorbalanced",),
+    "stage4_colorbalanced": ("stage4_color",),
+    "stage5_linear": ("stage5_denoised",),
+    "stage7_starless": ("stage6_starless",),
+    "stage6_starless": ("stage7_starless",),
+    "stage7_starless_repaired": ("stage6_starless_repaired",),
+    "stage6_starless_repaired": ("stage7_starless_repaired",),
+    "stage6_input": ("stage7_input",),
+    "stage7_input": ("stage6_input",),
+}
+
+STAGE_JSON_ALIASES = {
+    "stage7_quality.json": ("stage6_starless_quality.json",),
+    "stage6_starless_quality.json": ("stage7_quality.json",),
+    "pre_starless_gate_report.json": ("stage7_5_pre_starless_gate_report.json",),
+    "stage7_5_pre_starless_gate_report.json": ("pre_starless_gate_report.json",),
+}
+
+
+def _stage_output_aliases(stem: str) -> Tuple[str, ...]:
+    aliases = list(STAGE_OUTPUT_ALIASES.get(stem, ()))
+    return tuple(aliases)
+
+
 def _png_chunk(tag: bytes, payload: bytes) -> bytes:
     length = struct.pack(">I", len(payload))
     crc = zlib.crc32(tag)
@@ -57,6 +82,12 @@ def save_stage_output(cmd_with_check: Callable[..., Any], log: Any, stem: str) -
     try:
         cmd_with_check("save", stem)
         log.info(f"阶段产物已保存: {stem}.fit")
+        for alias in _stage_output_aliases(stem):
+            try:
+                cmd_with_check("save", alias)
+                log.info(f"阶段产物已保存: {alias}.fit")
+            except Exception as alias_error:
+                log.warn(f"阶段产物兼容别名保存失败 ({alias}): {alias_error}")
         return True
     except Exception as e:
         log.warn(f"阶段产物保存失败 ({stem}): {e}")
@@ -73,10 +104,16 @@ def write_stage_json(
         return
     path = process_dir / filename
     try:
+        text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
         path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            text,
             encoding="utf-8",
         )
+        for alias in STAGE_JSON_ALIASES.get(filename, ()):
+            (process_dir / alias).write_text(
+                text,
+                encoding="utf-8",
+            )
     except OSError as e:
         log.warn(f"写入阶段 JSON 失败 ({filename}): {e}")
 
@@ -129,47 +166,69 @@ def export_final_outputs(
     base_filename: str,
     fallback_base: str,
     fallback_fit_base: str,
+    output_format: str = "all",
     status: str,
     messages: List[str],
 ) -> Tuple[str, List[str]]:
-    log.info("导出高质量 TIFF...")
-    try:
-        cmd_with_check("savetif", base_filename, "-astro")
-        log.info("TIFF 已导出")
-    except Exception as e:
-        log.warn(f"TIFF 导出失败: {e}")
-        try:
-            cmd_with_check("savetif", fallback_base, "-astro")
-            log.info(f"TIFF 已导出: {fallback_base}.tif")
-        except Exception:
-            log.error("TIFF 导出完全失败")
-            status = "degraded"
-            messages.append("TIFF 导出完全失败")
+    requested = {
+        item.strip().lower()
+        for item in str(output_format or "all").split(",")
+        if item.strip()
+    }
+    if not requested or "all" in requested:
+        requested = {"tif", "png", "fit"}
+    if "tiff" in requested:
+        requested.add("tif")
+    if "fits" in requested:
+        requested.add("fit")
 
-    log.info("导出 PNG 预览...")
-    try:
-        cmd_with_check("savepng", base_filename)
-        log.info("PNG 已导出")
-    except Exception as e:
-        log.warn(f"PNG 导出失败: {e}")
+    if "tif" in requested:
+        log.info("导出高质量 TIFF...")
         try:
-            cmd_with_check("savepng", fallback_base)
-            log.info(f"PNG 已导出: {fallback_base}.png")
-        except Exception:
-            log.error("PNG 导出完全失败")
-            messages.append("PNG 导出完全失败")
+            cmd_with_check("savetif", base_filename, "-astro")
+            log.info("TIFF 已导出")
+        except Exception as e:
+            log.warn(f"TIFF 导出失败: {e}")
+            try:
+                cmd_with_check("savetif", fallback_base, "-astro")
+                log.info(f"TIFF 已导出: {fallback_base}.tif")
+            except Exception:
+                log.error("TIFF 导出完全失败")
+                status = "degraded"
+                messages.append("TIFF 导出完全失败")
 
-    log.info("保存 FITS 存档...")
-    try:
-        cmd_with_check("save", base_filename + "_final")
-        log.info("FITS 存档已保存")
-    except Exception:
+    if "fit" in requested:
+        log.info("保存 FITS 存档...")
         try:
-            cmd_with_check("save", fallback_fit_base)
-            log.info(f"FITS 存档已保存: {fallback_fit_base}.fit")
+            cmd_with_check("save", base_filename + "_final")
+            log.info("FITS 存档已保存")
         except Exception:
-            log.error("FITS 存档保存失败")
-            status = "degraded"
-            messages.append("FITS 存档保存失败")
+            try:
+                cmd_with_check("save", fallback_fit_base)
+                log.info(f"FITS 存档已保存: {fallback_fit_base}.fit")
+            except Exception:
+                log.error("FITS 存档保存失败")
+                status = "degraded"
+                messages.append("FITS 存档保存失败")
+
+    if "png" in requested:
+        log.info("导出 PNG 预览...")
+        try:
+            cmd_with_check("autostretch")
+            messages.append("PNG preview stretch applied")
+        except Exception as e:
+            log.warn(f"PNG 预览拉伸跳过: {e}")
+            messages.append(f"PNG preview stretch failed: {e}")
+        try:
+            cmd_with_check("savepng", base_filename)
+            log.info("PNG 已导出")
+        except Exception as e:
+            log.warn(f"PNG 导出失败: {e}")
+            try:
+                cmd_with_check("savepng", fallback_base)
+                log.info(f"PNG 已导出: {fallback_base}.png")
+            except Exception:
+                log.error("PNG 导出完全失败")
+                messages.append("PNG 导出完全失败")
 
     return status, messages

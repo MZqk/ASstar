@@ -36,10 +36,15 @@ DEFAULT_POLICY: Dict[str, Any] = {
         "avoid_global_sharpen": True,
     },
     "stage6_stretch": {
-        "candidate_mode": ["asinh_core_protect", "asinh_mild_ghs", "autostretch_reference"],
+        "candidate_mode": [
+            "asinh_core_protect",
+            "low_contrast_masked_lift",
+            "asinh_mild_ghs",
+            "autostretch_reference",
+        ],
         "forbidden_when_dirty": ["autostretch"],
         "allow_autostretch_as_reference_only": True,
-        "fallback_candidate": "asinh_core_protect",
+        "fallback_candidate": "low_contrast_masked_lift",
         "scoring": {
             "core_blowout_weight": 0.30,
             "bg_noise_weight": 0.35,
@@ -124,6 +129,112 @@ BUILTIN_POLICY_OVERLAYS: Dict[str, Dict[str, Any]] = {
         },
     }
 }
+
+BUILTIN_POLICY_OVERLAYS.update(
+    {
+        "large_galaxy_core_protect": {
+            "policy_name": "large_galaxy_core_protect",
+            "applies_to": {"target_types": ["large_galaxy", "small_galaxy"]},
+            "stage3_background": {
+                "model_priority": ["rbf_smooth", "polynomial_low_order"],
+                "protect_nebulosity": True,
+                "protect_outer_halo": True,
+                "max_bg_std_growth": 1.06,
+                "fallback_to_safe_model": True,
+            },
+            "stage4_color": {
+                "prefer_spcc": True,
+                "reduce_saturation_if_solution_imprecise": True,
+                "blue_gain_limit": 0.92,
+                "red_gain_limit": 1.08,
+                "max_allowed_saturation_boost": 0.12,
+            },
+            "stage5_linear": {
+                "denoise_mode": "luma_chroma_balanced",
+                "sharpen_mode": "mid_frequency_masked",
+                "protect_background": True,
+                "protect_star_halo": True,
+                "avoid_global_sharpen": True,
+            },
+            "stage6_stretch": {
+                "candidate_mode": [
+                    "masked_galaxy_stretch",
+                    "low_contrast_masked_lift",
+                    "asinh_mild_ghs",
+                    "mild_histogram",
+                    "autostretch_reference",
+                ],
+                "forbidden_when_dirty": ["autostretch"],
+                "allow_autostretch_as_reference_only": True,
+                "fallback_candidate": "low_contrast_masked_lift",
+                "scoring": {
+                    "core_blowout_weight": 0.30,
+                    "bg_noise_weight": 0.25,
+                    "nebulosity_weight": 0.30,
+                    "star_bloat_weight": 0.10,
+                    "color_shift_weight": 0.05,
+                },
+            },
+            "stage6_5_pre_starless_gate": {
+                "max_bg_dirty_score": 0.40,
+                "max_core_clip_ratio": 0.012,
+                "max_star_halo_risk": 0.70,
+                "default_starless_input": "stage7_conservative_asinh",
+            },
+        },
+        "dark_nebula_low_contrast": {
+            "policy_name": "dark_nebula_low_contrast",
+            "applies_to": {"target_types": ["dark_nebula_low_contrast"]},
+            "stage3_background": {
+                "model_priority": ["polynomial_low_order", "rbf_smooth"],
+                "protect_dark_structure": True,
+                "protect_nebulosity": True,
+                "max_bg_std_growth": 1.02,
+                "fallback_to_safe_model": True,
+            },
+            "stage4_color": {
+                "prefer_spcc": True,
+                "reduce_saturation_if_solution_imprecise": True,
+                "blue_gain_limit": 0.90,
+                "red_gain_limit": 1.08,
+                "max_allowed_saturation_boost": 0.08,
+            },
+            "stage5_linear": {
+                "denoise_mode": "chroma_first",
+                "sharpen_mode": "minimal",
+                "protect_background": True,
+                "protect_star_halo": True,
+                "avoid_global_sharpen": True,
+            },
+            "stage6_stretch": {
+                "candidate_mode": [
+                    "dark_nebula_masked_lift",
+                    "asinh_core_protect",
+                    "masked_curve_dark_boost",
+                    "asinh_mild_ghs",
+                    "autostretch_reference",
+                ],
+                "forbidden_when_dirty": ["autostretch"],
+                "allow_autostretch_as_reference_only": True,
+                "fallback_candidate": "dark_nebula_masked_lift",
+                "scoring": {
+                    "core_blowout_weight": 0.15,
+                    "bg_noise_weight": 0.45,
+                    "nebulosity_weight": 0.25,
+                    "star_bloat_weight": 0.10,
+                    "color_shift_weight": 0.05,
+                },
+            },
+            "stage6_5_pre_starless_gate": {
+                "max_bg_dirty_score": 0.28,
+                "max_core_clip_ratio": 0.008,
+                "max_star_halo_risk": 0.55,
+                "require_conservative_starless_input": True,
+                "default_starless_input": "stage7_ultra_conservative_asinh",
+            },
+        },
+    }
+)
 
 
 def _load_json_or_yaml(path: Path) -> Dict[str, Any]:

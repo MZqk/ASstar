@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -231,6 +231,111 @@ def measure_image_features(image: np.ndarray) -> ImageFeatures:
         if not np.isfinite(value):
             setattr(feat, key, getattr(defaults, key))
     return feat
+
+
+def measure_stage3_signal_preservation(
+    before_image: np.ndarray,
+    after_image: np.ndarray,
+) -> Dict[str, Any]:
+    """Measure star and diffuse signal preservation after background extraction."""
+    result: Dict[str, Any] = {
+        "available": False,
+        "star_retention_ratio": None,
+        "before_star_count": 0,
+        "after_star_count": 0,
+        "nebula_mean_change_ratio": None,
+        "before_nebula_mean": None,
+        "after_nebula_mean": None,
+        "nebula_pixel_count": 0,
+        "notes": [],
+    }
+    try:
+        before_rgb = _to_rgb_float_image(before_image)
+        after_rgb = _to_rgb_float_image(after_image)
+        if before_rgb.shape != after_rgb.shape:
+            result["notes"].append(
+                f"shape mismatch: before={before_rgb.shape}, after={after_rgb.shape}"
+            )
+            return result
+
+        before_gray = (
+            0.2126 * before_rgb[0] + 0.7152 * before_rgb[1] + 0.0722 * before_rgb[2]
+        ).astype(np.float32)
+        after_gray = (
+            0.2126 * after_rgb[0] + 0.7152 * after_rgb[1] + 0.0722 * after_rgb[2]
+        ).astype(np.float32)
+        image_area = max(1, int(before_gray.size))
+
+        bg_threshold = float(np.quantile(before_gray, 0.22))
+        bg_mask = before_gray <= bg_threshold
+        if int(np.count_nonzero(bg_mask)) < 64:
+            bg_mask = before_gray <= float(np.quantile(before_gray, 0.30))
+        bg_values = before_gray[bg_mask] if np.any(bg_mask) else before_gray.reshape(-1)
+        bg_median = float(np.median(bg_values))
+        bg_std = float(np.std(bg_values))
+
+        star_threshold = max(
+            float(np.quantile(before_gray, 0.985)),
+            bg_median + max(4.0 * bg_std, 0.05),
+        )
+        max_star_area = max(4, int(image_area * 0.0008))
+        before_star_mask = before_gray > star_threshold
+        after_star_mask = after_gray > star_threshold
+        before_star_areas = _component_areas(
+            before_star_mask,
+            min_area=1,
+            max_area=max_star_area,
+            max_components=18000,
+        )
+        after_star_areas = _component_areas(
+            after_star_mask,
+            min_area=1,
+            max_area=max_star_area,
+            max_components=18000,
+        )
+        before_star_count = len(before_star_areas)
+        after_star_count = len(after_star_areas)
+        result["before_star_count"] = before_star_count
+        result["after_star_count"] = after_star_count
+        if before_star_count >= 8:
+            result["star_retention_ratio"] = after_star_count / float(before_star_count)
+        else:
+            result["notes"].append("star retention skipped: too few stars")
+
+        object_threshold = max(
+            float(np.quantile(before_gray, 0.70)),
+            bg_median + max(1.8 * bg_std, 0.02),
+        )
+        object_mask = before_gray > object_threshold
+        object_areas = _component_areas(object_mask, min_area=1, max_components=6000)
+        diffuse_area_limit = max(24, int(image_area * 0.0015))
+        diffuse_mask = np.zeros_like(object_mask, dtype=bool)
+        if object_areas:
+            # Rebuild an approximate diffuse mask by excluding compact star-like highlights.
+            diffuse_mask = object_mask & ~before_star_mask
+            if int(np.count_nonzero(diffuse_mask)) < diffuse_area_limit:
+                diffuse_mask = np.zeros_like(object_mask, dtype=bool)
+        nebula_count = int(np.count_nonzero(diffuse_mask))
+        result["nebula_pixel_count"] = nebula_count
+        if nebula_count >= diffuse_area_limit:
+            before_mean = float(np.mean(before_gray[diffuse_mask]))
+            after_mean = float(np.mean(after_gray[diffuse_mask]))
+            result["before_nebula_mean"] = before_mean
+            result["after_nebula_mean"] = after_mean
+            result["nebula_mean_change_ratio"] = abs(after_mean - before_mean) / max(
+                before_mean,
+                1e-6,
+            )
+        else:
+            result["notes"].append("nebula retention skipped: diffuse mask too small")
+
+        result["available"] = (
+            result["star_retention_ratio"] is not None
+            or result["nebula_mean_change_ratio"] is not None
+        )
+    except Exception as exc:
+        result["notes"].append(f"preservation metrics failed: {exc}")
+    return result
 
 
 def _box_blur_gray(gray: np.ndarray) -> np.ndarray:

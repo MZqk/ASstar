@@ -8,11 +8,55 @@ def _clamp_float(value: float, lower: float, upper: float) -> float:
     return float(max(lower, min(upper, float(value))))
 
 
+def _prepare_stage9_starmask_for_pixel_remix(
+    pipeline,
+    starmask_name: str,
+    *,
+    star_stretch_used: bool,
+    messages: List[str],
+) -> str:
+    if not bool(getattr(pipeline.cfg, "stage9_starmask_stretch_enabled", True)):
+        messages.append("Stage9 starmask stretch disabled; using original starmask")
+        return starmask_name
+
+    stretched_name = "starmask_stretched"
+    try:
+        pipeline.cmd_with_check("load", starmask_name)
+        if not star_stretch_used:
+            stretch = _clamp_float(
+                getattr(pipeline.cfg, "stage9_starmask_asinh_stretch", 2.0),
+                1.10,
+                3.00,
+            )
+            offset = _clamp_float(
+                getattr(pipeline.cfg, "stage9_starmask_asinh_offset", 0.001),
+                0.0005,
+                0.0060,
+            )
+            pipeline.cmd_with_check("asinh", f"{stretch:.3f}", f"{offset:.5f}")
+            messages.append(
+                "Stage9 starmask stretched before pixel remix "
+                f"(method=asinh, stretch={stretch:.3f}, offset={offset:.5f})"
+            )
+        else:
+            messages.append("Stage9 starmask uses plugin-stretched star layer for pixel remix")
+        pipeline.cmd_with_check("save", stretched_name)
+        if pipeline.process_dir:
+            pipeline._stage9_stretched_starmask_file = (
+                pipeline.process_dir / f"{stretched_name}.fit"
+            )
+        return stretched_name
+    except (CommandError, SirilError) as e:
+        pipeline.log.warn(f"Stage9 starmask stretch failed, using original starmask: {e}")
+        messages.append(f"Stage9 starmask stretch failed; using original starmask: {e}")
+        return starmask_name
+
+
 def run_stage9_star_remixing(pipeline) -> None:
     """
     阶段 9: 星点处理与合成
     - 对齐工作流中的 Star Stretch / SCNR / Curves / StarComposer
-    - 插件不可用时使用阶段 8 的 starless_enhanced 作为主图，再回混 starmask
+    - 插件不可用时使用阶段 8 的 starless_enhanced 作为主图，再回混非线性 starmask
     """
     pipeline.log.stage_start("阶段 9: 星点处理与合成")
     messages: List[str] = []
@@ -70,10 +114,11 @@ def run_stage9_star_remixing(pipeline) -> None:
         except (OSError, CommandError, SirilError) as e:
             pipeline.log.warn(f"导入外部 Starmask 失败，继续使用本地 starmask: {e}")
 
+    star_stretch_used = False
     if pipeline.starmask_file and pipeline.starmask_file.exists():
         try:
             pipeline.cmd_with_check("load", pipeline.starmask_file.stem)
-            pipeline._run_first_available_command(
+            star_stretch_label = pipeline._run_first_available_command(
                 "星点拉伸",
                 [
                     ("SASP Star Stretch", ("sasp_star_stretch",)),
@@ -95,9 +140,11 @@ def run_stage9_star_remixing(pipeline) -> None:
                 ],
             )
             pipeline.cmd_with_check("save", "starmask")
+            star_stretch_used = bool(star_stretch_label)
             pipeline.starmask_file = pipeline.process_dir / "starmask.fit"
             pipeline._export_sasp_exchange_files()
         except (CommandError, SirilError) as e:
+            star_stretch_used = False
             pipeline.log.warn(f"星点处理插件链失败，使用原始 starmask: {e}")
 
     # 按工作流先在 Siril 侧做 Starless 二次细化，再进行星点合成
@@ -139,6 +186,8 @@ def run_stage9_star_remixing(pipeline) -> None:
     )
     if fallback_used:
         messages.append("Stage8 fallback source active; bypass StarComposer for controlled remix")
+        remix_scale = min(remix_scale, 0.95 / max(float(pipeline.cfg.star_intensity), 1e-6))
+        messages.append("Stage8 fallback star remix intensity capped at 0.950")
         composer_used = None
     elif remix_scale < 0.999:
         messages.append(
@@ -159,9 +208,9 @@ def run_stage9_star_remixing(pipeline) -> None:
         diff_note = pipeline._stage_diff_note("stage9_remixed", "stage8_enhanced")
         if diff_note:
             messages.append(diff_note)
-        stage6_diff_note = pipeline._stage_diff_note("stage9_remixed", "stage6_stretched")
-        if stage6_diff_note:
-            messages.append(stage6_diff_note)
+        stage7_diff_note = pipeline._stage_diff_note("stage9_remixed", "stage7_stretched")
+        if stage7_diff_note:
+            messages.append(stage7_diff_note)
         elapsed = pipeline.log.stage_end("阶段 9: 星点处理与合成")
         if stage_saved:
             pipeline._record_stage(
@@ -202,20 +251,26 @@ def run_stage9_star_remixing(pipeline) -> None:
             f"fallback={fallback_intensity:.3f}, reason={reason})"
         )
     starmask_name = pipeline.starmask_file.stem
-    if pipeline._apply_previous_stage_star_remix(source_stem, starmask_name, intensity):
+    remix_starmask_name = _prepare_stage9_starmask_for_pixel_remix(
+        pipeline,
+        starmask_name,
+        star_stretch_used=star_stretch_used,
+        messages=messages,
+    )
+    if pipeline._apply_previous_stage_star_remix(source_stem, remix_starmask_name, intensity):
         messages.append(
             "previous_stage_star_remix "
-            f"source={source_stem}, starmask={starmask_name}, "
+            f"source={source_stem}, starmask={remix_starmask_name}, "
             f"intensity={intensity:.3f}"
         )
     else:
         pipeline.log.warn("主混合失败，尝试替代强度...")
         if pipeline._apply_previous_stage_star_remix(
-            source_stem, starmask_name, fallback_intensity
+            source_stem, remix_starmask_name, fallback_intensity
         ):
             messages.append(
                 "previous_stage_star_remix fallback "
-                f"source={source_stem}, starmask={starmask_name}, "
+                f"source={source_stem}, starmask={remix_starmask_name}, "
                 f"intensity={fallback_intensity:.3f}"
             )
             pipeline.log.info(
@@ -232,9 +287,9 @@ def run_stage9_star_remixing(pipeline) -> None:
     diff_note = pipeline._stage_diff_note("stage9_remixed", "stage8_enhanced")
     if diff_note:
         messages.append(diff_note)
-    stage6_diff_note = pipeline._stage_diff_note("stage9_remixed", "stage6_stretched")
-    if stage6_diff_note:
-        messages.append(stage6_diff_note)
+    stage7_diff_note = pipeline._stage_diff_note("stage9_remixed", "stage7_stretched")
+    if stage7_diff_note:
+        messages.append(stage7_diff_note)
 
     elapsed = pipeline.log.stage_end("阶段 9: 星点处理与合成")
     if stage_saved:
@@ -252,4 +307,3 @@ def run_stage9_star_remixing(pipeline) -> None:
             elapsed,
             "；".join(messages),
         )
-

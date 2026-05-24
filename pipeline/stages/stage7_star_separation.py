@@ -1,27 +1,175 @@
-"""Stage 7 star separation and star-mask preparation."""
+"""Star separation and star-mask preparation."""
 from typing import Any, Dict, List, Optional, Tuple
 
 from sirilpy.exceptions import CommandError, SirilError
 
 
+def _select_stage7_source(pipeline) -> str:
+    source_stem = pipeline.stretched_name or "stage7_stretched"
+    if pipeline.process_dir and (pipeline.process_dir / f"{source_stem}.fit").exists():
+        return source_stem
+    for fallback in (
+        "stage5_linear",
+        "stage5_denoised",
+        "stage5_deconv",
+        "stage4_color",
+        "stage4_colorbalanced",
+        "stage3_bgremoved",
+        "stage1_prepared",
+        "working",
+    ):
+        if pipeline.process_dir and (pipeline.process_dir / f"{fallback}.fit").exists():
+            pipeline.log.info(
+                "[Stage6] Stretch output not available; using linear starless-first input: "
+                f"{fallback}"
+            )
+            pipeline.stretched_name = fallback
+            pipeline._stage7_starless_first_source = fallback
+            return fallback
+    pipeline.stretched_name = source_stem
+    return source_stem
+
+
+def _stage7_linear_source(pipeline) -> str:
+    for stem in (
+        "stage5_linear",
+        "stage5_denoised",
+        "stage5_deconv",
+        "stage4_color",
+        "stage4_colorbalanced",
+        "stage3_bgremoved",
+        "stage2_corrected",
+        "stage1_prepared",
+        "working",
+    ):
+        if pipeline.process_dir and (pipeline.process_dir / f"{stem}.fit").exists():
+            return stem
+    return _select_stage7_source(pipeline)
+
+
+def _prepare_star_separation_source(pipeline) -> Tuple[str, str, List[Dict[str, Any]]]:
+    mode = str(
+        getattr(pipeline.cfg, "star_separation_mode", "linear_star_separation")
+    ).strip().lower()
+    if mode not in {"linear_star_separation", "mild_prestretch_star_separation"}:
+        pipeline.log.warn(
+            "Invalid star_separation_mode="
+            f"{mode!r}; falling back to linear_star_separation"
+        )
+        mode = "linear_star_separation"
+
+    linear_source = _stage7_linear_source(pipeline)
+    records: List[Dict[str, Any]] = [
+        {
+            "mode": "linear_star_separation",
+            "source_stem": linear_source,
+            "status": "selected" if mode == "linear_star_separation" else "available",
+            "method": "linear",
+        }
+    ]
+    pipeline.cmd_with_check("load", linear_source)
+    pipeline._save_stage_output("stage6_input")
+
+    if mode == "linear_star_separation":
+        pipeline.stretched_name = linear_source
+        return linear_source, mode, records
+
+    mild_stem = "stage6_mild_prestretch_star_input"
+    stretch = max(
+        1.05,
+        min(1.80, float(getattr(pipeline.cfg, "mild_prestretch_strength", 1.35))),
+    )
+    offset = float(getattr(pipeline.cfg, "stage7_conservative_asinh_offset", 0.0025))
+    try:
+        pipeline.cmd_with_check("load", linear_source)
+        pipeline.cmd_with_check("asinh", str(stretch), str(offset))
+        saved = pipeline._save_stage_output(mild_stem)
+        records.append(
+            {
+                "mode": "mild_prestretch_star_separation",
+                "source_stem": mild_stem,
+                "linear_source_stem": linear_source,
+                "status": "selected" if saved else "failed",
+                "method": "asinh",
+                "asinh_stretch": stretch,
+                "asinh_offset": offset,
+            }
+        )
+        if saved:
+            pipeline.stretched_name = mild_stem
+            return mild_stem, mode, records
+    except (CommandError, SirilError) as e:
+        records.append(
+            {
+                "mode": "mild_prestretch_star_separation",
+                "source_stem": mild_stem,
+                "linear_source_stem": linear_source,
+                "status": "failed",
+                "method": "asinh",
+                "asinh_stretch": stretch,
+                "asinh_offset": offset,
+                "reason": pipeline._short_text(e, 180),
+            }
+        )
+        pipeline.log.warn(f"轻微预拉伸去星输入生成失败，回退线性输入: {e}")
+
+    pipeline.stretched_name = linear_source
+    return linear_source, "linear_star_separation", records
+
+
+def _switch_to_mild_prestretch_after_failure(
+    pipeline,
+    *,
+    current_source: str,
+    stage_messages: List[str],
+    conservative_input_records: List[Dict[str, Any]],
+) -> Optional[str]:
+    if current_source == "stage6_mild_prestretch_star_input":
+        return None
+    if not bool(getattr(pipeline.cfg, "star_separation_fallback_to_mild_prestretch", True)):
+        return None
+    previous_mode = getattr(pipeline.cfg, "star_separation_mode", "linear_star_separation")
+    try:
+        pipeline.cfg.star_separation_mode = "mild_prestretch_star_separation"
+        source_stem, mode, records = _prepare_star_separation_source(pipeline)
+        conservative_input_records.extend(records)
+        if source_stem == current_source:
+            return None
+        stage_messages.append(
+            "linear star separation failed; retrying with mild prestretch input "
+            f"(source={source_stem}, strength={pipeline.cfg.mild_prestretch_strength:.2f})"
+        )
+        pipeline.log.warn(
+            "线性去星失败，改用轻微预拉伸输入重试: "
+            f"{source_stem}"
+        )
+        return source_stem if mode == "mild_prestretch_star_separation" else None
+    finally:
+        pipeline.cfg.star_separation_mode = previous_mode
+
+
 def run_stage7_star_separation(pipeline) -> None:
     """
-    阶段 7: 星点分离
+    阶段 6: 去星与星点层准备
     - 优先 SyQon-Starless.py / SASP Dark Star
     - 生成并导出 starless/starmask 交换文件供外部工具使用
     """
-    pipeline.log.stage_start("阶段 7: 去星与星点层准备")
+    stage_label = "阶段 6: 去星与星点层准备"
+    pipeline.log.stage_start(stage_label)
     pipeline._stage7_starless_skipped = False
     pipeline._stage8_conservative_mode = False
+    selected_source_stem, star_separation_mode, mode_input_records = (
+        _prepare_star_separation_source(pipeline)
+    )
     gate_report = getattr(pipeline, "pre_starless_gate_report", {}) or {}
     recommended = str(gate_report.get("recommended_starless_input") or "").strip()
     if recommended.endswith(".fit"):
         recommended = recommended[:-4]
     if recommended and pipeline.process_dir and (pipeline.process_dir / f"{recommended}.fit").exists():
-        previous_stretched = pipeline.stretched_name or "stage6_stretched"
+        previous_stretched = pipeline.stretched_name or "stage7_stretched"
         if recommended != previous_stretched:
             pipeline.log.info(
-                "[Stage7] Using pre-starless recommended input: "
+                "[Stage6] Using pre-starless recommended input: "
                 f"{recommended} (previous={previous_stretched})"
             )
             pipeline.stretched_name = recommended
@@ -31,7 +179,7 @@ def run_stage7_star_separation(pipeline) -> None:
         and not bool(gate_report.get("ready_for_starless", True))
         and bool(getattr(pipeline.cfg, "stage7_skip_unready_starless", True))
     ):
-        source_stem = pipeline.stretched_name or "stage6_stretched"
+        source_stem = pipeline.stretched_name or "stage7_stretched"
         reasons = [str(item) for item in gate_report.get("reason", []) if item]
         message_parts = [
             "Stage6.5 ready_for_starless=false; skipped SyQon/SASP starless",
@@ -63,7 +211,9 @@ def run_stage7_star_separation(pipeline) -> None:
                     "attempts": [quality_record],
                     "selected": quality_record,
                     "mode": "skipped_by_pre_starless_gate",
+                    "star_separation_mode": star_separation_mode,
                     "selected_source_stem": source_stem,
+                    "conservative_inputs": mode_input_records,
                     "pre_starless_gate": gate_report,
                     "stage9_star_remix": stage9_record,
                     "retry_max": 0,
@@ -73,16 +223,16 @@ def run_stage7_star_separation(pipeline) -> None:
             stage_saved = pipeline._save_stage_output("stage7_starless")
             if not stage_saved:
                 message_parts.append("stage7 输出保存失败")
-            elapsed = pipeline.log.stage_end("阶段 7: 去星与星点层准备")
+            elapsed = pipeline.log.stage_end(stage_label)
             pipeline._record_stage(
-                "阶段 7: 去星与星点层准备",
+                stage_label,
                 "skipped" if stage_saved else "degraded",
                 elapsed,
                 "；".join(message_parts),
             )
             return
         except (CommandError, SirilError) as e:
-            pipeline.log.warn(f"Stage7 gate skip fallback failed, continuing with starless tools: {e}")
+            pipeline.log.warn(f"Stage6 gate skip fallback failed, continuing with starless tools: {e}")
 
     pipeline.log.info("执行去星流程...")
     try:
@@ -98,11 +248,22 @@ def run_stage7_star_separation(pipeline) -> None:
         starmask_cleanup_records: List[Dict[str, Any]] = []
         repair_records: List[Dict[str, Any]] = []
         starless_pixel_repair_records: List[Dict[str, Any]] = []
-        conservative_input_records: List[Dict[str, Any]] = []
-        selected_source_stem = pipeline.stretched_name or "stage6_stretched"
+        conservative_input_records: List[Dict[str, Any]] = list(mode_input_records)
+        selected_source_stem = pipeline.stretched_name or selected_source_stem
+        stage_messages.append(
+            "star_separation_mode="
+            f"{star_separation_mode}; source={selected_source_stem}"
+        )
 
-        stage7_preflight = pipeline._stage7_preflight_check()
-        preflight_summary = pipeline._stage7_preflight_summary(stage7_preflight)
+        if hasattr(pipeline, "_stage7_preflight_check"):
+            stage7_preflight = pipeline._stage7_preflight_check()
+        else:
+            stage7_preflight = {"risk_level": "ok", "issues": []}
+        preflight_summary = (
+            pipeline._stage7_preflight_summary(stage7_preflight)
+            if hasattr(pipeline, "_stage7_preflight_summary")
+            else ""
+        )
         if stage7_preflight.get("risk_level") != "ok":
             stage_messages.append(preflight_summary)
 
@@ -154,6 +315,28 @@ def run_stage7_star_separation(pipeline) -> None:
                     getattr(pipeline, "_last_plugin_script_error", None)
                     or f"SyQon 脚本执行失败: {syqon_script.name}"
                 )
+                retry_source = _switch_to_mild_prestretch_after_failure(
+                    pipeline,
+                    current_source=selected_source_stem,
+                    stage_messages=stage_messages,
+                    conservative_input_records=conservative_input_records,
+                )
+                if retry_source:
+                    selected_source_stem = retry_source
+                    syqon_used = pipeline._stage7_try_syqon_variant(
+                        syqon_script,
+                        attempt_name="mild_prestretch_fallback",
+                        tile_size=plan_tile_size,
+                        overlap=plan_overlap,
+                        axiom=plan_axiom,
+                    )
+                    if syqon_used:
+                        syqon_failure_reason = None
+                        starless_used = syqon_used
+                        star_separation_mode = "mild_prestretch_star_separation"
+                        stage_messages.append(
+                            "mild prestretch star separation fallback succeeded"
+                        )
         else:
             syqon_failure_reason = "SyQon-Starless.py 缺失，回退到 SASP Dark Star"
 
@@ -374,7 +557,7 @@ def run_stage7_star_separation(pipeline) -> None:
                         attempt_name,
                         tool_label=used,
                         use_ai=True,
-                        source_stem=pipeline.stretched_name or "stage6_stretched",
+                        source_stem=pipeline.stretched_name or "stage7_stretched",
                     )
                     quality_records.append(retry_quality)
                     retry_snapshot = pipeline._stage7_snapshot_current_outputs(
@@ -384,7 +567,7 @@ def run_stage7_star_separation(pipeline) -> None:
                         best_quality = retry_quality
                         best_snapshot = retry_snapshot
                         best_label = attempt_name
-                        best_source_stem = pipeline.stretched_name or "stage6_stretched"
+                        best_source_stem = pipeline.stretched_name or "stage7_stretched"
 
                 if best_snapshot is not None:
                     pipeline._stage7_restore_snapshot(best_snapshot)
@@ -522,6 +705,7 @@ def run_stage7_star_separation(pipeline) -> None:
                 "attempts": quality_records,
                 "selected": selected_quality,
                 "mode": quality_mode,
+                "star_separation_mode": star_separation_mode,
                 "selected_source_stem": selected_source_stem,
                 "preflight": stage7_preflight,
                 "starmask_cleanup": starmask_cleanup_records,
@@ -548,18 +732,18 @@ def run_stage7_star_separation(pipeline) -> None:
         stage_saved = pipeline._save_stage_output("stage7_starless")
         stage_message_text = "；".join(stage_messages)
 
-        elapsed = pipeline.log.stage_end("阶段 7: 去星与星点层准备")
+        elapsed = pipeline.log.stage_end(stage_label)
         if stage_saved:
             selected_status = str((selected_quality or {}).get("status", "ok")).lower()
             stage_status = "ok" if selected_status == "ok" else "degraded"
-            pipeline._record_stage("阶段 7: 去星与星点层准备", stage_status, elapsed, stage_message_text)
+            pipeline._record_stage(stage_label, stage_status, elapsed, stage_message_text)
         else:
             if stage_message_text:
                 stage_message_text = f"{stage_message_text}；stage7 输出保存失败"
             else:
                 stage_message_text = "stage7 输出保存失败"
             pipeline._record_stage(
-                "阶段 7: 去星与星点层准备", 'degraded', elapsed, stage_message_text
+                stage_label, 'degraded', elapsed, stage_message_text
             )
 
     except (CommandError, SirilError) as e:
@@ -578,14 +762,14 @@ def run_stage7_star_separation(pipeline) -> None:
                 {
                     "attempts": [
                         {
-                            "attempt": "degraded_stage6_stretched",
+                            "attempt": "degraded_stage7_stretched",
                             "tool_label": "none",
                             "status": "degraded",
                             "issues": [pipeline._short_text(e, 180)],
                         }
                     ],
                     "selected": {
-                        "attempt": "degraded_stage6_stretched",
+                        "attempt": "degraded_stage7_stretched",
                         "status": "degraded",
                     },
                     "mode": "degraded_fallback",
@@ -601,10 +785,9 @@ def run_stage7_star_separation(pipeline) -> None:
         pipeline.cmd_with_check("load", "starless")
         stage_saved = pipeline._save_stage_output("stage7_starless")
 
-        elapsed = pipeline.log.stage_end("阶段 7: 去星与星点层准备")
+        elapsed = pipeline.log.stage_end(stage_label)
         message = "无可用去星工具，已退化为直接使用拉伸图继续"
         if not stage_saved:
             message += "；stage7 输出保存失败"
         pipeline._record_stage(
-            "阶段 7: 去星与星点层准备", 'degraded', elapsed, message)
-
+            stage_label, 'degraded', elapsed, message)

@@ -27,6 +27,7 @@ PIPELINE_SRC="$PROJECT_ROOT/pipeline/seestar_Superimpose.py"
 STAGE11_MODULE_SRC="$PROJECT_ROOT/pipeline/stage11_ai_postprocess.py"
 LOCAL_TEMPLATE="$PROJECT_ROOT/resources/config.1.4.ini.template"
 CONFIG_TEMPLATE_IN="$LOCAL_TEMPLATE"
+DEFAULT_ENV_SRC="$PROJECT_ROOT/resources/default.env"
 AI_ENV_SRC="$PROJECT_ROOT/resources/ai.env"
 SIRIL_PLUGIN_DIR_SRC="$PROJECT_ROOT/resources/siril_plugins"
 USER_CONFIG="$HOME/Library/Application Support/org.siril.Siril/siril/config.1.4.ini"
@@ -695,11 +696,18 @@ fi
 if [[ ! -f "$APP_RESOURCES/pipeline/stage11_ai_postprocess.py" ]]; then
   cp "$STAGE11_MODULE_SRC" "$APP_RESOURCES/pipeline/stage11_ai_postprocess.py"
 fi
+if [[ -f "$DEFAULT_ENV_SRC" ]]; then
+  cp "$DEFAULT_ENV_SRC" "$APP_RESOURCES/default.env"
+  log "[BUILD] Embedded default env file: $DEFAULT_ENV_SRC"
+fi
 if [[ -f "$AI_ENV_SRC" ]]; then
   cp "$AI_ENV_SRC" "$APP_RESOURCES/ai.env"
   log "[BUILD] Embedded AI env file: $AI_ENV_SRC"
+elif [[ -f "$DEFAULT_ENV_SRC" ]]; then
+  cp "$DEFAULT_ENV_SRC" "$APP_RESOURCES/ai.env"
+  log "[BUILD] Embedded default env as ai.env: $DEFAULT_ENV_SRC"
 else
-  log "[BUILD] AI env file not found, skip embedding: $AI_ENV_SRC"
+  log "[BUILD] Env file not found, skip embedding: $AI_ENV_SRC"
 fi
 if [[ -d "$SIRIL_PLUGIN_DIR_SRC" ]]; then
   require_glob_exists "$SIRIL_PLUGIN_DIR_SRC/downloads/setiastrosuitepro-*.whl" "[BUILD] setiastrosuitepro wheel (run resources/siril_plugins/download_siril_plugins.sh)"

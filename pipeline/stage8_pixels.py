@@ -64,6 +64,36 @@ def stage8_soften_mask(pipeline, mask: np.ndarray, passes: int = 3) -> np.ndarra
         softened = _box_blur_gray(softened)
     return np.clip(softened, 0.0, 1.0)
 
+def stage8_low_signal_thresholds(
+    *,
+    bg_median: float,
+    bg_std: float,
+    p90: float,
+    p99: float,
+) -> Dict[str, Any]:
+    signal_span = max(float(p99) - float(bg_median), float(p90) - float(bg_median), 0.0)
+    low_signal = (
+        float(bg_median) < 0.080
+        and float(p99) < 0.120
+        and signal_span < 0.015
+    )
+    if not low_signal:
+        return {
+            "low_signal": False,
+            "nebula_floor": 0.025,
+            "faint_floor": 0.008,
+            "ramp_floor": 0.020,
+            "std_floor": 0.010,
+        }
+    noise_floor = max(4.0 * float(bg_std), signal_span * 0.25, 0.00025)
+    return {
+        "low_signal": True,
+        "nebula_floor": min(0.006, max(0.00035, noise_floor * 1.2)),
+        "faint_floor": min(0.003, max(0.00015, noise_floor * 0.45)),
+        "ramp_floor": min(0.008, max(0.00050, signal_span * 0.75, noise_floor * 1.4)),
+        "std_floor": 0.0005,
+    }
+
 def stage8_generate_starless_masks(pipeline, image_data: np.ndarray) -> Dict[str, Any]:
     rgb = _to_rgb_float_fullres(image_data)
     gray = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]).astype(np.float32)
@@ -74,6 +104,18 @@ def stage8_generate_starless_masks(pipeline, image_data: np.ndarray) -> Dict[str
     bg_values = gray[bg_mask] if np.any(bg_mask) else gray.reshape(-1)
     bg_median = float(np.median(bg_values))
     bg_std = float(np.std(bg_values))
+    p90 = float(np.quantile(gray, 0.90))
+    p99 = float(np.quantile(gray, 0.99))
+    low_signal_thresholds = stage8_low_signal_thresholds(
+        bg_median=bg_median,
+        bg_std=bg_std,
+        p90=p90,
+        p99=p99,
+    )
+    nebula_floor = float(low_signal_thresholds["nebula_floor"])
+    faint_floor = float(low_signal_thresholds["faint_floor"])
+    ramp_floor = float(low_signal_thresholds["ramp_floor"])
+    std_floor = float(low_signal_thresholds["std_floor"])
 
     core_threshold = max(
         float(np.quantile(gray, 0.992)),
@@ -85,20 +127,20 @@ def stage8_generate_starless_masks(pipeline, image_data: np.ndarray) -> Dict[str
 
     nebula_threshold = max(
         float(np.quantile(gray, 0.68)),
-        bg_median + max(1.6 * bg_std, 0.025),
+        bg_median + max(1.6 * bg_std, nebula_floor),
     )
-    nebula_ramp = (gray - nebula_threshold) / max(0.35, 3.0 * max(bg_std, 0.01))
+    nebula_ramp = (gray - nebula_threshold) / max(ramp_floor, 3.0 * max(bg_std, std_floor))
     nebula_mask = pipeline._stage8_soften_mask(np.clip(nebula_ramp, 0.0, 1.0), passes=3)
     nebula_mask = np.clip(nebula_mask * (1.0 - 0.90 * core_mask), 0.0, 1.0)
 
     faint_threshold = max(
         float(np.quantile(gray, 0.40)),
-        bg_median + max(0.55 * bg_std, 0.008),
+        bg_median + max(0.55 * bg_std, faint_floor),
     )
     faint_ramp = (gray - faint_threshold) / max(
         nebula_threshold - faint_threshold,
-        2.0 * max(bg_std, 0.01),
-        0.02,
+        2.0 * max(bg_std, std_floor),
+        ramp_floor,
     )
     faint_nebula_mask = pipeline._stage8_soften_mask(np.clip(faint_ramp, 0.0, 1.0), passes=4)
     faint_nebula_mask = np.clip(

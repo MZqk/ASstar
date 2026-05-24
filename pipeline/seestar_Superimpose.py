@@ -194,7 +194,17 @@ AUTO_CLAMP_FIELDS = (
     "bg_median_drop_ratio_min",
     "bg_object_preserve_ratio_min",
     "bg_edge_black_rise_max",
+    "bg_star_preserve_ratio_min",
+    "bg_nebula_mean_change_max",
     "denoise_mod",
+    "stage5_builtin_denoise_mod",
+    "stage5_rl_maxstars",
+    "stage5_rl_psf_kernel_size",
+    "stage5_rl_iters",
+    "stage5_rl_alpha",
+    "stage5_rl_gdstep",
+    "stage5_rl_stop",
+    "stage5_graxpert_deconv_strength",
     "asinh_stretch",
     "asinh_offset",
     "ghs_shadowsclip",
@@ -239,6 +249,7 @@ AUTO_CLAMP_FIELDS = (
     "stage7_starmask_halo_blur_strength",
     "stage7_starmask_small_star_scale",
     "stage7_starmask_nebula_suppression",
+    "mild_prestretch_strength",
     "stage7_conservative_asinh_stretch",
     "stage7_ultra_conservative_asinh_stretch",
     "stage7_soft_starless_asinh_stretch",
@@ -258,7 +269,8 @@ TARGET_KEYWORDS: Dict[TargetType, Tuple[str, ...]] = {
     TargetType.EMISSION_NEBULA: (
         "m42", "orion", "rosette", "ngc2237", "ngc2244", "lagoon",
         "trifid", "north america", "north_america", "northamerica", "ngc7000",
-        "heart", "soul",
+        "heart", "soul", "ic434", "ic 434", "horsehead", "barnard33", "b33",
+        "flame", "ngc2024",
     ),
     TargetType.REFLECTION_NEBULA: (
         "m45", "pleiades", "iris",
@@ -432,9 +444,31 @@ def clamp_config(cfg: PipelineConfig) -> PipelineConfig:
     tuned.bg_edge_black_rise_max = _clamp_float(
         tuned.bg_edge_black_rise_max, 0.10, 0.60
     )
+    tuned.bg_star_preserve_ratio_min = _clamp_float(
+        tuned.bg_star_preserve_ratio_min, 0.50, 1.00
+    )
+    tuned.bg_nebula_mean_change_max = _clamp_float(
+        tuned.bg_nebula_mean_change_max, 0.02, 0.35
+    )
 
     denoise_upper = max(0.2, min(0.55, float(tuned.denoise_safety_max)))
     tuned.denoise_mod = _clamp_float(tuned.denoise_mod, 0.2, denoise_upper)
+    tuned.stage5_builtin_denoise_mod = _clamp_float(
+        tuned.stage5_builtin_denoise_mod, 0.20, 0.55
+    )
+    tuned.stage5_rl_maxstars = _clamp_int(tuned.stage5_rl_maxstars, 20, 1000)
+    tuned.stage5_rl_psf_kernel_size = _clamp_int(
+        tuned.stage5_rl_psf_kernel_size, 9, 99
+    )
+    if tuned.stage5_rl_psf_kernel_size % 2 == 0:
+        tuned.stage5_rl_psf_kernel_size += 1
+    tuned.stage5_rl_iters = _clamp_int(tuned.stage5_rl_iters, 1, 40)
+    tuned.stage5_rl_alpha = _clamp_float(tuned.stage5_rl_alpha, 100.0, 10000.0)
+    tuned.stage5_rl_gdstep = _clamp_float(tuned.stage5_rl_gdstep, 0.00001, 0.01)
+    tuned.stage5_rl_stop = _clamp_float(tuned.stage5_rl_stop, 0.0001, 0.05)
+    tuned.stage5_graxpert_deconv_strength = _clamp_float(
+        tuned.stage5_graxpert_deconv_strength, 0.20, 0.40
+    )
 
     tuned.asinh_stretch = _clamp_float(tuned.asinh_stretch, 1.6, 3.6)
     tuned.asinh_offset = _clamp_float(tuned.asinh_offset, 0.0005, 0.006)
@@ -549,6 +583,9 @@ def clamp_config(cfg: PipelineConfig) -> PipelineConfig:
     )
     tuned.stage7_starmask_nebula_suppression = _clamp_float(
         tuned.stage7_starmask_nebula_suppression, 0.0, 0.95
+    )
+    tuned.mild_prestretch_strength = _clamp_float(
+        tuned.mild_prestretch_strength, 1.05, 1.80
     )
     tuned.stage7_conservative_asinh_stretch = _clamp_float(
         tuned.stage7_conservative_asinh_stretch, 1.60, 2.60
@@ -704,6 +741,51 @@ def auto_tune_config(
         "feature_formula:final_saturation"
     )
 
+    low_signal_emission = (
+        target_type == TargetType.EMISSION_NEBULA
+        and feat.object_area_ratio < 0.02
+        and feat.diffuse_ratio < 0.08
+    )
+    if low_signal_emission:
+        notes.append(
+            "low-signal emission nebula tuning: lift nebula/final saturation and cap star remix"
+        )
+        set_param(
+            "asinh_stretch",
+            max(float(tuned.asinh_stretch), 1.85),
+            "low_signal_emission_nebula:asinh_floor",
+        )
+        set_param(
+            "asinh_offset",
+            max(float(tuned.asinh_offset), 0.0018),
+            "low_signal_emission_nebula:offset_floor",
+        )
+        set_param(
+            "nebula_saturation",
+            max(float(tuned.nebula_saturation), 0.30),
+            "low_signal_emission_nebula:nebula_saturation_floor",
+        )
+        set_param(
+            "final_saturation",
+            max(float(tuned.final_saturation), 0.12),
+            "low_signal_emission_nebula:final_saturation_floor",
+        )
+        set_param(
+            "star_intensity",
+            min(float(tuned.star_intensity), 0.95),
+            "low_signal_emission_nebula:star_intensity_cap",
+        )
+        set_param(
+            "star_fallback_intensity",
+            min(float(tuned.star_fallback_intensity), 0.90),
+            "low_signal_emission_nebula:star_fallback_intensity_cap",
+        )
+        set_param(
+            "stage8_mask_signal_coverage_min",
+            min(float(tuned.stage8_mask_signal_coverage_min), 0.001),
+            "low_signal_emission_nebula:stage8_mask_floor",
+        )
+
     before_clamp = copy.deepcopy(tuned)
     tuned = clamp_config(tuned)
     for name in AUTO_CLAMP_FIELDS:
@@ -725,7 +807,8 @@ def format_config_summary(cfg: PipelineConfig) -> str:
     return (
         "crop_margin={:.3f}, bg_samples={}, bg_tol={:.2f}, bg_smooth={:.2f}, "
         "denoise={}({:.2f}), asinh=({:.2f},{:.4f}), ghs=({:.2f},{:.2f}), "
-        "nebula_sat={:.2f}, star_intensity={:.2f}, final_sat={:.2f}, "
+        "nebula_sat={:.2f}, star_mode={}, mild_prestretch={:.2f}, "
+        "star_intensity={:.2f}, final_sat={:.2f}, "
         "ai_enabled={}, ai_strength={:.2f}"
     ).format(
         cfg.crop_margin,
@@ -739,6 +822,8 @@ def format_config_summary(cfg: PipelineConfig) -> str:
         cfg.ghs_shadowsclip,
         cfg.ghs_stretchamount,
         cfg.nebula_saturation,
+        cfg.star_separation_mode,
+        cfg.mild_prestretch_strength,
         cfg.star_intensity,
         cfg.final_saturation,
         cfg.ai_post_enabled,
@@ -790,6 +875,7 @@ class SeestarPostProcessor(
     }
 
     def __init__(self, config=None):
+        self._load_project_env_defaults()
         if config is None:
             self.cfg = PipelineConfig()
         else:
@@ -1122,12 +1208,16 @@ class SeestarPostProcessor(
     def stage2_view_correction(self):
         run_stage2_view_correction(self)
 
-    def stage2_5_target_profiler(self):
-        """Stage 2.5: target profile and policy selection."""
-        self.log.stage_start("阶段 2.5: 目标画像识别")
-        status = "ok"
+    def _run_target_profile_preflight(
+        self,
+        *,
+        source: str,
+        metadata_candidates: Optional[Tuple[Any, ...]] = None,
+        preview_name: str = "",
+    ) -> str:
+        """Run target profile detection without adding a separate pipeline stage."""
         messages: List[str] = []
-        self.log.info("[Stage2.5] Target profiler started")
+        self.log.info(f"[{source}] Target profiler preflight started")
         try:
             if build_target_profile is None or analyze_adaptive_image is None:
                 raise RuntimeError(f"adaptive modules unavailable: {ADAPTIVE_IMPORT_ERROR}")
@@ -1138,8 +1228,7 @@ class SeestarPostProcessor(
             features_obj = analyze_adaptive_image(image_data)
             context = self._target_profile_context_text()
             metadata = self._read_fits_header_metadata(
-                "stage2_corrected",
-                self.source_file,
+                *(metadata_candidates or ("stage2_corrected", self.source_file))
             )
             auto_hint = self._auto_target_hint()
             if auto_hint:
@@ -1152,36 +1241,35 @@ class SeestarPostProcessor(
             policy = profile.pop("policy", None)
             policy = self._sync_runtime_policy_from_profile(
                 profile,
-                source="Stage2.5",
+                source=source,
                 policy_candidate=policy if isinstance(policy, dict) else None,
             )
             self.log.info(
-                "[Stage2.5] Classification: "
+                f"[{source}] Classification: "
                 f"{profile.get('target_type')} confidence={float(profile.get('target_confidence', 0.0)):.2f}"
             )
             if metadata:
                 self.log.info(
-                    "[Stage2.5] FITS metadata source: "
+                    f"[{source}] FITS metadata source: "
                     f"{metadata.get('_header_source', 'unknown')}"
                 )
             for warning in profile.get("warnings", []) or []:
-                self.log.warn(f"[Stage2.5] {warning}")
+                self.log.warn(f"[{source}] {warning}")
             self.log.info(
-                f"[Stage2.5] Selected policy: {self._active_policy_name()}"
+                f"[{source}] Selected policy: {self._active_policy_name()}"
             )
             self._write_stage_json("target_profile.json", profile)
             self._write_stage_json("pipeline_policy.json", policy)
-            if write_safe_preview is not None and self.process_dir:
-                preview_path = self.process_dir / "stage2_5_target_preview.png"
+            if write_safe_preview is not None and self.process_dir and preview_name:
+                preview_path = self.process_dir / preview_name
                 if write_safe_preview(image_data, preview_path):
-                    messages.append("stage2_5_target_preview.png generated")
+                    messages.append(f"{preview_name} generated")
             messages.append(
                 f"target_type={profile.get('target_type')}; policy={self._active_policy_name()}"
             )
         except Exception as e:
-            status = "degraded"
             reason = self._short_text(e, 180)
-            self.log.warn(f"[Stage2.5] Target profiler failed, using generic policy: {reason}")
+            self.log.warn(f"[{source}] Target profiler failed, using generic policy: {reason}")
             profile = self._fallback_target_profile(reason)
             policy = profile.pop("policy", copy.deepcopy(DEFAULT_POLICY))
             self.target_profile = profile
@@ -1189,13 +1277,17 @@ class SeestarPostProcessor(
             self._write_stage_json("target_profile.json", self.target_profile)
             self._write_stage_json("pipeline_policy.json", self.pipeline_policy)
             messages.append(f"target profiler fallback: {reason}")
+        return "；".join(messages)
 
-        elapsed = self.log.stage_end("阶段 2.5: 目标画像识别")
-        self._record_stage(
-            "阶段 2.5: 目标画像识别",
-            status,
-            elapsed,
-            "；".join(messages),
+    def stage2_5_target_profiler(self):
+        """Compatibility wrapper: target profiling is now a Stage3/4 preflight."""
+        message = self._run_target_profile_preflight(
+            source="Stage2.5 compatibility preflight",
+            preview_name="stage3_target_preview.png",
+        )
+        self.log.info(
+            "阶段 2.5 已合并到 Stage3/4 preflight，不再写入独立阶段"
+            + (f"；{message}" if message else "")
         )
 
     # ========================================
@@ -1217,7 +1309,7 @@ class SeestarPostProcessor(
         return run_stage6_stretching(self)
 
     def stage6_5_pre_starless_gate(self):
-        """Stage 6.5: choose the safest input for star separation."""
+        """Compatibility gate: choose the safest input for star separation."""
         self.log.stage_start("阶段 6.5: 去星前质量门控")
         status = "ok"
         messages: List[str] = []
@@ -1225,7 +1317,7 @@ class SeestarPostProcessor(
         try:
             if evaluate_pre_starless_gate is None:
                 raise RuntimeError(f"quality gate module unavailable: {ADAPTIVE_IMPORT_ERROR}")
-            source_stem = self.stretched_name or "stage6_stretched"
+            source_stem = self.stretched_name or "stage7_stretched"
             metrics = self._adaptive_features_by_stem(source_stem)
             quality_metrics = self._measure_current_quality()
             if quality_metrics is not None:
@@ -1285,12 +1377,12 @@ class SeestarPostProcessor(
                 "stage": "stage6_5_pre_starless_gate",
                 "ready_for_starless": True,
                 "reason": [reason],
-                "recommended_starless_input": self.stretched_name or "stage6_stretched",
+                "recommended_starless_input": self.stretched_name or "stage7_stretched",
                 "fallback_created": False,
             }
             self.pre_starless_gate_report = report
             self._write_stage_json("pre_starless_gate_report.json", report)
-            self.log.warn(f"[Stage6.5] quality gate failed, using stage6_stretched: {reason}")
+            self.log.warn(f"[Stage6.5] quality gate failed, using stage7_stretched: {reason}")
             messages.append(f"quality gate fallback: {reason}")
 
         elapsed = self.log.stage_end("阶段 6.5: 去星前质量门控")
@@ -1302,7 +1394,7 @@ class SeestarPostProcessor(
         )
 
     # ========================================
-    # 阶段 7: 星点分离
+    # 阶段 6: 星点分离（starless-first，先于主体拉伸执行）
     # ========================================
     def stage7_star_separation(self):
         return run_stage7_star_separation(self)
@@ -1394,6 +1486,7 @@ class SeestarPostProcessor(
         try:
             start_time = time.time()
 
+            self._load_project_env_defaults()
             self.cfg = copy.deepcopy(self.initial_cfg)
             self._force_denoise_enabled = None
             self.input_mode = INPUT_MODE_AUTO
@@ -1426,6 +1519,8 @@ class SeestarPostProcessor(
             self._stage7_selected_quality = None
             self._stage7_residual_star_score = 0.0
             self._stage7_starless_skipped = False
+            self._stage7_before_stage6 = True
+            self._stage7_starless_first_source = ""
             self._stage9_star_intensity_scale = 1.0
             self._stage9_star_intensity_reason = ""
             self._stage9_bypassed_bad_starless = False
@@ -1445,7 +1540,11 @@ class SeestarPostProcessor(
                     "阶段 2: 裁切",
                     "skipped by linear resume mode",
                 )
-                self.stage2_5_target_profiler()
+                self._run_target_profile_preflight(
+                    source="Linear resume preflight",
+                    metadata_candidates=(LINEAR_RESUME_INPUT_NAME, self.source_file),
+                    preview_name="stage3_target_preview.png",
+                )
                 self._record_skipped_stage(
                     "阶段 3: 背景提取",
                     "skipped by linear resume mode",
@@ -1455,7 +1554,7 @@ class SeestarPostProcessor(
                     "skipped by linear resume mode",
                 )
                 self._record_skipped_stage(
-                    "阶段 5: 星点矫正 / 锐化 / 初步降噪",
+                    "阶段 5: 线性反卷积 / 轻降噪",
                     "skipped by linear resume mode",
                 )
             else:
@@ -1463,14 +1562,15 @@ class SeestarPostProcessor(
                 self.stage1_preparation()
                 self._auto_tune_for_current_input()
                 self.stage2_view_correction()
-                self.stage2_5_target_profiler()
                 self.stage3_background_extraction()
                 self.stage4_color_calibration()
                 self.stage5_linear_denoise()
-            # 非线性阶段 (6-10)
-            self.stage6_stretching()
-            self.stage6_5_pre_starless_gate()
             self.stage7_star_separation()
+            self.stage6_stretching()
+            self._record_skipped_stage(
+                "阶段 7.5: 去星前质量门控（兼容跳过）",
+                "starless-first mode: Stage6 already separated stars before Stage7 stretch",
+            )
             self.stage8_nebula_enhancement()
             self.stage9_star_remixing()
             self.stage10_export()

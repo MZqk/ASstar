@@ -260,7 +260,7 @@ def stage7_quality_assessment(
     use_ai: bool = True,
     source_stem: Optional[str] = None,
 ) -> Dict[str, Any]:
-    source_stem = source_stem or pipeline.stretched_name or "stage6_stretched"
+    source_stem = source_stem or pipeline.stretched_name or "stage7_stretched"
     source_data = pipeline._read_image_by_stem(source_stem)
     starless_data = pipeline._read_image_by_stem("starless")
     starmask_data = None

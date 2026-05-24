@@ -1,7 +1,68 @@
 """Stage 2 view correction and crop."""
 from typing import List
 
+import numpy as np
+
+from image_metrics import _to_rgb_float_fullres
 from sirilpy.exceptions import CommandError, SirilError
+
+
+def _edge_color_artifact_crop(pipeline) -> str:
+    image_data = pipeline.siril.get_image_pixeldata(preview=False)
+    shape = pipeline.siril.get_image_shape()
+    if image_data is None or not shape:
+        return ""
+    rgb = _to_rgb_float_fullres(np.asarray(image_data))
+    if rgb.ndim != 3 or rgb.shape[1] < 80 or rgb.shape[2] < 80:
+        return ""
+    _channels, height, width = rgb.shape
+    strip_w = max(8, int(width * 0.025))
+    strip_h = max(8, int(height * 0.025))
+    center = rgb[
+        :,
+        int(height * 0.22) : int(height * 0.78),
+        int(width * 0.22) : int(width * 0.78),
+    ]
+    center_cast = _edge_color_cast_score(center)
+    sides = {
+        "left": rgb[:, :, :strip_w],
+        "right": rgb[:, :, width - strip_w :],
+        "top": rgb[:, :strip_h, :],
+        "bottom": rgb[:, height - strip_h :, :],
+    }
+    bad_sides = {
+        name: _edge_color_cast_score(strip)
+        for name, strip in sides.items()
+        if _edge_color_cast_score(strip) > max(0.010, center_cast * 2.6)
+    }
+    if not bad_sides:
+        return ""
+    crop_left = strip_w if "left" in bad_sides else 0
+    crop_right = strip_w if "right" in bad_sides else 0
+    crop_top = strip_h if "top" in bad_sides else 0
+    crop_bottom = strip_h if "bottom" in bad_sides else 0
+    crop_w = width - crop_left - crop_right
+    crop_h = height - crop_top - crop_bottom
+    if crop_w <= width * 0.90 or crop_h <= height * 0.90:
+        return ""
+    pipeline.cmd_with_check("crop", str(crop_left), str(crop_top), str(crop_w), str(crop_h))
+    side_text = ",".join(sorted(bad_sides))
+    return (
+        "adaptive color-edge crop applied "
+        f"(sides={side_text}, edge_cast={max(bad_sides.values()):.4f}, "
+        f"center_cast={center_cast:.4f}, pixels={crop_left}/{crop_top}/{crop_right}/{crop_bottom})"
+    )
+
+
+def _edge_color_cast_score(rgb: np.ndarray) -> float:
+    if rgb.size == 0:
+        return 0.0
+    arr = np.asarray(rgb, dtype=np.float32)
+    gray = (0.2126 * arr[0] + 0.7152 * arr[1] + 0.0722 * arr[2]).astype(np.float32)
+    chroma = np.mean(np.abs(arr - gray[None, :, :]), axis=0)
+    blue_excess = np.maximum(arr[2] - np.maximum(arr[0], arr[1]), 0.0)
+    red_excess = np.maximum(arr[0] - np.maximum(arr[1], arr[2]), 0.0)
+    return float(np.nanmedian(chroma + 0.65 * np.maximum(blue_excess, red_excess)))
 
 
 def run_stage2_view_correction(pipeline) -> None:
@@ -108,6 +169,19 @@ def run_stage2_view_correction(pipeline) -> None:
                 messages.append(
                     f"edge_black remains above stage2 target: {final_feat.edge_black_ratio:.3f}>{target:.3f}"
                 )
+
+    if status == "ok":
+        try:
+            color_edge_note = _edge_color_artifact_crop(pipeline)
+            if color_edge_note:
+                messages.append(color_edge_note)
+        except (CommandError, SirilError) as e:
+            pipeline.log.warn(f"彩色边缘裁切失败: {e}")
+            status = "degraded"
+            messages.append(f"adaptive color-edge crop failed: {pipeline._short_text(e, 160)}")
+        except Exception as e:
+            pipeline.log.warn(f"彩色边缘检测失败: {e}")
+            messages.append(f"adaptive color-edge crop skipped: {pipeline._short_text(e, 160)}")
 
     stage_saved = pipeline._save_stage_output("stage2_corrected")
     if not stage_saved and status == "ok":

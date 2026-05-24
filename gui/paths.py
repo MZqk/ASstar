@@ -8,6 +8,7 @@ PIPELINE_RESOURCE_REL = Path("pipeline") / "seestar_Superimpose.py"
 SIRIL_PLUGIN_RESOURCE_REL = Path("resources") / "siril_plugins"
 APP_RUNTIME_HOME_REL = Path("Library/Application Support/SeestarSuperimpose/runtime_home")
 AI_ENV_RESOURCE_REL = Path("ai.env")
+DEFAULT_ENV_RESOURCE_REL = Path("default.env")
 AI_ENV_OVERRIDE_NAME = ".seestar_ai.env"
 
 

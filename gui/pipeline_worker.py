@@ -268,12 +268,28 @@ show_linemarks=false
 """
 
 
+def _normalize_gaia_photo_catalog(value: str) -> str:
+    stripped = value.strip()
+    unquoted = stripped.strip('"').strip("'")
+    if not unquoted:
+        return ""
+
+    path = Path(unquoted).expanduser()
+    if path.name == "gaia_photometric.dat" or not path.is_dir():
+        return ""
+    return stripped
+
+
 def normalize_siril_config_template(config_text: str) -> str:
     removed_keys = {"starnet_exe", "starnet_weights"}
     lines = []
     for raw_line in config_text.splitlines():
         key = raw_line.split("=", 1)[0].strip().lower() if "=" in raw_line else ""
         if key in removed_keys:
+            continue
+        if key == "catalogue_gaia_photo":
+            value = raw_line.split("=", 1)[1]
+            lines.append(f"catalogue_gaia_photo={_normalize_gaia_photo_catalog(value)}")
             continue
         lines.append(raw_line)
 
@@ -303,6 +319,7 @@ COSMIC_CLARITY_REQUIRED_MODEL_FILES = (
 )
 APP_RUNTIME_HOME_REL = Path("Library/Application Support/SeestarSuperimpose/runtime_home")
 AI_ENV_RESOURCE_REL = Path("ai.env")
+DEFAULT_ENV_RESOURCE_REL = Path("default.env")
 AI_ENV_OVERRIDE_NAME = ".seestar_ai.env"
 AI_ENV_ALLOWED_KEYS = frozenset(
     {
@@ -313,16 +330,65 @@ AI_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_AI_TIMEOUT_SEC",
         "SEESTAR_AI_STRENGTH",
         "SEESTAR_AI_PROMPT",
+        "SEESTAR_AI_STAGE6_ENABLE",
+        "SEESTAR_AI_STAGE7_ENABLE",
+        "SEESTAR_AI_STAGE8_ENABLE",
+        "SEESTAR_OUTPUT_FORMAT",
         "SEESTAR_DENOISE_ENABLE",
         "SEESTAR_DENOISE_FORCE",
         "SEESTAR_SYQON_GPU",
         "SEESTAR_SYQON_TIMEOUT_SEC",
+        "SEESTAR_SIRILPY_TIMEOUT_SEC",
         "SEESTAR_WORKFLOW_PLUGIN_PROBE",
         "SEESTAR_SPCC_ENABLE",
+        "SEESTAR_STAGE4_PLATESOLVE_ENABLE",
+        "SEESTAR_STAGE4_SPCC_SENSOR_MODE",
+        "SEESTAR_STAGE4_SPCC_OSC_SENSOR",
+        "SEESTAR_STAGE4_SPCC_OSC_FILTER",
+        "SEESTAR_STAGE4_SPCC_MONO_SENSOR",
+        "SEESTAR_STAGE4_SPCC_R_FILTER",
+        "SEESTAR_STAGE4_SPCC_G_FILTER",
+        "SEESTAR_STAGE4_SPCC_B_FILTER",
+        "SEESTAR_STAGE4_SPCC_WHITE_REF",
+        "SEESTAR_STAGE4_SPCC_ADAPTIVE_WHITE_REF",
+        "SEESTAR_STAGE4_SPCC_NEBULA_WHITE_REF",
+        "SEESTAR_STAGE4_SPCC_BGTOL",
+        "SEESTAR_STAGE4_SPCC_LIMITMAG",
+        "SEESTAR_STAGE4_LOCAL_STAR_WB_ENABLE",
+        "SEESTAR_STAGE4_LOCAL_STAR_WB_MIN_PIXELS",
+        "SEESTAR_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT",
         "SEESTAR_SPCC_ALLOW_LIGHT_PREPROCESS",
+        "SEESTAR_ABERRATION_API_ENABLE",
+        "SEESTAR_ABERRATION_PROVIDER",
+        "SEESTAR_OPTIONAL_COLOR_TRANSFORM",
+        "SEESTAR_COSMIC_CLASSIC_ENABLE",
         "SEESTAR_COSMIC_CLARITY_EXECUTABLE",
         "SEESTAR_COSMIC_CLASSIC_GPU",
         "SEESTAR_COSMIC_NATIVE_GPU",
+        "SEESTAR_STAGE5_BUILTIN_DENOISE_MOD",
+        "SEESTAR_STAGE5_DECONV_ENABLE",
+        "SEESTAR_STAGE5_RL_MAXSTARS",
+        "SEESTAR_STAGE5_RL_PSF_KS",
+        "SEESTAR_STAGE5_RL_ITERS",
+        "SEESTAR_STAGE5_RL_ALPHA",
+        "SEESTAR_STAGE5_RL_GDSTEP",
+        "SEESTAR_STAGE5_RL_STOP",
+        "SEESTAR_STAGE5_GRAXPERT_DECONV_STRENGTH",
+        "SEESTAR_STAGE7_QUALITY_RETRY_MAX",
+        "SEESTAR_STAGE7_SKIP_UNREADY_STARLESS",
+        "SEESTAR_STAR_SEPARATION_MODE",
+        "SEESTAR_STAR_SEPARATION_FALLBACK_TO_MILD_PRESTRETCH",
+        "SEESTAR_MILD_PRESTRETCH_STRENGTH",
+        "SEESTAR_STAGE7_SOFT_STARLESS_ASINH_STRETCH",
+        "SEESTAR_STAGE7_BRIGHT_NEBULA_HALO_RESIDUE_SCORE_MAX",
+        "SEESTAR_STAGE7_STARLESS_REPAIR_STRENGTH",
+        "SEESTAR_STAGE7_STARLESS_HALO_REPAIR_STRENGTH",
+        "SEESTAR_STAGE7_STARLESS_CHROMA_DENOISE_STRENGTH",
+        "SEESTAR_STAGE7_STARLESS_PIXEL_REPAIR_ENABLE",
+        "SEESTAR_STAGE8_FORCE_CONSERVATIVE_AFTER_STAGE7_REPAIR",
+        "SEESTAR_STAGE9_STARMASK_STRETCH_ENABLE",
+        "SEESTAR_STAGE9_STARMASK_ASINH_STRETCH",
+        "SEESTAR_STAGE9_STARMASK_ASINH_OFFSET",
     }
 )
 
@@ -693,6 +759,10 @@ class PipelineWorker(QThread):
         self._pipeline_output_seen = False
         self._python_env_issue = False
         self._python_env_repair_attempted = False
+        self._spcc_seen_in_run = False
+        self._spcc_cli_crash_detected = False
+        self._spcc_crash_retry_attempted = False
+        self._force_disable_spcc_for_retry = False
         self._ai_env_sources: list[str] = []
         self._ai_env_applied_keys: list[str] = []
         self._ai_env_warnings: list[str] = []
@@ -715,6 +785,7 @@ class PipelineWorker(QThread):
 
     def _ai_env_candidates(self) -> list[Path]:
         return [
+            self.resources / DEFAULT_ENV_RESOURCE_REL,
             self.resources / AI_ENV_RESOURCE_REL,
             self.runtime_home / AI_ENV_OVERRIDE_NAME,
             self.work_dir / AI_ENV_OVERRIDE_NAME,
@@ -771,6 +842,13 @@ class PipelineWorker(QThread):
             # Treat Python environment problems as hard pipeline errors even when
             # siril-cli exits 0, so caller can retry/reset/fallback correctly.
             self._run_had_errors = True
+        if (
+            "running command: spcc" in lowered
+            or "running command spcc" in lowered
+            or "input command:spcc" in lowered
+            or "input command: spcc" in lowered
+        ):
+            self._spcc_seen_in_run = True
         if (
             ("running command: pyscript" in lowered or "running command pyscript" in lowered)
             and self._pyscript_seen_at is None
@@ -1087,6 +1165,8 @@ class PipelineWorker(QThread):
         env["SEESTAR_INPUT_MODE"] = self.input_mode
         # GUI toggle is the highest-priority control for optional stage11 execution.
         env["SEESTAR_AI_ENABLED"] = "1" if self.ai_stage_enabled else "0"
+        if self._force_disable_spcc_for_retry:
+            env["SEESTAR_SPCC_ENABLE"] = "0"
         return env
 
     def _run_once(self, siril_cli: Path, run_ssf: Path, run_ini: Path) -> tuple[bool, int]:
@@ -1094,6 +1174,8 @@ class PipelineWorker(QThread):
         self._python_env_issue = False
         self._pyscript_seen_at = None
         self._pipeline_output_seen = False
+        self._spcc_seen_in_run = False
+        self._spcc_cli_crash_detected = False
         self._last_output_ts = time.time()
 
         cmd = build_siril_cli_command(
@@ -1239,6 +1321,10 @@ class PipelineWorker(QThread):
         if bootstrap_timeout:
             return False, exit_code
 
+        if exit_code == -11 and self._spcc_seen_in_run:
+            self._spcc_cli_crash_detected = True
+            self._run_had_errors = True
+
         if (
             self._active_mode == "python"
             and self._pyscript_seen_at is not None
@@ -1278,6 +1364,21 @@ class PipelineWorker(QThread):
                 if success:
                     run_status = "Completed"
                     break
+
+                if self._spcc_cli_crash_detected and not self._spcc_crash_retry_attempted:
+                    self._spcc_crash_retry_attempted = True
+                    self._force_disable_spcc_for_retry = True
+                    self._append_event(
+                        "检测到 Siril 在 SPCC 测光阶段崩溃（退出码 -11）。"
+                        "正在禁用 SPCC 并重试完整流水线，Stage 4 将改走 PCC/本地校色回退。"
+                    )
+                    success, exit_code = self._run_once(siril_cli, run_ssf, run_ini)
+                    if self._stop_event.is_set():
+                        run_status = "Stopped"
+                        break
+                    if success:
+                        run_status = "Completed"
+                        break
 
                 if self._python_env_issue and not self._python_env_repair_attempted:
                     self._python_env_repair_attempted = True

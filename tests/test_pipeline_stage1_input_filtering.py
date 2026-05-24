@@ -224,6 +224,17 @@ class _LinearResumeProbe(_Stage1Probe):
         self.stage_records.append((name, status, message))
 
 
+class _Stage1PreprocessProbe(_Stage1Probe):
+    def _prepare_isolated_light_input(self, light_files: list[Path]):
+        return self.module.SeestarPostProcessor._prepare_isolated_light_input(
+            self,
+            light_files,
+        )
+
+    def _count_sequence_products(self, _seq_name: str) -> int:
+        return 2
+
+
 class PipelineStage1InputFilteringTests(unittest.TestCase):
     def test_is_candidate_stacked_rejects_sasp_exchange_files(self):
         with tempfile.TemporaryDirectory() as td:
@@ -306,6 +317,34 @@ class PipelineStage1InputFilteringTests(unittest.TestCase):
             _name, status, message = probe.stage_records[-1]
             self.assertEqual(status, "ok")
             self.assertEqual(message, "")
+
+    def test_light_preprocess_mirrors_stacked_working_before_load(self):
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td)
+            light_files = [
+                work_dir / "Light_0001.fit",
+                work_dir / "Light_0002.fit",
+            ]
+            for path in light_files:
+                path.write_bytes(b"")
+            probe = _Stage1PreprocessProbe(pipeline_module, work_dir)
+            probe.process_dir.mkdir()
+
+            stats = pipeline_module.SeestarPostProcessor._preprocess_light_frames(
+                probe,
+                light_files,
+            )
+
+            self.assertEqual(stats["registered"], 2)
+            self.assertIn(("mirrorx_single", "working"), probe.cmd_calls)
+            stack_index = next(
+                idx for idx, call in enumerate(probe.cmd_calls)
+                if call and call[0] == "stack"
+            )
+            mirror_index = probe.cmd_calls.index(("mirrorx_single", "working"))
+            load_index = probe.cmd_calls.index(("load", "working"))
+            self.assertLess(stack_index, mirror_index)
+            self.assertLess(mirror_index, load_index)
 
     def test_prepare_linear_resume_input_uses_result_linear_fit(self):
         with tempfile.TemporaryDirectory() as td:

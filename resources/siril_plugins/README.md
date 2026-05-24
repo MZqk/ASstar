@@ -6,6 +6,9 @@
 
 - `downloads/`: 下载产物缓存（tar.gz / wheel）
 - `vendor/`: 解压后的插件脚本或工具目录
+- `syqon_starless/`: SyQon Starless 离线推理脚本、Zenith 模型、校验/日期文件
+- `cosmic_clarity/`: CosmicClarity Native/classic wrapper 共用模型
+- `bin/CosmicClarity`: classic CosmicClarity 兼容 wrapper
 - `download_siril_plugins.sh`: 一键下载脚本
 - `requirements.txt`: Siril runtime 插件依赖说明；对应 wheel 需缓存在 `downloads/`，供离线 venv 安装使用。
 
@@ -21,7 +24,7 @@ bash resources/siril_plugins/download_siril_plugins.sh
 
 1. 官方 Siril scripts 仓库归档（GitLab）
 2. SetiAstroSuitePro（PyPI wheel）
-3. PyQt6 / PySide6 / astropy / scipy / tifffile / onnxruntime / sep / spandrel 等 Siril 插件运行时 wheels
+3. PyQt6 / PySide6 / astropy / scipy / tifffile / onnxruntime / sep / spandrel / lz4 / zstandard / exifread / opencv-python-headless / requests / wheel 等 Siril 插件运行时 wheels
 4. SyQon Starless 所需的 PyTorch wheels
 5. SyQon Starless 离线推理缓存：`syqon_starless_inference.py`、`zenith.pt`
 
@@ -32,3 +35,10 @@ bash resources/siril_plugins/download_siril_plugins.sh
 - `syqon_starless/`: 随项目保存 SyQon Starless 推理文件与 Zenith 模型，GUI 启动前会同步到 Siril 运行时 user data 目录。
 - `cosmic_clarity/`: CosmicClarity Native/classic wrapper 共用模型缓存目录。当前项目保留 denoise + sharpen 的最小模型集：`deep_denoise_mono_AI4.pth`、`deep_denoise_color_AI4.pth`、`deep_sharp_stellar_AI4.pth`、`deep_nonstellar_sharp_conditional_psf_AI4.pth`。
 - `bin/CosmicClarity`: 兼容 Siril classic `CosmicClarity_Denoise.py` / `CosmicClarity_Sharpen.py` 协议的 standalone wrapper；内部使用 bundled `setiastrosuitepro`/`lz4`/`zstandard`/`exifread`/`opencv-python-headless`/`requests` wheel 和 `cosmic_clarity/` 模型；wrapper 会复用当前 Siril runtime 的 torch/torchvision，避免 SASPro 额外创建联网安装运行时。
+
+## 运行时行为
+
+- GUI 会在运行前把本目录复制到临时 runtime 插件目录，并通过 `SEESTAR_SIRIL_PLUGIN_DIR` 注入 pipeline。
+- GUI 会把 `syqon_starless/` 同步到 Siril user data 目录，供 `SyQon-Starless.py` 离线使用。
+- GUI 会把 `cosmic_clarity/` 模型同步到 runtime 插件目录，Native 优先使用本地模型；classic wrapper 仅在 `SEESTAR_COSMIC_CLASSIC_ENABLE=1` 时参与。
+- `SIRIL_PYTHON_CLI` 可能被第三方脚本改写，wrapper 应优先使用 `SEESTAR_SIRIL_PYTHON_CLI` 作为稳定 Python 回退。

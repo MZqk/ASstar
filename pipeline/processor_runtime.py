@@ -30,6 +30,7 @@ from image_metrics import (
     _clamp_float,
     _to_rgb_float_fullres,
     format_feature_summary,
+    measure_image_features,
     measure_quality_metrics,
 )
 from models import ImageFeatures, QualityMetrics, Stage6StretchStrategy, StageResult, TargetType
@@ -69,6 +70,84 @@ ENV_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 ENV_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 ENV_DEBUG_MODE_KEY = "SEESTAR_DEBUG_MODE"
 ENV_INPUT_MODE_KEY = "SEESTAR_INPUT_MODE"
+PROJECT_DEFAULT_ENV_RESOURCE_REL = Path("resources") / "default.env"
+PROJECT_ENV_RESOURCE_REL = Path("resources") / "ai.env"
+PROJECT_ENV_OVERRIDE_NAME = ".seestar_ai.env"
+PROJECT_ENV_ALLOWED_KEYS = frozenset(
+    {
+        "SEESTAR_DEBUG_MODE",
+        "SEESTAR_INPUT_MODE",
+        "SEESTAR_OUTPUT_FORMAT",
+        "SEESTAR_WORKFLOW_PLUGIN_PROBE",
+        "SEESTAR_SPCC_ENABLE",
+        "SEESTAR_STAGE4_PLATESOLVE_ENABLE",
+        "SEESTAR_STAGE4_SPCC_SENSOR_MODE",
+        "SEESTAR_STAGE4_SPCC_OSC_SENSOR",
+        "SEESTAR_STAGE4_SPCC_OSC_FILTER",
+        "SEESTAR_STAGE4_SPCC_MONO_SENSOR",
+        "SEESTAR_STAGE4_SPCC_R_FILTER",
+        "SEESTAR_STAGE4_SPCC_G_FILTER",
+        "SEESTAR_STAGE4_SPCC_B_FILTER",
+        "SEESTAR_STAGE4_SPCC_WHITE_REF",
+        "SEESTAR_STAGE4_SPCC_ADAPTIVE_WHITE_REF",
+        "SEESTAR_STAGE4_SPCC_NEBULA_WHITE_REF",
+        "SEESTAR_STAGE4_SPCC_BGTOL",
+        "SEESTAR_STAGE4_SPCC_LIMITMAG",
+        "SEESTAR_STAGE4_LOCAL_STAR_WB_ENABLE",
+        "SEESTAR_STAGE4_LOCAL_STAR_WB_MIN_PIXELS",
+        "SEESTAR_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT",
+        "SEESTAR_SPCC_ALLOW_LIGHT_PREPROCESS",
+        "SEESTAR_ABERRATION_API_ENABLE",
+        "SEESTAR_ABERRATION_PROVIDER",
+        "SEESTAR_OPTIONAL_COLOR_TRANSFORM",
+        "SEESTAR_DENOISE_ENABLE",
+        "SEESTAR_DENOISE_FORCE",
+        "SEESTAR_STAGE5_BUILTIN_DENOISE_MOD",
+        "SEESTAR_STAGE5_DECONV_ENABLE",
+        "SEESTAR_STAGE5_RL_MAXSTARS",
+        "SEESTAR_STAGE5_RL_PSF_KS",
+        "SEESTAR_STAGE5_RL_ITERS",
+        "SEESTAR_STAGE5_RL_ALPHA",
+        "SEESTAR_STAGE5_RL_GDSTEP",
+        "SEESTAR_STAGE5_RL_STOP",
+        "SEESTAR_STAGE5_GRAXPERT_DECONV_STRENGTH",
+        "SEESTAR_AI_ENABLED",
+        "SEESTAR_AI_ENDPOINT",
+        "SEESTAR_AI_MODEL",
+        "SEESTAR_AI_API_KEY",
+        "SEESTAR_AI_TIMEOUT_SEC",
+        "SEESTAR_AI_STRENGTH",
+        "SEESTAR_AI_PROMPT",
+        "SEESTAR_AI_STAGE6_ENABLE",
+        "SEESTAR_AI_STAGE7_ENABLE",
+        "SEESTAR_AI_STAGE8_ENABLE",
+        "SEESTAR_STAGE7_QUALITY_RETRY_MAX",
+        "SEESTAR_STAGE7_SKIP_UNREADY_STARLESS",
+        "SEESTAR_STAR_SEPARATION_MODE",
+        "SEESTAR_STAR_SEPARATION_FALLBACK_TO_MILD_PRESTRETCH",
+        "SEESTAR_MILD_PRESTRETCH_STRENGTH",
+        "SEESTAR_STAGE7_SOFT_STARLESS_ASINH_STRETCH",
+        "SEESTAR_STAGE7_BRIGHT_NEBULA_HALO_RESIDUE_SCORE_MAX",
+        "SEESTAR_STAGE7_STARLESS_REPAIR_STRENGTH",
+        "SEESTAR_STAGE7_STARLESS_HALO_REPAIR_STRENGTH",
+        "SEESTAR_STAGE7_STARLESS_CHROMA_DENOISE_STRENGTH",
+        "SEESTAR_STAGE7_STARLESS_PIXEL_REPAIR_ENABLE",
+        "SEESTAR_STAGE8_FORCE_CONSERVATIVE_AFTER_STAGE7_REPAIR",
+        "SEESTAR_STAGE9_STARMASK_STRETCH_ENABLE",
+        "SEESTAR_STAGE9_STARMASK_ASINH_STRETCH",
+        "SEESTAR_STAGE9_STARMASK_ASINH_OFFSET",
+        "SEESTAR_COSMIC_CLASSIC_ENABLE",
+        "SEESTAR_COSMIC_CLARITY_EXECUTABLE",
+        "SEESTAR_COSMIC_CLASSIC_GPU",
+        "SEESTAR_COSMIC_NATIVE_GPU",
+        "SEESTAR_SYQON_GPU",
+        "SEESTAR_SYQON_TIMEOUT_SEC",
+        "SEESTAR_SIRILPY_TIMEOUT_SEC",
+        "SEESTAR_SIRIL_PLUGIN_DIR",
+        "SIRIL_PYTHON_CLI",
+        "SEESTAR_SIRIL_PYTHON_CLI",
+    }
+)
 INPUT_MODE_AUTO = "auto"
 INPUT_MODE_LINEAR_RESUME = "result_linear_resume"
 RESULT_BASENAME_TEMPLATE = (
@@ -80,6 +159,57 @@ def _clamp_int(value: int, lower: int, upper: int) -> int:
     return max(lower, min(upper, int(value)))
 
 class ProcessorRuntimeMixin:
+    def _project_env_candidates(self) -> List[Path]:
+        module_project_root = Path(__file__).resolve().parents[1]
+        return [
+            module_project_root / PROJECT_DEFAULT_ENV_RESOURCE_REL,
+            module_project_root / PROJECT_ENV_RESOURCE_REL,
+            Path.cwd() / PROJECT_ENV_OVERRIDE_NAME,
+        ]
+
+
+    def _parse_project_env_file(self, path: Path) -> Dict[str, str]:
+        parsed: Dict[str, str] = {}
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return parsed
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key not in PROJECT_ENV_ALLOWED_KEYS:
+                continue
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            elif value and value[0] in {"'", '"'}:
+                continue
+            else:
+                hash_with_space = value.find(" #")
+                if hash_with_space >= 0:
+                    value = value[:hash_with_space].rstrip()
+            parsed[key] = value
+        return parsed
+
+
+    def _load_project_env_defaults(self) -> None:
+        merged: Dict[str, str] = {}
+        for path in self._project_env_candidates():
+            if not path.is_file():
+                continue
+            merged.update(self._parse_project_env_file(path))
+        for key, value in merged.items():
+            os.environ.setdefault(key, value)
+
+
     def _result_output_basename(self) -> str:
         base_filename = RESULT_BASENAME_TEMPLATE
         if self._stage1_input_mode == "linear_resume":
@@ -173,6 +303,22 @@ class ProcessorRuntimeMixin:
                 )
             self._sync_logger_level()
 
+        output_format_raw = os.getenv("SEESTAR_OUTPUT_FORMAT")
+        if output_format_raw is not None:
+            normalized_output = output_format_raw.strip().lower()
+            allowed_formats = {"all", "tif", "tiff", "png", "fit", "fits"}
+            requested = {
+                item.strip()
+                for item in normalized_output.split(",")
+                if item.strip()
+            }
+            if requested and requested.issubset(allowed_formats):
+                self.cfg.output_format = normalized_output
+            else:
+                self.log.warn(
+                    f"Invalid SEESTAR_OUTPUT_FORMAT={output_format_raw!r}; using current value"
+                )
+
         plugin_probe_raw = os.getenv("SEESTAR_WORKFLOW_PLUGIN_PROBE")
         if plugin_probe_raw is not None:
             parsed = self._parse_env_bool(
@@ -196,6 +342,86 @@ class ProcessorRuntimeMixin:
             if spcc_enable_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
                 self.log.warn(
                     "SEESTAR_SPCC_ENABLE has invalid value; keeping current setting"
+                )
+
+        spcc_adaptive_white_ref_raw = os.getenv("SEESTAR_STAGE4_SPCC_ADAPTIVE_WHITE_REF")
+        if spcc_adaptive_white_ref_raw is not None:
+            parsed = self._parse_env_bool(
+                spcc_adaptive_white_ref_raw,
+                self.cfg.stage4_spcc_adaptive_white_ref_enabled,
+            )
+            self.cfg.stage4_spcc_adaptive_white_ref_enabled = parsed
+            if spcc_adaptive_white_ref_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
+                self.log.warn(
+                    "SEESTAR_STAGE4_SPCC_ADAPTIVE_WHITE_REF has invalid value; "
+                    "keeping current setting"
+                )
+
+        stage4_platesolve_raw = os.getenv("SEESTAR_STAGE4_PLATESOLVE_ENABLE")
+        if stage4_platesolve_raw is not None:
+            parsed = self._parse_env_bool(
+                stage4_platesolve_raw,
+                getattr(self.cfg, "stage4_platesolve_enabled", False),
+            )
+            self.cfg.stage4_platesolve_enabled = parsed
+            if stage4_platesolve_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
+                self.log.warn(
+                    "SEESTAR_STAGE4_PLATESOLVE_ENABLE has invalid value; "
+                    "keeping current setting"
+                )
+
+        for env_key, attr_name in (
+            ("SEESTAR_STAGE4_SPCC_SENSOR_MODE", "stage4_spcc_sensor_mode"),
+            ("SEESTAR_STAGE4_SPCC_OSC_SENSOR", "stage4_spcc_osc_sensor"),
+            ("SEESTAR_STAGE4_SPCC_OSC_FILTER", "stage4_spcc_osc_filter"),
+            ("SEESTAR_STAGE4_SPCC_MONO_SENSOR", "stage4_spcc_mono_sensor"),
+            ("SEESTAR_STAGE4_SPCC_R_FILTER", "stage4_spcc_r_filter"),
+            ("SEESTAR_STAGE4_SPCC_G_FILTER", "stage4_spcc_g_filter"),
+            ("SEESTAR_STAGE4_SPCC_B_FILTER", "stage4_spcc_b_filter"),
+            ("SEESTAR_STAGE4_SPCC_WHITE_REF", "stage4_spcc_white_ref"),
+            ("SEESTAR_STAGE4_SPCC_NEBULA_WHITE_REF", "stage4_spcc_nebula_white_ref"),
+            ("SEESTAR_STAGE4_SPCC_BGTOL", "stage4_spcc_bgtol"),
+            ("SEESTAR_STAGE4_SPCC_LIMITMAG", "stage4_spcc_limitmag"),
+        ):
+            raw_value = os.getenv(env_key)
+            if raw_value is not None:
+                setattr(self.cfg, attr_name, raw_value.strip())
+
+        local_star_wb_raw = os.getenv("SEESTAR_STAGE4_LOCAL_STAR_WB_ENABLE")
+        if local_star_wb_raw is not None:
+            parsed = self._parse_env_bool(
+                local_star_wb_raw,
+                getattr(self.cfg, "stage4_local_star_wb_enabled", True),
+            )
+            self.cfg.stage4_local_star_wb_enabled = parsed
+            if local_star_wb_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
+                self.log.warn(
+                    "SEESTAR_STAGE4_LOCAL_STAR_WB_ENABLE has invalid value; "
+                    "keeping current setting"
+                )
+
+        for env_key, attr_name, caster in (
+            ("SEESTAR_STAGE4_LOCAL_STAR_WB_MIN_PIXELS", "stage4_local_star_wb_min_pixels", int),
+            ("SEESTAR_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT", "stage4_local_star_wb_gain_limit", float),
+        ):
+            raw_value = os.getenv(env_key)
+            if raw_value is None:
+                continue
+            try:
+                setattr(self.cfg, attr_name, caster(raw_value.strip()))
+            except (TypeError, ValueError):
+                self.log.warn(f"{env_key} has invalid value; keeping current setting")
+
+        optional_color_raw = os.getenv("SEESTAR_OPTIONAL_COLOR_TRANSFORM")
+        if optional_color_raw is not None:
+            parsed = self._parse_env_bool(
+                optional_color_raw,
+                self.cfg.optional_color_transform_enabled,
+            )
+            self.cfg.optional_color_transform_enabled = parsed
+            if optional_color_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
+                self.log.warn(
+                    "SEESTAR_OPTIONAL_COLOR_TRANSFORM has invalid value; keeping current setting"
                 )
 
         aberration_api_raw = os.getenv("SEESTAR_ABERRATION_API_ENABLE")
@@ -233,6 +459,36 @@ class ProcessorRuntimeMixin:
                 self.log.warn(
                     "SEESTAR_DENOISE_FORCE has invalid value; keeping current setting"
                 )
+
+        stage5_deconv_raw = os.getenv("SEESTAR_STAGE5_DECONV_ENABLE")
+        if stage5_deconv_raw is not None:
+            parsed = self._parse_env_bool(
+                stage5_deconv_raw,
+                getattr(self.cfg, "stage5_deconvolution_enabled", True),
+            )
+            self.cfg.stage5_deconvolution_enabled = parsed
+            if stage5_deconv_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
+                self.log.warn(
+                    "SEESTAR_STAGE5_DECONV_ENABLE has invalid value; keeping current setting"
+                )
+
+        for env_key, attr_name, caster in (
+            ("SEESTAR_STAGE5_BUILTIN_DENOISE_MOD", "stage5_builtin_denoise_mod", float),
+            ("SEESTAR_STAGE5_RL_MAXSTARS", "stage5_rl_maxstars", int),
+            ("SEESTAR_STAGE5_RL_PSF_KS", "stage5_rl_psf_kernel_size", int),
+            ("SEESTAR_STAGE5_RL_ITERS", "stage5_rl_iters", int),
+            ("SEESTAR_STAGE5_RL_ALPHA", "stage5_rl_alpha", float),
+            ("SEESTAR_STAGE5_RL_GDSTEP", "stage5_rl_gdstep", float),
+            ("SEESTAR_STAGE5_RL_STOP", "stage5_rl_stop", float),
+            ("SEESTAR_STAGE5_GRAXPERT_DECONV_STRENGTH", "stage5_graxpert_deconv_strength", float),
+        ):
+            raw_value = os.getenv(env_key)
+            if raw_value is None:
+                continue
+            try:
+                setattr(self.cfg, attr_name, caster(raw_value.strip()))
+            except ValueError:
+                self.log.warn(f"Invalid {env_key}={raw_value!r}; using current value")
 
         enabled_raw = os.getenv("SEESTAR_AI_ENABLED")
         if enabled_raw is not None:
@@ -312,12 +568,53 @@ class ProcessorRuntimeMixin:
                     "SEESTAR_STAGE7_SKIP_UNREADY_STARLESS has invalid value; keeping current setting"
                 )
 
+        star_mode_raw = os.getenv("SEESTAR_STAR_SEPARATION_MODE")
+        if star_mode_raw is not None:
+            normalized_mode = star_mode_raw.strip().lower()
+            if normalized_mode in {
+                "linear_star_separation",
+                "mild_prestretch_star_separation",
+            }:
+                self.cfg.star_separation_mode = normalized_mode
+            else:
+                self.log.warn(
+                    "Invalid SEESTAR_STAR_SEPARATION_MODE="
+                    f"{star_mode_raw!r}; using current value"
+                )
+
+        star_fallback_raw = os.getenv(
+            "SEESTAR_STAR_SEPARATION_FALLBACK_TO_MILD_PRESTRETCH"
+        )
+        if star_fallback_raw is not None:
+            parsed = self._parse_env_bool(
+                star_fallback_raw,
+                self.cfg.star_separation_fallback_to_mild_prestretch,
+            )
+            self.cfg.star_separation_fallback_to_mild_prestretch = parsed
+            if star_fallback_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
+                self.log.warn(
+                    "SEESTAR_STAR_SEPARATION_FALLBACK_TO_MILD_PRESTRETCH has invalid value; "
+                    "keeping current setting"
+                )
+
+        mild_prestretch_raw = os.getenv("SEESTAR_MILD_PRESTRETCH_STRENGTH")
+        if mild_prestretch_raw is not None:
+            try:
+                self.cfg.mild_prestretch_strength = float(mild_prestretch_raw.strip())
+            except ValueError:
+                self.log.warn(
+                    "Invalid SEESTAR_MILD_PRESTRETCH_STRENGTH="
+                    f"{mild_prestretch_raw!r}; using current value"
+                )
+
         for env_key, attr_name in (
             ("SEESTAR_STAGE7_SOFT_STARLESS_ASINH_STRETCH", "stage7_soft_starless_asinh_stretch"),
             ("SEESTAR_STAGE7_BRIGHT_NEBULA_HALO_RESIDUE_SCORE_MAX", "stage7_bright_nebula_halo_residue_score_max"),
             ("SEESTAR_STAGE7_STARLESS_REPAIR_STRENGTH", "stage7_starless_repair_strength"),
             ("SEESTAR_STAGE7_STARLESS_HALO_REPAIR_STRENGTH", "stage7_starless_halo_repair_strength"),
             ("SEESTAR_STAGE7_STARLESS_CHROMA_DENOISE_STRENGTH", "stage7_starless_chroma_denoise_strength"),
+            ("SEESTAR_STAGE9_STARMASK_ASINH_STRETCH", "stage9_starmask_asinh_stretch"),
+            ("SEESTAR_STAGE9_STARMASK_ASINH_OFFSET", "stage9_starmask_asinh_offset"),
         ):
             raw_value = os.getenv(env_key)
             if raw_value is None:
@@ -330,6 +627,7 @@ class ProcessorRuntimeMixin:
         for env_key, attr_name in (
             ("SEESTAR_STAGE7_STARLESS_PIXEL_REPAIR_ENABLE", "stage7_starless_pixel_repair_enabled"),
             ("SEESTAR_STAGE8_FORCE_CONSERVATIVE_AFTER_STAGE7_REPAIR", "stage8_force_conservative_after_stage7_repair"),
+            ("SEESTAR_STAGE9_STARMASK_STRETCH_ENABLE", "stage9_starmask_stretch_enabled"),
         ):
             raw_value = os.getenv(env_key)
             if raw_value is None:
@@ -342,15 +640,23 @@ class ProcessorRuntimeMixin:
         old_timeout = self.cfg.ai_timeout_sec
         old_strength = self.cfg.ai_strength
         old_stage7_retry = self.cfg.stage7_quality_retry_max
+        old_mild_prestretch = self.cfg.mild_prestretch_strength
         old_stage7_soft = self.cfg.stage7_soft_starless_asinh_stretch
         old_stage7_bright_halo = self.cfg.stage7_bright_nebula_halo_residue_score_max
         old_stage7_repair = self.cfg.stage7_starless_repair_strength
         old_stage7_halo = self.cfg.stage7_starless_halo_repair_strength
         old_stage7_chroma = self.cfg.stage7_starless_chroma_denoise_strength
+        old_stage9_starmask_stretch = self.cfg.stage9_starmask_asinh_stretch
+        old_stage9_starmask_offset = self.cfg.stage9_starmask_asinh_offset
         self.cfg.ai_timeout_sec = _clamp_int(self.cfg.ai_timeout_sec, 15, 300)
         self.cfg.ai_strength = _clamp_float(self.cfg.ai_strength, 0.05, 0.25)
         self.cfg.stage7_quality_retry_max = _clamp_int(
             self.cfg.stage7_quality_retry_max, 0, 3
+        )
+        self.cfg.mild_prestretch_strength = _clamp_float(
+            self.cfg.mild_prestretch_strength,
+            1.05,
+            1.80,
         )
         self.cfg.stage7_soft_starless_asinh_stretch = _clamp_float(
             self.cfg.stage7_soft_starless_asinh_stretch,
@@ -377,6 +683,16 @@ class ProcessorRuntimeMixin:
             0.0,
             0.90,
         )
+        self.cfg.stage9_starmask_asinh_stretch = _clamp_float(
+            self.cfg.stage9_starmask_asinh_stretch,
+            1.10,
+            3.00,
+        )
+        self.cfg.stage9_starmask_asinh_offset = _clamp_float(
+            self.cfg.stage9_starmask_asinh_offset,
+            0.0005,
+            0.0060,
+        )
         if old_timeout != self.cfg.ai_timeout_sec:
             self.log.warn(
                 f"AI timeout clamped: {old_timeout} -> {self.cfg.ai_timeout_sec}"
@@ -390,12 +706,19 @@ class ProcessorRuntimeMixin:
                 "Stage7 quality retry max clamped: "
                 f"{old_stage7_retry} -> {self.cfg.stage7_quality_retry_max}"
             )
+        if old_mild_prestretch != self.cfg.mild_prestretch_strength:
+            self.log.warn(
+                "Mild prestretch strength clamped: "
+                f"{old_mild_prestretch} -> {self.cfg.mild_prestretch_strength}"
+            )
         for label, old_value, new_value in (
             ("Stage7 soft starless asinh stretch", old_stage7_soft, self.cfg.stage7_soft_starless_asinh_stretch),
             ("Stage7 bright-nebula halo threshold", old_stage7_bright_halo, self.cfg.stage7_bright_nebula_halo_residue_score_max),
             ("Stage7 starless repair strength", old_stage7_repair, self.cfg.stage7_starless_repair_strength),
             ("Stage7 starless halo repair strength", old_stage7_halo, self.cfg.stage7_starless_halo_repair_strength),
             ("Stage7 starless chroma denoise strength", old_stage7_chroma, self.cfg.stage7_starless_chroma_denoise_strength),
+            ("Stage9 starmask asinh stretch", old_stage9_starmask_stretch, self.cfg.stage9_starmask_asinh_stretch),
+            ("Stage9 starmask asinh offset", old_stage9_starmask_offset, self.cfg.stage9_starmask_asinh_offset),
         ):
             if old_value != new_value:
                 self.log.warn(f"{label} clamped: {old_value} -> {new_value}")
@@ -528,4 +851,3 @@ class ProcessorRuntimeMixin:
             content=content,
             error_text=error_text,
         )
-

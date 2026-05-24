@@ -23,7 +23,8 @@ def run_stage10_export(pipeline) -> None:
     for candidate in [
         final_file,
         "starless_enhanced",
-        pipeline.stretched_name or "stage6_stretched",
+        pipeline.stretched_name or "stage7_stretched",
+        "stage7_stretched",
     ]:
         candidate_path = pipeline.process_dir / f"{candidate}.fit"
         if not candidate_path.exists():
@@ -369,6 +370,7 @@ def run_stage10_export(pipeline) -> None:
         base_filename=base_filename,
         fallback_base=fallback_base,
         fallback_fit_base=fallback_fit_base,
+        output_format=getattr(pipeline.cfg, "output_format", "all"),
         status=status,
         messages=messages,
     )
