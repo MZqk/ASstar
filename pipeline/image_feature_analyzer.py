@@ -277,6 +277,8 @@ def write_safe_preview(image: Any, path: Path) -> bool:
         hi = float(np.quantile(gray, 0.995))
         stretched = np.clip((rgb - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
         stretched = np.sqrt(stretched)
+        # FITS pixel data is bottom-up; flip vertically for correct PNG orientation.
+        stretched = np.flip(stretched, axis=1)
         write_png_rgb16(path, stretched)
         return True
     except Exception:

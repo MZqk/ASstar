@@ -948,6 +948,17 @@ class SeestarPostProcessor(
         error_text = str(error).lower()
         return any(token in error_text for token in self._RETRYABLE_ERROR_HINTS)
 
+    def _command_error_debug_detail(self, error):
+        details = [f"type={type(error).__name__}"]
+        for attr in ("status_code", "status", "code", "errno"):
+            value = getattr(error, attr, None)
+            if value is not None:
+                details.append(f"{attr}={value}")
+        text = str(error).strip()
+        if text:
+            details.append(f"message={self._short_text(text)}")
+        return ", ".join(details)
+
     def cmd_with_check(self, *args, quiet=False):
         """执行 Siril 命令，带基于状态码与错误文本的智能重试"""
         cmd_str = ' '.join(map(str, args))
@@ -955,11 +966,23 @@ class SeestarPostProcessor(
         max_attempts = self.cfg.max_retries + 1
 
         for attempt in range(1, max_attempts + 1):
+            started = time.time()
+            attempt_note = (
+                f" attempt={attempt}/{max_attempts}" if max_attempts > 1 else ""
+            )
+            self.log.debug(f"  → Siril command{attempt_note}: {cmd_str}")
             try:
                 self.siril.cmd(*args)
-                self.log.debug(f"  ✓ {cmd_str}")
+                elapsed = time.time() - started
+                self.log.debug(f"  ✓ Siril command ok ({elapsed:.2f}s): {cmd_str}")
                 return True
             except CommandError as e:
+                elapsed = time.time() - started
+                self.log.debug(
+                    "  ✗ Siril command error "
+                    f"({elapsed:.2f}s): {cmd_str} "
+                    f"[{self._command_error_debug_detail(e)}]"
+                )
                 can_retry = (
                     attempt < max_attempts
                     and cmd_name not in self._NON_IDEMPOTENT
@@ -981,6 +1004,12 @@ class SeestarPostProcessor(
                     self.log.error(f"命令失败: {cmd_str}\n    错误: {e}")
                 raise
             except (DataError, SirilError) as e:
+                elapsed = time.time() - started
+                self.log.debug(
+                    "  ✗ Siril command failed "
+                    f"({elapsed:.2f}s): {cmd_str} "
+                    f"[{self._command_error_debug_detail(e)}]"
+                )
                 if quiet:
                     self.log.debug(f"失败: {cmd_str} ({e})")
                 else:

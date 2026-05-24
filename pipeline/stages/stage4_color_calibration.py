@@ -156,6 +156,12 @@ def _stage4_siril_named_arg(name: str, value: str) -> str:
     return arg
 
 
+def _stage4_debug_command(command: str, args: Tuple[str, ...]) -> str:
+    parts = [command]
+    parts.extend(str(arg) for arg in args)
+    return " ".join(parts)
+
+
 def _stage4_spcc_bgtol_args(pipeline) -> Tuple[str, ...]:
     bgtol = str(getattr(pipeline.cfg, "stage4_spcc_bgtol", "-2.8,2.0") or "").strip()
     normalized = bgtol.replace(" ", "").replace("+", "")
@@ -460,6 +466,17 @@ def run_stage4_color_calibration(pipeline) -> None:
         spcc_runtime_allowed = False
         messages.append("SPCC skipped on Light_ preprocess mode to avoid siril-cli crash risk")
 
+    pipeline.log.debug(
+        "Stage4 runtime: "
+        f"platesolve_enabled={bool(getattr(pipeline.cfg, 'stage4_platesolve_enabled', True))}, "
+        f"platesolve_ok={bool(pipeline.platesolve_ok)}, "
+        f"spcc_enabled={bool(getattr(pipeline.cfg, 'spcc_enabled', True))}, "
+        f"spcc_runtime_allowed={bool(spcc_runtime_allowed)}, "
+        f"allow_light_spcc={bool(allow_light_spcc)}, "
+        f"input_mode={getattr(pipeline, '_stage1_input_mode', '') or 'unknown'}, "
+        f"target_aware_color={bool(target_aware_color)}"
+    )
+
     if spcc_runtime_allowed:
         try:
             spcc_white_ref, spcc_white_ref_reason = _stage4_effective_spcc_white_ref(pipeline)
@@ -467,6 +484,14 @@ def run_stage4_color_calibration(pipeline) -> None:
             messages.extend(spcc_messages)
             messages.append(
                 f"SPCC whiteref={spcc_white_ref} ({spcc_white_ref_reason})"
+            )
+            pipeline.log.debug(
+                "SPCC selected white reference: "
+                f"{spcc_white_ref} (reason={spcc_white_ref_reason})"
+            )
+            pipeline.log.debug(
+                "SPCC command: "
+                + _stage4_debug_command("spcc", spcc_args)
             )
             pipeline.cmd_with_check("spcc", *spcc_args)
             color_ok = True
@@ -492,6 +517,10 @@ def run_stage4_color_calibration(pipeline) -> None:
                         whiteref=DEFAULT_SPCC_WHITE_REF,
                     )
                     messages.extend(fallback_messages)
+                    pipeline.log.debug(
+                        "SPCC fallback command: "
+                        + _stage4_debug_command("spcc", fallback_args)
+                    )
                     pipeline.cmd_with_check("spcc", *fallback_args)
                     color_ok = True
                     color_method = "SPCC"
@@ -524,6 +553,10 @@ def run_stage4_color_calibration(pipeline) -> None:
     if not color_ok:
         try:
             pcc_args = _stage4_pcc_args()
+            pipeline.log.debug(
+                "PCC fallback command: "
+                + _stage4_debug_command("pcc", pcc_args)
+            )
             pipeline.cmd_with_check("pcc", *pcc_args)
             color_ok = True
             color_method = "PCC"
@@ -546,6 +579,7 @@ def run_stage4_color_calibration(pipeline) -> None:
             ) = _stage4_local_color_fallback(pipeline, target_aware=target_aware_color)
             messages.append(fallback_message)
             pipeline.log.info(fallback_message)
+            pipeline.log.debug(f"local color fallback report: {local_fallback_report}")
         except Exception as e:
             color_ok = False
             status = "degraded"

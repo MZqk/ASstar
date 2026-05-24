@@ -1126,7 +1126,7 @@ class SeestarGui(QMainWindow):
         self._append_event(
             "Debug 模式已"
             + (
-                "开启：保留 stage* 中间产物（lightsrc 序列仍清理）"
+                "开启：保留 stage* 中间产物，并输出 DEBUG 级别过程日志（含 SPCC 命令细节；lightsrc 序列仍清理）"
                 if self.debug_mode_enabled
                 else "关闭：将按默认策略清理中间产物"
             )

@@ -34,6 +34,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.pycache/
 
 # Virtual environments
 .venv/
@@ -46,13 +47,26 @@ env/
 *.swp
 *.swo
 .claude/
+.codex/
 
 # Build/log temp files
 *.log
 *.tmp
 resources/ai.env
 resources/siril_plugins/downloads/
+.seestar_ai.env
 
 # Local build artifacts
 release/
 packages/
+
+# Pipeline outputs and intermediate files
+process/
+target_profile.json
+pipeline_policy.json
+stage3_target_preview.png
+result_processed*.png
+result_processed*.tif
+result_processed*.tiff
+result_final.fit
+stage11_ai_*
