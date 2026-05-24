@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""Stage 1 input filtering regression tests."""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PIPELINE_MODULE_PATH = REPO_ROOT / "pipeline" / "seestar_Superimpose.py"
+
+
+def _ensure_fake_sirilpy() -> None:
+    if "sirilpy" in sys.modules:
+        return
+
+    fake_sirilpy = types.ModuleType("sirilpy")
+    fake_exceptions = types.ModuleType("sirilpy.exceptions")
+    fake_enums = types.ModuleType("sirilpy.enums")
+
+    class _SirilError(Exception):
+        pass
+
+    class _SirilConnectionError(_SirilError):
+        pass
+
+    class _CommandError(_SirilError):
+        pass
+
+    class _DataError(_SirilError):
+        pass
+
+    class _CommandStatus:
+        CMD_GENERIC_ERROR = 1
+        CMD_THREAD_RUNNING = 2
+
+    class _SirilInterface:
+        def cmd(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    fake_sirilpy.SirilInterface = _SirilInterface
+    fake_exceptions.SirilError = _SirilError
+    fake_exceptions.SirilConnectionError = _SirilConnectionError
+    fake_exceptions.CommandError = _CommandError
+    fake_exceptions.DataError = _DataError
+    fake_enums.CommandStatus = _CommandStatus
+
+    sys.modules["sirilpy"] = fake_sirilpy
+    sys.modules["sirilpy.exceptions"] = fake_exceptions
+    sys.modules["sirilpy.enums"] = fake_enums
+
+
+def _ensure_fake_numpy() -> None:
+    if "numpy" in sys.modules:
+        return
+    try:
+        import numpy  # type: ignore
+
+        _ = numpy
+        return
+    except Exception:
+        pass
+
+    fake_numpy = types.ModuleType("numpy")
+    fake_numpy.float32 = float
+    fake_numpy.uint16 = int
+    fake_numpy.uint8 = int
+    fake_numpy.integer = int
+    fake_numpy.ndarray = object
+
+    def _asarray(value: Any):
+        return value
+
+    def _transpose(value: Any, _axes: Any):
+        return value
+
+    def _issubdtype(_lhs: Any, _rhs: Any) -> bool:
+        return False
+
+    def _clip(value: Any, _vmin: Any, _vmax: Any):
+        return value
+
+    fake_numpy.asarray = _asarray
+    fake_numpy.transpose = _transpose
+    fake_numpy.issubdtype = _issubdtype
+    fake_numpy.clip = _clip
+    sys.modules["numpy"] = fake_numpy
+
+
+def _load_pipeline_module():
+    _ensure_fake_numpy()
+    _ensure_fake_sirilpy()
+    spec = importlib.util.spec_from_file_location(
+        "seestar_pipeline_stage1_filter_test_module",
+        PIPELINE_MODULE_PATH,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load module spec: {PIPELINE_MODULE_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+pipeline_module = _load_pipeline_module()
+
+
+class _FakeLogger:
+    def stage_start(self, _name: str) -> None:
+        return
+
+    def stage_end(self, _name: str | None = None) -> float:
+        return 0.01
+
+    def info(self, _msg: str) -> None:
+        return
+
+    def warn(self, _msg: str) -> None:
+        return
+
+    def error(self, _msg: str) -> None:
+        return
+
+    def debug(self, _msg: str) -> None:
+        return
+
+
+class _Stage1Probe:
+    def __init__(self, module: Any, work_dir: Path) -> None:
+        self.module = module
+        self.cfg = module.PipelineConfig()
+        self.work_dir = work_dir
+        self.process_dir = work_dir / "process"
+        self.log = _FakeLogger()
+        self.used_stacked = False
+        self.used_light = False
+        self.saved_stage = False
+        self.source_file = None
+        self.linear_intermediate_path = None
+        self._stage1_input_mode = "unknown"
+        self.cmd_calls: list[tuple[Any, ...]] = []
+
+    def _find_fit_files(self) -> list[Path]:
+        return self.module.SeestarPostProcessor._find_fit_files(self)
+
+    def _is_candidate_stacked(self, path: Path) -> bool:
+        return self.module.SeestarPostProcessor._is_candidate_stacked(self, path)
+
+    def _prepare_process_dir(self) -> None:
+        return self.module.SeestarPostProcessor._prepare_process_dir(self)
+
+    def _load_stacked_file(self, _stacked_files: list[Path]) -> None:
+        self.used_stacked = True
+
+    def _preprocess_light_frames(self, _light_files: list[Path]) -> None:
+        self.used_light = True
+
+    def _save_stage_output(self, _stem: str) -> bool:
+        self.saved_stage = True
+        return True
+
+    def _record_stage(
+        self,
+        _name: str,
+        _status: str,
+        _duration: float = 0.0,
+        _message: str = "",
+    ) -> None:
+        return
+
+    def cmd_with_check(self, *args: Any, **_kwargs: Any) -> bool:
+        self.cmd_calls.append(args)
+        return True
+
+
+class _Stage1GateProbe(_Stage1Probe):
+    def __init__(self, module: Any, work_dir: Path) -> None:
+        super().__init__(module, work_dir)
+        self.preprocess_stats = {
+            "total": 0,
+            "registered": 0,
+            "failed": 0,
+            "fail_ratio": 0.0,
+        }
+        self.stage_save_ok = True
+        self.stage_records: list[tuple[str, str, str]] = []
+
+    def _preprocess_light_frames(self, _light_files: list[Path]):
+        self.used_light = True
+        return self.preprocess_stats
+
+    def _save_stage_output(self, _stem: str) -> bool:
+        self.saved_stage = True
+        return self.stage_save_ok
+
+    def _record_stage(
+        self,
+        name: str,
+        status: str,
+        _duration: float = 0.0,
+        message: str = "",
+    ) -> None:
+        self.stage_records.append((name, status, message))
+
+
+class _LinearResumeProbe(_Stage1Probe):
+    def __init__(self, module: Any, work_dir: Path) -> None:
+        super().__init__(module, work_dir)
+        self.stage_records: list[tuple[str, str, str]] = []
+
+    def _record_stage(
+        self,
+        name: str,
+        status: str,
+        _duration: float = 0.0,
+        message: str = "",
+    ) -> None:
+        self.stage_records.append((name, status, message))
+
+
+class PipelineStage1InputFilteringTests(unittest.TestCase):
+    def test_is_candidate_stacked_rejects_sasp_exchange_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td)
+            probe = SimpleNamespace(cfg=pipeline_module.PipelineConfig(), work_dir=work_dir)
+
+            for name in (
+                "sasp_starmask_input.fit",
+                "sasp_starless_input.fit",
+                "manual_starless_export.fit",
+                "manual_starmask_export.fits",
+            ):
+                path = work_dir / name
+                path.write_bytes(b"")
+                self.assertFalse(
+                    pipeline_module.SeestarPostProcessor._is_candidate_stacked(
+                        probe,
+                        path,
+                    ),
+                    msg=f"expected non-candidate: {name}",
+                )
+
+            candidate = work_dir / "IC2177_master.fit"
+            candidate.write_bytes(b"")
+            self.assertTrue(
+                pipeline_module.SeestarPostProcessor._is_candidate_stacked(
+                    probe,
+                    candidate,
+                )
+            )
+
+    def test_stage1_prefers_light_when_only_sasp_candidates_exist(self):
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td)
+            (work_dir / "sasp_starmask_input.fit").write_bytes(b"")
+            (work_dir / "sasp_starless_input.fit").write_bytes(b"")
+            (work_dir / "Light_0001.fit").write_bytes(b"")
+            (work_dir / "Light_0002.fit").write_bytes(b"")
+
+            probe = _Stage1Probe(pipeline_module, work_dir)
+
+            pipeline_module.SeestarPostProcessor.stage1_preparation(probe)
+
+            self.assertFalse(probe.used_stacked)
+            self.assertTrue(probe.used_light)
+            self.assertTrue(probe.saved_stage)
+
+    def test_stage1_marks_degraded_when_register_fail_ratio_exceeds_threshold(self):
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td)
+            (work_dir / "Light_0001.fit").write_bytes(b"")
+            probe = _Stage1GateProbe(pipeline_module, work_dir)
+            probe.preprocess_stats = {
+                "total": 100,
+                "registered": 86,
+                "failed": 14,
+                "fail_ratio": 0.14,
+            }
+
+            pipeline_module.SeestarPostProcessor.stage1_preparation(probe)
+
+            _name, status, message = probe.stage_records[-1]
+            self.assertEqual(status, "degraded")
+            self.assertIn("registration failed=14/100", message)
+
+    def test_stage1_keeps_ok_when_register_fail_ratio_within_threshold(self):
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td)
+            (work_dir / "Light_0001.fit").write_bytes(b"")
+            probe = _Stage1GateProbe(pipeline_module, work_dir)
+            probe.preprocess_stats = {
+                "total": 80,
+                "registered": 73,
+                "failed": 7,
+                "fail_ratio": 0.0875,
+            }
+
+            pipeline_module.SeestarPostProcessor.stage1_preparation(probe)
+
+            _name, status, message = probe.stage_records[-1]
+            self.assertEqual(status, "ok")
+            self.assertEqual(message, "")
+
+    def test_prepare_linear_resume_input_uses_result_linear_fit(self):
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td)
+            linear_path = work_dir / pipeline_module.LINEAR_RESUME_INPUT_NAME
+            linear_path.write_bytes(b"linear-fit")
+            probe = _LinearResumeProbe(pipeline_module, work_dir)
+
+            pipeline_module.SeestarPostProcessor._prepare_linear_resume_input(probe)
+
+            self.assertEqual(probe.source_file, linear_path)
+            self.assertEqual(probe.linear_intermediate_path, linear_path)
+            self.assertEqual(probe._stage1_input_mode, "linear_resume")
+            self.assertTrue((work_dir / "process" / "working.fit").is_file())
+            self.assertIn(("load", "working"), probe.cmd_calls)
+            self.assertEqual(len(probe.stage_records), 1)
+            name, status, message = probe.stage_records[0]
+            self.assertEqual(name, "阶段 1: 前期准备")
+            self.assertEqual(status, "ok")
+            self.assertIn("loaded existing result_linear.fit", message)
+
+
+if __name__ == "__main__":
+    unittest.main()

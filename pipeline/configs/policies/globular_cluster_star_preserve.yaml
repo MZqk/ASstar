@@ -1,0 +1,9 @@
+{
+  "policy_name": "globular_cluster_star_preserve",
+  "applies_to": {"target_types": ["globular_cluster"]},
+  "stage3_background": {"model_priority": ["rbf_smooth", "polynomial_low_order"], "protect_star_core": true, "max_bg_std_growth": 1.08, "fallback_to_safe_model": true},
+  "stage4_color": {"prefer_spcc": true, "reduce_saturation_if_solution_imprecise": true, "blue_gain_limit": 0.95, "red_gain_limit": 1.05, "max_allowed_saturation_boost": 0.08},
+  "stage5_linear": {"denoise_mode": "minimal", "sharpen_mode": "star_preserve", "protect_background": true, "protect_star_halo": true, "avoid_global_sharpen": true},
+  "stage6_stretch": {"candidate_mode": ["star_color_preserving_stretch", "asinh_core_protect", "autostretch_reference"], "forbidden_when_dirty": ["autostretch"], "allow_autostretch_as_reference_only": true, "scoring": {"core_blowout_weight": 0.20, "bg_noise_weight": 0.20, "nebulosity_weight": 0.10, "star_bloat_weight": 0.40, "color_shift_weight": 0.10}, "fallback_candidate": "star_color_preserving_stretch"},
+  "stage6_5_pre_starless_gate": {"max_bg_dirty_score": 0.45, "max_core_clip_ratio": 0.02, "max_star_halo_risk": 0.80, "default_starless_input": "stage6_stretched"}
+}

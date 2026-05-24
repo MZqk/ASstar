@@ -1,0 +1,2 @@
+resources/siril_plugins/cosmic_clarity/*.pth filter=lfs diff=lfs merge=lfs -text
+resources/siril_plugins/syqon_starless/*.pt filter=lfs diff=lfs merge=lfs -text

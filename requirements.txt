@@ -1,0 +1,18 @@
+# Local development / runtime helper dependencies.
+# The macOS app still prepares Siril's isolated Python 3.12 venv from
+# resources/siril_plugins/downloads for offline execution.
+
+PySide6
+pyinstaller
+numpy
+astropy
+scipy
+tifffile
+onnxruntime
+torch
+torchvision
+sep
+spandrel
+einops
+safetensors
+setiastrosuitepro

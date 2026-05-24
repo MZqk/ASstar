@@ -1,0 +1,237 @@
+#!/bin/sh
+''':'
+PY="${SEESTAR_SIRIL_PYTHON_CLI:-${SIRIL_PYTHON_CLI:-python3}}"
+case "$PY" in
+  ""|0|1|true|false|yes|no|on|off) PY="python3" ;;
+esac
+exec "$PY" "$0" "$@"
+':'''
+"""Compatibility executable for Siril CosmicClarity classic scripts.
+
+The upstream Siril scripts expect a standalone executable that reads TIFF files
+from ./input and writes processed TIFF files to ./output. This wrapper provides
+that legacy contract using the bundled setiastrosuitepro wheel and local model
+cache, so the app does not need a separate system-wide Cosmic Clarity install.
+"""
+
+import argparse
+import os
+import sys
+import zipfile
+from pathlib import Path
+from typing import Optional
+
+
+def _plugin_root(executable: Path) -> Path:
+    parent = executable.parent
+    if parent.name == "bin":
+        return parent.parent
+    return parent
+
+
+def _latest_input(input_dir: Path) -> Path:
+    files = [
+        p for p in input_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in {".tif", ".tiff", ".fit", ".fits"}
+    ]
+    if not files:
+        raise FileNotFoundError(f"No input image found in {input_dir}")
+    return max(files, key=lambda p: p.stat().st_mtime)
+
+
+def _add_bundled_wheel(plugin_root: Path) -> None:
+    wheels = sorted(
+        (plugin_root / "downloads").glob("setiastrosuitepro-*.whl"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not wheels:
+        raise FileNotFoundError(
+            f"setiastrosuitepro wheel not found in {plugin_root / 'downloads'}"
+        )
+    wheel = wheels[0]
+    extract_root = plugin_root / "cosmic_clarity_runtime" / "wheels" / wheel.stem
+    marker = extract_root / ".seestar_extracted"
+    if not marker.exists() or marker.read_text(encoding="utf-8", errors="ignore") != wheel.name:
+        extract_root.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(wheel) as zf:
+            zf.extractall(extract_root)
+        marker.write_text(wheel.name, encoding="utf-8")
+
+    # setiastrosuitepro 1.13.x ships cosmicclarity_engines as a directory
+    # without __init__.py. That works from an extracted tree, but not from a
+    # zipimported wheel in the embedded Siril runtime.
+    engine_pkg = extract_root / "setiastro" / "saspro" / "cosmicclarity_engines"
+    engine_pkg.mkdir(parents=True, exist_ok=True)
+    (engine_pkg / "__init__.py").touch()
+
+    sys.path.insert(0, str(extract_root))
+
+
+def _prepare_offline_pip_env(plugin_root: Path) -> None:
+    downloads_dir = plugin_root / "downloads"
+    if not downloads_dir.is_dir():
+        return
+    os.environ.setdefault("PIP_NO_INDEX", "1")
+    os.environ.setdefault("PIP_FIND_LINKS", str(downloads_dir))
+    os.environ.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+
+
+def _add_runtime_site_packages() -> None:
+    candidates: list[Path] = []
+    home = os.environ.get("HOME")
+    if home:
+        candidates.append(
+            Path(home)
+            / "Library"
+            / "Application Support"
+            / "org.siril.Siril"
+            / "siril"
+            / "venv"
+        )
+    for key in ("SIRIL_PYTHON_CLI", "SEESTAR_SIRIL_PYTHON_CLI"):
+        raw = os.environ.get(key, "").strip()
+        if not raw:
+            continue
+        path = Path(raw)
+        if path.parent.name == "bin":
+            candidates.append(path.parent.parent)
+
+    for venv in candidates:
+        lib_dir = venv / "lib"
+        if not lib_dir.is_dir():
+            continue
+        for site_dir in sorted(lib_dir.glob("python*/site-packages")):
+            if site_dir.is_dir():
+                site_str = str(site_dir)
+                if site_str not in sys.path:
+                    sys.path.insert(0, site_str)
+
+
+def _patch_saspro_runtime_torch() -> None:
+    try:
+        import setiastro.saspro.runtime_torch as runtime_torch
+    except Exception:
+        return
+
+    def _use_current_runtime_torch(*args, **kwargs):
+        import torch
+        import torchvision  # noqa: F401
+
+        return torch
+
+    runtime_torch.import_torch = _use_current_runtime_torch
+
+
+def _prepare_model_runtime(plugin_root: Path) -> None:
+    model_src = plugin_root / "cosmic_clarity"
+    if not model_src.is_dir():
+        return
+
+    runtime_root = plugin_root / "cosmic_clarity_runtime"
+    models_dir = runtime_root / "py312" / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("SASPRO_RUNTIME_DIR", str(runtime_root))
+
+    for source in model_src.glob("*"):
+        if not source.is_file() or source.suffix.lower() not in {".pth", ".pt", ".onnx"}:
+            continue
+        target = models_dir / source.name
+        if target.exists() and target.stat().st_size == source.stat().st_size:
+            continue
+        try:
+            if target.exists() or target.is_symlink():
+                target.unlink()
+            target.symlink_to(source)
+        except OSError:
+            import shutil
+
+            shutil.copy2(source, target)
+
+
+def _build_preset(args: argparse.Namespace) -> tuple[str, dict[str, object]]:
+    if args.denoise_mode:
+        return (
+            "denoised",
+            {
+                "mode": "denoise",
+                "gpu": not args.disable_gpu,
+                "denoise_luma": float(args.denoise_strength),
+                "denoise_color": float(args.denoise_strength),
+                "denoise_mode": str(args.denoise_mode),
+                "separate_channels": False,
+                "chunk_size": 256,
+                "overlap": 64,
+            },
+        )
+
+    return (
+        "sharpened",
+        {
+            "mode": "sharpen",
+            "gpu": not args.disable_gpu,
+            "sharpening_mode": str(args.sharpening_mode),
+            "stellar_amount": float(args.stellar_amount),
+            "nonstellar_amount": float(args.nonstellar_amount),
+            "nonstellar_psf": float(args.nonstellar_strength),
+            "auto_psf": bool(args.auto_detect_psf),
+            "sharpen_channels_separately": bool(args.sharpen_channels_separately),
+            "chunk_size": 256,
+            "overlap": 64,
+        },
+    )
+
+
+def _progress(done: int, total: int) -> bool:
+    if total <= 0:
+        return True
+    pct = max(0, min(100, int(done * 100 / total)))
+    print(f"{pct}%", flush=True)
+    return True
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Bundled Cosmic Clarity classic wrapper")
+    parser.add_argument("--denoise_mode", choices=["luminance", "full", "separate"])
+    parser.add_argument("--denoise_strength", type=float, default=1.0)
+    parser.add_argument("--sharpening_mode", choices=["Stellar Only", "Non-Stellar Only", "Both"])
+    parser.add_argument("--stellar_amount", type=float, default=0.5)
+    parser.add_argument("--nonstellar_strength", type=float, default=3.0)
+    parser.add_argument("--nonstellar_amount", type=float, default=0.5)
+    parser.add_argument("--disable_gpu", action="store_true")
+    parser.add_argument("--auto_detect_psf", action="store_true")
+    parser.add_argument("--sharpen_channels_separately", action="store_true")
+    args = parser.parse_args(argv)
+
+    executable = Path(__file__).resolve()
+    plugin_root = _plugin_root(executable)
+    input_dir = executable.parent / "input"
+    output_dir = executable.parent / "output"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    _prepare_offline_pip_env(plugin_root)
+    _add_runtime_site_packages()
+    _add_bundled_wheel(plugin_root)
+    _patch_saspro_runtime_torch()
+    _prepare_model_runtime(plugin_root)
+
+    input_path = _latest_input(input_dir)
+    suffix, preset = _build_preset(args)
+    output_stem = input_path.name[: -len(input_path.suffix)] if input_path.suffix else input_path.name
+    output_path = output_dir / f"{output_stem}_{suffix}.tif"
+
+    from setiastro.saspro.cosmicclarity_headless import run_cosmicclarity_on_file
+
+    run_cosmicclarity_on_file(
+        str(input_path),
+        str(output_path),
+        preset,
+        progress_cb=_progress,
+    )
+    print(f"Output: {output_path}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

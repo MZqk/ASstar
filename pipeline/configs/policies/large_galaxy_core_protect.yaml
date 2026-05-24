@@ -1,0 +1,9 @@
+{
+  "policy_name": "large_galaxy_core_protect",
+  "applies_to": {"target_types": ["large_galaxy", "small_galaxy"]},
+  "stage3_background": {"model_priority": ["rbf_smooth", "polynomial_low_order"], "protect_nebulosity": true, "protect_outer_halo": true, "max_bg_std_growth": 1.06, "fallback_to_safe_model": true},
+  "stage4_color": {"prefer_spcc": true, "reduce_saturation_if_solution_imprecise": true, "blue_gain_limit": 0.92, "red_gain_limit": 1.08, "max_allowed_saturation_boost": 0.12},
+  "stage5_linear": {"denoise_mode": "luma_chroma_balanced", "sharpen_mode": "mid_frequency_masked", "protect_background": true, "protect_star_halo": true, "avoid_global_sharpen": true},
+  "stage6_stretch": {"candidate_mode": ["masked_galaxy_stretch", "asinh_mild_ghs", "mild_histogram", "autostretch_reference"], "forbidden_when_dirty": ["autostretch"], "allow_autostretch_as_reference_only": true, "scoring": {"core_blowout_weight": 0.30, "bg_noise_weight": 0.25, "nebulosity_weight": 0.30, "star_bloat_weight": 0.10, "color_shift_weight": 0.05}, "fallback_candidate": "masked_galaxy_stretch"},
+  "stage6_5_pre_starless_gate": {"max_bg_dirty_score": 0.40, "max_core_clip_ratio": 0.012, "max_star_halo_risk": 0.70, "default_starless_input": "stage7_conservative_asinh"}
+}

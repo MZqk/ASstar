@@ -1,0 +1,1 @@
+{"default_models": ["rbf_smooth", "polynomial_low_order"], "safe_max_bg_std_growth": 1.05}
