@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from image_metrics import _to_rgb_float_fullres
+from models import PipelineStage
 from sirilpy.exceptions import CommandError, SirilError
 
 
@@ -335,7 +336,8 @@ def run_stage2_view_correction(pipeline) -> None:
     - 按工作流先做画面边缘裁切
     - 图像解析（天体测量）在阶段4执行
     """
-    pipeline.log.stage_start("阶段 2: 裁切")
+    stage_label = PipelineStage.VIEW_CORRECTION.label
+    pipeline.log.stage_start(stage_label)
     status = "ok"
     messages: List[str] = []
     try:
@@ -472,5 +474,5 @@ def run_stage2_view_correction(pipeline) -> None:
     if hasattr(pipeline, "_write_stage_json"):
         pipeline._write_stage_json("stage2_crop_report.json", crop_report)
 
-    elapsed = pipeline.log.stage_end("阶段 2: 裁切")
-    pipeline._record_stage("阶段 2: 裁切", status, elapsed, "；".join(messages))
+    elapsed = pipeline.log.stage_end(stage_label)
+    pipeline._record_stage(stage_label, status, elapsed, "；".join(messages))

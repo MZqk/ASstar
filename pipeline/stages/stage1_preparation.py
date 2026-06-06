@@ -1,6 +1,7 @@
 """Stage 1 preparation."""
 from typing import List
 
+from models import PipelineStage
 from sirilpy.exceptions import SirilError
 
 
@@ -12,7 +13,8 @@ def run_stage1_preparation(pipeline) -> None:
       A) 已叠加的 .fit 文件 → 直接加载
       B) Light_ 单帧文件 → 执行预处理
     """
-    pipeline.log.stage_start("阶段 1: 前期准备")
+    stage_label = PipelineStage.PREPARATION.label
+    pipeline.log.stage_start(stage_label)
     pipeline._prepare_process_dir()
 
     # 一次遍历查找所有 .fit/.fits 文件
@@ -72,9 +74,9 @@ def run_stage1_preparation(pipeline) -> None:
                 f"registered={registered}"
             )
 
-    elapsed = pipeline.log.stage_end("阶段 1: 前期准备")
+    elapsed = pipeline.log.stage_end(stage_label)
     pipeline._record_stage(
-        "阶段 1: 前期准备",
+        stage_label,
         stage_status,
         elapsed,
         "；".join(stage_messages),

@@ -1,6 +1,8 @@
 """Stretch selection and execution."""
 from typing import List
 
+from models import PipelineStage
+
 
 def run_stage6_stretching(pipeline) -> None:
     """
@@ -9,7 +11,7 @@ def run_stage6_stretching(pipeline) -> None:
     - 只生成 stage7_cand_a / stage7_cand_b 和一个 stage7_preview_ref
     - 输出 stage7_stretched.fit
     """
-    stage_label = "阶段 7: 主体拉伸"
+    stage_label = PipelineStage.STRETCHING.label
     pipeline.log.stage_start(stage_label)
     stretched = False
     stage_degraded = False

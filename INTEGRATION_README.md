@@ -64,6 +64,8 @@ Runtime env 来源优先级：进程环境 > 工作目录 `.seestar_ai.env` > ru
 | `SIRIL_PYTHON_CLI` / `SEESTAR_SIRIL_PYTHON_CLI` | bundled Python | GUI 注入稳定 Siril Python；wrapper 用后者兜底 |
 | `SEESTAR_SIRIL_PLUGIN_DIR` | bundled/runtime plugin dir | GUI 指向打包或复制后的插件缓存 |
 | `SEESTAR_SIRILPY_TIMEOUT_SEC` | `120` from GUI | sirilpy/plugin subprocess timeout |
+| `SEESTAR_BOOTSTRAP_TIMEOUT_SEC` | `300` from GUI | pyscript bootstrap base timeout; GUI adds 120 seconds per GiB of top-level FITS input and clamps the result to 60–3600 seconds |
+| `SEESTAR_TEMP_CLEANUP_TIMEOUT_SEC` | `30` from GUI | maximum foreground wait for deleting the temporary embedded runtime; cleanup continues on a daemon thread after timeout |
 
 ## Pipeline Contracts
 

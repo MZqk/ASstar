@@ -30,16 +30,25 @@ def _install_sirilpy_stub() -> None:
     class CommandError(SirilError):
         pass
 
+    class DataError(SirilError):
+        pass
+
     sirilpy.SirilInterface = object
     exceptions.SirilError = SirilError
     exceptions.CommandError = CommandError
+    exceptions.DataError = DataError
     sys.modules["sirilpy"] = sirilpy
     sys.modules["sirilpy.exceptions"] = exceptions
 
 
 _install_sirilpy_stub()
 
-from models import ImageFeatures, PipelineConfig  # noqa: E402
+from models import (  # noqa: E402
+    ImageFeatures,
+    PipelineCheckpoint,
+    PipelineConfig,
+    PipelineStage,
+)
 from stages import (  # noqa: E402
     stage10_export,
     stage1_preparation,
@@ -72,6 +81,21 @@ class _Log:
 
     def debug(self, _message: str) -> None:
         return
+
+
+class PipelineStageTests(unittest.TestCase):
+    def test_formal_stage_labels_are_unique_and_contiguous(self):
+        labels = [stage.label for stage in PipelineStage]
+
+        self.assertEqual(len(labels), 11)
+        self.assertEqual(len(set(labels)), 11)
+        for number, label in enumerate(labels, start=1):
+            self.assertTrue(label.startswith(f"阶段 {number}:"))
+
+        self.assertNotIn(
+            PipelineCheckpoint.PRE_STARLESS_COMPATIBILITY_GATE.label,
+            labels,
+        )
 
 
 class _Siril:

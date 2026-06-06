@@ -24,9 +24,23 @@ except ImportError:
     from common import *  # type: ignore[no-redef]
 
 try:
-    from .disk_preflight import *
+    from .constants import FITS_SUFFIXES
+    from .disk_preflight import format_bytes, safe_file_size
 except ImportError:
-    from disk_preflight import *  # type: ignore[no-redef]
+    from constants import FITS_SUFFIXES  # type: ignore[no-redef]
+    from disk_preflight import format_bytes, safe_file_size  # type: ignore[no-redef]
+
+
+BOOTSTRAP_TIMEOUT_ENV = "SEESTAR_BOOTSTRAP_TIMEOUT_SEC"
+DEFAULT_BOOTSTRAP_TIMEOUT_SEC = 300
+MIN_BOOTSTRAP_TIMEOUT_SEC = 60
+MAX_BOOTSTRAP_TIMEOUT_SEC = 3600
+BOOTSTRAP_TIMEOUT_SEC_PER_GIB = 120
+BYTES_PER_GIB = 1024 * 1024 * 1024
+TEMP_CLEANUP_TIMEOUT_ENV = "SEESTAR_TEMP_CLEANUP_TIMEOUT_SEC"
+DEFAULT_TEMP_CLEANUP_TIMEOUT_SEC = 30
+MIN_TEMP_CLEANUP_TIMEOUT_SEC = 1
+MAX_TEMP_CLEANUP_TIMEOUT_SEC = 300
 
 
 class PipelineWorker(QThread):
@@ -91,6 +105,7 @@ class PipelineWorker(QThread):
         self._ai_env_applied_keys: list[str] = []
         self._ai_env_warnings: list[str] = []
         self._runtime_plugin_dir: Path | None = None
+        self._temp_cleanup_timeout_sec = DEFAULT_TEMP_CLEANUP_TIMEOUT_SEC
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -495,6 +510,26 @@ class PipelineWorker(QThread):
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"
+        env.setdefault(
+            BOOTSTRAP_TIMEOUT_ENV,
+            str(DEFAULT_BOOTSTRAP_TIMEOUT_SEC),
+        )
+        env.setdefault(
+            TEMP_CLEANUP_TIMEOUT_ENV,
+            str(DEFAULT_TEMP_CLEANUP_TIMEOUT_SEC),
+        )
+        try:
+            cleanup_timeout = int(round(float(env[TEMP_CLEANUP_TIMEOUT_ENV])))
+        except (OverflowError, TypeError, ValueError):
+            cleanup_timeout = DEFAULT_TEMP_CLEANUP_TIMEOUT_SEC
+            self._append_event(
+                f"{TEMP_CLEANUP_TIMEOUT_ENV}={env[TEMP_CLEANUP_TIMEOUT_ENV]!r} 无效，"
+                f"使用默认值 {DEFAULT_TEMP_CLEANUP_TIMEOUT_SEC}s。"
+            )
+        self._temp_cleanup_timeout_sec = max(
+            MIN_TEMP_CLEANUP_TIMEOUT_SEC,
+            min(MAX_TEMP_CLEANUP_TIMEOUT_SEC, cleanup_timeout),
+        )
         env.setdefault("SEESTAR_SIRILPY_TIMEOUT_SEC", "120")
         env["PIP_NO_INDEX"] = "1"
         env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
@@ -546,6 +581,95 @@ class PipelineWorker(QThread):
             env["SEESTAR_SPCC_ENABLE"] = "0"
         return env
 
+    def _bootstrap_input_size_bytes(self) -> int:
+        if not self.work_dir.is_dir():
+            return 0
+        total = 0
+        try:
+            candidates = self.work_dir.iterdir()
+            for path in candidates:
+                if path.is_file() and path.suffix.lower() in FITS_SUFFIXES:
+                    total += safe_file_size(path)
+        except OSError:
+            return total
+        return total
+
+    def _bootstrap_timeout_sec(
+        self,
+        env: dict[str, str] | None = None,
+    ) -> tuple[int, int, int]:
+        source_env = env if env is not None else os.environ
+        raw_value = source_env.get(
+            BOOTSTRAP_TIMEOUT_ENV,
+            str(DEFAULT_BOOTSTRAP_TIMEOUT_SEC),
+        )
+        try:
+            base_timeout = int(round(float(raw_value)))
+        except (OverflowError, TypeError, ValueError):
+            base_timeout = DEFAULT_BOOTSTRAP_TIMEOUT_SEC
+            self._append_event(
+                f"{BOOTSTRAP_TIMEOUT_ENV}={raw_value!r} 无效，"
+                f"使用默认值 {DEFAULT_BOOTSTRAP_TIMEOUT_SEC}s。"
+            )
+        base_timeout = max(
+            MIN_BOOTSTRAP_TIMEOUT_SEC,
+            min(MAX_BOOTSTRAP_TIMEOUT_SEC, base_timeout),
+        )
+
+        input_bytes = self._bootstrap_input_size_bytes()
+        adaptive_extra = (
+            input_bytes * BOOTSTRAP_TIMEOUT_SEC_PER_GIB + BYTES_PER_GIB - 1
+        ) // BYTES_PER_GIB
+        effective_timeout = min(
+            MAX_BOOTSTRAP_TIMEOUT_SEC,
+            base_timeout + adaptive_extra,
+        )
+        return effective_timeout, base_timeout, input_bytes
+
+    def _cleanup_temp_dir(
+        self,
+        temp_dir: Path,
+        timeout_sec: float | None = None,
+    ) -> bool:
+        timeout = (
+            float(self._temp_cleanup_timeout_sec)
+            if timeout_sec is None
+            else max(0.0, float(timeout_sec))
+        )
+        errors: list[Exception] = []
+        removed = threading.Event()
+
+        def remove() -> None:
+            try:
+                shutil.rmtree(temp_dir)
+            except FileNotFoundError:
+                removed.set()
+            except Exception as exc:
+                errors.append(exc)
+            else:
+                removed.set()
+
+        cleanup_thread = threading.Thread(
+            target=remove,
+            name="seestar-temp-cleanup",
+            daemon=True,
+        )
+        cleanup_thread.start()
+        cleanup_thread.join(timeout)
+
+        if cleanup_thread.is_alive():
+            self._append_event(
+                f"临时目录清理超过 {timeout:g}s，已转为后台清理：{temp_dir}"
+            )
+            return False
+        if errors:
+            self._append_event(f"临时目录清理失败，已保留：{temp_dir} ({errors[0]})")
+            return False
+        if not removed.is_set():
+            self._append_event(f"临时目录清理异常中止，已保留：{temp_dir}")
+            return False
+        return True
+
     def _run_once(self, siril_cli: Path, run_ssf: Path, run_ini: Path) -> tuple[bool, int]:
         self._run_had_errors = False
         self._python_env_issue = False
@@ -582,6 +706,15 @@ class PipelineWorker(QThread):
         self._append_event(
             f"AI 阶段开关: {'ON' if self.ai_stage_enabled else 'OFF'} "
             "(controls stage11)"
+        )
+        bootstrap_timeout_sec, bootstrap_base_sec, bootstrap_input_bytes = (
+            self._bootstrap_timeout_sec(proc_env)
+        )
+        self._append_event(
+            "pyscript bootstrap 超时: "
+            f"{bootstrap_timeout_sec}s "
+            f"(base={bootstrap_base_sec}s, FITS={format_bytes(bootstrap_input_bytes)}, "
+            f"rate={BOOTSTRAP_TIMEOUT_SEC_PER_GIB}s/GiB)"
         )
         if self._ai_env_sources:
             self._append_event(
@@ -652,13 +785,14 @@ class PipelineWorker(QThread):
                 and self._active_mode == "python"
                 and self._pyscript_seen_at
                 and not self._pipeline_output_seen
-                and now - self._pyscript_seen_at > 180
+                and now - self._pyscript_seen_at > bootstrap_timeout_sec
             ):
                 bootstrap_timeout = True
                 self._run_had_errors = True
                 self._python_env_issue = True
                 self._append_event(
-                    "pyscript 启动超时（>180s）：Siril Python 环境疑似卡住。"
+                    "pyscript 启动超时"
+                    f"（>{bootstrap_timeout_sec}s）：Siril Python 环境疑似卡住。"
                 )
                 self._append_event(
                     "提示：关闭 Siril，删除 "
@@ -793,7 +927,7 @@ class PipelineWorker(QThread):
             run_status = "Failed"
             exit_code = -1
         finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            self._cleanup_temp_dir(temp_dir)
 
         if self._stop_event.is_set() and run_status != "Stopped":
             run_status = "Stopped"

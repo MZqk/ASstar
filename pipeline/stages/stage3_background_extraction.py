@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from models import PipelineStage
 from sirilpy.exceptions import CommandError, SirilError
 
 
@@ -614,7 +615,8 @@ def run_stage3_background_extraction(pipeline) -> None:
     - 每个候选成功后执行质量门控，避免过度扣背景
     - 候选命令失败或未达到充分质量时，继续 fallback 到下一个候选
     """
-    pipeline.log.stage_start("阶段 3: 背景提取")
+    stage_label = PipelineStage.BACKGROUND_EXTRACTION.label
+    pipeline.log.stage_start(stage_label)
     bg_ok = False
     selected_source = ""
     preflight_message = ""
@@ -969,10 +971,10 @@ def run_stage3_background_extraction(pipeline) -> None:
             else "stage3 输出保存失败"
         )
 
-    elapsed = pipeline.log.stage_end("阶段 3: 背景提取")
+    elapsed = pipeline.log.stage_end(stage_label)
     if bg_ok:
         status = "ok" if stage_saved else "degraded"
-        pipeline._record_stage("阶段 3: 背景提取", status, elapsed, stage_message)
+        pipeline._record_stage(stage_label, status, elapsed, stage_message)
         if selected_source == "builtin":
             pipeline.log.info("阶段3按策略使用内置 subsky/RBF 背景提取")
     else:
@@ -980,7 +982,7 @@ def run_stage3_background_extraction(pipeline) -> None:
         if not stage_saved:
             degrade_message += "；stage3 输出保存失败"
         pipeline._record_stage(
-            "阶段 3: 背景提取",
+            stage_label,
             "degraded",
             elapsed,
             degrade_message,

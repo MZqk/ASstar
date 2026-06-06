@@ -8,6 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
 
+from models import PipelineStage
 from sirilpy.exceptions import CommandError, DataError, SirilError
 
 
@@ -22,15 +23,16 @@ def run_stage11_ai_postprocess(
     The owner object must provide the runtime state and callbacks used by
     stage11 (cfg/log/siril/cmd_with_check/etc.).
     """
-    owner.log.stage_start("阶段 11: AI 后期美化")
+    stage_label = PipelineStage.AI_POSTPROCESS.label
+    owner.log.stage_start(stage_label)
     status = "ok"
     message = ""
     owner.ai_outputs_generated = False
 
     if not owner.cfg.ai_post_enabled:
-        elapsed = owner.log.stage_end("阶段 11: AI 后期美化")
+        elapsed = owner.log.stage_end(stage_label)
         owner._record_stage(
-            "阶段 11: AI 后期美化",
+            stage_label,
             "skipped",
             elapsed,
             "SEESTAR_AI_ENABLED not enabled",
@@ -45,9 +47,9 @@ def run_stage11_ai_postprocess(
     if not owner.cfg.ai_api_key.strip():
         missing_env.append("SEESTAR_AI_API_KEY")
     if missing_env:
-        elapsed = owner.log.stage_end("阶段 11: AI 后期美化")
+        elapsed = owner.log.stage_end(stage_label)
         owner._record_stage(
-            "阶段 11: AI 后期美化",
+            stage_label,
             "skipped",
             elapsed,
             f"missing required env: {', '.join(missing_env)}",
@@ -241,5 +243,5 @@ def run_stage11_ai_postprocess(
         if not owner.cfg.debug_mode:
             for path in temp_files:
                 owner._safe_unlink(path)
-        elapsed = owner.log.stage_end("阶段 11: AI 后期美化")
-        owner._record_stage("阶段 11: AI 后期美化", status, elapsed, message)
+        elapsed = owner.log.stage_end(stage_label)
+        owner._record_stage(stage_label, status, elapsed, message)

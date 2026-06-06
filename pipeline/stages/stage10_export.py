@@ -3,6 +3,7 @@ from typing import List
 
 from sirilpy.exceptions import CommandError, SirilError
 
+from models import PipelineStage
 from save_utils import export_final_outputs
 
 
@@ -13,7 +14,8 @@ def run_stage10_export(pipeline) -> None:
     - SCUNet 最终降噪（若可用）
     - 导出 TIFF/PNG/FITS
     """
-    pipeline.log.stage_start("阶段 10: 最终降噪与导出")
+    stage_label = PipelineStage.EXPORT.label
+    pipeline.log.stage_start(stage_label)
     status = "ok"
     messages: List[str] = []
 
@@ -375,9 +377,9 @@ def run_stage10_export(pipeline) -> None:
         messages=messages,
     )
 
-    elapsed = pipeline.log.stage_end("阶段 10: 最终降噪与导出")
+    elapsed = pipeline.log.stage_end(stage_label)
     pipeline._record_stage(
-        "阶段 10: 最终降噪与导出",
+        stage_label,
         status,
         elapsed,
         "；".join(messages),

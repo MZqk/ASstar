@@ -36,7 +36,7 @@ flowchart TD
     I --> J[stage5 RL反卷积/轻降噪]
     J --> K[stage6 线性去星与星点层准备]
     K --> L[stage7 拉伸 Starless]
-    L --> M[stage7.5 兼容记录/默认跳过]
+    L -.-> M[Stage 7 兼容检查点 非正式阶段/默认跳过]
     M --> N[stage8 Starless 深加工]
     N --> O[stage9 星点处理与合成]
     O --> P[stage10 最终降噪与导出]
@@ -47,18 +47,20 @@ flowchart TD
 
 其中：
 
-- 阶段 1-5 视为线性阶段，目标画像与 policy 选择合并到 Stage 3/4 preflight，不再单独占一个阶段
+- 正式阶段编号固定为 Stage 1-11，代码统一由 `models.PipelineStage` 提供阶段身份和显示标签
+- 阶段 1-5 视为线性阶段，目标画像与 policy 选择合并到 Stage 3/4 preflight，不再单独占一个阶段；`stage2_5_target_profiler()` 仅是兼容别名
 - 阶段 6 是线性去星与星点层准备，先在线性图上分离星点；阶段 7 再拉伸 starless，避免拉伸放大的脏背景进入去星模型
+- 主类正式入口为 `stage6_star_separation()` / `stage7_stretching()`；旧的 `stage7_star_separation()` / `stage6_stretching()` 仅为兼容别名
 - 因此阶段 7-10 是 starless-first 非线性核心处理
-- 默认 starless-first 路径下阶段 7.5 只记录兼容 skip，旧的去星前质量门控仍保留给非默认/调试路径
+- 默认 starless-first 路径下只记录一个 Stage 7 兼容检查点（非正式阶段）；旧的去星前质量门控仍保留给非默认/调试路径，`stage6_5_pre_starless_gate()` 仅是兼容别名
 - 阶段 6 去星、阶段 8 增强和阶段 11 可在 AI 总开关开启且凭据齐全时启用参数优化与诊断记录；当前阶段 7 主体拉伸固定为本地两候选，不再让 AI 或 policy 扩展候选集合
 - 自动调参发生在阶段 1 完成之后、阶段 2 开始之前
 - 脚本不会因为单个非致命阶段失败就立刻退出，而是尽量记录 `ok / degraded / failed / skipped` 后继续处理
 - 当 `SEESTAR_INPUT_MODE=stage2_corrected_resume` 时，会使用工作目录根下或旧 `process/` 下的 `stage2_corrected.fit` 作为已完成裁切/视场修正的叠加后中间结果：
-  `prepare stage2_corrected.fit -> auto tune -> stage3 background -> stage4 color -> stage5 linear -> stage6 starless -> stage7 stretch -> stage7.5 skipped -> stage8 -> stage9 -> stage10 -> stage11 -> cleanup`
+  `prepare stage2_corrected.fit -> auto tune -> stage3 background -> stage4 color -> stage5 linear -> stage6 starless -> stage7 stretch -> compatibility checkpoint skipped -> stage8 -> stage9 -> stage10 -> stage11 -> cleanup`
   同时把阶段 1 记录为 `skipped`，阶段 2 记录为加载既有中间结果
 - 当 `SEESTAR_INPUT_MODE=result_linear_resume` 时，会改走显式续跑分支：
-  `prepare result_linear.fit -> auto tune -> target preflight -> stage6 starless -> stage7 stretch -> stage7.5 skipped -> stage8 -> stage9 -> stage10 -> stage11 -> cleanup`
+  `prepare result_linear.fit -> auto tune -> target preflight -> stage6 starless -> stage7 stretch -> compatibility checkpoint skipped -> stage8 -> stage9 -> stage10 -> stage11 -> cleanup`
   同时把阶段 2、3、4、5 记录为 `skipped`
 
 ### 2.1 实际天文后期逻辑总览
@@ -124,11 +126,11 @@ flowchart TD
 Stage 3/4 preflight 会生成运行时目标画像和策略：
 
 - `target_profile.json`：目标名称猜测、置信度、target type、风险标记和识别来源
-- `pipeline_policy.json`：阶段 3-6.5 使用的背景、校色、线性处理、拉伸候选和去星前门控策略
+- `pipeline_policy.json`：Stage 3-7 使用的背景、校色、线性处理、拉伸候选和兼容门控策略
 - 内置策略来自 `policy_selector.py`，配置文件来自 `pipeline/configs/policies/*.yaml`
 - 若 profiler、metadata 或自适应特征读取失败，会回退为 `generic_low_snr_safe`
 
-目标画像识别不再作为独立 Stage 2.5 记录到 stage summary；它合并为 Stage 3/4 preflight。Stage 3 背景提取前先生成初始 `target_profile.json` / `pipeline_policy.json`，Stage 4 在 `platesolve -focal=160 -pixelsize=2.90 -catalog=gaia -order=3` 后会再次基于 `stage4_psolved.fit` metadata 刷新目标画像，若 target type 或 policy 改变，会覆盖上述 JSON 并记录告警。
+目标画像识别不是独立 Stage 2.5，而是 Stage 3/4 内部 preflight，不记录到 stage summary。`stage2_5_target_profiler()` 仅为旧调用方保留，实际转发到 `target_profile_preflight()`。Stage 3 背景提取前先生成初始 `target_profile.json` / `pipeline_policy.json`，Stage 4 在 `platesolve -focal=160 -pixelsize=2.90 -catalog=gaia -order=3` 后会再次基于 `stage4_psolved.fit` metadata 刷新目标画像，若 target type 或 policy 改变，会覆盖上述 JSON 并记录告警。
 
 ### 3.5 `PipelineLogger`
 
@@ -501,9 +503,9 @@ AI 参数优化（`SEESTAR_AI_ENABLED=1` 且 endpoint/model/key 齐全时）：
 
 这意味着阶段 7 的 `failed` 更像"拉伸目标未达成"，而不是"整条链路终止"。
 
-### 5.7.5 阶段 7.5：兼容门控记录
+### 5.7.1 Stage 7 兼容检查点：去星前质量门控
 
-职责：保留旧流程的去星前质量门控兼容点。当前默认 starless-first 顺序已经在阶段 7 拉伸前完成阶段 6 去星，因此主流程会把阶段 7.5 记录为 `skipped`，消息为 `starless-first mode: Stage6 already separated stars before Stage7 stretch`。
+该检查点不是正式 Stage 6.5 或 Stage 7.5，不改变 Stage 1-11 的编号。职责是保留旧流程的去星前质量门控兼容点。当前默认 starless-first 顺序已经在 Stage 7 拉伸前完成 Stage 6 去星，因此主流程会把 “Stage 7 兼容检查点” 记录为 `skipped`。
 
 旧的非默认/调试路径仍可使用以下逻辑：在调用 SyQon/SASP 前判断当前拉伸图是否适合去星，并选择更安全的 starless 输入。
 
@@ -511,13 +513,13 @@ AI 参数优化（`SEESTAR_AI_ENABLED=1` 且 endpoint/model/key 齐全时）：
 
 1. 以 `stage7_stretched` 或当前 `stretched_name` 为源读取自适应特征
 2. 合并当前质量指标：黑场比例、高光裁剪、星点尺寸、边缘黑边等
-3. 使用 `target_profile` 和 `pipeline_policy.stage6_5_pre_starless_gate` 评估 `ready_for_starless`
+3. 使用 `target_profile` 和历史兼容 policy key `pipeline_policy.stage6_5_pre_starless_gate` 评估 `ready_for_starless`
 4. 当 policy 推荐 `stage7_conservative_asinh` 或 `stage7_ultra_conservative_asinh` 时，生成更保守的去星输入候选
 5. 若推荐文件缺失，会回退到可用的保守输入或原始阶段 7 拉伸检查点
 
 阶段输出：
 
-- `stage7_5_pre_starless_gate_report.json`（兼容别名：`pre_starless_gate_report.json`）
+- `stage7_5_pre_starless_gate_report.json`（历史文件名，兼容别名：`pre_starless_gate_report.json`）
 - 可能生成 `stage7_conservative_asinh.fit` 或 `stage7_ultra_conservative_asinh.fit`
 
 回退逻辑：
@@ -916,10 +918,10 @@ JSON 结构固定包含 `schema`、`sequence`、`stem`、`file`、`metrics`、`f
 
 1. 阶段顺序是核心契约：1-10 为稳定主链，阶段 11 仅可选追加，不可插到 1-10 中间。
 2. 自动调参是"重写配置"，不是"给某个阶段附加参数"，排查参数异常时要先看自动调参日志。
-3. Stage 3/4 preflight 的 `target_profile.json` / `pipeline_policy.json` 是 Stage 3-6.5 的策略输入；新增 target type 或候选时要同步内置 policy、配置文件和候选 evaluator。
+3. Stage 3/4 preflight 的 `target_profile.json` / `pipeline_policy.json` 是 Stage 3-7 的策略输入；新增 target type 或候选时要同步内置 policy、配置文件和候选 evaluator。`stage6_5_pre_starless_gate` 只是历史 policy key。
 4. Stage 7 候选不能只看命令成功，必须看 `quality_ok`、`pixel_stats` 和 `normal_selected`；degraded fallback 是可导出兜底，不是正常最佳结果。
 5. `workflow_plugin_probe_enabled` 控制广泛插件探测开关：为 `False` 时大部分插件命令不会被尝试，只有标记 `allow_when_probe_disabled=True` 的命令（如 Stage 6 的 SASP Dark Star fallback）仍可执行；阶段 8 默认走 SASP Python API，不再先探测实验性 `sasp_*` Siril 命令。
-6. 阶段 5、6、6.5、7、8、9、10、11 都有明显降级路径，改动时不能只看成功路径。
+6. Stage 5-11 及 Stage 7 兼容门控检查点都有明显降级路径，改动时不能只看成功路径。
 7. `process/` 每轮都会重建，任何依赖历史中间文件的思路都不成立。
 8. `Light_` 输入路径使用隔离目录再 `link`，不要直接在工作目录对历史序列做操作。
 9. 去星工具失败时并不会终止，而是退化为"把当前 Stage 6 输入当作 starless 继续"，这一点会直接影响阶段 7-10 的视觉预期。
@@ -940,7 +942,7 @@ JSON 结构固定包含 `schema`、`sequence`、`stem`、`file`、`metrics`、`f
 - Stage5 降噪无效：看 `stage5_linear_report.json` 的 `denoise.method`，确认 Siril `denoise -indep` 是否失败以及 CosmicClarity 低强度回退是否命中
 - Stage5 反卷积无效：看 `stage5_linear_report.json` 的 `deconvolution.applied` 和日志中的 `findstar/makepsf/rl` 错误；失败时流程会回退使用 `stage5_linear.fit`
 - 拉伸异常：看阶段 7 的 `stage7_stretch_quality.json` 和 `stretch_candidates_report.json`，确认 `stage7_cand_a` / `stage7_cand_b` 哪个被选中、是否为 degraded fallback，以及 `pixel_stats` 是否命中黑场/白场/动态范围门控
-- 去星前直接跳过或输入过保守：看阶段 7.5 的 `stage7_5_pre_starless_gate_report.json`、`ready_for_starless` 和 `recommended_starless_input`
+- 去星前直接跳过或输入过保守：看 Stage 7 兼容检查点的 `stage7_5_pre_starless_gate_report.json`、`ready_for_starless` 和 `recommended_starless_input`
 - 去星无效：看阶段 6 是 SyQon 成功、回退到 SASP Dark Star、还是已经退化成"直接保存当前 Stage 6 输入为 starless"
 - 星点回混异常：看阶段 9 走的是 StarComposer 还是上一阶段 `starless_enhanced` + `starmask` 像素级回混
 - 最终没有某类导出：看阶段 10 是否命中了回退文件名 `result_processed` / `result_final`

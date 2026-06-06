@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -90,6 +91,102 @@ gui_module = _load_gui_module()
 
 
 class GuiRuntimeModesTests(unittest.TestCase):
+    def test_append_text_holds_log_lock_while_writing(self):
+        lock = threading.Lock()
+
+        class LogFile:
+            def __init__(self):
+                self.writes = []
+                self.flush_count = 0
+
+            def write(self, text):
+                self.assert_locked()
+                self.writes.append(text)
+
+            def flush(self):
+                self.assert_locked()
+                self.flush_count += 1
+
+            @staticmethod
+            def assert_locked():
+                if not lock.locked():
+                    raise AssertionError("run log lock is not held")
+
+        log_file = LogFile()
+        log_view = SimpleNamespace(
+            moveCursor=lambda *_args: None,
+            insertPlainText=lambda *_args: None,
+        )
+        proxy = SimpleNamespace(
+            log_view=log_view,
+            run_log_file=log_file,
+            _run_log_lock=lock,
+        )
+        append_text = gui_module.SeestarGui._append_text
+        method_globals = append_text.__globals__
+        original_cursor = method_globals["QTextCursor"]
+        method_globals["QTextCursor"] = SimpleNamespace(
+            MoveOperation=SimpleNamespace(End=object())
+        )
+        try:
+            append_text(proxy, "worker output\n")
+        finally:
+            method_globals["QTextCursor"] = original_cursor
+
+        self.assertEqual(log_file.writes, ["worker output\n"])
+        self.assertEqual(log_file.flush_count, 1)
+
+    def test_close_event_forces_termination_after_wait_timeout(self):
+        calls = []
+
+        class Worker:
+            def isRunning(self):
+                return True
+
+            def wait(self, timeout=None):
+                calls.append(("wait", timeout))
+                return timeout is None
+
+            def terminate(self):
+                calls.append(("terminate", None))
+
+        class Event:
+            accepted = False
+            ignored = False
+
+            def accept(self):
+                self.accepted = True
+
+            def ignore(self):
+                self.ignored = True
+
+        worker = Worker()
+        proxy = SimpleNamespace(
+            worker=worker,
+            _stop_run=lambda: (_ for _ in ()).throw(RuntimeError("stop failed")),
+            _append_event=lambda _message: (_ for _ in ()).throw(OSError("log failed")),
+        )
+        event = Event()
+        close_event = gui_module.SeestarGui.closeEvent
+        method_globals = close_event.__globals__
+        original_message_box = method_globals["QMessageBox"]
+        yes = 1
+        method_globals["QMessageBox"] = SimpleNamespace(
+            StandardButton=SimpleNamespace(Yes=yes, No=2),
+            question=lambda *_args, **_kwargs: yes,
+        )
+        try:
+            close_event(proxy, event)
+        finally:
+            method_globals["QMessageBox"] = original_message_box
+
+        self.assertEqual(
+            calls,
+            [("wait", 8000), ("terminate", None), ("wait", None)],
+        )
+        self.assertTrue(event.accepted)
+        self.assertFalse(event.ignored)
+
     def _make_gui_proxy(self, work_dir: Path, *, input_mode: str):
         resources = work_dir / "resources"
         resources.mkdir(exist_ok=True)
@@ -373,6 +470,125 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 gui_module.INPUT_MODE_LINEAR_RESUME,
             )
             self.assertEqual(env.get("PYTHONUNBUFFERED"), "1")
+            self.assertEqual(env.get("SEESTAR_BOOTSTRAP_TIMEOUT_SEC"), "300")
+            self.assertEqual(env.get("SEESTAR_TEMP_CLEANUP_TIMEOUT_SEC"), "30")
+            self.assertEqual(worker._temp_cleanup_timeout_sec, 30)
+
+    def test_pipeline_worker_bootstrap_timeout_uses_env_and_fits_size(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            work_dir = root / "work"
+            work_dir.mkdir()
+            large_fit = work_dir / "large_input.fit"
+            with large_fit.open("wb") as stream:
+                stream.truncate(2 * 1024 * 1024 * 1024)
+            worker = gui_module.PipelineWorker(
+                work_dir=work_dir,
+                config_template=root / "config.ini",
+                pipeline_path=root / "pipeline.py",
+                siril_plugin_dir=root / "plugins",
+                resources=root / "resources",
+                runtime_home=root / "runtime_home",
+                siril_candidates=[],
+            )
+
+            effective, base, input_bytes = worker._bootstrap_timeout_sec(
+                {"SEESTAR_BOOTSTRAP_TIMEOUT_SEC": "600"}
+            )
+
+            self.assertEqual(base, 600)
+            self.assertEqual(input_bytes, 2 * 1024 * 1024 * 1024)
+            self.assertEqual(effective, 840)
+
+    def test_pipeline_worker_bootstrap_timeout_invalid_value_uses_default_and_caps(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            work_dir = root / "work"
+            work_dir.mkdir()
+            worker = gui_module.PipelineWorker(
+                work_dir=work_dir,
+                config_template=root / "config.ini",
+                pipeline_path=root / "pipeline.py",
+                siril_plugin_dir=root / "plugins",
+                resources=root / "resources",
+                runtime_home=root / "runtime_home",
+                siril_candidates=[],
+            )
+            events = []
+            worker.log = SimpleNamespace(emit=lambda text: events.append(str(text)))
+
+            effective, base, input_bytes = worker._bootstrap_timeout_sec(
+                {"SEESTAR_BOOTSTRAP_TIMEOUT_SEC": "invalid"}
+            )
+            capped, capped_base, _ = worker._bootstrap_timeout_sec(
+                {"SEESTAR_BOOTSTRAP_TIMEOUT_SEC": "99999"}
+            )
+
+            self.assertEqual((effective, base, input_bytes), (300, 300, 0))
+            self.assertEqual((capped, capped_base), (3600, 3600))
+            self.assertTrue(any("使用默认值 300s" in event for event in events))
+
+    def test_pipeline_worker_temp_cleanup_timeout_does_not_block(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            temp_dir = root / "embedded"
+            temp_dir.mkdir()
+            worker = gui_module.PipelineWorker(
+                work_dir=root / "work",
+                config_template=root / "config.ini",
+                pipeline_path=root / "pipeline.py",
+                siril_plugin_dir=root / "plugins",
+                resources=root / "resources",
+                runtime_home=root / "runtime_home",
+                siril_candidates=[],
+            )
+            events = []
+            worker.log = SimpleNamespace(emit=lambda text: events.append(str(text)))
+            release_cleanup = threading.Event()
+            cleanup_finished = threading.Event()
+            original_rmtree = gui_module.PipelineWorker._cleanup_temp_dir.__globals__[
+                "shutil"
+            ].rmtree
+
+            def slow_rmtree(_path):
+                release_cleanup.wait(1)
+                cleanup_finished.set()
+
+            gui_module.PipelineWorker._cleanup_temp_dir.__globals__[
+                "shutil"
+            ].rmtree = slow_rmtree
+            try:
+                cleaned = worker._cleanup_temp_dir(temp_dir, timeout_sec=0.01)
+            finally:
+                release_cleanup.set()
+                cleanup_finished.wait(1)
+                gui_module.PipelineWorker._cleanup_temp_dir.__globals__[
+                    "shutil"
+                ].rmtree = original_rmtree
+
+            self.assertFalse(cleaned)
+            self.assertTrue(any("已转为后台清理" in event for event in events))
+
+    def test_pipeline_worker_temp_cleanup_removes_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            temp_dir = root / "embedded"
+            temp_dir.mkdir()
+            (temp_dir / "runtime.bin").write_bytes(b"x")
+            worker = gui_module.PipelineWorker(
+                work_dir=root / "work",
+                config_template=root / "config.ini",
+                pipeline_path=root / "pipeline.py",
+                siril_plugin_dir=root / "plugins",
+                resources=root / "resources",
+                runtime_home=root / "runtime_home",
+                siril_candidates=[],
+            )
+
+            cleaned = worker._cleanup_temp_dir(temp_dir, timeout_sec=1)
+
+            self.assertTrue(cleaned)
+            self.assertFalse(temp_dir.exists())
 
     def test_pipeline_worker_accepts_stage2_corrected_resume_input_mode(self):
         with tempfile.TemporaryDirectory() as td:

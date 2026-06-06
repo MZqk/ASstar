@@ -1,6 +1,7 @@
 """Stage 9 star processing and remixing."""
 from typing import List
 
+from models import PipelineStage
 from sirilpy.exceptions import CommandError, SirilError
 
 
@@ -58,7 +59,8 @@ def run_stage9_star_remixing(pipeline) -> None:
     - 对齐工作流中的 Star Stretch / SCNR / Curves / StarComposer
     - 插件不可用时使用阶段 8 的 starless_enhanced 作为主图，再回混非线性 starmask
     """
-    pipeline.log.stage_start("阶段 9: 星点处理与合成")
+    stage_label = PipelineStage.STAR_REMIXING.label
+    pipeline.log.stage_start(stage_label)
     messages: List[str] = []
     source_stem = getattr(pipeline, "_stage8_final_source", "starless_enhanced") or "starless_enhanced"
     fallback_used = bool(getattr(pipeline, "_stage8_fallback_used", False))
@@ -85,9 +87,9 @@ def run_stage9_star_remixing(pipeline) -> None:
             diff_note = pipeline._stage_diff_note("stage9_remixed", safe_source)
             if diff_note:
                 messages.append(diff_note)
-            elapsed = pipeline.log.stage_end("阶段 9: 星点处理与合成")
+            elapsed = pipeline.log.stage_end(stage_label)
             pipeline._record_stage(
-                "阶段 9: 星点处理与合成",
+                stage_label,
                 "ok" if stage_saved else "degraded",
                 elapsed,
                 "；".join(messages),
@@ -211,10 +213,10 @@ def run_stage9_star_remixing(pipeline) -> None:
         stage7_diff_note = pipeline._stage_diff_note("stage9_remixed", "stage7_stretched")
         if stage7_diff_note:
             messages.append(stage7_diff_note)
-        elapsed = pipeline.log.stage_end("阶段 9: 星点处理与合成")
+        elapsed = pipeline.log.stage_end(stage_label)
         if stage_saved:
             pipeline._record_stage(
-                "阶段 9: 星点处理与合成",
+                stage_label,
                 'ok',
                 elapsed,
                 "；".join(messages),
@@ -222,7 +224,7 @@ def run_stage9_star_remixing(pipeline) -> None:
         else:
             messages.append("stage9 输出保存失败")
             pipeline._record_stage(
-                "阶段 9: 星点处理与合成",
+                stage_label,
                 'degraded',
                 elapsed,
                 "；".join(messages),
@@ -232,9 +234,9 @@ def run_stage9_star_remixing(pipeline) -> None:
     pipeline.log.info("执行基于上一阶段的星点合成...")
     if not pipeline.starmask_file or not pipeline.starmask_file.exists():
         pipeline.log.warn("无星点蒙版，跳过混合阶段")
-        elapsed = pipeline.log.stage_end("阶段 9: 星点处理与合成")
+        elapsed = pipeline.log.stage_end(stage_label)
         pipeline._record_stage(
-            "阶段 9: 星点处理与合成", 'skipped', elapsed, "无星点蒙版")
+            stage_label, 'skipped', elapsed, "无星点蒙版")
         return
 
     intensity = _clamp_float(pipeline.cfg.star_intensity * remix_scale, 0.10, 1.05)
@@ -279,9 +281,9 @@ def run_stage9_star_remixing(pipeline) -> None:
                 "使用替代强度完成混合 "
                 f"({fallback_intensity})")
         else:
-            elapsed = pipeline.log.stage_end("阶段 9: 星点处理与合成")
+            elapsed = pipeline.log.stage_end(stage_label)
             pipeline._record_stage(
-                "阶段 9: 星点处理与合成", 'degraded', elapsed,
+                stage_label, 'degraded', elapsed,
                 "星点混合失败，使用上一阶段无星结果")
             return
 
@@ -293,10 +295,10 @@ def run_stage9_star_remixing(pipeline) -> None:
     if stage7_diff_note:
         messages.append(stage7_diff_note)
 
-    elapsed = pipeline.log.stage_end("阶段 9: 星点处理与合成")
+    elapsed = pipeline.log.stage_end(stage_label)
     if stage_saved:
         pipeline._record_stage(
-            "阶段 9: 星点处理与合成",
+            stage_label,
             'ok',
             elapsed,
             "；".join(messages),
@@ -304,7 +306,7 @@ def run_stage9_star_remixing(pipeline) -> None:
     else:
         messages.append("stage9 输出保存失败")
         pipeline._record_stage(
-            "阶段 9: 星点处理与合成",
+            stage_label,
             'degraded',
             elapsed,
             "；".join(messages),

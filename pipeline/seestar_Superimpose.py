@@ -56,7 +56,9 @@ from processor_services import (
 from models import (
     AutoTuneResult,
     ImageFeatures,
+    PipelineCheckpoint,
     PipelineConfig,
+    PipelineStage,
     QualityMetrics,
     Stage6StretchStrategy,
     StageResult,
@@ -810,7 +812,6 @@ class SeestarPostProcessor(
     }
 
     def __init__(self, config=None):
-        print("DEBUG: SeestarPostProcessor __init__ started")
         self._load_project_env_defaults()
         if config is None:
             self.cfg = PipelineConfig()
@@ -1050,7 +1051,8 @@ class SeestarPostProcessor(
         self.log.info(f"处理目录: {self.process_dir}")
 
     def _prepare_linear_resume_input(self) -> None:
-        self.log.stage_start("阶段 1: 前期准备")
+        stage_label = PipelineStage.PREPARATION.label
+        self.log.stage_start(stage_label)
         self._prepare_process_dir()
 
         linear_path = self.work_dir / LINEAR_RESUME_INPUT_NAME
@@ -1078,8 +1080,8 @@ class SeestarPostProcessor(
         if not stage_saved:
             message += "；stage1 输出保存失败"
 
-        elapsed = self.log.stage_end("阶段 1: 前期准备")
-        self._record_stage("阶段 1: 前期准备", stage_status, elapsed, message)
+        elapsed = self.log.stage_end(stage_label)
+        self._record_stage(stage_label, stage_status, elapsed, message)
 
     def _stage2_corrected_resume_candidates(self) -> List[Path]:
         candidates = [
@@ -1098,10 +1100,11 @@ class SeestarPostProcessor(
 
     def _prepare_stage2_corrected_resume_input(self) -> None:
         self._record_skipped_stage(
-            "阶段 1: 前期准备",
+            PipelineStage.PREPARATION.label,
             "skipped by stage2 corrected resume mode",
         )
-        self.log.stage_start("阶段 2: 裁切")
+        stage_label = PipelineStage.VIEW_CORRECTION.label
+        self.log.stage_start(stage_label)
 
         source_path = next(
             (path for path in self._stage2_corrected_resume_candidates() if path.is_file()),
@@ -1150,8 +1153,8 @@ class SeestarPostProcessor(
             if not stage_saved:
                 message += "；stage2 输出保存失败"
 
-            elapsed = self.log.stage_end("阶段 2: 裁切")
-            self._record_stage("阶段 2: 裁切", stage_status, elapsed, message)
+            elapsed = self.log.stage_end(stage_label)
+            self._record_stage(stage_label, stage_status, elapsed, message)
         finally:
             if temp_source is not None:
                 try:
@@ -1329,16 +1332,24 @@ class SeestarPostProcessor(
             messages.append(f"target profiler fallback: {reason}")
         return "；".join(messages)
 
-    def stage2_5_target_profiler(self):
-        """Compatibility wrapper: target profiling is now a Stage3/4 preflight."""
+    def target_profile_preflight(self):
+        """Run target profiling as an internal Stage 3/4 preflight."""
         message = self._run_target_profile_preflight(
-            source="Stage2.5 compatibility preflight",
+            source=PipelineCheckpoint.TARGET_PROFILE_PREFLIGHT.label,
             preview_name="stage3_target_preview.png",
         )
         self.log.info(
-            "阶段 2.5 已合并到 Stage3/4 preflight，不再写入独立阶段"
+            "Target profiler 属于 Stage 3/4 内部 preflight，不写入独立阶段"
             + (f"；{message}" if message else "")
         )
+
+    def stage2_5_target_profiler(self):
+        """Deprecated compatibility alias for target_profile_preflight()."""
+        self.log.warn(
+            "stage2_5_target_profiler() 是历史兼容别名；"
+            "Target profiler 已合并到 Stage 3/4 preflight"
+        )
+        return self.target_profile_preflight()
 
     # ========================================
     # 阶段 3: 背景提取
@@ -1355,12 +1366,17 @@ class SeestarPostProcessor(
     def stage5_linear_denoise(self):
         return run_stage5_linear_denoise(self)
 
-    def stage6_stretching(self):
+    def stage7_stretching(self):
         return run_stage6_stretching(self)
 
-    def stage6_5_pre_starless_gate(self):
-        """Compatibility gate: choose the safest input for star separation."""
-        self.log.stage_start("阶段 6.5: 去星前质量门控")
+    def stage6_stretching(self):
+        """Deprecated compatibility alias for stage7_stretching()."""
+        return self.stage7_stretching()
+
+    def pre_starless_compatibility_gate(self):
+        """Run the legacy pre-starless checkpoint outside the formal stages."""
+        stage_label = PipelineCheckpoint.PRE_STARLESS_COMPATIBILITY_GATE.label
+        self.log.stage_start(stage_label)
         status = "ok"
         messages: List[str] = []
         report: Dict[str, Any]
@@ -1412,7 +1428,7 @@ class SeestarPostProcessor(
             self.pre_starless_gate_report = report
             self._write_stage_json("pre_starless_gate_report.json", report)
             self.log.info(
-                "[Stage6.5] ready_for_starless="
+                "[PreStarlessCompatibilityGate] ready_for_starless="
                 f"{bool(report.get('ready_for_starless'))} recommended={report.get('recommended_starless_input')}"
             )
             messages.append(
@@ -1432,22 +1448,37 @@ class SeestarPostProcessor(
             }
             self.pre_starless_gate_report = report
             self._write_stage_json("pre_starless_gate_report.json", report)
-            self.log.warn(f"[Stage6.5] quality gate failed, using stage7_stretched: {reason}")
+            self.log.warn(
+                "[PreStarlessCompatibilityGate] quality gate failed, "
+                f"using stage7_stretched: {reason}"
+            )
             messages.append(f"quality gate fallback: {reason}")
 
-        elapsed = self.log.stage_end("阶段 6.5: 去星前质量门控")
+        elapsed = self.log.stage_end(stage_label)
         self._record_stage(
-            "阶段 6.5: 去星前质量门控",
+            stage_label,
             status,
             elapsed,
             "；".join(messages),
         )
 
+    def stage6_5_pre_starless_gate(self):
+        """Deprecated compatibility alias for pre_starless_compatibility_gate()."""
+        self.log.warn(
+            "stage6_5_pre_starless_gate() 是历史兼容别名；"
+            "该门控不是正式 Stage 6.5"
+        )
+        return self.pre_starless_compatibility_gate()
+
     # ========================================
     # 阶段 6: 星点分离（starless-first，先于主体拉伸执行）
     # ========================================
-    def stage7_star_separation(self):
+    def stage6_star_separation(self):
         return run_stage7_star_separation(self)
+
+    def stage7_star_separation(self):
+        """Deprecated compatibility alias for stage6_star_separation()."""
+        return self.stage6_star_separation()
 
     def stage8_nebula_enhancement(self):
         return run_stage8_nebula_enhancement(self)
@@ -1463,12 +1494,13 @@ class SeestarPostProcessor(
     # ========================================
     def stage11_ai_postprocess(self):
         if run_stage11_ai_postprocess is None:
-            self.log.stage_start("阶段 11: AI 后期美化")
+            stage_label = PipelineStage.AI_POSTPROCESS.label
+            self.log.stage_start(stage_label)
             status = "degraded"
             message = f"stage11 module import failed: {STAGE11_IMPORT_ERROR}"
             self.log.warn(message)
-            elapsed = self.log.stage_end("阶段 11: AI 后期美化")
-            self._record_stage("阶段 11: AI 后期美化", status, elapsed, message)
+            elapsed = self.log.stage_end(stage_label)
+            self._record_stage(stage_label, status, elapsed, message)
             return
 
         run_stage11_ai_postprocess(
@@ -1587,7 +1619,7 @@ class SeestarPostProcessor(
                 self._prepare_linear_resume_input()
                 self._auto_tune_for_current_input()
                 self._record_skipped_stage(
-                    "阶段 2: 裁切",
+                    PipelineStage.VIEW_CORRECTION.label,
                     "skipped by linear resume mode",
                 )
                 self._run_target_profile_preflight(
@@ -1596,15 +1628,15 @@ class SeestarPostProcessor(
                     preview_name="stage3_target_preview.png",
                 )
                 self._record_skipped_stage(
-                    "阶段 3: 背景提取",
+                    PipelineStage.BACKGROUND_EXTRACTION.label,
                     "skipped by linear resume mode",
                 )
                 self._record_skipped_stage(
-                    "阶段 4: 图像解析 + 色彩校准",
+                    PipelineStage.COLOR_CALIBRATION.label,
                     "skipped by linear resume mode",
                 )
                 self._record_skipped_stage(
-                    "阶段 5: 线性反卷积 / 轻降噪",
+                    PipelineStage.LINEAR_DENOISE.label,
                     "skipped by linear resume mode",
                 )
             elif self.input_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
@@ -1621,11 +1653,12 @@ class SeestarPostProcessor(
                 self.stage3_background_extraction()
                 self.stage4_color_calibration()
                 self.stage5_linear_denoise()
-            self.stage7_star_separation()
-            self.stage6_stretching()
+            self.stage6_star_separation()
+            self.stage7_stretching()
             self._record_skipped_stage(
-                "阶段 7.5: 去星前质量门控（兼容跳过）",
-                "starless-first mode: Stage6 already separated stars before Stage7 stretch",
+                PipelineCheckpoint.PRE_STARLESS_COMPATIBILITY_GATE.label,
+                "not a formal stage; starless-first mode completes Stage 6 "
+                "before Stage 7",
             )
             self.stage8_nebula_enhancement()
             self.stage9_star_remixing()

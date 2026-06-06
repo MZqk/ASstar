@@ -1,6 +1,7 @@
 """Star separation and star-mask preparation."""
 from typing import Any, Dict, List, Optional, Tuple
 
+from models import PipelineStage
 from sirilpy.exceptions import CommandError, SirilError
 
 
@@ -154,7 +155,7 @@ def run_stage7_star_separation(pipeline) -> None:
     - 优先 SyQon-Starless.py / SASP Dark Star
     - 生成并导出 starless/starmask 交换文件供外部工具使用
     """
-    stage_label = "阶段 6: 去星与星点层准备"
+    stage_label = PipelineStage.STAR_SEPARATION.label
     pipeline.log.stage_start(stage_label)
     pipeline._stage7_starless_skipped = False
     pipeline._stage8_conservative_mode = False

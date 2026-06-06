@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
+from models import PipelineStage
 from sirilpy.exceptions import CommandError, SirilError
 
 
@@ -224,7 +225,7 @@ def run_stage5_linear_denoise(pipeline) -> None:
     - RL 后再做轻量线性降噪，最终保存 stage5_linear。
     - 不再默认执行全局锐化，避免在线性暗背景中放大彩噪和星环。
     """
-    stage_name = "阶段 5: 线性反卷积 / 轻降噪"
+    stage_name = PipelineStage.LINEAR_DENOISE.label
     pipeline.log.stage_start(stage_name)
     status = "ok"
     messages: List[str] = []

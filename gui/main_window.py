@@ -8,6 +8,7 @@ import platform
 import re
 import shutil
 import subprocess
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from PySide6.QtCore import QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QTextCursor
 
 try:
-    from .disk_preflight import (
+    from .constants import (
         DISK_SPACE_HEADROOM_RATIO,
         DISK_SPACE_MIN_HEADROOM_BYTES,
         FITS_SUFFIXES,
@@ -23,6 +24,8 @@ try:
         LIGHT_PREPROCESS_SEQUENCE_COPIES,
         LINEAR_RESUME_STAGE_ARTIFACT_COPIES,
         STACKED_STAGE_ARTIFACT_COPIES,
+    )
+    from .disk_preflight import (
         DiskSpaceEstimate,
         directory_size_bytes,
         format_bytes,
@@ -30,7 +33,7 @@ try:
         safe_mtime,
     )
 except ImportError:
-    from disk_preflight import (  # type: ignore[no-redef]
+    from constants import (  # type: ignore[no-redef]
         DISK_SPACE_HEADROOM_RATIO,
         DISK_SPACE_MIN_HEADROOM_BYTES,
         FITS_SUFFIXES,
@@ -38,6 +41,8 @@ except ImportError:
         LIGHT_PREPROCESS_SEQUENCE_COPIES,
         LINEAR_RESUME_STAGE_ARTIFACT_COPIES,
         STACKED_STAGE_ARTIFACT_COPIES,
+    )
+    from disk_preflight import (  # type: ignore[no-redef]
         DiskSpaceEstimate,
         directory_size_bytes,
         format_bytes,
@@ -95,6 +100,7 @@ class SeestarGui(QMainWindow):
         self.worker: PipelineWorker | None = None
         self.run_log_path: Path | None = None
         self.run_log_file = None
+        self._run_log_lock = threading.Lock()
         self._current_work_dir: Path | None = None
         self.input_mode = INPUT_MODE_AUTO
         self.debug_mode_enabled = False
@@ -570,9 +576,10 @@ class SeestarGui(QMainWindow):
         self.log_view.moveCursor(QTextCursor.MoveOperation.End)
         self.log_view.insertPlainText(text)
         self.log_view.moveCursor(QTextCursor.MoveOperation.End)
-        if self.run_log_file:
-            self.run_log_file.write(text)
-            self.run_log_file.flush()
+        with self._run_log_lock:
+            if self.run_log_file:
+                self.run_log_file.write(text)
+                self.run_log_file.flush()
 
     def _timestamp(self) -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2042,7 +2049,12 @@ class SeestarGui(QMainWindow):
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.run_log_path = work_dir / f"seestar_gui_run_{stamp}.log"
-        self.run_log_file = self.run_log_path.open("a", encoding="utf-8", errors="replace")
+        with self._run_log_lock:
+            self.run_log_file = self.run_log_path.open(
+                "a",
+                encoding="utf-8",
+                errors="replace",
+            )
         self._append_divider(
             "本次任务开始",
             [
@@ -2126,14 +2138,23 @@ class SeestarGui(QMainWindow):
             self.worker.deleteLater()
             self.worker = None
 
-        if self.run_log_file:
-            self.run_log_file.close()
-            self.run_log_file = None
+        with self._run_log_lock:
+            if self.run_log_file:
+                self.run_log_file.close()
+                self.run_log_file = None
 
         self._current_work_dir = None
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if self.worker and self.worker.isRunning():
+            worker = self.worker
+
+            def log_shutdown_error(message: str) -> None:
+                try:
+                    self._append_event(message)
+                except (AttributeError, OSError, RuntimeError, ValueError):
+                    pass
+
             ret = QMessageBox.question(
                 self,
                 "处理仍在运行",
@@ -2144,6 +2165,26 @@ class SeestarGui(QMainWindow):
             if ret != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-            self._stop_run()
-            self.worker.wait(8000)
+            stopped = False
+            try:
+                self._stop_run()
+            except Exception as e:
+                log_shutdown_error(f"停止 worker 时发生异常：{e}")
+            finally:
+                try:
+                    stopped = worker.wait(8000)
+                except Exception as e:
+                    log_shutdown_error(f"等待 worker 退出时发生异常：{e}")
+
+            if not stopped:
+                log_shutdown_error("worker 停止超时，正在强制终止...")
+                try:
+                    worker.terminate()
+                except Exception as e:
+                    log_shutdown_error(f"强制终止 worker 时发生异常：{e}")
+                finally:
+                    try:
+                        worker.wait()
+                    except Exception as e:
+                        log_shutdown_error(f"最终等待 worker 退出时发生异常：{e}")
         event.accept()

@@ -7,6 +7,37 @@ from enum import Enum
 from typing import Any, Dict, List, Tuple
 
 
+class PipelineStage(str, Enum):
+    """Stable identities and display labels for the formal pipeline stages."""
+
+    PREPARATION = "阶段 1: 前期准备"
+    VIEW_CORRECTION = "阶段 2: 裁切"
+    BACKGROUND_EXTRACTION = "阶段 3: 背景提取"
+    COLOR_CALIBRATION = "阶段 4: 图像解析 + 色彩校准"
+    LINEAR_DENOISE = "阶段 5: 线性反卷积 / 轻降噪"
+    STAR_SEPARATION = "阶段 6: 去星与星点层准备"
+    STRETCHING = "阶段 7: 主体拉伸"
+    NEBULA_ENHANCEMENT = "阶段 8: Starless 深加工"
+    STAR_REMIXING = "阶段 9: 星点处理与合成"
+    EXPORT = "阶段 10: 最终降噪与导出"
+    AI_POSTPROCESS = "阶段 11: AI 后期美化"
+
+    @property
+    def label(self) -> str:
+        return self.value
+
+
+class PipelineCheckpoint(str, Enum):
+    """Named checkpoints that do not consume a formal stage number."""
+
+    TARGET_PROFILE_PREFLIGHT = "Stage 3/4 target profile preflight"
+    PRE_STARLESS_COMPATIBILITY_GATE = "Stage 7 兼容检查点: 去星前质量门控"
+
+    @property
+    def label(self) -> str:
+        return self.value
+
+
 @dataclass
 class PipelineConfig:
     """处理参数配置 - 所有可调参数集中管理"""

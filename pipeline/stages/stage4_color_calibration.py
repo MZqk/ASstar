@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from models import PipelineStage
 from sirilpy.exceptions import CommandError, SirilError
 
 
@@ -1055,7 +1056,7 @@ def run_stage4_color_calibration(pipeline) -> None:
     - platesolve -focal=160 -pixelsize=2.90 -catalog=gaia -order=3 后保存 stage4_psolved
     - SPCC 指定 Sony IMX585 OSC 参数，按 LP / No filter / narrowband 三类参数分支执行，失败后 PCC，最后本地背景中性化/星点白平衡回退
     """
-    stage_label = "阶段 4: 图像解析 + 色彩校准"
+    stage_label = PipelineStage.COLOR_CALIBRATION.label
     pipeline.log.stage_start(stage_label)
     status = "ok"
     hard_degraded = False

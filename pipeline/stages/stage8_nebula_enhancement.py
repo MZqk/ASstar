@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 from sirilpy.exceptions import CommandError, SirilError
 
 from image_metrics import format_feature_summary
+from models import PipelineStage
 
 
 def run_stage8_nebula_enhancement(pipeline) -> None:
@@ -13,7 +14,8 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
     - SASP WaveScale/DSE 输出必须经 Starless soft mask 回混
     - 插件不可用时回退到内置分区增强
     """
-    pipeline.log.stage_start("阶段 8: Starless 深加工")
+    stage_label = PipelineStage.NEBULA_ENHANCEMENT.label
+    pipeline.log.stage_start(stage_label)
     status = 'ok'
     messages: List[str] = []
     pipeline._stage8_final_source = "starless_enhanced"
@@ -107,9 +109,9 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                     },
                 )
                 pipeline._write_stage_json("stage8_enhancement_report.json", guard_payload)
-                elapsed = pipeline.log.stage_end("阶段 8: Starless 深加工")
+                elapsed = pipeline.log.stage_end(stage_label)
                 pipeline._record_stage(
-                    "阶段 8: Starless 深加工",
+                    stage_label,
                     "ok" if conservative_only_skip else "degraded",
                     elapsed,
                     "；".join(messages),
@@ -447,5 +449,5 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
         messages.append(line)
     pipeline.starless_file = pipeline.process_dir / f"{pipeline._stage8_final_source}.fit"
 
-    elapsed = pipeline.log.stage_end("阶段 8: Starless 深加工")
-    pipeline._record_stage("阶段 8: Starless 深加工", status, elapsed, "；".join(messages))
+    elapsed = pipeline.log.stage_end(stage_label)
+    pipeline._record_stage(stage_label, status, elapsed, "；".join(messages))
