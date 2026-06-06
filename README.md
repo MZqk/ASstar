@@ -13,6 +13,7 @@
 | `gui/seestar_gui_app.py` | GUI 入口 |
 | `gui/main_window.py` / `gui/pipeline_worker.py` | PySide6 主窗口与 Siril worker |
 | `build/build_macos_app.sh` | macOS 打包 |
+| `requirements.txt` / `requirements.lock` | 直接依赖约束 / pip-tools 生成的完整依赖锁 |
 | `resources/default.env` | 项目内默认 runtime env；无需手工 export |
 | `resources/ai.env` | 本地/打包覆盖 env；可放 API key，默认被 git 忽略 |
 | `INTEGRATION_README.md` | 内部集成/runtime/验证细节 |
@@ -70,6 +71,21 @@ Optional bundled resources:
 - `resources/siril_plugins/`（可用 `bash resources/siril_plugins/download_siril_plugins.sh` 准备）
 
 Default output: `release/SeestarSuperimpose.app`
+
+依赖更新后使用 Python 3.13 重新生成锁文件：
+
+```bash
+python3.13 -m pip install -r requirements-dev.txt
+PIP_CONFIG_FILE=/dev/null python3.13 -m piptools compile \
+  --resolver=backtracking --strip-extras --allow-unsafe --generate-hashes \
+  --index-url https://pypi.org/simple \
+  --output-file requirements.lock requirements.txt
+PIP_CONFIG_FILE=/dev/null python3.13 -m piptools compile \
+  --resolver=backtracking --strip-extras --allow-unsafe --generate-hashes \
+  --index-url https://pypi.org/simple \
+  --output-file resources/siril_plugins/requirements.lock \
+  resources/siril_plugins/requirements.txt
+```
 
 ## Common Env
 

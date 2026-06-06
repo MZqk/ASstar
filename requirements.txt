@@ -1,18 +1,20 @@
 # Local development / runtime helper dependencies.
 # The macOS app prepares offline runtime wheels from
 # resources/siril_plugins/downloads for offline execution.
+# Keep the resolver aligned with the reviewed macOS arm64 wheel hashes.
+-c resources/siril_plugins/requirements-macos-arm64.lock
 
-PySide6
-pyinstaller
-numpy
-astropy
-scipy
-tifffile
-onnxruntime
-torch
-torchvision
-sep
-spandrel
-einops
-safetensors
-platformdirs
+PySide6>=6.11.1,<7
+pyinstaller>=6.20.0,<7
+numpy>=2.4.6,<3
+astropy>=7.2.0,<8
+scipy>=1.17.1,<2
+tifffile>=2026.5.15,<2027
+onnxruntime>=1.26.0,<2
+torch>=2.12.0,<3
+torchvision>=0.27.0,<1
+sep>=1.4.1,<2
+spandrel>=0.4.2,<1
+einops>=0.8.2,<1
+safetensors>=0.7.0,<1
+platformdirs>=4.10.0,<5

@@ -1,0 +1,2 @@
+# Tooling used to regenerate dependency lock files.
+pip-tools>=7.5.3,<8

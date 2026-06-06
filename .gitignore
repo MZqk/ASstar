@@ -35,17 +35,37 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .pycache/
+.hypothesis/
+.tox/
+.nox/
+.pyre/
+.pytype/
+.cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 
 # Virtual environments
 .venv/
 venv/
 env/
 
+# Python packaging artifacts
+dist/
+*.egg-info/
+.eggs/
+
 # IDE and editor
 .vscode/
 .idea/
 *.swp
 *.swo
+*.bak
+*.orig
+*.rej
+*~
+.ipynb_checkpoints/
 .claude/
 .codex/
 .codegraph/
@@ -55,6 +75,8 @@ env/
 # Build/log temp files
 *.log
 *.tmp
+*.pid
+*.sock
 resources/ai.env
 resources/siril_plugins/downloads/
 .seestar_ai.env
@@ -62,6 +84,14 @@ resources/siril_plugins/downloads/
 # Local build artifacts
 release/
 packages/
+
+# Root-level astronomy inputs and generated exports
+/*.fit
+/*.fits
+/*.fts
+/*_processed*.png
+/*_processed*.tif
+/*_processed*.tiff
 
 # Pipeline outputs and intermediate files
 process/

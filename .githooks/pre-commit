@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -eu
+
+openai_key_pattern='s''k-[A-Za-z0-9_-]{16,}'
+bearer_token_pattern='B''earer[[:space:]]+[A-Za-z0-9._~+/=-]{16,}'
+found_secret=0
+
+while IFS= read -r -d '' path; do
+    if ! git show ":$path" | LC_ALL=C grep -Iq .; then
+        continue
+    fi
+
+    if git show ":$path" | LC_ALL=C grep -Eq "$openai_key_pattern"; then
+        printf 'Secret scan blocked commit: OpenAI-style key in %s\n' "$path" >&2
+        found_secret=1
+    fi
+    if git show ":$path" | LC_ALL=C grep -Eq "$bearer_token_pattern"; then
+        printf 'Secret scan blocked commit: Bearer token in %s\n' "$path" >&2
+        found_secret=1
+    fi
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+if ((found_secret)); then
+    printf 'Remove the credential from staged content before committing.\n' >&2
+    exit 1
+fi

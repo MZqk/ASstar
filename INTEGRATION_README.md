@@ -32,6 +32,7 @@ Inputs:
 
 Notes:
 - 打包前清理同名 `.app` 与 PyInstaller onedir。
+- 构建下载依赖时使用 `requirements.lock` 和 `resources/siril_plugins/requirements.lock`，并强制校验 pip-tools 生成的 SHA256。
 - seed venv 只保留最小运行依赖；重型插件依赖运行时从本地 wheels 离线安装。
 - `resources/ai.env` 和 `resources/siril_plugins/` 存在时会打包进 App Resources。
 - `resources/siril_plugins/cosmic_clarity/` 保留 CosmicClarity Native/classic wrapper 共用的最小模型集：`deep_denoise_{mono,color}_AI4.pth` 与 `deep_{sharp_stellar,nonstellar_sharp_conditional_psf}_AI4.pth`。

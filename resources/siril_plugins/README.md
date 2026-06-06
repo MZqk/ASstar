@@ -10,7 +10,10 @@
 - `cosmic_clarity/`: CosmicClarity Native/classic wrapper 共用模型
 - `bin/CosmicClarity`: classic CosmicClarity 兼容 wrapper
 - `download_siril_plugins.sh`: 一键下载脚本
-- `requirements.txt`: Python 3.13 runtime 插件依赖说明；对应 wheel 需缓存在 `downloads/`，供离线安装使用。`setiastrosuitepro` 单独按 `--no-deps` 下载，避免解析其不兼容的可选依赖。
+- `requirements.txt`: Python 3.13 runtime 直接依赖及兼容版本范围。
+- `requirements.lock`: pip-tools 生成的固定传递依赖和 SHA256，供构建流程使用。
+- `requirements-macos-arm64.lock`: macOS arm64 wheels 的固定版本与 SHA256；下载时由 pip `--require-hashes` 强制校验。
+- `asset-checksums.sha256`: Siril scripts 与 SyQon 文件的可信 SHA256 清单。
 
 ## 下载与更新
 
@@ -28,7 +31,7 @@ bash resources/siril_plugins/download_siril_plugins.sh
 4. SyQon Starless 所需的 PyTorch wheels
 5. SyQon Starless 离线推理缓存：`syqon_starless_inference.py`、`zenith.pt`
 
-下载失败不会删除已有缓存。
+所有下载均先写入临时文件并校验 SHA256，校验通过后才替换缓存；下载或校验失败会立即中断且不会覆盖已有缓存。第三方版本更新时必须同步审查并更新 lock/checksum 文件。当前 wheel 锁仅支持 macOS arm64。
 
 ## 当前缓存边界
 

@@ -30,8 +30,8 @@ CONFIG_TEMPLATE_IN="$LOCAL_TEMPLATE"
 DEFAULT_ENV_SRC="$PROJECT_ROOT/resources/default.env"
 AI_ENV_SRC="$PROJECT_ROOT/resources/ai.env"
 SIRIL_PLUGIN_DIR_SRC="$PROJECT_ROOT/resources/siril_plugins"
-APP_REQUIREMENTS="$PROJECT_ROOT/requirements.txt"
-SIRIL_PLUGIN_REQUIREMENTS="$SIRIL_PLUGIN_DIR_SRC/requirements.txt"
+APP_REQUIREMENTS="$PROJECT_ROOT/requirements.lock"
+SIRIL_PLUGIN_REQUIREMENTS="$SIRIL_PLUGIN_DIR_SRC/requirements.lock"
 SIRIL_PLUGIN_DOWNLOADS_DIR="$SIRIL_PLUGIN_DIR_SRC/downloads"
 USER_CONFIG="$HOME/Library/Application Support/org.siril.Siril/siril/config.1.4.ini"
 
@@ -285,6 +285,7 @@ download_offline_python_packages() {
   platform_tag="$(macos_wheel_platform_tag)"
   log "[BUILD] Downloading Python 3.13 offline wheels from: $APP_REQUIREMENTS"
   "$BUILD_PYTHON" -m pip download \
+    --require-hashes \
     --only-binary=:all: \
     --python-version 313 \
     --implementation cp \
@@ -297,6 +298,7 @@ download_offline_python_packages() {
 
   log "[BUILD] Downloading Python 3.13 offline wheels from: $SIRIL_PLUGIN_REQUIREMENTS"
   "$BUILD_PYTHON" -m pip download \
+    --require-hashes \
     --only-binary=:all: \
     --python-version 313 \
     --implementation cp \

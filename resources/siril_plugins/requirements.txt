@@ -1,26 +1,28 @@
 # Siril runtime plugin dependencies for Python 3.13.
 # These packages must be available as wheels in resources/siril_plugins/downloads
 # so the app can prepare Siril's isolated venv without network access.
+# Keep the resolver aligned with the reviewed macOS arm64 wheel hashes.
+-c requirements-macos-arm64.lock
 
-PyQt6
-PySide6
-astropy
-scipy
-tifffile
-onnxruntime
-coloredlogs
-humanfriendly
-torch
-torchvision
-sep
-spandrel
-einops
-safetensors
-lz4
-zstandard
-exifread
-opencv-python-headless
-requests
-setuptools<82
-wheel
-platformdirs
+PyQt6>=6.11.0,<7
+PySide6>=6.11.1,<7
+astropy>=7.2.0,<8
+scipy>=1.17.1,<2
+tifffile>=2026.5.15,<2027
+onnxruntime>=1.26.0,<2
+coloredlogs>=15.0.1,<16
+humanfriendly>=10.0,<11
+torch>=2.12.0,<3
+torchvision>=0.27.0,<1
+sep>=1.4.1,<2
+spandrel>=0.4.2,<1
+einops>=0.8.2,<1
+safetensors>=0.7.0,<1
+lz4>=4.4.5,<5
+zstandard>=0.25.0,<1
+exifread>=3.5.1,<4
+opencv-python-headless>=4.13.0.92,<5
+requests>=2.34.2,<3
+setuptools>=81.0.0,<82
+wheel>=0.47.0,<1
+platformdirs>=4.10.0,<5

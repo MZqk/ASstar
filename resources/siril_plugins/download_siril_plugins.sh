@@ -5,7 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOWNLOAD_DIR="${ROOT_DIR}/downloads"
 VENDOR_DIR="${ROOT_DIR}/vendor"
 SYQON_DIR="${ROOT_DIR}/syqon_starless"
-REQUIREMENTS_FILE="${ROOT_DIR}/requirements.txt"
+WHEEL_LOCK_FILE="${ROOT_DIR}/requirements-macos-arm64.lock"
+ASSET_CHECKSUM_FILE="${ROOT_DIR}/asset-checksums.sha256"
 TARGET_PYTHON_VERSION="313"
 TARGET_ABI="cp313"
 TARGET_PLATFORM="macosx_14_0_arm64"
@@ -19,177 +20,113 @@ case "$(uname -m)" in
   arm64|aarch64)
     TARGET_PLATFORM="macosx_14_0_arm64"
     ;;
-  x86_64|amd64)
-    TARGET_PLATFORM="macosx_10_15_x86_64"
-    ;;
   *)
-    echo "Unsupported macOS architecture for wheel download: $(uname -m)" >&2
+    echo "No SHA256 wheel lock is available for architecture: $(uname -m)" >&2
     exit 1
     ;;
 esac
 
-pip_download_cp313() {
-  python3 -m pip download \
-    --only-binary=:all: \
-    --python-version "${TARGET_PYTHON_VERSION}" \
-    --implementation cp \
-    --abi "${TARGET_ABI}" \
-    --abi abi3 \
-    --platform "${TARGET_PLATFORM}" \
-    --index-url "https://pypi.org/simple" \
-    --dest "${DOWNLOAD_DIR}" \
-    "$@"
-}
-
-prune_python_wheels() {
-  python3 - "${DOWNLOAD_DIR}" "${TARGET_ABI}" <<'PY'
-from __future__ import annotations
-
-import sys
-from pathlib import Path
-
-try:
-    from pip._vendor.packaging.utils import canonicalize_name, parse_wheel_filename
-except Exception as exc:
-    raise SystemExit(f"Cannot import pip wheel parser: {exc}")
-
-download_dir = Path(sys.argv[1])
-target_abi = sys.argv[2]
-allowed_interpreters = {target_abi, "py3"}
-allowed_abis = {target_abi, "abi3", "none"}
-
-removed: list[Path] = []
-groups: dict[str, list[tuple[object, Path]]] = {}
-
-for wheel in sorted(download_dir.glob("*.whl")):
-    try:
-        name, version, _build, tags = parse_wheel_filename(wheel.name)
-    except Exception:
-        continue
-
-    compatible = any(
-        (
-            tag.interpreter in allowed_interpreters
-            and tag.abi in allowed_abis
-        )
-        or (
-            tag.interpreter.startswith("cp")
-            and tag.abi == "abi3"
-        )
-        for tag in tags
-    )
-    if not compatible:
-        wheel.unlink()
-        removed.append(wheel)
-        continue
-
-    groups.setdefault(canonicalize_name(name), []).append((version, wheel))
-
-for _name, candidates in sorted(groups.items()):
-    candidates.sort(key=lambda item: (item[0], item[1].name))
-    if _name == "setuptools":
-        compatible = [item for item in candidates if item[0].major < 82]
-        if compatible:
-            keep = compatible[-1]
-        else:
-            keep = candidates[-1]
-    else:
-        keep = candidates[-1]
-    for _version, wheel in candidates:
-        if wheel == keep[1]:
-            continue
-        wheel.unlink()
-        removed.append(wheel)
-
-print(f"Pruned Python wheels: removed={len(removed)}, kept={len(groups)}")
-for wheel in removed:
-    print(f"  removed {wheel.name}")
-PY
-}
-
-echo "[1/8] Downloading official siril-scripts archive..."
-SIRIL_URLS=(
-  "https://gitlab.com/free-astro/siril-scripts/-/archive/main/siril-scripts-main.tar.gz"
-  "https://gitlab.com/free-astro/siril-scripts/-/archive/master/siril-scripts-master.tar.gz"
-)
-download_ok=0
-for url in "${SIRIL_URLS[@]}"; do
-  if curl -fL "${url}" -o "${SIRIL_ARCHIVE}.tmp"; then
-    mv "${SIRIL_ARCHIVE}.tmp" "${SIRIL_ARCHIVE}"
-    download_ok=1
-    break
+expected_sha256() {
+  local relative_path="$1"
+  local checksum
+  checksum="$(awk -v path="${relative_path}" '$2 == path { print $1; exit }' "${ASSET_CHECKSUM_FILE}")"
+  if [[ ! "${checksum}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "Missing or invalid SHA256 for ${relative_path} in ${ASSET_CHECKSUM_FILE}" >&2
+    exit 1
   fi
-done
-if [[ "${download_ok}" -ne 1 ]]; then
-  echo "Failed to download siril-scripts archive from known URLs." >&2
+  printf '%s\n' "${checksum}"
+}
+
+verify_sha256() {
+  local file="$1"
+  local expected="$2"
+  local actual
+  actual="$(shasum -a 256 "${file}" | awk '{print $1}')"
+  if [[ "${actual}" != "${expected}" ]]; then
+    echo "SHA256 verification failed for ${file}" >&2
+    echo "  expected: ${expected}" >&2
+    echo "  actual:   ${actual}" >&2
+    return 1
+  fi
+}
+
+download_verified() {
+  local url="$1"
+  local destination="$2"
+  local relative_path="$3"
+  local tmp="${destination}.tmp"
+  local expected
+  expected="$(expected_sha256 "${relative_path}")"
+  rm -f "${tmp}"
+  if ! curl -fL "${url}" -o "${tmp}"; then
+    rm -f "${tmp}"
+    echo "Download failed: ${url}" >&2
+    exit 1
+  fi
+  if ! verify_sha256 "${tmp}" "${expected}"; then
+    rm -f "${tmp}"
+    exit 1
+  fi
+  mv "${tmp}" "${destination}"
+}
+
+if [[ ! -f "${ASSET_CHECKSUM_FILE}" || ! -f "${WHEEL_LOCK_FILE}" ]]; then
+  echo "Integrity lock files are missing." >&2
   exit 1
 fi
 
-echo "[2/8] Extracting siril-scripts..."
+echo "[1/4] Downloading and verifying official siril-scripts archive..."
+download_verified \
+  "https://gitlab.com/free-astro/siril-scripts/-/archive/main/siril-scripts-main.tar.gz" \
+  "${SIRIL_ARCHIVE}" \
+  "downloads/siril-scripts.tar.gz"
+
+echo "[2/4] Extracting siril-scripts..."
 rm -rf "${SIRIL_UNPACK_DIR}.tmp"
 mkdir -p "${SIRIL_UNPACK_DIR}.tmp"
 tar -xzf "${SIRIL_ARCHIVE}" -C "${SIRIL_UNPACK_DIR}.tmp" --strip-components=1
 rm -rf "${SIRIL_UNPACK_DIR}"
 mv "${SIRIL_UNPACK_DIR}.tmp" "${SIRIL_UNPACK_DIR}"
 
-echo "[3/8] Downloading SetiAstroSuitePro wheel (PyPI)..."
+echo "[3/4] Downloading hash-locked Python 3.13 wheels..."
 python3 -m pip download \
   --no-deps \
+  --require-hashes \
   --only-binary=:all: \
   --python-version "${TARGET_PYTHON_VERSION}" \
-  --implementation py \
-  --abi none \
+  --implementation cp \
+  --abi "${TARGET_ABI}" \
+  --abi abi3 \
+  --platform "${TARGET_PLATFORM}" \
   --index-url "https://pypi.org/simple" \
   --dest "${DOWNLOAD_DIR}" \
-  setiastrosuitepro
+  -r "${WHEEL_LOCK_FILE}"
 
-echo "[4/8] Downloading onnxruntime wheel for Python 3.13..."
-pip_download_cp313 \
-  --no-deps \
-  onnxruntime
+echo "[4/4] Downloading and verifying SyQon Starless offline cache..."
+download_verified \
+  "https://siril.syqon.it/syqon_starless_inference.py" \
+  "${SYQON_DIR}/syqon_starless_inference.py" \
+  "syqon_starless/syqon_starless_inference.py"
+download_verified \
+  "https://siril.syqon.it/zenith.pt.sha256" \
+  "${SYQON_DIR}/zenith.pt.sha256" \
+  "syqon_starless/zenith.pt.sha256"
+download_verified \
+  "https://siril.syqon.it/zenith.pt.date" \
+  "${SYQON_DIR}/zenith.pt.date" \
+  "syqon_starless/zenith.pt.date"
+download_verified \
+  "https://siril.syqon.it/zenith.pt" \
+  "${SYQON_DIR}/zenith.pt" \
+  "syqon_starless/zenith.pt"
 
-echo "[5/8] Downloading PyQt6/PySide6 wheels for Python 3.13..."
-pip_download_cp313 \
-  PyQt6
-
-pip_download_cp313 \
-  PySide6
-
-echo "[6/8] Downloading astropy/scipy/tifffile/sep/spandrel/lz4/zstandard/exifread/opencv/requests/setuptools/wheel wheels for Python 3.13..."
-pip_download_cp313 \
-  astropy \
-  scipy \
-  tifffile \
-  sep \
-  spandrel \
-  lz4 \
-  zstandard \
-  exifread \
-  opencv-python-headless \
-  requests \
-  wheel
-
-echo "[7/8] Downloading PyTorch wheels for SyQon Starless..."
-pip_download_cp313 \
-  torch \
-  torchvision
-
-echo "[7/8] Downloading requirement-declared Python 3.13 runtime wheels..."
-pip_download_cp313 \
-  -r "${REQUIREMENTS_FILE}"
-
-echo "[7/8] Pruning duplicate/non-3.13 Python wheels..."
-prune_python_wheels
-
-echo "[8/8] Downloading SyQon Starless offline model cache..."
-curl -fL "https://siril.syqon.it/syqon_starless_inference.py" \
-  -o "${SYQON_DIR}/syqon_starless_inference.py"
-curl -fL "https://siril.syqon.it/zenith.pt" \
-  -o "${SYQON_DIR}/zenith.pt"
-curl -fL "https://siril.syqon.it/zenith.pt.sha256" \
-  -o "${SYQON_DIR}/zenith.pt.sha256"
-curl -fL "https://siril.syqon.it/zenith.pt.date" \
-  -o "${SYQON_DIR}/zenith.pt.date" || true
+upstream_zenith_sha="$(awk 'NR == 1 { print $1 }' "${SYQON_DIR}/zenith.pt.sha256")"
+locked_zenith_sha="$(expected_sha256 "syqon_starless/zenith.pt")"
+if [[ "${upstream_zenith_sha}" != "${locked_zenith_sha}" ]]; then
+  echo "SyQon zenith.pt checksum file does not match the trusted lock." >&2
+  exit 1
+fi
+verify_sha256 "${SYQON_DIR}/zenith.pt" "${upstream_zenith_sha}"
 
 echo "Plugin download complete."
 echo "Downloaded files:"
