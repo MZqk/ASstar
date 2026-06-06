@@ -15,10 +15,11 @@ Pipeline:
   Phase 1 – Master Bias    : per session (skip if pre-existing master found)
   Phase 2 – Master Darks   : per session (skip if pre-existing / external folder)
   Phase 3 – Master Flats   : per session × filter (bias-calibrated before stacking)
-  Phase 4 – Calibrate Lights: per session × filter
-  Phase 5 – Register & Stack: per filter, merge all sessions, register, stack, save
+  Phase 4 – Calibrate, Register & Stack: per (object × filter × exptime) group,
+             calibrate all sessions → register → stack → clean up before next group
+  Phase 5 – Cross-stack Alignment: align stacks of the same object across filters
 
-  version 1.0.11
+  version 1.0.16
 
   1.0.0  First release
   1.0.1  Don't use temporary file system; do all operations in the cwd
@@ -45,6 +46,21 @@ Pipeline:
   1.0.9  Save aligned files according to the STACK_SAVE_PATTERN
   1.0.10 Add the option to save master files
   1.0.11 Sanitise a string for use in directory and sequence names
+  1.0.12 Forget to use _qarg in the last alignment step
+  1.0.13 Detect IMAGETYP=DarkFlat (written by some capture software) as a
+         dark-flat substitute for bias, in addition to IMAGETYP=Dark with
+         matching exposure time
+         _dark_arg now scores candidates on both exposure time and CCD
+         temperature (CCD-TEMP / CCD_TEMP / CCDTEMP / TEMPERAT / CAMTCCD /
+         SET-TEMP); warns when ΔCCD-TEMP exceeds 5 °C
+  1.0.14 Add button to clear process folder. Same patern than external darks
+  1.0.15 Merge calibration and register/stack into a single per-group loop so
+         that each group's calibrated frames are deleted immediately after
+         stacking; peak disk usage is now proportional to one group rather
+         than the sum of all groups
+  1.0.16 Fix: masters_dir was deleted before phase 4, so _flat_arg / _bias_arg
+         / _dark_arg found no masters during light calibration; move cleanup
+         to after _phase_calibrate_register_stack completes
 """
 
 import json
@@ -81,7 +97,7 @@ from astropy.io import fits as astrofits
 # =============================================================================
 
 APP_NAME         = "Siril Wizard – Automatic Multi-Session Processing"
-VERSION          = "1.0.11"
+VERSION          = "1.0.16"
 FITS_SUFFIXES    = {'.fits', '.fit', '.fts'}
 FITS_FZ_SUFFIXES = {'.fits.fz', '.fit.fz', '.fts.fz'}
 FITS_EXTS      = tuple(FITS_SUFFIXES | FITS_FZ_SUFFIXES)
@@ -105,13 +121,14 @@ STACK_SAVE_PATTERN = (
 )
 
 TYPE_INFO: dict[str, tuple[str, str]] = {
-    'light':   ('💡  Lights',  '#5BA3FF'),
-    'flat':    ('🌓  Flats',   '#FFB347'),
-    'dark':    ('🌑  Darks',   '#BBBBBB'),
-    'bias':    ('⚡  Bias',    '#CC99FF'),
-    'unknown': ('❓  Unknown', '#FF7070'),
+    'light':    ('💡  Lights',     '#5BA3FF'),
+    'flat':     ('🌓  Flats',      '#FFB347'),
+    'darkflat': ('🌓🌑 Dark Flats', '#CC8844'),
+    'dark':     ('🌑  Darks',      '#BBBBBB'),
+    'bias':     ('⚡  Bias',       '#CC99FF'),
+    'unknown':  ('❓  Unknown',    '#FF7070'),
 }
-TYPE_ORDER        = ['light', 'flat', 'dark', 'bias', 'unknown']
+TYPE_ORDER        = ['light', 'flat', 'darkflat', 'dark', 'bias', 'unknown']
 TYPES_WITH_FILTER = {'light', 'flat'}
 SUB_INFO          = ('📷  Subs',    '#CCCCCC')
 MASTER_INFO       = ('🏆  Masters', '#FFD700')
@@ -120,8 +137,7 @@ PHASE_LABELS = [
     'Master Bias',
     'Master Darks',
     'Master Flats',
-    'Calibrate Lights',
-    'Register & Stack',
+    'Calibrate, Register & Stack',
     'Cross-stack Alignment',
 ]
 N_PHASES = len(PHASE_LABELS)
@@ -203,6 +219,7 @@ def _exptime_sort_key(exp_str: str) -> float:
 def normalize_imagetyp(raw: str) -> str:
     t = raw.strip().lower()
     if 'light' in t or t == 'science': return 'light'
+    if 'dark'  in t and 'flat' in t:   return 'darkflat'
     if 'flat'  in t:                   return 'flat'
     if 'dark'  in t:                   return 'dark'
     if 'bias'  in t or 'zero' in t:    return 'bias'
@@ -292,6 +309,7 @@ def read_fits_info(path: Path) -> dict:
         'is_master':   False,
         'stackcnt':    0,
         'exptime':     None,
+        'ccd_temp':    None,
         'object_name': '',
         'bayerpat':    None,    # str if CFA, None if mono
         'instrume':    '',
@@ -320,6 +338,13 @@ def read_fits_info(path: Path) -> dict:
                 if raw is not None:
                     try:
                         info['exptime'] = float(raw); break
+                    except (ValueError, TypeError):
+                        pass
+            for kw in ('CCD-TEMP', 'CCD_TEMP', 'CCDTEMP', 'TEMPERAT', 'CAMTCCD', 'SET-TEMP'):
+                v = h.get(kw, None)
+                if v is not None:
+                    try:
+                        info['ccd_temp'] = float(v); break
                     except (ValueError, TypeError):
                         pass
             obj = str(h.get('OBJECT', '')).strip()
@@ -640,10 +665,15 @@ class PreprocessingEngine:
         Find a "dark flat" – a dark frame whose exposure time matches the
         flat's exposure time, used as -bias= when no real bias is available.
 
-        Dark flats are stored as IMAGETYP=DARK by the capture software.
+        Dark flats are detected two ways:
+          - IMAGETYP=DARK with the same exposure time as the flats.
+          - IMAGETYP=DarkFlat (or any variant containing both "dark" and "flat"),
+            as written by some capture software.
+
         They are searched in:
           1. masters_dir  (locally stacked master-dark_* files, read their EXPTIME header)
           2. external_darks folder (recursively, same as _dark_arg)
+          3. Raw subs scanned from the input directory (IMAGETYP=DarkFlat bucket)
 
         The closest EXPTIME match within 20 % of the flat exptime is accepted.
         Returns a -bias=<path> argument string, or None.
@@ -664,7 +694,7 @@ class PreprocessingEngine:
                                      ignore_missing_simple=True) as hdul:
                     h = _find_image_header(hdul)
                     imgtype = normalize_imagetyp(str(h.get('IMAGETYP', '')))
-                    if imgtype != 'dark':
+                    if imgtype not in ('dark', 'darkflat'):
                         return
                     et = h.get('EXPTIME', h.get('EXPOSURE', None))
                     if et is None:
@@ -685,6 +715,12 @@ class PreprocessingEngine:
             for f in self.external_darks.rglob('*'):
                 _check(f)
 
+        # 3. Raw subs explicitly tagged IMAGETYP=DarkFlat (or similar) in input dir
+        for session_buckets in self._by.values():
+            for fi_list in session_buckets.get('darkflat', {}).values():
+                for fi in fi_list:
+                    _check(fi['path'])
+
         if best_path is not None:
             self._log(
                 f'    Using dark flat: {best_path.name}'
@@ -693,30 +729,57 @@ class PreprocessingEngine:
             return _qflag('-bias', best_path)
         return None
 
-    def _dark_arg(self, session: str, exptime: Optional[float]) -> Optional[str]:
+    def _dark_arg(self, session: str, exptime: Optional[float],
+                  ccd_temp: Optional[float] = None) -> Optional[str]:
         """
-        Choose the best master dark for the given exposure time.
+        Choose the best master dark for the given exposure time and temperature.
 
         Dark frames depend on camera state (gain, offset, sensor temperature)
         rather than session date or filter, so any master dark with the
-        right exposure can be reused across sessions.
+        right exposure and temperature can be reused across sessions.
 
         Selection order (when exptime is known):
-          1. Exact exposure match anywhere in masters_dir.  All sessions are
-             equivalent for darks – first match wins.
-          2. Closest-exposure match across all session masters.  A warning
-             is logged when the exposure delta exceeds 5 % of the target.
+          1. Exact exposure match anywhere in masters_dir, sorted by closest
+             CCD temperature.  A warning is logged when ΔCCD-TEMP > 5 °C.
+          2. Closest-exposure match across all session masters, sorted by
+             (exposure delta, temperature delta).  A warning is logged when
+             the exposure delta exceeds 5 % of the target.
           3. Legacy generic master-dark_{session}.fit (no exptime suffix),
              retained for backwards compatibility.
-          4. External darks folder – closest exposure match across all
-             files, with INSTRUME mismatches filtered out.
+          4. External darks folder – best (exposure, temperature) score,
+             with INSTRUME mismatches filtered out.
 
         The 'session' argument is retained for the legacy fallback (step 3)
         and for log clarity, but does not affect the primary selection.
+        Temperature matching is skipped gracefully when CCD-TEMP is absent
+        from either the light subs or the dark master headers.
         """
+        TEMP_WARN = 5.0  # °C – log a warning above this delta
+
+        def _td(ct: Optional[float]) -> float:
+            """Sort key for temperature. 0 when comparison is impossible (neutral)."""
+            if ccd_temp is None or ct is None:
+                return 0.0
+            return abs(ct - ccd_temp)
+
+        def _temp_str(ct: Optional[float]) -> str:
+            if ccd_temp is None or ct is None:
+                return ''
+            return f', ΔCCD-TEMP={abs(ct - ccd_temp):.1f}°C'
+
+        def _read_temp(h) -> Optional[float]:
+            for kw in ('CCD-TEMP', 'CCD_TEMP', 'CCDTEMP', 'TEMPERAT', 'CAMTCCD', 'SET-TEMP'):
+                v = h.get(kw, None)
+                if v is not None:
+                    try:
+                        return float(v)
+                    except (ValueError, TypeError):
+                        pass
+            return None
+
         # ── Build the candidate list of in-folder per-exposure masters ───
-        # Each entry: (path, file_session, file_et)
-        candidates: list[tuple[Path, str, float]] = []
+        # Each entry: (path, file_session, file_et, file_ccd_temp)
+        candidates: list[tuple[Path, str, float, Optional[float]]] = []
         prefix = 'master-dark_'
         for ext in FITS_EXTS:
             for p in self.masters_dir.glob(f'{prefix}*{ext}'):
@@ -731,33 +794,48 @@ class PreprocessingEngine:
                     file_et = float(exp_token[:-1])
                 except ValueError:
                     continue
-                candidates.append((p, file_session, file_et))
+                file_temp: Optional[float] = None
+                try:
+                    with astrofits.open(p, memmap=True,
+                                        ignore_missing_simple=True) as hdul:
+                        file_temp = _read_temp(_find_image_header(hdul))
+                except Exception:
+                    pass
+                candidates.append((p, file_session, file_et, file_temp))
 
         if exptime is not None and candidates:
             target_key = _exptime_key(exptime)
 
-            # 1. Exact exposure match – any session is fine for darks
-            for p, s, et in candidates:
-                if _exptime_key(et) == target_key:
-                    scope = ('this session' if s == session
-                             else f'session {s}')
-                    self._log(
-                        f'    Using master dark {p.name}'
-                        f'  (exact exposure, from {scope})',
-                        LogColor.BLUE)
-                    return _qflag('-dark', p)
+            # 1. Exact exposure match – pick closest temperature
+            exact = [(p, s, et, t) for p, s, et, t in candidates
+                     if _exptime_key(et) == target_key]
+            if exact:
+                exact.sort(key=lambda x: _td(x[3]))
+                best_p, best_s, best_t = exact[0][0], exact[0][1], exact[0][3]
+                scope = 'this session' if best_s == session else f'session {best_s}'
+                td = _td(best_t)
+                warn = ccd_temp is not None and best_t is not None and td > TEMP_WARN
+                color = LogColor.SALMON if warn else LogColor.BLUE
+                tag   = '⚠ ' if warn else ''
+                self._log(
+                    f'    {tag}Using master dark {best_p.name}'
+                    f'  (exact exposure, from {scope}{_temp_str(best_t)})',
+                    color)
+                return _qflag('-dark', best_p)
 
-            # 2. Closest exposure overall – warn if delta is large
-            candidates.sort(key=lambda pse: abs(pse[2] - exptime))
-            best_p, best_s, best_et = candidates[0]
+            # 2. Closest exposure overall – sort by (exp_delta, temp_delta)
+            candidates.sort(key=lambda x: (abs(x[2] - exptime), _td(x[3])))
+            best_p, best_s, best_et, best_t = candidates[0]
             best_delta = abs(best_et - exptime)
             large = exptime > 0 and (best_delta / exptime) > 0.05
-            color = LogColor.SALMON if large else LogColor.BLUE
-            tag   = '⚠ ' if large else ''
+            td = _td(best_t)
+            warn_temp = ccd_temp is not None and best_t is not None and td > TEMP_WARN
+            color = LogColor.SALMON if (large or warn_temp) else LogColor.BLUE
+            tag   = '⚠ ' if (large or warn_temp) else ''
             self._log(
                 f'    {tag}Using closest-exposure dark {best_p.name}'
                 f'  (from session {best_s}, ΔEXPTIME={best_delta:.2f}s,'
-                f' target={exptime:.0f}s)',
+                f' target={exptime:.0f}s{_temp_str(best_t)})',
                 color)
             return _qflag('-dark', best_p)
 
@@ -767,9 +845,11 @@ class PreprocessingEngine:
             if p.exists():
                 return _qflag('-dark', p)
 
-        # 4. External dark masters folder – closest EXPTIME match
+        # 4. External dark masters folder – best (EXPTIME, CCD-TEMP) score
         if self.external_darks and self.external_darks.is_dir() and exptime is not None:
-            best_path, best_delta = None, float('inf')
+            best_path: Optional[Path] = None
+            best_score: tuple[float, float] = (float('inf'), float('inf'))
+            best_ext_t: Optional[float] = None
             for f in self.external_darks.rglob('*'):
                 if not is_fits_file(f):
                     continue
@@ -789,14 +869,22 @@ class PreprocessingEngine:
                         et = h.get('EXPTIME', h.get('EXPOSURE', None))
                         if et is None:
                             continue
-                        delta = abs(float(et) - exptime)
-                        if delta < best_delta:
-                            best_path, best_delta = f, delta
+                        exp_delta = abs(float(et) - exptime)
+                        file_temp = _read_temp(h)
+                        score = (exp_delta, _td(file_temp))
+                        if score < best_score:
+                            best_score, best_path, best_ext_t = score, f, file_temp
                 except Exception:
                     pass
             if best_path is not None:
-                self._log(f'    Using external dark {best_path.name}'
-                          f'  (ΔEXPTIME={best_delta:.2f}s)', LogColor.BLUE)
+                td = _td(best_ext_t)
+                warn_temp = ccd_temp is not None and best_ext_t is not None and td > TEMP_WARN
+                color = LogColor.SALMON if warn_temp else LogColor.BLUE
+                tag   = '⚠ ' if warn_temp else ''
+                self._log(
+                    f'    {tag}Using external dark {best_path.name}'
+                    f'  (ΔEXPTIME={best_score[0]:.2f}s{_temp_str(best_ext_t)})',
+                    color)
                 return _qflag('-dark', best_path)
             elif self.instrument:
                 self._log(
@@ -1082,13 +1170,10 @@ class PreprocessingEngine:
                         break
                 self._cleanup(seq_dir)
 
-    def _phase_lights(self):
+    def _calibrate_light_group(self, session: str, filt: str, filt_safe: str,
+                               exp_key: str, light_files: list):
         """
-        Calibrate lights grouped by (filter, exptime).
-
-        Each group gets its own sequence: light_FILTER_EXPs_
-        so that HDR sets with different exposure times are kept separate
-        all the way through registration and stacking.
+        Calibrate one (session, filter, exptime) group of light frames.
 
         Decision matrix (bias/dark/flat availability → calibrate args):
           bias  dark  flat  → -dark= -flat=              dark absorbs bias
@@ -1106,107 +1191,106 @@ class PreprocessingEngine:
 
         Debayer: -debayer added when any sub in the group carries BAYERPAT.
         """
-        self._log('━━ Phase 4 – Calibrate Lights ━━', LogColor.GREEN)
-        for session in self.sessions:
-            bias_arg = self._bias_arg()
+        obj_safe   = _safe_name(
+            (light_files[0].get('object_name') or 'unknown')
+            if light_files else 'unknown')
+        group_safe = f'{obj_safe}_{filt_safe}_{exp_key}'  # e.g. M106_Ha_600s
 
-            for filt, all_light_files in self._by[session]['light'].items():
-                if not all_light_files:
-                    continue
-                filt_safe = _safe_name(filt)
-                flat_arg  = self._flat_arg(session, filt_safe)
+        bias_arg = self._bias_arg()
+        flat_arg = self._flat_arg(session, filt_safe)
 
-                # Sub-group by exptime for HDR support
-                by_exptime: dict = defaultdict(list)
-                for fi in all_light_files:
-                    by_exptime[_exptime_key(fi.get('exptime'))].append(fi)
+        # Representative float exptime for dark matching
+        exptimes = [fi['exptime'] for fi in light_files
+                    if fi.get('exptime') is not None]
+        exptime  = (float(max(set(exptimes), key=exptimes.count))
+                    if exptimes else None)
 
-                for exp_key, light_files in sorted(by_exptime.items()):
-                    obj_safe   = _safe_name(
-                        (light_files[0].get('object_name') or 'unknown')
-                        if light_files else 'unknown')
-                    group_safe = f'{obj_safe}_{filt_safe}_{exp_key}'  # e.g. M106_Ha_600s
+        # Representative CCD temperature for dark matching
+        temps = [fi['ccd_temp'] for fi in light_files
+                 if fi.get('ccd_temp') is not None]
+        ccd_temp = (sum(temps) / len(temps)) if temps else None
 
-                    # Representative float exptime for dark matching
-                    exptimes = [fi['exptime'] for fi in light_files
-                                if fi.get('exptime') is not None]
-                    exptime  = (float(max(set(exptimes), key=exptimes.count))
-                                if exptimes else None)
+        dark_arg = self._dark_arg(session, exptime, ccd_temp)
 
-                    dark_arg = self._dark_arg(session, exptime)
+        has_bias = bias_arg is not None
+        has_dark = dark_arg is not None
+        has_flat = flat_arg is not None
+        is_cfa   = any(fi.get('bayerpat') for fi in light_files)
 
-                    has_bias = bias_arg is not None
-                    has_dark = dark_arg is not None
-                    has_flat = flat_arg is not None
-                    is_cfa   = any(fi.get('bayerpat') for fi in light_files)
+        seq = f'light_{group_safe}_'
+        cal_args = ['calibrate', seq]
 
-                    seq = f'light_{group_safe}_'
-                    cal_args = ['calibrate', seq]
+        if has_dark:
+            # Dark already contains bias – never pass -bias= to
+            # calibrate when a dark is available.
+            cal_args.append(dark_arg)
+            if has_flat:
+                cal_args.append(flat_arg)
+            mode = f'dark{("+flat" if has_flat else " only")}'
+        elif has_bias and has_flat:
+            # No dark: use bias as pedestal correction.
+            cal_args += [bias_arg, flat_arg]
+            mode = 'bias-as-dark+flat'
+        elif has_bias:
+            cal_args.append(bias_arg)
+            mode = 'bias-as-dark only'
+        elif has_flat:
+            cal_args.append(flat_arg)
+            mode = 'flat only'
+        else:
+            mode = 'no masters'
 
-                    if has_dark:
-                        # Dark already contains bias – never pass -bias= to
-                        # calibrate when a dark is available.
-                        cal_args.append(dark_arg)
-                        if has_flat:
-                            cal_args.append(flat_arg)
-                        mode = f'dark{("+flat" if has_flat else " only")}'
-                    elif has_bias and has_flat:
-                        # No dark: use bias as pedestal correction.
-                        cal_args += [bias_arg, flat_arg]
-                        mode = 'bias-as-dark+flat'
-                    elif has_bias:
-                        cal_args.append(bias_arg)
-                        mode = 'bias-as-dark only'
-                    elif has_flat:
-                        cal_args.append(flat_arg)
-                        mode = 'flat only'
-                    else:
-                        mode = 'no masters'
+        if is_cfa:
+            # -cfa : sequence is Bayer
+            cal_args.append('-cfa')
 
-                    if is_cfa:
-                        # -cfa : sequence is Bayer
-                        cal_args.append('-cfa')
+            if has_flat:
+                # Normalize each CFA channel only if flats are used
+                cal_args.append('-equalize_cfa')
 
-                        if has_flat:
-                            # Normalize each CFA channel only if flats are used
-                            cal_args.append('-equalize_cfa')
+            if has_dark:
+                # Cosmetic correction only if a dark is available
+                cal_args.append('-cc=dark')
 
-                        if has_dark:
-                            # Cosmetic correction only if a dark is available
-                            cal_args.append('-cc=dark')
+            if not self.use_drizzle:
+                # Debayer only if we are not doing drizzle
+                cal_args.append('-debayer')
 
-                        if not self.use_drizzle:
-                            # Debayer only if we are not doing drizzle
-                            cal_args.append('-debayer')
+        seq_dir = (self.proc_dir / f'session_{session}'
+                   / f'light_{group_safe}')
+        self._copy_files(light_files, seq_dir)
+        self._cd(seq_dir)
+        self.siril.cmd('convert', seq)
+        self.siril.cmd(*cal_args)
+        self._log(
+            f'  [{session}] ✓ {filt}/{exp_key}  mode={mode}'
+            f'{"  debayer" if is_cfa else ""}'
+            f'  ({len(light_files)} frames)',
+            LogColor.GREEN,
+        )
 
-                    seq_dir = (self.proc_dir / f'session_{session}'
-                               / f'light_{group_safe}')
-                    self._copy_files(light_files, seq_dir)
-                    self._cd(seq_dir)
-                    self.siril.cmd('convert', seq)
-                    self.siril.cmd(*cal_args)
-                    self._log(
-                        f'  [{session}] ✓ {filt}/{exp_key}  mode={mode}'
-                        f'{"  debayer" if is_cfa else ""}'
-                        f'  ({len(light_files)} frames)',
-                        LogColor.GREEN,
-                    )
-
-    def _phase_register_stack(self) -> dict[str, list[Path]]:
+    def _phase_calibrate_register_stack(self) -> dict[str, list[Path]]:
         """
-        Per (filter, exptime) group:
-          1. Collect pp_light_FILTER_EXPs sequences across sessions.
-          2. Merge if multiple sessions (Siril `merge`), or use directly.
-          3. register -2pass  +  seqapplyreg -framing=current
-          4. stack → stacked_FILTER_EXPs.fit  (absolute path)
-          5. load, mirrorx -bottomup, save with keyword-token pattern.
+        Combined calibrate + register + stack, iterated per (obj, filter, exptime) group.
+
+        For each group:
+          1. Calibrate lights for every session that has matching frames.
+          2. Collect pp_light sequences across sessions.
+          3. Merge if multiple sessions (Siril `merge`), or use directly.
+          4. register -2pass  +  seqapplyreg -framing=current
+          5. stack → stacked_*.fit  (absolute path)
+          6. load, mirrorx -bottomup, save with keyword-token pattern.
+          7. Clean up calibrated frames for this group immediately.
+
+        Processing one group end-to-end before moving to the next keeps peak
+        disk usage proportional to a single group rather than all groups combined.
 
         Returns the list of saved stack Paths (for cross-stack alignment).
         Cleanup of _preproc happens after alignment in run().
         """
-        self._log('━━ Phase 5 – Register & Stack ━━', LogColor.GREEN)
+        self._log('━━ Phase 4 – Calibrate, Register & Stack ━━', LogColor.GREEN)
 
-        # Build the set of (filter, exptime_key) groups across all sessions
+        # Build the set of (obj, filter, exptime_key) groups across all sessions
         all_groups: set = set()
         for session in self.sessions:
             for filt, files in self._by[session]['light'].items():
@@ -1217,8 +1301,24 @@ class PreprocessingEngine:
         saved_stacks: dict[str, list[Path]] = defaultdict(list)
 
         for obj, filt, exp_key in sorted(all_groups):
+            filt_safe  = _safe_name(filt)
+
+            # ── Step 1: calibrate this group for every session ────────────
+            for session in self.sessions:
+                if filt not in self._by[session]['light']:
+                    continue
+                light_files = [
+                    fi for fi in self._by[session]['light'][filt]
+                    if _exptime_key(fi.get('exptime')) == exp_key
+                    and (fi.get('object_name') or 'unknown') == obj
+                ]
+                if not light_files:
+                    continue
+                self._calibrate_light_group(session, filt, filt_safe,
+                                            exp_key, light_files)
+
+            # ── Steps 2-7: register, stack, save, and clean up ────────────
             obj_safe      = _safe_name(obj)
-            filt_safe     = _safe_name(filt)
             group_safe    = f'{obj_safe}_{filt_safe}_{exp_key}'  # e.g. M106_Ha_600s
             seq_base      = f'light_{group_safe}_'    # sequence produced by calibrate
 
@@ -1444,7 +1544,7 @@ class PreprocessingEngine:
 
             for r_file, original in zip(registered, ordered):
                 self._cd(self.output_dir)
-                self.siril.cmd('load', str(r_file))
+                self.siril.cmd('load', _qarg(r_file))
                 self.siril.cmd('save', 'aligned_' + STACK_SAVE_PATTERN)
 
             self._cleanup(tmp_dir)
@@ -1484,25 +1584,26 @@ class PreprocessingEngine:
                 self._phase_bias,
                 self._phase_darks,
                 self._phase_flats,
-                self._phase_lights,
             ]
             for i, fn in enumerate(linear_phases):
                 if self.progress_cb:
                     self.progress_cb(i + 1, N_PHASES, PHASE_LABELS[i])
                 fn()
 
-            # Masters are only needed for phase 4 (calibrate lights).
-            # Delete them now to free space before the heavier register/stack phase.
+            # Phase 4: calibrate + register + stack, one group at a time.
+            # Each group's calibrated frames are removed immediately after stacking,
+            # keeping peak disk usage proportional to a single group.
+            if self.progress_cb:
+                self.progress_cb(4, N_PHASES, PHASE_LABELS[3])
+            saved_stacks = self._phase_calibrate_register_stack()
+
+            # Masters are only needed for calibration (phase 4).
+            # Delete them now that all groups have been calibrated and stacked.
             self._cleanup(self.masters_dir)
 
-            # Phase 5: register & stack – returns the list of saved stack paths
+            # Phase 5: cross-stack alignment (needs the exact file list from phase 4)
             if self.progress_cb:
                 self.progress_cb(5, N_PHASES, PHASE_LABELS[4])
-            saved_stacks = self._phase_register_stack()
-
-            # Phase 6: cross-stack alignment (needs the exact file list from phase 5)
-            if self.progress_cb:
-                self.progress_cb(6, N_PHASES, PHASE_LABELS[5])
             self._phase_align_stacks(dict(saved_stacks))
 
             self._log('━━ Pre-processing complete! ━━', LogColor.GREEN)
@@ -1928,6 +2029,15 @@ class FITSOrganizerWindow(QMainWindow):
         btn_out = QPushButton('Browse…'); btn_out.setFixedHeight(24)
         btn_out.clicked.connect(self._browse_output)
         opts_lay.addWidget(btn_out)
+        btn_out_clear = QPushButton('✕'); btn_out_clear.setFixedSize(24, 24)
+        btn_out_clear.setToolTip('Clear output directory (use Siril working directory)')
+        btn_out_clear.setStyleSheet(
+            'QPushButton { color:#aa4444; border:1px solid #553333;'
+            ' border-radius:4px; background:#1a1a2e; }'
+            'QPushButton:hover { background:#2a1a1a; }'
+        )
+        btn_out_clear.clicked.connect(self._clear_output)
+        opts_lay.addWidget(btn_out_clear)
 
         root.addWidget(opts)
 
@@ -1999,6 +2109,14 @@ class FITSOrganizerWindow(QMainWindow):
         self._darks_lbl.setToolTip('')
         self._darks_lbl.setStyleSheet('color:#666666; font-size:9pt; border:none;')
         self.siril.log('External darks cleared.', LogColor.BLUE)
+        self._save_config()
+
+    def _clear_output(self):
+        self._output_dir = None
+        self._out_lbl.setText('(Siril working directory)')
+        self._out_lbl.setToolTip('')
+        self._out_lbl.setStyleSheet('color:#666666; font-size:9pt; border:none;')
+        self.siril.log('Output directory cleared — will use Siril working directory.', LogColor.BLUE)
         self._save_config()
 
     def _show_options(self):

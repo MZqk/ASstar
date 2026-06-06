@@ -6,6 +6,7 @@ Allows to plot various registration data fields and mask out bad frames by drawi
 
 Version history:
 1.0.0: Initial version
+1.0.1: If no CLI arguments, run in GUI mode by default
 """
 
 import sirilpy as s
@@ -13,7 +14,7 @@ import numpy as np
 import os, sys
 import warnings
 
-VERSION = "0.0.5"
+VERSION = "1.0.1"
 DATA_FIELDS = [
             'FWHM',
             'wFWHM',
@@ -1202,7 +1203,7 @@ def create_registration_plot_cli(siril_interface, output_path=None):
 
 def main():
 
-    if siril.is_cli(): #CLI mode
+    if siril.is_cli() and len(sys.argv) > 1: #CLI mode
         try:
             import argparse
             parser = argparse.ArgumentParser(description="Create a registration inspection plot for a sequence")

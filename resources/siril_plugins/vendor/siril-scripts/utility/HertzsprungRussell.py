@@ -20,6 +20,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 # 1.1.0  Added choice between two photometry methods and a way to export data
 # 1.1.1  Improved error handling and added fallback to partner Gaia archives
 # 1.1.2  Commented Gaia archives part due to server issue
+# 1.1.3  If no CLI arguments, run in GUI mode by default
 
 import sirilpy as s
 s.ensure_installed('PyQt6')
@@ -51,7 +52,7 @@ import astropy.units as u
 # NOTE: We import Gaia only when needed to avoid connection attempts at startup
 import csv
 
-VERSION = "1.1.1"
+VERSION = "1.1.3"
 
 if not s.check_module_version('>=0.6.42'):
     print("Error: requires sirilpy module >= 0.6.42")
@@ -1852,7 +1853,7 @@ def main():
         except s.CommandError:
             return
         
-        if siril.is_cli():
+        if siril.is_cli() and len(sys.argv) > 1:
             print("This script requires GUI mode")
             sys.exit(1)
         

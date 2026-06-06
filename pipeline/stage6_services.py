@@ -683,6 +683,143 @@ class Stage6ServiceMixin:
         return float(score)
 
 
+    def _stage7_baseline_background_stats(
+        self,
+        baseline_quality: Optional[QualityMetrics],
+        baseline_adaptive: Optional[Dict[str, Any]],
+    ) -> Dict[str, float]:
+        bg_median = 0.0
+        if baseline_quality is not None:
+            bg_median = float(getattr(baseline_quality, "bg_median", 0.0) or 0.0)
+        adaptive = baseline_adaptive or {}
+        if bg_median <= 0.0 and isinstance(adaptive, dict):
+            try:
+                bg_median = float(adaptive.get("bg_median", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                bg_median = 0.0
+        bg_std = 0.0
+        if isinstance(adaptive, dict):
+            try:
+                bg_std = float(adaptive.get("bg_std", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                bg_std = 0.0
+        return {"bg_median": bg_median, "bg_std": bg_std}
+
+
+    def _stage7_compact_stretch_candidates(
+        self,
+        baseline_quality: Optional[QualityMetrics],
+        baseline_adaptive: Optional[Dict[str, Any]],
+        baseline_pixel_stats: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        stats = self._stage7_baseline_background_stats(baseline_quality, baseline_adaptive)
+        bg_median = float(stats.get("bg_median", 0.0) or 0.0)
+        bg_std = float(stats.get("bg_std", 0.0) or 0.0)
+        adaptation: Dict[str, Any] = {
+            "mode": "default_compact",
+            "bg_median": bg_median,
+            "bg_std": bg_std,
+            "reason": "baseline background not extremely low",
+        }
+        cand_a_params = {"asinh_stretch": 2.2, "asinh_offset": 0.002}
+        cand_b_params = {
+            "asinh_stretch": 2.1,
+            "asinh_offset": 0.002,
+            "ghs_shadowsclip": -2.1,
+            "ghs_stretchamount": 1.05,
+        }
+
+        if 0.0 < bg_median <= 0.005:
+            severity = _clamp_float((0.005 - bg_median) / 0.003, 0.0, 1.0)
+            cand_a_params = {
+                "asinh_stretch": round(1.80 - 0.30 * severity, 3),
+                "asinh_offset": round(0.005 + 0.003 * severity, 5),
+            }
+            cand_b_params = {
+                "asinh_stretch": round(1.85 - 0.25 * severity, 3),
+                "asinh_offset": round(0.005 + 0.002 * severity, 5),
+                "ghs_shadowsclip": -2.1,
+                "ghs_stretchamount": round(1.02 - 0.02 * severity, 3),
+            }
+            adaptation.update(
+                {
+                    "mode": "extreme_low_background",
+                    "severity": severity,
+                    "reason": "bg_median<=0.005; lower Asinh stretch and raise offset to avoid crushing faint background",
+                }
+            )
+        elif 0.005 < bg_median < 0.010:
+            severity = _clamp_float((0.010 - bg_median) / 0.005, 0.0, 1.0)
+            cand_a_params = {
+                "asinh_stretch": round(2.20 - 0.40 * severity, 3),
+                "asinh_offset": round(0.002 + 0.003 * severity, 5),
+            }
+            cand_b_params = {
+                "asinh_stretch": round(2.10 - 0.25 * severity, 3),
+                "asinh_offset": round(0.002 + 0.0025 * severity, 5),
+                "ghs_shadowsclip": -2.1,
+                "ghs_stretchamount": round(1.05 - 0.03 * severity, 3),
+            }
+            adaptation.update(
+                {
+                    "mode": "low_background",
+                    "severity": severity,
+                    "reason": "bg_median<0.010; moderately raise offset and reduce stretch",
+                }
+            )
+
+        pixel_stats = baseline_pixel_stats or {}
+        try:
+            p99 = float(pixel_stats.get("p99", 0.0) or 0.0)
+            max_v = float(pixel_stats.get("max", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            p99 = 0.0
+            max_v = 0.0
+        cap_candidates = [
+            value
+            for value in (p99 * 0.85, max_v * 0.80)
+            if math.isfinite(value) and value > 0.0005
+        ]
+        if cap_candidates:
+            offset_cap = max(0.0005, min(cap_candidates))
+            capped: List[str] = []
+            for name, params in (("cand_a", cand_a_params), ("cand_b", cand_b_params)):
+                current_offset = float(params.get("asinh_offset", 0.002) or 0.002)
+                if current_offset >= p99 and current_offset > offset_cap:
+                    params["asinh_offset"] = round(offset_cap, 5)
+                    capped.append(name)
+            if capped:
+                adaptation["offset_cap"] = {
+                    "capped_candidates": capped,
+                    "p99": p99,
+                    "max": max_v,
+                    "cap": offset_cap,
+                    "reason": "asinh_offset must stay below starless effective signal range",
+                }
+                adaptation["reason"] = (
+                    str(adaptation.get("reason") or "")
+                    + "; capped offset below starless p99/max signal"
+                ).strip("; ")
+
+        candidates = [
+            {
+                "name": "cand_a",
+                "stem": "stage7_cand_a",
+                "method": "asinh",
+                "params": cand_a_params,
+                "adaptation": adaptation,
+            },
+            {
+                "name": "cand_b",
+                "stem": "stage7_cand_b",
+                "method": "asinh_ghs",
+                "params": cand_b_params,
+                "adaptation": adaptation,
+            },
+        ]
+        return candidates, adaptation
+
+
     def _run_stage6_ai_stretching(
         self,
         allow_ai: bool = True,
@@ -699,6 +836,11 @@ class Stage6ServiceMixin:
         baseline_adaptive = (
             self._adaptive_features_current()
             if hasattr(self, "_adaptive_features_current")
+            else {}
+        )
+        baseline_pixel_stats = (
+            self._current_pixel_distribution_stats()
+            if hasattr(self, "_current_pixel_distribution_stats")
             else {}
         )
         messages.append("stage7 stretch candidates: stage7_cand_a, stage7_cand_b; preview=stage7_preview_ref")
@@ -727,25 +869,17 @@ class Stage6ServiceMixin:
         except (CommandError, SirilError) as e:
             messages.append(f"stage7 preview_ref failed: {self._short_text(e, 160)}")
 
-        candidate_list: List[Dict[str, Any]] = [
-            {
-                "name": "cand_a",
-                "stem": "stage7_cand_a",
-                "method": "asinh",
-                "params": {"asinh_stretch": 2.2, "asinh_offset": 0.002},
-            },
-            {
-                "name": "cand_b",
-                "stem": "stage7_cand_b",
-                "method": "asinh_ghs",
-                "params": {
-                    "asinh_stretch": 2.1,
-                    "asinh_offset": 0.002,
-                    "ghs_shadowsclip": -2.1,
-                    "ghs_stretchamount": 1.05,
-                },
-            },
-        ]
+        candidate_list, stretch_adaptation = self._stage7_compact_stretch_candidates(
+            baseline_quality,
+            baseline_adaptive,
+            baseline_pixel_stats,
+        )
+        if stretch_adaptation.get("mode") != "default_compact":
+            messages.append(
+                "stage7 low-background stretch adaptation "
+                f"mode={stretch_adaptation.get('mode')}, "
+                f"bg_median={float(stretch_adaptation.get('bg_median', 0.0) or 0.0):.4f}"
+            )
         attempts: List[Dict[str, Any]] = []
         best_attempt: Optional[Dict[str, Any]] = None
 
@@ -760,6 +894,7 @@ class Stage6ServiceMixin:
                         "file": f"{stem}.fit",
                         "method": candidate["method"],
                         "params": candidate["params"],
+                        "adaptation": candidate.get("adaptation"),
                         "status": "failed",
                         "reason": self._short_text(e, 160),
                     }
@@ -774,6 +909,7 @@ class Stage6ServiceMixin:
                         "file": f"{stem}.fit",
                         "method": candidate["method"],
                         "params": candidate["params"],
+                        "adaptation": candidate.get("adaptation"),
                         "status": "failed",
                         "reason": used_or_error,
                     }
@@ -803,6 +939,7 @@ class Stage6ServiceMixin:
                 "stem": stem if candidate_saved else None,
                 "method": candidate["method"],
                 "params": candidate["params"],
+                "adaptation": candidate.get("adaptation"),
                 "status": "ok" if candidate_saved else "failed",
                 "used": used_or_error,
                 "quality_ok": quality_ok,
@@ -849,6 +986,8 @@ class Stage6ServiceMixin:
                     "reference_only": True,
                 },
                 "baseline_adaptive": baseline_adaptive,
+                "baseline_pixel_stats": baseline_pixel_stats,
+                "stretch_adaptation": stretch_adaptation,
                 "attempts": attempts,
                 "selected": best_attempt,
             },
@@ -858,12 +997,15 @@ class Stage6ServiceMixin:
             {
                 "stage": "stage7_stretch",
                 "input": f"{source_stem}.fit",
+                "stretch_adaptation": stretch_adaptation,
+                "baseline_pixel_stats": baseline_pixel_stats,
                 "candidates": [
                     {
                         "name": item.get("name"),
                         "file": item.get("file"),
                         "method": item.get("method"),
                         "params": item.get("params"),
+                        "adaptation": item.get("adaptation"),
                         "quality_ok": item.get("quality_ok"),
                         "risk_score": item.get("risk_score"),
                         "pixel_stats": item.get("pixel_stats"),

@@ -155,6 +155,9 @@ class _Stage1Probe:
     def _prepare_process_dir(self) -> None:
         return self.module.SeestarPostProcessor._prepare_process_dir(self)
 
+    def _stage2_corrected_resume_candidates(self) -> list[Path]:
+        return self.module.SeestarPostProcessor._stage2_corrected_resume_candidates(self)
+
     def _load_stacked_file(self, _stacked_files: list[Path]) -> None:
         self.used_stacked = True
 
@@ -208,6 +211,9 @@ class _Stage1GateProbe(_Stage1Probe):
     ) -> None:
         self.stage_records.append((name, status, message))
 
+    def _record_skipped_stage(self, name: str, message: str) -> None:
+        self.stage_records.append((name, "skipped", message))
+
 
 class _LinearResumeProbe(_Stage1Probe):
     def __init__(self, module: Any, work_dir: Path) -> None:
@@ -222,6 +228,9 @@ class _LinearResumeProbe(_Stage1Probe):
         message: str = "",
     ) -> None:
         self.stage_records.append((name, status, message))
+
+    def _record_skipped_stage(self, name: str, message: str) -> None:
+        self.stage_records.append((name, "skipped", message))
 
 
 class _Stage1PreprocessProbe(_Stage1Probe):
@@ -365,6 +374,43 @@ class PipelineStage1InputFilteringTests(unittest.TestCase):
             self.assertEqual(name, "阶段 1: 前期准备")
             self.assertEqual(status, "ok")
             self.assertIn("loaded existing result_linear.fit", message)
+
+    def test_prepare_stage2_corrected_resume_uses_existing_process_artifact(self):
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td)
+            old_process = work_dir / "process"
+            old_process.mkdir()
+            stage2_path = old_process / pipeline_module.STAGE2_CORRECTED_INPUT_NAME
+            stage2_path.write_bytes(b"stage2-fit")
+            stale_path = old_process / "stale.fit"
+            stale_path.write_bytes(b"stale")
+            probe = _LinearResumeProbe(pipeline_module, work_dir)
+
+            pipeline_module.SeestarPostProcessor._prepare_stage2_corrected_resume_input(probe)
+
+            self.assertEqual(probe.source_file, stage2_path)
+            self.assertIsNone(probe.linear_intermediate_path)
+            self.assertEqual(probe._stage1_input_mode, "stage2_corrected_resume")
+            self.assertEqual((work_dir / "process" / "working.fit").read_bytes(), b"stage2-fit")
+            self.assertEqual(
+                (work_dir / "process" / pipeline_module.STAGE2_CORRECTED_INPUT_NAME).read_bytes(),
+                b"stage2-fit",
+            )
+            self.assertFalse(stale_path.exists())
+            self.assertIn(("load", "stage2_corrected"), probe.cmd_calls)
+            self.assertEqual(len(probe.stage_records), 2)
+            self.assertEqual(
+                probe.stage_records[0],
+                (
+                    "阶段 1: 前期准备",
+                    "skipped",
+                    "skipped by stage2 corrected resume mode",
+                ),
+            )
+            name, status, message = probe.stage_records[1]
+            self.assertEqual(name, "阶段 2: 裁切")
+            self.assertEqual(status, "ok")
+            self.assertIn("continue from stage3", message)
 
 
 if __name__ == "__main__":

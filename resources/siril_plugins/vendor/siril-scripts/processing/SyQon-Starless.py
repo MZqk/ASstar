@@ -55,6 +55,7 @@ Usage:
 #         Added selectable output folder for starless and starmask FITS files.
 #         Fixed Axiom 2.1 direct-output handling and bundled model preference.
 #         Fixed Siril reload handling for saved starless and starmask files.
+# v2.0.1  If no CLI arguments, run in GUI mode by default
 
 import sys
 import os
@@ -115,6 +116,7 @@ from PySide6.QtWidgets import (
 # Constants — paths are set dynamically in main() once engine_dir is known
 # ============================================================================
 
+SCRIPT_VERSION     = "2.0.1"
 BASE_URL           = "https://siril.syqon.it"
 ZENITH_MODEL_PATH  = None   # set to engine_dir / "zenith.pt" in main()
 AXIOM21_MODEL_PATH = None   # set to engine_dir / "axiom21.pt" in main()
@@ -1439,7 +1441,7 @@ class InferenceGUI(QMainWindow):
     # ------------------------------------------------------------------
 
     def _init_ui(self):
-        self.setWindowTitle("SyQon Starless - Siril Edition")
+        self.setWindowTitle(f"SyQon Starless - Siril Edition v{SCRIPT_VERSION}")
         self.setMinimumSize(1120, 720)
         self.resize(1280, 800)
         self.setStyleSheet(self._premium_stylesheet())
@@ -3056,7 +3058,7 @@ def main():
     config = load_config(siril)
 
     # ---- GUI mode -----------------------------------------------------------
-    if not siril.is_cli():
+    if not (siril.is_cli() and len(sys.argv) > 1):
         if is_single:
             basename = None
             try:

@@ -24,6 +24,7 @@ import copy
 import re
 import shutil
 import subprocess
+import tempfile
 import textwrap
 import threading
 import traceback
@@ -165,7 +166,9 @@ ENV_COSMIC_CLASSIC_GPU_KEY = "SEESTAR_COSMIC_CLASSIC_GPU"
 ENV_COSMIC_CLASSIC_ENABLE_KEY = "SEESTAR_COSMIC_CLASSIC_ENABLE"
 INPUT_MODE_AUTO = "auto"
 INPUT_MODE_LINEAR_RESUME = "result_linear_resume"
+INPUT_MODE_STAGE2_CORRECTED_RESUME = "stage2_corrected_resume"
 LINEAR_RESUME_INPUT_NAME = "result_linear.fit"
+STAGE2_CORRECTED_INPUT_NAME = "stage2_corrected.fit"
 DEFAULT_AI_PROMPT = (
     "Conservative deep-sky astrophotography enhancement only. "
     "Preserve astronomical realism, faint structures, and natural star colors. "
@@ -187,6 +190,8 @@ AUTO_CLAMP_FIELDS = (
     "stage2_edge_black_target",
     "stage2_adaptive_edge_crop_max_passes",
     "stage2_adaptive_edge_crop_max_extra",
+    "stage2_guard_band_pixels",
+    "stage2_color_artifact_max_crop",
     "bg_samples",
     "bg_tolerance",
     "bg_smooth",
@@ -245,6 +250,8 @@ AUTO_CLAMP_FIELDS = (
     "stage7_starless_noise_gain_max",
     "stage7_starmask_coverage_min_ratio",
     "stage7_starmask_width_ratio_max",
+    "stage7_starless_dynamic_range_min_ratio",
+    "stage7_starless_peak_signal_min",
     "stage7_starmask_background_floor_percentile",
     "stage7_starmask_halo_blur_strength",
     "stage7_starmask_small_star_scale",
@@ -429,6 +436,12 @@ def clamp_config(cfg: PipelineConfig) -> PipelineConfig:
     tuned.stage2_adaptive_edge_crop_max_extra = _clamp_float(
         tuned.stage2_adaptive_edge_crop_max_extra, 0.005, 0.060
     )
+    tuned.stage2_guard_band_pixels = _clamp_int(
+        tuned.stage2_guard_band_pixels, 0, 8
+    )
+    tuned.stage2_color_artifact_max_crop = _clamp_float(
+        tuned.stage2_color_artifact_max_crop, 0.05, 0.25
+    )
     tuned.bg_samples = _clamp_int(tuned.bg_samples, 12, 32)
     tuned.bg_tolerance = _clamp_float(tuned.bg_tolerance, 0.6, 1.8)
     tuned.bg_smooth = _clamp_float(tuned.bg_smooth, 0.2, 1.2)
@@ -571,6 +584,12 @@ def clamp_config(cfg: PipelineConfig) -> PipelineConfig:
     )
     tuned.stage7_starmask_width_ratio_max = _clamp_float(
         tuned.stage7_starmask_width_ratio_max, 1.10, 3.00
+    )
+    tuned.stage7_starless_dynamic_range_min_ratio = _clamp_float(
+        tuned.stage7_starless_dynamic_range_min_ratio, 0.20, 0.90
+    )
+    tuned.stage7_starless_peak_signal_min = _clamp_float(
+        tuned.stage7_starless_peak_signal_min, 0.0015, 0.0300
     )
     tuned.stage7_starmask_background_floor_percentile = _clamp_float(
         tuned.stage7_starmask_background_floor_percentile, 20.0, 80.0
@@ -875,6 +894,7 @@ class SeestarPostProcessor(
     }
 
     def __init__(self, config=None):
+        print("DEBUG: SeestarPostProcessor __init__ started")
         self._load_project_env_defaults()
         if config is None:
             self.cfg = PipelineConfig()
@@ -925,6 +945,7 @@ class SeestarPostProcessor(
         self._stage9_star_intensity_reason: str = ""
         self._stage9_bypassed_bad_starless: bool = False
         self._stage9_final_source: str = ""
+        self._debug_quality_metric_index: int = 0
         self.target_profile: Dict[str, Any] = {}
         self.pipeline_policy: Dict[str, Any] = copy.deepcopy(DEFAULT_POLICY)
         self.pre_starless_gate_report: Dict[str, Any] = {}
@@ -1143,6 +1164,84 @@ class SeestarPostProcessor(
 
         elapsed = self.log.stage_end("阶段 1: 前期准备")
         self._record_stage("阶段 1: 前期准备", stage_status, elapsed, message)
+
+    def _stage2_corrected_resume_candidates(self) -> List[Path]:
+        candidates = [
+            self.work_dir / STAGE2_CORRECTED_INPUT_NAME,
+            self.work_dir / "process" / STAGE2_CORRECTED_INPUT_NAME,
+        ]
+        seen = set()
+        unique: List[Path] = []
+        for path in candidates:
+            resolved = path.resolve() if path.exists() else path
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            unique.append(path)
+        return unique
+
+    def _prepare_stage2_corrected_resume_input(self) -> None:
+        self._record_skipped_stage(
+            "阶段 1: 前期准备",
+            "skipped by stage2 corrected resume mode",
+        )
+        self.log.stage_start("阶段 2: 裁切")
+
+        source_path = next(
+            (path for path in self._stage2_corrected_resume_candidates() if path.is_file()),
+            None,
+        )
+        if source_path is None:
+            searched = ", ".join(str(path) for path in self._stage2_corrected_resume_candidates())
+            raise SirilError(
+                f"未找到叠加后处理输入文件 {STAGE2_CORRECTED_INPUT_NAME}，已检查: {searched}"
+            )
+
+        temp_source: Optional[Path] = None
+        source_for_copy = source_path
+        process_dir_candidate = self.work_dir / "process"
+        try:
+            if process_dir_candidate in source_path.parents:
+                fd, temp_name = tempfile.mkstemp(
+                    prefix="seestar_stage2_corrected_",
+                    suffix=".fit",
+                    dir=str(self.work_dir),
+                )
+                os.close(fd)
+                temp_source = Path(temp_name)
+                shutil.copy2(source_path, temp_source)
+                source_for_copy = temp_source
+
+            self._prepare_process_dir()
+            self.source_file = source_path
+            self.linear_intermediate_path = None
+            self._stage1_input_mode = "stage2_corrected_resume"
+            self._stage1_registration_stats = None
+
+            corrected_file = self.process_dir / STAGE2_CORRECTED_INPUT_NAME
+            working_file = self.process_dir / "working.fit"
+            shutil.copy2(source_for_copy, corrected_file)
+            shutil.copy2(source_for_copy, working_file)
+            self.log.info(f"叠加后处理输入: {source_path}")
+            self.log.info("已复制 stage2_corrected 输入到处理目录")
+
+            self.cmd_with_check("cd", f'"{self.process_dir}"')
+            self.cmd_with_check("load", "stage2_corrected")
+
+            stage_saved = self._save_stage_output("stage2_corrected")
+            stage_status = "ok" if stage_saved else "degraded"
+            message = f"loaded existing {STAGE2_CORRECTED_INPUT_NAME}; continue from stage3"
+            if not stage_saved:
+                message += "；stage2 输出保存失败"
+
+            elapsed = self.log.stage_end("阶段 2: 裁切")
+            self._record_stage("阶段 2: 裁切", stage_status, elapsed, message)
+        finally:
+            if temp_source is not None:
+                try:
+                    temp_source.unlink()
+                except OSError as e:
+                    self.log.debug(f"Unable to remove temp stage2 input {temp_source.name}: {e}")
 
     def _apply_forced_runtime_switches(self):
         if self._force_denoise_enabled is not None:
@@ -1586,6 +1685,12 @@ class SeestarPostProcessor(
                     "阶段 5: 线性反卷积 / 轻降噪",
                     "skipped by linear resume mode",
                 )
+            elif self.input_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
+                self._prepare_stage2_corrected_resume_input()
+                self._auto_tune_for_current_input()
+                self.stage3_background_extraction()
+                self.stage4_color_calibration()
+                self.stage5_linear_denoise()
             else:
                 # 线性阶段 (1-5)
                 self.stage1_preparation()

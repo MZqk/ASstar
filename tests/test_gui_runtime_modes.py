@@ -115,6 +115,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             _display_path=lambda path: str(path),
             _current_input_mode=lambda: input_mode,
             _linear_resume_input_path=lambda wd: gui_module.SeestarGui._linear_resume_input_path(proxy, wd),
+            _stage2_corrected_resume_input_path=lambda wd: gui_module.SeestarGui._stage2_corrected_resume_input_path(proxy, wd),
             _disk_space_mode_label=lambda estimate: gui_module.SeestarGui._disk_space_mode_label(proxy, estimate),
             _disk_space_summary_lines=lambda estimate: gui_module.SeestarGui._disk_space_summary_lines(proxy, estimate),
         )
@@ -371,6 +372,54 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 env.get("SEESTAR_INPUT_MODE"),
                 gui_module.INPUT_MODE_LINEAR_RESUME,
             )
+            self.assertEqual(env.get("PYTHONUNBUFFERED"), "1")
+
+    def test_pipeline_worker_accepts_stage2_corrected_resume_input_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worker = gui_module.PipelineWorker(
+                work_dir=root / "work",
+                config_template=root / "config.ini",
+                pipeline_path=root / "pipeline.py",
+                siril_plugin_dir=root / "plugins",
+                resources=root / "resources",
+                runtime_home=root / "runtime_home",
+                siril_candidates=[],
+                input_mode=gui_module.INPUT_MODE_STAGE2_CORRECTED_RESUME,
+            )
+
+            env = worker._build_env(Path("/tmp/siril-cli"))
+
+            self.assertEqual(
+                env.get("SEESTAR_INPUT_MODE"),
+                gui_module.INPUT_MODE_STAGE2_CORRECTED_RESUME,
+            )
+
+    def test_pipeline_worker_build_env_points_pip_to_bundled_wheels(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            downloads = root / "resources" / "siril_plugins" / "downloads"
+            runtime_downloads = root / "runtime_plugins" / "downloads"
+            downloads.mkdir(parents=True)
+            runtime_downloads.mkdir(parents=True)
+            worker = gui_module.PipelineWorker(
+                work_dir=root / "work",
+                config_template=root / "config.ini",
+                pipeline_path=root / "pipeline.py",
+                siril_plugin_dir=root / "plugins",
+                resources=root / "resources",
+                runtime_home=root / "runtime_home",
+                siril_candidates=[],
+            )
+            worker._runtime_plugin_dir = root / "runtime_plugins"
+
+            env = worker._build_env(Path("/tmp/siril-cli"))
+
+            self.assertEqual(env.get("PIP_NO_INDEX"), "1")
+            self.assertEqual(
+                env.get("PIP_FIND_LINKS"),
+                f"{downloads} {runtime_downloads}",
+            )
 
     def test_pipeline_worker_spcc_crash_retry_env_disables_spcc(self):
         with tempfile.TemporaryDirectory() as td:
@@ -403,9 +452,33 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 siril_candidates=[],
             )
 
-            worker._inspect_output_for_errors('input command:spcc "-oscsensor=seestar s30pro"')
+            worker._inspect_output_for_errors('input command:spcc "-oscsensor=Sony IMX585"')
 
             self.assertTrue(worker._spcc_seen_in_run)
+
+    def test_pipeline_worker_spcc_crash_diagnostics_include_recent_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worker = gui_module.PipelineWorker(
+                work_dir=root / "work",
+                config_template=root / "config.ini",
+                pipeline_path=root / "pipeline.py",
+                siril_plugin_dir=root / "plugins",
+                resources=root / "resources",
+                runtime_home=root / "runtime_home",
+                siril_candidates=[],
+            )
+            events: list[str] = []
+            worker.log = SimpleNamespace(emit=lambda text: events.append(str(text)))
+
+            worker._inspect_output_for_errors('input command:spcc "-oscsensor=Sony IMX585"')
+            worker._inspect_output_for_errors("log: Applying aperture photometry to 991 stars.")
+            worker._append_spcc_crash_diagnostics(-11)
+
+            rendered = "".join(events)
+            self.assertIn("SPCC 崩溃诊断", rendered)
+            self.assertIn("input command:spcc", rendered)
+            self.assertIn("Applying aperture photometry to 991 stars", rendered)
 
     def test_normalize_siril_config_blanks_legacy_gaia_photo_file_path(self):
         with tempfile.TemporaryDirectory() as td:
@@ -497,6 +570,22 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 any(gui_module.LINEAR_RESUME_INPUT_NAME in err for err in errors)
             )
 
+    def test_preflight_errors_require_stage2_corrected_for_resume_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td)
+            (work_dir / "M42_master.fit").write_bytes(b"stacked")
+            proxy = self._make_gui_proxy(
+                work_dir,
+                input_mode=gui_module.INPUT_MODE_STAGE2_CORRECTED_RESUME,
+            )
+
+            errors = gui_module.SeestarGui._preflight_errors(proxy, work_dir)
+
+            self.assertTrue(errors)
+            self.assertTrue(
+                any(gui_module.STAGE2_CORRECTED_INPUT_NAME in err for err in errors)
+            )
+
     def test_linear_resume_disk_estimate_and_summary_use_dedicated_mode(self):
         with tempfile.TemporaryDirectory() as td:
             work_dir = Path(td)
@@ -519,6 +608,32 @@ class GuiRuntimeModesTests(unittest.TestCase):
             )
             self.assertTrue(
                 any(gui_module.LINEAR_RESUME_INPUT_NAME in line for line in summary_lines)
+            )
+
+    def test_stage2_corrected_resume_disk_estimate_and_summary_use_dedicated_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td)
+            process_dir = work_dir / "process"
+            process_dir.mkdir()
+            stage2_path = process_dir / gui_module.STAGE2_CORRECTED_INPUT_NAME
+            stage2_path.write_bytes(b"x" * 1024)
+            proxy = self._make_gui_proxy(
+                work_dir,
+                input_mode=gui_module.INPUT_MODE_STAGE2_CORRECTED_RESUME,
+            )
+
+            estimate = gui_module.SeestarGui._estimate_disk_space(proxy, work_dir)
+            self.assertIsNotNone(estimate)
+            assert estimate is not None
+            self.assertEqual(estimate.mode, "stage2_corrected_resume")
+            self.assertEqual(estimate.selected_input_label, gui_module.STAGE2_CORRECTED_INPUT_NAME)
+
+            summary_lines = gui_module.SeestarGui._disk_space_summary_lines(proxy, estimate)
+            self.assertTrue(
+                any("stage2_corrected.fit 叠加后处理模式" in line for line in summary_lines)
+            )
+            self.assertTrue(
+                any(gui_module.STAGE2_CORRECTED_INPUT_NAME in line for line in summary_lines)
             )
 
 

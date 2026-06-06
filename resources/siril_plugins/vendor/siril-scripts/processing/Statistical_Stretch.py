@@ -20,13 +20,14 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QThread
 from PyQt6.QtGui import QFont, QImage, QPixmap
 
-VERSION = "3.1.1"
+VERSION = "3.1.2"
 REQUIRES_SIRILPY = "0.6.10"
 
 # Changelog:
 # 3.0.0 CR: Full feature parity with SAS Pro (HDR + luminance-only)
 # 3.1.0 CR: Add non-destructive preview with zoom/pan, clip stats, and toggle
 # 3.1.1 CR: Fixing bug in "Luminance Only" mode
+# 3.1.2 RS: If no CLI arguments, run in GUI mode by default
 
 if not s.check_module_version(f'>={REQUIRES_SIRILPY}'):
     print(f"Please install sirilpy version {REQUIRES_SIRILPY} or higher")
@@ -1148,7 +1149,7 @@ def main():
                 print("Failed to connect to Siril")
             return
         
-        if siril.is_cli():
+        if siril.is_cli() and len(sys.argv) > 1:
             parser = argparse.ArgumentParser(description="Statistical Stretch")
             parser.add_argument("-median", type=float, default=0.25)
             parser.add_argument("-sigma", type=float, default=5.0)

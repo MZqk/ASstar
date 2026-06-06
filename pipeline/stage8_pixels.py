@@ -297,8 +297,16 @@ def stage8_enhancement_quality_report(pipeline) -> Dict[str, Any]:
     if before and after:
         bg_growth = after.get("bg_dirty_score", 0.0) / max(before.get("bg_dirty_score", 0.0), 1e-6)
         chroma_growth = after.get("chroma_noise_score", 0.0) / max(before.get("chroma_noise_score", 0.0), 1e-6)
-        if bg_growth > 1.05:
-            issues.append(f"bg_dirty_score_growth {bg_growth:.3f}>1.050")
+        dirty_growth_issue = _stage8_bg_noise_growth_issue(
+            pipeline,
+            growth=bg_growth,
+            baseline_std=float(before.get("bg_std", 0.0) or 0.0),
+            candidate_std=float(after.get("bg_std", 0.0) or 0.0),
+            candidate_dirty_score=float(after.get("bg_dirty_score", 0.0) or 0.0),
+            label="bg_dirty_score_growth",
+        )
+        if dirty_growth_issue:
+            issues.append(dirty_growth_issue)
         if chroma_growth > 1.10:
             issues.append(f"chroma_noise_score_growth {chroma_growth:.3f}>1.100")
         if after.get("background_mottling_score", 0.0) > 0.55:
@@ -321,6 +329,29 @@ def stage8_enhancement_quality_report(pipeline) -> Dict[str, Any]:
         "status": "poor" if issues else "ok",
         "issues": issues,
     }
+
+def _stage8_bg_noise_growth_issue(
+    pipeline,
+    *,
+    growth: float,
+    baseline_std: float,
+    candidate_std: float,
+    candidate_dirty_score: float,
+    label: str = "bg_std_growth",
+) -> Optional[str]:
+    if growth <= pipeline.cfg.stage8_bg_std_growth_max:
+        return None
+
+    absolute_growth = max(0.0, candidate_std - baseline_std)
+    low_absolute_noise = (
+        candidate_std <= 0.00075
+        and absolute_growth <= 0.00050
+        and candidate_dirty_score <= 0.060
+    )
+    if low_absolute_noise:
+        return None
+
+    return f"{label} {growth:.3f}>{pipeline.cfg.stage8_bg_std_growth_max:.3f}"
 
 def rollback_stage8_to_input(pipeline) -> bool:
     try:
@@ -828,10 +859,18 @@ def stage8_quality_assessment(
             "highlight_clip_ratio "
             f"{candidate_metrics.highlight_clip_ratio:.4f}>{pipeline.cfg.stage8_highlight_clip_ratio_max:.4f}"
         )
-    if bg_std_growth > pipeline.cfg.stage8_bg_std_growth_max:
-        issues.append(
-            f"bg_std_growth {bg_std_growth:.3f}>{pipeline.cfg.stage8_bg_std_growth_max:.3f}"
+    bg_noise_issue = _stage8_bg_noise_growth_issue(
+        pipeline,
+        growth=bg_std_growth,
+        baseline_std=float(baseline_masked_metrics.get("background_std", 0.0) or 0.0),
+        candidate_std=float(candidate_masked_metrics.get("background_std", 0.0) or 0.0),
+        candidate_dirty_score=float(
+            candidate_masked_metrics.get("background_std", 0.0) or 0.0
         )
+        / max(float(candidate_masked_metrics.get("background_brightness", 0.0) or 0.0), 0.015),
+    )
+    if bg_noise_issue:
+        issues.append(bg_noise_issue)
     if (
         background_brightening > 0.020
         and candidate_masked_metrics.get("background_brightness", 0.0) > 0.08

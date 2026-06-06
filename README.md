@@ -21,7 +21,7 @@
 
 主流程是 starless-first 后期链路：输入统一和裁切 -> 目标画像/策略 -> 背景提取、platesolve、校色、线性反卷积/轻降噪 -> 线性去星与 starmask 准备 -> Starless 主体拉伸和分区增强 -> 受控回星 -> 最终降噪和 TIFF/PNG/FITS 导出。
 
-Stage 3 背景提取默认先尝试动态 `subsky -rbf` 再尝试 `subsky 1`；若 target profile 判定为大面积发射星云，则先尝试 `subsky 1`，再尝试 RBF，GraXpert 仍只作为内置候选不充分后的补救。
+Stage 3 背景提取按候选质量门控自动选择：有 Siril scripts 缓存时优先通过 `pyscript GraXpert-AI.py` / `pyscript AutoBGE.py` 尝试 GraXpert、ADBE、DBE、AutoDBE；再尝试动态 `subsky -rbf` 和 `subsky 1` 兜底。GraXpert BGE 模型会从 `resources/siril_plugins/model_v2_0_1.onnx` 同步到运行时 GraXpert 模型目录。
 
 Stage 11 是可选 AI 后期，只生成 `*_ai` 副本，不覆盖 Stage 10 原始产物。Stage 状态为 `ok / degraded / failed / skipped`；summary 可显示 `ok_with_fallback`、`ok_skipped_optional`。
 
@@ -33,6 +33,7 @@ Stage 11 是可选 AI 后期，只生成 `*_ai` 副本，不覆盖 Stage 10 原�
 2. 选择包含 `.fit/.fits` 的工作目录。
 3. 选择模式：
    - `Normal Pipeline`：完整流程。
+   - `Postprocess From stage2_corrected.fit`：要求工作目录根下或 `process/` 下存在 `stage2_corrected.fit`，作为叠加后中间结果从 stage 3 继续完整后处理。
    - `Continue From result_linear.fit`：要求工作目录根下存在 `result_linear.fit`，从 stage 6 继续。
 4. 按需切换：
    - `AI: ON/OFF` -> `SEESTAR_AI_ENABLED`
@@ -48,6 +49,7 @@ Stage 11 是可选 AI 后期，只生成 `*_ai` 副本，不覆盖 Stage 10 原�
 - `result_linear.fit`：stage 5 线性中间结果，可用于续跑
 - `*_linear.*`：`result_linear.fit` 续跑模式产物
 - `process/stage*.fit`、`process/*.json`：Debug 模式中间产物与诊断报告
+- `process/*_quality_metrics.json`、`process/stage_quality_metrics.jsonl`：Debug 模式下每个阶段输出的统一质量指标，日志同步输出 `[STAGE_QUALITY_METRICS] schema=seestar.stage_quality.v1 ...`
 - `result_processed_ai.tif/png`、`result_final_ai.fit`：可选 AI 后期产物
 
 完整中间文件清单见 `pipeline/seestar_Superimpose_workflow.md` 的“文件与目录行为”。
@@ -61,7 +63,7 @@ cd /Users/mz/dev/aiseestart
 
 Required packages:
 - `packages/python-3.13.12-macos11.pkg`
-- `packages/siril-1.4.2-arm64.dmg`
+- `packages/siril-1.4.3-arm64.dmg`
 
 Optional bundled resources:
 - `resources/ai.env`
@@ -76,7 +78,7 @@ Default output: `release/SeestarSuperimpose.app`
 | Variable | Purpose |
 |---|---|
 | `SEESTAR_AI_*` | AI 总配置；开启后用于阶段 6 去星、阶段 8 增强诊断/参数建议和阶段 11 AI 副本；阶段 7 拉伸当前固定本地两候选 |
-| `SEESTAR_DEBUG_MODE` / `SEESTAR_INPUT_MODE` | GUI Debug 开关与处理模式；`result_linear_resume` 从 `result_linear.fit` 续跑 |
+| `SEESTAR_DEBUG_MODE` / `SEESTAR_INPUT_MODE` | GUI Debug 开关与处理模式；`stage2_corrected_resume` 从 `stage2_corrected.fit` 进入 stage 3，`result_linear_resume` 从 `result_linear.fit` 续跑 |
 | `SEESTAR_OUTPUT_FORMAT` | 最终导出格式：`all`（默认）或逗号分隔 `tif,png,fit` |
 | `SEESTAR_STAR_SEPARATION_MODE` / `SEESTAR_STAGE7_*` | 阶段 6 去星输入、重试、质量阈值和修复控制；变量名保留 `STAGE7` 以兼容旧配置 |
 | `SEESTAR_STAGE9_STARMASK_*` | Stage 9 像素回混前的 starmask Asinh 拉伸控制 |

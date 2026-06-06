@@ -84,6 +84,37 @@ def _edge_mask(shape: tuple[int, int], width_ratio: float = 0.08) -> np.ndarray:
     return mask
 
 
+def _dark_clip_threshold(bg_median: float, bg_mad: float) -> float:
+    """Return a threshold for true clipped pixels, not merely low linear sky."""
+    return max(
+        1e-6,
+        min(
+            0.002,
+            bg_median * 0.45,
+            bg_median - 8.0 * bg_mad,
+        ),
+    )
+
+
+def _low_linear_signal_floor(
+    bg_median: float,
+    bg_mad: float,
+    *,
+    default_floor: float,
+    mad_multiplier: float,
+    median_multiplier: float,
+    minimum: float,
+) -> float:
+    return min(
+        default_floor,
+        max(
+            bg_mad * mad_multiplier,
+            bg_median * median_multiplier,
+            minimum,
+        ),
+    )
+
+
 @dataclass
 class AdaptiveImageFeatures:
     bg_median: float = 0.0
@@ -133,7 +164,7 @@ def analyze_image(image: Any, *, max_side: int = 1024) -> AdaptiveImageFeatures:
     bg_mad = float(np.median(np.abs(bg_pixels - bg_median)))
     edge = _edge_mask(gray.shape)
     edge_values = gray[edge]
-    edge_black_ratio = float(np.mean(edge_values <= max(bg_median * 0.35, 0.002)))
+    edge_black_ratio = float(np.mean(edge_values <= _dark_clip_threshold(bg_median, bg_mad)))
 
     top = float(np.median(gray[: max(1, gray.shape[0] // 8), :]))
     bottom = float(np.median(gray[-max(1, gray.shape[0] // 8):, :]))
@@ -151,7 +182,18 @@ def analyze_image(image: Any, *, max_side: int = 1024) -> AdaptiveImageFeatures:
         + 0.25 * chroma_noise_score
     )
 
-    object_threshold = max(float(np.quantile(gray, 0.72)), bg_median + max(bg_std * 2.0, 0.015))
+    object_floor = _low_linear_signal_floor(
+        bg_median,
+        bg_mad,
+        default_floor=0.015,
+        mad_multiplier=6.0,
+        median_multiplier=0.08,
+        minimum=0.00015,
+    )
+    object_threshold = max(
+        float(np.quantile(gray, 0.72)),
+        bg_median + max(bg_std * 2.0, object_floor),
+    )
     object_mask = gray > object_threshold
     object_area_ratio = float(np.mean(object_mask))
     bright_threshold = max(float(np.quantile(gray, 0.985)), bg_median + max(bg_std * 6.0, 0.08))
@@ -161,7 +203,18 @@ def analyze_image(image: Any, *, max_side: int = 1024) -> AdaptiveImageFeatures:
     core_clip_ratio = float(np.mean(gray >= 0.985))
     bright_core_score = _clamp(core_peak_ratio * 0.7 + min(bright_area * 30.0, 1.0) * 0.3)
 
-    faint_threshold = max(float(np.quantile(gray, 0.58)), bg_median + max(bg_std * 1.1, 0.008))
+    faint_floor = _low_linear_signal_floor(
+        bg_median,
+        bg_mad,
+        default_floor=0.008,
+        mad_multiplier=3.0,
+        median_multiplier=0.05,
+        minimum=0.00008,
+    )
+    faint_threshold = max(
+        float(np.quantile(gray, 0.58)),
+        bg_median + max(bg_std * 1.1, faint_floor),
+    )
     faint_mask = (gray > faint_threshold) & (~bright_mask)
     nebulosity_area_ratio = float(np.mean(faint_mask))
     faint_structure_score = _clamp(nebulosity_area_ratio * 2.2 + float(np.median(texture[faint_mask])) / max(bg_std * 3.0, 0.01) if np.any(faint_mask) else 0.0)
@@ -283,4 +336,3 @@ def write_safe_preview(image: Any, path: Path) -> bool:
         return True
     except Exception:
         return False
-

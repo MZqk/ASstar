@@ -3,7 +3,7 @@
 SPDX-License-Identifier: GPL-3.0-or-later
 
 Naztronomy - OSC Image Preprocessing script
-Version: 2.0.2
+Version: 2.0.3
 =====================================
 
 The author of this script is Nazmus Nasir (Naztronomy) and can be reached at:
@@ -27,6 +27,24 @@ allows you to choose files from any folder and drive and they will all be consol
 
 """
 CHANGELOG:
+
+2.0.3 - Files tab UI overhaul
+      - Drag and drop files or folders directly onto the file list
+      - Folder drop: named folders (lights/darks/flats/biases/dark flats) auto-detected
+      - Folder drop: parent directory containing named subfolders also accepted
+      - Stacked calibration folders (darks_stacked, flats_stacked, biases_stacked) also accepted
+      - Stacked folder drop: prompts current vs all sessions when multiple sessions exist
+      - Frame type selection dialog on drop (Lights, Darks, Flats, Biases)
+      - Master calibration frame support via drag & drop (Master Dark, Master Flat, Master Bias)
+      - Master frames can be applied to the current session, selected sessions (checkboxes), or all sessions
+      - File list rows color-coded by frame type (green=Lights, blue=Darks, amber=Flats, purple=Biases)
+      - Custom item delegate: visible selection highlight and hover effect on file list rows
+      - Green circle indicator on Add buttons when that frame type has files loaded
+      - Empty-state placeholder text on the file list
+      - Drag-hover border highlight on the file list drop zone
+      - Files tab split into two group boxes: Session Management (top) and Files in Session N (bottom)
+      - Session content group box title updates dynamically to show current session number
+      - Next / Back single toggle button for navigating between tabs (styled white with dark border)
 2.0.2 - Bug fixes - bias and BGE colliding
 2.0.1 - Single/Multi/Paneled mosaic workflows 
       - Allow stacking multiple targets at the same time (without combining them at the end)
@@ -45,10 +63,13 @@ CHANGELOG:
 """
 
 
-from operator import index
 from pathlib import Path
 import shutil
 import sirilpy as s
+
+# Themes requirements: qt_themes, pyside6, qtpy
+s.ensure_installed("PyQt6", "numpy", "astropy", "qt_themes", "pyside6", "qtpy")
+
 
 from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtWidgets import (
@@ -62,6 +83,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QFrame,
     QListWidget,
+    QListWidgetItem,
     QSpinBox,
     QDoubleSpinBox,
     QCheckBox,
@@ -78,13 +100,27 @@ from PyQt6.QtWidgets import (
     QTextBrowser,
     QSizePolicy,
     QScrollArea,
+    QStyledItemDelegate,
+    QStyle,
 )
-from PyQt6.QtGui import QFont, QShortcut, QKeySequence, QAction, QDesktopServices
+from PyQt6.QtGui import (
+    QFont,
+    QShortcut,
+    QKeySequence,
+    QAction,
+    QDesktopServices,
+    QDragEnterEvent,
+    QDropEvent,
+    QPainter,
+    QColor,
+    QBrush,
+)
 from datetime import datetime
 import time
 import os
 import sys
 import json
+import qt_themes
 from sirilpy import LogColor, NoImageError
 from astropy.io import fits
 import numpy as np
@@ -92,8 +128,8 @@ from dataclasses import dataclass, field
 from typing import List, Dict
 
 APP_NAME = "Naztronomy - OSC Image Preprocessor"
-VERSION = "2.0.2"
-BUILD = "20260403"
+VERSION = "2.0.3"
+BUILD = "20260430"
 AUTHOR = "Nazmus Nasir"
 WEBSITE = "https://www.Naztronomy.com"
 YOUTUBE = "https://www.YouTube.com/Naztronomy"
@@ -111,6 +147,14 @@ UI_DEFAULTS = {
     "drizzle_amount": 1.0,
     "pixel_fraction": 1.0,
 }
+
+# Controls how files are staged into the sessions/ folder before processing.
+# False (default): symlink files on the same drive, copy files from a different drive.
+#   Cross-drive symlinks cause Siril/libraw to read through untrusted mounts and
+#   fail with I/O errors (WinError 448), so they are always copied.
+# True: always symlink regardless of drive. Use only if your OS / mount allows it
+#   and you want to avoid the disk copy (e.g. large raw files on a trusted NAS).
+ALWAYS_SYMLINK: bool = False
 FRAME_TYPES = ("lights", "darks", "flats", "biases")
 
 
@@ -156,6 +200,273 @@ class Session:
         self.darks.clear()
         self.flats.clear()
         self.biases.clear()
+
+
+class FileListDelegate(QStyledItemDelegate):
+    """Paints row colors from item data, with visible selection and hover highlights."""
+
+    _SEL_BG = QColor("#2563eb")
+    _SEL_FG = QColor("#ffffff")
+    _HOVER_BG = QColor(0, 0, 0, 45)  # semi-transparent dark tint for hover
+
+    def paint(self, painter, option, index):
+        painter.save()
+
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+
+        # --- background ---
+        if selected:
+            painter.fillRect(option.rect, self._SEL_BG)
+        else:
+            bg = index.data(Qt.ItemDataRole.BackgroundRole)
+            if bg is not None:
+                painter.fillRect(
+                    option.rect, bg if isinstance(bg, QColor) else bg.color()
+                )
+            if hovered:
+                painter.fillRect(option.rect, self._HOVER_BG)
+
+        # --- text color ---
+        if selected:
+            text_color = self._SEL_FG
+        else:
+            fg = index.data(Qt.ItemDataRole.ForegroundRole)
+            if fg is not None:
+                text_color = fg if isinstance(fg, QColor) else fg.color()
+            else:
+                text_color = option.palette.color(option.palette.ColorRole.Text)
+
+        text_rect = option.rect.adjusted(4, 0, -4, 0)
+        painter.setPen(text_color)
+        font = index.data(Qt.ItemDataRole.FontRole)
+        if font:
+            painter.setFont(font)
+        painter.drawText(
+            text_rect,
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            index.data(Qt.ItemDataRole.DisplayRole) or "",
+        )
+
+        painter.restore()
+
+
+class FileTypeDialog(QDialog):
+    """Prompt the user to choose a frame type for drag-and-dropped files."""
+
+    FRAME_TYPES = ["Lights", "Darks", "Flats", "Biases"]
+    MASTER_TYPES = ["Master Dark", "Master Flat", "Master Bias"]
+
+    def __init__(
+        self,
+        file_count: int,
+        current_session_name: str = "Current Session",
+        all_session_names: list | None = None,
+        current_session_index: int = 0,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._current_session_name = current_session_name
+        self._all_session_names = all_session_names or [current_session_name]
+        self._current_session_index = current_session_index
+        self.setWindowTitle("Select Frame Type")
+        self.setModal(True)
+        self.setMinimumWidth(320)
+        self.chosen_type: str | None = None
+        self.chosen_scope: str = "current"  # "current", "selected", or "all"
+        self.chosen_session_indices: list = [current_session_index]
+
+        layout = QVBoxLayout(self)
+        plural = "s" if file_count != 1 else ""
+        layout.addWidget(
+            QLabel(
+                f"You dropped {file_count} file{plural}.\nWhat type of frames are these?"
+            )
+        )
+
+        for frame_type in self.FRAME_TYPES:
+            btn = QPushButton(frame_type)
+            btn.setMinimumHeight(50)
+            btn.setMinimumWidth(100)
+            if frame_type.lower() == "lights":
+                btn.clicked.connect(lambda checked, t=frame_type: self._select(t))
+            else:
+                btn.clicked.connect(
+                    lambda checked, t=frame_type: self._select_master(t)
+                )
+            layout.addWidget(btn)
+
+        sep = QLabel("— Master calibration frames —")
+        sep.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sep.setStyleSheet(
+            "color: #888; font-style: italic; font-size: 11px; margin-top: 4px;"
+        )
+        layout.addWidget(sep)
+
+        for master_type in self.MASTER_TYPES:
+            btn = QPushButton(master_type)
+            btn.setMinimumHeight(50)
+            btn.setMinimumWidth(100)
+            btn.setStyleSheet(
+                "QPushButton { background-color: #e8f4e8; color: #1d4e2d; }"
+                " QPushButton:hover { background-color: #c3e6cb; }"
+            )
+            btn.clicked.connect(lambda checked, t=master_type: self._select_master(t))
+            layout.addWidget(btn)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        layout.addWidget(cancel_btn)
+
+    def _select(self, frame_type: str):
+        self.chosen_type = frame_type
+        self.chosen_scope = "current"
+        self.accept()
+
+    def _select_master(self, frame_type: str):
+        if len(self._all_session_names) <= 1:
+            self.chosen_type = frame_type
+            self.chosen_scope = "current"
+            self.accept()
+            return
+
+        sub = QDialog(self)
+        sub.setWindowTitle("Apply to which sessions?")
+        sub.setModal(True)
+        sub_layout = QVBoxLayout(sub)
+
+        sub_layout.addWidget(QLabel(f"Add <b>{frame_type}</b> to:"))
+
+        checkboxes: list[QCheckBox] = []
+        for i, name in enumerate(self._all_session_names):
+            cb = QCheckBox(name)
+            cb.setChecked(i == self._current_session_index)
+            checkboxes.append(cb)
+            sub_layout.addWidget(cb)
+
+        btn_row = QHBoxLayout()
+        selected_btn = QPushButton("Selected Sessions")
+        all_btn = QPushButton("All Sessions")
+        cancel_btn = QPushButton("Cancel")
+        btn_row.addWidget(selected_btn)
+        btn_row.addWidget(all_btn)
+        btn_row.addWidget(cancel_btn)
+        sub_layout.addLayout(btn_row)
+
+        result = {"action": None}
+
+        def on_selected():
+            result["action"] = "selected"
+            sub.accept()
+
+        def on_all():
+            result["action"] = "all"
+            sub.accept()
+
+        selected_btn.clicked.connect(on_selected)
+        all_btn.clicked.connect(on_all)
+        cancel_btn.clicked.connect(sub.reject)
+
+        if sub.exec() != QDialog.DialogCode.Accepted:
+            return  # stay in outer dialog
+
+        if result["action"] == "all":
+            self.chosen_type = frame_type
+            self.chosen_scope = "all"
+            self.chosen_session_indices = list(range(len(self._all_session_names)))
+            self.accept()
+        elif result["action"] == "selected":
+            indices = [i for i, cb in enumerate(checkboxes) if cb.isChecked()]
+            if not indices:
+                return  # nothing checked — stay in dialog
+            self.chosen_type = frame_type
+            self.chosen_scope = "selected"
+            self.chosen_session_indices = indices
+            self.accept()
+        # else: cancel — stay in outer dialog
+
+
+class DragDropListWidget(QListWidget):
+    """A QListWidget that accepts file drag-and-drop and emits the dropped paths."""
+
+    _NORMAL_STYLE = ""
+    _HOVER_STYLE = (
+        "QListWidget { border: 2px dashed #2563eb;"
+        " background-color: rgba(37, 99, 235, 0.07); }"
+    )
+
+    def __init__(self, on_drop_callback, on_delete_callback=None, parent=None):
+        super().__init__(parent)
+        self._on_drop = on_drop_callback
+        self._on_delete = on_delete_callback
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+
+    def keyPressEvent(self, event):
+        if (
+            self._on_delete is not None
+            and self.selectedItems()
+            and event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace)
+        ):
+            self._on_delete()
+        else:
+            super().keyPressEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.count() == 0:
+            painter = QPainter(self.viewport())
+            painter.save()
+            pen_color = self.palette().color(self.palette().ColorRole.PlaceholderText)
+            painter.setPen(pen_color)
+            font = painter.font()
+            font.setPointSize(9)
+            font.setItalic(True)
+            painter.setFont(font)
+            painter.drawText(
+                self.viewport().rect(),
+                Qt.AlignmentFlag.AlignCenter,
+                "Drop files or folders here\nor use the Add buttons above",
+            )
+            painter.restore()
+
+    def dragEnterEvent(self, event: QDragEnterEvent | None):
+        if event is None:
+            return
+        mime = event.mimeData()
+        if mime is not None and mime.hasUrls():
+            self.setStyleSheet(self._HOVER_STYLE)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event is None:
+            return
+        mime = event.mimeData()
+        if mime is not None and mime.hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self.setStyleSheet(self._NORMAL_STYLE)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event: QDropEvent | None):
+        self.setStyleSheet(self._NORMAL_STYLE)
+        if event is None:
+            return
+        mime = event.mimeData()
+        if mime is None or not mime.hasUrls():
+            event.ignore()
+            return
+        paths = [Path(u.toLocalFile()) for u in mime.urls() if u.isLocalFile()]
+        if paths:
+            event.acceptProposedAction()
+            self._on_drop(paths)
+        else:
+            event.ignore()
 
 
 class PreprocessingInterface(QMainWindow):
@@ -340,10 +651,10 @@ class PreprocessingInterface(QMainWindow):
     def on_session_selected(self, index: int):
         if index < 0 or index >= len(self.sessions):
             return
-        # Only update if actually changing sessions
-        if self.chosen_session != self.sessions[index]:
-            self.chosen_session = self.get_session_by_index(index)
-            self.current_session = f"Session {index+1}"
+
+        self.chosen_session = self.get_session_by_index(index)
+        self.current_session = f"Session {index+1}"
+        if hasattr(self, "file_listbox"):
             self.refresh_file_list()
 
     def add_dropdown_session(self):
@@ -376,6 +687,553 @@ class PreprocessingInterface(QMainWindow):
         session_names = [f"Session {i+1}" for i in range(len(self.sessions))]
         self.session_dropdown.clear()  # remove old items
         self.session_dropdown.addItems(session_names)  # add new items
+
+    def _scan_folder_for_sessions(self, folder: Path):
+        """Recursively scan `folder` for recognised frame-type subdirectories.
+
+        Recognised directories (lights/darks/flats/biases etc.) that contain
+        actual files are treated as leaf nodes — their files are collected and
+        the scanner does NOT descend into them further.
+
+        Recognised directories that contain NO direct files are treated as
+        passthrough containers and recursed into.  This handles structures like:
+
+            parent/lights/night_1/LIGHT/<files>
+            parent/lights/night_2/LIGHT/<files>
+
+        where `lights/` exists at an intermediate level.
+
+        Unrecognised directories are treated as potential session boundaries.
+
+        Returns:
+            ("single", {frame_type: [files]})           – one group found
+            ("multi",  {Path: {frame_type: [files]}})   – multiple groups found
+            ("none",   {})                              – nothing recognised found
+
+        Frame types prefixed with "_stacked_" come from *_stacked folder names.
+        """
+        _FT_MAP = {
+            "lights": "lights",
+            "light": "lights",
+            "darks": "darks",
+            "dark": "darks",
+            "flats": "flats",
+            "flat": "flats",
+            "biases": "biases",
+            "bias": "biases",
+            "dark flats": "biases",
+            "dark_flats": "biases",
+            "dark flat": "biases",
+            "dark_flat": "biases",
+        }
+        _ST_MAP = {
+            "darks_stacked": "darks",
+            "flats_stacked": "flats",
+            "biases_stacked": "biases",
+        }
+
+        def recurse(d: Path, group_key: Path | None) -> dict:
+            """Return {group_key_path: {frame_type: [files]}} for all discovered groups.
+
+            For each child directory of d:
+            - Recognised + has files  → leaf: collect files, stop descending into it
+            - Recognised + no files   → passthrough: recurse into it keeping group_key
+            - Unrecognised            → session boundary: recurse with child as new group_key
+            """
+            collected: dict[str, list[Path]] = {}  # frame-type matches at this level
+            sub_sessions: dict[Path, dict] = {}  # session groups from deeper recursion
+
+            for child in sorted(d.iterdir()):
+                if not child.is_dir():
+                    continue
+                child_key = child.name.lower()
+
+                if child_key in _FT_MAP or child_key in _ST_MAP:
+                    files = sorted(f for f in child.iterdir() if f.is_file())
+                    if files:
+                        # Leaf: recognised dir with direct files
+                        if child_key in _FT_MAP:
+                            collected.setdefault(_FT_MAP[child_key], []).extend(files)
+                        else:
+                            collected.setdefault(
+                                f"_stacked_{_ST_MAP[child_key]}", []
+                            ).extend(files)
+                    else:
+                        # Passthrough: recognised dir with no direct files — recurse keeping group_key
+                        for k, v in recurse(child, group_key).items():
+                            for ft, flist in v.items():
+                                sub_sessions.setdefault(k, {}).setdefault(
+                                    ft, []
+                                ).extend(flist)
+                else:
+                    # Unrecognised dir — potential session boundary
+                    new_group = child if group_key is None else group_key
+                    for k, v in recurse(child, new_group).items():
+                        for ft, flist in v.items():
+                            sub_sessions.setdefault(k, {}).setdefault(ft, []).extend(
+                                flist
+                            )
+
+            if collected:
+                gkey = group_key if group_key is not None else d
+                result = {gkey: collected}
+                for k, v in sub_sessions.items():
+                    result.setdefault(k, {}).update(
+                        {ft: flist for ft, flist in v.items()}
+                    )
+                return result
+
+            return sub_sessions
+
+        all_sessions = recurse(folder, None)
+        if not all_sessions:
+            return "none", {}
+        if len(all_sessions) == 1:
+            return "single", list(all_sessions.values())[0]
+        return "multi", all_sessions
+
+    def _handle_multi_session_drop(self, root_folder: Path | None, session_data: dict):
+        """Show a confirmation dialog then create new sessions from a multi-group folder drop.
+
+        root_folder is used for display only; pass None when data comes from
+        multiple dropped parent directories.
+        """
+        groups = sorted(session_data.keys(), key=lambda p: p.name)
+
+        # Determine if any two groups share the same final folder name.
+        # When they do, prepend the nearest non-recognised ancestor for disambiguation.
+        _RECOGNISED_NAMES = {
+            "lights",
+            "light",
+            "darks",
+            "dark",
+            "flats",
+            "flat",
+            "biases",
+            "bias",
+            "dark flats",
+            "dark_flats",
+            "dark flat",
+            "dark_flat",
+        }
+
+        def _ancestor_label(p: Path) -> str:
+            """Walk up past recognised intermediate dirs to find a meaningful ancestor name."""
+            candidate = p.parent
+            while candidate != candidate.parent:
+                if candidate.name.lower() not in _RECOGNISED_NAMES:
+                    return candidate.name
+                candidate = candidate.parent
+            return ""
+
+        group_names = [g.name for g in groups]
+        has_duplicates = len(group_names) != len(set(group_names))
+
+        def _display_label(g: Path) -> str:
+            if not has_duplicates:
+                return g.name
+            ancestor = _ancestor_label(g)
+            return f"{ancestor} / {g.name}" if ancestor else g.name
+
+        summary_parts = []
+        for g in groups:
+            parts = []
+            for ft, files in sorted(session_data[g].items()):
+                display = (
+                    (ft[len("_stacked_") :] + " (stacked)")
+                    if ft.startswith("_stacked_")
+                    else ft
+                )
+                parts.append(f"{display}: {len(files)}")
+            summary_parts.append(
+                f"<li><b>{_display_label(g)}</b> &mdash; {', '.join(parts)}</li>"
+            )
+
+        if root_folder is not None:
+            header = (
+                f"Found <b>{len(groups)}</b> session group(s) in "
+                f"<b>{root_folder.name}/</b>:<br>"
+            )
+        else:
+            header = f"Found <b>{len(groups)}</b> session group(s) across dropped folders:<br>"
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Multi-Session Folder Detected")
+        msg.setTextFormat(Qt.TextFormat.RichText)
+        msg.setText(
+            f"{header}"
+            f"<ul>{''.join(summary_parts)}</ul>"
+            f"Create <b>{len(groups)}</b> new session(s)?"
+        )
+        btn_create = msg.addButton(
+            f"Create {len(groups)} Session(s)", QMessageBox.ButtonRole.AcceptRole
+        )
+        msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        msg.exec()
+
+        if msg.clickedButton() is not btn_create:
+            return
+
+        # If the current session is completely empty, reuse it for the first group
+        # instead of leaving it as a blank Session 1.
+        first_group, *rest_groups = groups
+        current_is_empty = (
+            not self.chosen_session.lights
+            and not self.chosen_session.darks
+            and not self.chosen_session.flats
+            and not self.chosen_session.biases
+        )
+
+        def _populate(session: Session, group_dir: Path):
+            for ft, ft_files in session_data[group_dir].items():
+                real_ft = ft[len("_stacked_") :] if ft.startswith("_stacked_") else ft
+                match real_ft:
+                    case "lights":
+                        session.lights.extend(ft_files)
+                    case "darks":
+                        session.darks.extend(ft_files)
+                    case "flats":
+                        session.flats.extend(ft_files)
+                    case "biases":
+                        session.biases.extend(ft_files)
+
+        if current_is_empty:
+            _populate(self.chosen_session, first_group)
+            self.siril.log(
+                f"> Loaded '{first_group.name}' into {self.session_dropdown.currentText()}",
+                LogColor.BLUE,
+            )
+            remaining = rest_groups
+        else:
+            remaining = groups
+
+        for group_dir in remaining:
+            new_session = Session()
+            self.sessions.append(new_session)
+            _populate(new_session, group_dir)
+            self.siril.log(
+                f"> Created Session {len(self.sessions)} from '{group_dir.name}'",
+                LogColor.BLUE,
+            )
+
+        self.update_dropdown()
+        new_idx = len(self.sessions) - 1
+        self.session_dropdown.setCurrentIndex(new_idx)
+        self.chosen_session = self.sessions[new_idx]
+        self.current_session = f"Session {new_idx + 1}"
+        self.update_process_separately_checkbox()
+
+    def _handle_dropped_files(self, paths: list):
+        """Called by DragDropListWidget when files or folders are dropped onto the list.
+
+        Folders named lights/darks/flats/biases (or dark flats → biases) are
+        recognised and their contents are added to the *current session* directly,
+        bypassing the frame-type dialog.
+
+        A parent folder is scanned recursively (stopping at recognised directories)
+        to find frame-type subfolders.  If one group is found it is added to the
+        current session; if multiple groups are found the user is offered the option
+        to create a new session for each group.
+
+        Individual files whose names contain _darks_stacked, _flats_stacked, or
+        _biases_stacked are auto-categorised into their respective frame types.
+        When more than one session exists the user is asked whether to apply them
+        to the current session only or to all sessions.
+
+        All other plain files still trigger the frame-type dialog.
+        """
+        _FOLDER_TYPE_MAP = {
+            "lights": "lights",
+            "light": "lights",
+            "darks": "darks",
+            "dark": "darks",
+            "flats": "flats",
+            "flat": "flats",
+            "biases": "biases",
+            "bias": "biases",
+            "dark flats": "biases",
+            "dark_flats": "biases",
+            "dark flat": "biases",
+            "dark_flat": "biases",
+        }
+        _STACKED_FOLDER_MAP = {
+            "darks_stacked": "darks",
+            "flats_stacked": "flats",
+            "biases_stacked": "biases",
+        }
+
+        folders = [p for p in paths if Path(p).is_dir()]
+        files = [p for p in paths if Path(p).is_file()]
+
+        # ── Process folders ──────────────────────────────────────────────────
+        # Regular named folders → always current session
+        folder_additions: dict[str, list[Path]] = {}
+        # Stacked calibration folders → ask current vs all when >1 session
+        stacked_additions: dict[str, list[Path]] = {}
+        # Accumulated multi-session groups from all scanned folders — one dialog at end
+        pending_multi_sessions: dict[Path, dict] = {}
+        # "single" scan results keyed by the dropped folder — resolved after the loop
+        pending_single_sessions: dict[Path, dict] = {}
+
+        for folder in folders:
+            folder = Path(folder)
+            folder_key = folder.name.lower()
+            if folder_key in _FOLDER_TYPE_MAP:
+                frame_type = _FOLDER_TYPE_MAP[folder_key]
+                folder_files = sorted(f for f in folder.iterdir() if f.is_file())
+                if folder_files:
+                    folder_additions.setdefault(frame_type, []).extend(folder_files)
+                else:
+                    # No direct files — the recognised folder may contain session subdirs
+                    mode, scan_data = self._scan_folder_for_sessions(folder)
+                    if mode == "single":
+                        pending_single_sessions[folder] = scan_data
+                    elif mode == "multi":
+                        pending_multi_sessions.update(scan_data)
+                    else:
+                        self.siril.log(
+                            f"> Folder '{folder.name}' is empty and contains no recognised subfolders. Skipping.",
+                            LogColor.SALMON,
+                        )
+            elif folder_key in _STACKED_FOLDER_MAP:
+                frame_type = _STACKED_FOLDER_MAP[folder_key]
+                folder_files = sorted(f for f in folder.iterdir() if f.is_file())
+                if folder_files:
+                    stacked_additions.setdefault(frame_type, []).extend(folder_files)
+            else:
+                # Scan recursively for recognised frame-type subdirectories
+                mode, scan_data = self._scan_folder_for_sessions(folder)
+                if mode == "none":
+                    self.siril.log(
+                        f"> Folder '{folder.name}' does not contain recognised "
+                        f"subfolders (lights, darks, flats, biases, dark_flats, "
+                        f"darks_stacked, flats_stacked, biases_stacked). Skipping.",
+                        LogColor.SALMON,
+                    )
+                elif mode == "single":
+                    # Track per-folder — resolved after the loop
+                    pending_single_sessions[folder] = scan_data
+                elif mode == "multi":
+                    # Accumulate — will show one combined dialog after the loop
+                    pending_multi_sessions.update(scan_data)
+
+        # Resolve pending "single" scan results:
+        # - Exactly one, no multi pending → add directly to the current session
+        # - More than one, or mixed with multi → treat each folder as its own session
+        if len(pending_single_sessions) == 1 and not pending_multi_sessions:
+            for ft_map in pending_single_sessions.values():
+                for ft, ft_files in ft_map.items():
+                    if ft.startswith("_stacked_"):
+                        stacked_additions.setdefault(ft[len("_stacked_"):], []).extend(ft_files)
+                    else:
+                        folder_additions.setdefault(ft, []).extend(ft_files)
+        elif pending_single_sessions:
+            # Multiple single-session folders dropped — promote each to its own session group
+            for src_folder, ft_map in pending_single_sessions.items():
+                pending_multi_sessions[src_folder] = ft_map
+
+        # Show a single combined dialog for all accumulated multi-session groups
+        if pending_multi_sessions:
+            root = None if len(folders) > 1 else Path(folders[0])
+            self._handle_multi_session_drop(root, pending_multi_sessions)
+
+        # Apply regular folders → current session only
+        for frame_type, folder_files in folder_additions.items():
+            match frame_type:
+                case "lights":
+                    self.chosen_session.lights.extend(folder_files)
+                case "darks":
+                    self.chosen_session.darks.extend(folder_files)
+                case "flats":
+                    self.chosen_session.flats.extend(folder_files)
+                case "biases":
+                    self.chosen_session.biases.extend(folder_files)
+            self.siril.log(
+                f"> Added {len(folder_files)} {frame_type} files to "
+                f"{self.session_dropdown.currentText()} (folder drop)",
+                LogColor.BLUE,
+            )
+
+        # Apply stacked calibration folders → ask session scope if >1 session
+        if stacked_additions:
+            if len(self.sessions) > 1:
+                stacked_names = ", ".join(f"{ft}_stacked" for ft in stacked_additions)
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Apply Stacked Calibration Frames")
+                msg.setText(
+                    f"You dropped stacked calibration folder(s):\n<b>{stacked_names}</b>\n\n"
+                    f"Apply to which sessions?"
+                )
+                msg.setTextFormat(Qt.TextFormat.RichText)
+                btn_current = msg.addButton(
+                    f"Current Session ({self.session_dropdown.currentText()})",
+                    QMessageBox.ButtonRole.AcceptRole,
+                )
+                btn_all = msg.addButton(
+                    "All Sessions", QMessageBox.ButtonRole.ActionRole
+                )
+                msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+                msg.exec()
+                clicked = msg.clickedButton()
+                if clicked is btn_all:
+                    stacked_target_sessions = self.sessions
+                    stacked_session_label = "all sessions"
+                elif clicked is btn_current:
+                    stacked_target_sessions = [self.chosen_session]
+                    stacked_session_label = self.session_dropdown.currentText()
+                else:
+                    stacked_target_sessions = []
+                    stacked_session_label = ""
+            else:
+                stacked_target_sessions = [self.chosen_session]
+                stacked_session_label = self.session_dropdown.currentText()
+
+            for frame_type, stacked_files in stacked_additions.items():
+                for session in stacked_target_sessions:
+                    match frame_type:
+                        case "darks":
+                            session.darks.extend(stacked_files)
+                        case "flats":
+                            session.flats.extend(stacked_files)
+                        case "biases":
+                            session.biases.extend(stacked_files)
+                if stacked_target_sessions:
+                    self.siril.log(
+                        f"> Added {len(stacked_files)} {frame_type} (stacked) files to "
+                        f"{stacked_session_label} (folder drop)",
+                        LogColor.BLUE,
+                    )
+
+        # ── Process plain files ──────────────────────────────────────────────
+        # First, pull out any stacked calibration files identified by filename pattern.
+        # e.g. session1_240s_2024-12-03_darks_stacked.fit → darks
+        _STACKED_FILE_SUFFIXES = {
+            "_darks_stacked": "darks",
+            "_flats_stacked": "flats",
+            "_biases_stacked": "biases",
+        }
+
+        stacked_files: dict[str, list[Path]] = {}
+        regular_files: list[Path] = []
+        for f in files:
+            stem = Path(f).stem.lower()
+            matched = False
+            for suffix, frame_type in _STACKED_FILE_SUFFIXES.items():
+                if suffix in stem:
+                    stacked_files.setdefault(frame_type, []).append(Path(f))
+                    matched = True
+                    break
+            if not matched:
+                regular_files.append(Path(f))
+
+        # Apply stacked calibration files → ask session scope if >1 session
+        if stacked_files:
+            if len(self.sessions) > 1:
+                stacked_names = ", ".join(f"{ft}_stacked" for ft in stacked_files)
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Apply Stacked Calibration Frames")
+                msg.setText(
+                    f"You dropped stacked/master calibration file(s):\n<b>{stacked_names}</b>\n\n"
+                    f"Apply to which sessions?"
+                )
+                msg.setTextFormat(Qt.TextFormat.RichText)
+                btn_current = msg.addButton(
+                    f"Current Session ({self.session_dropdown.currentText()})",
+                    QMessageBox.ButtonRole.AcceptRole,
+                )
+                btn_all = msg.addButton(
+                    "All Sessions", QMessageBox.ButtonRole.ActionRole
+                )
+                msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+                msg.exec()
+                clicked = msg.clickedButton()
+                if clicked is btn_all:
+                    stacked_file_sessions = self.sessions
+                    stacked_file_label = "all sessions"
+                elif clicked is btn_current:
+                    stacked_file_sessions = [self.chosen_session]
+                    stacked_file_label = self.session_dropdown.currentText()
+                else:
+                    stacked_file_sessions = []
+                    stacked_file_label = ""
+            else:
+                stacked_file_sessions = [self.chosen_session]
+                stacked_file_label = self.session_dropdown.currentText()
+
+            for frame_type, sf_list in stacked_files.items():
+                for session in stacked_file_sessions:
+                    match frame_type:
+                        case "darks":
+                            session.darks.extend(sf_list)
+                        case "flats":
+                            session.flats.extend(sf_list)
+                        case "biases":
+                            session.biases.extend(sf_list)
+                if stacked_file_sessions:
+                    self.siril.log(
+                        f"> Added {len(sf_list)} {frame_type} (stacked) file(s) to "
+                        f"{stacked_file_label} (drag & drop)",
+                        LogColor.BLUE,
+                    )
+
+        # Remaining non-stacked files → show frame-type dialog as before
+        if regular_files:
+            dlg = FileTypeDialog(
+                file_count=len(regular_files),
+                current_session_name=self.session_dropdown.currentText(),
+                all_session_names=[f"Session {i+1}" for i in range(len(self.sessions))],
+                current_session_index=self.session_dropdown.currentIndex(),
+                parent=self,
+            )
+            if dlg.exec() != QDialog.DialogCode.Accepted or dlg.chosen_type is None:
+                if folder_additions or stacked_additions or stacked_files:
+                    self.refresh_file_list()
+                return
+            filetype = dlg.chosen_type
+            scope = dlg.chosen_scope
+
+            # Determine which sessions to apply to
+            if scope == "all":
+                target_sessions = self.sessions
+            elif scope == "selected":
+                target_sessions = [self.sessions[i] for i in dlg.chosen_session_indices]
+            else:
+                target_sessions = [self.chosen_session]
+
+            # Map master types to their underlying calibration list
+            _master_map = {
+                "master dark": "darks",
+                "master flat": "flats",
+                "master bias": "biases",
+            }
+            resolved_type = _master_map.get(filetype.lower(), filetype.lower())
+
+            for session in target_sessions:
+                match resolved_type:
+                    case "lights":
+                        session.lights.extend(regular_files)
+                    case "darks":
+                        session.darks.extend(regular_files)
+                    case "flats":
+                        session.flats.extend(regular_files)
+                    case "biases":
+                        session.biases.extend(regular_files)
+
+            if scope == "all":
+                session_label = "all sessions"
+            elif scope == "selected":
+                session_label = ", ".join(
+                    f"Session {i+1}" for i in dlg.chosen_session_indices
+                )
+            else:
+                session_label = self.session_dropdown.currentText()
+
+            self.siril.log(
+                f"> Added {len(regular_files)} {filetype} files to {session_label} (drag & drop)",
+                LogColor.BLUE,
+            )
+
+        self.refresh_file_list()
 
     def load_files(self, filetype: str):
         file_dialog = QFileDialog()
@@ -428,41 +1286,82 @@ class PreprocessingInterface(QMainWindow):
                 files = session.get_files_by_type(image_type)
                 for file in files:
                     dest_path = session_dir / image_type / file.name
+                    src = Path(file)
 
-                    try:
-                        # Convert to absolute paths for reliable symlinks
-                        src_abs = Path(file).resolve()
-                        dest_abs = dest_path.resolve()
+                    # If source and destination are on different drives, always copy.
+                    # Symlinking across drives (e.g. M:\ → H:\) causes Siril/libraw to
+                    # resolve the symlink back to the original path and read from the
+                    # untrusted mount, producing "Error in libraw Input/output error".
+                    src_drive = src.resolve(strict=False).drive.lower()
+                    dst_drive = dest_path.resolve(strict=False).drive.lower()
+                    same_drive = src_drive == dst_drive
 
-                        # Attempt to create symlink
-                        os.symlink(src_abs, dest_abs)
-                        self.siril.log(
-                            f"Symlinked {file} to {dest_path}", LogColor.BLUE
-                        )
+                    if ALWAYS_SYMLINK or same_drive:
+                        try:
+                            os.symlink(src.resolve(strict=False), dest_path.resolve(strict=False))
+                            self.siril.log(f"Symlinked {file} to {dest_path}", LogColor.BLUE)
+                            continue
+                        except (OSError, NotImplementedError):
+                            pass  # fall through to copy
 
-                    except (OSError, NotImplementedError):
-                        # Fall back to copying if symlink fails
-                        # OSError covers permission issues and unsupported filesystems
-                        # NotImplementedError covers platforms that don't support symlinks
-                        shutil.copy(file, dest_path)
-                        self.siril.log(f"Copied {file} to {dest_path}", LogColor.BLUE)
+                    shutil.copy(str(src), str(dest_path))
+                    self.siril.log(f"Copied {file} to {dest_path}", LogColor.BLUE)
             else:
                 self.siril.log(
                     f"Skipping {image_type}: no files found", LogColor.SALMON
                 )
 
+    # Background/foreground colors per frame type
+    _FRAME_COLORS = {
+        "lights": ("#c3e6cb", "#1d4e2d"),
+        "darks": ("#b8daff", "#003680"),
+        "flats": ("#ffeaa7", "#7d5a00"),
+        "biases": ("#d1c4e9", "#311b5e"),
+    }
+
     def refresh_file_list(self):
-        self.file_listbox.clear()  # clear QListWidget instead of delete()
-        self.siril.log(f"Switched to session {self.chosen_session}", LogColor.BLUE)
+        self.file_listbox.clear()
+        self.siril.log(
+            f"Switched to {self.session_dropdown.currentText()}", LogColor.BLUE
+        )
+
+        # Update the session content group box title
+        if hasattr(self, "session_content_group"):
+            idx = self.session_dropdown.currentIndex() + 1
+            self.session_content_group.setTitle(f"Files in Session {idx}")
 
         if self.chosen_session:
             for file_type in FRAME_TYPES:
                 files = self.chosen_session.get_files_by_type(file_type)
                 if files:
-                    for index, file in enumerate(files):
-                        self.file_listbox.addItem(
-                            f"{index + 1:>4}. {file_type.capitalize():^20}  {str(file.resolve())}"
+                    bg_hex, fg_hex = self._FRAME_COLORS.get(
+                        file_type, ("#ffffff", "#000000")
+                    )
+                    bg = QBrush(QColor(bg_hex))
+                    fg = QBrush(QColor(fg_hex))
+                    for idx, file in enumerate(files):
+                        item = QListWidgetItem(
+                            f"{idx + 1:>4}. {file_type.capitalize():^20}  {str(file.resolve())}"
                         )
+                        item.setBackground(bg)
+                        item.setForeground(fg)
+                        self.file_listbox.addItem(item)
+
+        self.update_frame_buttons()
+
+    def update_frame_buttons(self):
+        """Show a green circle on each Add button when that frame type has files loaded."""
+        if not hasattr(self, "lights_btn"):
+            return
+        btn_map = {
+            "lights": (self.lights_btn, "Add Lights"),
+            "darks": (self.darks_btn, "Add Darks"),
+            "flats": (self.flats_btn, "Add Flats"),
+            "biases": (self.biases_btn, "Add Biases"),
+        }
+        for file_type, (btn, label) in btn_map.items():
+            files = self.chosen_session.get_files_by_type(file_type)
+            btn.setText(f"\U0001f7e2 {label}" if files else label)
 
     # Debug code
     def show_all_sessions(self):
@@ -536,12 +1435,17 @@ class PreprocessingInterface(QMainWindow):
         if os.path.isdir(directory):
             print(f"Found directory for {image_type}: {directory}")
             self.siril.cmd("cd", f'"{directory}"')
-            # Ignore hidden files and dirs
+            # Ignore hidden files and dirs.
+            # Also accept symlinks: os.path.isfile() silently returns False for
+            # symlinks whose targets live on an untrusted mount (WinError 448).
+            def _is_file_or_link(p):
+                return os.path.islink(p) or (os.path.isfile(p) and not os.path.isdir(p))
+
             file_count = len(
                 [
                     name
                     for name in os.listdir(directory)
-                    if os.path.isfile(os.path.join(directory, name))
+                    if _is_file_or_link(os.path.join(directory, name))
                     and not name.startswith(".")
                 ]
             )
@@ -556,7 +1460,13 @@ class PreprocessingInterface(QMainWindow):
                     f"Only one file found in {image_type} directory. Treating it like a master {image_type} frame.",
                     LogColor.BLUE,
                 )
-                src = os.path.join(directory, os.listdir(directory)[0])
+                first_file = next(
+                    name
+                    for name in os.listdir(directory)
+                    if _is_file_or_link(os.path.join(directory, name))
+                    and not name.startswith(".")
+                )
+                src = os.path.join(directory, first_file)
 
                 dst = os.path.join(
                     self.current_working_directory,
@@ -574,9 +1484,21 @@ class PreprocessingInterface(QMainWindow):
                 return False
             else:
                 try:
-                    # using `link` to only get fits files
-                    args = ["link", image_type, "-out=../process"]
-                    # args = ["convert", image_type, "-out=../process"]
+                    # Check file extension to determine whether to use link or convert. Fixes bug for other raw files
+                    first_file = next(
+                        name
+                        for name in os.listdir(directory)
+                        if _is_file_or_link(os.path.join(directory, name))
+                        and not name.startswith(".")
+                    )
+                    file_ext = os.path.splitext(first_file)[1].lower()
+                    fits_extensions = [".fit", ".fits", ".fit.fz", ".fits.fz"]
+
+                    if file_ext in fits_extensions:
+                        args = ["link", image_type, "-out=../process"]
+                    else:
+                        args = ["convert", image_type, "-out=../process"]
+
                     # if "lights" in image_type.lower():
                     #     if not self.drizzle_status:
                     #         args.append("-debayer")
@@ -920,14 +1842,18 @@ class PreprocessingInterface(QMainWindow):
         ):
             cmd_args.append("-flat=flats_stacked")
 
-        # apply bias to lights because it does magic
-        # if os.path.exists(
-        #     os.path.join(
-        #         self.current_working_directory,
-        #         f"process/biases_stacked{self.fits_extension}",
-        #     )
-        # ):
-        #     cmd_args.append("-bias=biases_stacked")
+        # apply dark flats to lights if using that instead of bias frames
+        if (
+            os.path.exists(
+                os.path.join(
+                    self.current_working_directory,
+                    f"process/biases_stacked{self.fits_extension}",
+                )
+            )
+            and self.dark_flats_check.isChecked()
+            # and not self.bg_extract_check.isChecked()
+        ):
+            cmd_args.append("-bias=biases_stacked")
         cmd_args.extend(["-cfa", "-equalize_cfa"])
         # cmd_args = [
         #     "calibrate",
@@ -1063,6 +1989,8 @@ class PreprocessingInterface(QMainWindow):
             process_dir = os.path.join(self.current_working_directory, "process")
         else:
             process_dir = self.current_working_directory
+        if not os.path.isdir(process_dir):
+            return
         for f in os.listdir(process_dir):
             # Skip the stacked file
             name, ext = os.path.splitext(f.lower())
@@ -1118,8 +2046,7 @@ class PreprocessingInterface(QMainWindow):
         browser.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
-        browser.setHtml(
-            """
+        browser.setHtml("""
             <style>
             body  { font-family: sans-serif; font-size: 13px; margin: 4px; }
             h3    { margin-bottom: 4px; margin-top: 14px; color: #2c7bb6; }
@@ -1147,6 +2074,25 @@ class PreprocessingInterface(QMainWindow):
             <li>Calibration cannot be shared between sessions (yet).</li>
             <li>Preprocessed lights are saved to a <b>collected_lights/</b> directory when
                 <i>Save Calibrated Lights</i> is enabled.</li>
+            </ul>
+
+            <h3>Drag &amp; Drop</h3>
+            <ul>
+            <li>You can drag and drop <b>files or folders</b> directly onto the file list.</li>
+            <li><b>Named folders</b> (<code>lights</code>, <code>darks</code>, <code>flats</code>,
+                <code>biases</code>, <code>dark_flats</code>) are recognised automatically — their
+                contents are added to the <b>current session</b> with no dialog.</li>
+            <li>Drop a <b>parent folder</b> that contains those named subfolders and each subfolder
+                is scanned and categorised the same way.</li>
+            <li><b>Stacked calibration files</b> whose filenames contain <code>_darks_stacked</code>,
+                <code>_flats_stacked</code>, or <code>_biases_stacked</code> are auto-categorised
+                into their respective frame type. When more than one session exists you will be
+                asked whether to apply them to the <i>current session</i> or <i>all sessions</i>.</li>
+            <li>Any other dropped files trigger the normal <b>frame-type dialog</b> where you
+                choose Lights, Darks, Flats, Biases, or a Master calibration type and the target
+                session scope.</li>
+            <li>You can mix files and folders in a single drop - each group is handled
+                independently.</li>
             </ul>
 
             <h3>Presets</h3>
@@ -1186,8 +2132,7 @@ class PreprocessingInterface(QMainWindow):
             <li>When <i>Save Calibrated Lights</i> is <b>on</b>, all calibrated lights are
                 collected and stacked together in one pass.</li>
             </ul>
-            """
-        )
+            """)
         outer.addWidget(browser)
 
         # Social / community buttons
@@ -1265,66 +2210,96 @@ class PreprocessingInterface(QMainWindow):
         # Files tab
         files_tab = QWidget()
         files_layout = QVBoxLayout(files_tab)
+        files_layout.setSpacing(8)
 
-        # Session selection row
+        # ── Top container: Session Management ──────────────────────────────
+        session_mgmt_group = QGroupBox("Session Management")
+        session_mgmt_layout = QVBoxLayout(session_mgmt_group)
+        session_mgmt_layout.setContentsMargins(10, 8, 10, 8)
+
         session_row = QHBoxLayout()
         session_label = QLabel("Session:")
-        # self.session_dropdown = QComboBox()
-        # self.session_dropdown.addItems([f"Session {i+1}" for i in range(len(self.sessions))])
-        # self.session_dropdown.currentIndexChanged.connect(self.on_session_selected)
-        # Now populate the dropdown here
-        self.update_dropdown()  # Add this line
-        self.session_dropdown.setCurrentIndex(0)  # Set initial selection
+        self.update_dropdown()
+        self.session_dropdown.setCurrentIndex(0)
 
         add_session_btn = QPushButton("+ Add Session")
         add_session_btn.clicked.connect(self.add_dropdown_session)
-        remove_session_btn = QPushButton("– Remove Session")
+        remove_session_btn = QPushButton("\u2013 Remove Session")
         remove_session_btn.clicked.connect(self.remove_session)
 
         session_row.addWidget(session_label)
         session_row.addWidget(self.session_dropdown)
         session_row.addWidget(add_session_btn)
         session_row.addWidget(remove_session_btn)
-        files_layout.addLayout(session_row)
+        session_mgmt_layout.addLayout(session_row)
+
+        files_layout.addWidget(session_mgmt_group)
+
+        # ── Bottom container: Session Content ──────────────────────────────
+        self.session_content_group = QGroupBox("Files in Session 1")
+        session_content_layout = QVBoxLayout(self.session_content_group)
+        session_content_layout.setContentsMargins(10, 8, 10, 8)
+        session_content_layout.setSpacing(6)
 
         # Frame buttons
         frame_buttons = QHBoxLayout()
-        lights_btn = QPushButton("Add Lights")
-        lights_btn.clicked.connect(lambda: self.load_files("Lights"))
-        darks_btn = QPushButton("Add Darks")
-        darks_btn.clicked.connect(lambda: self.load_files("Darks"))
-        flats_btn = QPushButton("Add Flats")
-        flats_btn.clicked.connect(lambda: self.load_files("Flats"))
-        biases_btn = QPushButton("Add Biases")
-        biases_btn.clicked.connect(lambda: self.load_files("Biases"))
-        biases_btn.setToolTip("Bias frames or Dark Flats can be used.")
+        self.lights_btn = QPushButton("Add Lights")
+        self.lights_btn.clicked.connect(lambda: self.load_files("Lights"))
+        self.darks_btn = QPushButton("Add Darks")
+        self.darks_btn.clicked.connect(lambda: self.load_files("Darks"))
+        self.flats_btn = QPushButton("Add Flats")
+        self.flats_btn.clicked.connect(lambda: self.load_files("Flats"))
+        self.biases_btn = QPushButton("Add Biases")
+        self.biases_btn.clicked.connect(lambda: self.load_files("Biases"))
+        self.biases_btn.setToolTip("Bias frames or Dark Flats can be used.")
 
-        for btn in [lights_btn, darks_btn, flats_btn, biases_btn]:
+        for btn in [self.lights_btn, self.darks_btn, self.flats_btn, self.biases_btn]:
             frame_buttons.addWidget(btn)
-        files_layout.addLayout(frame_buttons)
+        session_content_layout.addLayout(frame_buttons)
+
+        drop_hint_label = QLabel(
+            "\u2193  or drag & drop files directly onto the list below"
+        )
+        drop_hint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        drop_hint_label.setStyleSheet(
+            "color: #888; font-style: italic; font-size: 11px;"
+        )
+        session_content_layout.addWidget(drop_hint_label)
 
         # Files list
-        list_group = QGroupBox("Files in Current Session")
-        list_layout = QVBoxLayout()
-        self.file_listbox = QListWidget()
+        self.file_listbox = DragDropListWidget(
+            on_drop_callback=self._handle_dropped_files,
+            on_delete_callback=self.remove_selected_files,
+        )
         self.file_listbox.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
         )
-        list_layout.addWidget(self.file_listbox)
+        self.file_listbox.setToolTip(
+            "Drag and drop files or folders here to add them to the current session.\n"
+            "Named folders (lights, darks, flats, biases) are auto-categorised.\n"
+            "Drop a parent folder containing those subfolders to load an entire session,\n"
+            "or a folder with session sub-folders to auto-create multiple sessions."
+        )
+        self.file_listbox.setItemDelegate(FileListDelegate(self.file_listbox))
+        self.file_listbox.viewport().setMouseTracking(True)
+        session_content_layout.addWidget(self.file_listbox)
 
         file_buttons = QHBoxLayout()
         remove_btn = QPushButton("Remove Selected File(s)")
         remove_btn.clicked.connect(self.remove_selected_files)
+        remove_btn.setToolTip(
+            "Remove the selected file(s) from this session.\n"
+            "Tip: You can also press Delete or Backspace while a file(s) is highlighted."
+        )
         reset_btn = QPushButton("Reset Everything")
         reset_btn.clicked.connect(self.reset_everything)
         reset_btn.setToolTip("Warning: This will remove all sessions and files!")
 
         file_buttons.addWidget(remove_btn)
         file_buttons.addWidget(reset_btn)
-        list_layout.addLayout(file_buttons)
+        session_content_layout.addLayout(file_buttons)
 
-        list_group.setLayout(list_layout)
-        files_layout.addWidget(list_group)
+        files_layout.addWidget(self.session_content_group)
 
         # Processing tab
         processing_tab = QWidget()
@@ -1341,24 +2316,29 @@ class PreprocessingInterface(QMainWindow):
         processing_layout = QVBoxLayout(scroll_content)
 
         # Drizzle settings
-        drizzle_group = QGroupBox("Optional Preprocessing Steps")
-        drizzle_layout = QVBoxLayout()
+        preprocessing_group = QGroupBox("Optional Preprocessing Steps")
+        preprocessing_layout = QVBoxLayout()
+
+        dark_flats_tooltip = "If your bias frames are dark flats instead, check this box. It'll be properly applied to the light frames during calibration."
+        self.dark_flats_check = QCheckBox("Using Dark Flats?")
+        self.dark_flats_check.setToolTip(dark_flats_tooltip)
+        preprocessing_layout.addWidget(self.dark_flats_check)
 
         cleanup_tooltip = "Enable this option to delete all intermediary files after they are done processing. This saves space on your hard drive.\nNote: If your session is batched, this option is automatically enabled even if it's unchecked!"
         self.cleanup_check = QCheckBox("Clean up intermediate files")
         self.cleanup_check.setToolTip(cleanup_tooltip)
-        drizzle_layout.addWidget(self.cleanup_check)
+        preprocessing_layout.addWidget(self.cleanup_check)
 
         bg_extract_tooltip = "Removes background gradients from your images before stacking. Uses Polynomial value 1 and 10 samples."
 
         self.bg_extract_check = QCheckBox("Background Extraction")
         self.bg_extract_check.setToolTip(bg_extract_tooltip)
-        drizzle_layout.addWidget(self.bg_extract_check)
+        preprocessing_layout.addWidget(self.bg_extract_check)
 
         drizzle_tooltip = "Drizzle integration can improve resolution but increases processing time and file size. Use values above 1.0 with caution."
         self.drizzle_checkbox = QCheckBox("Enable Drizzle")
         self.drizzle_checkbox.setToolTip(drizzle_tooltip)
-        drizzle_layout.addWidget(self.drizzle_checkbox)
+        preprocessing_layout.addWidget(self.drizzle_checkbox)
 
         drizzle_amount_tooltip = "Scale factor for drizzle integration. Values between 1.0 and 3.0 are typical. \nNote: Higher values increase processing time and file size."
         drizzle_amount_layout = QHBoxLayout()
@@ -1376,7 +2356,7 @@ class PreprocessingInterface(QMainWindow):
         self.drizzle_amount_spinbox.setToolTip(drizzle_amount_tooltip)
         drizzle_amount_layout.addWidget(drizzle_amount_label)
         drizzle_amount_layout.addWidget(self.drizzle_amount_spinbox)
-        drizzle_layout.addLayout(drizzle_amount_layout)
+        preprocessing_layout.addLayout(drizzle_amount_layout)
 
         self.drizzle_checkbox.toggled.connect(self.drizzle_amount_spinbox.setEnabled)
 
@@ -1394,16 +2374,16 @@ class PreprocessingInterface(QMainWindow):
         self.pixel_fraction_spinbox.setToolTip(pixel_fraction_label_tooltip)
         pixel_fraction_layout.addWidget(pixel_fraction_label)
         pixel_fraction_layout.addWidget(self.pixel_fraction_spinbox)
-        drizzle_layout.addLayout(pixel_fraction_layout)
+        preprocessing_layout.addLayout(pixel_fraction_layout)
 
         self.drizzle_checkbox.toggled.connect(self.pixel_fraction_spinbox.setEnabled)
 
-        drizzle_group.setLayout(drizzle_layout)
-        processing_layout.addWidget(drizzle_group)
+        preprocessing_group.setLayout(preprocessing_layout)
+        processing_layout.addWidget(preprocessing_group)
 
         # Registration settings
-        reg_group = QGroupBox("Optional Filter Settings")
-        reg_layout = QVBoxLayout()
+        filter_group = QGroupBox("Optional Filter Settings")
+        filter_layout = QVBoxLayout()
 
         # Roundness filter
         roundness_label_tooltip = "Filters images by star roundness, calculated using the second moments of detected stars. \nA lower roundness value applies a stricter filter, keeping only frames with well-defined, circular stars. Higher roundness values allow more variation in star shapes."
@@ -1433,7 +2413,7 @@ class PreprocessingInterface(QMainWindow):
         roundness_layout.addWidget(self.roundness_check)
         roundness_layout.addWidget(self.roundness_spinbox)
         roundness_layout.addWidget(self.roundness_mode_combo)
-        reg_layout.addLayout(roundness_layout)
+        filter_layout.addLayout(roundness_layout)
 
         # FWHM filter
         fwhm_label_tooltip = "Filters images by weighted Full Width at Half Maximum (FWHM), calculated using star sharpness. \nA lower sigma value applies a stricter filter, keeping only frames close to the median FWHM. Higher sigma allows more variation."
@@ -1463,7 +2443,7 @@ class PreprocessingInterface(QMainWindow):
         fwhm_layout.addWidget(self.fwhm_check)
         fwhm_layout.addWidget(self.fwhm_spinbox)
         fwhm_layout.addWidget(self.fwhm_mode_combo)
-        reg_layout.addLayout(fwhm_layout)
+        filter_layout.addLayout(fwhm_layout)
 
         # Star count filter
         stars_label_tooltip = "Filters images by star count. Frames with significantly fewer stars than the median are excluded. \nA lower sigma value applies a stricter filter. Higher sigma allows more variation."
@@ -1493,7 +2473,7 @@ class PreprocessingInterface(QMainWindow):
         stars_layout.addWidget(self.stars_check)
         stars_layout.addWidget(self.stars_spinbox)
         stars_layout.addWidget(self.stars_mode_combo)
-        reg_layout.addLayout(stars_layout)
+        filter_layout.addLayout(stars_layout)
 
         # Background filter
         bkg_label_tooltip = "Filters images by background level. Frames with a significantly higher background than the median are excluded. \nA lower sigma value applies a stricter filter. Higher sigma allows more variation."
@@ -1523,14 +2503,14 @@ class PreprocessingInterface(QMainWindow):
         bkg_layout.addWidget(self.bkg_check)
         bkg_layout.addWidget(self.bkg_spinbox)
         bkg_layout.addWidget(self.bkg_mode_combo)
-        reg_layout.addLayout(bkg_layout)
+        filter_layout.addLayout(bkg_layout)
 
-        reg_group.setLayout(reg_layout)
-        processing_layout.addWidget(reg_group)
+        filter_group.setLayout(filter_layout)
+        processing_layout.addWidget(filter_group)
 
         # Stacking settings
-        stack_group = QGroupBox("Stacking Settings")
-        stack_layout = QVBoxLayout()
+        stacking_group = QGroupBox("Stacking Settings")
+        stacking_layout = QVBoxLayout()
 
         feather_tooltip = "Blends the edges of stacked frames to reduce edge artifacts in the final image."
         feather_amount_tooltip = "Size of the feathering blend in pixels. Larger values create smoother transitions but may affect more of the image edge."
@@ -1547,7 +2527,7 @@ class PreprocessingInterface(QMainWindow):
         self.feather_amount_spinbox.setToolTip(feather_amount_tooltip)
         feather_layout.addWidget(self.feather_checkbox)
         feather_layout.addWidget(self.feather_amount_spinbox)
-        stack_layout.addLayout(feather_layout)
+        stacking_layout.addLayout(feather_layout)
 
         self.feather_checkbox.toggled.connect(self.feather_amount_spinbox.setEnabled)
 
@@ -1564,18 +2544,18 @@ class PreprocessingInterface(QMainWindow):
         self.weight_stack_check.toggled.connect(self.weight_method_combo.setEnabled)
         weight_layout.addWidget(self.weight_stack_check)
         weight_layout.addWidget(self.weight_method_combo)
-        stack_layout.addLayout(weight_layout)
+        stacking_layout.addLayout(weight_layout)
 
         save_calibrated_lights_tooltip = "Save calibrated light frames after processing. Allows you to collect everything even if you don't create stacks immediately."
         self.save_calibrated_lights_check = QCheckBox("Save calibrated lights")
         self.save_calibrated_lights_check.setToolTip(save_calibrated_lights_tooltip)
-        stack_layout.addWidget(self.save_calibrated_lights_check)
+        stacking_layout.addWidget(self.save_calibrated_lights_check)
 
         output_norm_tooltip = "Normalize the output stack so pixel values are scaled relatively. Recommended for most use cases. Turn it OFF for photometry or if you see strange artifacts in where your background is clipping to zero."
         self.output_norm_check = QCheckBox("Output normalization")
         self.output_norm_check.setToolTip(output_norm_tooltip)
         self.output_norm_check.setChecked(True)
-        stack_layout.addWidget(self.output_norm_check)
+        stacking_layout.addWidget(self.output_norm_check)
 
         # Target mode radio buttons
         target_mode_box = QGroupBox("Target Mode")
@@ -1619,7 +2599,7 @@ class PreprocessingInterface(QMainWindow):
         target_mode_layout.addWidget(self.paneled_mosaic_radio)
         target_mode_layout.addWidget(self.mono_radio)
         target_mode_box.setLayout(target_mode_layout)
-        stack_layout.addWidget(target_mode_box)
+        stacking_layout.addWidget(target_mode_box)
 
         self.target_mode_button_group.buttonToggled.connect(self.on_target_mode_changed)
 
@@ -1628,10 +2608,10 @@ class PreprocessingInterface(QMainWindow):
         self.create_final_stack_check = QCheckBox("Create final stack")
         self.create_final_stack_check.setToolTip(create_final_stack_tooltip)
         self.create_final_stack_check.setChecked(True)
-        stack_layout.addWidget(self.create_final_stack_check)
+        stacking_layout.addWidget(self.create_final_stack_check)
 
-        stack_group.setLayout(stack_layout)
-        processing_layout.addWidget(stack_group)
+        stacking_group.setLayout(stacking_layout)
+        processing_layout.addWidget(stacking_group)
 
         scroll_area.setWidget(scroll_content)
         processing_tab_outer.addWidget(scroll_area)
@@ -1676,6 +2656,7 @@ class PreprocessingInterface(QMainWindow):
         # Add tabs
         tab_widget.addTab(files_tab, "1. Files")
         tab_widget.addTab(processing_tab, "2. Processing")
+        self.tab_widget = tab_widget
         main_layout.addWidget(tab_widget)
 
         # Bottom buttons
@@ -1721,18 +2702,50 @@ class PreprocessingInterface(QMainWindow):
         load_presets_button.setMenu(load_menu)
         button_layout.addWidget(load_presets_button)
 
-        button_layout.addStretch()  # Add space between buttons
+        button_layout.addStretch()
 
         close_button = QPushButton("Close")
         close_button.setMinimumWidth(100)
         close_button.setMinimumHeight(35)
         close_button.clicked.connect(self.close_dialog)
-        # button_layout.addWidget(close_button)
-
-        # button_layout.addWidget(help_button)
-        button_layout.addStretch()
         button_layout.addWidget(close_button)
-        # main_layout.addLayout(button_layout)
+
+        _NAV_STYLE = (
+            "QPushButton {"
+            "  background-color: #ffffff;"
+            "  color: #000000;"
+            "  border: 2px solid #1e3a8a;"
+            "  border-radius: 4px;"
+            "  font-weight: 800;"
+            "  font-size: 13px;"
+            "  padding: 0 14px;"
+            "}"
+            "QPushButton:hover { background-color: #eff6ff; }"
+            "QPushButton:pressed { background-color: #dbeafe; }"
+        )
+
+        self.nav_button = QPushButton("Next \u2192")
+        self.nav_button.setMinimumWidth(100)
+        self.nav_button.setMinimumHeight(35)
+        self.nav_button.setStyleSheet(_NAV_STYLE)
+        self.nav_button.clicked.connect(self._tab_nav)
+        self.tab_widget.currentChanged.connect(self._on_tab_changed)
+        button_layout.addWidget(self.nav_button)
+
+    def _tab_nav(self):
+        idx = self.tab_widget.currentIndex()
+        last = self.tab_widget.count() - 1
+        if idx < last:
+            self.tab_widget.setCurrentIndex(idx + 1)
+        else:
+            self.tab_widget.setCurrentIndex(idx - 1)
+
+    def _on_tab_changed(self, idx: int):
+        last = self.tab_widget.count() - 1
+        if idx < last:
+            self.nav_button.setText("Next \u2192")
+        else:
+            self.nav_button.setText("\u2190 Back")
 
     def close_dialog(self):
         try:
@@ -1801,6 +2814,7 @@ class PreprocessingInterface(QMainWindow):
         If filepath is None, saves to the default location."""
         # Collect settings
         presets = {
+            "dark_flats": self.dark_flats_check.isChecked(),
             "bg_extract": self.bg_extract_check.isChecked(),
             "drizzle": self.drizzle_checkbox.isChecked(),
             "drizzle_amount": round(self.drizzle_amount_spinbox.value(), 1),
@@ -1926,6 +2940,7 @@ class PreprocessingInterface(QMainWindow):
                 presets = json.load(f)
 
                 # Load UI settings
+                self.dark_flats_check.setChecked(presets.get("dark_flats", False))
                 self.bg_extract_check.setChecked(presets.get("bg_extract", False))
                 self.drizzle_checkbox.setChecked(presets.get("drizzle", False))
                 self.drizzle_amount_spinbox.setValue(presets.get("drizzle_amount", 1.0))
@@ -2056,8 +3071,31 @@ class PreprocessingInterface(QMainWindow):
         weighting_method: str = "Weighted FWHM",
         output_norm: bool = True,
     ):
+        # ── Pre-flight: check every session has at least 2 light frames ──────
+        problem_sessions = []
+        for i, session in enumerate(self.sessions):
+            if len(session.lights) == 0:
+                problem_sessions.append((i + 1, len(session.lights), "no lights"))
+            elif len(session.lights) == 1:
+                problem_sessions.append((i + 1, len(session.lights), "only 1 light"))
+
+        if problem_sessions:
+            lines = "".join(
+                f"• Session {n}: {reason} - at least 2 are required\n"
+                for n, _, reason in problem_sessions
+            )
+            QMessageBox.warning(
+                self,
+                "Not Enough Light Frames",
+                f"The following session(s) do not have enough light frames to stack:\n\n"
+                f"{lines}\n"
+                f"Each session needs at least 2 light frames.",
+            )
+            return
+
         self.siril.log(
             f"Running script version {VERSION} with arguments:\n"
+            f"dark_flats={self.dark_flats_check.isChecked()}\n"
             f"bg_extract={bg_extract}\n"
             f"drizzle={drizzle}\n"
             f"drizzle_amount={drizzle_amount}\n"
@@ -2206,7 +3244,7 @@ class PreprocessingInterface(QMainWindow):
             current_dir = os.path.join(self.current_working_directory, "process")
 
             # Only save calibrated lights if requested
-            if save_calibrated_lights:
+            if save_calibrated_lights and os.path.isdir(current_dir):
                 # Mitigate bug: If collected_lights doesn't exist, create it here because sometimes it doesn't get created earlier
                 os.makedirs(self.collected_lights_dir, exist_ok=True)
                 # Find and move all files starting with 'pp_lights'
@@ -3003,6 +4041,8 @@ class PreprocessingInterface(QMainWindow):
 def main():
     try:
         app = QApplication(sys.argv)
+        # qdarktheme.setup_theme()
+        qt_themes.set_theme("dracula")
         window = PreprocessingInterface()
         # Only show window if initialization was successful
         if window.initialization_successful:

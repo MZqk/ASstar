@@ -1,4 +1,4 @@
-# Siril runtime plugin dependencies for Python 3.12.
+# Siril runtime plugin dependencies for Python 3.13.
 # These packages must be available as wheels in resources/siril_plugins/downloads
 # so the app can prepare Siril's isolated venv without network access.
 
@@ -8,16 +8,19 @@ astropy
 scipy
 tifffile
 onnxruntime
+coloredlogs
+humanfriendly
 torch
 torchvision
 sep
 spandrel
 einops
 safetensors
-setiastrosuitepro
 lz4
 zstandard
 exifread
 opencv-python-headless
 requests
+setuptools<82
 wheel
+platformdirs

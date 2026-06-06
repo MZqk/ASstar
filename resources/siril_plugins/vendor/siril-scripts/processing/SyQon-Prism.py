@@ -52,6 +52,7 @@ v2.0.0  Official SyQon single-file release for Siril
         - Reflect-padded edges to eliminate border tile artefacts
         - Draggable before/after live preview updated tile-by-tile (single images)
         - Persistent JSON configuration
+v2.0.1  If no CLI arguments, run in GUI mode by default
 """
 
 from __future__ import annotations
@@ -132,7 +133,7 @@ from PySide6.QtWidgets import (
 # Script-level constants
 # ============================================================================
 
-SCRIPT_VERSION   = "2.0.0"
+SCRIPT_VERSION   = "2.0.1"
 BASE_URL         = "https://siril.syqon.it"
 PRISM_DEEP_URL   = "https://syqon.it/prism"
 
@@ -3076,7 +3077,7 @@ def main():
     use_gpu = not args.no_gpu
 
     # ---- GUI mode ----
-    if not siril.is_cli():
+    if not (siril.is_cli() and len(sys.argv) > 1):
         app = QApplication.instance() or QApplication(sys.argv)
 
         # Ensure Mini model present before opening GUI

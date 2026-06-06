@@ -48,6 +48,9 @@ env/
 *.swo
 .claude/
 .codex/
+.codegraph/
+.antigravitycli/
+.workbuddy/
 
 # Build/log temp files
 *.log

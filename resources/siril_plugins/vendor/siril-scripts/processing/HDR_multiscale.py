@@ -25,6 +25,7 @@ with luminance masking and Lab color space processing
 # Version History
 # 1.0.0  Initial release
 # 1.0.1  Adding information text
+# 1.0.2  If no CLI arguments, run in GUI mode by default
 
 import sirilpy as s
 s.ensure_installed('PyQt6')
@@ -42,7 +43,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThread
 from PyQt6.QtGui import QFont, QImage, QPixmap
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 if not s.check_module_version('>=0.6.42'):
     print("Error: requires sirilpy module >= 0.6.42")
@@ -584,7 +585,7 @@ def main():
             QMessageBox.critical(None, "Error", "Failed to connect to Siril")
             sys.exit(1)
         
-        if siril.is_cli():
+        if siril.is_cli() and len(sys.argv) > 1:
             print("This script requires GUI mode")
             sys.exit(1)
         

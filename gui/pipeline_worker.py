@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import platform
 import queue
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from math import floor
@@ -342,9 +344,11 @@ AI_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_WORKFLOW_PLUGIN_PROBE",
         "SEESTAR_SPCC_ENABLE",
         "SEESTAR_STAGE4_PLATESOLVE_ENABLE",
+        "SEESTAR_STAGE4_PLATESOLVE_CATALOGS",
         "SEESTAR_STAGE4_SPCC_SENSOR_MODE",
         "SEESTAR_STAGE4_SPCC_OSC_SENSOR",
         "SEESTAR_STAGE4_SPCC_OSC_FILTER",
+        "SEESTAR_STAGE4_SPCC_BUILTIN_DUALBAND_FILTER",
         "SEESTAR_STAGE4_SPCC_MONO_SENSOR",
         "SEESTAR_STAGE4_SPCC_R_FILTER",
         "SEESTAR_STAGE4_SPCC_G_FILTER",
@@ -453,7 +457,9 @@ SIRIL_STARLESS_REQUIRED_WHEEL_LABELS = (
 FITS_SUFFIXES = (".fit", ".fits")
 INPUT_MODE_AUTO = "auto"
 INPUT_MODE_LINEAR_RESUME = "result_linear_resume"
+INPUT_MODE_STAGE2_CORRECTED_RESUME = "stage2_corrected_resume"
 LINEAR_RESUME_INPUT_NAME = "result_linear.fit"
+STAGE2_CORRECTED_INPUT_NAME = "stage2_corrected.fit"
 PIPELINE_EXCLUDE_PREFIXES = (
     "light_",
     "pp_",
@@ -494,6 +500,20 @@ def resolve_siril_scripts_root(plugin_root: Path) -> Path | None:
         if (root / "processing" / "AberrationRemover.py").is_file():
             return root
     return None
+
+
+def apply_siril_runtime_patches(plugin_root: Path, target_root: Path | None = None) -> bool:
+    patcher = plugin_root / "patches" / "apply_graxpert_ai_runtime_patch.py"
+    if not patcher.is_file():
+        return False
+    spec = importlib.util.spec_from_file_location(
+        "seestar_graxpert_ai_runtime_patch", patcher
+    )
+    if spec is None or spec.loader is None:
+        return False
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return bool(module.apply_patch(target_root or plugin_root))
 
 
 def build_siril_cli_command(
@@ -743,7 +763,11 @@ class PipelineWorker(QThread):
         self.siril_candidates = siril_candidates
         self.input_mode = (
             input_mode
-            if input_mode in {INPUT_MODE_AUTO, INPUT_MODE_LINEAR_RESUME}
+            if input_mode in {
+                INPUT_MODE_AUTO,
+                INPUT_MODE_LINEAR_RESUME,
+                INPUT_MODE_STAGE2_CORRECTED_RESUME,
+            }
             else INPUT_MODE_AUTO
         )
         self.debug_mode = bool(debug_mode)
@@ -763,6 +787,8 @@ class PipelineWorker(QThread):
         self._spcc_cli_crash_detected = False
         self._spcc_crash_retry_attempted = False
         self._force_disable_spcc_for_retry = False
+        self._recent_process_output: deque[str] = deque(maxlen=80)
+        self._last_spcc_command = ""
         self._ai_env_sources: list[str] = []
         self._ai_env_applied_keys: list[str] = []
         self._ai_env_warnings: list[str] = []
@@ -809,6 +835,8 @@ class PipelineWorker(QThread):
     def _inspect_output_for_errors(self, text: str) -> None:
         lowered = text.lower()
         stripped = text.strip()
+        if stripped:
+            self._recent_process_output.append(stripped)
         error_markers = (
             "script execution failed",
             "failed to install python module",
@@ -849,6 +877,8 @@ class PipelineWorker(QThread):
             or "input command: spcc" in lowered
         ):
             self._spcc_seen_in_run = True
+            if "spcc" in lowered:
+                self._last_spcc_command = stripped
         if (
             ("running command: pyscript" in lowered or "running command pyscript" in lowered)
             and self._pyscript_seen_at is None
@@ -861,6 +891,19 @@ class PipelineWorker(QThread):
         pipeline_markers = ("stage 1", "阶段 1", "[info]")
         if any(marker in lowered for marker in pipeline_markers):
             self._pipeline_output_seen = True
+
+    def _append_spcc_crash_diagnostics(self, exit_code: int) -> None:
+        self._append_event(
+            "SPCC 崩溃诊断: siril-cli 在执行 SPCC 后以 "
+            f"{exit_code} 退出，通常表示 Siril 原生测光/SPCC 代码段错误，"
+            "Python 侧不会产生 CommandError。"
+        )
+        if self._last_spcc_command:
+            self._append_event(f"SPCC 崩溃前命令标记: {self._last_spcc_command}")
+        if self._recent_process_output:
+            self._append_event("SPCC 崩溃前最后输出（最多 25 行）:")
+            for line in list(self._recent_process_output)[-25:]:
+                self._append_event(f"  {line}")
 
     def _siril_venv_dir(self) -> Path:
         return self._siril_state_root() / "venv"
@@ -1086,6 +1129,8 @@ class PipelineWorker(QThread):
         if self.siril_plugin_dir.exists() and self.siril_plugin_dir.is_dir():
             plugin_dst = temp_dir / "siril_plugins"
             shutil.copytree(self.siril_plugin_dir, plugin_dst, dirs_exist_ok=True)
+            if apply_siril_runtime_patches(plugin_dst):
+                self._append_event("已应用 GraXpert-AI 运行时兼容补丁")
             self._runtime_plugin_dir = plugin_dst
 
         ssf_lines = [
@@ -1128,9 +1173,20 @@ class PipelineWorker(QThread):
         env["LC_CTYPE"] = "en_US.UTF-8"
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUNBUFFERED"] = "1"
         env.setdefault("SEESTAR_SIRILPY_TIMEOUT_SEC", "120")
         env["PIP_NO_INDEX"] = "1"
         env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+        pip_find_links: list[str] = []
+        bundled_downloads = self.resources / "siril_plugins" / "downloads"
+        if bundled_downloads.is_dir():
+            pip_find_links.append(str(bundled_downloads))
+        if self._runtime_plugin_dir:
+            runtime_downloads = self._runtime_plugin_dir / "downloads"
+            if runtime_downloads.is_dir():
+                pip_find_links.append(str(runtime_downloads))
+        if pip_find_links:
+            env["PIP_FIND_LINKS"] = " ".join(dict.fromkeys(pip_find_links))
         bundled_py = (
             self.resources
             / "Siril.app"
@@ -1176,6 +1232,8 @@ class PipelineWorker(QThread):
         self._pipeline_output_seen = False
         self._spcc_seen_in_run = False
         self._spcc_cli_crash_detected = False
+        self._recent_process_output.clear()
+        self._last_spcc_command = ""
         self._last_output_ts = time.time()
 
         cmd = build_siril_cli_command(
@@ -1324,6 +1382,7 @@ class PipelineWorker(QThread):
         if exit_code == -11 and self._spcc_seen_in_run:
             self._spcc_cli_crash_detected = True
             self._run_had_errors = True
+            self._append_spcc_crash_diagnostics(exit_code)
 
         if (
             self._active_mode == "python"

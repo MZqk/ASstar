@@ -168,6 +168,7 @@ class FakeProcessor:
             ghs_stretchamount=2.0,
             nebula_saturation=0.4,
             nebula_bg_factor=1,
+            stage8_bg_std_growth_max=1.08,
             remix_nebula_weight=0.18,
             star_intensity=1.0,
             star_fallback_intensity=0.95,
@@ -180,9 +181,12 @@ class FakeProcessor:
             aberration_api_enabled=False,
             spcc_enabled=True,
             stage4_platesolve_enabled=True,
+            stage4_spcc_restore_cpu=8,
+            stage4_pcc_header_fallback_enabled=True,
             stage4_local_star_wb_enabled=True,
-            stage4_local_star_wb_min_pixels=80,
+            stage4_local_star_wb_min_pixels=32,
             stage4_local_star_wb_gain_limit=1.25,
+            stage4_local_star_wb_target_aware_enabled=False,
         )
         self.auto_tune_result = None
         self.stretched_name = "stage6_stretched"
@@ -230,6 +234,7 @@ class FakeProcessor:
         self.sasp_stage8_label: str | None = None
         self.sasp_stage8_calls: list[dict[str, Any] | None] = []
         self.stage_json_reports: dict[str, dict[str, Any]] = {}
+        self.header_metadata: dict[str, Any] = {}
 
     def cmd_with_check(self, *args: Any, quiet: bool = False) -> bool:
         _ = quiet
@@ -410,8 +415,8 @@ class FakeProcessor:
     def _save_stage_output(self, _stem: str) -> bool:
         return True
 
-    def _read_fits_header_metadata(self, _stem: str):
-        return {}
+    def _read_fits_header_metadata(self, *_candidates: str):
+        return dict(self.header_metadata)
 
     def _auto_target_hint(self):
         return None
@@ -586,6 +591,56 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         self.assertTrue((process_dir / "stage6_starless_quality.json").exists())
         self.assertTrue((process_dir / "stage7_quality.json").exists())
+
+    def test_debug_stage_save_writes_quality_metrics(self):
+        import json
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        process_dir = Path(td.name)
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.cfg.debug_mode = True
+        processor.log = FakeLogger()
+        processor.process_dir = process_dir
+        processor.siril = SimpleNamespace(
+            cmd=lambda *_args: None,
+            get_image_pixeldata=lambda preview=False: object(),
+        )
+
+        metric_globals = processor._write_debug_quality_metrics.__globals__
+        with patch.dict(
+            metric_globals,
+            {
+                "measure_quality_metrics": lambda _image: pipeline_module.QualityMetrics(
+                    bg_median=0.123,
+                ),
+                "measure_image_features": lambda _image: pipeline_module.ImageFeatures(
+                    edge_black_ratio=0.045,
+                ),
+            },
+        ):
+            self.assertTrue(processor._save_stage_output("stage_debug_probe"))
+
+        metrics_path = process_dir / "stage_debug_probe_quality_metrics.json"
+        self.assertTrue(metrics_path.exists())
+        payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["schema"], "seestar.stage_quality.v1")
+        self.assertEqual(payload["stem"], "stage_debug_probe")
+        self.assertIn("bg_median", payload["metrics"])
+        self.assertIn("edge_black_ratio", payload["features"])
+
+        jsonl_path = process_dir / "stage_quality_metrics.jsonl"
+        self.assertTrue(jsonl_path.exists())
+        lines = jsonl_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["stem"], "stage_debug_probe")
+        self.assertTrue(
+            any(
+                "[STAGE_QUALITY_METRICS]" in message
+                for level, message in processor.log.events
+                if level == "info"
+            )
+        )
 
     def test_stage5_uses_aberration_api_with_script_preferred_sharpen_and_denoise(self):
         processor = self._new_processor()
@@ -872,12 +927,34 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         _name, status, _dur, message = processor.results[-1]
         self.assertEqual(status, "ok")
-        self.assertIn("platesolve -noflip -downscale ok", message)
+        self.assertIn("platesolve -focal=160 -pixelsize=2.90 -catalog=gaia -order=3 ok", message)
         cmds = [str(call[0]) for call in processor.cmd_calls]
         self.assertIn("platesolve", cmds)
+        platesolve_calls = [call for call in processor.cmd_calls if call[0] == "platesolve"]
+        self.assertEqual(
+            platesolve_calls[0],
+            ("platesolve", "-focal=160", "-pixelsize=2.90", "-catalog=gaia", "-order=3"),
+        )
         self.assertIn("spcc", cmds)
         self.assertNotIn("cc", cmds)
         self.assertFalse({"mirrorx", "mirrory", "flip", "rotate"} & set(cmds))
+
+    def test_stage4_wraps_spcc_with_single_thread_setcpu_guard(self):
+        processor = self._new_processor()
+
+        stage4_color_calibration(processor)
+
+        spcc_index = processor.cmd_calls.index(
+            next(call for call in processor.cmd_calls if call[0] == "spcc")
+        )
+        set_one_index = processor.cmd_calls.index(("setcpu", "1"))
+        restore_index = processor.cmd_calls.index(("setcpu", "8"))
+        self.assertLess(set_one_index, spcc_index)
+        self.assertLess(spcc_index, restore_index)
+        self.assertEqual(
+            processor.color_calibration_report["spcc"]["cpu_guard"],
+            {"runtime": 1, "restore": 8},
+        )
 
     def test_stage4_platesolve_can_be_disabled_explicitly(self):
         processor = self._new_processor()
@@ -890,9 +967,10 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertIn("platesolve disabled by config", message)
         cmds = [str(call[0]) for call in processor.cmd_calls]
         self.assertNotIn("platesolve", cmds)
-        self.assertIn("spcc", cmds)
+        self.assertNotIn("spcc", cmds)
+        self.assertNotIn("pcc", cmds)
 
-    def test_stage4_uses_star_white_ref_for_emission_nebula_profile(self):
+    def test_stage4_uses_average_spiral_white_ref_and_lp_filter_by_default(self):
         processor = self._new_processor()
         processor.cfg.stage4_platesolve_enabled = True
         processor.target_profile = {"target_type": "emission_nebula_widefield"}
@@ -901,14 +979,93 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         spcc_calls = [call for call in processor.cmd_calls if call[0] == "spcc"]
         self.assertTrue(spcc_calls)
-        self.assertIn('"-whiteref=Star, type G2(v)"', spcc_calls[0])
-        self.assertIn('"-oscsensor=seestar s30pro"', spcc_calls[0])
-        self.assertIn('"-oscfilter=seestar s30pro"', spcc_calls[0])
-        self.assertIn("-limitmag=11.5", spcc_calls[0])
+        self.assertIn('"-whiteref=Average Spiral Galaxy"', spcc_calls[0])
+        self.assertIn('"-oscsensor=Sony IMX585"', spcc_calls[0])
+        self.assertIn('"-oscfilter=ZWO Seestar LP"', spcc_calls[0])
+        self.assertIn("-limitmag=10.5", spcc_calls[0])
         self.assertNotIn("-bgtol=-2.8,2.0", spcc_calls[0])
         _name, status, _dur, message = processor.results[-1]
         self.assertEqual(status, "ok")
-        self.assertIn("SPCC whiteref=Star, type G2(v)", message)
+        self.assertIn("SPCC whiteref=Average Spiral Galaxy", message)
+
+    def test_stage4_uses_zwo_seestar_lp_when_builtin_dualband_filter_enabled(self):
+        processor = self._new_processor()
+        processor.cfg.stage4_platesolve_enabled = True
+        processor.cfg.stage4_spcc_builtin_dualband_filter_enabled = True
+
+        stage4_color_calibration(processor)
+
+        spcc_calls = [call for call in processor.cmd_calls if call[0] == "spcc"]
+        self.assertTrue(spcc_calls)
+        self.assertIn('"-oscsensor=Sony IMX585"', spcc_calls[0])
+        self.assertIn('"-oscfilter=ZWO Seestar LP"', spcc_calls[0])
+        self.assertIn('"-whiteref=Average Spiral Galaxy"', spcc_calls[0])
+
+    def test_stage4_uses_s30pro_spcc_database_filter_for_lp_header(self):
+        processor = self._new_processor()
+        processor.cfg.stage4_platesolve_enabled = True
+        processor.target_profile = {"target_type": "emission_nebula_widefield"}
+        processor.header_metadata = {
+            "OBJECT": "NGC 2237",
+            "RA": 98.01666,
+            "DEC": 4.966111,
+            "FILTER": "LP",
+            "INSTRUME": "imx585",
+            "TELESCOP": "S30 Pro_90f61d23",
+        }
+
+        stage4_color_calibration(processor)
+
+        spcc_calls = [call for call in processor.cmd_calls if call[0] == "spcc"]
+        self.assertTrue(spcc_calls)
+        self.assertIn('"-oscsensor=Sony IMX585"', spcc_calls[0])
+        self.assertIn('"-oscfilter=ZWO Seestar LP"', spcc_calls[0])
+        self.assertIn('"-whiteref=Average Spiral Galaxy"', spcc_calls[0])
+        self.assertIn("-limitmag=10.5", spcc_calls[0])
+        self.assertEqual(
+            processor.color_calibration_report["spcc"]["osc_filter"],
+            "ZWO Seestar LP",
+        )
+        self.assertFalse(processor.color_calibration_report["spcc"]["narrowband"])
+
+    def test_stage4_uses_no_filter_when_lp_is_explicitly_absent(self):
+        processor = self._new_processor()
+        processor.cfg.stage4_platesolve_enabled = True
+        processor.header_metadata = {"FILTER": "No filter"}
+
+        stage4_color_calibration(processor)
+
+        spcc_calls = [call for call in processor.cmd_calls if call[0] == "spcc"]
+        self.assertTrue(spcc_calls)
+        self.assertIn('"-oscsensor=Sony IMX585"', spcc_calls[0])
+        self.assertIn('"-oscfilter=No filter"', spcc_calls[0])
+        self.assertIn('"-whiteref=Average Spiral Galaxy"', spcc_calls[0])
+        self.assertIn("-limitmag=10.5", spcc_calls[0])
+        self.assertFalse(processor.color_calibration_report["spcc"]["narrowband"])
+
+    def test_stage4_uses_narrowband_spcc_args_for_ha_oiii_filter_hint(self):
+        processor = self._new_processor()
+        processor.cfg.stage4_platesolve_enabled = True
+        processor.header_metadata = {"FILTER": "Ha + OIII narrowband"}
+
+        stage4_color_calibration(processor)
+
+        spcc_calls = [call for call in processor.cmd_calls if call[0] == "spcc"]
+        self.assertTrue(spcc_calls)
+        flat = " ".join(str(arg) for arg in spcc_calls[0])
+        self.assertIn('"-oscsensor=Sony IMX585"', spcc_calls[0])
+        self.assertIn('"-whiteref=Average Spiral Galaxy"', spcc_calls[0])
+        self.assertNotIn("-oscfilter=", flat)
+        self.assertIn("-narrowband", spcc_calls[0])
+        self.assertIn("-rwl=656.28", spcc_calls[0])
+        self.assertIn("-rbw=20", spcc_calls[0])
+        self.assertIn("-gwl=500.70", spcc_calls[0])
+        self.assertIn("-gbw=30", spcc_calls[0])
+        self.assertIn("-bwl=500.70", spcc_calls[0])
+        self.assertIn("-bbw=30", spcc_calls[0])
+        self.assertIn("-limitmag=10.5", spcc_calls[0])
+        self.assertTrue(processor.color_calibration_report["spcc"]["narrowband"])
+        self.assertEqual(processor.color_calibration_report["spcc"]["osc_filter"], "")
 
     def test_stage4_explicit_white_ref_overrides_emission_nebula_profile(self):
         processor = self._new_processor()
@@ -926,6 +1083,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
     def test_stage4_target_aware_white_ref_does_not_retry_average_galaxy(self):
         processor = self._new_processor()
         processor.cfg.stage4_platesolve_enabled = True
+        processor.cfg.stage4_spcc_adaptive_white_ref_enabled = True
         processor.target_profile = {"target_type": "emission_nebula_widefield"}
         original_cmd_with_check = processor.cmd_with_check
 
@@ -971,6 +1129,38 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertIn("pcc", cmds)
         self.assertNotIn("cc", cmds)
 
+    def test_stage4_skips_spcc_when_setcpu_guard_fails(self):
+        processor = self._new_processor()
+        processor.cfg.stage4_platesolve_enabled = True
+        processor.fail_commands.add("setcpu")
+
+        stage4_color_calibration(processor)
+
+        cmds = [str(call[0]) for call in processor.cmd_calls]
+        self.assertIn("setcpu", cmds)
+        self.assertNotIn("spcc", cmds)
+        self.assertIn("pcc", cmds)
+        _name, status, _dur, message = processor.results[-1]
+        self.assertEqual(status, "ok")
+        self.assertIn("SPCC failed: mock failure: setcpu", message)
+
+    def test_stage4_restores_setcpu_before_pcc_after_spcc_failure(self):
+        processor = self._new_processor()
+        processor.cfg.stage4_platesolve_enabled = True
+        processor.fail_commands.add("spcc")
+
+        stage4_color_calibration(processor)
+
+        spcc_index = processor.cmd_calls.index(
+            next(call for call in processor.cmd_calls if call[0] == "spcc")
+        )
+        restore_index = processor.cmd_calls.index(("setcpu", "8"))
+        pcc_index = processor.cmd_calls.index(
+            next(call for call in processor.cmd_calls if call[0] == "pcc")
+        )
+        self.assertLess(spcc_index, restore_index)
+        self.assertLess(restore_index, pcc_index)
+
     def test_stage4_pcc_uses_siril_default_bgtol_for_142_compat(self):
         processor = self._new_processor()
         processor.cfg.stage4_platesolve_enabled = True
@@ -982,21 +1172,187 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertEqual(pcc_calls, [("pcc", "-catalog=localgaia")])
         _name, status, _dur, message = processor.results[-1]
         self.assertEqual(status, "ok")
-        self.assertIn("PCC localgaia ok (default bgtol)", message)
+        self.assertIn("pcc -catalog=localgaia ok (default bgtol)", message)
 
-    def test_stage4_still_tries_spcc_when_platesolve_failed(self):
+    def test_stage4_tries_header_pcc_when_platesolve_failed_with_coordinates(self):
         processor = self._new_processor()
         processor.cfg.stage4_platesolve_enabled = True
+        processor.target_profile = {"target_type": "emission_nebula_widefield"}
+        processor.header_metadata = {
+            "OBJECT": "NGC 2237",
+            "RA": 98.01666,
+            "DEC": 4.966111,
+            "FILTER": "LP",
+            "INSTRUME": "imx585",
+            "TELESCOP": "S30 Pro_90f61d23",
+        }
         processor.fail_commands.add("platesolve")
 
         stage4_color_calibration(processor)
 
         _name, status, _dur, message = processor.results[-1]
-        self.assertEqual(status, "degraded")
-        self.assertIn("platesolve -noflip -downscale failed", message)
+        self.assertEqual(status, "ok")
+        self.assertIn("platesolve failed: mock failure: platesolve", message)
+        self.assertIn("trying PCC header-coordinate fallback", message)
+        self.assertIn("pcc -catalog=localgaia ok using FITS header coordinates", message)
         cmds = [str(call[0]) for call in processor.cmd_calls]
-        self.assertIn("spcc", cmds)
+        self.assertNotIn("spcc", cmds)
+        self.assertIn("pcc", cmds)
         self.assertNotIn("cc", cmds)
+        header_platesolve_calls = [
+            call
+            for call in processor.cmd_calls
+            if call[0] == "platesolve" and str(call[1]).startswith("98.01666,4.966111")
+        ]
+        self.assertTrue(header_platesolve_calls)
+        self.assertEqual(
+            processor.color_calibration_report["spcc_white_reference"]["requested"],
+            "Average Spiral Galaxy",
+        )
+        self.assertEqual(
+            processor.color_calibration_report["spcc"]["osc_filter"],
+            "ZWO Seestar LP",
+        )
+        self.assertEqual(
+            processor.color_calibration_report["platesolve"]["diagnostics"]["failure_kind"],
+            "siril_generic_failure",
+        )
+        self.assertTrue(
+            processor.color_calibration_report["platesolve"]["diagnostics"][
+                "has_header_coordinates"
+            ]
+        )
+        self.assertEqual(processor.color_calibration_report["method"], "PCC_HEADER")
+        self.assertEqual(
+            processor.color_calibration_report["warning"],
+            "pcc_header_coordinate_fallback",
+        )
+        self.assertTrue(
+            processor.color_calibration_report["pcc"][
+                "header_coordinate_fallback_allowed"
+            ]
+        )
+
+    def test_stage4_local_fallback_skips_star_wb_for_target_aware_nebula(self):
+        processor = self._new_processor()
+        processor.cfg.stage4_platesolve_enabled = True
+        processor.target_profile = {"target_type": "emission_nebula_widefield"}
+        processor.header_metadata = {
+            "OBJECT": "NGC 2237",
+            "RA": 98.01666,
+            "DEC": 4.966111,
+            "FILTER": "LP",
+        }
+        processor.fail_commands.update({"platesolve", "pcc"})
+
+        stage4_module = sys.modules["stages.stage4_color_calibration"]
+        image = stage4_module.np.full((3, 64, 64), 0.05, dtype=stage4_module.np.float32)
+        image[0] *= 1.15
+        image[2] *= 0.90
+        written_pixels = []
+        processor.siril = SimpleNamespace(
+            get_image_shape=lambda: image.shape,
+            get_image_pixeldata=lambda preview=False: image.copy(),
+            set_image_pixeldata=lambda pixels: written_pixels.append(pixels),
+        )
+        with patch.object(
+            stage4_module,
+            "_stage4_star_white_balance",
+            wraps=stage4_module._stage4_star_white_balance,
+        ) as star_wb:
+            stage4_color_calibration(processor)
+
+        _name, status, _dur, message = processor.results[-1]
+        self.assertEqual(status, "degraded")
+        self.assertIn("target-aware star white balance skipped", message)
+        self.assertTrue(written_pixels)
+        star_wb.assert_not_called()
+        self.assertEqual(
+            processor.color_calibration_report["method"],
+            "BACKGROUND_NEUTRALIZATION",
+        )
+        self.assertEqual(
+            processor.color_calibration_report["warning"],
+            "target_aware_background_neutralization_only",
+        )
+        self.assertEqual(
+            processor.color_calibration_report["local_fallback"]["star_white_balance"][
+                "reason"
+            ],
+            "target-aware emission/dualband color preservation",
+        )
+
+    def test_stage4_background_neutralization_adapts_window_for_large_targets(self):
+        stage4_module = sys.modules["stages.stage4_color_calibration"]
+        lum = stage4_module.np.linspace(
+            0.001,
+            0.100,
+            10000,
+            dtype=stage4_module.np.float32,
+        ).reshape(100, 100)
+        image = stage4_module.np.stack(
+            [lum * 1.10, lum, lum * 0.92],
+            axis=0,
+        )
+        processor = self._new_processor()
+
+        processor.target_profile = {
+            "target_type": "large_galaxy",
+            "object_stats": {"object_area_ratio": 0.42},
+        }
+        _large_pixels, large_report = stage4_module._stage4_background_neutralize(
+            image,
+            processor,
+        )
+
+        processor.target_profile = {
+            "target_type": "open_cluster",
+            "object_stats": {"object_area_ratio": 0.02},
+        }
+        _small_pixels, small_report = stage4_module._stage4_background_neutralize(
+            image,
+            processor,
+        )
+
+        self.assertEqual(
+            large_report["sampling_window"]["mode"],
+            "large_target_q5_q25",
+        )
+        self.assertAlmostEqual(
+            large_report["sampling_window"]["upper_quantile"],
+            0.25,
+        )
+        self.assertAlmostEqual(
+            small_report["sampling_window"]["upper_quantile"],
+            0.45,
+        )
+        self.assertLess(
+            large_report["sample_pixels"],
+            small_report["sample_pixels"],
+        )
+
+    def test_stage4_background_neutralization_uses_nebulosity_for_target_aware_fields(self):
+        stage4_module = sys.modules["stages.stage4_color_calibration"]
+        image = stage4_module.np.full((3, 80, 80), 0.05, dtype=stage4_module.np.float32)
+        processor = self._new_processor()
+        processor.target_profile = {
+            "target_type": "emission_nebula_widefield",
+            "object_stats": {
+                "object_area_ratio": 0.12,
+                "nebulosity_area_ratio": 0.41,
+            },
+        }
+
+        _pixels, report = stage4_module._stage4_background_neutralize(image, processor)
+
+        self.assertEqual(
+            report["sampling_window"]["mode"],
+            "large_target_q5_q25",
+        )
+        self.assertAlmostEqual(
+            report["sampling_window"]["effective_area_ratio"],
+            0.41,
+        )
 
     def test_stage4_local_star_wb_fallback_replaces_fixed_ccm(self):
         processor = self._new_processor()
@@ -1023,7 +1379,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             stage4_color_calibration(processor)
 
         _name, status, _dur, message = processor.results[-1]
-        self.assertEqual(status, "degraded")
+        self.assertEqual(status, "ok")
         self.assertIn("local background neutralization + star white balance fallback ok", message)
         self.assertIn("platesolve 失败，已使用本地背景中性化/星点白平衡回退", message)
         cmds = [str(call[0]) for call in processor.cmd_calls]
@@ -1174,6 +1530,75 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         self.assertLessEqual(stage6_services.stage6_effective_bg_median_min(0.020), 0.0199)
 
+    def test_stage7_compact_stretch_adapts_extreme_low_background(self):
+        processor = self._new_processor()
+        processor._stage7_baseline_background_stats = types.MethodType(
+            pipeline_module.SeestarPostProcessor._stage7_baseline_background_stats,
+            processor,
+        )
+
+        candidates, adaptation = (
+            pipeline_module.SeestarPostProcessor._stage7_compact_stretch_candidates(
+                processor,
+                pipeline_module.QualityMetrics(bg_median=0.002),
+                {"bg_std": 0.00005},
+            )
+        )
+
+        self.assertEqual(adaptation["mode"], "extreme_low_background")
+        self.assertEqual(candidates[0]["name"], "cand_a")
+        self.assertAlmostEqual(candidates[0]["params"]["asinh_stretch"], 1.5)
+        self.assertAlmostEqual(candidates[0]["params"]["asinh_offset"], 0.008)
+        self.assertEqual(candidates[1]["name"], "cand_b")
+        self.assertAlmostEqual(candidates[1]["params"]["asinh_stretch"], 1.6)
+        self.assertAlmostEqual(candidates[1]["params"]["asinh_offset"], 0.007)
+        self.assertLessEqual(candidates[1]["params"]["ghs_stretchamount"], 1.01)
+
+    def test_stage7_compact_stretch_caps_offset_below_low_signal_starless(self):
+        processor = self._new_processor()
+        processor._stage7_baseline_background_stats = types.MethodType(
+            pipeline_module.SeestarPostProcessor._stage7_baseline_background_stats,
+            processor,
+        )
+
+        candidates, adaptation = (
+            pipeline_module.SeestarPostProcessor._stage7_compact_stretch_candidates(
+                processor,
+                pipeline_module.QualityMetrics(bg_median=0.002),
+                {"bg_std": 0.00005},
+                {"p99": 0.00224, "max": 0.00298},
+            )
+        )
+
+        self.assertEqual(adaptation["mode"], "extreme_low_background")
+        self.assertIn("offset_cap", adaptation)
+        self.assertAlmostEqual(candidates[0]["params"]["asinh_offset"], 0.0019, places=4)
+        self.assertAlmostEqual(candidates[1]["params"]["asinh_offset"], 0.0019, places=4)
+        self.assertLess(candidates[0]["params"]["asinh_offset"], 0.00224)
+        self.assertLess(candidates[1]["params"]["asinh_offset"], 0.00224)
+
+    def test_stage7_compact_stretch_keeps_default_for_normal_background(self):
+        processor = self._new_processor()
+        processor._stage7_baseline_background_stats = types.MethodType(
+            pipeline_module.SeestarPostProcessor._stage7_baseline_background_stats,
+            processor,
+        )
+
+        candidates, adaptation = (
+            pipeline_module.SeestarPostProcessor._stage7_compact_stretch_candidates(
+                processor,
+                pipeline_module.QualityMetrics(bg_median=0.020),
+                {},
+            )
+        )
+
+        self.assertEqual(adaptation["mode"], "default_compact")
+        self.assertEqual(
+            candidates[0]["params"],
+            {"asinh_stretch": 2.2, "asinh_offset": 0.002},
+        )
+        self.assertEqual(candidates[1]["params"]["asinh_offset"], 0.002)
+
     def test_stage8_applies_blue_guard_when_starless_layer_is_too_blue(self):
         processor = self._new_processor()
         processor.feature_measurements.append(
@@ -1220,6 +1645,34 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         _name, status, _dur, message = processor.results[-1]
         self.assertEqual(status, "ok")
         self.assertIn("Starless 蓝色门控回滚", message)
+
+    def test_stage8_bg_growth_gate_allows_low_absolute_background_noise(self):
+        processor = self._new_processor()
+        helper = pipeline_module.stage8_pixels._stage8_bg_noise_growth_issue
+
+        issue = helper(
+            processor,
+            growth=2.744,
+            baseline_std=0.000169,
+            candidate_std=0.000464,
+            candidate_dirty_score=0.025,
+        )
+
+        self.assertIsNone(issue)
+
+    def test_stage8_bg_growth_gate_rejects_material_background_noise(self):
+        processor = self._new_processor()
+        helper = pipeline_module.stage8_pixels._stage8_bg_noise_growth_issue
+
+        issue = helper(
+            processor,
+            growth=2.744,
+            baseline_std=0.00030,
+            candidate_std=0.00120,
+            candidate_dirty_score=0.080,
+        )
+
+        self.assertIn("bg_std_growth", issue)
 
     def test_stage10_script_failure_with_aberration_fallback_is_ok(self):
         processor = self._new_processor()
@@ -1852,6 +2305,69 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             skipped,
         )
 
+    def test_run_stage2_corrected_resume_continues_from_stage3(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.log = FakeLogger()
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        work_dir = Path(td.name)
+        stage2_path = work_dir / pipeline_module.STAGE2_CORRECTED_INPUT_NAME
+        stage2_path.write_bytes(b"stage2-fit")
+
+        calls: list[str] = []
+
+        processor.connect = lambda: setattr(processor, "work_dir", work_dir)  # type: ignore[method-assign]
+        processor.siril = SimpleNamespace(
+            cmd=lambda *_args, **_kwargs: None,
+            disconnect=lambda: None,
+        )
+
+        def _prepare_stage2_corrected_resume() -> None:
+            calls.append("prepare_stage2_corrected_resume")
+            processor._stage1_input_mode = "stage2_corrected_resume"
+            processor.source_file = stage2_path
+
+        processor._prepare_stage2_corrected_resume_input = _prepare_stage2_corrected_resume  # type: ignore[method-assign]
+        processor._auto_tune_for_current_input = lambda: calls.append("auto_tune")  # type: ignore[method-assign]
+        processor.stage1_preparation = lambda: calls.append("stage1")  # type: ignore[method-assign]
+        processor.stage2_view_correction = lambda: calls.append("stage2")  # type: ignore[method-assign]
+        processor.stage3_background_extraction = lambda: calls.append("stage3")  # type: ignore[method-assign]
+        processor.stage4_color_calibration = lambda: calls.append("stage4")  # type: ignore[method-assign]
+        processor.stage5_linear_denoise = lambda: calls.append("stage5")  # type: ignore[method-assign]
+        processor.stage6_stretching = lambda: calls.append("stage6")  # type: ignore[method-assign]
+        processor.stage7_star_separation = lambda: calls.append("stage7")  # type: ignore[method-assign]
+        processor.stage8_nebula_enhancement = lambda: calls.append("stage8")  # type: ignore[method-assign]
+        processor.stage9_star_remixing = lambda: calls.append("stage9")  # type: ignore[method-assign]
+        processor.stage10_export = lambda: calls.append("stage10")  # type: ignore[method-assign]
+        processor.stage11_ai_postprocess = lambda: calls.append("stage11")  # type: ignore[method-assign]
+        processor.cleanup = lambda: calls.append("cleanup")  # type: ignore[method-assign]
+
+        with patch.dict(
+            os.environ,
+            {pipeline_module.ENV_INPUT_MODE_KEY: pipeline_module.INPUT_MODE_STAGE2_CORRECTED_RESUME},
+            clear=False,
+        ):
+            processor.run()
+
+        self.assertEqual(
+            calls,
+            [
+                "prepare_stage2_corrected_resume",
+                "auto_tune",
+                "stage3",
+                "stage4",
+                "stage5",
+                "stage7",
+                "stage6",
+                "stage8",
+                "stage9",
+                "stage10",
+                "stage11",
+                "cleanup",
+            ],
+        )
+
     def test_plugin_script_prereq_check_skips_runtime_execution_when_modules_missing(self):
         processor = pipeline_module.SeestarPostProcessor()
         processor.log = FakeLogger()
@@ -2068,7 +2584,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertAlmostEqual(parsed["adjustments"]["background_protection"], 0.92)
         self.assertAlmostEqual(parsed["adjustments"]["detail_boost"], 0.05)
 
-    def test_stage3_plugin_order_prioritizes_noise_and_star_density(self):
+    def test_stage3_plugin_order_uses_theoretical_effect_chain(self):
         processor = pipeline_module.SeestarPostProcessor()
         processor.log = FakeLogger()
 
@@ -2077,18 +2593,10 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             high_noise,
             {"dirty_background_score": 0.42},
         )
-        self.assertEqual(high_noise_order[0][0], "NOX")
-
-        dense_stars = pipeline_module.ImageFeatures(bg_std=0.020, star_density=0.006)
-        dense_order = processor._stage3_plugin_candidates(dense_stars, {})
-        self.assertEqual(dense_order[0][0], "ADBE")
-
-        low_noise_gradient = pipeline_module.ImageFeatures(bg_std=0.015, star_density=0.001)
-        low_noise_order = processor._stage3_plugin_candidates(
-            low_noise_gradient,
-            {"gradient_score": 0.12},
+        self.assertEqual(
+            [label for label, _cmd, _source in high_noise_order],
+            ["GraXpert", "GraXpert-BGE", "ADBE", "DBE", "AutoDBE", "NOX", "VeraLux NOX"],
         )
-        self.assertEqual(low_noise_order[0][0], "DBE")
 
     def test_stage3_quality_gate_rejects_star_or_nebula_loss(self):
         processor = pipeline_module.SeestarPostProcessor()
@@ -2146,6 +2654,37 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertFalse(stage3_module._stage3_candidate_sufficient(before, dirty_candidate, dirty_score))
         self.assertTrue(stage3_module._stage3_candidate_sufficient(before, cleaner_candidate, cleaner_score))
 
+    def test_stage3_candidate_sufficient_uses_policy_std_growth_limit(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+
+        before = {
+            "bg_std": 0.00010,
+            "gradient_score": 0.08,
+            "dirty_background_score": 0.28,
+            "red_dominance": 1.00,
+            "blue_dominance": 1.00,
+            "green_cast": 1.00,
+        }
+        candidate = {
+            "bg_std": 0.000107,
+            "gradient_score": 0.02,
+            "dirty_background_score": 0.12,
+            "chroma_noise_score": 0.02,
+            "red_dominance": 1.01,
+            "blue_dominance": 1.00,
+            "green_cast": 0.99,
+        }
+
+        self.assertTrue(stage3_module._stage3_candidate_sufficient(before, candidate, 0.12))
+        self.assertFalse(
+            stage3_module._stage3_candidate_sufficient(
+                before,
+                candidate,
+                0.12,
+                {"max_bg_std_growth": 1.03},
+            )
+        )
+
     def test_stage3_large_emission_nebula_prefers_poly_first(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
 
@@ -2158,11 +2697,23 @@ class PipelinePluginFallbackTests(unittest.TestCase):
                 {},
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             stage3_module._stage3_prefers_poly_first(
                 {
                     "target_type": "emission_nebula_widefield",
                     "object_stats": {"object_area_ratio": 0.18},
+                },
+                {},
+            )
+        )
+        self.assertTrue(
+            stage3_module._stage3_prefers_poly_first(
+                {
+                    "target_type": "bright_emission_reflection_nebula",
+                    "object_stats": {
+                        "object_area_ratio": 0.16,
+                        "nebulosity_area_ratio": 0.42,
+                    },
                 },
                 {},
             )
@@ -2177,14 +2728,66 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             )
         )
 
-    def test_stage3_tries_graxpert_only_after_builtin_candidates_are_not_sufficient(self):
+    def test_stage3_faint_nebula_signal_protects_generic_profile(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+
+        profile = {
+            "target_type": "generic_low_snr_safe",
+            "object_stats": {
+                "nebulosity_area_ratio": 0.12,
+                "faint_structure_score": 0.45,
+            },
+        }
+        protect, context = stage3_module._stage3_should_exhaust_builtin_search(
+            profile,
+            {},
+            {},
+        )
+
+        self.assertTrue(stage3_module._stage3_prefers_poly_first(profile, {}))
+        self.assertTrue(protect)
+        self.assertTrue(context["faint_nebula_protection"])
+        self.assertEqual(context["protection_reason"], "faint_nebula_signal")
+
+    def test_stage3_faint_structure_increases_nebula_preservation_penalty(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+
+        preservation = {
+            "available": True,
+            "nebula_mean_change_ratio": 0.08,
+            "star_retention_ratio": 1.0,
+        }
+        base_penalty = stage3_module._stage3_preservation_penalty(
+            preservation,
+            diffuse_context={"faint_structure_score": 0.40},
+        )
+        strong_penalty = stage3_module._stage3_preservation_penalty(
+            preservation,
+            diffuse_context={
+                "faint_nebula_protection": True,
+                "faint_structure_score": 0.90,
+            },
+        )
+
+        self.assertGreater(strong_penalty, base_penalty)
+        self.assertLessEqual(
+            stage3_module._stage3_nebula_preservation_weight(
+                {"faint_nebula_protection": True, "faint_structure_score": 1.0}
+            ),
+            2.5,
+        )
+
+    def test_stage3_theoretical_chain_falls_back_until_candidate_is_sufficient(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
 
         class Stage3Fake:
             def __init__(self) -> None:
                 self.log = FakeLogger()
                 self.cfg = SimpleNamespace(workflow_plugin_probe_enabled=False)
-                self.pipeline_policy = {"policy_name": "test", "stage3_background": {}}
+                self.pipeline_policy = {
+                    "policy_name": "test",
+                    "stage3_background": {"protect_nebulosity": True},
+                }
                 self.siril = SimpleNamespace(get_image_pixeldata=lambda preview=False: None)
                 self.try_calls: list[tuple[str, ...]] = []
                 self.cmd_calls: list[tuple[Any, ...]] = []
@@ -2272,23 +2875,127 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         processor = Stage3Fake()
         stage3_module.run_stage3_background_extraction(processor)
+        background_attempts = [
+            tuple(call)
+            for call in processor.cmd_calls
+            if call and call[0] not in ("save", "load")
+        ]
 
         self.assertEqual(
-            processor.try_calls[:3],
-            [("subsky", "-rbf"), ("subsky", "1"), ("gxp",)],
+            background_attempts[:3],
+            [("gxp",), ("graxpert",), ("adbe",)],
         )
-        self.assertIn(("load", "stage3_candidate_graxpert"), processor.cmd_calls)
-        self.assertEqual(processor.workflow_command_used["GraXpert 背景提取"], "GraXpert")
+        self.assertIn(("load", "stage3_candidate_adbe"), processor.cmd_calls)
+        self.assertEqual(processor.workflow_command_used["背景提取插件链"], "ADBE")
+        self.assertTrue(processor.report["graxpert_attempted"])
         self.assertEqual(processor.results[-1][1], "ok")
 
-    def test_stage3_skips_graxpert_when_builtin_candidate_is_sufficient(self):
+    def test_stage3_graxpert_runtime_error_triggers_background_fallback(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
 
         class Stage3Fake:
             def __init__(self) -> None:
                 self.log = FakeLogger()
                 self.cfg = SimpleNamespace(workflow_plugin_probe_enabled=False)
-                self.pipeline_policy = {"policy_name": "test", "stage3_background": {}}
+                self.pipeline_policy = {
+                    "policy_name": "test",
+                    "stage3_background": {"protect_nebulosity": True},
+                }
+                self.siril = SimpleNamespace(get_image_pixeldata=lambda preview=False: None)
+                self.cmd_calls: list[tuple[Any, ...]] = []
+                self.saved: list[str] = []
+                self.workflow_command_used: dict[str, str] = {}
+                self.results: list[tuple[str, str, float, str]] = []
+                self.report: dict[str, Any] = {}
+                self.adaptive_measurements = [
+                    {
+                        "bg_std": 0.00010,
+                        "gradient_score": 0.12,
+                        "dirty_background_score": 0.44,
+                        "red_dominance": 1.00,
+                        "blue_dominance": 1.00,
+                        "green_cast": 1.00,
+                    },
+                    {
+                        "bg_std": 0.00010,
+                        "gradient_score": 0.03,
+                        "dirty_background_score": 0.16,
+                        "chroma_noise_score": 0.04,
+                        "red_dominance": 1.01,
+                        "blue_dominance": 1.01,
+                        "green_cast": 0.99,
+                    },
+                    {
+                        "bg_std": 0.00010,
+                        "gradient_score": 0.03,
+                        "dirty_background_score": 0.16,
+                        "chroma_noise_score": 0.04,
+                    },
+                ]
+
+            def cmd_with_check(self, *args: Any, quiet: bool = False) -> bool:
+                _ = quiet
+                self.cmd_calls.append(args)
+                if args and args[0] in ("gxp", "graxpert"):
+                    raise RuntimeError(
+                        "GraXpert-AI.py Error: too many indices for array: "
+                        "array is 2-dimensional, but 3 were indexed"
+                    )
+                return True
+
+            def _stage3_subsky_rbf_candidates(self):
+                return [("subsky", "-rbf")]
+
+            def _stage3_measure_features(self, _label: str):
+                return None
+
+            def _stage3_signal_preservation_metrics(self, _before: Any, _after: Any):
+                return {"available": False}
+
+            def _stage3_quality_gate(self, _before: Any, _after: Any, _preservation: Any):
+                return True, "quality gate ok"
+
+            def _adaptive_features_current(self):
+                return self.adaptive_measurements.pop(0)
+
+            def _save_stage_output(self, stem: str) -> bool:
+                self.saved.append(stem)
+                return True
+
+            def _write_stage_json(self, _name: str, payload: dict[str, Any]) -> None:
+                self.report = payload
+
+            def _record_stage(self, name: str, status: str, elapsed: float, message: str) -> None:
+                self.results.append((name, status, elapsed, message))
+
+        processor = Stage3Fake()
+        stage3_module.run_stage3_background_extraction(processor)
+        background_attempts = [
+            tuple(call)
+            for call in processor.cmd_calls
+            if call and call[0] not in ("save", "load")
+        ]
+
+        self.assertEqual(background_attempts[:3], [("gxp",), ("graxpert",), ("adbe",)])
+        self.assertEqual(processor.workflow_command_used["背景提取插件链"], "ADBE")
+        self.assertTrue(processor.report["graxpert_runtime_error"])
+        self.assertTrue(processor.report["fallback_triggered_by_graxpert_error"])
+        self.assertEqual(
+            [record["status"] for record in processor.report["attempts"][:2]],
+            ["graxpert_runtime_error", "graxpert_runtime_error"],
+        )
+
+    def test_stage3_stops_when_first_theoretical_candidate_is_sufficient(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+
+        class Stage3Fake:
+            def __init__(self) -> None:
+                self.log = FakeLogger()
+                self.cfg = SimpleNamespace(workflow_plugin_probe_enabled=False)
+                self.pipeline_policy = {
+                    "policy_name": "test",
+                    "stage3_background": {"protect_nebulosity": True},
+                }
                 self.siril = SimpleNamespace(get_image_pixeldata=lambda preview=False: None)
                 self.try_calls: list[tuple[str, ...]] = []
                 self.cmd_calls: list[tuple[Any, ...]] = []
@@ -2358,10 +3065,15 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         processor = Stage3Fake()
         stage3_module.run_stage3_background_extraction(processor)
+        background_attempts = [
+            tuple(call)
+            for call in processor.cmd_calls
+            if call and call[0] not in ("save", "load")
+        ]
 
-        self.assertEqual(processor.try_calls, [("subsky", "-rbf")])
-        self.assertNotIn(("gxp",), processor.try_calls)
-        self.assertIn(("load", "stage3_candidate_subsky_rbf_1"), processor.cmd_calls)
+        self.assertEqual(background_attempts, [("gxp",)])
+        self.assertIn(("load", "stage3_candidate_graxpert"), processor.cmd_calls)
+        self.assertEqual(processor.workflow_command_used["GraXpert 背景提取"], "GraXpert")
 
     def test_stage3_large_emission_nebula_tries_poly_before_rbf(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
@@ -2374,7 +3086,10 @@ class PipelinePluginFallbackTests(unittest.TestCase):
                     "target_type": "emission_nebula_widefield",
                     "object_stats": {"object_area_ratio": 0.46},
                 }
-                self.pipeline_policy = {"policy_name": "test", "stage3_background": {}}
+                self.pipeline_policy = {
+                    "policy_name": "test",
+                    "stage3_background": {"protect_nebulosity": True},
+                }
                 self.siril = SimpleNamespace(get_image_pixeldata=lambda preview=False: None)
                 self.try_calls: list[tuple[str, ...]] = []
                 self.cmd_calls: list[tuple[Any, ...]] = []
@@ -2388,23 +3103,33 @@ class PipelinePluginFallbackTests(unittest.TestCase):
                         "gradient_score": 0.12,
                         "dirty_background_score": 0.44,
                         "object_area_ratio": 0.46,
+                        "nebulosity_area_ratio": 0.42,
                         "red_dominance": 1.00,
                         "blue_dominance": 1.00,
                         "green_cast": 1.00,
                     },
                     {
+                        "bg_std": 0.00011,
+                        "gradient_score": 0.11,
+                        "dirty_background_score": 0.39,
+                        "chroma_noise_score": 0.10,
+                        "red_dominance": 1.03,
+                        "blue_dominance": 1.02,
+                        "green_cast": 0.98,
+                    },
+                    {
                         "bg_std": 0.00010,
-                        "gradient_score": 0.03,
-                        "dirty_background_score": 0.16,
-                        "chroma_noise_score": 0.04,
+                        "gradient_score": 0.02,
+                        "dirty_background_score": 0.14,
+                        "chroma_noise_score": 0.03,
                         "red_dominance": 1.01,
                         "blue_dominance": 1.01,
                         "green_cast": 0.99,
                     },
                     {
                         "bg_std": 0.00010,
-                        "gradient_score": 0.03,
-                        "dirty_background_score": 0.16,
+                        "gradient_score": 0.02,
+                        "dirty_background_score": 0.14,
                         "chroma_noise_score": 0.04,
                     },
                 ]
@@ -2412,11 +3137,13 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             def cmd_with_check(self, *args: Any, quiet: bool = False) -> bool:
                 _ = quiet
                 self.cmd_calls.append(args)
+                if args and args[0] not in ("save", "load", "subsky"):
+                    raise RuntimeError(f"mock plugin unavailable: {args[0]}")
                 return True
 
             def _try_cmd(self, *args: str) -> bool:
                 self.try_calls.append(tuple(args))
-                return True
+                return args and args[0] == "subsky"
 
             def _stage3_subsky_rbf_candidates(self):
                 return [("subsky", "-rbf")]
@@ -2445,10 +3172,22 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         processor = Stage3Fake()
         stage3_module.run_stage3_background_extraction(processor)
+        background_attempts = [
+            tuple(call)
+            for call in processor.cmd_calls
+            if call and call[0] not in ("save", "load")
+        ]
 
-        self.assertEqual(processor.try_calls, [("subsky", "1")])
-        self.assertIn(("load", "stage3_candidate_subsky_poly"), processor.cmd_calls)
-        self.assertEqual(processor.report["builtin_order_reason"], "large_emission_nebula_poly_first")
+        self.assertLess(
+            background_attempts.index(("subsky", "1")),
+            background_attempts.index(("subsky", "-rbf")),
+        )
+        self.assertIn(("load", "stage3_candidate_subsky_rbf_1"), processor.cmd_calls)
+        self.assertEqual(processor.report["builtin_order_reason"], "diffuse_signal_subsky_poly_before_rbf")
+        self.assertEqual(
+            processor.report["builtin_search_mode"],
+            "theoretical_effect_order_with_diffuse_signal_protection",
+        )
 
     def test_stage3_dynamic_rbf_candidates_expand_for_noisy_complex_fields(self):
         processor = pipeline_module.SeestarPostProcessor()

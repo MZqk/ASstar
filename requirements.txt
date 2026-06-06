@@ -1,5 +1,5 @@
 # Local development / runtime helper dependencies.
-# The macOS app still prepares Siril's isolated Python 3.12 venv from
+# The macOS app prepares offline runtime wheels from
 # resources/siril_plugins/downloads for offline execution.
 
 PySide6
@@ -15,4 +15,4 @@ sep
 spandrel
 einops
 safetensors
-setiastrosuitepro
+platformdirs

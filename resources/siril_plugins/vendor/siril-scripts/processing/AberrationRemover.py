@@ -19,6 +19,7 @@
 # 1.1.1 Fixed incorrect ensure_installed call (AKB)
 # 1.1.2 Move onnxruntime import before PyQt6 (prevents DLL error in some cases) (AKB)
 # 1.1.3 Added CLI args
+# 1.1.4 If no CLI arguments, run in GUI mode by default
 
 import sirilpy as s
 
@@ -32,7 +33,7 @@ import argparse
 _siril_early = s.SirilInterface()
 try:
     _siril_early.connect()
-    _IS_CLI = _siril_early.is_cli()
+    _IS_CLI = _siril_early.is_cli() and len(sys.argv) > 1
 except s.SirilConnectionError:
     _IS_CLI = False
 finally:
@@ -65,7 +66,7 @@ if not _IS_CLI:
     from PyQt6.QtCore import Qt, QThread, pyqtSignal
     from PyQt6.QtGui import QFont
 
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 CONFIG_FILENAME = "aberration_remover_model.conf"
 
 if not _IS_CLI:

@@ -16,7 +16,7 @@ class PipelineLogger:
 
     def _emit(self, tag, msg):
         ts = time.strftime("%H:%M:%S")
-        print(f"[{ts}] [{tag}] {msg}")
+        print(f"[{ts}] [{tag}] {msg}", flush=True)
 
     def debug(self, msg):
         if self.min_level <= 0:

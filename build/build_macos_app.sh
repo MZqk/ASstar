@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Build Seestar Superimpose macOS app bundle with:
-# - Embedded Siril extracted from packages/siril-1.4.2-arm64.dmg
+# - Embedded Siril extracted from packages/siril-1.4.3-arm64.dmg
 # - Embedded Python 3.13.12 runtime from packages/python-3.13.12-macos11.pkg
 #
 # Usage:
@@ -30,10 +30,13 @@ CONFIG_TEMPLATE_IN="$LOCAL_TEMPLATE"
 DEFAULT_ENV_SRC="$PROJECT_ROOT/resources/default.env"
 AI_ENV_SRC="$PROJECT_ROOT/resources/ai.env"
 SIRIL_PLUGIN_DIR_SRC="$PROJECT_ROOT/resources/siril_plugins"
+APP_REQUIREMENTS="$PROJECT_ROOT/requirements.txt"
+SIRIL_PLUGIN_REQUIREMENTS="$SIRIL_PLUGIN_DIR_SRC/requirements.txt"
+SIRIL_PLUGIN_DOWNLOADS_DIR="$SIRIL_PLUGIN_DIR_SRC/downloads"
 USER_CONFIG="$HOME/Library/Application Support/org.siril.Siril/siril/config.1.4.ini"
 
 PYTHON_PKG="$PACKAGES_DIR/python-3.13.12-macos11.pkg"
-SIRIL_DMG="$PACKAGES_DIR/siril-1.4.2-arm64.dmg"
+SIRIL_DMG="$PACKAGES_DIR/siril-1.4.3-arm64.dmg"
 SIRIL_SRC_APP=""
 SIRIL_RUNTIME_STATE="$HOME/Library/Application Support/org.siril.Siril/siril"
 SIRIL_SEED_VENV="$SIRIL_RUNTIME_STATE/venv"
@@ -50,7 +53,7 @@ Usage:
 This script requires the following package files in:
   $PACKAGES_DIR
   - python-3.13.12-macos11.pkg
-  - siril-1.4.2-arm64.dmg
+  - siril-1.4.3-arm64.dmg
 EOF
 }
 
@@ -198,6 +201,114 @@ require_executable() {
   if [[ ! -x "$path" ]]; then
     die "$label is not executable: $path"
   fi
+}
+
+macos_wheel_platform_tag() {
+  case "$(uname -m)" in
+    arm64|aarch64)
+      echo "macosx_14_0_arm64"
+      ;;
+    x86_64|amd64)
+      echo "macosx_10_15_x86_64"
+      ;;
+    *)
+      die "[BUILD] Unsupported macOS architecture for wheel download: $(uname -m)"
+      ;;
+  esac
+}
+
+prune_offline_python_wheels() {
+  local download_dir="$1"
+  local target_abi="cp313"
+
+  "$BUILD_PYTHON" - "$download_dir" "$target_abi" <<'PY'
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+from pip._vendor.packaging.utils import canonicalize_name, parse_wheel_filename
+
+download_dir = Path(sys.argv[1])
+target_abi = sys.argv[2]
+allowed_interpreters = {target_abi, "py3"}
+allowed_abis = {target_abi, "abi3", "none"}
+removed = []
+groups = {}
+
+for wheel in sorted(download_dir.glob("*.whl")):
+    try:
+        name, version, _build, tags = parse_wheel_filename(wheel.name)
+    except Exception:
+        continue
+    compatible = any(
+        (
+            tag.interpreter in allowed_interpreters
+            and tag.abi in allowed_abis
+        )
+        or (
+            tag.interpreter.startswith("cp")
+            and tag.abi == "abi3"
+        )
+        for tag in tags
+    )
+    if not compatible:
+        wheel.unlink()
+        removed.append(wheel)
+        continue
+    groups.setdefault(canonicalize_name(name), []).append((version, wheel))
+
+for _name, candidates in sorted(groups.items()):
+    candidates.sort(key=lambda item: (item[0], item[1].name))
+    if _name == "setuptools":
+        compatible = [item for item in candidates if item[0].major < 82]
+        keep = compatible[-1] if compatible else candidates[-1]
+    else:
+        keep = candidates[-1]
+    for _version, wheel in candidates:
+        if wheel == keep[1]:
+            continue
+        wheel.unlink()
+        removed.append(wheel)
+
+print(f"[BUILD] Pruned Python wheels: removed={len(removed)}, kept={len(groups)}")
+PY
+}
+
+download_offline_python_packages() {
+  local platform_tag=""
+
+  require_file "$APP_REQUIREMENTS" "[BUILD] App Python requirements"
+  require_file "$SIRIL_PLUGIN_REQUIREMENTS" "[BUILD] Siril plugin Python requirements"
+  mkdir -p "$SIRIL_PLUGIN_DOWNLOADS_DIR"
+
+  platform_tag="$(macos_wheel_platform_tag)"
+  log "[BUILD] Downloading Python 3.13 offline wheels from: $APP_REQUIREMENTS"
+  "$BUILD_PYTHON" -m pip download \
+    --only-binary=:all: \
+    --python-version 313 \
+    --implementation cp \
+    --abi cp313 \
+    --abi abi3 \
+    --platform "$platform_tag" \
+    --index-url "https://pypi.org/simple" \
+    --dest "$SIRIL_PLUGIN_DOWNLOADS_DIR" \
+    -r "$APP_REQUIREMENTS"
+
+  log "[BUILD] Downloading Python 3.13 offline wheels from: $SIRIL_PLUGIN_REQUIREMENTS"
+  "$BUILD_PYTHON" -m pip download \
+    --only-binary=:all: \
+    --python-version 313 \
+    --implementation cp \
+    --abi cp313 \
+    --abi abi3 \
+    --platform "$platform_tag" \
+    --index-url "https://pypi.org/simple" \
+    --dest "$SIRIL_PLUGIN_DOWNLOADS_DIR" \
+    -r "$SIRIL_PLUGIN_REQUIREMENTS"
+
+  prune_offline_python_wheels "$SIRIL_PLUGIN_DOWNLOADS_DIR"
+  log "[BUILD] Offline Python package cache updated: $SIRIL_PLUGIN_DOWNLOADS_DIR"
 }
 
 resolve_venv_site_packages_dir() {
@@ -624,6 +735,8 @@ log "[BUILD] Stage11 module script: $STAGE11_MODULE_SRC"
 log "[BUILD] AI env source: $AI_ENV_SRC"
 log "[BUILD] PyInstaller config dir: $PYINSTALLER_CONFIG_DIR"
 
+download_offline_python_packages
+
 log "[BUILD] Cleaning previous output artifacts..."
 remove_old_build_outputs "$APP_PATH" "$ONEDIR_PATH"
 
@@ -760,6 +873,7 @@ if [[ -d "$SIRIL_PLUGIN_DIR_SRC" ]]; then
   require_glob_exists "$SIRIL_PLUGIN_DIR_SRC/downloads/idna-*.whl" "[BUILD] idna wheel missing (run resources/siril_plugins/download_siril_plugins.sh)"
   require_glob_exists "$SIRIL_PLUGIN_DIR_SRC/downloads/certifi-*.whl" "[BUILD] certifi wheel missing (run resources/siril_plugins/download_siril_plugins.sh)"
   require_glob_exists "$SIRIL_PLUGIN_DIR_SRC/downloads/charset_normalizer-*.whl" "[BUILD] charset_normalizer wheel missing (run resources/siril_plugins/download_siril_plugins.sh)"
+  require_glob_exists "$SIRIL_PLUGIN_DIR_SRC/downloads/setuptools-*.whl" "[BUILD] setuptools wheel missing (run resources/siril_plugins/download_siril_plugins.sh)"
   require_glob_exists "$SIRIL_PLUGIN_DIR_SRC/downloads/wheel-*.whl" "[BUILD] wheel package missing (run resources/siril_plugins/download_siril_plugins.sh)"
   require_glob_exists "$SIRIL_PLUGIN_DIR_SRC/downloads/einops-*.whl" "[BUILD] einops wheel missing (run resources/siril_plugins/download_siril_plugins.sh)"
   require_glob_exists "$SIRIL_PLUGIN_DIR_SRC/downloads/safetensors-*.whl" "[BUILD] safetensors wheel missing (run resources/siril_plugins/download_siril_plugins.sh)"
@@ -778,6 +892,8 @@ if [[ -d "$SIRIL_PLUGIN_DIR_SRC" ]]; then
   require_executable "$SIRIL_PLUGIN_DIR_SRC/bin/CosmicClarity" "[BUILD] CosmicClarity classic wrapper"
   rm -rf "$APP_RESOURCES/siril_plugins"
   ditto "$SIRIL_PLUGIN_DIR_SRC" "$APP_RESOURCES/siril_plugins"
+  "$BUILD_PYTHON" "$APP_RESOURCES/siril_plugins/patches/apply_graxpert_ai_runtime_patch.py" \
+    "$APP_RESOURCES/siril_plugins"
   log "[BUILD] Runtime plugin wheels will be installed lazily from bundled cache on first app run."
   log "[BUILD] Embedded Siril plugin dir: $SIRIL_PLUGIN_DIR_SRC"
 else
@@ -798,6 +914,7 @@ require_exists "$APP_FRAMEWORKS/Python.framework/Versions/3.13" "[VERIFY] Embedd
 require_executable "$APP_RESOURCES/python/bin/python3.13" "[VERIFY] Embedded Python wrapper"
 
 log "[BUILD] Applying ad-hoc deep signing for local execution..."
+/usr/bin/xattr -cr "$APP_PATH" >/dev/null 2>&1 || true
 codesign --force --deep --sign - "$APP_PATH"
 codesign --verify --deep --strict "$APP_PATH"
 

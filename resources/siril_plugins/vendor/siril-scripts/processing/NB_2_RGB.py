@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QPixmap, QImage, QPainter
 
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 # 1.0.1 CR: using tkfilebrowser for linux OS
 # 1.0.2 CR: fixing script due to API changes
 # 1.0.3 CM: remove unnecessary import
@@ -29,6 +29,7 @@ VERSION = "2.0.1"
 # 2.0.1 RS: patch to make OSC-only input respond to Ha:OIII ratio and
 #           apply visible post-processing (SCNR + saturation) so preview
 #           changes even when no narrowband inputs are present.
+# 2.0.2 RS: If no CLI arguments, run in GUI mode by default
 
 class ImageLabel(QLabel):
     def __init__(self, parent=None):
@@ -790,7 +791,7 @@ def main():
         # Create Siril interface first to determine mode
         siril = s.SirilInterface()
         
-        if siril.is_cli():
+        if siril.is_cli() and len(sys.argv) > 1:
             print("CLI mode not supported for this script")
             return
         

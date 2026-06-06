@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import platform
 import queue
+import re
 import signal
 import shutil
 import subprocess
@@ -373,9 +375,11 @@ AI_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_WORKFLOW_PLUGIN_PROBE",
         "SEESTAR_SPCC_ENABLE",
         "SEESTAR_STAGE4_PLATESOLVE_ENABLE",
+        "SEESTAR_STAGE4_PLATESOLVE_CATALOGS",
         "SEESTAR_STAGE4_SPCC_SENSOR_MODE",
         "SEESTAR_STAGE4_SPCC_OSC_SENSOR",
         "SEESTAR_STAGE4_SPCC_OSC_FILTER",
+        "SEESTAR_STAGE4_SPCC_BUILTIN_DUALBAND_FILTER",
         "SEESTAR_STAGE4_SPCC_MONO_SENSOR",
         "SEESTAR_STAGE4_SPCC_R_FILTER",
         "SEESTAR_STAGE4_SPCC_G_FILTER",
@@ -483,7 +487,9 @@ SIRIL_STARLESS_REQUIRED_WHEEL_LABELS = (
 )
 INPUT_MODE_AUTO = "auto"
 INPUT_MODE_LINEAR_RESUME = "result_linear_resume"
+INPUT_MODE_STAGE2_CORRECTED_RESUME = "stage2_corrected_resume"
 LINEAR_RESUME_INPUT_NAME = "result_linear.fit"
+STAGE2_CORRECTED_INPUT_NAME = "stage2_corrected.fit"
 PIPELINE_EXCLUDE_PREFIXES = (
     "light_",
     "pp_",
@@ -518,6 +524,20 @@ def resolve_siril_scripts_root(plugin_root: Path) -> Path | None:
         if (root / "processing" / "AberrationRemover.py").is_file():
             return root
     return None
+
+
+def apply_siril_runtime_patches(plugin_root: Path, target_root: Path | None = None) -> bool:
+    patcher = plugin_root / "patches" / "apply_graxpert_ai_runtime_patch.py"
+    if not patcher.is_file():
+        return False
+    spec = importlib.util.spec_from_file_location(
+        "seestar_graxpert_ai_runtime_patch", patcher
+    )
+    if spec is None or spec.loader is None:
+        return False
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return bool(module.apply_patch(target_root or plugin_root))
 
 
 def build_siril_cli_command(
@@ -939,6 +959,10 @@ class SeestarGui(QMainWindow):
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("Normal Pipeline", INPUT_MODE_AUTO)
         self.mode_combo.addItem(
+            "Postprocess From stage2_corrected.fit",
+            INPUT_MODE_STAGE2_CORRECTED_RESUME,
+        )
+        self.mode_combo.addItem(
             "Continue From result_linear.fit",
             INPUT_MODE_LINEAR_RESUME,
         )
@@ -1056,21 +1080,37 @@ class SeestarGui(QMainWindow):
     def _input_mode_label(self, mode: str) -> str:
         if mode == INPUT_MODE_LINEAR_RESUME:
             return "result_linear.fit 后期模式"
+        if mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
+            return "stage2_corrected.fit 叠加后处理模式"
         return "正常流程模式"
 
     def _current_input_mode(self) -> str:
         combo = getattr(self, "mode_combo", None)
         if combo is not None and hasattr(combo, "currentData"):
             value = combo.currentData()
-            if value in {INPUT_MODE_AUTO, INPUT_MODE_LINEAR_RESUME}:
+            if value in {
+                INPUT_MODE_AUTO,
+                INPUT_MODE_LINEAR_RESUME,
+                INPUT_MODE_STAGE2_CORRECTED_RESUME,
+            }:
                 return str(value)
         value = getattr(self, "input_mode", INPUT_MODE_AUTO)
-        if value in {INPUT_MODE_AUTO, INPUT_MODE_LINEAR_RESUME}:
+        if value in {
+            INPUT_MODE_AUTO,
+            INPUT_MODE_LINEAR_RESUME,
+            INPUT_MODE_STAGE2_CORRECTED_RESUME,
+        }:
             return str(value)
         return INPUT_MODE_AUTO
 
     def _linear_resume_input_path(self, work_dir: Path) -> Path:
         return work_dir / LINEAR_RESUME_INPUT_NAME
+
+    def _stage2_corrected_resume_input_path(self, work_dir: Path) -> Path:
+        root_candidate = work_dir / STAGE2_CORRECTED_INPUT_NAME
+        if root_candidate.is_file():
+            return root_candidate
+        return work_dir / "process" / STAGE2_CORRECTED_INPUT_NAME
 
     def _on_input_mode_changed(self, _index: int) -> None:
         self.input_mode = self._current_input_mode()
@@ -1218,6 +1258,16 @@ class SeestarGui(QMainWindow):
             input_bytes = source_bytes
             mode = "linear_resume"
             selected_input_label = source.name
+        elif current_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
+            source = self._stage2_corrected_resume_input_path(work_dir)
+            if not source.is_file():
+                return None
+            source_bytes = safe_file_size(source)
+            base_growth_bytes = int(source_bytes * STACKED_STAGE_ARTIFACT_COPIES)
+            input_count = 1
+            input_bytes = source_bytes
+            mode = "stage2_corrected_resume"
+            selected_input_label = source.name
         else:
             fits = self._fits_in_work_dir(work_dir)
             if not fits:
@@ -1279,6 +1329,8 @@ class SeestarGui(QMainWindow):
     def _disk_space_mode_label(self, estimate: DiskSpaceEstimate) -> str:
         if estimate.mode == "linear_resume":
             return "result_linear.fit 后期模式"
+        if estimate.mode == "stage2_corrected_resume":
+            return "stage2_corrected.fit 叠加后处理模式"
         if estimate.mode == "light":
             return "Light_ 预处理模式"
         return "已叠加 FITS 直处理模式"
@@ -1333,6 +1385,7 @@ class SeestarGui(QMainWindow):
         machine = platform.machine().lower()
         current_mode = self._current_input_mode()
         linear_resume_path = self._linear_resume_input_path(work_dir)
+        stage2_corrected_resume_path = self._stage2_corrected_resume_input_path(work_dir)
         lines = [
             "预检摘要：",
             f"  工作目录: {self._display_path(work_dir)}",
@@ -1351,6 +1404,15 @@ class SeestarGui(QMainWindow):
                     linear_resume_path.name
                     if linear_resume_path.is_file()
                     else f"{LINEAR_RESUME_INPUT_NAME}（未找到）"
+                )
+            )
+        elif current_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
+            lines.append(
+                "  叠加后处理输入: "
+                + (
+                    str(stage2_corrected_resume_path.relative_to(work_dir))
+                    if stage2_corrected_resume_path.is_file()
+                    else f"{STAGE2_CORRECTED_INPUT_NAME}（未找到）"
                 )
             )
         if disk_estimate is not None:
@@ -1399,6 +1461,13 @@ class SeestarGui(QMainWindow):
             if not linear_resume_path.is_file():
                 errors.append(
                     f"续跑模式要求工作目录根下存在 {LINEAR_RESUME_INPUT_NAME}：{linear_resume_path}"
+                )
+        elif current_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
+            stage2_corrected_path = self._stage2_corrected_resume_input_path(work_dir)
+            if not stage2_corrected_path.is_file():
+                errors.append(
+                    "叠加后处理模式要求工作目录根下或 process/ 下存在 "
+                    f"{STAGE2_CORRECTED_INPUT_NAME}：{stage2_corrected_path}"
                 )
         else:
             fits = self._fits_in_work_dir(work_dir)
@@ -1483,6 +1552,9 @@ class SeestarGui(QMainWindow):
 
     def _plugin_downloads_dir(self) -> Path:
         return self.siril_plugin_dir / "downloads"
+
+    def _plugin_requirements_path(self) -> Path:
+        return self.siril_plugin_dir / "requirements.txt"
 
     def _onnxruntime_wheels(self) -> list[Path]:
         return sorted(self._plugin_downloads_dir().glob("onnxruntime-*.whl"))
@@ -1604,6 +1676,37 @@ class SeestarGui(QMainWindow):
     def _torchvision_wheels(self) -> list[Path]:
         return sorted(self._plugin_downloads_dir().glob("torchvision-*.whl"))
 
+    def _requirement_names(self, requirements_path: Path) -> list[str]:
+        if not requirements_path.is_file():
+            return []
+        names: list[str] = []
+        for raw_line in requirements_path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines():
+            line = raw_line.split("#", 1)[0].strip()
+            if not line or line.startswith(("-", "http:", "https:", ".")):
+                continue
+            name = re.split(r"[<>=!~;\[\s]", line, maxsplit=1)[0].strip()
+            if name:
+                names.append(name.replace("_", "-").lower())
+        return names
+
+    def _missing_requirement_wheels(self, requirements_path: Path) -> list[str]:
+        downloads_dir = self._plugin_downloads_dir()
+        wheel_names = [path.name.lower() for path in downloads_dir.glob("*.whl")]
+        missing: list[str] = []
+        for name in self._requirement_names(requirements_path):
+            normalized = name.replace("-", "_")
+            prefixes = (
+                f"{name}-",
+                f"{normalized}-",
+            )
+            if not any(
+                wheel_name.startswith(prefix) for wheel_name in wheel_names for prefix in prefixes
+            ):
+                missing.append(name)
+        return missing
+
     def _missing_plugin_artifacts(self) -> list[str]:
         missing: list[str] = []
 
@@ -1683,6 +1786,16 @@ class SeestarGui(QMainWindow):
             missing.append("torch wheel 缺失")
         if not call("_torchvision_wheels"):
             missing.append("torchvision wheel 缺失")
+        missing_requirement_wheels = []
+        if isinstance(self, SeestarGui):
+            missing_requirement_wheels = self._missing_requirement_wheels(
+                self._plugin_requirements_path()
+            )
+        if missing_requirement_wheels:
+            missing.append(
+                "requirements wheel 缺失: "
+                + ", ".join(missing_requirement_wheels)
+            )
 
         syqon_bundle = plugin_root / SYQON_STARLESS_BUNDLE_REL
         for name in ("syqon_starless_inference.py", "zenith.pt"):
@@ -1857,10 +1970,14 @@ class SeestarGui(QMainWindow):
         runtime_repo = self._runtime_siril_scripts_repo_dir()
         marker = runtime_repo / "processing" / "AberrationRemover.py"
         if marker.is_file():
+            if apply_siril_runtime_patches(self.siril_plugin_dir, runtime_repo):
+                self._append_event("已应用 GraXpert-AI 运行时兼容补丁")
             return
 
         runtime_repo.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(scripts_root, runtime_repo, dirs_exist_ok=True)
+        if apply_siril_runtime_patches(self.siril_plugin_dir, runtime_repo):
+            self._append_event("已应用 GraXpert-AI 运行时兼容补丁")
         self._append_event(
             "已同步 Siril scripts 仓库到运行时目录: "
             + self._display_path(runtime_repo)
@@ -1882,6 +1999,11 @@ class SeestarGui(QMainWindow):
         runtime_env["LC_CTYPE"] = "en_US.UTF-8"
         runtime_env["PYTHONUTF8"] = "1"
         runtime_env["PYTHONIOENCODING"] = "utf-8"
+        bundled_downloads = self.resources / "siril_plugins" / "downloads"
+        if bundled_downloads.is_dir():
+            runtime_env["PIP_NO_INDEX"] = "1"
+            runtime_env["PIP_FIND_LINKS"] = str(bundled_downloads)
+            runtime_env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
         return runtime_env
 
     def _ensure_runtime_tiffile_alias(self) -> None:
@@ -1992,6 +2114,60 @@ class SeestarGui(QMainWindow):
             "已写入 sirilpy timeout 补丁: "
             + self._display_path(patch_path)
         )
+
+    def _ensure_runtime_requirements_ready(self) -> None:
+        python_bin = self._runtime_venv_python_bin()
+        if not python_bin.exists():
+            raise FileNotFoundError(f"Siril runtime python not found: {python_bin}")
+
+        requirements_path = self._plugin_requirements_path()
+        if not requirements_path.is_file():
+            raise FileNotFoundError(f"Siril runtime requirements not found: {requirements_path}")
+
+        missing_wheels = self._missing_requirement_wheels(requirements_path)
+        if missing_wheels:
+            raise RuntimeError(
+                "Siril runtime requirements 离线 wheel 缺失："
+                + "、".join(missing_wheels)
+            )
+
+        runtime_env = self._runtime_python_env()
+        wheel_dir = self._plugin_downloads_dir()
+        self._append_event(
+            "正在按 requirements 离线安装 Siril runtime 依赖 "
+            f"(no-index, find-links={self._display_path(wheel_dir)})..."
+        )
+        install_cp = subprocess.run(
+            [
+                str(python_bin),
+                "-m",
+                "pip",
+                "install",
+                "--no-index",
+                "--upgrade",
+                "--find-links",
+                str(wheel_dir),
+                "-r",
+                str(requirements_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=runtime_env,
+        )
+        if install_cp.returncode != 0:
+            tail = (
+                install_cp.stderr.strip()
+                or install_cp.stdout.strip()
+                or "unknown error"
+            )
+            raise RuntimeError(
+                "Siril runtime requirements 离线安装失败 "
+                f"(exit={install_cp.returncode}): {tail[-320:]}"
+            )
+
+        self._ensure_runtime_tiffile_alias()
+        self._append_event("Siril runtime requirements 离线安装完成。")
 
     def _ensure_runtime_cosmic_clarity_deps_ready(self) -> None:
         python_bin = self._runtime_venv_python_bin()
@@ -2448,6 +2624,17 @@ class SeestarGui(QMainWindow):
             for line in self._disk_space_summary_lines(disk_estimate):
                 self._append_text(f"{line}\n")
             self._append_event("当前卷剩余空间不足，已取消本次运行。")
+            return
+
+        try:
+            self._ensure_runtime_requirements_ready()
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Siril runtime 依赖准备失败",
+                f"无法按 requirements 准备 Siril runtime 依赖：\n{e}",
+            )
+            self._append_event(f"Siril runtime requirements 依赖准备失败：{e}")
             return
 
         try:

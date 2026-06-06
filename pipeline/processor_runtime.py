@@ -81,9 +81,15 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_WORKFLOW_PLUGIN_PROBE",
         "SEESTAR_SPCC_ENABLE",
         "SEESTAR_STAGE4_PLATESOLVE_ENABLE",
+        "SEESTAR_STAGE4_PLATESOLVE_FOCAL",
+        "SEESTAR_STAGE4_PLATESOLVE_PIXELSIZE",
+        "SEESTAR_STAGE4_PLATESOLVE_ORDER",
+        "SEESTAR_STAGE4_PLATESOLVE_CATALOGS",
+        "SEESTAR_STAGE4_PLATESOLVE_HEADER_RADIUS",
         "SEESTAR_STAGE4_SPCC_SENSOR_MODE",
         "SEESTAR_STAGE4_SPCC_OSC_SENSOR",
         "SEESTAR_STAGE4_SPCC_OSC_FILTER",
+        "SEESTAR_STAGE4_SPCC_BUILTIN_DUALBAND_FILTER",
         "SEESTAR_STAGE4_SPCC_MONO_SENSOR",
         "SEESTAR_STAGE4_SPCC_R_FILTER",
         "SEESTAR_STAGE4_SPCC_G_FILTER",
@@ -93,9 +99,14 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_STAGE4_SPCC_NEBULA_WHITE_REF",
         "SEESTAR_STAGE4_SPCC_BGTOL",
         "SEESTAR_STAGE4_SPCC_LIMITMAG",
+        "SEESTAR_STAGE4_SPCC_RESTORE_CPU",
+        "SEESTAR_STAGE4_SPCC_RESTORE_MAXPROCS",
+        "SEESTAR_STAGE4_PCC_CATALOGS",
+        "SEESTAR_STAGE4_PCC_HEADER_FALLBACK_ENABLE",
         "SEESTAR_STAGE4_LOCAL_STAR_WB_ENABLE",
         "SEESTAR_STAGE4_LOCAL_STAR_WB_MIN_PIXELS",
         "SEESTAR_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT",
+        "SEESTAR_STAGE4_LOCAL_STAR_WB_TARGET_AWARE_ENABLE",
         "SEESTAR_SPCC_ALLOW_LIGHT_PREPROCESS",
         "SEESTAR_ABERRATION_API_ENABLE",
         "SEESTAR_ABERRATION_PROVIDER",
@@ -150,6 +161,7 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
 )
 INPUT_MODE_AUTO = "auto"
 INPUT_MODE_LINEAR_RESUME = "result_linear_resume"
+INPUT_MODE_STAGE2_CORRECTED_RESUME = "stage2_corrected_resume"
 RESULT_BASENAME_TEMPLATE = (
     "$OBJECT:%s$_$STACKCNT:%d$x$EXPTIME:%d$sec"
     "_$DATE-OBS:dm12$_processed"
@@ -234,8 +246,83 @@ class ProcessorRuntimeMixin:
         )
 
 
+    def _format_debug_quality_metrics_line(
+        self,
+        stem: str,
+        metrics: QualityMetrics,
+        features: ImageFeatures,
+    ) -> str:
+        return (
+            "[STAGE_QUALITY_METRICS] "
+            "schema=seestar.stage_quality.v1 "
+            f"stem={stem} "
+            f"bg_median={metrics.bg_median:.6f} "
+            f"black_pixel_ratio={metrics.black_pixel_ratio:.6f} "
+            f"highlight_clip_ratio={metrics.highlight_clip_ratio:.6f} "
+            f"star_density={metrics.star_density:.8f} "
+            f"median_star_size={metrics.median_star_size:.6f} "
+            f"star_coverage_ratio={metrics.star_coverage_ratio:.6f} "
+            f"star_energy_ratio={metrics.star_energy_ratio:.6f} "
+            f"saturation_median={metrics.saturation_median:.6f} "
+            f"saturation_p95={metrics.saturation_p95:.6f} "
+            f"microcontrast={metrics.microcontrast:.6f} "
+            f"blue_excess={metrics.blue_excess:.6f} "
+            f"edge_black_ratio={features.edge_black_ratio:.6f} "
+            f"global_dark_ratio={features.global_dark_ratio:.6f} "
+            f"object_area_ratio={features.object_area_ratio:.6f} "
+            f"diffuse_ratio={features.diffuse_ratio:.6f} "
+            f"core_brightness_ratio={features.core_brightness_ratio:.6f}"
+        )
+
+
+    def _write_debug_quality_metrics(self, stem: str) -> None:
+        if not self.cfg.debug_mode:
+            return
+
+        try:
+            image_data = self.siril.get_image_pixeldata(preview=False)
+            metrics = measure_quality_metrics(image_data)
+            features = measure_image_features(image_data)
+        except Exception as e:
+            self.log.warn(f"阶段质量指标采集失败 ({stem}): {e}")
+            return
+
+        self._debug_quality_metric_index = (
+            int(getattr(self, "_debug_quality_metric_index", 0)) + 1
+        )
+        payload = {
+            "schema": "seestar.stage_quality.v1",
+            "sequence": self._debug_quality_metric_index,
+            "stem": stem,
+            "file": f"{stem}.fit",
+            "metrics": asdict(metrics),
+            "features": asdict(features),
+        }
+
+        self.log.info(self._format_debug_quality_metrics_line(stem, metrics, features))
+        if not self.process_dir:
+            return
+
+        try:
+            text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            (self.process_dir / f"{stem}_quality_metrics.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            with (self.process_dir / "stage_quality_metrics.jsonl").open(
+                "a",
+                encoding="utf-8",
+            ) as f:
+                f.write(text + "\n")
+        except OSError as e:
+            self.log.warn(f"写入阶段质量指标失败 ({stem}): {e}")
+
+
     def _save_stage_output(self, stem: str) -> bool:
-        return save_stage_output(self.cmd_with_check, self.log, stem)
+        saved = save_stage_output(self.cmd_with_check, self.log, stem)
+        if saved:
+            self._write_debug_quality_metrics(stem)
+        return saved
 
 
     def _sha256_file(self, path: Path) -> Optional[str]:
@@ -286,7 +373,11 @@ class ProcessorRuntimeMixin:
         input_mode_raw = os.getenv(ENV_INPUT_MODE_KEY)
         if input_mode_raw is not None:
             normalized = input_mode_raw.strip().lower()
-            if normalized in {INPUT_MODE_AUTO, INPUT_MODE_LINEAR_RESUME}:
+            if normalized in {
+                INPUT_MODE_AUTO,
+                INPUT_MODE_LINEAR_RESUME,
+                INPUT_MODE_STAGE2_CORRECTED_RESUME,
+            }:
                 self.input_mode = normalized
             else:
                 self.log.warn(
@@ -370,6 +461,32 @@ class ProcessorRuntimeMixin:
                     "keeping current setting"
                 )
 
+        builtin_dualband_raw = os.getenv("SEESTAR_STAGE4_SPCC_BUILTIN_DUALBAND_FILTER")
+        if builtin_dualband_raw is not None:
+            parsed = self._parse_env_bool(
+                builtin_dualband_raw,
+                getattr(self.cfg, "stage4_spcc_builtin_dualband_filter_enabled", False),
+            )
+            self.cfg.stage4_spcc_builtin_dualband_filter_enabled = parsed
+            if builtin_dualband_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
+                self.log.warn(
+                    "SEESTAR_STAGE4_SPCC_BUILTIN_DUALBAND_FILTER has invalid value; "
+                    "keeping current setting"
+                )
+
+        pcc_header_fallback_raw = os.getenv("SEESTAR_STAGE4_PCC_HEADER_FALLBACK_ENABLE")
+        if pcc_header_fallback_raw is not None:
+            parsed = self._parse_env_bool(
+                pcc_header_fallback_raw,
+                getattr(self.cfg, "stage4_pcc_header_fallback_enabled", True),
+            )
+            self.cfg.stage4_pcc_header_fallback_enabled = parsed
+            if pcc_header_fallback_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
+                self.log.warn(
+                    "SEESTAR_STAGE4_PCC_HEADER_FALLBACK_ENABLE has invalid value; "
+                    "keeping current setting"
+                )
+
         for env_key, attr_name in (
             ("SEESTAR_STAGE4_SPCC_SENSOR_MODE", "stage4_spcc_sensor_mode"),
             ("SEESTAR_STAGE4_SPCC_OSC_SENSOR", "stage4_spcc_osc_sensor"),
@@ -387,6 +504,22 @@ class ProcessorRuntimeMixin:
             if raw_value is not None:
                 setattr(self.cfg, attr_name, raw_value.strip())
 
+        spcc_restore_cpu_raw = (
+            os.getenv("SEESTAR_STAGE4_SPCC_RESTORE_CPU")
+            or os.getenv("SEESTAR_STAGE4_SPCC_RESTORE_MAXPROCS")
+        )
+        if spcc_restore_cpu_raw is not None:
+            try:
+                parsed = int(spcc_restore_cpu_raw.strip())
+                if parsed < 0:
+                    raise ValueError
+                self.cfg.stage4_spcc_restore_cpu = parsed
+            except (TypeError, ValueError):
+                self.log.warn(
+                    "SEESTAR_STAGE4_SPCC_RESTORE_CPU has invalid value; "
+                    "keeping current setting"
+                )
+
         local_star_wb_raw = os.getenv("SEESTAR_STAGE4_LOCAL_STAR_WB_ENABLE")
         if local_star_wb_raw is not None:
             parsed = self._parse_env_bool(
@@ -397,6 +530,19 @@ class ProcessorRuntimeMixin:
             if local_star_wb_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
                 self.log.warn(
                     "SEESTAR_STAGE4_LOCAL_STAR_WB_ENABLE has invalid value; "
+                    "keeping current setting"
+                )
+
+        local_star_wb_target_aware_raw = os.getenv("SEESTAR_STAGE4_LOCAL_STAR_WB_TARGET_AWARE_ENABLE")
+        if local_star_wb_target_aware_raw is not None:
+            parsed = self._parse_env_bool(
+                local_star_wb_target_aware_raw,
+                getattr(self.cfg, "stage4_local_star_wb_target_aware_enabled", False),
+            )
+            self.cfg.stage4_local_star_wb_target_aware_enabled = parsed
+            if local_star_wb_target_aware_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
+                self.log.warn(
+                    "SEESTAR_STAGE4_LOCAL_STAR_WB_TARGET_AWARE_ENABLE has invalid value; "
                     "keeping current setting"
                 )
 

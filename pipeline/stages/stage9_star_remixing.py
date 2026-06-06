@@ -244,9 +244,11 @@ def run_stage9_star_remixing(pipeline) -> None:
         1.05,
     )
     if remix_scale < 0.999:
-        reason = getattr(pipeline, "_stage9_star_intensity_reason", "") or "stage7 residual stars"
+        reason = getattr(pipeline, "_stage9_star_intensity_reason", "")
+        if not reason:
+            reason = "stage8 fallback star intensity cap" if fallback_used else "stage7 residual stars"
         messages.append(
-            "Stage9 star remix intensity reduced from Stage7 diagnostics "
+            "Stage9 star remix intensity reduced from safety diagnostics "
             f"(base={pipeline.cfg.star_intensity:.3f}, effective={intensity:.3f}, "
             f"fallback={fallback_intensity:.3f}, reason={reason})"
         )

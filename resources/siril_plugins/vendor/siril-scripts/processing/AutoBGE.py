@@ -10,6 +10,7 @@
 #       shown with the "Show Gradient Removed" button.
 # 1.0.4 Fix CLI mode so the script can be used with pyscript
 # 2.0.0 Converted to PyQt6
+# 2.0.1 If no CLI arguments, run in GUI mode by default
 
 """
 Auto Background Extraction script for Siril
@@ -63,7 +64,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 
 if not s.check_module_version(">=0.7.41"):
     print("Error: requires sirilpy version 0.7.41 or higher")
@@ -91,7 +92,7 @@ class GradientRemovalInterface:
         self.siril = siril
         self.app = app
 
-        self.cli_call = self.siril.is_cli()
+        self.cli_call = self.siril.is_cli() and len(sys.argv) > 1
         # If no CLI args, create a default namespace with defaults
         if self.cli_call and cli_args is None:
             parser = argparse.ArgumentParser()
@@ -1148,7 +1149,7 @@ def main():
                 print("Failed to connect to Siril")
             return
 
-        if siril.is_cli():
+        if siril.is_cli() and len(sys.argv) > 1:
             # CLI mode
             parser = argparse.ArgumentParser(description="Automatic Background Extraction")
             parser.add_argument("-npoints", type=int, default=100,

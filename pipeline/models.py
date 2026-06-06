@@ -17,9 +17,11 @@ class PipelineConfig:
 
     # 阶段 2: 裁切
     crop_margin: float = 0.02       # 每边裁切比例（0.02 = 宽高各裁 2%）
-    stage2_edge_black_target: float = 0.10  # 阶段2自适应黑边裁切目标，后续阶段不再临时裁黑边
+    stage2_edge_black_target: float = 0.03  # 阶段2自动黑边裁切目标，后续阶段不再临时裁黑边
     stage2_adaptive_edge_crop_max_passes: int = 3  # 阶段2自适应黑边裁切最大迭代次数
     stage2_adaptive_edge_crop_max_extra: float = 0.035  # 阶段2单次自适应额外裁切上限
+    stage2_guard_band_pixels: int = 3  # 阶段2最终裁切后护带检查的像素宽度，清除残余暗边/色偏
+    stage2_color_artifact_max_crop: float = 0.15  # 阶段2彩色伪影裁切单边最大比例上限
 
     # 阶段 3: 背景提取 (RBF)
     bg_samples: int = 20            # 背景采样点数量；越大拟合更细，但更慢且更易过拟合
@@ -49,22 +51,26 @@ class PipelineConfig:
     optional_color_transform_enabled: bool = False  # 是否启用可选转色（Alchemy/Hubble）
     workflow_plugin_probe_enabled: bool = False  # Probe broad workflow plugin commands only when explicitly enabled; stage8 has a narrow safe SASP probe
     spcc_enabled: bool = True  # Prefer SPCC first by default; can be disabled via SEESTAR_SPCC_ENABLE=0
-    stage4_platesolve_enabled: bool = True  # 阶段4默认执行 platesolve -noflip -downscale，保存 stage4_psolved
+    stage4_platesolve_enabled: bool = True  # 阶段4默认执行 platesolve -focal=160 -pixelsize=2.90 -catalog=gaia -order=3
     stage4_spcc_sensor_mode: str = "osc"  # SPCC 传感器模式：osc 或 mono_lrgb
-    stage4_spcc_osc_sensor: str = "seestar s30pro"  # OSC/SPCC oscsensor 名称
-    stage4_spcc_osc_filter: str = "seestar s30pro"  # OSC/SPCC oscfilter 名称
+    stage4_spcc_osc_sensor: str = "Sony IMX585"  # OSC/SPCC oscsensor 名称；Seestar S30 Pro 使用 Sony IMX585
+    stage4_spcc_osc_filter: str = ""  # OSC/SPCC oscfilter 显式覆盖；为空时按内置双带光害滤镜开关自动选择
+    stage4_spcc_builtin_dualband_filter_enabled: bool = False  # 是否开启 Seestar 内置双带光害滤镜；决定默认 SPCC oscfilter
     stage4_spcc_mono_sensor: str = ""  # Mono/LRGB SPCC monosensor 名称；为空时回退 OSC 配置
     stage4_spcc_r_filter: str = ""  # Mono/LRGB SPCC R filter 名称
     stage4_spcc_g_filter: str = ""  # Mono/LRGB SPCC G filter 名称
     stage4_spcc_b_filter: str = ""  # Mono/LRGB SPCC B filter 名称
     stage4_spcc_white_ref: str = "Average Spiral Galaxy"  # SPCC white reference
-    stage4_spcc_adaptive_white_ref_enabled: bool = True  # 发射星云目标自动切换更适合星光的 SPCC white reference
+    stage4_spcc_adaptive_white_ref_enabled: bool = False  # 默认按 Siril SPCC 方案使用 Average Spiral Galaxy；需要时可显式开启星云白参考切换
     stage4_spcc_nebula_white_ref: str = "Star, type G2(v)"  # 发射/双窄带星云默认 SPCC 星型白参考；可由 env 覆盖
     stage4_spcc_bgtol: str = "-2.8,2.0"  # SPCC 背景容差参数；默认值不显式传入，PCC 使用 Siril 默认 bgtol
-    stage4_spcc_limitmag: str = "11.5"  # SPCC Gaia 查询极限星等；限制星数以规避 Siril 1.4.x aperture photometry 崩溃
+    stage4_spcc_limitmag: str = "10.5"  # SPCC Gaia 查询极限星等；限制测光星数以降低 Siril 1.4.x SPCC 崩溃风险
+    stage4_spcc_restore_cpu: int = 0  # SPCC 前 setcpu 1；结束后恢复到该值，0 表示自动使用 CPU 数
+    stage4_pcc_header_fallback_enabled: bool = True  # platesolve 失败但 FITS 有 RA/DEC 时，允许尝试 PCC header 坐标回退
     stage4_local_star_wb_enabled: bool = True  # SPCC/PCC 都失败时，允许基于未饱和星点做保守白平衡
-    stage4_local_star_wb_min_pixels: int = 80  # 本地星点白平衡所需的最小白参考像素数
+    stage4_local_star_wb_min_pixels: int = 32  # 本地星点白平衡所需的最小白参考像素数
     stage4_local_star_wb_gain_limit: float = 1.25  # 本地星点白平衡单通道增益限制，避免替代光度校准
+    stage4_local_star_wb_target_aware_enabled: bool = False  # 发射/双窄带目标默认跳过本地星点白平衡以保护 Hα/OIII 色彩
     aberration_api_enabled: bool = False  # Disabled by default: API path may fail in siril-cli thread ownership context
 
     # 阶段 6: 拉伸
@@ -136,6 +142,8 @@ class PipelineConfig:
     stage7_starless_noise_gain_max: float = 1.25  # 阶段7验收：starless 背景噪声增益上限
     stage7_starmask_coverage_min_ratio: float = 0.35  # 阶段7验收：starmask 覆盖相对 stage6 星点覆盖的下限
     stage7_starmask_width_ratio_max: float = 1.80  # 阶段7验收：starmask 中位宽度相对 stage6 星点宽度上限
+    stage7_starless_dynamic_range_min_ratio: float = 0.55  # 阶段7验收：starless 相对输入的有效动态范围下限，防止去星输出塌缩
+    stage7_starless_peak_signal_min: float = 0.006  # 阶段7验收：低动态范围 starless 的最低峰值信号，低于此值触发保守重试
     stage7_starmask_clean_enabled: bool = True  # 阶段7默认清理星点层，避免背景/星云残差直接回混
     stage7_starmask_background_floor_percentile: float = 55.0  # 阶段7星点层低亮背景残差软阈值百分位
     stage7_starmask_halo_blur_strength: float = 0.35  # 阶段7亮星 halo 区域轻微平滑强度

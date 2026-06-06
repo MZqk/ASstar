@@ -27,7 +27,7 @@ cd /Users/mz/dev/aiseestart
 ```
 
 Inputs:
-- Required: `packages/python-3.13.12-macos11.pkg`, `packages/siril-1.4.2-arm64.dmg`
+- Required: `packages/python-3.13.12-macos11.pkg`, `packages/siril-1.4.3-arm64.dmg`
 - Required Siril seed source: `~/Library/Application Support/org.siril.Siril/siril/{venv,.python_module}`; missing时先运行 Siril 初始化。
 
 Notes:
@@ -57,7 +57,7 @@ Runtime env 来源优先级：进程环境 > 工作目录 `.seestar_ai.env` > ru
 | Variable | Default | Scope |
 |---|---:|---|
 | `SEESTAR_DEBUG_MODE` | GUI toggle | GUI 强制写入；控制是否保留 `process/stage*.fit` |
-| `SEESTAR_INPUT_MODE` | `auto` | GUI 处理模式；`result_linear_resume` 要求工作目录有 `result_linear.fit` |
+| `SEESTAR_INPUT_MODE` | `auto` | GUI 处理模式；`stage2_corrected_resume` 要求工作目录根下或 `process/` 有 `stage2_corrected.fit`，从 Stage 3 继续；`result_linear_resume` 要求工作目录有 `result_linear.fit` |
 | `SEESTAR_AI_ENABLED` | GUI toggle | GUI 强制写入；AI endpoint/model/key 仍按 env 优先级读取 |
 | `SEESTAR_AI_ENDPOINT` / `SEESTAR_AI_MODEL` / `SEESTAR_AI_API_KEY` | unset | 可来自工作目录、runtime home、bundled/project env 文件 |
 | `SIRIL_PYTHON_CLI` / `SEESTAR_SIRIL_PYTHON_CLI` | bundled Python | GUI 注入稳定 Siril Python；wrapper 用后者兜底 |
@@ -71,6 +71,7 @@ Pipeline 细节以 `pipeline/seestar_Superimpose_workflow.md` 为准；这里仅
 - Stage states: `ok`、`degraded`、`failed`、`skipped`；summary 可显示 `ok_with_fallback`、`ok_skipped_optional`。
 - Worker 必须复制外部 `pipeline/stages/`、Stage11 和共享 helper 模块；不再内嵌 pipeline 源码字符串。
 - Stage 11 必须保持可选，只写 `*_ai` 产物，失败不得阻断 Stage 10 原始输出。
+- `stage2_corrected_resume` 要求 `<work_dir>/stage2_corrected.fit` 或 `<work_dir>/process/stage2_corrected.fit`，将其作为已完成裁切/视场修正的叠加后中间结果，并从 Stage 3 继续完整后处理。
 - `result_linear_resume` 要求 `<work_dir>/result_linear.fit`，记录 stage 2-5 为 skipped，并从 Stage 6 继续。
 - Stage 6/7 兼容别名属于外部和调试界面：`stage6_starless*` 与 `stage7_starless*`、`stage6_starless_quality.json` 与 `stage7_quality.json` 需继续兼容。
 - Stage 10 导出必须保留 TIFF/PNG/FITS fallback 名称，包括续跑模式的 `_linear` fallbacks。
@@ -78,7 +79,7 @@ Pipeline 细节以 `pipeline/seestar_Superimpose_workflow.md` 为准；这里仅
 
 ## Plugin Cache
 
-- 准备：`bash resources/siril_plugins/download_siril_plugins.sh`
+- 准备：`bash resources/siril_plugins/download_siril_plugins.sh`；脚本按 Python 3.13 下载 wheel，并清理 `downloads/` 中同一库的旧版本/非 3.13 wheel。
 - GUI 每轮检查插件脚本、SASP/SyQon/AberrationRemover、PyQt6/PySide6/astropy/scipy/tifffile/onnxruntime 等 wheels。
 - 缺失时自动尝试下载；仍缺失则阻断运行。
 - runtime offline pip 只从 bundled wheels 安装，并写入 `tiffile` shim 与 `sitecustomize.py` sirilpy timeout patch。

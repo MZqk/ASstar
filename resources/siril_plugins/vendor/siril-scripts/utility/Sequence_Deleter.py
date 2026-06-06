@@ -46,9 +46,9 @@
 # 2.0.3 - Added check for currently loaded sequence. If it matches the selection, it's closed before deletion.
 # 2.0.4 - Changed deletion to use send2trash for safer file removal
 # 2.0.5 - CLI mode added
-#
+# 2.0.6 - If no CLI arguments, run in GUI mode by default
 
-VERSION = "2.0.5"
+VERSION = "2.0.6"
 
 # Core module imports
 import os
@@ -504,7 +504,7 @@ def main():
     qapp = QApplication(sys.argv)
 
     # Let's check if the script was launched in CLI mode
-    if siril.is_cli():
+    if siril.is_cli() and len(sys.argv) > 1:
         # CLI mode
         siril.log(f"Sequence Deleter Tool v{VERSION} - CLI Mode - (c) Carlo Mollicone AstroBOH", s.LogColor.BLUE)
         

@@ -1538,13 +1538,14 @@ class StageSupportMixin:
         before: Optional[ImageFeatures],
         adaptive: Optional[Dict[str, Any]] = None,
     ) -> List[Tuple[str, Tuple[str, ...], str]]:
+        _ = adaptive
         candidates: List[Tuple[str, Tuple[str, ...], str]] = [
-            ("DBE", ("dbe",), "plugin"),
+            ("GraXpert", ("gxp",), "graxpert"),
+            ("GraXpert-BGE", ("graxpert",), "graxpert"),
             ("ADBE", ("adbe",), "plugin"),
-            ("GXP", ("gxp",), "plugin"),
-            ("NOX", ("nox",), "plugin"),
+            ("DBE", ("dbe",), "plugin"),
             ("AutoDBE", ("autodbe",), "plugin"),
-            ("AutoBGE", ("autobge",), "plugin"),
+            ("NOX", ("nox",), "plugin"),
             ("VeraLux NOX", ("veralux_nox",), "plugin"),
         ]
         if before is None:
@@ -1556,33 +1557,15 @@ class StageSupportMixin:
         adaptive = adaptive or {}
         dirty = float(adaptive.get("dirty_background_score", 0.0) or 0.0)
         gradient = float(adaptive.get("gradient_score", 0.0) or 0.0)
-        high_noise = bg_std >= 0.045 or dirty >= 0.35
-        dense_stars = star_density >= 0.0045
-        low_noise_structured = bg_std <= 0.025 and gradient >= 0.08
-        diffuse_object = object_area >= 0.25
-
-        if high_noise:
-            priority = ["NOX", "VeraLux NOX", "AutoBGE", "GXP", "ADBE", "DBE", "AutoDBE"]
-        elif dense_stars:
-            priority = ["ADBE", "DBE", "AutoDBE", "GXP", "NOX", "AutoBGE", "VeraLux NOX"]
-        elif low_noise_structured:
-            priority = ["DBE", "ADBE", "AutoDBE", "GXP", "AutoBGE", "NOX", "VeraLux NOX"]
-        elif diffuse_object:
-            priority = ["ADBE", "GXP", "DBE", "AutoBGE", "NOX", "AutoDBE", "VeraLux NOX"]
-        else:
-            priority = ["DBE", "ADBE", "GXP", "AutoDBE", "AutoBGE", "NOX", "VeraLux NOX"]
-
-        by_label = {label: (label, command, source) for label, command, source in candidates}
-        ordered = [by_label[label] for label in priority if label in by_label]
         self.log.info(
-            "[Stage3] Smart plugin order: "
-            + " -> ".join(label for label, _, _ in ordered)
+            "[Stage3] Theoretical plugin order: "
+            + " -> ".join(label for label, _, _ in candidates)
             + (
                 f" (bg_std={bg_std:.4f}, star_density={star_density:.5f}, "
                 f"object_area={object_area:.3f}, dirty={dirty:.3f}, gradient={gradient:.3f})"
             )
         )
-        return ordered
+        return candidates
 
 
     def _stage3_subsky_rbf_candidates(self) -> List[Tuple[str, ...]]:
@@ -1749,6 +1732,10 @@ class StageSupportMixin:
             residual = float(derived.get("residual_star_score", 0.0) or 0.0)
             halo = float(derived.get("halo_residue_score", 0.0) or 0.0)
             noise_gain = float(derived.get("starless_noise_gain", 0.0) or 0.0)
+            dynamic_range_ratio = float(
+                derived.get("starless_dynamic_range_ratio", 1.0) or 0.0
+            )
+            peak_signal = float(derived.get("starless_peak_signal", 1.0) or 0.0)
             if residual > self.cfg.stage7_residual_star_score_max:
                 reasons.append(
                     f"stage7_residual_star_score {residual:.3f}>{self.cfg.stage7_residual_star_score_max:.3f}"
@@ -1761,6 +1748,18 @@ class StageSupportMixin:
             if noise_gain > self.cfg.stage7_starless_noise_gain_max:
                 reasons.append(
                     f"stage7_starless_noise_gain {noise_gain:.3f}>{self.cfg.stage7_starless_noise_gain_max:.3f}"
+                )
+            dynamic_threshold = float(
+                getattr(self.cfg, "stage7_starless_dynamic_range_min_ratio", 0.55)
+            )
+            peak_threshold = float(
+                getattr(self.cfg, "stage7_starless_peak_signal_min", 0.006)
+            )
+            if dynamic_range_ratio < dynamic_threshold and peak_signal < peak_threshold:
+                reasons.append(
+                    "stage7_starless_dynamic_range "
+                    f"{dynamic_range_ratio:.3f}<{dynamic_threshold:.3f}, "
+                    f"peak={peak_signal:.5f}<{peak_threshold:.5f}"
                 )
         return ", ".join(dict.fromkeys(reasons))
 

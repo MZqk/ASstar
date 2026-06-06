@@ -23,6 +23,7 @@ and a thumbnail table of the found galaxies.
 # 1.2.1 Remove "subprocess" from ensure_installed as it is a core python module (AKB)
 # 1.2.2 Fix selection of loading result image in Siril
 # 1.2.3 Add minimal support for object types other than galaxies
+# 1.2.4 If no CLI arguments, run in GUI mode by default
 
 # Core module imports
 import os
@@ -71,7 +72,7 @@ import astropy.units as u
 from astroquery.simbad import Simbad
 import pandas as pd
 
-VERSION = "1.2.3"
+VERSION = "1.2.4"
 CONFIG_FILENAME = "Galaxy_Annotations.conf"
 
 # ============================================================================
@@ -1107,7 +1108,7 @@ def main():
         except s.CommandError:
             return
         
-        if siril.is_cli():
+        if siril.is_cli() and len(sys.argv) > 1:
             print("This script requires GUI mode")
             sys.exit(1)
 

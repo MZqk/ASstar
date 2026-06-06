@@ -14,6 +14,37 @@ def _clamp_float(value: float, lower: float, upper: float) -> float:
     return float(max(lower, min(upper, float(value))))
 
 
+def _dark_clip_threshold(bg_median: float, bg_mad: float) -> float:
+    """Detect true clipped black pixels without flagging normal low linear sky."""
+    return max(
+        1e-6,
+        min(
+            0.002,
+            bg_median * 0.45,
+            bg_median - 8.0 * bg_mad,
+        ),
+    )
+
+
+def _low_linear_signal_floor(
+    bg_median: float,
+    bg_mad: float,
+    *,
+    default_floor: float,
+    mad_multiplier: float,
+    median_multiplier: float,
+    minimum: float,
+) -> float:
+    return min(
+        default_floor,
+        max(
+            bg_mad * mad_multiplier,
+            bg_median * median_multiplier,
+            minimum,
+        ),
+    )
+
+
 def _to_rgb_float_image(image: np.ndarray, max_side: int = 1024) -> np.ndarray:
     arr = np.asarray(image)
     if arr.size == 0:
@@ -140,6 +171,7 @@ def measure_image_features(image: np.ndarray) -> ImageFeatures:
         bg_values = gray[bg_mask] if np.any(bg_mask) else gray.reshape(-1)
         feat.bg_median = float(np.median(bg_values))
         feat.bg_std = float(np.std(bg_values))
+        bg_mad = float(np.median(np.abs(bg_values - feat.bg_median)))
 
         signal_threshold = max(
             float(np.quantile(gray, 0.55)),
@@ -158,9 +190,17 @@ def measure_image_features(image: np.ndarray) -> ImageFeatures:
                 np.median((b[signal_mask] + eps) / g_signal)
             )
 
+        object_floor = _low_linear_signal_floor(
+            feat.bg_median,
+            bg_mad,
+            default_floor=0.020,
+            mad_multiplier=6.0,
+            median_multiplier=0.08,
+            minimum=0.00015,
+        )
         object_threshold = max(
             float(np.quantile(gray, 0.70)),
-            feat.bg_median + max(1.8 * feat.bg_std, 0.02)
+            feat.bg_median + max(1.8 * feat.bg_std, object_floor)
         )
         object_mask = gray > object_threshold
         object_pixels = int(np.count_nonzero(object_mask))
@@ -206,7 +246,7 @@ def measure_image_features(image: np.ndarray) -> ImageFeatures:
         left = gray[:, :edge_w].reshape(-1)
         right = gray[:, -edge_w:].reshape(-1)
         edge_values = np.concatenate([top, bottom, left, right], axis=0)
-        global_dark_threshold = max(0.0015, min(0.010, feat.bg_median * 0.45))
+        global_dark_threshold = _dark_clip_threshold(feat.bg_median, bg_mad)
         feat.global_dark_ratio = float(np.mean(gray <= global_dark_threshold))
         edge_black_threshold = global_dark_threshold
         if edge_values.size:
@@ -273,6 +313,7 @@ def measure_stage3_signal_preservation(
         bg_values = before_gray[bg_mask] if np.any(bg_mask) else before_gray.reshape(-1)
         bg_median = float(np.median(bg_values))
         bg_std = float(np.std(bg_values))
+        bg_mad = float(np.median(np.abs(bg_values - bg_median)))
 
         star_threshold = max(
             float(np.quantile(before_gray, 0.985)),
@@ -302,9 +343,17 @@ def measure_stage3_signal_preservation(
         else:
             result["notes"].append("star retention skipped: too few stars")
 
+        object_floor = _low_linear_signal_floor(
+            bg_median,
+            bg_mad,
+            default_floor=0.020,
+            mad_multiplier=6.0,
+            median_multiplier=0.08,
+            minimum=0.00015,
+        )
         object_threshold = max(
             float(np.quantile(before_gray, 0.70)),
-            bg_median + max(1.8 * bg_std, 0.02),
+            bg_median + max(1.8 * bg_std, object_floor),
         )
         object_mask = before_gray > object_threshold
         object_areas = _component_areas(object_mask, min_area=1, max_components=6000)

@@ -47,6 +47,11 @@ def stage7_starless_artifact_scores(
         "compact_residual_coverage": 0.0,
         "starmask_contamination": 0.0,
         "starless_noise_gain": 1.0,
+        "starless_dynamic_range_ratio": 1.0,
+        "source_dynamic_range": 0.0,
+        "starless_dynamic_range": 0.0,
+        "source_peak_signal": 0.0,
+        "starless_peak_signal": 0.0,
     }
     if source_data is None or starless_data is None:
         return scores
@@ -73,6 +78,22 @@ def stage7_starless_artifact_scores(
         source_std = max(float(source_features.bg_std), 1e-5)
         starless_bg = float(starless_features.bg_median)
         starless_std = max(float(starless_features.bg_std), 1e-5)
+        try:
+            source_q01, source_q99 = np.quantile(source_gray, (0.01, 0.99))
+            starless_q01, starless_q99 = np.quantile(starless_gray, (0.01, 0.99))
+            source_range = max(float(source_q99 - source_q01), 1e-7)
+            starless_range = max(float(starless_q99 - starless_q01), 0.0)
+            scores["source_dynamic_range"] = source_range
+            scores["starless_dynamic_range"] = starless_range
+            scores["starless_dynamic_range_ratio"] = _clamp_float(
+                starless_range / source_range,
+                0.0,
+                10.0,
+            )
+            scores["source_peak_signal"] = float(np.nanmax(source_gray))
+            scores["starless_peak_signal"] = float(np.nanmax(starless_gray))
+        except Exception:
+            pass
         broad_source = source_gray.copy()
         for _ in range(5):
             broad_source = _box_blur_gray(broad_source)
@@ -312,6 +333,12 @@ def stage7_quality_assessment(
     compact_residual_coverage = artifact_scores.get("compact_residual_coverage", 0.0)
     starmask_contamination = artifact_scores["starmask_contamination"]
     starless_noise_gain = artifact_scores["starless_noise_gain"]
+    starless_dynamic_range_ratio = float(
+        artifact_scores.get("starless_dynamic_range_ratio", 1.0) or 0.0
+    )
+    starless_peak_signal = float(
+        artifact_scores.get("starless_peak_signal", 0.0) or 0.0
+    )
     residual_coverage_score = (
         starless_metrics.star_coverage_ratio / baseline_star_coverage
         if source_metrics.star_density > 1e-7
@@ -363,6 +390,21 @@ def stage7_quality_assessment(
             "starless_noise_gain "
             f"{starless_noise_gain:.3f}>{pipeline.cfg.stage7_starless_noise_gain_max:.3f}"
         )
+    dynamic_range_threshold = float(
+        getattr(pipeline.cfg, "stage7_starless_dynamic_range_min_ratio", 0.55)
+    )
+    peak_signal_threshold = float(
+        getattr(pipeline.cfg, "stage7_starless_peak_signal_min", 0.006)
+    )
+    if (
+        starless_dynamic_range_ratio < dynamic_range_threshold
+        and starless_peak_signal < peak_signal_threshold
+    ):
+        issues.append(
+            "starless_dynamic_range_collapse "
+            f"{starless_dynamic_range_ratio:.3f}<{dynamic_range_threshold:.3f}, "
+            f"peak={starless_peak_signal:.5f}<{peak_signal_threshold:.5f}"
+        )
     if starmask_data is None:
         issues.append("starmask_missing")
     elif starmask_coverage_ratio < pipeline.cfg.stage7_starmask_coverage_min_ratio:
@@ -399,6 +441,11 @@ def stage7_quality_assessment(
             "black_hole_score": black_hole_score,
             "starmask_contamination": starmask_contamination,
             "starless_noise_gain": starless_noise_gain,
+            "starless_dynamic_range_ratio": starless_dynamic_range_ratio,
+            "source_dynamic_range": artifact_scores.get("source_dynamic_range", 0.0),
+            "starless_dynamic_range": artifact_scores.get("starless_dynamic_range", 0.0),
+            "source_peak_signal": artifact_scores.get("source_peak_signal", 0.0),
+            "starless_peak_signal": starless_peak_signal,
             "starmask_coverage_ratio": starmask_coverage_ratio,
             "starmask_width_ratio": starmask_width_ratio,
             "halo_threshold": halo_threshold,
@@ -443,6 +490,8 @@ def stage7_quality_score(pipeline, quality: Optional[Dict[str, Any]]) -> float:
     black_hole = float(derived.get("black_hole_score", 0.0))
     contamination = float(derived.get("starmask_contamination", 0.0))
     noise_gain = float(derived.get("starless_noise_gain", 1.0))
+    dynamic_range_ratio = float(derived.get("starless_dynamic_range_ratio", 1.0))
+    peak_signal = float(derived.get("starless_peak_signal", 1.0))
     coverage_ratio = float(derived.get("starmask_coverage_ratio", 0.0))
     width_ratio = float(derived.get("starmask_width_ratio", 1.0))
     coverage_penalty = max(0.0, pipeline.cfg.stage7_starmask_coverage_min_ratio - coverage_ratio)
@@ -454,6 +503,11 @@ def stage7_quality_score(pipeline, quality: Optional[Dict[str, Any]]) -> float:
         contamination - pipeline.cfg.stage7_starmask_contamination_max,
     )
     noise_penalty = max(0.0, noise_gain - pipeline.cfg.stage7_starless_noise_gain_max)
+    dynamic_threshold = float(getattr(pipeline.cfg, "stage7_starless_dynamic_range_min_ratio", 0.55))
+    peak_threshold = float(getattr(pipeline.cfg, "stage7_starless_peak_signal_min", 0.006))
+    dynamic_penalty = 0.0
+    if dynamic_range_ratio < dynamic_threshold and peak_signal < peak_threshold:
+        dynamic_penalty = (dynamic_threshold - dynamic_range_ratio) * 2.0
     return (
         residual
         + coverage_penalty * 2.0
@@ -462,6 +516,7 @@ def stage7_quality_score(pipeline, quality: Optional[Dict[str, Any]]) -> float:
         + black_hole_penalty * 2.0
         + contamination_penalty
         + noise_penalty
+        + dynamic_penalty
     )
 
 def stage7_repair_triggers(pipeline, quality: Optional[Dict[str, Any]]) -> List[str]:
@@ -483,12 +538,26 @@ def stage7_repair_triggers(pipeline, quality: Optional[Dict[str, Any]]) -> List[
         halo = float(derived.get("halo_residue_score", 0.0))
     except Exception:
         halo = 0.0
+    try:
+        dynamic_range_ratio = float(derived.get("starless_dynamic_range_ratio", 1.0))
+    except Exception:
+        dynamic_range_ratio = 1.0
+    try:
+        peak_signal = float(derived.get("starless_peak_signal", 1.0))
+    except Exception:
+        peak_signal = 1.0
     if residual > float(pipeline.cfg.stage7_residual_star_score_max):
         triggers.append("residual_stars")
     if halo > float(pipeline._stage7_effective_halo_threshold()):
         triggers.append("halo_residue")
     if black_hole > float(pipeline.cfg.stage7_black_hole_score_max):
         triggers.append("black_hole")
+    if (
+        dynamic_range_ratio
+        < float(getattr(pipeline.cfg, "stage7_starless_dynamic_range_min_ratio", 0.55))
+        and peak_signal < float(getattr(pipeline.cfg, "stage7_starless_peak_signal_min", 0.006))
+    ):
+        triggers.append("dynamic_range_collapse")
     return triggers
 
 def stage7_update_star_remix_from_quality(

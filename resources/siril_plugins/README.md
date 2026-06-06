@@ -10,7 +10,7 @@
 - `cosmic_clarity/`: CosmicClarity Native/classic wrapper 共用模型
 - `bin/CosmicClarity`: classic CosmicClarity 兼容 wrapper
 - `download_siril_plugins.sh`: 一键下载脚本
-- `requirements.txt`: Siril runtime 插件依赖说明；对应 wheel 需缓存在 `downloads/`，供离线 venv 安装使用。
+- `requirements.txt`: Python 3.13 runtime 插件依赖说明；对应 wheel 需缓存在 `downloads/`，供离线安装使用。`setiastrosuitepro` 单独按 `--no-deps` 下载，避免解析其不兼容的可选依赖。
 
 ## 下载与更新
 
@@ -23,8 +23,8 @@ bash resources/siril_plugins/download_siril_plugins.sh
 脚本会尝试下载：
 
 1. 官方 Siril scripts 仓库归档（GitLab）
-2. SetiAstroSuitePro（PyPI wheel）
-3. PyQt6 / PySide6 / astropy / scipy / tifffile / onnxruntime / sep / spandrel / lz4 / zstandard / exifread / opencv-python-headless / requests / wheel 等 Siril 插件运行时 wheels
+2. SetiAstroSuitePro（PyPI wheel，单独 `--no-deps` 缓存）
+3. PyQt6 / PySide6 / astropy / scipy / tifffile / onnxruntime / coloredlogs / humanfriendly / sep / spandrel / lz4 / zstandard / exifread / opencv-python-headless / requests / setuptools / wheel 等 Python 3.13 运行时 wheels
 4. SyQon Starless 所需的 PyTorch wheels
 5. SyQon Starless 离线推理缓存：`syqon_starless_inference.py`、`zenith.pt`
 
