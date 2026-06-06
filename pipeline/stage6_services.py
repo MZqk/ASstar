@@ -37,10 +37,10 @@ from save_utils import save_stage_output, write_ai_raw_response, write_stage_jso
 
 try:
     from sirilpy.exceptions import CommandError, DataError, SirilError
-except Exception:
-    CommandError = Exception
-    DataError = Exception
-    SirilError = Exception
+except ImportError:
+    CommandError = RuntimeError
+    DataError = RuntimeError
+    SirilError = RuntimeError
 
 try:
     from image_feature_analyzer import analyze_image as analyze_adaptive_image
@@ -52,7 +52,7 @@ try:
         score_candidate as score_stretch_candidate,
     )
     from target_profiler import build_target_profile
-except Exception:
+except (ImportError, RuntimeError):
     analyze_adaptive_image = None
     DEFAULT_POLICY = {
         "policy_name": "generic_low_snr_safe",

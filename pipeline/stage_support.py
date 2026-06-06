@@ -41,10 +41,10 @@ from save_utils import save_stage_output, write_ai_raw_response, write_stage_jso
 
 try:
     from sirilpy.exceptions import CommandError, DataError, SirilError
-except Exception:
-    CommandError = Exception
-    DataError = Exception
-    SirilError = Exception
+except ImportError:
+    CommandError = RuntimeError
+    DataError = RuntimeError
+    SirilError = RuntimeError
 
 try:
     from image_feature_analyzer import analyze_image as analyze_adaptive_image
@@ -56,7 +56,7 @@ try:
         score_candidate as score_stretch_candidate,
     )
     from target_profiler import build_target_profile
-except Exception:
+except (ImportError, RuntimeError):
     analyze_adaptive_image = None
     DEFAULT_POLICY = {
         "policy_name": "generic_low_snr_safe",
@@ -508,8 +508,8 @@ class Stage7ServiceMixin:
             self.log.warn(f"Stage7 preflight failed: {e}")
             try:
                 self.cmd_with_check("load", source_stem)
-            except Exception:
-                pass
+            except (CommandError, DataError, SirilError, OSError, RuntimeError) as e:
+                self.log.warn(f"Stage7 preflight input restore failed: {e}")
             return result
 
 
@@ -699,8 +699,8 @@ class Stage7ServiceMixin:
                 self.log.warn(f"Stage7 conservative starless input failed ({stem}): {e}")
         try:
             self.cmd_with_check("load", self.stretched_name or "stage7_stretched")
-        except Exception:
-            pass
+        except (CommandError, DataError, SirilError, OSError, RuntimeError) as e:
+            self.log.warn(f"Stage7 conservative input restore failed: {e}")
         return records
 
 
@@ -928,7 +928,7 @@ class Stage8ServiceMixin:
         if isinstance(derived, dict):
             try:
                 return float(derived.get("halo_residue_score", 0.0) or 0.0)
-            except Exception:
+            except (TypeError, ValueError):
                 return 0.0
         return 0.0
 
@@ -1443,7 +1443,7 @@ class StageSupportMixin:
                 f"edge_black={feat.edge_black_ratio:.4f}"
             )
             return feat
-        except Exception as e:
+        except (CommandError, DataError, SirilError, OSError, RuntimeError, TypeError, ValueError) as e:
             self.log.debug(f"[stage3:{tag}] feature sampling skipped: {e}")
             return None
 
@@ -1576,7 +1576,7 @@ class StageSupportMixin:
         try:
             image_data = self.siril.get_image_pixeldata(preview=False)
             feat = measure_image_features(image_data)
-        except Exception:
+        except (CommandError, DataError, SirilError, RuntimeError, ValueError):
             feat = None
 
         bg_std = float(feat.bg_std) if feat is not None else 0.03

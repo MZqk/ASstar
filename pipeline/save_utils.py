@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
+from sirilpy.exceptions import CommandError, DataError, SirilError
 
 
 STAGE_OUTPUT_ALIASES = {
@@ -86,10 +87,10 @@ def save_stage_output(cmd_with_check: Callable[..., Any], log: Any, stem: str) -
             try:
                 cmd_with_check("save", alias)
                 log.info(f"阶段产物已保存: {alias}.fit")
-            except Exception as alias_error:
+            except (CommandError, DataError, SirilError, OSError, RuntimeError) as alias_error:
                 log.warn(f"阶段产物兼容别名保存失败 ({alias}): {alias_error}")
         return True
-    except Exception as e:
+    except (CommandError, DataError, SirilError, OSError, RuntimeError) as e:
         log.warn(f"阶段产物保存失败 ({stem}): {e}")
         return False
 
@@ -187,12 +188,12 @@ def export_final_outputs(
         try:
             cmd_with_check("savetif", base_filename, "-astro")
             log.info("TIFF 已导出")
-        except Exception as e:
+        except (CommandError, DataError, SirilError, OSError, RuntimeError) as e:
             log.warn(f"TIFF 导出失败: {e}")
             try:
                 cmd_with_check("savetif", fallback_base, "-astro")
                 log.info(f"TIFF 已导出: {fallback_base}.tif")
-            except Exception:
+            except (CommandError, DataError, SirilError, OSError, RuntimeError):
                 log.error("TIFF 导出完全失败")
                 status = "degraded"
                 messages.append("TIFF 导出完全失败")
@@ -202,11 +203,11 @@ def export_final_outputs(
         try:
             cmd_with_check("save", base_filename + "_final")
             log.info("FITS 存档已保存")
-        except Exception:
+        except (CommandError, DataError, SirilError, OSError, RuntimeError):
             try:
                 cmd_with_check("save", fallback_fit_base)
                 log.info(f"FITS 存档已保存: {fallback_fit_base}.fit")
-            except Exception:
+            except (CommandError, DataError, SirilError, OSError, RuntimeError):
                 log.error("FITS 存档保存失败")
                 status = "degraded"
                 messages.append("FITS 存档保存失败")
@@ -216,18 +217,18 @@ def export_final_outputs(
         try:
             cmd_with_check("autostretch")
             messages.append("PNG preview stretch applied")
-        except Exception as e:
+        except (CommandError, DataError, SirilError, OSError, RuntimeError) as e:
             log.warn(f"PNG 预览拉伸跳过: {e}")
             messages.append(f"PNG preview stretch failed: {e}")
         try:
             cmd_with_check("savepng", base_filename)
             log.info("PNG 已导出")
-        except Exception as e:
+        except (CommandError, DataError, SirilError, OSError, RuntimeError) as e:
             log.warn(f"PNG 导出失败: {e}")
             try:
                 cmd_with_check("savepng", fallback_base)
                 log.info(f"PNG 已导出: {fallback_base}.png")
-            except Exception:
+            except (CommandError, DataError, SirilError, OSError, RuntimeError):
                 log.error("PNG 导出完全失败")
                 messages.append("PNG 导出完全失败")
 

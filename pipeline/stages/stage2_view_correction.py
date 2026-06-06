@@ -340,7 +340,7 @@ def run_stage2_view_correction(pipeline) -> None:
     messages: List[str] = []
     try:
         initial_shape = _stage2_shape_dict(pipeline.siril.get_image_shape())
-    except Exception:
+    except (CommandError, SirilError, OSError, RuntimeError, TypeError, ValueError):
         initial_shape = {}
     crop_report = {
         "stage": "stage2_crop",
@@ -454,7 +454,7 @@ def run_stage2_view_correction(pipeline) -> None:
             pipeline.log.warn(f"彩色边缘裁切失败: {e}")
             status = "degraded"
             messages.append(f"adaptive color-edge crop failed: {pipeline._short_text(e, 160)}")
-        except Exception as e:
+        except (OSError, RuntimeError, TypeError, ValueError) as e:
             pipeline.log.warn(f"彩色边缘检测失败: {e}")
             messages.append(f"adaptive color-edge crop skipped: {pipeline._short_text(e, 160)}")
 
@@ -464,7 +464,7 @@ def run_stage2_view_correction(pipeline) -> None:
         messages.append("stage2 输出保存失败")
     try:
         crop_report["final_shape"] = _stage2_shape_dict(pipeline.siril.get_image_shape())
-    except Exception:
+    except (CommandError, SirilError, OSError, RuntimeError, TypeError, ValueError):
         crop_report["final_shape"] = crop_report.get("current_shape") or {}
     crop_report["total_crop"] = _stage2_crop_totals(crop_report)
     crop_report["status"] = status

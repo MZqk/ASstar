@@ -6,7 +6,7 @@ from typing import Optional
 def _clamp_float(value: object, min_value: float, max_value: float) -> float:
     try:
         fvalue = float(value)  # type: ignore[arg-type]
-    except Exception:
+    except (TypeError, ValueError):
         fvalue = min_value
     return max(min_value, min(max_value, fvalue))
 

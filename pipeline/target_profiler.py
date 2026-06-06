@@ -80,7 +80,7 @@ def load_catalog(path: Path = CATALOG_PATH) -> List[Dict[str, Any]]:
                 if _norm(str(fallback.get("name", ""))) not in known:
                     items.append(fallback)
             return items
-    except Exception:
+    except (OSError, UnicodeError, ValueError, TypeError):
         pass
     return list(BUILTIN_CATALOG)
 
@@ -207,7 +207,7 @@ def _catalog_coordinate_match(
         size = item.get("size_arcmin") or [60.0, 60.0]
         try:
             radius = max(float(size[0]), float(size[1])) / 120.0
-        except Exception:
+        except (TypeError, ValueError, IndexError):
             radius = 0.5
         # Seestar/FITS center coordinates often point at the framed field center,
         # not the catalog object centroid. Large nebula entries therefore need a

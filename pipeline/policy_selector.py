@@ -265,7 +265,7 @@ def _load_json_or_yaml(path: Path) -> Dict[str, Any]:
         parsed = yaml.safe_load(text)
         if isinstance(parsed, dict):
             return parsed
-    except Exception:
+    except (OSError, UnicodeError, ValueError, TypeError):
         pass
     raise ValueError(f"policy file is not valid JSON/YAML: {path}")
 
@@ -307,5 +307,5 @@ def policy_for_profile(profile: Dict[str, Any], *, policy_dir: Optional[Path] = 
     )
     try:
         return load_policy(str(policy_name), policy_dir=policy_dir)
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError):
         return copy.deepcopy(DEFAULT_POLICY)

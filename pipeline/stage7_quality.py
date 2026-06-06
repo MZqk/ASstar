@@ -26,9 +26,9 @@ from models import ImageFeatures, QualityMetrics
 
 try:
     from sirilpy.exceptions import CommandError, SirilError
-except Exception:  # Tests may import with lightweight fakes.
-    CommandError = Exception
-    SirilError = Exception
+except ImportError:  # Tests may import with lightweight fakes.
+    CommandError = RuntimeError
+    SirilError = RuntimeError
 
 def stage7_starless_artifact_scores(
     pipeline,
@@ -92,7 +92,7 @@ def stage7_starless_artifact_scores(
             )
             scores["source_peak_signal"] = float(np.nanmax(source_gray))
             scores["starless_peak_signal"] = float(np.nanmax(starless_gray))
-        except Exception:
+        except (TypeError, ValueError, FloatingPointError):
             pass
         broad_source = source_gray.copy()
         for _ in range(5):
@@ -269,7 +269,7 @@ def stage7_starless_artifact_scores(
                             0.0,
                             3.0,
                         )
-    except Exception as e:
+    except (TypeError, ValueError, IndexError, FloatingPointError) as e:
         pipeline.log.debug(f"stage7 artifact scoring skipped: {e}")
     return scores
 
@@ -528,23 +528,23 @@ def stage7_repair_triggers(pipeline, quality: Optional[Dict[str, Any]]) -> List[
     triggers: List[str] = []
     try:
         residual = float(derived.get("residual_star_score", 0.0))
-    except Exception:
+    except (TypeError, ValueError):
         residual = 0.0
     try:
         black_hole = float(derived.get("black_hole_score", 0.0))
-    except Exception:
+    except (TypeError, ValueError):
         black_hole = 0.0
     try:
         halo = float(derived.get("halo_residue_score", 0.0))
-    except Exception:
+    except (TypeError, ValueError):
         halo = 0.0
     try:
         dynamic_range_ratio = float(derived.get("starless_dynamic_range_ratio", 1.0))
-    except Exception:
+    except (TypeError, ValueError):
         dynamic_range_ratio = 1.0
     try:
         peak_signal = float(derived.get("starless_peak_signal", 1.0))
-    except Exception:
+    except (TypeError, ValueError):
         peak_signal = 1.0
     if residual > float(pipeline.cfg.stage7_residual_star_score_max):
         triggers.append("residual_stars")
@@ -574,15 +574,15 @@ def stage7_update_star_remix_from_quality(
     if isinstance(derived, dict):
         try:
             residual_score = float(derived.get("residual_star_score", 0.0))
-        except Exception:
+        except (TypeError, ValueError):
             residual_score = 0.0
         try:
             halo_score = float(derived.get("halo_residue_score", 0.0))
-        except Exception:
+        except (TypeError, ValueError):
             halo_score = 0.0
         try:
             contamination_score = float(derived.get("starmask_contamination", 0.0))
-        except Exception:
+        except (TypeError, ValueError):
             contamination_score = 0.0
     else:
         halo_score = 0.0
@@ -614,7 +614,7 @@ def stage7_update_star_remix_from_quality(
             if value is not None:
                 try:
                     ai_scale = _clamp_float(value, 0.35, 1.0)
-                except Exception:
+                except (TypeError, ValueError):
                     ai_scale = None
         if pipeline._stage7_residual_star_score > threshold:
             over_ratio = pipeline._stage7_residual_star_score / threshold
@@ -680,14 +680,14 @@ def stage7_residual_suppression_strength(
         if value is not None:
             try:
                 return _clamp_float(value, 0.0, 0.25)
-            except Exception:
+            except (TypeError, ValueError):
                 pass
     derived = (quality or {}).get("derived")
     residual_score = 0.0
     if isinstance(derived, dict):
         try:
             residual_score = float(derived.get("residual_star_score", 0.0))
-        except Exception:
+        except (TypeError, ValueError):
             residual_score = 0.0
     threshold = max(float(pipeline.cfg.stage7_residual_star_score_max), 1e-4)
     if residual_score <= threshold:

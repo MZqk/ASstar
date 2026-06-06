@@ -72,6 +72,18 @@ pipeline = _load_pipeline_module()
 
 
 class ClampConfigTests(unittest.TestCase):
+    def test_clamp_rules_cover_all_auto_clamp_fields(self) -> None:
+        rule_names = [name for name, _value_type, _lower, _upper in pipeline.CLAMP_RULES]
+
+        self.assertEqual(len(rule_names), len(set(rule_names)))
+        self.assertTrue(
+            all(value_type in {int, float} for _, value_type, _, _ in pipeline.CLAMP_RULES)
+        )
+        self.assertEqual(
+            set(pipeline.AUTO_CLAMP_FIELDS),
+            set(rule_names) | set(pipeline.DYNAMIC_CLAMP_FIELDS),
+        )
+
     def test_clamps_low_values_and_preserves_input(self) -> None:
         cfg = pipeline.PipelineConfig()
         cfg.crop_margin = -1.0

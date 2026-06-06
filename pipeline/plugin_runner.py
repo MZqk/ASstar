@@ -85,7 +85,7 @@ def is_python_module_available(pipeline, module_name: str) -> bool:
         return True
     try:
         return importlib.util.find_spec(module_name) is not None
-    except Exception:
+    except (ImportError, ModuleNotFoundError, ValueError):
         return False
 
 
@@ -113,7 +113,7 @@ def validate_plugin_script_prerequisites(
                 text=True,
                 timeout=15,
             )
-        except Exception as e:
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as e:
             return False, (
                 "python module prerequisite probe failed: "
                 f"{pipeline._short_text(e, 160)}"
@@ -196,7 +196,7 @@ def current_image_fingerprint(pipeline) -> Optional[str]:
         digest.update(str(arr.dtype).encode("ascii", errors="ignore"))
         digest.update(np.ascontiguousarray(arr).view(np.uint8))
         return digest.hexdigest()
-    except Exception as e:
+    except (AttributeError, TypeError, ValueError, IndexError, FloatingPointError) as e:
         pipeline.log.debug(f"图像指纹采样跳过: {e}")
         return None
 
@@ -362,7 +362,7 @@ def run_plugin_script_cli_subprocess(
             pipeline.log.debug(
                 f"{step_key} CLI 子进程前已临时释放 Siril 连接"
             )
-        except Exception as e:
+        except (CommandError, DataError, SirilError, OSError, RuntimeError) as e:
             pipeline._last_plugin_script_error = (
                 f"{script_path.name}: failed to release parent Siril "
                 f"connection before CLI subprocess: {pipeline._short_text(e, 160)}"
@@ -385,6 +385,7 @@ def run_plugin_script_cli_subprocess(
                 f"(elapsed={elapsed}s, timeout={timeout_value}s)"
             )
 
+    reconnect_failed = False
     try:
         heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
         heartbeat_thread.start()
@@ -407,7 +408,7 @@ def run_plugin_script_cli_subprocess(
                 f"{step_key} CLI 子进程超时 ({script_path.name}): {timeout_sec}s"
             )
             return None
-        except Exception as e:
+        except (OSError, RuntimeError, subprocess.SubprocessError) as e:
             pipeline._last_plugin_script_error = (
                 f"{script_path.name}: subprocess error: {pipeline._short_text(e, 160)}"
             )
@@ -423,7 +424,8 @@ def run_plugin_script_cli_subprocess(
                 pipeline.log.debug(
                     f"{step_key} CLI 子进程后已恢复 Siril 连接"
                 )
-            except Exception as e:
+            except (CommandError, DataError, SirilError, OSError, RuntimeError) as e:
+                reconnect_failed = True
                 pipeline._last_plugin_script_error = (
                     f"{script_path.name}: failed to reconnect parent Siril "
                     f"after CLI subprocess: {pipeline._short_text(e, 160)}"
@@ -431,7 +433,9 @@ def run_plugin_script_cli_subprocess(
                 pipeline.log.warn(
                     f"{step_key} CLI 子进程后恢复 Siril 连接失败: {e}"
                 )
-                return None
+
+    if reconnect_failed:
+        return None
 
     output_text = proc.stdout or ""
     for raw_line in output_text.splitlines():
@@ -482,4 +486,3 @@ def run_plugin_script_cli_subprocess(
     pipeline.workflow_command_used[step_key] = used_label
     pipeline.log.info(f"{step_key} CLI 子进程成功: {script_path.name}")
     return used_label
-

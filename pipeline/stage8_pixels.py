@@ -28,9 +28,9 @@ def _clamp_int(value: int, lower: int, upper: int) -> int:
 
 try:
     from sirilpy.exceptions import CommandError, SirilError
-except Exception:  # Tests may import with lightweight fakes.
-    CommandError = Exception
-    SirilError = Exception
+except ImportError:  # Tests may import with lightweight fakes.
+    CommandError = RuntimeError
+    SirilError = RuntimeError
 
 def stage8_restore_rgb_like(pipeline, source_data: np.ndarray, rgb: np.ndarray) -> np.ndarray:
     source = np.asarray(source_data)
@@ -215,7 +215,7 @@ def stage8_masked_metrics(
             "diffuse_signal": weighted_mean(np.clip(gray, 0.0, 1.0), diffuse_weight),
             "texture_artifact_score": weighted_mean(np.abs(gray - blurred), texture_weight),
         }
-    except Exception as e:
+    except (TypeError, ValueError, IndexError, FloatingPointError) as e:
         pipeline.log.warn(f"stage8 masked metrics unavailable: {e}")
         return {}
 
@@ -276,7 +276,7 @@ def background_quality_metrics(
             "core_clip_score": float(np.mean(gray >= 0.985)),
             "starless_artifact_score": _clamp_float(weighted_mean(local_texture) / max(weighted_std(gray) * 3.0, 0.006), 0.0, 2.0),
         }
-    except Exception as e:
+    except (TypeError, ValueError, IndexError, FloatingPointError) as e:
         pipeline.log.warn(f"background quality metrics unavailable: {e}")
         return {}
 
@@ -287,7 +287,7 @@ def stage8_enhancement_quality_report(pipeline) -> Dict[str, Any]:
     if before_data is not None:
         try:
             masks = pipeline._stage8_generate_starless_masks(before_data)
-        except Exception:
+        except (CommandError, SirilError, RuntimeError, TypeError, ValueError):
             masks = None
     before = pipeline._background_quality_metrics(before_data, masks)
     after = pipeline._background_quality_metrics(after_data, masks)
@@ -448,15 +448,15 @@ def stage8_input_enhancement_guard(pipeline) -> Dict[str, Any]:
     if isinstance(derived, dict):
         try:
             residual = float(derived.get("residual_star_score", 0.0) or 0.0)
-        except Exception:
+        except (TypeError, ValueError):
             residual = 0.0
         try:
             halo = max(halo, float(derived.get("halo_residue_score", 0.0) or 0.0))
-        except Exception:
+        except (TypeError, ValueError):
             pass
         try:
             noise_gain = float(derived.get("starless_noise_gain", 0.0) or 0.0)
-        except Exception:
+        except (TypeError, ValueError):
             noise_gain = 0.0
     if residual > pipeline.cfg.stage7_residual_star_score_max:
         reasons.append(
@@ -489,7 +489,7 @@ def stage8_input_enhancement_guard(pipeline) -> Dict[str, Any]:
                     "stage8_mask_signal_coverage "
                     f"{mask_signal_coverage:.4f}<{pipeline.cfg.stage8_mask_signal_coverage_min:.4f}"
                 )
-    except Exception as e:
+    except (CommandError, SirilError, OSError, RuntimeError, TypeError, ValueError) as e:
         reasons.append(f"stage8_mask_guard_unavailable={pipeline._short_text(e, 120)}")
 
     return {
@@ -780,7 +780,7 @@ def stage8_target_blue_excess(pipeline, quality_record: Optional[Dict[str, Any]]
         if value is not None:
             try:
                 return _clamp_float(value, 0.05, 0.16)
-            except Exception:
+            except (TypeError, ValueError):
                 pass
     return float(pipeline.cfg.stage8_blue_excess_max)
 

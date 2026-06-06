@@ -9,14 +9,14 @@ import numpy as np
 
 try:
     from save_utils import write_png_rgb16
-except Exception:  # pragma: no cover - import fallback for unusual loaders
+except (ImportError, RuntimeError):  # pragma: no cover - unusual loaders
     write_png_rgb16 = None  # type: ignore[assignment]
 
 
 def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     try:
         numeric = float(value)
-    except Exception:
+    except (TypeError, ValueError):
         return lower
     if not np.isfinite(numeric):
         return lower
@@ -334,5 +334,5 @@ def write_safe_preview(image: Any, path: Path) -> bool:
         stretched = np.flip(stretched, axis=1)
         write_png_rgb16(path, stretched)
         return True
-    except Exception:
+    except (OSError, RuntimeError, TypeError, ValueError):
         return False

@@ -25,10 +25,10 @@ from models import ImageFeatures, QualityMetrics
 
 try:
     from sirilpy.exceptions import CommandError, DataError, SirilError
-except Exception:  # Tests may import with lightweight fakes.
-    CommandError = Exception
-    DataError = Exception
-    SirilError = Exception
+except ImportError:  # Tests may import with lightweight fakes.
+    CommandError = RuntimeError
+    DataError = RuntimeError
+    SirilError = RuntimeError
 
 def stage7_clean_starmask(
     pipeline,

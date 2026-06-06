@@ -245,14 +245,14 @@ def _stage3_find_script(pipeline, *relative_candidates: str) -> Optional[Path]:
             found = pipeline._find_plugin_script(tuple(relative_candidates))
             if found is not None:
                 return found
-        except Exception as exc:
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
             if hasattr(pipeline, "log"):
                 pipeline.log.debug(f"stage3 plugin script lookup skipped: {exc}")
     scripts_root = None
     if hasattr(pipeline, "_resolve_siril_scripts_root"):
         try:
             scripts_root = pipeline._resolve_siril_scripts_root()
-        except Exception:
+        except (OSError, RuntimeError, TypeError, ValueError):
             scripts_root = None
     if scripts_root is None:
         plugin_dir = getattr(pipeline, "siril_plugin_dir", None)
@@ -304,7 +304,7 @@ def _stage3_ensure_graxpert_bge_model(pipeline) -> bool:
             if hasattr(pipeline, "log"):
                 pipeline.log.info(f"Stage3 GraXpert BGE model installed: {target}")
         return target.is_file()
-    except Exception as exc:
+    except (OSError, RuntimeError, shutil.Error) as exc:
         if hasattr(pipeline, "log"):
             pipeline.log.warn(f"Stage3 GraXpert BGE model install failed: {exc}")
         return False
@@ -443,7 +443,7 @@ def _stage3_try_background_command(
     try:
         pipeline.cmd_with_check(*command, quiet=True)
         return True, None
-    except Exception as exc:
+    except (CommandError, SirilError, OSError, RuntimeError) as exc:
         if _stage3_is_graxpert_attempt(label, command, source):
             reason = _stage3_graxpert_runtime_error_reason(exc, command)
             if reason is None:
@@ -646,7 +646,7 @@ def run_stage3_background_extraction(pipeline) -> None:
     before_image = None
     try:
         before_image = pipeline.siril.get_image_pixeldata(preview=False)
-    except Exception as e:
+    except (CommandError, SirilError, OSError, RuntimeError, TypeError, ValueError) as e:
         pipeline.log.debug(f"stage3 baseline image sampling skipped: {e}")
     before_adaptive = (
         pipeline._adaptive_features_current()
@@ -722,7 +722,7 @@ def run_stage3_background_extraction(pipeline) -> None:
             after_image = None
             try:
                 after_image = pipeline.siril.get_image_pixeldata(preview=False)
-            except Exception as e:
+            except (CommandError, SirilError, OSError, RuntimeError, TypeError, ValueError) as e:
                 pipeline.log.debug(f"stage3 candidate image sampling skipped ({label}): {e}")
             preservation = pipeline._stage3_signal_preservation_metrics(
                 before_image,

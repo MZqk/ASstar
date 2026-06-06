@@ -46,7 +46,7 @@ def classic_cosmic_clarity_args(
     if config_path.is_file():
         try:
             configured = config_path.read_text(encoding="utf-8").splitlines()[0].strip()
-        except Exception:
+        except (OSError, UnicodeError, IndexError):
             configured = ""
         if configured:
             candidates.append(Path(configured).expanduser())
@@ -82,7 +82,7 @@ def classic_cosmic_clarity_candidate_error(pipeline, candidate: Path) -> Optiona
         return None
     try:
         candidate.resolve().relative_to((pipeline.siril_plugin_dir / "bin").resolve())
-    except Exception:
+    except (OSError, ValueError):
         return None
 
     try:
@@ -142,7 +142,7 @@ def persist_classic_cosmic_clarity_config(
         pipeline.log.info(
             f"{label} classic executable 已自动配置: {executable}"
         )
-    except Exception as e:
+    except (OSError, UnicodeError, IndexError) as e:
         pipeline.log.warn(
             f"{label} classic executable 配置写入失败，仍继续使用本次发现路径: {e}"
         )
@@ -207,7 +207,7 @@ def final_denoise_cli_timeout_sec(pipeline) -> int:
     raw_timeout = str(os.getenv("SEESTAR_SIRILPY_TIMEOUT_SEC", "120")).strip()
     try:
         sirilpy_timeout = int(float(raw_timeout))
-    except Exception:
+    except (TypeError, ValueError):
         sirilpy_timeout = 120
     return max(60, min(300, sirilpy_timeout + 60))
 

@@ -16,7 +16,7 @@ ENV_SYQON_TIMEOUT_KEY = "SEESTAR_SYQON_TIMEOUT_SEC"
 def _clamp_int(value: object, min_value: int, max_value: int) -> int:
     try:
         ivalue = int(value)  # type: ignore[arg-type]
-    except Exception:
+    except (TypeError, ValueError):
         ivalue = min_value
     return max(min_value, min(max_value, ivalue))
 
@@ -59,7 +59,7 @@ def syqon_starless_cli_options(
             elif hasattr(torch_mod, "xpu") and torch_mod.xpu.is_available():
                 accel_available = True
                 accel_name = "XPU"
-        except Exception as e:
+        except (OSError, RuntimeError, TypeError, ValueError) as e:
             pipeline.log.warn(
                 "SyQon GPU backend probe failed; script will decide device: "
                 f"{pipeline._short_text(e, 120)}"
@@ -70,7 +70,7 @@ def syqon_starless_cli_options(
     if timeout_raw is not None:
         try:
             timeout_sec = int(float(timeout_raw.strip()))
-        except Exception:
+        except (TypeError, ValueError):
             pipeline.log.warn(
                 f"{ENV_SYQON_TIMEOUT_KEY} has invalid value; using {timeout_sec}s"
             )

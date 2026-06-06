@@ -29,9 +29,9 @@ ENV_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 try:
     from sirilpy.exceptions import CommandError, SirilError
-except Exception:  # Tests may import with lightweight fakes.
-    CommandError = Exception
-    SirilError = Exception
+except ImportError:  # Tests may import with lightweight fakes.
+    CommandError = RuntimeError
+    SirilError = RuntimeError
 
 def find_latest_sasp_wheel(pipeline) -> Optional[Path]:
     if not pipeline.siril_plugin_dir:
@@ -101,7 +101,7 @@ def install_pyqt6_headless_stub(pipeline) -> bool:
                 return value
             try:
                 return type(value)
-            except Exception:
+            except (TypeError, ValueError):
                 return value
 
         def setValue(self, key, value):
@@ -229,7 +229,7 @@ def load_sasp_aberration_module(pipeline):
 
     try:
         module = importlib.import_module("setiastro.saspro.aberration_ai")
-    except Exception as e:
+    except (ImportError, RuntimeError, AttributeError) as e:
         if "PyQt6" in str(e):
             stubbed = pipeline._install_pyqt6_headless_stub()
             if stubbed:
@@ -239,7 +239,7 @@ def load_sasp_aberration_module(pipeline):
                 sys.modules.pop("setiastro.saspro.aberration_ai", None)
                 try:
                     module = importlib.import_module("setiastro.saspro.aberration_ai")
-                except Exception as e2:
+                except (ImportError, RuntimeError, AttributeError) as e2:
                     pipeline._sasp_aberration_module_error = (
                         f"import failed after PyQt6 stub: {pipeline._short_text(e2)}"
                     )
@@ -356,7 +356,7 @@ def preferred_aberration_providers(pipeline, module) -> Tuple[Optional[List[str]
 
     try:
         available = list(ort_mod.get_available_providers())
-    except Exception:
+    except (RuntimeError, TypeError, ValueError):
         return None, "default"
 
     available_set = set(available)
@@ -431,7 +431,7 @@ def run_aberration_api(pipeline, step_key: str, model_path: Optional[Path] = Non
                 input_image,
                 **run_kwargs,
             )
-        except Exception as coreml_exc:
+        except (OSError, RuntimeError, TypeError, ValueError) as coreml_exc:
             if not (preferred_providers and provider_strategy.startswith("coreml")):
                 raise
             _log_cb(
@@ -478,7 +478,7 @@ def run_aberration_api(pipeline, step_key: str, model_path: Optional[Path] = Non
         pipeline.workflow_command_used[step_key] = label
         pipeline.log.info(f"{step_key} 使用命令: {label}")
         return label
-    except Exception as e:
+    except (CommandError, SirilError, OSError, RuntimeError, TypeError, ValueError) as e:
         reason = f"runtime failed: {pipeline._short_text(e)}"
         pipeline._last_aberration_api_error = reason
         pipeline.log.warn(f"{step_key} Aberration API {reason}")
@@ -506,11 +506,11 @@ def load_sasp_stage8_module(pipeline):
     pipeline._install_pyqt6_headless_stub()
     try:
         pipeline._install_sasp_stage8_widget_import_shims(wheel_path)
-    except Exception as e:
+    except (ImportError, RuntimeError, AttributeError, OSError) as e:
         pipeline.log.warn(f"SASP Starless 深加工 widget shim failed: {e}")
     try:
         module = importlib.import_module("setiastro.saspro.wavescalede")
-    except Exception as e:
+    except (ImportError, RuntimeError, AttributeError) as e:
         pipeline._sasp_stage8_module_error = f"import failed: {pipeline._short_text(e)}"
         pipeline.log.warn(f"SASP Starless 深加工 API import failed: {e}")
         if pipeline.cfg.debug_mode:
@@ -718,7 +718,7 @@ def run_sasp_stage8_api(pipeline, plan: Optional[Dict[str, Any]] = None):
         pipeline.workflow_command_used["SASP Starless 深加工 API"] = label
         pipeline.log.info(f"SASP Starless 深加工 API 使用命令: {label}")
         return label
-    except Exception as e:
+    except (CommandError, SirilError, OSError, RuntimeError, TypeError, ValueError) as e:
         reason = f"runtime failed: {pipeline._short_text(e)}"
         pipeline._last_sasp_stage8_error = reason
         pipeline.log.warn(f"SASP Starless 深加工 API {reason}")

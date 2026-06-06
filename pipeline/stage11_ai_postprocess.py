@@ -8,6 +8,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
 
+from sirilpy.exceptions import CommandError, DataError, SirilError
+
 
 def run_stage11_ai_postprocess(
     owner: Any,
@@ -157,7 +159,7 @@ def run_stage11_ai_postprocess(
                         ),
                     },
                 )
-            except Exception as json_error:
+            except (OSError, RuntimeError, TypeError, ValueError) as json_error:
                 owner.log.warn(f"[AI] stage11 quality JSON write failed: {json_error}")
         else:
             owner.cmd_with_check("load", blended_name)
@@ -165,17 +167,17 @@ def run_stage11_ai_postprocess(
 
             try:
                 owner.cmd_with_check("savetif", "result_processed_ai", "-astro")
-            except Exception as e:
+            except (CommandError, DataError, SirilError, OSError, RuntimeError) as e:
                 export_errors.append(f"TIFF export failed: {e}")
 
             try:
                 owner.cmd_with_check("savepng", "result_processed_ai")
-            except Exception as e:
+            except (CommandError, DataError, SirilError, OSError, RuntimeError) as e:
                 export_errors.append(f"PNG export failed: {e}")
 
             try:
                 owner.cmd_with_check("save", "result_final_ai")
-            except Exception as e:
+            except (CommandError, DataError, SirilError, OSError, RuntimeError) as e:
                 export_errors.append(f"FITS export failed: {e}")
 
             if export_errors:
@@ -206,7 +208,7 @@ def run_stage11_ai_postprocess(
                             ),
                         },
                     )
-                except Exception as json_error:
+                except (OSError, RuntimeError, TypeError, ValueError) as json_error:
                     owner.log.warn(f"[AI] stage11 quality JSON write failed: {json_error}")
                 plan_parse_fallback = bool(
                     getattr(owner, "_ai_plan_parse_fallback", False)
@@ -221,7 +223,15 @@ def run_stage11_ai_postprocess(
                     else:
                         message = f"{message}; AI plan fallback triggered"
 
-    except Exception as e:
+    except (
+        CommandError,
+        DataError,
+        SirilError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as e:
         status = "degraded"
         message = f"AI postprocess failed: {e}"
         owner.log.warn(message)

@@ -251,7 +251,7 @@ def measure_image_features(image: np.ndarray) -> ImageFeatures:
         edge_black_threshold = global_dark_threshold
         if edge_values.size:
             feat.edge_black_ratio = float(np.mean(edge_values <= edge_black_threshold))
-    except Exception:
+    except (TypeError, ValueError, IndexError, FloatingPointError):
         feat = defaults
 
     # 统一清洗和限幅，保证返回值总是有效。
@@ -382,7 +382,7 @@ def measure_stage3_signal_preservation(
             result["star_retention_ratio"] is not None
             or result["nebula_mean_change_ratio"] is not None
         )
-    except Exception as exc:
+    except (TypeError, ValueError, IndexError, FloatingPointError) as exc:
         result["notes"].append(f"preservation metrics failed: {exc}")
     return result
 
@@ -467,7 +467,7 @@ def measure_quality_metrics(image: np.ndarray) -> QualityMetrics:
             red_dom = float(np.median((r[signal_values] + eps) / (g[signal_values] + eps)))
             blue_dom = float(np.median((b[signal_values] + eps) / (g[signal_values] + eps)))
             metrics.blue_excess = max(0.0, blue_dom - max(1.08, red_dom + 0.12))
-    except Exception:
+    except (TypeError, ValueError, IndexError, FloatingPointError):
         metrics = defaults
 
     metrics.bg_median = _clamp_float(metrics.bg_median, 0.0, 1.0)

@@ -349,7 +349,7 @@ def run_stage10_export(pipeline) -> None:
                         messages.append("final_quality_issues=" + issue_text)
                     else:
                         messages.append("final_quality=poor")
-            except Exception as e:
+            except (OSError, RuntimeError, TypeError, ValueError) as e:
                 pipeline.log.warn(f"final quality report failed: {e}")
                 messages.append("final_quality_report 写入失败")
                 status = "degraded" if status == "ok" else status

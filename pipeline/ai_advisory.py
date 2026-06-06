@@ -25,7 +25,7 @@ ENV_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 def _clamp_float(value: object, min_value: float, max_value: float) -> float:
     try:
         fvalue = float(value)  # type: ignore[arg-type]
-    except Exception:
+    except (TypeError, ValueError):
         fvalue = min_value
     return max(min_value, min(max_value, fvalue))
 
@@ -33,7 +33,7 @@ def _clamp_float(value: object, min_value: float, max_value: float) -> float:
 def _clamp_int(value: object, min_value: int, max_value: int) -> int:
     try:
         ivalue = int(value)  # type: ignore[arg-type]
-    except Exception:
+    except (TypeError, ValueError):
         ivalue = min_value
     return max(min_value, min(max_value, ivalue))
 
@@ -60,7 +60,7 @@ def post_json_with_auth(
         detail = ""
         try:
             detail = e.read().decode("utf-8", errors="replace").strip()
-        except Exception:
+        except (OSError, UnicodeError):
             detail = ""
         if len(detail) > 280:
             detail = detail[:280] + "..."
@@ -169,7 +169,7 @@ def extract_adjustments_from_text(pipeline: object, text: str) -> Optional[Dict[
             continue
         try:
             adjustments[key] = float(match.group(1))
-        except Exception:
+        except (TypeError, ValueError):
             continue
 
     if not adjustments:
@@ -194,7 +194,7 @@ def extract_first_json_object(pipeline: object, text: str) -> Dict[str, Any]:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
             return parsed
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         pass
 
     fenced = re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
@@ -203,7 +203,7 @@ def extract_first_json_object(pipeline: object, text: str) -> Dict[str, Any]:
             parsed = json.loads(block.strip())
             if isinstance(parsed, dict):
                 return parsed
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             continue
 
     starts = [idx for idx, ch in enumerate(text) if ch == "{"]
@@ -236,7 +236,7 @@ def extract_first_json_object(pipeline: object, text: str) -> Dict[str, Any]:
                         parsed = json.loads(candidate)
                         if isinstance(parsed, dict):
                             return parsed
-                    except Exception:
+                    except (json.JSONDecodeError, TypeError):
                         pass
                     break
 
@@ -282,7 +282,7 @@ def extract_stage_advisory_from_text(
                 if match:
                     try:
                         return float(match.group(1))
-                    except Exception:
+                    except (TypeError, ValueError):
                         return None
         return None
 
@@ -334,7 +334,7 @@ def extract_stage_advisory_from_text(
             if match:
                 try:
                     return int(match.group(1))
-                except Exception:
+                except (TypeError, ValueError):
                     pass
             return default
 
@@ -436,7 +436,7 @@ def extract_stage_advisory_from_text(
             if match:
                 try:
                     return float(match.group(1))
-                except Exception:
+                except (TypeError, ValueError):
                     pass
             return default
 
@@ -537,7 +537,7 @@ def request_stage_ai_advisory(
                     )
                     try:
                         plan_obj = pipeline._extract_first_json_object(content)
-                    except Exception:
+                    except (TypeError, ValueError, json.JSONDecodeError):
                         parse_failures.append(
                             f"endpoint={endpoint_url},temperature={temperature},json_mode={json_mode}"
                         )
@@ -554,7 +554,7 @@ def request_stage_ai_advisory(
                             f"[AI] {stage_name} advisory used temperature fallback={temperature}"
                         )
                     return plan_obj
-                except Exception as e:
+                except (OSError, RuntimeError, TypeError, ValueError) as e:
                     if "response_obj" in locals() or "content" in locals():
                         try:
                             pipeline._write_ai_raw_response(
@@ -566,7 +566,7 @@ def request_stage_ai_advisory(
                                 content=locals().get("content"),
                                 error_text=str(e),
                             )
-                        except Exception:
+                        except (OSError, RuntimeError, TypeError, ValueError):
                             pass
                     attempt_errors.append(
                         "endpoint="
@@ -693,7 +693,7 @@ def request_stage6_stretch_plan(
         if plan is None:
             raise RuntimeError("stage6 AI plan has invalid method")
         return plan
-    except Exception as e:
+    except (OSError, RuntimeError, TypeError, ValueError) as e:
         pipeline.log.warn(f"[AI] stage6 stretch advisory unavailable: {e}")
         return None
 
@@ -755,7 +755,7 @@ def request_stage7_starless_plan(pipeline: object) -> Optional[Dict[str, Any]]:
             "stage7_starless_plan", schema, observations
         )
         return pipeline._normalize_stage7_starless_plan(raw)
-    except Exception as e:
+    except (OSError, RuntimeError, TypeError, ValueError) as e:
         pipeline.log.warn(f"[AI] stage7 starless plan unavailable: {e}")
         return None
 
@@ -786,7 +786,7 @@ def normalize_stage7_ai_quality(pipeline: object, obj: Dict[str, Any]) -> Dict[s
             return None
         try:
             return _clamp_float(quality.get(name), lo, hi)
-        except Exception:
+        except (TypeError, ValueError):
             return None
 
     return {
@@ -830,7 +830,7 @@ def request_stage7_quality_ai(
             "stage7_quality", schema, observations
         )
         return pipeline._normalize_stage7_ai_quality(raw)
-    except Exception as e:
+    except (OSError, RuntimeError, TypeError, ValueError) as e:
         pipeline.log.warn(f"[AI] stage7 quality advisory unavailable: {e}")
         return None
 
@@ -897,7 +897,7 @@ def request_stage8_processing_plan(pipeline: object) -> Optional[Dict[str, Any]]
             "stage8_processing_plan", schema, observations
         )
         return pipeline._normalize_stage8_processing_plan(raw)
-    except Exception as e:
+    except (OSError, RuntimeError, TypeError, ValueError) as e:
         pipeline.log.warn(f"[AI] stage8 processing plan unavailable: {e}")
         return None
 
@@ -925,7 +925,7 @@ def normalize_stage8_ai_quality(pipeline: object, obj: Dict[str, Any]) -> Dict[s
     if target_blue_excess is not None:
         try:
             target_blue_excess = _clamp_float(target_blue_excess, 0.05, 0.16)
-        except Exception:
+        except (TypeError, ValueError):
             target_blue_excess = None
     return {
         "verdict": verdict,
@@ -962,7 +962,7 @@ def request_stage8_quality_ai(
             "stage8_quality", schema, observations
         )
         return pipeline._normalize_stage8_ai_quality(raw)
-    except Exception as e:
+    except (OSError, RuntimeError, TypeError, ValueError) as e:
         pipeline.log.warn(f"[AI] stage8 quality advisory unavailable: {e}")
         return None
 
@@ -976,7 +976,7 @@ def normalize_ai_adjustments(pipeline: object, obj: Dict[str, Any]) -> Dict[str,
         value = adjustments.get(name, default)
         try:
             return float(value)
-        except Exception:
+        except (TypeError, ValueError):
             return float(default)
 
     return {
@@ -1169,7 +1169,7 @@ def request_ai_adjustments(
                             f"[AI] Plan request used temperature fallback={temperature}"
                         )
                     return adjustments, summary
-                except Exception as e:
+                except (OSError, RuntimeError, TypeError, ValueError) as e:
                     if "response_obj" in locals() or "content" in locals():
                         try:
                             pipeline._write_ai_raw_response(
@@ -1181,7 +1181,7 @@ def request_ai_adjustments(
                                 content=locals().get("content"),
                                 error_text=str(e),
                             )
-                        except Exception:
+                        except (OSError, RuntimeError, TypeError, ValueError):
                             pass
                     last_error = e
                     attempt_errors.append(

@@ -450,7 +450,7 @@ def _stage4_header_metadata(pipeline) -> Dict[str, Any]:
         metadata = pipeline._read_fits_header_metadata(*candidates)
     except TypeError:
         metadata = pipeline._read_fits_header_metadata("stage3_bgremoved")
-    except Exception as e:
+    except (OSError, RuntimeError, TypeError, ValueError) as e:
         pipeline.log.debug(f"Stage4 FITS header metadata unavailable: {e}")
         return {}
     return metadata if isinstance(metadata, dict) else {}
@@ -645,7 +645,7 @@ def _stage4_pixel_scale_arcsec_per_px() -> float:
 def _stage4_image_geometry(pipeline) -> Dict[str, Any]:
     try:
         shape = _stage4_shape_dict(pipeline.siril.get_image_shape())
-    except Exception:
+    except (CommandError, SirilError, OSError, RuntimeError, TypeError, ValueError):
         shape = {}
     crop_report = getattr(pipeline, "stage2_crop_report", None)
     if not isinstance(crop_report, dict):
@@ -1301,7 +1301,15 @@ def run_stage4_color_calibration(pipeline) -> None:
             messages.append(fallback_message)
             pipeline.log.info(fallback_message)
             pipeline.log.debug(f"local color fallback report: {local_fallback_report}")
-        except Exception as e:
+        except (
+            AttributeError,
+            CommandError,
+            SirilError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as e:
             color_ok = False
             status = "degraded"
             messages.append(f"local color fallback failed: {e}")

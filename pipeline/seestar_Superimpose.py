@@ -81,7 +81,7 @@ from save_utils import (
 try:
     from stage11_ai_postprocess import run_stage11_ai_postprocess
     STAGE11_IMPORT_ERROR = None
-except Exception as stage11_import_exc:
+except (ImportError, RuntimeError) as stage11_import_exc:
     run_stage11_ai_postprocess = None
     STAGE11_IMPORT_ERROR = stage11_import_exc
 
@@ -108,7 +108,7 @@ try:
         CommandStatus.CMD_GENERIC_ERROR,
         CommandStatus.CMD_THREAD_RUNNING,
     })
-except Exception:
+except (ImportError, AttributeError):
     RETRYABLE_STATUSES = frozenset()
 
 from stages.stage1_preparation import run_stage1_preparation
@@ -136,7 +136,7 @@ try:
         score_candidate as score_stretch_candidate,
     )
     from target_profiler import build_target_profile
-except Exception as adaptive_import_exc:
+except (ImportError, RuntimeError) as adaptive_import_exc:
     analyze_adaptive_image = None
     write_safe_preview = None
     DEFAULT_POLICY = {
@@ -270,6 +270,104 @@ AUTO_CLAMP_FIELDS = (
     "stage8_saturation_growth_ratio_max",
     "stage8_microcontrast_growth_ratio_max",
     "stage8_highlight_clip_ratio_max",
+)
+
+CLAMP_RULES: list[tuple[str, type, float, float]] = [
+    ("crop_margin", float, 0.0, 0.06),
+    ("stage2_edge_black_target", float, 0.03, 0.18),
+    ("stage2_adaptive_edge_crop_max_passes", int, 0, 6),
+    ("stage2_adaptive_edge_crop_max_extra", float, 0.005, 0.060),
+    ("stage2_guard_band_pixels", int, 0, 8),
+    ("stage2_color_artifact_max_crop", float, 0.05, 0.25),
+    ("bg_samples", int, 12, 32),
+    ("bg_tolerance", float, 0.6, 1.8),
+    ("bg_smooth", float, 0.2, 1.2),
+    ("bg_std_worsen_ratio_max", float, 1.0, 1.4),
+    ("bg_median_drop_ratio_min", float, 0.05, 0.60),
+    ("bg_object_preserve_ratio_min", float, 0.20, 0.90),
+    ("bg_edge_black_rise_max", float, 0.10, 0.60),
+    ("bg_star_preserve_ratio_min", float, 0.50, 1.00),
+    ("bg_nebula_mean_change_max", float, 0.02, 0.35),
+    ("stage5_builtin_denoise_mod", float, 0.20, 0.55),
+    ("stage5_rl_maxstars", int, 20, 1000),
+    ("stage5_rl_psf_kernel_size", int, 9, 99),
+    ("stage5_rl_iters", int, 1, 40),
+    ("stage5_rl_alpha", float, 100.0, 10000.0),
+    ("stage5_rl_gdstep", float, 0.00001, 0.01),
+    ("stage5_rl_stop", float, 0.0001, 0.05),
+    ("stage5_graxpert_deconv_strength", float, 0.20, 0.40),
+    ("asinh_stretch", float, 1.6, 3.6),
+    ("asinh_offset", float, 0.0005, 0.006),
+    ("ghs_shadowsclip", float, -3.6, -1.8),
+    ("ghs_stretchamount", float, 1.0, 2.8),
+    ("nebula_saturation", float, 0.0, 0.65),
+    ("stage8_core_protection_strength", float, 0.50, 1.00),
+    ("stage8_background_denoise_strength", float, 0.0, 0.25),
+    ("stage8_faint_nebula_boost_max", float, 0.0, 0.18),
+    ("stage8_nebula_contrast_max", float, 0.0, 0.20),
+    ("stage8_masked_unsharp_amount_max", float, 0.0, 0.25),
+    ("stage8_blue_precontrol_strength", float, 0.0, 1.00),
+    ("stage8_bg_std_growth_max", float, 1.00, 1.50),
+    ("stage8_texture_artifact_growth_max", float, 1.00, 2.20),
+    ("star_intensity", float, 0.8, 1.05),
+    ("star_fallback_intensity", float, 0.75, 1.05),
+    ("final_saturation", float, 0.05, 0.25),
+    ("ai_timeout_sec", int, 15, 300),
+    ("ai_strength", float, 0.05, 0.25),
+    ("ai_bg_median_delta_max", float, 0.01, 0.06),
+    ("ai_color_ratio_delta_max", float, 0.08, 0.35),
+    ("ai_core_growth_ratio_max", float, 1.05, 1.80),
+    ("ai_star_growth_ratio_max", float, 1.05, 1.80),
+    ("stage6_bg_median_min", float, 0.005, 0.080),
+    ("stage6_black_pixel_ratio_max", float, 0.10, 0.70),
+    ("stage6_highlight_clip_ratio_max", float, 0.001, 0.050),
+    ("stage6_star_growth_ratio_max", float, 1.05, 1.80),
+    ("stage7_quality_retry_max", int, 0, 3),
+    ("stage7_edge_black_warn", float, 0.04, 0.30),
+    ("stage7_bg_median_high", float, 0.08, 0.35),
+    ("stage7_bg_std_high", float, 0.020, 0.120),
+    ("stage7_bg_noise_ratio_high", float, 0.20, 1.50),
+    ("stage7_residual_star_score_max", float, 0.10, 1.20),
+    ("stage7_halo_residue_score_max", float, 0.05, 1.00),
+    ("stage7_black_hole_score_max", float, 0.01, 0.35),
+    ("stage7_starmask_contamination_max", float, 0.05, 0.80),
+    ("stage7_starless_noise_gain_max", float, 1.00, 2.50),
+    ("stage7_starmask_coverage_min_ratio", float, 0.05, 0.90),
+    ("stage7_starmask_width_ratio_max", float, 1.10, 3.00),
+    ("stage7_starless_dynamic_range_min_ratio", float, 0.20, 0.90),
+    ("stage7_starless_peak_signal_min", float, 0.0015, 0.0300),
+    ("stage7_starmask_background_floor_percentile", float, 20.0, 80.0),
+    ("stage7_starmask_halo_blur_strength", float, 0.0, 0.80),
+    ("stage7_starmask_small_star_scale", float, 0.50, 1.00),
+    ("stage7_starmask_nebula_suppression", float, 0.0, 0.95),
+    ("mild_prestretch_strength", float, 1.05, 1.80),
+    ("stage7_conservative_asinh_stretch", float, 1.60, 2.60),
+    ("stage7_conservative_asinh_offset", float, 0.0005, 0.0060),
+    ("stage7_starless_repair_strength", float, 0.0, 0.85),
+    ("stage7_starless_halo_repair_strength", float, 0.0, 0.90),
+    ("stage7_starless_chroma_denoise_strength", float, 0.0, 0.90),
+    ("stage7_starless_repair_max_score_growth", float, 0.0, 0.20),
+    ("stage8_mask_signal_coverage_min", float, 0.001, 0.050),
+    ("stage8_blue_excess_max", float, 0.02, 0.30),
+    ("stage8_saturation_growth_ratio_max", float, 1.05, 2.50),
+    ("stage8_microcontrast_growth_ratio_max", float, 1.05, 2.80),
+    ("stage8_highlight_clip_ratio_max", float, 0.001, 0.060),
+]
+
+DENOISE_MOD_MIN = 0.20
+DENOISE_SAFETY_MIN = 0.20
+DENOISE_SAFETY_MAX = 0.55
+RL_PSF_KERNEL_ODD_INCREMENT = 1
+STAGE7_EDGE_BLACK_HIGH_MAX = 0.60
+STAGE7_BRIGHT_NEBULA_HALO_SCORE_MAX = 1.20
+STAGE7_ULTRA_CONSERVATIVE_ASINH_MIN = 1.20
+STAGE7_SOFT_STARLESS_ASINH_MIN = 1.05
+DYNAMIC_CLAMP_FIELDS = (
+    "denoise_mod",
+    "stage7_edge_black_high",
+    "stage7_bright_nebula_halo_residue_score_max",
+    "stage7_ultra_conservative_asinh_stretch",
+    "stage7_soft_starless_asinh_stretch",
 )
 
 TARGET_KEYWORDS: Dict[TargetType, Tuple[str, ...]] = {
@@ -419,229 +517,47 @@ def detect_target_type(
     try:
         features = measure_image_features(image_data)
         return _infer_target_type_from_features(features)
-    except Exception:
+    except (TypeError, ValueError, RuntimeError, FloatingPointError):
         return TargetType.UNKNOWN
 
 
 def clamp_config(cfg: PipelineConfig) -> PipelineConfig:
     """自动调参的统一安全限幅，防止参数进入危险区间。"""
     tuned = copy.deepcopy(cfg)
-    tuned.crop_margin = _clamp_float(tuned.crop_margin, 0.0, 0.06)
-    tuned.stage2_edge_black_target = _clamp_float(
-        tuned.stage2_edge_black_target, 0.03, 0.18
-    )
-    tuned.stage2_adaptive_edge_crop_max_passes = _clamp_int(
-        tuned.stage2_adaptive_edge_crop_max_passes, 0, 6
-    )
-    tuned.stage2_adaptive_edge_crop_max_extra = _clamp_float(
-        tuned.stage2_adaptive_edge_crop_max_extra, 0.005, 0.060
-    )
-    tuned.stage2_guard_band_pixels = _clamp_int(
-        tuned.stage2_guard_band_pixels, 0, 8
-    )
-    tuned.stage2_color_artifact_max_crop = _clamp_float(
-        tuned.stage2_color_artifact_max_crop, 0.05, 0.25
-    )
-    tuned.bg_samples = _clamp_int(tuned.bg_samples, 12, 32)
-    tuned.bg_tolerance = _clamp_float(tuned.bg_tolerance, 0.6, 1.8)
-    tuned.bg_smooth = _clamp_float(tuned.bg_smooth, 0.2, 1.2)
-    tuned.bg_std_worsen_ratio_max = _clamp_float(
-        tuned.bg_std_worsen_ratio_max, 1.0, 1.4
-    )
-    tuned.bg_median_drop_ratio_min = _clamp_float(
-        tuned.bg_median_drop_ratio_min, 0.05, 0.60
-    )
-    tuned.bg_object_preserve_ratio_min = _clamp_float(
-        tuned.bg_object_preserve_ratio_min, 0.20, 0.90
-    )
-    tuned.bg_edge_black_rise_max = _clamp_float(
-        tuned.bg_edge_black_rise_max, 0.10, 0.60
-    )
-    tuned.bg_star_preserve_ratio_min = _clamp_float(
-        tuned.bg_star_preserve_ratio_min, 0.50, 1.00
-    )
-    tuned.bg_nebula_mean_change_max = _clamp_float(
-        tuned.bg_nebula_mean_change_max, 0.02, 0.35
-    )
+    for name, value_type, lower, upper in CLAMP_RULES:
+        clamp = _clamp_int if value_type is int else _clamp_float
+        setattr(tuned, name, clamp(getattr(tuned, name), lower, upper))
 
-    denoise_upper = max(0.2, min(0.55, float(tuned.denoise_safety_max)))
-    tuned.denoise_mod = _clamp_float(tuned.denoise_mod, 0.2, denoise_upper)
-    tuned.stage5_builtin_denoise_mod = _clamp_float(
-        tuned.stage5_builtin_denoise_mod, 0.20, 0.55
+    denoise_upper = max(
+        DENOISE_SAFETY_MIN,
+        min(DENOISE_SAFETY_MAX, float(tuned.denoise_safety_max)),
     )
-    tuned.stage5_rl_maxstars = _clamp_int(tuned.stage5_rl_maxstars, 20, 1000)
-    tuned.stage5_rl_psf_kernel_size = _clamp_int(
-        tuned.stage5_rl_psf_kernel_size, 9, 99
+    tuned.denoise_mod = _clamp_float(
+        tuned.denoise_mod,
+        DENOISE_MOD_MIN,
+        denoise_upper,
     )
     if tuned.stage5_rl_psf_kernel_size % 2 == 0:
-        tuned.stage5_rl_psf_kernel_size += 1
-    tuned.stage5_rl_iters = _clamp_int(tuned.stage5_rl_iters, 1, 40)
-    tuned.stage5_rl_alpha = _clamp_float(tuned.stage5_rl_alpha, 100.0, 10000.0)
-    tuned.stage5_rl_gdstep = _clamp_float(tuned.stage5_rl_gdstep, 0.00001, 0.01)
-    tuned.stage5_rl_stop = _clamp_float(tuned.stage5_rl_stop, 0.0001, 0.05)
-    tuned.stage5_graxpert_deconv_strength = _clamp_float(
-        tuned.stage5_graxpert_deconv_strength, 0.20, 0.40
-    )
-
-    tuned.asinh_stretch = _clamp_float(tuned.asinh_stretch, 1.6, 3.6)
-    tuned.asinh_offset = _clamp_float(tuned.asinh_offset, 0.0005, 0.006)
-    tuned.ghs_shadowsclip = _clamp_float(tuned.ghs_shadowsclip, -3.6, -1.8)
-    tuned.ghs_stretchamount = _clamp_float(tuned.ghs_stretchamount, 1.0, 2.8)
-    tuned.nebula_saturation = _clamp_float(tuned.nebula_saturation, 0.0, 0.65)
-    tuned.stage8_core_protection_strength = _clamp_float(
-        tuned.stage8_core_protection_strength, 0.50, 1.00
-    )
-    tuned.stage8_background_denoise_strength = _clamp_float(
-        tuned.stage8_background_denoise_strength, 0.0, 0.25
-    )
-    tuned.stage8_faint_nebula_boost_max = _clamp_float(
-        tuned.stage8_faint_nebula_boost_max, 0.0, 0.18
-    )
-    tuned.stage8_nebula_contrast_max = _clamp_float(
-        tuned.stage8_nebula_contrast_max, 0.0, 0.20
-    )
-    tuned.stage8_masked_unsharp_amount_max = _clamp_float(
-        tuned.stage8_masked_unsharp_amount_max, 0.0, 0.25
-    )
-    tuned.stage8_blue_precontrol_strength = _clamp_float(
-        tuned.stage8_blue_precontrol_strength, 0.0, 1.00
-    )
-    tuned.stage8_bg_std_growth_max = _clamp_float(
-        tuned.stage8_bg_std_growth_max, 1.00, 1.50
-    )
-    tuned.stage8_texture_artifact_growth_max = _clamp_float(
-        tuned.stage8_texture_artifact_growth_max, 1.00, 2.20
-    )
-    tuned.star_intensity = _clamp_float(tuned.star_intensity, 0.8, 1.05)
-    tuned.star_fallback_intensity = _clamp_float(
-        tuned.star_fallback_intensity, 0.75, 1.05
-    )
-    tuned.final_saturation = _clamp_float(tuned.final_saturation, 0.05, 0.25)
-    tuned.ai_timeout_sec = _clamp_int(tuned.ai_timeout_sec, 15, 300)
-    tuned.ai_strength = _clamp_float(tuned.ai_strength, 0.05, 0.25)
-    tuned.ai_bg_median_delta_max = _clamp_float(
-        tuned.ai_bg_median_delta_max, 0.01, 0.06
-    )
-    tuned.ai_color_ratio_delta_max = _clamp_float(
-        tuned.ai_color_ratio_delta_max, 0.08, 0.35
-    )
-    tuned.ai_core_growth_ratio_max = _clamp_float(
-        tuned.ai_core_growth_ratio_max, 1.05, 1.80
-    )
-    tuned.ai_star_growth_ratio_max = _clamp_float(
-        tuned.ai_star_growth_ratio_max, 1.05, 1.80
-    )
-    tuned.stage6_bg_median_min = _clamp_float(tuned.stage6_bg_median_min, 0.005, 0.080)
-    tuned.stage6_black_pixel_ratio_max = _clamp_float(
-        tuned.stage6_black_pixel_ratio_max, 0.10, 0.70
-    )
-    tuned.stage6_highlight_clip_ratio_max = _clamp_float(
-        tuned.stage6_highlight_clip_ratio_max, 0.001, 0.050
-    )
-    tuned.stage6_star_growth_ratio_max = _clamp_float(
-        tuned.stage6_star_growth_ratio_max, 1.05, 1.80
-    )
-    tuned.stage7_quality_retry_max = _clamp_int(tuned.stage7_quality_retry_max, 0, 3)
-    tuned.stage7_edge_black_warn = _clamp_float(
-        tuned.stage7_edge_black_warn, 0.04, 0.30
-    )
+        tuned.stage5_rl_psf_kernel_size += RL_PSF_KERNEL_ODD_INCREMENT
     tuned.stage7_edge_black_high = _clamp_float(
         tuned.stage7_edge_black_high,
         tuned.stage7_edge_black_warn,
-        0.60,
-    )
-    tuned.stage7_bg_median_high = _clamp_float(
-        tuned.stage7_bg_median_high, 0.08, 0.35
-    )
-    tuned.stage7_bg_std_high = _clamp_float(
-        tuned.stage7_bg_std_high, 0.020, 0.120
-    )
-    tuned.stage7_bg_noise_ratio_high = _clamp_float(
-        tuned.stage7_bg_noise_ratio_high, 0.20, 1.50
-    )
-    tuned.stage7_residual_star_score_max = _clamp_float(
-        tuned.stage7_residual_star_score_max, 0.10, 1.20
-    )
-    tuned.stage7_halo_residue_score_max = _clamp_float(
-        tuned.stage7_halo_residue_score_max, 0.05, 1.00
+        STAGE7_EDGE_BLACK_HIGH_MAX,
     )
     tuned.stage7_bright_nebula_halo_residue_score_max = _clamp_float(
         tuned.stage7_bright_nebula_halo_residue_score_max,
         tuned.stage7_halo_residue_score_max,
-        1.20,
-    )
-    tuned.stage7_black_hole_score_max = _clamp_float(
-        tuned.stage7_black_hole_score_max, 0.01, 0.35
-    )
-    tuned.stage7_starmask_contamination_max = _clamp_float(
-        tuned.stage7_starmask_contamination_max, 0.05, 0.80
-    )
-    tuned.stage7_starless_noise_gain_max = _clamp_float(
-        tuned.stage7_starless_noise_gain_max, 1.00, 2.50
-    )
-    tuned.stage7_starmask_coverage_min_ratio = _clamp_float(
-        tuned.stage7_starmask_coverage_min_ratio, 0.05, 0.90
-    )
-    tuned.stage7_starmask_width_ratio_max = _clamp_float(
-        tuned.stage7_starmask_width_ratio_max, 1.10, 3.00
-    )
-    tuned.stage7_starless_dynamic_range_min_ratio = _clamp_float(
-        tuned.stage7_starless_dynamic_range_min_ratio, 0.20, 0.90
-    )
-    tuned.stage7_starless_peak_signal_min = _clamp_float(
-        tuned.stage7_starless_peak_signal_min, 0.0015, 0.0300
-    )
-    tuned.stage7_starmask_background_floor_percentile = _clamp_float(
-        tuned.stage7_starmask_background_floor_percentile, 20.0, 80.0
-    )
-    tuned.stage7_starmask_halo_blur_strength = _clamp_float(
-        tuned.stage7_starmask_halo_blur_strength, 0.0, 0.80
-    )
-    tuned.stage7_starmask_small_star_scale = _clamp_float(
-        tuned.stage7_starmask_small_star_scale, 0.50, 1.00
-    )
-    tuned.stage7_starmask_nebula_suppression = _clamp_float(
-        tuned.stage7_starmask_nebula_suppression, 0.0, 0.95
-    )
-    tuned.mild_prestretch_strength = _clamp_float(
-        tuned.mild_prestretch_strength, 1.05, 1.80
-    )
-    tuned.stage7_conservative_asinh_stretch = _clamp_float(
-        tuned.stage7_conservative_asinh_stretch, 1.60, 2.60
+        STAGE7_BRIGHT_NEBULA_HALO_SCORE_MAX,
     )
     tuned.stage7_ultra_conservative_asinh_stretch = _clamp_float(
-        tuned.stage7_ultra_conservative_asinh_stretch, 1.20, tuned.stage7_conservative_asinh_stretch
+        tuned.stage7_ultra_conservative_asinh_stretch,
+        STAGE7_ULTRA_CONSERVATIVE_ASINH_MIN,
+        tuned.stage7_conservative_asinh_stretch,
     )
     tuned.stage7_soft_starless_asinh_stretch = _clamp_float(
-        tuned.stage7_soft_starless_asinh_stretch, 1.05, tuned.stage7_ultra_conservative_asinh_stretch
-    )
-    tuned.stage7_conservative_asinh_offset = _clamp_float(
-        tuned.stage7_conservative_asinh_offset, 0.0005, 0.0060
-    )
-    tuned.stage7_starless_repair_strength = _clamp_float(
-        tuned.stage7_starless_repair_strength, 0.0, 0.85
-    )
-    tuned.stage7_starless_halo_repair_strength = _clamp_float(
-        tuned.stage7_starless_halo_repair_strength, 0.0, 0.90
-    )
-    tuned.stage7_starless_chroma_denoise_strength = _clamp_float(
-        tuned.stage7_starless_chroma_denoise_strength, 0.0, 0.90
-    )
-    tuned.stage7_starless_repair_max_score_growth = _clamp_float(
-        tuned.stage7_starless_repair_max_score_growth, 0.0, 0.20
-    )
-    tuned.stage8_mask_signal_coverage_min = _clamp_float(
-        tuned.stage8_mask_signal_coverage_min, 0.001, 0.050
-    )
-    tuned.stage8_blue_excess_max = _clamp_float(tuned.stage8_blue_excess_max, 0.02, 0.30)
-    tuned.stage8_saturation_growth_ratio_max = _clamp_float(
-        tuned.stage8_saturation_growth_ratio_max, 1.05, 2.50
-    )
-    tuned.stage8_microcontrast_growth_ratio_max = _clamp_float(
-        tuned.stage8_microcontrast_growth_ratio_max, 1.05, 2.80
-    )
-    tuned.stage8_highlight_clip_ratio_max = _clamp_float(
-        tuned.stage8_highlight_clip_ratio_max, 0.001, 0.060
+        tuned.stage7_soft_starless_asinh_stretch,
+        STAGE7_SOFT_STARLESS_ASINH_MIN,
+        tuned.stage7_ultra_conservative_asinh_stretch,
     )
     return tuned
 
@@ -1270,7 +1186,7 @@ class SeestarPostProcessor(
 
         try:
             image_data = self.siril.get_image_pixeldata(preview=False)
-        except Exception as e:
+        except (CommandError, DataError, SirilError, OSError, RuntimeError) as e:
             self.log.warn(f"[AUTO] Failed to load image pixel data: {e}")
             self.log.warn("[AUTO] Fallback to default config")
             self.cfg = copy.deepcopy(self.base_cfg)
@@ -1307,7 +1223,13 @@ class SeestarPostProcessor(
                 self.log.debug(
                     f"[AUTO] Source hint: {source_hint if source_hint else 'N/A'}"
                 )
-        except Exception as e:
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+            RuntimeError,
+            FloatingPointError,
+        ) as e:
             self.log.warn(f"[AUTO] Auto tuning failed: {e}")
             self.log.warn("[AUTO] Fallback to default config")
             if self.cfg.debug_mode:
@@ -1395,7 +1317,7 @@ class SeestarPostProcessor(
             messages.append(
                 f"target_type={profile.get('target_type')}; policy={self._active_policy_name()}"
             )
-        except Exception as e:
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as e:
             reason = self._short_text(e, 180)
             self.log.warn(f"[{source}] Target profiler failed, using generic policy: {reason}")
             profile = self._fallback_target_profile(reason)
@@ -1498,7 +1420,7 @@ class SeestarPostProcessor(
             )
             if report.get("reason"):
                 messages.append("; ".join(str(item) for item in report.get("reason", [])[:3]))
-        except Exception as e:
+        except (CommandError, DataError, SirilError, OSError, RuntimeError, TypeError, ValueError) as e:
             status = "degraded"
             reason = self._short_text(e, 180)
             report = {
@@ -1769,12 +1691,12 @@ class SeestarPostProcessor(
             self.log.warn("用户中断操作")
         except Exception as e:
             self.log.error(f"程序中断: {e}")
-            traceback.print_exc()
+            self.log.error(traceback.format_exc())
         finally:
             try:
                 self.siril.disconnect()
-            except Exception:
-                pass
+            except (CommandError, DataError, SirilError, OSError, RuntimeError) as e:
+                self.log.warn(f"Siril 断开连接失败: {e}")
 
 
 if __name__ == "__main__":

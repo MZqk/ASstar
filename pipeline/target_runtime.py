@@ -37,10 +37,10 @@ from save_utils import save_stage_output, write_ai_raw_response, write_stage_jso
 
 try:
     from sirilpy.exceptions import CommandError, DataError, SirilError
-except Exception:
-    CommandError = Exception
-    DataError = Exception
-    SirilError = Exception
+except ImportError:
+    CommandError = RuntimeError
+    DataError = RuntimeError
+    SirilError = RuntimeError
 
 try:
     from image_feature_analyzer import analyze_image as analyze_adaptive_image
@@ -52,7 +52,7 @@ try:
         score_candidate as score_stretch_candidate,
     )
     from target_profiler import build_target_profile
-except Exception:
+except (ImportError, RuntimeError):
     analyze_adaptive_image = None
     DEFAULT_POLICY = {
         "policy_name": "generic_low_snr_safe",
@@ -139,7 +139,7 @@ class TargetRuntimeMixin:
                 f"{stage_label} target_profile={profile.get('target_name_guess') or profile.get('target_type')} "
                 f"policy={new_policy} previous_policy={previous_policy}"
             )
-        except Exception as e:
+        except (OSError, RuntimeError, TypeError, ValueError) as e:
             self.log.warn(f"[{stage_label}] target profile metadata refresh failed: {e}")
             return None
 
@@ -150,7 +150,7 @@ class TargetRuntimeMixin:
         try:
             features = analyze_adaptive_image(image_data)
             return features.to_dict()
-        except Exception as e:
+        except (RuntimeError, TypeError, ValueError, IndexError, FloatingPointError) as e:
             self.log.warn(f"自适应图像特征分析失败: {e}")
             return {}
 
@@ -161,7 +161,7 @@ class TargetRuntimeMixin:
             if image_data is None:
                 return {}
             return self._adaptive_features_from_image(image_data)
-        except Exception as e:
+        except (CommandError, DataError, SirilError, OSError, RuntimeError, TypeError, ValueError) as e:
             self.log.warn(f"当前图像自适应特征读取失败: {e}")
             return {}
 
@@ -231,7 +231,7 @@ class TargetRuntimeMixin:
                 "is_nearly_white": bool(nearly_white),
                 "invalid_dynamic_range": bool(invalid_dynamic),
             }
-        except Exception as e:
+        except (RuntimeError, TypeError, ValueError, IndexError, FloatingPointError) as e:
             return {
                 "error": self._short_text(e, 160),
                 "is_nearly_black": False,
@@ -246,7 +246,7 @@ class TargetRuntimeMixin:
             if image_data is None:
                 raise RuntimeError("image buffer is empty")
             return self._pixel_distribution_stats(image_data)
-        except Exception as e:
+        except (CommandError, DataError, SirilError, OSError, RuntimeError, TypeError, ValueError) as e:
             return {
                 "error": self._short_text(e, 160),
                 "is_nearly_black": False,
