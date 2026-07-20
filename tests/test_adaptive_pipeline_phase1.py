@@ -16,7 +16,9 @@ PIPELINE_DIR = REPO_ROOT / "pipeline"
 if str(PIPELINE_DIR) not in sys.path:
     sys.path.insert(0, str(PIPELINE_DIR))
 
-if "numpy" not in sys.modules:
+try:
+    import numpy  # noqa: F401
+except ImportError:
     fake_numpy = types.ModuleType("numpy")
     fake_numpy.ndarray = object
     fake_numpy.float32 = float
@@ -163,7 +165,24 @@ class AdaptivePipelinePhase1Tests(unittest.TestCase):
 
         self.assertEqual(profile["target_type"], "bright_emission_reflection_nebula")
         self.assertEqual(profile["pipeline"], "bright_nebula_hdr_conservative")
-        self.assertIn("auto_target_hint", ",".join(profile["warnings"]))
+        self.assertIn("auto_target_hint", ",".join(profile["diagnostics"]))
+
+    def test_catalog_visual_difference_is_diagnostic_not_warning(self) -> None:
+        features = AdaptiveImageFeatures(
+            object_area_ratio=0.35,
+            bright_core_score=0.30,
+            nebulosity_area_ratio=0.34,
+            red_dominance=1.22,
+            blue_dominance=1.18,
+        )
+
+        profile = build_target_profile(
+            features,
+            metadata={"OBJCTRA": "05:35:39.735", "OBJCTDEC": "-05:27:33.020"},
+        )
+
+        self.assertIn("catalog_visual_type_resolution", ",".join(profile["diagnostics"]))
+        self.assertEqual(profile["warnings"], [])
 
     def test_dirty_background_forbids_autostretch_final(self) -> None:
         policy = load_policy("bright_nebula_hdr_conservative")

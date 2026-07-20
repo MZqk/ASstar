@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
+
+import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -113,6 +116,9 @@ def _load_pipeline_module():
 
 
 pipeline_module = _load_pipeline_module()
+stage_support_module = sys.modules["stage_support"]
+stage7_star_separation_module = sys.modules["stages.stage7_star_separation"]
+stage7_quality_module = sys.modules["stage7_quality"]
 stage4_color_calibration = pipeline_module.SeestarPostProcessor.stage4_color_calibration
 stage5_linear_denoise = pipeline_module.SeestarPostProcessor.stage5_linear_denoise
 stage2_view_correction = pipeline_module.SeestarPostProcessor.stage2_view_correction
@@ -157,6 +163,20 @@ class FakeProcessor:
         self.work_dir = work_dir
         self.process_dir = work_dir / "process"
         self.process_dir.mkdir(exist_ok=True)
+        catalog_root = work_dir / "catalogs"
+        self.local_gaia_photo_catalog = (
+            catalog_root / "siril_cat1_healpix8_xpsamp"
+        )
+        self.local_gaia_photo_catalog.mkdir(parents=True, exist_ok=True)
+        (
+            self.local_gaia_photo_catalog
+            / "siril_cat1_healpix8_xpsamp_14.dat"
+        ).write_bytes(b"x" * 2048)
+        self.local_gaia_astro_catalog = (
+            catalog_root / "siril_cat_healpix8_astro.dat"
+        )
+        self.local_gaia_astro_catalog.write_bytes(b"x" * 2048)
+        self.spcc_database_dir = REPO_ROOT / "resources" / "siril_spcc_database"
 
         self.cfg = SimpleNamespace(
             denoise_enabled=True,
@@ -416,7 +436,12 @@ class FakeProcessor:
         return True
 
     def _read_fits_header_metadata(self, *_candidates: str):
-        return dict(self.header_metadata)
+        metadata = {
+            "CRVAL1": 303.051891667,
+            "CRVAL2": 38.331575278,
+        }
+        metadata.update(self.header_metadata)
+        return metadata
 
     def _auto_target_hint(self):
         return None
@@ -540,6 +565,150 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         return FakeProcessor(pipeline_module, Path(td.name))
+
+    def _copy_spcc_database(self, processor: FakeProcessor) -> Path:
+        target = processor.work_dir / "siril-spcc-database"
+        shutil.copytree(processor.spcc_database_dir, target)
+        processor.spcc_database_dir = target
+        return target
+
+    def test_stage_review_bundle_skips_visual_request_when_ai_is_disabled(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.log = FakeLogger()
+        processor.cfg.ai_post_enabled = False
+        processor.cfg.ai_advisor_mode = "multimodal"
+        processor.cfg.ai_endpoint = "https://example.invalid/v1/chat/completions"
+        processor.cfg.ai_model = "vision-model"
+        processor.cfg.ai_api_key = "configured-but-disabled"
+        payload = {
+            "status": "ready",
+            "stage": "stage3_background_extraction",
+            "visual_review": {
+                "status": "not_requested",
+                "advisor_mode": "not_requested",
+            },
+            "candidates": [
+                {
+                    "selection_status": "selected",
+                    "visual_acceptance_status": "not_requested",
+                }
+            ],
+        }
+
+        with patch.object(
+            stage_support_module.review_bundle,
+            "create_stage_review_bundle",
+            return_value=payload,
+        ), patch.object(
+            stage_support_module.ai_advisory,
+            "request_visual_acceptance",
+            return_value=None,
+        ) as request_visual_acceptance:
+            result = processor._create_stage_review_bundle(
+                "stage3_background_extraction",
+                "before",
+                "after",
+            )
+
+        request_visual_acceptance.assert_not_called()
+        self.assertEqual(result["visual_review"]["status"], "not_requested")
+        self.assertEqual(result["visual_review"]["advisor_mode"], "not_requested")
+
+    def test_stage_preview_publishes_only_accepted_artifact_pixels(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        work_dir = Path(td.name)
+        process_dir = work_dir / "process"
+        process_dir.mkdir()
+        (process_dir / "stage1_prepared.fit").write_bytes(b"accepted")
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.work_dir = work_dir
+        processor.process_dir = process_dir
+        processor.log = FakeLogger()
+        processor.siril = SimpleNamespace(
+            get_image_pixeldata=lambda preview=False: np.array(
+                [[0.0, 0.25], [0.5, 0.75]],
+                dtype=np.float32,
+            )
+        )
+        commands = []
+        processor.cmd_with_check = lambda *args: commands.append(args)
+
+        processor._publish_stage_preview(1, "前期准备", "ok")
+
+        preview_path = process_dir / "ui_preview" / "latest.png"
+        self.assertTrue(preview_path.is_file())
+        self.assertIn(("load", "stage1_prepared"), commands)
+        self.assertTrue(
+            any(
+                "[PIPELINE_PREVIEW]" in message and '"status":"ready"' in message
+                for level, message in processor.log.events
+                if level == "info"
+            )
+        )
+
+    def test_failed_or_skipped_stage_does_not_publish_preview(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.log = FakeLogger()
+        processor.process_dir = Path("/tmp/unused-preview-test")
+        processor.siril = SimpleNamespace(
+            get_image_pixeldata=lambda preview=False: (_ for _ in ()).throw(
+                AssertionError("failed/skipped stage must not decode")
+            )
+        )
+
+        processor._publish_stage_preview(3, "背景提取", "failed")
+        processor._publish_stage_preview(4, "校色", "skipped")
+
+        self.assertFalse(processor.log.events)
+
+    def test_unexpected_preview_error_cannot_change_stage_result(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.results = []
+        processor.log = FakeLogger()
+        processor._publish_stage_preview = lambda *_args: (_ for _ in ()).throw(
+            AttributeError("mock preview failure")
+        )
+
+        processor._record_stage("阶段 2: 裁切", "ok", 0.2, "accepted")
+
+        self.assertEqual(processor.results[-1].status, "ok")
+        self.assertTrue(
+            any(
+                "预览观察链路异常" in message
+                for level, message in processor.log.events
+                if level == "warn"
+            )
+        )
+
+    def test_record_stage_propagates_summary_only_states_to_gui(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.results = []
+        processor.log = FakeLogger()
+        processor._publish_stage_preview = lambda *_args: None
+
+        processor._record_stage(
+            "阶段 9: 星点处理与合成",
+            "ok",
+            1.2,
+            "fallback_used=true; controlled Screen remix",
+        )
+        processor._record_stage(
+            "阶段 10: 最终降噪与导出",
+            "ok",
+            0.5,
+            "final denoise skipped because input is already low-noise",
+        )
+
+        events = [
+            message
+            for level, message in processor.log.events
+            if level == "info" and "[PIPELINE_STAGE_RESULT]" in message
+        ]
+        self.assertIn("stage=9 status=degraded", events[0])
+        self.assertIn("stage=10 status=skipped", events[1])
+        self.assertEqual(processor.results[0].status, "ok")
+        self.assertEqual(processor.results[1].status, "ok")
 
     def test_stage_output_aliases_follow_display_stage_names(self):
         calls: list[tuple[str, str]] = []
@@ -713,6 +882,165 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertEqual(report["denoise"]["input"], "stage5_deconv")
         self.assertTrue(report["deconvolution"]["runs_before_denoise"])
 
+    def test_stage5_prefers_graxpert_object_deconvolution_when_model_exists(self):
+        processor = self._new_processor()
+        processor.available_scripts.add("processing/GraXpert-AI.py")
+        model = (
+            processor.work_dir
+            / "Library"
+            / "Application Support"
+            / "GraXpert"
+            / "deconvolution-object-ai-models"
+            / "1.0.1"
+            / "model.onnx"
+        )
+        model.parent.mkdir(parents=True)
+        model.write_bytes(b"mock onnx")
+
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": str(processor.work_dir),
+                "SEESTAR_GRAXPERT_OBJECT_MODEL_PATH": "",
+            },
+            clear=False,
+        ):
+            stage5_linear_denoise(processor)
+
+        graxpert_call = next(
+            args
+            for step, _name, args in processor.script_calls
+            if step == "Stage5 GraXpert反卷积"
+        )
+        self.assertIn("-deconv_obj", graxpert_call)
+        self.assertIn("1.0.1", graxpert_call)
+        self.assertNotIn("rl", [str(call[0]) for call in processor.cmd_calls])
+        report = processor.stage_json_reports["stage5_linear_report.json"]
+        self.assertEqual(report["deconvolution"]["method"], "graxpert_object")
+        self.assertEqual(report["denoise"]["input"], "stage5_graxpert_deconv")
+
+    def test_stage5_graxpert_failure_reloads_baseline_then_falls_back_to_rl(self):
+        processor = self._new_processor()
+        processor.available_scripts.add("processing/GraXpert-AI.py")
+        processor.script_fail_steps.add("Stage5 GraXpert反卷积")
+        model = (
+            processor.work_dir
+            / "Library"
+            / "Application Support"
+            / "GraXpert"
+            / "deconvolution-object-ai-models"
+            / "1.0.1"
+            / "model.onnx"
+        )
+        model.parent.mkdir(parents=True)
+        model.write_bytes(b"mock onnx")
+
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": str(processor.work_dir),
+                "SEESTAR_GRAXPERT_OBJECT_MODEL_PATH": "",
+            },
+            clear=False,
+        ):
+            stage5_linear_denoise(processor)
+
+        self.assertIn(("load", "stage5_input_linear"), processor.cmd_calls)
+        self.assertIn("rl", [str(call[0]) for call in processor.cmd_calls])
+        report = processor.stage_json_reports["stage5_linear_report.json"]
+        self.assertEqual(report["deconvolution"]["method"], "siril_rl")
+        self.assertTrue(report["deconvolution"]["graxpert"]["attempted"])
+
+    def test_stage5_links_user_provided_graxpert_model_into_isolated_home(self):
+        processor = self._new_processor()
+        processor.available_scripts.add("processing/GraXpert-AI.py")
+        external_model = (
+            processor.work_dir
+            / "user-models"
+            / "deconvolution-object-ai-models"
+            / "1.0.1"
+            / "model.onnx"
+        )
+        external_model.parent.mkdir(parents=True)
+        external_model.write_bytes(b"user supplied onnx")
+        isolated_home = processor.work_dir / "isolated-home"
+
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": str(isolated_home),
+                "SEESTAR_GRAXPERT_OBJECT_MODEL_PATH": str(external_model.parent.parent),
+            },
+            clear=False,
+        ):
+            stage5_linear_denoise(processor)
+
+        linked_model = (
+            isolated_home
+            / "Library"
+            / "Application Support"
+            / "GraXpert"
+            / "deconvolution-object-ai-models"
+            / "1.0.1"
+            / "model.onnx"
+        )
+        self.assertTrue(linked_model.is_symlink())
+        self.assertEqual(linked_model.resolve(), external_model.resolve())
+        report = processor.stage_json_reports["stage5_linear_report.json"]
+        self.assertEqual(report["deconvolution"]["method"], "graxpert_object")
+        self.assertEqual(
+            report["deconvolution"]["graxpert"]["source"], "user_provided"
+        )
+        self.assertEqual(
+            report["deconvolution"]["graxpert"]["resolved_model_path"],
+            str(linked_model),
+        )
+
+    def test_stage5_invalid_user_model_path_falls_back_to_rl(self):
+        processor = self._new_processor()
+        processor.available_scripts.add("processing/GraXpert-AI.py")
+        missing_model = processor.work_dir / "missing-model"
+
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": str(processor.work_dir / "isolated-home"),
+                "SEESTAR_GRAXPERT_OBJECT_MODEL_PATH": str(missing_model),
+            },
+            clear=False,
+        ):
+            stage5_linear_denoise(processor)
+
+        report = processor.stage_json_reports["stage5_linear_report.json"]
+        graxpert = report["deconvolution"]["graxpert"]
+        self.assertEqual(report["deconvolution"]["method"], "siril_rl")
+        self.assertEqual(graxpert["reason"], "configured_model_not_found_or_invalid")
+        self.assertEqual(graxpert["configured_path"], str(missing_model))
+
+    def test_stage5_rejects_user_model_without_semantic_version_directory(self):
+        processor = self._new_processor()
+        processor.available_scripts.add("processing/GraXpert-AI.py")
+        model = processor.work_dir / "user-model" / "model.onnx"
+        model.parent.mkdir(parents=True)
+        model.write_bytes(b"user supplied onnx")
+
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": str(processor.work_dir / "isolated-home"),
+                "SEESTAR_GRAXPERT_OBJECT_MODEL_PATH": str(model),
+            },
+            clear=False,
+        ):
+            stage5_linear_denoise(processor)
+
+        report = processor.stage_json_reports["stage5_linear_report.json"]
+        graxpert = report["deconvolution"]["graxpert"]
+        self.assertEqual(report["deconvolution"]["method"], "siril_rl")
+        self.assertEqual(
+            graxpert["reason"], "model_version_directory_must_be_semver"
+        )
+
     def test_stage5_rl_failure_reloads_input_before_denoise(self):
         processor = self._new_processor()
         processor.fail_commands.add("rl")
@@ -729,10 +1057,21 @@ class PipelinePluginFallbackTests(unittest.TestCase):
     def test_stage7_prefers_final_stage5_linear_over_deconv_checkpoint(self):
         processor = self._new_processor()
         (processor.process_dir / "stage5_deconv.fit").write_bytes(b"mock")
+        (processor.process_dir / "stage5_graxpert_deconv.fit").write_bytes(b"mock")
         (processor.process_dir / "stage5_linear.fit").write_bytes(b"mock")
         stage7_module = sys.modules["stages.stage7_star_separation"]
 
         self.assertEqual(stage7_module._stage7_linear_source(processor), "stage5_linear")
+
+    def test_stage7_uses_graxpert_checkpoint_when_final_stage5_outputs_are_missing(self):
+        processor = self._new_processor()
+        (processor.process_dir / "stage5_graxpert_deconv.fit").write_bytes(b"mock")
+        stage7_module = sys.modules["stages.stage7_star_separation"]
+
+        self.assertEqual(
+            stage7_module._stage7_linear_source(processor),
+            "stage5_graxpert_deconv",
+        )
 
     def test_stage5_skips_classic_cosmic_clarity_without_executable(self):
         processor = self._new_processor()
@@ -927,17 +1266,380 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         _name, status, _dur, message = processor.results[-1]
         self.assertEqual(status, "ok")
-        self.assertIn("platesolve -focal=160 -pixelsize=2.90 -catalog=gaia -order=3 ok", message)
+        self.assertIn(
+            "platesolve -noflip -focal=160 -pixelsize=2.90 "
+            "-catalog=gaia -order=3 ok",
+            message,
+        )
         cmds = [str(call[0]) for call in processor.cmd_calls]
         self.assertIn("platesolve", cmds)
         platesolve_calls = [call for call in processor.cmd_calls if call[0] == "platesolve"]
         self.assertEqual(
             platesolve_calls[0],
-            ("platesolve", "-focal=160", "-pixelsize=2.90", "-catalog=gaia", "-order=3"),
+            (
+                "platesolve",
+                "-noflip",
+                "-focal=160",
+                "-pixelsize=2.90",
+                "-catalog=gaia",
+                "-order=3",
+            ),
         )
         self.assertIn("spcc", cmds)
+        self.assertIn(("spcc_list", "whiteref"), processor.cmd_calls)
+        spcc_call = next(call for call in processor.cmd_calls if call[0] == "spcc")
+        self.assertIn("-catalog=localgaia", spcc_call)
+        self.assertEqual(processor.color_calibration_report["spcc"]["catalog"], "localgaia")
+        metadata_report = processor.color_calibration_report["spcc"]["metadata_database"]
+        self.assertTrue(metadata_report["available"])
+        self.assertEqual(metadata_report["reason"], "ok")
+        self.assertTrue(all(item["found"] for item in metadata_report["requirements"]))
         self.assertNotIn("cc", cmds)
         self.assertFalse({"mirrorx", "mirrory", "flip", "rotate"} & set(cmds))
+
+    def test_stage4_imprecise_spcc_log_restores_psolved_and_uses_pcc(self):
+        processor = self._new_processor()
+        before = "existing Siril log\n"
+        warning = (
+            "The photometric color calibration seems to have found an imprecise "
+            "solution, consider correcting the image gradient first\n"
+        )
+        snapshots = iter((before, before + warning))
+        processor.siril = SimpleNamespace(
+            get_image_shape=lambda: processor.image_shape,
+            get_siril_log=lambda: next(snapshots),
+        )
+
+        stage4_color_calibration(processor)
+
+        spcc_index = next(
+            index for index, call in enumerate(processor.cmd_calls) if call[0] == "spcc"
+        )
+        restore_index = processor.cmd_calls.index(("load", "stage4_psolved"), spcc_index)
+        pcc_index = next(
+            index for index, call in enumerate(processor.cmd_calls) if call[0] == "pcc"
+        )
+        self.assertLess(spcc_index, restore_index)
+        self.assertLess(restore_index, pcc_index)
+        report = processor.color_calibration_report
+        self.assertEqual(report["method"], "PCC")
+        self.assertEqual(report["warning"], "spcc_imprecise_solution_pcc_fallback")
+        self.assertEqual(report["color_confidence"], 0.62)
+        self.assertEqual(report["status"], "success_with_warning")
+        solution = report["spcc"]["solution_quality"]
+        self.assertEqual(solution["status"], "imprecise")
+        self.assertTrue(solution["imprecise"])
+        self.assertTrue(solution["fallback_triggered"])
+        self.assertTrue(solution["fallback_source_restored"])
+        self.assertEqual(solution["confidence"], 0.45)
+        self.assertIn("imprecise solution", solution["matched_messages"][0])
+        self.assertEqual(
+            report["pcc"]["attempts"][0]["phase"],
+            "spcc_imprecise_recovery",
+        )
+
+    def test_stage4_spcc_imprecise_detector_recognizes_chinese_log_delta(self):
+        stage4_module = sys.modules["stages.stage4_color_calibration"]
+        before = "旧日志\n"
+        after = before + "测光法色彩校准似乎不能精确校准，考虑先修正图像渐变\n"
+
+        report = stage4_module._stage4_spcc_solution_quality(before, after)
+
+        self.assertEqual(report["status"], "imprecise")
+        self.assertTrue(report["imprecise"])
+        self.assertEqual(report["warning_code"], "spcc_imprecise_solution")
+        self.assertEqual(report["confidence"], 0.45)
+
+    def test_stage4_spcc_imprecise_detector_ignores_warning_from_old_log(self):
+        stage4_module = sys.modules["stages.stage4_color_calibration"]
+        warning = (
+            "The photometric color calibration seems to have found an imprecise "
+            "solution, consider correcting the image gradient first\n"
+        )
+        before = warning + "old command finished\n"
+        after = before + "Spectrophotometric Color Calibration succeeded.\n"
+
+        report = stage4_module._stage4_spcc_solution_quality(before, after)
+
+        self.assertEqual(report["status"], "accepted")
+        self.assertFalse(report["imprecise"])
+        self.assertFalse(report["matched_messages"])
+
+    def test_stage4_imprecise_spcc_restore_failure_keeps_degraded_result(self):
+        processor = self._new_processor()
+        before = "existing Siril log\n"
+        warning = (
+            "The photometric color calibration seems to have found an imprecise "
+            "solution, consider correcting the image gradient first\n"
+        )
+        snapshots = iter((before, before + warning))
+        processor.siril = SimpleNamespace(
+            get_image_shape=lambda: processor.image_shape,
+            get_siril_log=lambda: next(snapshots),
+        )
+        original_cmd = processor.cmd_with_check
+
+        def fail_recovery_load(*args: Any, quiet: bool = False):
+            if args == ("load", "stage4_psolved"):
+                processor.cmd_calls.append(args)
+                raise processor.module.CommandError("mock recovery load failure")
+            return original_cmd(*args, quiet=quiet)
+
+        processor.cmd_with_check = fail_recovery_load
+
+        stage4_color_calibration(processor)
+
+        report = processor.color_calibration_report
+        self.assertEqual(processor.results[-1][1], "degraded")
+        self.assertEqual(report["method"], "SPCC_IMPRECISE")
+        self.assertEqual(report["color_confidence"], 0.45)
+        self.assertEqual(report["status"], "success_with_warning")
+        self.assertEqual(
+            report["warning"],
+            "spcc_imprecise_solution_restore_failed",
+        )
+        self.assertFalse(
+            report["spcc"]["solution_quality"]["fallback_source_restored"]
+        )
+        self.assertFalse(any(call[0] == "pcc" for call in processor.cmd_calls))
+
+    def test_stage4_all_platesolve_variants_disable_orientation_flip(self):
+        stage4_module = sys.modules["stages.stage4_color_calibration"]
+        processor = self._new_processor()
+
+        variants = stage4_module._stage4_platesolve_variants(
+            processor,
+            {"RA": 10.0, "DEC": 20.0},
+        )
+
+        self.assertTrue(variants)
+        for _label, args in variants:
+            self.assertIn("-noflip", args)
+
+    def test_cmd_with_check_treats_closed_connection_as_fatal_without_retry(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.log = FakeLogger()
+        calls: list[tuple[Any, ...]] = []
+
+        def dead_cmd(*args: Any) -> None:
+            calls.append(args)
+            raise pipeline_module.SirilConnectionError("connection closed by Siril")
+
+        processor.siril = SimpleNamespace(cmd=dead_cmd)
+
+        with self.assertRaises(pipeline_module.SirilNativeProcessTerminated):
+            processor.cmd_with_check("spcc")
+
+        self.assertTrue(processor._siril_process_terminated)
+        self.assertEqual(calls, [("spcc",)])
+        with self.assertRaises(pipeline_module.SirilNativeProcessTerminated):
+            processor.cmd_with_check("pcc")
+        self.assertEqual(calls, [("spcc",)])
+
+    def test_direct_siril_api_connection_death_uses_same_fatal_fuse(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.log = FakeLogger()
+        processor._siril_ever_connected = True
+        calls: list[str] = []
+
+        def dead_pixel_read(*_args: Any, **_kwargs: Any):
+            calls.append("get_image_pixeldata")
+            raise pipeline_module.SirilConnectionError("broken pipe")
+
+        processor.siril = pipeline_module._FatalSirilInterfaceProxy(
+            processor,
+            SimpleNamespace(get_image_pixeldata=dead_pixel_read),
+        )
+
+        with self.assertRaises(pipeline_module.SirilNativeProcessTerminated):
+            processor.siril.get_image_pixeldata(preview=False)
+        with self.assertRaises(pipeline_module.SirilNativeProcessTerminated):
+            processor.siril.get_image_pixeldata(preview=False)
+
+        self.assertEqual(calls, ["get_image_pixeldata"])
+
+    def test_stage4_native_death_skips_cpu_restore_pcc_save_and_completion(self):
+        processor = self._new_processor()
+        original_cmd_with_check = processor.cmd_with_check
+        saved_stems: list[str] = []
+
+        def fatal_spcc(*args: Any, quiet: bool = False):
+            if args and args[0] == "spcc":
+                processor.cmd_calls.append(args)
+                processor._siril_process_terminated = True
+                raise pipeline_module.SirilNativeProcessTerminated(
+                    "spcc",
+                    pipeline_module.SirilConnectionError("connection closed"),
+                )
+            return original_cmd_with_check(*args, quiet=quiet)
+
+        processor.cmd_with_check = fatal_spcc
+        processor._save_stage_output = lambda stem: saved_stems.append(stem) or True
+
+        with self.assertRaises(pipeline_module.SirilNativeProcessTerminated):
+            stage4_color_calibration(processor)
+
+        cmds = [str(call[0]) for call in processor.cmd_calls]
+        self.assertEqual(
+            [call for call in processor.cmd_calls if call[0] == "setcpu"],
+            [("setcpu", "1")],
+        )
+        self.assertNotIn("pcc", cmds)
+        self.assertIn("stage4_psolved", saved_stems)
+        self.assertNotIn("stage4_color", saved_stems)
+        self.assertFalse(processor.results)
+        self.assertFalse(
+            any(level == "stage_end" for level, _message in processor.log.events)
+        )
+
+    def test_stage4_skips_all_spcc_commands_when_sensor_is_not_in_database(self):
+        processor = self._new_processor()
+        processor.cfg.stage4_spcc_osc_sensor = "Unsupported OSC sensor"
+
+        stage4_color_calibration(processor)
+
+        cmds = [str(call[0]) for call in processor.cmd_calls]
+        self.assertNotIn("spcc_list", cmds)
+        self.assertNotIn("spcc", cmds)
+        self.assertIn("pcc", cmds)
+        report = processor.color_calibration_report["spcc"]["metadata_database"]
+        self.assertEqual(report["reason"], "required_metadata_missing")
+        self.assertIn("osc_sensor=Unsupported OSC sensor", report["missing"])
+
+    def test_stage4_skips_all_spcc_commands_when_filter_is_not_in_database(self):
+        processor = self._new_processor()
+        processor.cfg.stage4_spcc_osc_filter = "Unsupported OSC filter"
+
+        stage4_color_calibration(processor)
+
+        cmds = [str(call[0]) for call in processor.cmd_calls]
+        self.assertNotIn("spcc_list", cmds)
+        self.assertNotIn("spcc", cmds)
+        self.assertIn("pcc", cmds)
+        report = processor.color_calibration_report["spcc"]["metadata_database"]
+        self.assertIn("osc_filter=Unsupported OSC filter", report["missing"])
+
+    def test_stage4_skips_all_spcc_commands_when_selected_json_is_invalid(self):
+        processor = self._new_processor()
+        database = self._copy_spcc_database(processor)
+        (database / "osc_sensors" / "Sony_IMX585.json").write_text(
+            "{invalid-json",
+            encoding="utf-8",
+        )
+
+        stage4_color_calibration(processor)
+
+        cmds = [str(call[0]) for call in processor.cmd_calls]
+        self.assertNotIn("spcc_list", cmds)
+        self.assertNotIn("spcc", cmds)
+        self.assertIn("pcc", cmds)
+        report = processor.color_calibration_report["spcc"]["metadata_database"]
+        self.assertEqual(report["reason"], "invalid_metadata_json")
+        self.assertTrue(report["invalid_json_files"])
+
+    def test_stage4_skips_all_spcc_commands_when_selected_json_array_is_empty(self):
+        processor = self._new_processor()
+        database = self._copy_spcc_database(processor)
+        (database / "osc_filters" / "ZWO_Seestar_LP.json").write_text(
+            "[]\n",
+            encoding="utf-8",
+        )
+
+        stage4_color_calibration(processor)
+
+        cmds = [str(call[0]) for call in processor.cmd_calls]
+        self.assertNotIn("spcc_list", cmds)
+        self.assertNotIn("spcc", cmds)
+        self.assertIn("pcc", cmds)
+        report = processor.color_calibration_report["spcc"]["metadata_database"]
+        self.assertEqual(report["reason"], "empty_metadata_json_array")
+        self.assertIn("osc_filters/ZWO_Seestar_LP.json", report["empty_json_files"])
+
+    def test_stage4_skips_all_spcc_commands_when_response_arrays_are_empty(self):
+        processor = self._new_processor()
+        database = self._copy_spcc_database(processor)
+        (database / "osc_filters" / "ZWO_Seestar_LP.json").write_text(
+            '[{"name":"ZWO Seestar LP","type":"OSC_FILTER",'
+            '"wavelength":{"value":[]},"values":{"value":[]}}]\n',
+            encoding="utf-8",
+        )
+
+        stage4_color_calibration(processor)
+
+        cmds = [str(call[0]) for call in processor.cmd_calls]
+        self.assertNotIn("spcc_list", cmds)
+        self.assertNotIn("spcc", cmds)
+        self.assertIn("pcc", cmds)
+        report = processor.color_calibration_report["spcc"]["metadata_database"]
+        self.assertEqual(report["reason"], "invalid_metadata_response_arrays")
+        self.assertTrue(report["invalid_entry_files"])
+
+    def test_stage4_skips_spcc_before_siril_when_catalog_is_empty(self):
+        processor = self._new_processor()
+        for path in processor.local_gaia_photo_catalog.glob("*.dat"):
+            path.unlink()
+
+        stage4_color_calibration(processor)
+
+        cmds = [str(call[0]) for call in processor.cmd_calls]
+        self.assertNotIn("spcc", cmds)
+        self.assertIn("pcc", cmds)
+        report = processor.color_calibration_report["spcc"]["local_catalog"]
+        self.assertFalse(report["available"])
+        self.assertEqual(report["reason"], "no_valid_catalog_chunks")
+        _name, _status, _dur, message = processor.results[-1]
+        self.assertIn("SPCC skipped before Siril call", message)
+
+    def test_stage4_skips_spcc_when_target_healpix_is_not_installed(self):
+        processor = self._new_processor()
+        chunk14 = (
+            processor.local_gaia_photo_catalog
+            / "siril_cat1_healpix8_xpsamp_14.dat"
+        )
+        chunk14.rename(
+            processor.local_gaia_photo_catalog
+            / "siril_cat1_healpix8_xpsamp_13.dat"
+        )
+
+        stage4_color_calibration(processor)
+
+        cmds = [str(call[0]) for call in processor.cmd_calls]
+        self.assertNotIn("spcc", cmds)
+        self.assertIn("pcc", cmds)
+        report = processor.color_calibration_report["spcc"]["local_catalog"]
+        self.assertEqual(report["reason"], "target_healpix_not_installed")
+        self.assertIn(14, report["required_pixels"])
+        self.assertIn(14, report["missing_pixels"])
+
+    def test_stage4_pcc_skips_missing_localgaia_and_uses_explicit_online_catalog(self):
+        processor = self._new_processor()
+        processor.local_gaia_astro_catalog.unlink()
+        processor.fail_commands.add("spcc")
+
+        with patch.dict(os.environ, {"SEESTAR_NETWORK_MODE": "1"}):
+            stage4_color_calibration(processor)
+
+        pcc_calls = [call for call in processor.cmd_calls if call[0] == "pcc"]
+        self.assertEqual(pcc_calls, [("pcc", "-catalog=gaia")])
+        local_attempt = processor.color_calibration_report["pcc"]["attempts"][0]
+        self.assertEqual(local_attempt["label"], "catalog:localgaia")
+        self.assertEqual(local_attempt["status"], "skipped")
+        self.assertIn("local Gaia astrometric catalog unavailable", local_attempt["error"])
+
+    def test_stage4_offline_pcc_uses_installed_local_astrometric_catalog_only(self):
+        processor = self._new_processor()
+        processor.fail_commands.add("spcc")
+
+        with patch.dict(os.environ, {"SEESTAR_NETWORK_MODE": "0"}):
+            stage4_color_calibration(processor)
+
+        pcc_calls = [call for call in processor.cmd_calls if call[0] == "pcc"]
+        self.assertEqual(pcc_calls, [("pcc", "-catalog=localgaia")])
+        platesolve_calls = [
+            call for call in processor.cmd_calls if call[0] == "platesolve"
+        ]
+        self.assertTrue(platesolve_calls)
+        self.assertIn("-catalog=localgaia", platesolve_calls[0])
 
     def test_stage4_wraps_spcc_with_single_thread_setcpu_guard(self):
         processor = self._new_processor()
@@ -969,6 +1671,27 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertNotIn("platesolve", cmds)
         self.assertNotIn("spcc", cmds)
         self.assertNotIn("pcc", cmds)
+
+    def test_stage4_psolved_resume_reuses_wcs_and_runs_pcc_without_platesolve(self):
+        processor = self._new_processor()
+        processor._stage1_input_mode = "stage4_psolved_resume"
+        processor.cfg.spcc_enabled = False
+        saved_stems: list[str] = []
+        processor._save_stage_output = lambda stem: saved_stems.append(stem) or True
+
+        stage4_color_calibration(processor)
+
+        cmds = [str(call[0]) for call in processor.cmd_calls]
+        self.assertIn(("load", "stage4_psolved"), processor.cmd_calls)
+        self.assertNotIn("platesolve", cmds)
+        self.assertNotIn("spcc", cmds)
+        self.assertIn("pcc", cmds)
+        self.assertNotIn("stage4_psolved", saved_stems)
+        self.assertIn("stage4_color", saved_stems)
+        report = processor.color_calibration_report
+        self.assertEqual(report["input"], "stage4_psolved")
+        self.assertFalse(report["platesolve"]["attempted"])
+        self.assertTrue(report["platesolve"]["ok"])
 
     def test_stage4_uses_average_spiral_white_ref_and_lp_filter_by_default(self):
         processor = self._new_processor()
@@ -1067,7 +1790,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertTrue(processor.color_calibration_report["spcc"]["narrowband"])
         self.assertEqual(processor.color_calibration_report["spcc"]["osc_filter"], "")
 
-    def test_stage4_explicit_white_ref_overrides_emission_nebula_profile(self):
+    def test_stage4_rejects_explicit_white_ref_missing_from_database(self):
         processor = self._new_processor()
         processor.cfg.stage4_platesolve_enabled = True
         processor.target_profile = {"target_type": "emission_nebula_widefield"}
@@ -1075,10 +1798,12 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         stage4_color_calibration(processor)
 
-        spcc_calls = [call for call in processor.cmd_calls if call[0] == "spcc"]
-        self.assertTrue(spcc_calls)
-        self.assertIn('"-whiteref=Photon Flux"', spcc_calls[0])
-        self.assertNotIn('"-whiteref=Star, type G2(v)"', spcc_calls[0])
+        cmds = [str(call[0]) for call in processor.cmd_calls]
+        self.assertNotIn("spcc_list", cmds)
+        self.assertNotIn("spcc", cmds)
+        self.assertIn("pcc", cmds)
+        report = processor.color_calibration_report["spcc"]["metadata_database"]
+        self.assertIn("white_reference=Photon Flux", report["missing"])
 
     def test_stage4_target_aware_white_ref_does_not_retry_average_galaxy(self):
         processor = self._new_processor()
@@ -1547,12 +2272,54 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         self.assertEqual(adaptation["mode"], "extreme_low_background")
         self.assertEqual(candidates[0]["name"], "cand_a")
-        self.assertAlmostEqual(candidates[0]["params"]["asinh_stretch"], 1.5)
-        self.assertAlmostEqual(candidates[0]["params"]["asinh_offset"], 0.008)
+        self.assertAlmostEqual(candidates[0]["params"]["asinh_stretch"], 2.4)
+        self.assertAlmostEqual(candidates[0]["params"]["asinh_offset"], 0.001)
         self.assertEqual(candidates[1]["name"], "cand_b")
-        self.assertAlmostEqual(candidates[1]["params"]["asinh_stretch"], 1.6)
-        self.assertAlmostEqual(candidates[1]["params"]["asinh_offset"], 0.007)
+        self.assertAlmostEqual(candidates[1]["params"]["asinh_stretch"], 2.2)
+        self.assertAlmostEqual(candidates[1]["params"]["asinh_offset"], 0.0005)
         self.assertLessEqual(candidates[1]["params"]["ghs_stretchamount"], 1.01)
+
+    def test_stage7_preview_target_attainment_enforces_brightness_band(self):
+        stage6_services = sys.modules["stage6_services"]
+        adaptation = {
+            "preview_calibration": {
+                "candidate_a": {
+                    "target_p50": 0.09990,
+                    "calibrated_stretch": 1000.0,
+                    "stretch_max": 1000.0,
+                    "predicted_p50": 0.0388,
+                },
+                "candidate_b": {
+                    "target_p50": 0.06882,
+                    "calibrated_stretch": 850.0,
+                    "stretch_max": 1000.0,
+                    "predicted_p50": 0.06882,
+                },
+            }
+        }
+
+        dark = stage6_services._stage7_preview_target_attainment(
+            "cand_a", {"p50": 0.04007}, adaptation
+        )
+        balanced = stage6_services._stage7_preview_target_attainment(
+            "cand_a", {"p50": 0.11880}, adaptation
+        )
+        overbright = stage6_services._stage7_preview_target_attainment(
+            "cand_b", {"p50": 0.26384}, adaptation
+        )
+
+        self.assertFalse(dark["accepted"])
+        self.assertTrue(dark["stretch_saturated"])
+        self.assertIn("preview_target_p50_ratio", dark["issues"][0])
+        self.assertTrue(balanced["accepted"])
+        self.assertAlmostEqual(balanced["attainment_ratio"], 1.189189, places=5)
+        self.assertFalse(overbright["accepted"])
+        self.assertAlmostEqual(overbright["attainment_ratio"], 3.833769, places=5)
+        self.assertEqual(overbright["maximum_ratio"], 1.50)
+        self.assertIn(
+            "preview_target_p50_ratio_above_max",
+            overbright["issues"][0],
+        )
 
     def test_stage7_compact_stretch_caps_offset_below_low_signal_starless(self):
         processor = self._new_processor()
@@ -1566,16 +2333,108 @@ class PipelinePluginFallbackTests(unittest.TestCase):
                 processor,
                 pipeline_module.QualityMetrics(bg_median=0.002),
                 {"bg_std": 0.00005},
-                {"p99": 0.00224, "max": 0.00298},
+                {"p01": 0.00080, "p99": 0.00224, "max": 0.00298},
             )
         )
 
         self.assertEqual(adaptation["mode"], "extreme_low_background")
         self.assertIn("offset_cap", adaptation)
-        self.assertAlmostEqual(candidates[0]["params"]["asinh_offset"], 0.0019, places=4)
-        self.assertAlmostEqual(candidates[1]["params"]["asinh_offset"], 0.0019, places=4)
-        self.assertLess(candidates[0]["params"]["asinh_offset"], 0.00224)
-        self.assertLess(candidates[1]["params"]["asinh_offset"], 0.00224)
+        self.assertAlmostEqual(candidates[0]["params"]["asinh_offset"], 0.00064, places=6)
+        self.assertAlmostEqual(candidates[1]["params"]["asinh_offset"], 0.00050, places=6)
+        self.assertLess(candidates[0]["params"]["asinh_offset"], 0.002)
+        self.assertLess(candidates[1]["params"]["asinh_offset"], 0.002)
+
+    def test_stage7_compact_stretch_uses_safe_offset_for_sh2_296_statistics(self):
+        processor = self._new_processor()
+        processor._stage7_baseline_background_stats = types.MethodType(
+            pipeline_module.SeestarPostProcessor._stage7_baseline_background_stats,
+            processor,
+        )
+
+        candidates, adaptation = (
+            pipeline_module.SeestarPostProcessor._stage7_compact_stretch_candidates(
+                processor,
+                pipeline_module.QualityMetrics(bg_median=0.0004478424),
+                {"bg_std": 0.0000242532},
+                {
+                    "p01": 0.0002327696,
+                    "p99": 0.0013253181,
+                    "max": 0.0273016952,
+                },
+            )
+        )
+
+        self.assertEqual(adaptation["mode"], "extreme_low_background")
+        self.assertAlmostEqual(candidates[0]["params"]["asinh_offset"], 0.000186, places=6)
+        self.assertAlmostEqual(candidates[1]["params"]["asinh_offset"], 0.000112, places=6)
+        self.assertLess(candidates[0]["params"]["asinh_offset"], 0.0004478424)
+        self.assertLess(candidates[1]["params"]["asinh_offset"], 0.0004478424)
+
+    def test_stage7_preview_ref_calibrates_sh2_296_asinh_strength(self):
+        processor = self._new_processor()
+        processor._stage7_baseline_background_stats = types.MethodType(
+            pipeline_module.SeestarPostProcessor._stage7_baseline_background_stats,
+            processor,
+        )
+
+        candidates, adaptation = (
+            pipeline_module.SeestarPostProcessor._stage7_compact_stretch_candidates(
+                processor,
+                pipeline_module.QualityMetrics(bg_median=0.0004478424),
+                {"bg_std": 0.0000242532},
+                {
+                    "p01": 0.0002327696,
+                    "p50": 0.0004245928,
+                    "p99": 0.0013253181,
+                    "max": 0.0273016952,
+                },
+                {
+                    "p50": 0.124821,
+                    "p99": 0.800000,
+                },
+            )
+        )
+
+        calibration = adaptation["preview_calibration"]
+        self.assertEqual(calibration["source"], "stage7_preview_ref")
+        self.assertEqual(candidates[0]["params"]["asinh_stretch"], 1000.0)
+        self.assertGreater(candidates[1]["params"]["asinh_stretch"], 100.0)
+        self.assertLess(candidates[1]["params"]["asinh_stretch"], 1000.0)
+        self.assertGreaterEqual(
+            calibration["candidate_a"]["predicted_p50"],
+            0.025,
+        )
+        self.assertLessEqual(
+            calibration["candidate_b"]["predicted_p99"],
+            calibration["candidate_b"]["target_p99"],
+        )
+
+    def test_stage7_preview_calibration_can_be_disabled(self):
+        processor = self._new_processor()
+        processor.cfg.stage7_preview_calibration_enabled = False
+        processor._stage7_baseline_background_stats = types.MethodType(
+            pipeline_module.SeestarPostProcessor._stage7_baseline_background_stats,
+            processor,
+        )
+
+        candidates, adaptation = (
+            pipeline_module.SeestarPostProcessor._stage7_compact_stretch_candidates(
+                processor,
+                pipeline_module.QualityMetrics(bg_median=0.0004478424),
+                {"bg_std": 0.0000242532},
+                {
+                    "p01": 0.0002327696,
+                    "p50": 0.0004245928,
+                    "p99": 0.0013253181,
+                    "max": 0.0273016952,
+                },
+                {"p50": 0.124821, "p99": 0.800000},
+            )
+        )
+
+        self.assertNotIn("preview_calibration", adaptation)
+        self.assertEqual(candidates[0]["params"]["asinh_stretch"], 2.4)
+        self.assertEqual(candidates[1]["params"]["asinh_stretch"], 2.2)
 
     def test_stage7_compact_stretch_keeps_default_for_normal_background(self):
         processor = self._new_processor()
@@ -1598,6 +2457,79 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             {"asinh_stretch": 2.2, "asinh_offset": 0.002},
         )
         self.assertEqual(candidates[1]["params"]["asinh_offset"], 0.002)
+
+    def test_stage7_compact_stretch_restores_bright_nebula_target_profile(self):
+        processor = self._new_processor()
+        processor._active_target_type = lambda: "bright_emission_reflection_nebula"
+        processor.pipeline_policy = {
+            "policy_name": "bright_nebula_hdr_conservative",
+            "stage6_stretch": {
+                "candidate_mode": ["bright_nebula_hdr_masked", "asinh_core_protect"]
+            },
+        }
+        processor._stage7_baseline_background_stats = types.MethodType(
+            pipeline_module.SeestarPostProcessor._stage7_baseline_background_stats,
+            processor,
+        )
+
+        candidates, adaptation = (
+            pipeline_module.SeestarPostProcessor._stage7_compact_stretch_candidates(
+                processor,
+                pipeline_module.QualityMetrics(bg_median=0.020),
+                {},
+            )
+        )
+
+        self.assertEqual(adaptation["target_aware"]["name"], "bright_core_protect")
+        self.assertEqual(candidates[0]["method"], "bright_nebula_hdr_masked")
+        self.assertLess(candidates[0]["params"]["asinh_stretch"], 2.2)
+        self.assertAlmostEqual(candidates[0]["params"]["core_protection"], 0.72)
+        self.assertLessEqual(candidates[1]["params"]["ghs_stretchamount"], 1.0)
+
+    def test_stage7_compact_stretch_uses_asinh_only_for_star_preserve_targets(self):
+        processor = self._new_processor()
+        processor._active_target_type = lambda: "open_cluster"
+        processor.pipeline_policy = {
+            "policy_name": "open_cluster_color_preserve",
+            "stage6_stretch": {"candidate_mode": ["star_color_preserving_stretch"]},
+        }
+        processor._stage7_baseline_background_stats = types.MethodType(
+            pipeline_module.SeestarPostProcessor._stage7_baseline_background_stats,
+            processor,
+        )
+
+        candidates, adaptation = (
+            pipeline_module.SeestarPostProcessor._stage7_compact_stretch_candidates(
+                processor,
+                pipeline_module.QualityMetrics(bg_median=0.020),
+                {},
+            )
+        )
+
+        self.assertEqual(adaptation["target_aware"]["name"], "star_colour_preserve")
+        self.assertEqual([item["method"] for item in candidates], ["asinh", "asinh"])
+        self.assertLess(candidates[1]["params"]["asinh_stretch"], 2.1)
+
+    def test_stage7_target_aware_stretch_can_be_disabled(self):
+        processor = self._new_processor()
+        processor.cfg.stage7_target_aware_stretch_enabled = False
+        processor._active_target_type = lambda: "dark_nebula_low_contrast"
+        processor._stage7_baseline_background_stats = types.MethodType(
+            pipeline_module.SeestarPostProcessor._stage7_baseline_background_stats,
+            processor,
+        )
+
+        candidates, adaptation = (
+            pipeline_module.SeestarPostProcessor._stage7_compact_stretch_candidates(
+                processor,
+                pipeline_module.QualityMetrics(bg_median=0.020),
+                {},
+            )
+        )
+
+        self.assertFalse(adaptation["target_aware"]["enabled"])
+        self.assertEqual(candidates[0]["method"], "asinh")
+        self.assertEqual(candidates[0]["params"]["asinh_stretch"], 2.2)
 
     def test_stage8_applies_blue_guard_when_starless_layer_is_too_blue(self):
         processor = self._new_processor()
@@ -1695,6 +2627,57 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertIn("fallback_status=success", message)
         self.assertIn("final_denoise_effective=SASP Aberration API", message)
         self.assertIn("effective_status=success", message)
+
+    def test_stage10_color_dominant_input_uses_chroma_plan_with_full_model(self):
+        processor = self._new_processor()
+        (processor.process_dir / "stage9_remixed.fit").write_bytes(b"mock")
+        processor.available_scripts.add("processing/CosmicClarity_Denoise.py")
+        pixels = np.full((3, 32, 32), 0.05, dtype=np.float32)
+        processor.siril.get_image_pixeldata = lambda preview=False: pixels
+        processor._background_quality_metrics = lambda _image: {
+            "chroma_noise_score": 0.431,
+            "bg_std": 0.003,
+            "background_mottling_score": 0.144,
+        }
+        processor._set_current_image_pixeldata = lambda _image, **_kwargs: None
+
+        stage10_export(processor)
+
+        denoise_calls = [
+            call for call in processor.script_calls if call[1] == "CosmicClarity_Denoise.py"
+        ]
+        self.assertTrue(denoise_calls)
+        args = denoise_calls[0][2]
+        mode_index = args.index("-denoising_mode") + 1
+        self.assertEqual(args[mode_index], "full")
+        report = processor.stage_json_reports["stage10_denoise_plan.json"]
+        self.assertEqual(report["selected_mode"], "chroma")
+        self.assertEqual(report["effective_mode"], "chroma")
+
+    def test_stage10_low_noise_input_skips_expensive_denoiser(self):
+        processor = self._new_processor()
+        (processor.process_dir / "stage9_remixed.fit").write_bytes(b"mock")
+        processor.available_scripts.add("processing/CosmicClarity_Denoise.py")
+        pixels = np.full((3, 32, 32), 0.05, dtype=np.float32)
+        processor.siril.get_image_pixeldata = lambda preview=False: pixels
+        processor._background_quality_metrics = lambda _image: {
+            "chroma_noise_score": 0.058,
+            "bg_std": 0.00084,
+            "background_mottling_score": 0.031,
+        }
+
+        stage10_export(processor)
+
+        self.assertFalse(
+            any(step == "最终降噪" for step, _name, _args in processor.script_calls)
+        )
+        report = processor.stage_json_reports["stage10_denoise_plan.json"]
+        self.assertEqual(report["selected_mode"], "skip")
+        self.assertEqual(report["effective_status"], "skipped_safe")
+        self.assertTrue(report["skipped_by_low_noise_guard"])
+        self.assertFalse(report["skipped_by_review_only"])
+        self.assertFalse(report["skipped_by_duplicate_guard"])
+        self.assertIn("Stage10 low-noise guard", processor.results[-1][3])
 
     def test_stage10_script_failure_prefers_scunet_command_fallback(self):
         processor = self._new_processor()
@@ -1860,6 +2843,761 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertIn("Starless 后特征", message)
         self.assertIn("object_area=0.330", message)
 
+    def test_stage8_conservative_skip_status_survives_additional_guard_reasons(self):
+        processor = self._new_processor()
+        processor.cfg.stage8_masked_enhancement_enabled = True
+        processor._stage8_conservative_mode = True
+        processor._stage8_input_enhancement_guard = lambda: {
+            "skip_enhancement": True,
+            "conservative_mode": True,
+            "status": "skipped",
+            "final_quality": "skipped",
+            "reasons": [
+                "stage8_conservative_mode_after_stage7_starless_repair",
+                "stage7_quality_status=poor",
+            ],
+        }
+
+        stage8_nebula_enhancement(processor)
+
+        self.assertEqual(processor._stage8_final_quality, "conservative_skipped")
+        report = processor.stage_json_reports["stage8_enhancement_report.json"]
+        quality = processor.stage_json_reports["stage8_quality.json"]
+        self.assertEqual(report["status"], "conservative_skipped")
+        self.assertEqual(report["final_quality"], "conservative_skipped")
+        self.assertEqual(quality["initial"]["status"], "conservative_skipped")
+        self.assertEqual(quality["final"]["final_quality"], "conservative_skipped")
+
+    def test_final_quality_recognizes_stage8_conservative_skip(self):
+        probe = SimpleNamespace(
+            _stage8_final_quality="conservative_skipped",
+            _stage8_fallback_used=True,
+            _stage9_bypassed_bad_starless=False,
+            _read_image_by_stem=lambda _stem: object(),
+            _background_quality_metrics=lambda _image: {
+                "chroma_noise_score": 0.35,
+                "background_mottling_score": 0.0,
+                "local_patch_variance": 0.0,
+                "core_clip_score": 0.0,
+                "starless_artifact_score": 0.0,
+                "bg_dirty_score": 0.0,
+                "bg_std": 0.0,
+            },
+            _stage7_halo_residue_score=lambda: 0.0,
+            _active_policy_name=lambda: "emission_nebula_widefield",
+            _active_target_type=lambda: "emission_nebula_widefield",
+        )
+
+        report = pipeline_module.stage8_pixels.final_quality_report(probe)
+
+        self.assertFalse(report["strict_gate"])
+        self.assertTrue(report["metrics"]["stage8_conservative_skipped"])
+        self.assertEqual(report["final_quality"], "ok")
+
+    def test_final_quality_rejects_hidden_compact_stage7_halo(self):
+        probe = SimpleNamespace(
+            _stage8_final_quality="conservative_skipped",
+            _stage8_fallback_used=True,
+            _stage9_bypassed_bad_starless=False,
+            _stage7_selected_quality={
+                "status": "ok",
+                "derived": {
+                    "halo_residue_score": 0.427,
+                    "global_halo_residue_score": 0.427,
+                    "compact_halo_residue_score": 0.857,
+                },
+            },
+            _read_image_by_stem=lambda _stem: object(),
+            _background_quality_metrics=lambda _image: {
+                "chroma_noise_score": 0.0,
+                "background_mottling_score": 0.0,
+                "local_patch_variance": 0.0,
+                "core_clip_score": 0.0,
+                "starless_artifact_score": 0.0,
+                "bg_dirty_score": 0.0,
+                "bg_std": 0.0,
+            },
+            _stage7_halo_residue_score=lambda: 0.427,
+            _stage7_effective_halo_threshold=lambda: 0.60,
+            _active_policy_name=lambda: "bright_emission_reflection_nebula",
+            _active_target_type=lambda: "bright_emission_reflection_nebula",
+        )
+
+        report = pipeline_module.stage8_pixels.final_quality_report(probe)
+
+        self.assertTrue(report["strict_gate"])
+        self.assertEqual(report["final_quality"], "poor")
+        self.assertIn(
+            "stage7_compact_halo_residue_score 0.857>0.600",
+            report["issues"],
+        )
+        self.assertEqual(
+            report["metrics"]["stage7_compact_halo_residue_score"],
+            0.857,
+        )
+
+    def test_final_quality_rejects_selected_stage9_chromatic_artifacts(self):
+        probe = SimpleNamespace(
+            _stage8_final_quality="ok",
+            _stage8_fallback_used=False,
+            _stage9_bypassed_bad_starless=False,
+            _stage9_stars_required=True,
+            _stage9_stars_applied=True,
+            _stage9_stars_application_mode="screen",
+            _stage9_selected_remix_quality={
+                "metrics": {"chromatic_star_addition_ratio": 0.010},
+                "limits": {"chromatic_star_addition_ratio": 0.003},
+            },
+            _read_image_by_stem=lambda _stem: object(),
+            _background_quality_metrics=lambda _image: {
+                "chroma_noise_score": 0.0,
+                "background_mottling_score": 0.0,
+                "local_patch_variance": 0.0,
+                "core_clip_score": 0.0,
+                "starless_artifact_score": 0.0,
+                "bg_dirty_score": 0.0,
+                "bg_std": 0.0,
+            },
+            _stage7_halo_residue_score=lambda: 0.0,
+            _active_policy_name=lambda: "emission_nebula_widefield",
+            _active_target_type=lambda: "emission_nebula_widefield",
+        )
+
+        report = pipeline_module.stage8_pixels.final_quality_report(probe)
+
+        self.assertEqual(report["final_quality"], "poor")
+        self.assertIn(
+            "stage9_chromatic_star_addition_ratio 0.010000>0.003000",
+            report["issues"],
+        )
+        self.assertEqual(
+            report["metrics"]["stage9_chromatic_star_addition_ratio"],
+            0.010,
+        )
+
+    def test_final_quality_requires_review_after_unsafe_stage9_bypass(self):
+        probe = SimpleNamespace(
+            _stage8_final_quality="ok",
+            _stage8_fallback_used=False,
+            _stage9_bypassed_bad_starless=True,
+            _read_image_by_stem=lambda _stem: object(),
+            _background_quality_metrics=lambda _image: {
+                "chroma_noise_score": 0.0,
+                "background_mottling_score": 0.0,
+                "local_patch_variance": 0.0,
+                "core_clip_score": 0.0,
+                "starless_artifact_score": 0.0,
+                "bg_dirty_score": 0.0,
+                "bg_std": 0.0,
+            },
+            _stage7_halo_residue_score=lambda: 0.0,
+            _active_policy_name=lambda: "generic_low_snr_safe",
+            _active_target_type=lambda: "generic_low_snr_safe",
+        )
+
+        report = pipeline_module.stage8_pixels.final_quality_report(probe)
+
+        self.assertTrue(report["strict_gate"])
+        self.assertEqual(report["final_quality"], "poor")
+        self.assertTrue(report["needs_conservative_rerun"])
+
+    def test_final_quality_requires_review_when_required_stars_not_applied(self):
+        probe = SimpleNamespace(
+            _stage8_final_quality="ok",
+            _stage8_fallback_used=False,
+            _stage9_bypassed_bad_starless=False,
+            _stage9_stars_required=True,
+            _stage9_stars_applied=False,
+            _stage9_stars_application_mode="no_starmask",
+            _read_image_by_stem=lambda _stem: object(),
+            _background_quality_metrics=lambda _image: {
+                "chroma_noise_score": 0.0,
+                "background_mottling_score": 0.0,
+                "local_patch_variance": 0.0,
+                "core_clip_score": 0.0,
+                "starless_artifact_score": 0.0,
+                "bg_dirty_score": 0.0,
+                "bg_std": 0.0,
+            },
+            _stage7_halo_residue_score=lambda: 0.0,
+            _active_policy_name=lambda: "generic_low_snr_safe",
+            _active_target_type=lambda: "generic_low_snr_safe",
+        )
+
+        report = pipeline_module.stage8_pixels.final_quality_report(probe)
+
+        self.assertTrue(report["strict_gate"])
+        self.assertIn("stage9_required_stars_not_applied", report["issues"])
+        self.assertTrue(report["metrics"]["stage9_stars_required"])
+        self.assertFalse(report["metrics"]["stage9_stars_applied"])
+        self.assertTrue(report["needs_conservative_rerun"])
+
+    def test_final_quality_requires_review_after_starmask_stretch_failure(self):
+        probe = SimpleNamespace(
+            _stage8_final_quality="ok",
+            _stage8_fallback_used=False,
+            _stage9_bypassed_bad_starless=False,
+            _stage9_stars_required=True,
+            _stage9_stars_applied=True,
+            _stage9_starmask_stretch_failed=True,
+            _stage9_stars_application_mode="screen",
+            _read_image_by_stem=lambda _stem: object(),
+            _background_quality_metrics=lambda _image: {
+                "chroma_noise_score": 0.0,
+                "background_mottling_score": 0.0,
+                "local_patch_variance": 0.0,
+                "core_clip_score": 0.0,
+                "starless_artifact_score": 0.0,
+                "bg_dirty_score": 0.0,
+                "bg_std": 0.0,
+            },
+            _stage7_halo_residue_score=lambda: 0.0,
+            _active_policy_name=lambda: "generic_low_snr_safe",
+            _active_target_type=lambda: "generic_low_snr_safe",
+        )
+
+        report = pipeline_module.stage8_pixels.final_quality_report(probe)
+
+        self.assertTrue(report["strict_gate"])
+        self.assertIn("stage9_starmask_stretch_failed", report["issues"])
+        self.assertTrue(report["metrics"]["stage9_starmask_stretch_failed"])
+        self.assertTrue(report["needs_conservative_rerun"])
+
+    def test_stage8_input_guard_classifies_conservative_skip_with_other_reasons(self):
+        probe = SimpleNamespace(
+            _stage8_conservative_mode=True,
+            _stage7_selected_quality={"status": "poor", "derived": {}},
+            cfg=SimpleNamespace(
+                stage7_residual_star_score_max=0.45,
+                stage7_starless_noise_gain_max=1.25,
+                stage8_mask_signal_coverage_min=0.002,
+            ),
+            siril=SimpleNamespace(get_image_pixeldata=lambda preview=False: None),
+            _stage7_halo_residue_score=lambda: 0.0,
+            _stage7_effective_halo_threshold=lambda: 0.35,
+            _short_text=lambda value, _limit=120: str(value),
+        )
+
+        report = pipeline_module.stage8_pixels.stage8_input_enhancement_guard(probe)
+
+        self.assertEqual(report["status"], "conservative_skipped")
+        self.assertEqual(report["final_quality"], "conservative_skipped")
+        self.assertIn("stage7_quality_status=poor", report["reasons"])
+
+    def test_stage8_prefers_accepted_stage7_stretched_input(self):
+        processor = self._new_processor()
+        processor.stretched_name = "stage7_stretched"
+        processor._stage7_stretch_accepted = True
+        processor._stage7_stretch_output = "stage7_stretched"
+        (processor.process_dir / "stage7_stretched.fit").write_bytes(b"accepted")
+
+        stage8_nebula_enhancement(processor)
+
+        self.assertIn(("load", "stage7_stretched"), processor.cmd_calls)
+        self.assertNotIn(("load", "starless"), processor.cmd_calls)
+        self.assertEqual(processor._stage8_input_source, "stage7_stretched")
+        self.assertIn("stage8_input_source=stage7_stretched", processor.results[-1][3])
+
+    def test_stage8_ignores_stale_stage7_output_when_not_accepted(self):
+        processor = self._new_processor()
+        processor.stretched_name = "stage7_stretched"
+        processor._stage7_stretch_accepted = False
+        (processor.process_dir / "stage7_stretched.fit").write_bytes(b"stale")
+
+        stage8_nebula_enhancement(processor)
+
+        self.assertNotIn(("load", "stage7_stretched"), processor.cmd_calls)
+        self.assertIn(("load", "starless"), processor.cmd_calls)
+        self.assertEqual(processor._stage8_input_source, "starless")
+        self.assertIn("Stage7 output not accepted", processor.results[-1][3])
+
+    def test_stage8_falls_back_when_accepted_stage7_file_is_missing(self):
+        processor = self._new_processor()
+        processor.stretched_name = "stage7_stretched"
+        processor._stage7_stretch_accepted = True
+        processor._stage7_stretch_output = "stage7_stretched"
+
+        stage8_nebula_enhancement(processor)
+
+        self.assertNotIn(("load", "stage7_stretched"), processor.cmd_calls)
+        self.assertIn(("load", "starless"), processor.cmd_calls)
+        self.assertEqual(processor._stage8_input_source, "starless")
+        self.assertIn("preferred Stage7 input missing", processor.results[-1][3])
+
+    def test_stage8_falls_back_to_stage6_starless_when_starless_load_fails(self):
+        processor = self._new_processor()
+        processor._stage7_stretch_accepted = False
+        original_cmd_with_check = processor.cmd_with_check
+
+        def selective_load_failure(*args: Any, quiet: bool = False) -> bool:
+            if args == ("load", "starless"):
+                processor.cmd_calls.append(args)
+                raise pipeline_module.CommandError("mock missing starless")
+            return original_cmd_with_check(*args, quiet=quiet)
+
+        processor.cmd_with_check = selective_load_failure
+
+        stage8_nebula_enhancement(processor)
+
+        self.assertIn(("load", "starless"), processor.cmd_calls)
+        self.assertIn(("load", "stage6_starless"), processor.cmd_calls)
+        self.assertEqual(processor._stage8_input_source, "stage6_starless")
+        self.assertTrue(processor._stage8_input_fallback_used)
+        selection = processor.stage_json_reports["stage8_input_selection.json"]
+        self.assertEqual(selection["selected_source"], "stage6_starless")
+        self.assertTrue(selection["fallback_used"])
+
+    def test_stage7_marks_saved_quality_candidate_as_accepted_for_stage8(self):
+        processor = self._new_processor()
+        processor._run_stage6_ai_stretching = lambda allow_ai=False: (
+            True,
+            False,
+            ["quality_ok=true"],
+            "Asinh",
+        )
+
+        pipeline_module.run_stage6_stretching(processor)
+
+        self.assertTrue(processor._stage7_stretch_accepted)
+        self.assertEqual(processor._stage7_stretch_output, "stage7_stretched")
+
+    def test_stage7_marks_validated_rescue_as_accepted_but_degraded(self):
+        processor = self._new_processor()
+        processor._stage7_stretch_validated_rescue = True
+        processor._run_stage6_ai_stretching = lambda allow_ai=False: (
+            True,
+            True,
+            ["stage7 background chroma rescue accepted"],
+            "background_chroma_rescue",
+        )
+
+        pipeline_module.run_stage6_stretching(processor)
+
+        self.assertTrue(processor._stage7_stretch_accepted)
+        self.assertEqual(processor._stage7_stretch_output, "stage7_stretched")
+        self.assertEqual(processor.results[-1][1], "degraded")
+
+    def test_stage7_marks_review_only_candidate_as_degraded_not_accepted(self):
+        processor = self._new_processor()
+
+        def review_only_stretch(allow_ai=False):
+            processor._stage7_review_source = "stage7_cand_a"
+            return False, False, ["selected safe review source"], ""
+
+        processor._run_stage6_ai_stretching = review_only_stretch
+
+        pipeline_module.run_stage6_stretching(processor)
+
+        self.assertFalse(processor._stage7_stretch_accepted)
+        self.assertIsNone(processor._stage7_stretch_output)
+        self.assertEqual(processor.results[-1][1], "degraded")
+        self.assertIn("仅保留 Stage7 复核候选", processor.results[-1][3])
+
+    def test_stage7_chroma_rescue_only_allows_exclusive_chroma_rejection(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        chroma_only = {
+            "status": "ok",
+            "stem": "stage7_cand_a",
+            "target_local_quality": {"accepted": True},
+            "diagnostics": [
+                "background_chroma_noise_score 0.431>0.340",
+                "background_chroma_load_growth 3.210>1.350",
+            ],
+        }
+
+        self.assertTrue(processor._stage7_attempt_allows_chroma_rescue(chroma_only))
+        self.assertFalse(
+            processor._stage7_attempt_allows_chroma_rescue(
+                {
+                    **chroma_only,
+                    "diagnostics": [
+                        *chroma_only["diagnostics"],
+                        "background_mottling_score 0.600>0.450",
+                    ],
+                }
+            )
+        )
+        self.assertFalse(
+            processor._stage7_attempt_allows_chroma_rescue(
+                {
+                    **chroma_only,
+                    "diagnostics": [
+                        *chroma_only["diagnostics"],
+                        "preview_target_p50_ratio_above_max 3.833>1.500",
+                    ],
+                }
+            )
+        )
+        processor.cfg.stage7_chroma_rescue_enabled = False
+        self.assertFalse(
+            processor._stage7_attempt_allows_chroma_rescue(chroma_only)
+        )
+
+    def test_stage7_chroma_rescue_uses_three_strength_levels(self):
+        processor = pipeline_module.SeestarPostProcessor()
+
+        self.assertEqual(
+            processor._stage7_chroma_rescue_strengths(),
+            [0.35, 0.55, 0.65],
+        )
+
+    def test_stage7_candidate_selection_prefers_best_post_rescue_quality(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        gate_limits = {
+            "chroma_noise_score_max": 0.34,
+            "background_mottling_score_max": 0.45,
+            "chroma_load_growth_max": 1.35,
+        }
+
+        def attempt(name: str, chroma: float, risk: float) -> dict[str, Any]:
+            return {
+                "name": name,
+                "stem": f"stage7_{name}",
+                "status": "ok",
+                "allowed_as_final": False,
+                "diagnostics": [
+                    f"background_chroma_noise_score {chroma:.3f}>0.340"
+                ],
+                "risk_score": risk,
+                "background_quality_gate": {
+                    "metrics": {
+                        "chroma_noise_score": chroma,
+                        "background_mottling_score": 0.10,
+                        "chroma_load_growth": 1.10,
+                    },
+                    "limits": gate_limits,
+                },
+            }
+
+        candidates = [
+            attempt("cand_b", 0.751, 10.0),
+            attempt("chroma_rescue_1", 0.515, 8.0),
+            attempt("chroma_rescue_2", 0.380, 5.0),
+        ]
+
+        selected = min(
+            candidates,
+            key=processor._stage7_candidate_selection_key,
+        )
+
+        self.assertEqual(selected["name"], "chroma_rescue_2")
+
+    def test_stage7_candidate_selection_keeps_hard_gate_for_final_output(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        rejected_low_risk = {
+            "name": "rejected_low_risk",
+            "stem": "stage7_rejected_low_risk",
+            "status": "ok",
+            "allowed_as_final": False,
+            "diagnostics": ["background_chroma_noise_score 0.350>0.340"],
+            "risk_score": 1.0,
+        }
+        accepted_higher_risk = {
+            "name": "accepted_higher_risk",
+            "stem": "stage7_accepted_higher_risk",
+            "status": "ok",
+            "allowed_as_final": True,
+            "diagnostics": [],
+            "risk_score": 4.0,
+        }
+
+        selected = min(
+            [rejected_low_risk, accepted_higher_risk],
+            key=processor._stage7_candidate_selection_key,
+        )
+
+        self.assertEqual(selected["name"], "accepted_higher_risk")
+
+    def test_stage7_review_selection_prefers_lowest_safe_preview_ratio(self):
+        processor = pipeline_module.SeestarPostProcessor()
+
+        def review_attempt(
+            name: str,
+            ratio: float,
+            diagnostics: list[str],
+            *,
+            local_ok: bool = True,
+        ) -> dict[str, Any]:
+            return {
+                "name": name,
+                "stem": f"stage7_{name}",
+                "status": "ok",
+                "allowed_as_final": False,
+                "diagnostics": diagnostics,
+                "risk_score": 1.0,
+                "pixel_stats": {
+                    "p50": ratio * 0.10,
+                    "p99": 0.80,
+                    "dynamic_range": 0.79,
+                },
+                "preview_target_attainment": {
+                    "attainment_ratio": ratio,
+                },
+                "target_local_quality": {"accepted": local_ok},
+            }
+
+        candidate_a = review_attempt(
+            "cand_a",
+            1.19,
+            ["background_chroma_noise_score 0.431>0.340"],
+        )
+        candidate_b = review_attempt(
+            "cand_b",
+            3.83,
+            [
+                "background_chroma_noise_score 0.401>0.340",
+                "preview_target_p50_ratio_above_max 3.830>1.500",
+            ],
+        )
+        unsafe_lower_ratio = review_attempt(
+            "unsafe_core",
+            1.05,
+            ["background_chroma_noise_score 0.410>0.340"],
+            local_ok=False,
+        )
+
+        safe_candidates = [
+            attempt
+            for attempt in (candidate_b, unsafe_lower_ratio, candidate_a)
+            if processor._stage7_review_candidate_is_safe(attempt)
+        ]
+        selected = min(
+            safe_candidates,
+            key=processor._stage7_review_candidate_selection_key,
+        )
+
+        self.assertEqual(selected["name"], "cand_a")
+        self.assertNotIn(unsafe_lower_ratio, safe_candidates)
+
+    def test_stage7_chroma_rescue_preserves_luminance_and_signal_region(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        rgb = np.empty((3, 8, 8), dtype=np.float32)
+        rgb[0] = 0.34
+        rgb[1] = 0.22
+        rgb[2] = 0.30
+        luma = (
+            0.2126 * rgb[0]
+            + 0.7152 * rgb[1]
+            + 0.0722 * rgb[2]
+        ).astype(np.float32)
+        background_mask = np.ones((8, 8), dtype=np.float32)
+        background_mask[3:5, 3:5] = 0.0
+        processor._stage8_generate_starless_masks = lambda _image: {
+            "rgb": rgb.copy(),
+            "gray": luma.copy(),
+            "background_mask": background_mask,
+            "coverage": {
+                "core": 4.0 / 64.0,
+                "nebula": 0.0,
+                "faint_nebula": 0.0,
+            },
+        }
+        processor._stage8_restore_rgb_like = (
+            lambda source, rescued_rgb: rescued_rgb.astype(source.dtype, copy=False)
+        )
+
+        rescued, metadata = processor._stage7_background_chroma_rescue_pixels(
+            rgb,
+            strength=0.55,
+        )
+        rescued_luma = (
+            0.2126 * rescued[0]
+            + 0.7152 * rescued[1]
+            + 0.0722 * rescued[2]
+        )
+        before_chroma = np.std(rgb[:, 0, 0] - luma[0, 0])
+        after_chroma = np.std(rescued[:, 0, 0] - rescued_luma[0, 0])
+
+        self.assertTrue(np.allclose(rescued_luma, luma, atol=1e-6))
+        self.assertLess(after_chroma, before_chroma * 0.50)
+        self.assertTrue(np.allclose(rescued[:, 3:5, 3:5], rgb[:, 3:5, 3:5]))
+        self.assertTrue(metadata["luminance_preserved"])
+
+    def test_stage7_background_gate_rejects_case_candidates_a_and_b(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        baseline = {
+            "chroma_noise_score": 0.003310588,
+            "background_mottling_score": 0.000616090,
+            "bg_std": 0.000019856,
+            "bg_median": 0.000494266,
+        }
+        candidate_a = {
+            "chroma_noise_score": 0.430704,
+            "background_mottling_score": 0.078502,
+            "bg_std": 0.00253955,
+            "bg_median": 0.03274113,
+        }
+        candidate_b = {
+            "chroma_noise_score": 0.795766,
+            "background_mottling_score": 0.20,
+            "bg_std": 0.00941930,
+            "bg_median": 0.19506431,
+        }
+
+        gate_a = processor._stage7_stretch_background_gate(baseline, candidate_a)
+        gate_b = processor._stage7_stretch_background_gate(baseline, candidate_b)
+
+        self.assertFalse(gate_a["accepted"])
+        self.assertFalse(gate_b["accepted"])
+        self.assertTrue(
+            any("background_chroma_noise_score" in issue for issue in gate_a["issues"])
+        )
+        self.assertTrue(
+            any("background_chroma_load_growth" in issue for issue in gate_a["issues"])
+        )
+        self.assertTrue(
+            any("background_chroma_noise_score" in issue for issue in gate_b["issues"])
+        )
+
+    def test_stage7_background_gate_checks_mottling_and_accepts_safe_candidate(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        baseline = {
+            "chroma_noise_score": 0.0033,
+            "background_mottling_score": 0.001,
+            "bg_std": 0.00002,
+            "bg_median": 0.0005,
+        }
+        safe = {
+            "chroma_noise_score": 0.20,
+            "background_mottling_score": 0.20,
+            "bg_std": 0.003,
+            "bg_median": 0.05,
+        }
+        mottled = {**safe, "background_mottling_score": 0.60}
+
+        self.assertTrue(
+            processor._stage7_stretch_background_gate(baseline, safe)["accepted"]
+        )
+        mottled_gate = processor._stage7_stretch_background_gate(baseline, mottled)
+        self.assertFalse(mottled_gate["accepted"])
+        self.assertTrue(
+            any("background_mottling_score" in issue for issue in mottled_gate["issues"])
+        )
+
+    def test_stage7_background_gate_exempts_low_absolute_load_in_extreme_low_background(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        baseline = {
+            "chroma_noise_score": 0.0012268481441424228,
+            "background_mottling_score": 0.0004914217773451431,
+            "bg_std": 0.000014195245057635475,
+            "bg_median": 0.0005103948060423136,
+        }
+        candidate_a = {
+            "chroma_noise_score": 0.15973878325894475,
+            "background_mottling_score": 0.06247950174535314,
+            "bg_std": 0.001812034985050559,
+            "bg_median": 0.03351139277219772,
+        }
+        candidate_b = {
+            "chroma_noise_score": 0.4499879052243117,
+            "background_mottling_score": 0.1006566743036724,
+            "bg_std": 0.007080338895320892,
+            "bg_median": 0.18866348266601562,
+        }
+
+        gate_a = processor._stage7_stretch_background_gate(baseline, candidate_a)
+        gate_b = processor._stage7_stretch_background_gate(baseline, candidate_b)
+
+        self.assertTrue(gate_a["accepted"])
+        self.assertAlmostEqual(gate_a["metrics"]["chroma_load"], 0.04766700815594566)
+        self.assertTrue(
+            gate_a["metrics"]["chroma_load_growth_low_absolute_exempted"]
+        )
+        self.assertTrue(gate_a["metrics"]["extreme_low_background"])
+        self.assertFalse(gate_b["accepted"])
+        self.assertTrue(
+            any("background_chroma_noise_score" in issue for issue in gate_b["issues"])
+        )
+
+    def test_stage7_background_gate_still_rejects_high_absolute_load_growth(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        baseline = {
+            "chroma_noise_score": 0.10,
+            "background_mottling_score": 0.01,
+            "bg_std": 0.002,
+            "bg_median": 0.05,
+        }
+        candidate = {
+            "chroma_noise_score": 0.30,
+            "background_mottling_score": 0.10,
+            "bg_std": 0.004,
+            "bg_median": 0.03,
+        }
+
+        gate = processor._stage7_stretch_background_gate(baseline, candidate)
+
+        self.assertFalse(gate["accepted"])
+        self.assertFalse(gate["metrics"]["chroma_load_growth_low_absolute_exempted"])
+        self.assertTrue(
+            any("background_chroma_load_growth" in issue for issue in gate["issues"])
+        )
+
+    def test_stage7_background_gate_does_not_exempt_normal_background_growth(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        baseline = {
+            "chroma_noise_score": 0.10,
+            "background_mottling_score": 0.01,
+            "bg_std": 0.002,
+            "bg_median": 0.05,
+        }
+        candidate = {
+            "chroma_noise_score": 0.20,
+            "background_mottling_score": 0.10,
+            "bg_std": 0.003,
+            "bg_median": 0.05,
+        }
+
+        gate = processor._stage7_stretch_background_gate(baseline, candidate)
+
+        self.assertLessEqual(
+            gate["metrics"]["chroma_load"],
+            gate["limits"]["chroma_load_low_absolute_max"],
+        )
+        self.assertFalse(gate["metrics"]["extreme_low_background"])
+        self.assertFalse(gate["accepted"])
+        self.assertTrue(
+            any("background_chroma_load_growth" in issue for issue in gate["issues"])
+        )
+
+    def test_stage7_pixel_repair_accepts_significant_chroma_reduction(self):
+        cfg = pipeline_module.PipelineConfig()
+        assessment = stage7_star_separation_module._stage7_chroma_repair_acceptance(
+            cfg,
+            {"chroma_noise_score": 0.003310588},
+            {"chroma_noise_score": 0.001822228},
+            residual_not_worse=True,
+            halo_not_worse=True,
+        )
+
+        self.assertTrue(assessment["accepted"])
+        self.assertGreater(assessment["reduction_ratio"], 0.40)
+
+    def test_stage7_pixel_repair_rejects_chroma_gain_when_halo_worsens(self):
+        cfg = pipeline_module.PipelineConfig()
+        assessment = stage7_star_separation_module._stage7_chroma_repair_acceptance(
+            cfg,
+            {"chroma_noise_score": 0.003310588},
+            {"chroma_noise_score": 0.001822228},
+            residual_not_worse=True,
+            halo_not_worse=False,
+        )
+
+        self.assertFalse(assessment["accepted"])
+
+    def test_stage7_does_not_accept_degraded_candidate_for_stage8(self):
+        processor = self._new_processor()
+        processor._run_stage6_ai_stretching = lambda allow_ai=False: (
+            True,
+            True,
+            ["quality_ok=false"],
+            "Asinh",
+        )
+
+        pipeline_module.run_stage6_stretching(processor)
+
+        self.assertFalse(processor._stage7_stretch_accepted)
+        self.assertIsNone(processor._stage7_stretch_output)
+
     def test_stage8_builtin_saturation_fallback_is_reported_as_internal_processing(self):
         processor = self._new_processor()
 
@@ -2016,6 +3754,10 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertIn(("save", "starmask_stretched"), processor.cmd_calls)
         pm_calls = [call for call in processor.cmd_calls if call[0] == "pm"]
         self.assertFalse(pm_calls)
+        report = processor.stage_json_reports["stage9_remix_quality.json"]
+        self.assertTrue(report["stars_required"])
+        self.assertTrue(report["stars_applied"])
+        self.assertEqual(report["stars_application_mode"], "screen")
 
     def test_stage9_caps_star_remix_when_stage8_used_fallback(self):
         processor = self._new_processor()
@@ -2054,6 +3796,605 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertFalse(asinh_calls)
         self.assertIn(("save", "starmask_stretched"), processor.cmd_calls)
 
+    def test_stage9_gate_rolls_back_primary_and_accepts_fallback_intensity(self):
+        processor = self._new_processor()
+        processor.cfg.workflow_plugin_probe_enabled = False
+        processor.starmask_file = processor.process_dir / "starmask.fit"
+        processor.starmask_file.write_bytes(b"mock")
+        review_calls = []
+        processor._create_stage_review_bundle = (
+            lambda *args, **kwargs: (
+                review_calls.append((args, kwargs))
+                or {
+                    "status": "ready",
+                    "report_path": str(
+                        processor.process_dir
+                        / "review_bundles"
+                        / "stage9_star_remixing"
+                        / "review.json"
+                    ),
+                }
+            )
+        )
+
+        def assess(_source_stem, *, attempt, formula):
+            accepted = attempt == "screen_fallback_075"
+            return {
+                "attempt": attempt,
+                "formula": formula,
+                "status": "ok" if accepted else "rejected",
+                "accepted": accepted,
+                "issues": [] if accepted else ["background_lift 0.020000>0.010000"],
+                "metrics": {"background_lift": 0.0 if accepted else 0.02},
+            }
+
+        processor._stage9_assess_current_remix = assess
+
+        stage9_star_remixing(processor)
+
+        self.assertEqual(
+            processor.previous_stage_remix_calls,
+            [
+                ("starless_enhanced", "starmask_stretched", processor.cfg.star_intensity),
+                ("starless_enhanced", "starmask_stretched", 0.75),
+            ],
+        )
+        report = processor.stage_json_reports["stage9_remix_quality.json"]
+        self.assertEqual(report["selected"]["attempt"], "screen_fallback_075")
+        self.assertEqual(len(review_calls), 1)
+        review_args, review_kwargs = review_calls[0]
+        self.assertEqual(
+            review_args,
+            ("stage9_star_remixing", "starless_enhanced", "stage9_remixed"),
+        )
+        self.assertEqual(
+            review_kwargs["selected_candidate"],
+            "screen_fallback_075",
+        )
+        self.assertEqual(review_kwargs["context"]["mode"], "screen")
+        self.assertEqual(len(review_kwargs["candidates"]), 2)
+        self.assertEqual(processor.results[-1][1], "ok")
+
+    def test_stage9_review_bundle_marks_safe_rollback_as_selected(self):
+        processor = self._new_processor()
+        review_calls = []
+        processor._stage9_stars_required = True
+        processor._stage9_stars_applied = False
+        processor._stage9_stars_application_mode = "rejected_keep_starless"
+        processor._stage9_star_reference_summary = {
+            "status": "rejected",
+            "reason": "source_star_catalog_contamination_risk",
+        }
+        processor._create_stage_review_bundle = (
+            lambda *args, **kwargs: (
+                review_calls.append((args, kwargs))
+                or {"status": "ready", "report_path": "/tmp/stage9-review.json"}
+            )
+        )
+        messages = []
+        rejected_attempt = {
+            "attempt": "screen_primary",
+            "status": "rejected",
+            "accepted": False,
+            "issues": ["new_hollow_structure_max_area 1250>64"],
+        }
+
+        stage9_module = sys.modules["stages.stage9_star_remixing"]
+        stage9_module._append_stage9_review_bundle(
+            processor,
+            messages,
+            [rejected_attempt],
+            None,
+            source_stem="starless_enhanced",
+            mode="rejected_keep_starless",
+            stage_saved=True,
+        )
+
+        self.assertEqual(len(review_calls), 1)
+        _args, kwargs = review_calls[0]
+        self.assertEqual(kwargs["selected_candidate"], "stage9_safe_rollback")
+        self.assertEqual(kwargs["candidates"][0], rejected_attempt)
+        self.assertEqual(kwargs["candidates"][-1]["id"], "stage9_safe_rollback")
+        self.assertTrue(kwargs["candidates"][-1]["selected"])
+        self.assertIn("review_bundle=/tmp/stage9-review.json", messages)
+
+    def test_stage9_rebuilds_strict_compact_mask_before_lowering_intensity(self):
+        processor = self._new_processor()
+        processor.cfg.workflow_plugin_probe_enabled = False
+        processor.starmask_file = processor.process_dir / "starmask.fit"
+        processor.starmask_file.write_bytes(b"mock")
+        yy, xx = np.mgrid[:128, :128]
+        diffuse_floor = 0.00004 + 0.00003 * np.sin(xx / 6.0) ** 2
+        pixels = np.stack(
+            [diffuse_floor, diffuse_floor * 0.9, diffuse_floor * 0.8]
+        ).astype(np.float32)
+        for cy, cx, amplitude in (
+            (22, 24, 0.05),
+            (41, 92, 0.08),
+            (73, 61, 0.12),
+            (99, 31, 0.06),
+            (96, 105, 0.18),
+        ):
+            profile = np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2.0 * 1.4**2))
+            pixels += np.stack(
+                [profile * amplitude, profile * amplitude * 0.85, profile * amplitude * 0.70]
+            ).astype(np.float32)
+        written_pixels = []
+        processor.siril = SimpleNamespace(
+            get_image_shape=lambda: pixels.shape,
+            get_image_pixeldata=lambda preview=False: pixels.copy(),
+            set_image_pixeldata=lambda output: written_pixels.append(output.copy()),
+        )
+
+        def assess(_source_stem, *, attempt, formula):
+            accepted = attempt == "screen_compact_recovery"
+            return {
+                "attempt": attempt,
+                "formula": formula,
+                "status": "ok" if accepted else "rejected",
+                "accepted": accepted,
+                "issues": [] if accepted else [
+                    "background_mottling_growth 2.000000>1.350000"
+                ],
+                "metrics": {"changed_pixel_ratio": 0.25 if not accepted else 0.03},
+                "limits": {
+                    "changed_pixel_ratio": 0.35,
+                    "background_mottling_low_absolute_changed_pixel_ratio_max": 0.12,
+                },
+            }
+
+        processor._stage9_assess_current_remix = assess
+
+        stage9_star_remixing(processor)
+
+        self.assertEqual(len(written_pixels), 2)
+        normal_coverage = float(np.mean(np.max(written_pixels[0], axis=0) > 0.0))
+        recovery_coverage = float(np.mean(np.max(written_pixels[1], axis=0) > 0.0))
+        self.assertLess(recovery_coverage, normal_coverage)
+        self.assertEqual(
+            processor.previous_stage_remix_calls,
+            [
+                ("starless_enhanced", "starmask_stretched", processor.cfg.star_intensity),
+                (
+                    "starless_enhanced",
+                    "starmask_stretched_recovery",
+                    processor.cfg.star_intensity,
+                ),
+            ],
+        )
+        report = processor.stage_json_reports["stage9_remix_quality.json"]
+        self.assertEqual(report["selected"]["attempt"], "screen_compact_recovery")
+        self.assertTrue(report["starmask_calibration"]["recovery_attempted"])
+        self.assertTrue(report["starmask_calibration"]["recovery_applied"])
+        self.assertEqual(processor.results[-1][1], "ok")
+
+    def test_stage9_compact_starmask_write_claims_image_lock(self):
+        processor = self._new_processor()
+        processor.cfg.workflow_plugin_probe_enabled = False
+        processor.starmask_file = processor.process_dir / "starmask.fit"
+        processor.starmask_file.write_bytes(b"mock")
+        pixels = np.full((3, 8, 8), 0.01, dtype=np.float32)
+        writes = []
+        lock_events = []
+
+        class ImageLock:
+            def __enter__(self):
+                lock_events.append("enter")
+
+            def __exit__(self, _type, _value, _traceback):
+                lock_events.append("exit")
+
+        processor.siril = SimpleNamespace(
+            get_image_shape=lambda: pixels.shape,
+            get_image_pixeldata=lambda preview=False: pixels.copy(),
+            set_image_pixeldata=lambda output: writes.append(output.copy()),
+            image_lock=lambda: ImageLock(),
+        )
+        stage9_module = sys.modules["stages.stage9_star_remixing"]
+        calibration = {
+            "status": "ok",
+            "stretch": 12.0,
+            "offset": 0.001,
+            "star_sample_count": 64,
+            "compact_component_count": 4,
+            "_compact_support_mask": np.ones((8, 8), dtype=bool),
+        }
+
+        with patch.object(
+            stage9_module.stage9_quality,
+            "calibrate_starmask_asinh",
+            return_value=calibration,
+        ):
+            stage9_star_remixing(processor)
+
+        self.assertEqual(lock_events, ["enter", "exit"])
+        self.assertEqual(len(writes), 1)
+        report = processor.stage_json_reports["stage9_remix_quality.json"]
+        self.assertFalse(report["starmask_stretch_failed"])
+        self.assertEqual(processor.results[-1][1], "ok")
+
+    def test_stage9_starmask_pixel_write_failure_stops_raw_linear_remix(self):
+        processor = self._new_processor()
+        processor.cfg.workflow_plugin_probe_enabled = False
+        processor.starmask_file = processor.process_dir / "starmask.fit"
+        processor.starmask_file.write_bytes(b"mock")
+        pixels = np.full((3, 8, 8), 0.01, dtype=np.float32)
+
+        def fail_pixel_write(_output):
+            raise pipeline_module.SirilError("processing thread is not claimed")
+
+        processor.siril = SimpleNamespace(
+            get_image_shape=lambda: pixels.shape,
+            get_image_pixeldata=lambda preview=False: pixels.copy(),
+            set_image_pixeldata=fail_pixel_write,
+        )
+        stage9_module = sys.modules["stages.stage9_star_remixing"]
+        calibration = {
+            "status": "ok",
+            "stretch": 12.0,
+            "offset": 0.001,
+            "star_sample_count": 64,
+            "compact_component_count": 4,
+            "_compact_support_mask": np.ones((8, 8), dtype=bool),
+        }
+
+        with patch.object(
+            stage9_module.stage9_quality,
+            "calibrate_starmask_asinh",
+            return_value=calibration,
+        ):
+            stage9_star_remixing(processor)
+
+        self.assertFalse(processor.previous_stage_remix_calls)
+        self.assertTrue(processor._stage9_starmask_stretch_failed)
+        self.assertFalse(processor._stage9_stars_applied)
+        self.assertEqual(processor.results[-1][1], "degraded")
+        report = processor.stage_json_reports["stage9_remix_quality.json"]
+        self.assertTrue(report["starmask_stretch_failed"])
+        self.assertEqual(report["mode"], "starmask_stretch_failed")
+
+    def test_stage9_dynamic_collapse_advisory_still_remixes_after_accepted_stretch(self):
+        processor = self._new_processor()
+        processor.cfg.workflow_plugin_probe_enabled = False
+        processor.cfg.stage7_residual_star_score_max = 0.28
+        processor.cfg.stage7_halo_residue_score_max = 0.35
+        processor.cfg.stage7_starless_noise_gain_max = 2.2
+        processor.cfg.stage7_starless_dynamic_range_min_ratio = 0.55
+        processor.cfg.stage7_starless_peak_signal_min = 0.006
+        processor.cfg.stage9_starmask_stretch_enabled = False
+        processor.cfg.stage9_fallback_intensity_levels = (0.75, 0.55, 0.40)
+        processor.stretched_name = "stage7_stretched"
+        processor._stage7_stretch_accepted = True
+        processor._stage7_stretch_output = "stage7_stretched"
+        processor._stage7_selected_quality = {
+            "status": "poor",
+            "issues": [
+                "starless_dynamic_range_collapse 0.117<0.550, "
+                "peak=0.00551<0.00600"
+            ],
+            "derived": {
+                "residual_star_score": 0.0,
+                "halo_residue_score": 0.053,
+                "starless_noise_gain": 0.78,
+                "starless_dynamic_range_ratio": 0.117,
+                "starless_peak_signal": 0.00551,
+            },
+        }
+        processor._stage8_final_source = "stage7_stretched"
+        processor._stage8_fallback_used = True
+        (processor.process_dir / "stage7_stretched.fit").write_bytes(b"accepted")
+        processor.starmask_file = processor.process_dir / "starmask.fit"
+        processor.starmask_file.write_bytes(b"mock")
+        processor._stage9_bad_starless_reason = types.MethodType(
+            pipeline_module.SeestarPostProcessor._stage9_bad_starless_reason,
+            processor,
+        )
+        processor._stage7_effective_halo_threshold = lambda: (
+            processor.cfg.stage7_halo_residue_score_max
+        )
+
+        stage9_star_remixing(processor)
+
+        self.assertTrue(processor.previous_stage_remix_calls)
+        self.assertEqual(
+            processor.stage_json_reports["stage9_remix_quality.json"]["mode"],
+            "screen",
+        )
+        self.assertIn(
+            "accepted-stretch advisory",
+            processor.results[-1][3],
+        )
+
+    def test_stage9_bypasses_remix_and_degrades_when_stage7_was_not_accepted(self):
+        processor = self._new_processor()
+        processor._stage7_stretch_accepted = False
+        processor._stage7_stretch_output = None
+        processor.stretched_name = "stage7_stretched"
+        (processor.process_dir / "stage7_cand_a.fit").write_bytes(b"review-only")
+        processor._stage9_bad_starless_reason = types.MethodType(
+            pipeline_module.SeestarPostProcessor._stage9_bad_starless_reason,
+            processor,
+        )
+        processor._stage9_review_safe_source = types.MethodType(
+            pipeline_module.SeestarPostProcessor._stage9_review_safe_source,
+            processor,
+        )
+
+        stage9_star_remixing(processor)
+
+        self.assertFalse(processor.previous_stage_remix_calls)
+        self.assertIn(("load", "stage7_cand_a"), processor.cmd_calls)
+        self.assertTrue(processor._stage9_bypassed_bad_starless)
+        self.assertTrue(processor._stage9_stars_required)
+        self.assertFalse(processor._stage9_stars_applied)
+        report = processor.stage_json_reports["stage9_remix_quality.json"]
+        self.assertFalse(report["stars_applied"])
+        self.assertEqual(report["stars_application_mode"], "unsafe_starless_bypass")
+        self.assertEqual(processor.results[-1][1], "degraded")
+        self.assertIn("stage7_stretch_not_accepted", processor.results[-1][3])
+
+    def test_stage9_review_bypass_prefers_stage7_quality_ranked_source(self):
+        processor = self._new_processor()
+        processor._stage7_stretch_accepted = False
+        processor._stage7_stretch_output = None
+        processor._stage7_review_source = "stage7_cand_rescue_2"
+        processor.stretched_name = "stage7_stretched"
+        (processor.process_dir / "stage7_cand_a.fit").write_bytes(b"candidate-a")
+        (processor.process_dir / "stage7_cand_rescue_2.fit").write_bytes(
+            b"quality-ranked"
+        )
+        processor._stage9_bad_starless_reason = types.MethodType(
+            pipeline_module.SeestarPostProcessor._stage9_bad_starless_reason,
+            processor,
+        )
+        processor._stage9_review_safe_source = types.MethodType(
+            pipeline_module.SeestarPostProcessor._stage9_review_safe_source,
+            processor,
+        )
+
+        stage9_star_remixing(processor)
+
+        self.assertIn(("load", "stage7_cand_rescue_2"), processor.cmd_calls)
+        self.assertNotIn(("load", "stage7_cand_a"), processor.cmd_calls)
+        self.assertTrue(processor._stage9_bypassed_bad_starless)
+
+    def test_stage9_no_starmask_records_required_stars_not_applied(self):
+        processor = self._new_processor()
+
+        stage9_star_remixing(processor)
+
+        report = processor.stage_json_reports["stage9_remix_quality.json"]
+        self.assertEqual(report["mode"], "no_starmask")
+        self.assertTrue(report["stars_required"])
+        self.assertFalse(report["stars_applied"])
+        self.assertEqual(report["stars_application_mode"], "no_starmask")
+
+    def test_stage9_star_preserve_bypass_records_stars_not_required(self):
+        processor = self._new_processor()
+        processor._star_preserve_target_bypass = True
+        processor._stage8_final_source = "stage8_enhanced"
+
+        stage9_star_remixing(processor)
+
+        report = processor.stage_json_reports["stage9_remix_quality.json"]
+        self.assertEqual(report["mode"], "star_preserve_target_bypass")
+        self.assertFalse(report["stars_required"])
+        self.assertFalse(report["stars_applied"])
+        self.assertEqual(
+            report["stars_application_mode"],
+            "not_required_star_preserve",
+        )
+        self.assertEqual(processor.results[-1][1], "skipped")
+
+    def test_stage9_all_rejected_records_required_stars_not_applied(self):
+        processor = self._new_processor()
+        processor.cfg.workflow_plugin_probe_enabled = False
+        processor.starmask_file = processor.process_dir / "starmask.fit"
+        processor.starmask_file.write_bytes(b"mock")
+        processor._stage9_assess_current_remix = lambda *_args, **_kwargs: {
+            "attempt": "rejected",
+            "formula": "screen",
+            "status": "rejected",
+            "accepted": False,
+            "issues": ["mock rejection"],
+            "metrics": {},
+        }
+
+        stage9_star_remixing(processor)
+
+        report = processor.stage_json_reports["stage9_remix_quality.json"]
+        self.assertEqual(report["mode"], "rejected_keep_starless")
+        self.assertTrue(report["stars_required"])
+        self.assertFalse(report["stars_applied"])
+        self.assertEqual(
+            report["stars_application_mode"],
+            "rejected_keep_starless",
+        )
+
+    def test_stage9_accepted_screen_save_failure_does_not_claim_stars_applied(self):
+        processor = self._new_processor()
+        processor.cfg.workflow_plugin_probe_enabled = False
+        processor.starmask_file = processor.process_dir / "starmask.fit"
+        processor.starmask_file.write_bytes(b"mock")
+        processor._save_stage_output = lambda stem: stem != "stage9_remixed"
+
+        stage9_star_remixing(processor)
+
+        report = processor.stage_json_reports["stage9_remix_quality.json"]
+        self.assertEqual(report["mode"], "screen")
+        self.assertTrue(report["stars_required"])
+        self.assertFalse(report["stars_applied"])
+        self.assertEqual(report["stars_application_mode"], "screen_save_failed")
+        self.assertEqual(processor.results[-1][1], "degraded")
+
+    def test_stage7_dynamic_range_gate_accepts_peak_well_above_extreme_background(self):
+        cfg = pipeline_module.PipelineConfig()
+
+        assessment = stage7_quality_module.stage7_dynamic_range_assessment(
+            cfg,
+            dynamic_range_ratio=0.09246493544624469,
+            peak_signal=0.0051499465480446815,
+            background_level=0.000503482879139483,
+        )
+
+        self.assertFalse(assessment["collapsed"])
+        self.assertGreater(assessment["peak_background_ratio"], 10.0)
+
+    def test_stage7_dynamic_range_gate_rejects_flat_low_signal_output(self):
+        cfg = pipeline_module.PipelineConfig()
+
+        assessment = stage7_quality_module.stage7_dynamic_range_assessment(
+            cfg,
+            dynamic_range_ratio=0.09,
+            peak_signal=0.001,
+            background_level=0.0005,
+        )
+
+        self.assertTrue(assessment["collapsed"])
+        self.assertEqual(assessment["peak_background_ratio"], 2.0)
+
+    def test_stage7_dynamic_collapse_skips_same_model_parameter_retries(self):
+        without_axiom = SimpleNamespace(
+            _syqon_axiom_model_available=lambda: False,
+        )
+        with_axiom = SimpleNamespace(
+            _syqon_axiom_model_available=lambda: True,
+        )
+
+        self.assertEqual(
+            stage7_star_separation_module._syqon_refinement_variants(
+                without_axiom,
+                repair_triggers=["dynamic_range_collapse"],
+                initial_variant=(512, 64, False),
+            ),
+            [],
+        )
+        self.assertEqual(
+            stage7_star_separation_module._syqon_refinement_variants(
+                with_axiom,
+                repair_triggers=["dynamic_range_collapse"],
+                initial_variant=(512, 64, False),
+            ),
+            [(512, 64, True)],
+        )
+
+    def test_stage7_calibrated_dynamic_range_does_not_trigger_refinement(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        quality = {
+            "derived": {
+                "residual_star_score": 0.0,
+                "halo_residue_score": 0.03,
+                "black_hole_score": 0.0,
+                "starless_dynamic_range_ratio": 0.09246493544624469,
+                "starless_peak_signal": 0.0051499465480446815,
+                "dynamic_range_collapse": False,
+            }
+        }
+
+        self.assertEqual(processor._stage7_repair_triggers(quality), [])
+
+    def test_stage9_hard_halo_risk_still_bypasses_after_accepted_stretch(self):
+        processor = self._new_processor()
+        processor.cfg.stage7_residual_star_score_max = 0.28
+        processor.cfg.stage7_halo_residue_score_max = 0.35
+        processor.cfg.stage7_starless_noise_gain_max = 2.2
+        processor.cfg.stage7_starless_dynamic_range_min_ratio = 0.55
+        processor.cfg.stage7_starless_peak_signal_min = 0.006
+        processor.stretched_name = "stage7_stretched"
+        processor._stage7_stretch_accepted = True
+        processor._stage7_stretch_output = "stage7_stretched"
+        processor._stage7_selected_quality = {
+            "status": "poor",
+            "issues": [
+                "starless_dynamic_range_collapse 0.117<0.550, "
+                "peak=0.00551<0.00600"
+            ],
+            "derived": {
+                "residual_star_score": 0.0,
+                "halo_residue_score": 0.60,
+                "starless_noise_gain": 0.78,
+                "starless_dynamic_range_ratio": 0.117,
+                "starless_peak_signal": 0.00551,
+            },
+        }
+        (processor.process_dir / "stage7_stretched.fit").write_bytes(b"accepted")
+        processor._stage9_bad_starless_reason = types.MethodType(
+            pipeline_module.SeestarPostProcessor._stage9_bad_starless_reason,
+            processor,
+        )
+        processor._stage7_effective_halo_threshold = lambda: (
+            processor.cfg.stage7_halo_residue_score_max
+        )
+
+        reason = processor._stage9_bad_starless_reason()
+
+        self.assertIn("stage7_halo_residue_score", reason)
+        self.assertNotIn("stage7_starless_dynamic_range", reason)
+
+    def test_stage9_uses_descending_fallback_intensity_ladder(self):
+        processor = self._new_processor()
+        processor.cfg.workflow_plugin_probe_enabled = False
+        processor.cfg.star_intensity = 1.05
+        processor.cfg.star_fallback_intensity = 1.0
+        processor.starmask_file = processor.process_dir / "starmask.fit"
+        processor.starmask_file.write_bytes(b"mock")
+
+        def assess(_source_stem, *, attempt, formula):
+            accepted = attempt == "screen_fallback_040"
+            return {
+                "attempt": attempt,
+                "formula": formula,
+                "status": "ok" if accepted else "rejected",
+                "accepted": accepted,
+                "issues": [] if accepted else ["changed_pixel_ratio"],
+                "metrics": {},
+            }
+
+        processor._stage9_assess_current_remix = assess
+
+        stage9_star_remixing(processor)
+
+        self.assertEqual(
+            [call[2] for call in processor.previous_stage_remix_calls],
+            [1.05, 0.75, 0.55, 0.40],
+        )
+        report = processor.stage_json_reports["stage9_remix_quality.json"]
+        self.assertEqual(report["selected"]["attempt"], "screen_fallback_040")
+
+    def test_stage9_does_not_lower_screen_intensity_after_recovery_shortfall(self):
+        processor = self._new_processor()
+        processor.cfg.workflow_plugin_probe_enabled = False
+        processor.starmask_file = processor.process_dir / "starmask.fit"
+        processor.starmask_file.write_bytes(b"mock")
+        processor._stage9_assess_current_remix = lambda *_args, **kwargs: {
+            "attempt": kwargs["attempt"],
+            "formula": kwargs["formula"],
+            "status": "rejected",
+            "accepted": False,
+            "issues": ["weak_star_recovery_ratio 0.420000<0.700000"],
+            "metrics": {
+                "weak_star_recovery_ratio": 0.42,
+                "star_recovery_ratio": 0.50,
+            },
+        }
+
+        stage9_star_remixing(processor)
+
+        self.assertEqual(
+            processor.previous_stage_remix_calls,
+            [
+                (
+                    "starless_enhanced",
+                    "starmask_stretched",
+                    processor.cfg.star_intensity,
+                )
+            ],
+        )
+        report = processor.stage_json_reports["stage9_remix_quality.json"]
+        self.assertEqual(report["mode"], "rejected_keep_starless")
+        self.assertFalse(report["stars_applied"])
+        self.assertEqual(processor.results[-1][1], "degraded")
+
     def test_stage10_degraded_when_script_and_aberration_unavailable(self):
         processor = self._new_processor()
         processor.cfg.aberration_api_enabled = True
@@ -2069,17 +4410,193 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertIn("最终降噪脚本与 Aberration API 均不可用", message)
         self.assertIn("Aberration API 不可用", message)
 
+    def test_stage10_skips_scunet_after_primary_timeout(self):
+        processor = self._new_processor()
+        processor.classic_cc_args = None
+        processor.available_scripts.update(
+            {
+                "processing/CosmicClarity_Denoise.py",
+                "processing/CosmicClarity_Native.py",
+                "processing/SCUNet_Denoise.py",
+            }
+        )
+        processor.cli_fail_steps.add("最终降噪")
+        processor.cli_failure_errors["最终降噪"] = (
+            "CosmicClarity_Native.py: subprocess timeout after 180s"
+        )
+
+        stage10_export(processor)
+
+        scunet_calls = [
+            call for call in processor.script_calls if call[1] == "SCUNet_Denoise.py"
+        ]
+        self.assertFalse(scunet_calls)
+        self.assertIn("skipped after primary denoiser timeout", processor.results[-1][3])
+
     def test_stage10_uses_linear_resume_output_suffixes(self):
         processor = self._new_processor()
         processor._stage1_input_mode = "linear_resume"
 
         stage10_export(processor)
 
-        linear_base = pipeline_module.RESULT_BASENAME_TEMPLATE + "_linear"
+        linear_base = "result_processed_linear"
         self.assertIn(("savetif", linear_base, "-astro"), processor.cmd_calls)
         self.assertIn(("savepng", linear_base), processor.cmd_calls)
-        self.assertIn(("save", linear_base + "_final"), processor.cmd_calls)
+        self.assertIn(("save", "result_final_linear"), processor.cmd_calls)
         self.assertEqual(processor.main_output_basename_template, linear_base)
+
+    def test_stage10_withholds_normal_names_when_quality_requires_rerun(self):
+        processor = self._new_processor()
+        processor._final_quality_report = lambda _stem: {
+            "final_quality": "poor",
+            "status": "needs_conservative_rerun",
+            "needs_conservative_rerun": True,
+            "issues": ["background_chroma_noise_score 0.431>0.340"],
+        }
+
+        stage10_export(processor)
+
+        self.assertIn(("savetif", "result_review", "-astro"), processor.cmd_calls)
+        self.assertIn(("savepng", "result_review"), processor.cmd_calls)
+        self.assertIn(("save", "result_review_final"), processor.cmd_calls)
+        self.assertFalse(
+            any(
+                "result_processed" in str(item) or "result_final" in str(item)
+                for call in processor.cmd_calls
+                for item in call
+            )
+        )
+        self.assertTrue(processor._final_output_review_only)
+        self.assertEqual(processor.results[-1][1], "degraded")
+        self.assertIn("review_only_output=true", processor.results[-1][3])
+
+    def test_stage10_stage9_bypass_uses_linear_review_only_names(self):
+        processor = self._new_processor()
+        processor._stage1_input_mode = "linear_resume"
+        processor._stage9_bypassed_bad_starless = True
+        processor.available_scripts.add("processing/CosmicClarity_Denoise.py")
+
+        stage10_export(processor)
+
+        self.assertIn(
+            ("savetif", "result_review_linear", "-astro"),
+            processor.cmd_calls,
+        )
+        self.assertIn(("savepng", "result_review_linear"), processor.cmd_calls)
+        self.assertIn(
+            ("save", "result_review_linear_final"),
+            processor.cmd_calls,
+        )
+        self.assertTrue(processor._final_output_review_only)
+        self.assertFalse(
+            any(step == "最终降噪" for step, _name, _args in processor.script_calls)
+        )
+        denoise_plan = processor.stage_json_reports["stage10_denoise_plan.json"]
+        self.assertTrue(denoise_plan["skipped_by_review_only"])
+        self.assertFalse(denoise_plan["skipped_by_duplicate_guard"])
+
+    def test_stage10_missing_required_star_remix_forces_review_only_output(self):
+        processor = self._new_processor()
+        processor._stage9_bypassed_bad_starless = False
+        processor._stage9_stars_required = True
+        processor._stage9_stars_applied = False
+        processor._stage9_stars_application_mode = "no_starmask"
+
+        stage10_export(processor)
+
+        self.assertIn(("savetif", "result_review", "-astro"), processor.cmd_calls)
+        self.assertIn(("save", "result_review_final"), processor.cmd_calls)
+        self.assertTrue(processor._final_output_review_only)
+        self.assertIn("stage9_stars_applied=false", processor.results[-1][3])
+
+    def test_stage10_explicit_review_only_setting_withholds_normal_names(self):
+        processor = self._new_processor()
+        processor.cfg.force_review_only_output = True
+        processor._stage9_stars_required = True
+        processor._stage9_stars_applied = True
+
+        stage10_export(processor)
+
+        self.assertIn(("savetif", "result_review", "-astro"), processor.cmd_calls)
+        self.assertIn(("savepng", "result_review"), processor.cmd_calls)
+        self.assertIn(("save", "result_review_final"), processor.cmd_calls)
+        self.assertFalse(
+            any(
+                "result_processed" in str(item) or "result_final" in str(item)
+                for call in processor.cmd_calls
+                for item in call
+            )
+        )
+        self.assertIn("force_review_only_output=true", processor.results[-1][3])
+
+    def test_stage10_applied_required_star_remix_keeps_normal_output_names(self):
+        processor = self._new_processor()
+        processor._stage9_bypassed_bad_starless = False
+        processor._stage9_stars_required = True
+        processor._stage9_stars_applied = True
+        processor._stage9_stars_application_mode = "screen"
+
+        stage10_export(processor)
+
+        self.assertIn(
+            ("savetif", "result_processed", "-astro"),
+            processor.cmd_calls,
+        )
+        self.assertIn(("save", "result_final"), processor.cmd_calls)
+        self.assertFalse(processor._final_output_review_only)
+
+    def test_result_output_basename_uses_template_when_headers_are_complete(self):
+        processor = self._new_processor()
+        processor.header_metadata.update(
+            {
+                "OBJECT": "NGC7000",
+                "STACKCNT": 120,
+                "EXPTIME": 10.0,
+                "DATE-OBS": "2026-07-15T12:00:00",
+            }
+        )
+
+        base_name = processor._result_output_basename()
+
+        self.assertEqual(base_name, pipeline_module.RESULT_BASENAME_TEMPLATE)
+        self.assertEqual(
+            processor.main_output_fit_basename_template,
+            pipeline_module.RESULT_BASENAME_TEMPLATE + "_final",
+        )
+
+    def test_result_output_basename_uses_partial_metadata_when_stack_count_missing(self):
+        processor = self._new_processor()
+        processor.header_metadata.update(
+            {
+                "OBJECT": "M 42",
+                "EXPTIME": 60.0,
+                "DATE-OBS": "2026-02-16T14:02:34.608000",
+            }
+        )
+
+        base_name = processor._result_output_basename()
+
+        self.assertEqual(base_name, "M_42_60sec_20260216_140234_processed")
+        self.assertEqual(
+            processor.main_output_fit_basename_template,
+            "M_42_60sec_20260216_140234_processed_final",
+        )
+        self.assertNotIn("$", base_name)
+        self.assertTrue(
+            any(
+                "通用结果名覆盖" in message
+                for level, message in processor.log.events
+                if level == "warn"
+            )
+        )
+
+    def test_result_output_basename_keeps_generic_fallback_without_identity(self):
+        processor = self._new_processor()
+
+        base_name = processor._result_output_basename()
+
+        self.assertEqual(base_name, "result_processed")
+        self.assertEqual(processor.main_output_fit_basename_template, "result_final")
 
     def test_stage10_saves_fits_before_preview_autostretch_png(self):
         processor = self._new_processor()
@@ -2091,6 +4608,18 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertLess(commands.index("autostretch"), commands.index("savepng"))
         _name, _status, _dur, message = processor.results[-1]
         self.assertIn("PNG preview stretch applied", message)
+
+    def test_stage10_skips_second_preview_stretch_for_accepted_stage7_output(self):
+        processor = self._new_processor()
+        processor._stage7_stretch_accepted = True
+
+        stage10_export(processor)
+
+        commands = [call[0] for call in processor.cmd_calls]
+        self.assertNotIn("autostretch", commands)
+        self.assertIn("savepng", commands)
+        _name, _status, _dur, message = processor.results[-1]
+        self.assertIn("second autostretch skipped", message)
 
     def test_stage7_uses_sasp_when_probe_disabled(self):
         processor = self._new_processor()
@@ -2139,6 +4668,228 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertIn("line4", processor._last_plugin_script_error or "")
         self.assertIn("line15", processor._last_plugin_script_error or "")
         self.assertNotIn("output_tail=line1", processor._last_plugin_script_error or "")
+
+    def test_cleanup_preserves_raw_clean_and_stretched_starmask_layers(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.log = FakeLogger()
+        processor.cfg.debug_mode = False
+        processor.stretched_name = "stage7_stretched"
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        processor.process_dir = Path(td.name)
+        keep = {
+            "starless.fit",
+            "starmask.fit",
+            "starmask_raw.fit",
+            "starmask_clean.fit",
+            "starmask_external_raw.fit",
+            "starmask_stretched.fit",
+        }
+        for name in keep | {"temporary.fit"}:
+            (processor.process_dir / name).write_bytes(name.encode("utf-8"))
+
+        processor.cleanup()
+
+        self.assertTrue(all((processor.process_dir / name).exists() for name in keep))
+        self.assertFalse((processor.process_dir / "temporary.fit").exists())
+
+    def test_cleanup_archives_lightweight_diagnostics_before_deleting_logs(self):
+        import zipfile
+
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.log = FakeLogger()
+        processor.cfg.debug_mode = False
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        processor.work_dir = Path(td.name)
+        processor.process_dir = processor.work_dir / "process"
+        review_dir = processor.process_dir / "review_bundles" / "stage5"
+        review_dir.mkdir(parents=True)
+        (processor.process_dir / "stage5_linear_report.json").write_text(
+            '{"status":"ok"}', encoding="utf-8"
+        )
+        (processor.process_dir / "stage.log").write_text("diagnostic", encoding="utf-8")
+        (review_dir / "preview.png").write_bytes(b"png")
+        (processor.process_dir / "large.fit").write_bytes(b"fits")
+
+        processor.cleanup()
+
+        archive_path = processor.work_dir / "seestar_diagnostics.zip"
+        self.assertTrue(archive_path.exists())
+        with zipfile.ZipFile(archive_path) as archive:
+            names = set(archive.namelist())
+        self.assertIn("manifest.json", names)
+        self.assertIn("process/stage5_linear_report.json", names)
+        self.assertIn("process/review_bundles/stage5/preview.png", names)
+        self.assertNotIn("process/large.fit", names)
+
+    def test_plugin_fingerprint_uses_preview_and_bounded_sample(self):
+        preview_calls: list[bool] = []
+        image = np.zeros((3, 512, 512), dtype=np.float32)
+        processor = SimpleNamespace(
+            siril=SimpleNamespace(
+                get_image_pixeldata=lambda preview=False: (
+                    preview_calls.append(preview) or image
+                )
+            ),
+            log=FakeLogger(),
+        )
+
+        before = pipeline_module.plugin_runner.current_image_fingerprint(processor)
+        image[:] = 1.0
+        after = pipeline_module.plugin_runner.current_image_fingerprint(processor)
+
+        self.assertEqual(preview_calls, [True, True])
+        self.assertNotEqual(before, after)
+
+    def test_runtime_env_applies_adaptive_star_and_target_local_controls(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.log = FakeLogger()
+        overrides = {
+            "SEESTAR_STAGE9_STARMASK_ADAPTIVE_STRETCH_ENABLE": "0",
+            "SEESTAR_STAGE9_SOURCE_STAR_DETAIL_PERCENTILE": "98.2",
+            "SEESTAR_STAGE9_SOURCE_COMPONENT_DENSITY_MAX": "2300",
+            "SEESTAR_STAGE9_SOURCE_SINGLE_PIXEL_RATIO_MAX": "0.36",
+            "SEESTAR_STAGE9_STARMASK_ASINH_STRETCH_MAX": "640",
+            "SEESTAR_STAGE9_STARMASK_FAINT_TARGET": "0.19",
+            "SEESTAR_STAGE9_STARMASK_MID_TARGET": "0.48",
+            "SEESTAR_STAGE9_STARMASK_BRIGHT_TARGET": "0.73",
+            "SEESTAR_STAGE9_STARMASK_PEAK_TARGET": "0.79",
+            "SEESTAR_STAGE9_STARMASK_CHROMA_REGULARIZATION_ENABLE": "0",
+            "SEESTAR_STAGE9_STARMASK_FAINT_CHROMA_MAX": "0.32",
+            "SEESTAR_STAGE9_STARMASK_BRIGHT_CHROMA_MAX": "0.58",
+            "SEESTAR_STAGE9_STARMASK_PREDICTED_CHANGE_RATIO_MAX": "0.27",
+            "SEESTAR_STAGE9_STAR_REFERENCE_SIGMA": "5.5",
+            "SEESTAR_STAGE9_COMPACT_WEAK_STAR_RETENTION_MIN": "0.83",
+            "SEESTAR_STAGE9_MIXED_STAR_PEAK_RATIO_MIN": "4.5",
+            "SEESTAR_STAGE9_MIXED_STAR_WEAK_COUNT_MIN": "24",
+            "SEESTAR_STAGE9_MIXED_STAR_BRIGHT_COUNT_MIN": "4",
+            "SEESTAR_STAGE9_WEAK_STAR_RECOVERY_RATIO_MIN": "0.72",
+            "SEESTAR_STAGE9_STAR_RECOVERY_RATIO_MIN": "0.78",
+            "SEESTAR_STAGE9_WEAK_STAR_SCREEN_INTENSITY_MIN": "0.96",
+            "SEESTAR_STAGE9_STAR_SUPPORT_RATIO_MAX": "0.11",
+            "SEESTAR_STAGE9_UNMATCHED_CHANGED_RATIO_MAX": "0.008",
+            "SEESTAR_STAGE9_CHROMATIC_ADDITION_PEAK_MIN": "0.025",
+            "SEESTAR_STAGE9_CHROMATIC_ADDITION_SATURATION_MIN": "0.74",
+            "SEESTAR_STAGE9_CHROMATIC_ADDITION_RATIO_MAX": "0.0025",
+            "SEESTAR_STAGE9_STAR_APERTURE_RECOVERY_RATIO_MIN": "0.76",
+            "SEESTAR_STAGE9_STAR_WING_RECOVERY_RATIO_MIN": "0.66",
+            "SEESTAR_STAGE9_RESIDUAL_DARK_HOLE_RATIO_MAX": "0.14",
+            "SEESTAR_STAGE9_HOLLOW_STRUCTURE_DELTA_MIN": "0.06",
+            "SEESTAR_STAGE9_NEW_HOLLOW_STRUCTURE_AREA_MAX": "48",
+            "SEESTAR_STAGE9_LOCAL_COMPONENT_PEAK_MIN": "0.012",
+            "SEESTAR_STAGE9_LOCAL_COMPONENT_AREA_MAX": "320",
+            "SEESTAR_STAGE9_LOCAL_COMPONENT_ASPECT_RATIO_MAX": "4.0",
+            "SEESTAR_STAGE9_LOCAL_COMPONENT_FILL_RATIO_MIN": "0.12",
+            "SEESTAR_STAGE9_LOCAL_SINGLE_PIXEL_RATIO_MAX": "0.18",
+            "SEESTAR_STAGE9_LOCAL_CYAN_BLUE_PEAK_MIN": "0.015",
+            "SEESTAR_STAGE9_LOCAL_CYAN_BLUE_SATURATION_MIN": "0.55",
+            "SEESTAR_STAGE9_LOCAL_CYAN_BLUE_COMPONENT_AREA_MAX": "72",
+            "SEESTAR_STAGE9_CORE_PERCENTILE": "92",
+            "SEESTAR_STAGE9_CORE_COLOR_JUMP_MIN": "0.11",
+            "SEESTAR_STAGE9_CORE_COLOR_JUMP_COMPONENT_AREA_MAX": "80",
+            "SEESTAR_STAGE10_STAGE9_LOCAL_COLOR_RISK_STRENGTH": "0.8",
+            "SEESTAR_FORCE_REVIEW_ONLY_OUTPUT": "1",
+            "SEESTAR_STAGE7_TARGET_LOCAL_METRICS_ENABLE": "0",
+            "SEESTAR_STAGE7_LOCAL_CORE_CLIP_RATIO_MAX": "0.08",
+            "SEESTAR_STAGE7_LOCAL_FAINT_SNR_MIN": "0.31",
+            "SEESTAR_STAGE7_LOCAL_DARK_SEPARATION_MIN": "0.002",
+            "SEESTAR_STAGE7_STRETCH_CHROMA_LOAD_LOW_ABSOLUTE_MAX": "0.045",
+            "SEESTAR_STAGE7_PREVIEW_TARGET_P50_MAX_RATIO": "1.42",
+            "SEESTAR_STAGE7_STARLESS_PEAK_BACKGROUND_RATIO_MIN": "5.0",
+            "SEESTAR_STAGE7_STARMASK_DIFFUSE_RESIDUAL_RATIO_MAX": "0.07",
+        }
+
+        with patch.dict(os.environ, overrides, clear=False):
+            processor._apply_runtime_env_overrides()
+
+        self.assertFalse(processor.cfg.stage9_starmask_adaptive_stretch_enabled)
+        self.assertEqual(processor.cfg.stage9_source_star_detail_percentile, 98.2)
+        self.assertEqual(processor.cfg.stage9_source_component_density_max, 2300.0)
+        self.assertEqual(processor.cfg.stage9_source_single_pixel_ratio_max, 0.36)
+        self.assertEqual(processor.cfg.stage9_starmask_asinh_stretch_max, 640.0)
+        self.assertEqual(processor.cfg.stage9_starmask_faint_target, 0.19)
+        self.assertEqual(processor.cfg.stage9_starmask_mid_target, 0.48)
+        self.assertEqual(processor.cfg.stage9_starmask_bright_target, 0.73)
+        self.assertEqual(processor.cfg.stage9_starmask_peak_target, 0.79)
+        self.assertFalse(processor.cfg.stage9_starmask_chroma_regularization_enabled)
+        self.assertEqual(processor.cfg.stage9_starmask_faint_chroma_max, 0.32)
+        self.assertEqual(processor.cfg.stage9_starmask_bright_chroma_max, 0.58)
+        self.assertEqual(
+            processor.cfg.stage9_starmask_predicted_change_ratio_max,
+            0.27,
+        )
+        self.assertEqual(processor.cfg.stage9_star_reference_sigma, 5.5)
+        self.assertEqual(
+            processor.cfg.stage9_compact_weak_star_retention_min,
+            0.83,
+        )
+        self.assertEqual(processor.cfg.stage9_mixed_star_peak_ratio_min, 4.5)
+        self.assertEqual(processor.cfg.stage9_mixed_star_weak_count_min, 24)
+        self.assertEqual(processor.cfg.stage9_mixed_star_bright_count_min, 4)
+        self.assertEqual(processor.cfg.stage9_weak_star_recovery_ratio_min, 0.72)
+        self.assertEqual(processor.cfg.stage9_star_recovery_ratio_min, 0.78)
+        self.assertEqual(processor.cfg.stage9_weak_star_screen_intensity_min, 0.96)
+        self.assertEqual(processor.cfg.stage9_star_support_ratio_max, 0.11)
+        self.assertEqual(processor.cfg.stage9_unmatched_changed_ratio_max, 0.008)
+        self.assertEqual(processor.cfg.stage9_chromatic_addition_peak_min, 0.025)
+        self.assertEqual(
+            processor.cfg.stage9_chromatic_addition_saturation_min,
+            0.74,
+        )
+        self.assertEqual(processor.cfg.stage9_chromatic_addition_ratio_max, 0.0025)
+        self.assertEqual(
+            processor.cfg.stage9_star_aperture_recovery_ratio_min,
+            0.76,
+        )
+        self.assertEqual(processor.cfg.stage9_star_wing_recovery_ratio_min, 0.66)
+        self.assertEqual(processor.cfg.stage9_residual_dark_hole_ratio_max, 0.14)
+        self.assertEqual(processor.cfg.stage9_hollow_structure_delta_min, 0.06)
+        self.assertEqual(processor.cfg.stage9_new_hollow_structure_area_max, 48.0)
+        self.assertEqual(processor.cfg.stage9_local_component_peak_min, 0.012)
+        self.assertEqual(processor.cfg.stage9_local_component_area_max, 320.0)
+        self.assertEqual(processor.cfg.stage9_local_component_aspect_ratio_max, 4.0)
+        self.assertEqual(processor.cfg.stage9_local_component_fill_ratio_min, 0.12)
+        self.assertEqual(processor.cfg.stage9_local_single_pixel_ratio_max, 0.18)
+        self.assertEqual(processor.cfg.stage9_local_cyan_blue_peak_min, 0.015)
+        self.assertEqual(processor.cfg.stage9_local_cyan_blue_saturation_min, 0.55)
+        self.assertEqual(
+            processor.cfg.stage9_local_cyan_blue_component_area_max,
+            72.0,
+        )
+        self.assertEqual(processor.cfg.stage9_core_percentile, 92.0)
+        self.assertEqual(processor.cfg.stage9_core_color_jump_min, 0.11)
+        self.assertEqual(
+            processor.cfg.stage9_core_color_jump_component_area_max,
+            80.0,
+        )
+        self.assertEqual(
+            processor.cfg.stage10_stage9_local_color_risk_strength,
+            0.8,
+        )
+        self.assertTrue(processor.cfg.force_review_only_output)
+        self.assertFalse(processor.cfg.stage7_target_local_metrics_enabled)
+        self.assertEqual(processor.cfg.stage7_local_core_clip_ratio_max, 0.08)
+        self.assertEqual(processor.cfg.stage7_local_faint_snr_min, 0.31)
+        self.assertEqual(processor.cfg.stage7_local_dark_separation_min, 0.002)
+        self.assertEqual(
+            processor.cfg.stage7_stretch_chroma_load_low_absolute_max,
+            0.045,
+        )
+        self.assertEqual(
+            processor.cfg.stage7_preview_target_p50_max_ratio,
+            1.42,
+        )
+        self.assertEqual(
+            processor.cfg.stage7_starmask_diffuse_residual_ratio_max,
+            0.07,
+        )
+        self.assertEqual(
+            processor.cfg.stage7_starless_peak_background_ratio_min,
+            5.0,
+        )
 
     def test_cosmic_clarity_wrapper_uses_stable_python_when_siril_env_is_boolean(self):
         wrapper = REPO_ROOT / "resources" / "siril_plugins" / "bin" / "CosmicClarity"
@@ -2208,6 +4959,96 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertTrue((processor.process_dir / "starless.fit").exists())
         self.assertTrue((processor.process_dir / "starmask.fit").exists())
 
+    def test_stage7_retry_cleanup_preserves_all_best_snapshot_layers(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.log = FakeLogger()
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        processor.process_dir = Path(td.name)
+
+        retained = {
+            "starless_ai_best_syqon_refine_1.fit",
+            "starmask_ai_best_syqon_refine_1.fit",
+            "starmask_raw_ai_best_syqon_refine_1.fit",
+        }
+        removable = {
+            "starless.fit",
+            "starmask.fit",
+            "starmask_raw.fit",
+        }
+        for name in retained | removable:
+            (processor.process_dir / name).write_bytes(name.encode("utf-8"))
+
+        processor._clear_star_separation_outputs()
+
+        self.assertTrue(all((processor.process_dir / name).exists() for name in retained))
+        self.assertTrue(all(not (processor.process_dir / name).exists() for name in removable))
+
+    def test_stage7_restore_rejects_incomplete_snapshot_without_partial_restore(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.log = FakeLogger()
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        processor.process_dir = Path(td.name)
+
+        current_starless = processor.process_dir / "starless.fit"
+        current_starmask = processor.process_dir / "starmask.fit"
+        current_raw = processor.process_dir / "starmask_raw.fit"
+        current_starless.write_bytes(b"current-starless")
+        current_starmask.write_bytes(b"current-starmask")
+        current_raw.write_bytes(b"current-raw")
+        (processor.process_dir / "starless_best.fit").write_bytes(b"best-starless")
+        (processor.process_dir / "starmask_best.fit").write_bytes(b"best-starmask")
+        processor.starless_file = current_starless
+        processor.starmask_file = current_starmask
+
+        with self.assertRaisesRegex(FileNotFoundError, "Stage7 snapshot is incomplete"):
+            processor._stage7_restore_snapshot(
+                {
+                    "starless": "starless_best",
+                    "starmask": "starmask_best",
+                    "starmask_raw": "starmask_raw_missing",
+                    "starmask_kind": "raw",
+                }
+            )
+
+        self.assertEqual(current_starless.read_bytes(), b"current-starless")
+        self.assertEqual(current_starmask.read_bytes(), b"current-starmask")
+        self.assertEqual(current_raw.read_bytes(), b"current-raw")
+        self.assertEqual(processor.starless_file, current_starless)
+        self.assertEqual(processor.starmask_file, current_starmask)
+
+    def test_stage7_restore_replaces_all_layers_from_one_snapshot(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.log = FakeLogger()
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        processor.process_dir = Path(td.name)
+
+        current_starless = processor.process_dir / "starless.fit"
+        current_starmask = processor.process_dir / "starmask.fit"
+        current_raw = processor.process_dir / "starmask_raw.fit"
+        for path in (current_starless, current_starmask, current_raw):
+            path.write_bytes(b"retry-2")
+        (processor.process_dir / "starless_best.fit").write_bytes(b"retry-1-starless")
+        (processor.process_dir / "starmask_best.fit").write_bytes(b"retry-1-starmask")
+        (processor.process_dir / "starmask_raw_best.fit").write_bytes(b"retry-1-raw")
+
+        processor._stage7_restore_snapshot(
+            {
+                "starless": "starless_best",
+                "starmask": "starmask_best",
+                "starmask_raw": "starmask_raw_best",
+                "starmask_kind": "raw",
+            }
+        )
+
+        self.assertEqual(current_starless.read_bytes(), b"retry-1-starless")
+        self.assertEqual(current_starmask.read_bytes(), b"retry-1-starmask")
+        self.assertEqual(current_raw.read_bytes(), b"retry-1-raw")
+        self.assertEqual(processor.starless_file, current_starless)
+        self.assertEqual(processor.starmask_file, current_starmask)
+
     def test_stage7_can_force_syqon_cpu_with_env(self):
         processor = self._new_processor()
         processor.available_scripts.add("processing/SyQon-Starless.py")
@@ -2223,6 +5064,36 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         ]
         self.assertTrue(syqon_calls)
         self.assertIn("--no_gpu", syqon_calls[0])
+
+    def test_syqon_axiom21_cli_matches_bundled_script_interface(self):
+        processor = self._new_processor()
+
+        args, _timeout, note = pipeline_module.syqon_starless.syqon_starless_cli_options(
+            processor,
+            tile_size=512,
+            overlap=64,
+            axiom=True,
+        )
+
+        self.assertIn("--axiom21", args)
+        self.assertNotIn("--axiom", args)
+        self.assertIn("Axiom 2.1", note)
+
+    def test_syqon_axiom21_model_probe_matches_script_paths(self):
+        processor = self._new_processor()
+        processor.siril_plugin_dir = processor.work_dir / "siril_plugins"
+        bundled_model = (
+            processor.siril_plugin_dir
+            / "vendor"
+            / "siril-scripts"
+            / "Axiom2_1.pt"
+        )
+        bundled_model.parent.mkdir(parents=True, exist_ok=True)
+        bundled_model.write_bytes(b"mock-model")
+
+        available = pipeline_module.syqon_starless.syqon_axiom_model_available(processor)
+
+        self.assertTrue(available)
 
     def test_run_linear_resume_skips_stages_2_through_5(self):
         processor = pipeline_module.SeestarPostProcessor()
@@ -2368,6 +5239,187 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             ],
         )
 
+    def test_run_stage4_psolved_resume_skips_stages_1_through_3(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.log = FakeLogger()
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        work_dir = Path(td.name)
+        calls: list[str] = []
+
+        def connect() -> None:
+            processor.work_dir = work_dir
+            processor._siril_ever_connected = True
+
+        processor.connect = connect
+        processor.siril = SimpleNamespace(
+            cmd=lambda *_args, **_kwargs: None,
+            disconnect=lambda: calls.append("disconnect"),
+        )
+
+        def prepare_resume() -> None:
+            calls.append("prepare_stage4_psolved_resume")
+            processor._stage1_input_mode = "stage4_psolved_resume"
+
+        processor._prepare_stage4_psolved_resume_input = prepare_resume
+        processor._auto_tune_for_current_input = lambda: calls.append("auto_tune")
+        processor.stage1_preparation = lambda: calls.append("stage1")
+        processor.stage2_view_correction = lambda: calls.append("stage2")
+        processor.stage3_background_extraction = lambda: calls.append("stage3")
+        processor.stage4_color_calibration = lambda: calls.append("stage4")
+        processor.stage5_linear_denoise = lambda: calls.append("stage5")
+        processor.stage6_star_separation = lambda: calls.append("stage6")
+        processor.stage7_stretching = lambda: calls.append("stage7")
+        processor.stage8_nebula_enhancement = lambda: calls.append("stage8")
+        processor.stage9_star_remixing = lambda: calls.append("stage9")
+        processor.stage10_export = lambda: calls.append("stage10")
+        processor.stage11_ai_postprocess = lambda: calls.append("stage11")
+        processor.cleanup = lambda: calls.append("cleanup")
+
+        with patch.dict(
+            os.environ,
+            {
+                pipeline_module.ENV_INPUT_MODE_KEY:
+                pipeline_module.INPUT_MODE_STAGE4_PSOLVED_RESUME
+            },
+            clear=False,
+        ):
+            processor.run()
+
+        self.assertEqual(
+            calls,
+            [
+                "prepare_stage4_psolved_resume",
+                "auto_tune",
+                "stage4",
+                "stage5",
+                "stage6",
+                "stage7",
+                "stage8",
+                "stage9",
+                "stage10",
+                "stage11",
+                "cleanup",
+                "disconnect",
+            ],
+        )
+        skipped_names = {
+            result.name for result in processor.results if result.status == "skipped"
+        }
+        self.assertTrue(
+            {
+                pipeline_module.PipelineStage.PREPARATION.label,
+                pipeline_module.PipelineStage.VIEW_CORRECTION.label,
+                pipeline_module.PipelineStage.BACKGROUND_EXTRACTION.label,
+            }.issubset(skipped_names)
+        )
+
+    def test_prepare_stage4_psolved_resume_preserves_checkpoint_while_rebuilding_process_dir(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.log = FakeLogger()
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        work_dir = Path(td.name)
+        process_dir = work_dir / "process"
+        process_dir.mkdir()
+        checkpoint = process_dir / pipeline_module.STAGE4_PSOLVED_INPUT_NAME
+        checkpoint.write_bytes(b"stage4-psolved-checkpoint")
+        calls: list[tuple[Any, ...]] = []
+        processor.work_dir = work_dir
+        processor.process_dir = process_dir
+        processor.cmd_with_check = lambda *args, **_kwargs: calls.append(args) or True
+
+        processor._prepare_stage4_psolved_resume_input()
+
+        restored = process_dir / pipeline_module.STAGE4_PSOLVED_INPUT_NAME
+        self.assertEqual(restored.read_bytes(), b"stage4-psolved-checkpoint")
+        self.assertEqual(processor.source_file, restored)
+        self.assertEqual(processor._stage1_input_mode, "stage4_psolved_resume")
+        self.assertIn(("load", "stage4_psolved"), calls)
+
+    def test_run_native_death_in_stage4_does_not_continue_stage5_or_cleanup(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.log = FakeLogger()
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        work_dir = Path(td.name)
+        calls: list[str] = []
+
+        processor.connect = lambda: setattr(processor, "work_dir", work_dir)
+        processor.siril = SimpleNamespace(
+            cmd=lambda *_args, **_kwargs: None,
+            disconnect=lambda: calls.append("disconnect"),
+        )
+        processor.stage1_preparation = lambda: calls.append("stage1")
+        processor._auto_tune_for_current_input = lambda: calls.append("auto_tune")
+        processor.stage2_view_correction = lambda: calls.append("stage2")
+        processor.stage3_background_extraction = lambda: calls.append("stage3")
+
+        def fatal_stage4() -> None:
+            calls.append("stage4")
+            processor._siril_process_terminated = True
+            raise pipeline_module.SirilNativeProcessTerminated(
+                "spcc",
+                pipeline_module.SirilConnectionError("connection closed"),
+            )
+
+        processor.stage4_color_calibration = fatal_stage4
+        processor.stage5_linear_denoise = lambda: calls.append("stage5")
+        processor.cleanup = lambda: calls.append("cleanup")
+
+        with patch.dict(
+            os.environ,
+            {pipeline_module.ENV_INPUT_MODE_KEY: pipeline_module.INPUT_MODE_AUTO},
+            clear=False,
+        ):
+            with self.assertRaises(pipeline_module.SirilNativeProcessTerminated):
+                processor.run()
+
+        self.assertEqual(calls, ["stage1", "auto_tune", "stage2", "stage3", "stage4"])
+
+    def test_run_reraises_generic_stage_failure_for_siril_and_gui(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.log = FakeLogger()
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        work_dir = Path(td.name)
+        calls: list[str] = []
+
+        def connect() -> None:
+            processor.work_dir = work_dir
+            processor._siril_ever_connected = True
+
+        processor.connect = connect
+        processor.siril = SimpleNamespace(
+            cmd=lambda *_args, **_kwargs: None,
+            disconnect=lambda: calls.append("disconnect"),
+        )
+        processor.stage1_preparation = lambda: calls.append("stage1")
+        processor._auto_tune_for_current_input = lambda: calls.append("auto_tune")
+
+        def fail_stage2() -> None:
+            calls.append("stage2")
+            raise RuntimeError("simulated stage2 failure")
+
+        processor.stage2_view_correction = fail_stage2
+        processor.stage3_background_extraction = lambda: calls.append("stage3")
+
+        with patch.dict(
+            os.environ,
+            {pipeline_module.ENV_INPUT_MODE_KEY: pipeline_module.INPUT_MODE_AUTO},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated stage2 failure"):
+                processor.run()
+
+        self.assertEqual(calls, ["stage1", "auto_tune", "stage2", "disconnect"])
+        self.assertTrue(
+            any(
+                level == "error" and "程序中断: simulated stage2 failure" in message
+                for level, message in processor.log.events
+            )
+        )
+
     def test_plugin_script_prereq_check_skips_runtime_execution_when_modules_missing(self):
         processor = pipeline_module.SeestarPostProcessor()
         processor.log = FakeLogger()
@@ -2417,7 +5469,14 @@ class PipelinePluginFallbackTests(unittest.TestCase):
                 captured_env.update({str(k): str(v) for k, v in proc_env.items()})
             return SimpleNamespace(returncode=0, stdout="")
 
-        with patch.dict(os.environ, {"SIRIL_PYTHON_CLI": "1"}, clear=False):
+        contaminated_env = {
+            "SIRIL_PYTHON_CLI": "1",
+            "QT_PLUGIN_PATH": "/app/PySide6/Qt/plugins",
+            "QT_QPA_PLATFORM_PLUGIN_PATH": "/app/PySide6/Qt/plugins/platforms",
+            "QML2_IMPORT_PATH": "/app/PySide6/Qt/qml",
+            "QT_QPA_PLATFORM": "cocoa",
+        }
+        with patch.dict(os.environ, contaminated_env, clear=False):
             with patch.object(pipeline_module.subprocess, "run", _fake_run):
                 used = processor._run_plugin_script_cli_subprocess(
                     "最终降噪",
@@ -2432,6 +5491,10 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertIn(str(script_path), captured_cmd["value"])
         self.assertEqual(captured_env.get("SEESTAR_SIRILPY_TIMEOUT_SEC"), "120")
         self.assertNotEqual(captured_env.get("SIRIL_PYTHON_CLI"), "1")
+        self.assertEqual(captured_env.get("QT_QPA_PLATFORM"), "offscreen")
+        self.assertNotIn("QT_PLUGIN_PATH", captured_env)
+        self.assertNotIn("QT_QPA_PLATFORM_PLUGIN_PATH", captured_env)
+        self.assertNotIn("QML2_IMPORT_PATH", captured_env)
 
     def test_cli_subprocess_releases_parent_siril_connection(self):
         processor = pipeline_module.SeestarPostProcessor()
@@ -2482,6 +5545,112 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertIsNotNone(used)
         self.assertEqual(events, ["disconnect", "run", "connect"])
         self.assertTrue(processor.siril.connected)
+
+    def test_cli_subprocess_heartbeat_stays_local_while_parent_siril_is_disconnected(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.workflow_command_used = {}
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        processor.process_dir = Path(td.name)
+        processor.work_dir = Path(td.name)
+
+        script_path = Path(td.name) / "SyQon-Starless.py"
+        script_path.write_text("print('mock')\n", encoding="utf-8")
+        processor._validate_plugin_script_prerequisites = (  # type: ignore[method-assign]
+            lambda _path, _python_executable=None: (True, "")
+        )
+
+        live_messages: list[str] = []
+        connection_events: list[str] = []
+
+        class SirilConnectionError(Exception):
+            pass
+
+        class _ConnectedSiril:
+            connected = True
+
+            def disconnect(self) -> None:
+                connection_events.append("disconnect")
+                self.connected = False
+
+            def connect(self) -> bool:
+                connection_events.append("connect")
+                self.connected = True
+                return True
+
+            def log(self, line: str) -> None:
+                if not self.connected:
+                    raise SirilConnectionError(
+                        "Error in _send_command(): [Errno 9] Bad file descriptor"
+                    )
+                live_messages.append(line)
+
+        processor.siril = pipeline_module._FatalSirilInterfaceProxy(
+            processor,
+            _ConnectedSiril(),
+        )
+        processor._siril_ever_connected = True
+        processor.log = pipeline_module.PipelineLogger("DEBUG")
+        log_path = Path(td.name) / "pipeline.log"
+        processor.log.set_file_path(log_path)
+        processor.log.set_sink(processor.siril.log)
+
+        class _ImmediateFirstWaitEvent:
+            def __init__(self) -> None:
+                self._first_wait = True
+                self._stopped = False
+
+            def wait(self, _timeout: float) -> bool:
+                if self._stopped:
+                    return True
+                if self._first_wait:
+                    self._first_wait = False
+                    return False
+                return True
+
+            def set(self) -> None:
+                self._stopped = True
+
+        class _SynchronousThread:
+            def __init__(self, *, target: Any, daemon: bool) -> None:
+                _ = daemon
+                self._target = target
+
+            def start(self) -> None:
+                self._target()
+
+            def join(self, timeout: float | None = None) -> None:
+                _ = timeout
+
+        def _fake_run(_cmd: list[str], **_kwargs: Any):
+            return SimpleNamespace(returncode=0, stdout="")
+
+        with patch.dict(os.environ, {"SIRIL_PYTHON_CLI": sys.executable}, clear=False):
+            with patch.object(
+                pipeline_module.plugin_runner.threading,
+                "Event",
+                _ImmediateFirstWaitEvent,
+            ):
+                with patch.object(
+                    pipeline_module.plugin_runner.threading,
+                    "Thread",
+                    _SynchronousThread,
+                ):
+                    with patch.object(pipeline_module.subprocess, "run", _fake_run):
+                        used = processor._run_plugin_script_cli_subprocess(
+                            "去星",
+                            "SyQon Starless",
+                            script_path,
+                            args=("--tile-size", "512"),
+                        )
+
+        self.assertIsNotNone(used)
+        self.assertEqual(connection_events, ["disconnect", "connect"])
+        self.assertFalse(processor._siril_process_terminated)
+        self.assertIn("CLI 子进程仍在运行", log_path.read_text(encoding="utf-8"))
+        self.assertFalse(any("CLI 子进程仍在运行" in line for line in live_messages))
+        self.assertTrue(any("CLI 子进程成功" in line for line in live_messages))
 
     def test_cli_subprocess_timeout_applies_when_child_produces_no_output(self):
         processor = pipeline_module.SeestarPostProcessor()
@@ -2984,6 +6153,152 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             [record["status"] for record in processor.report["attempts"][:2]],
             ["graxpert_runtime_error", "graxpert_runtime_error"],
         )
+
+    def test_stage3_graxpert_success_without_image_change_is_runtime_error(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+
+        class Stage3Fake:
+            def __init__(self) -> None:
+                self.log = FakeLogger()
+                self.fingerprints = iter(("unchanged", "unchanged"))
+                self.cmd_calls: list[tuple[Any, ...]] = []
+
+            def _validate_plugin_script_prerequisites(self, _script_path: Path):
+                return True, ""
+
+            def _current_image_fingerprint(self):
+                return next(self.fingerprints)
+
+            def cmd_with_check(self, *args: Any, quiet: bool = False) -> bool:
+                _ = quiet
+                self.cmd_calls.append(args)
+                return True
+
+        processor = Stage3Fake()
+        command = (
+            "pyscript",
+            '"/mock/siril-scripts/processing/GraXpert-AI.py"',
+            "-bge",
+        )
+
+        ok, reason = stage3_module._stage3_try_background_command(
+            processor,
+            "GraXpert",
+            command,
+            "graxpert",
+        )
+
+        self.assertFalse(ok)
+        self.assertEqual(processor.cmd_calls, [command])
+        self.assertEqual(
+            reason,
+            "graxpert_runtime_error: command returned success but image did not change",
+        )
+
+    def test_stage3_graxpert_missing_onnx_is_rejected_before_execution(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+
+        class Stage3Fake:
+            def __init__(self) -> None:
+                self.log = FakeLogger()
+                self.cmd_calls: list[tuple[Any, ...]] = []
+
+            def _validate_plugin_script_prerequisites(self, script_path: Path):
+                self.validated_script = script_path
+                return False, "missing python modules: onnx"
+
+            def cmd_with_check(self, *args: Any, quiet: bool = False) -> bool:
+                _ = quiet
+                self.cmd_calls.append(args)
+                return True
+
+        processor = Stage3Fake()
+        command = (
+            "pyscript",
+            '"/mock/siril scripts/processing/GraXpert-AI.py"',
+            "-bge",
+        )
+
+        ok, reason = stage3_module._stage3_try_background_command(
+            processor,
+            "GraXpert",
+            command,
+            "graxpert",
+        )
+
+        self.assertFalse(ok)
+        self.assertFalse(processor.cmd_calls)
+        self.assertEqual(
+            processor.validated_script,
+            Path("/mock/siril scripts/processing/GraXpert-AI.py"),
+        )
+        self.assertEqual(
+            reason,
+            "graxpert_runtime_error: prerequisites unavailable: "
+            "missing python modules: onnx",
+        )
+
+    def test_stage3_autobge_success_without_image_change_is_rejected(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+
+        class Stage3Fake:
+            def __init__(self) -> None:
+                self.log = FakeLogger()
+                self.fingerprints = iter(("unchanged", "unchanged"))
+                self.cmd_calls: list[tuple[Any, ...]] = []
+
+            def _validate_plugin_script_prerequisites(self, script_path: Path):
+                self.validated_script = script_path
+                return True, ""
+
+            def _current_image_fingerprint(self):
+                return next(self.fingerprints)
+
+            def cmd_with_check(self, *args: Any, quiet: bool = False) -> bool:
+                _ = quiet
+                self.cmd_calls.append(args)
+                return True
+
+        processor = Stage3Fake()
+        command = (
+            "pyscript",
+            '"/mock/siril scripts/processing/AutoBGE.py"',
+        )
+
+        ok, reason = stage3_module._stage3_try_background_command(
+            processor,
+            "AutoBGE",
+            command,
+            "plugin",
+        )
+
+        self.assertFalse(ok)
+        self.assertEqual(
+            processor.validated_script,
+            Path("/mock/siril scripts/processing/AutoBGE.py"),
+        )
+        self.assertEqual(processor.cmd_calls, [command])
+        self.assertEqual(
+            reason,
+            "plugin_runtime_error: command returned success but image did not change",
+        )
+
+    def test_autobge_prerequisites_check_cv2_import_name(self):
+        modules = pipeline_module.SeestarPostProcessor._SCRIPT_PREREQUISITE_MODULES[
+            "AutoBGE.py"
+        ]
+
+        self.assertIn("cv2", modules)
+        self.assertNotIn("opencv-python", modules)
+
+    def test_graxpert_prerequisites_include_script_import_names(self):
+        modules = pipeline_module.SeestarPostProcessor._SCRIPT_PREREQUISITE_MODULES[
+            "GraXpert-AI.py"
+        ]
+
+        self.assertIn("onnx", modules)
+        self.assertIn("appdirs", modules)
+        self.assertNotIn("platformdirs", modules)
 
     def test_stage3_stops_when_first_theoretical_candidate_is_sufficient(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]

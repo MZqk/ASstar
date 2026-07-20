@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +14,24 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+PIPELINE_DIR = REPO_ROOT / "pipeline"
+if str(PIPELINE_DIR) not in sys.path:
+    sys.path.insert(0, str(PIPELINE_DIR))
+
+if "sirilpy" not in sys.modules:
+    sirilpy = types.ModuleType("sirilpy")
+    exceptions = types.ModuleType("sirilpy.exceptions")
+
+    class _SirilError(Exception):
+        pass
+
+    exceptions.CommandError = _SirilError
+    exceptions.DataError = _SirilError
+    exceptions.SirilError = _SirilError
+    sirilpy.exceptions = exceptions
+    sys.modules["sirilpy"] = sirilpy
+    sys.modules["sirilpy.exceptions"] = exceptions
+
 STAGE11_MODULE_PATH = REPO_ROOT / "pipeline" / "stage11_ai_postprocess.py"
 
 
@@ -78,6 +98,7 @@ class FakeProcessor:
             ai_timeout_sec=90,
             ai_strength=0.12,
             debug_mode=False,
+            review_bundle_enabled=False,
         )
         self.log = FakeLogger()
         self.work_dir = work_dir
@@ -91,6 +112,7 @@ class FakeProcessor:
         self.results: list[tuple[str, str, float, str]] = []
         self.cmd_calls: list[tuple[Any, ...]] = []
         self.unlinked: list[Path] = []
+        self.stage_json: dict[str, Any] = {}
         self.request_should_raise: Exception | None = None
         self.quality_results: list[tuple[bool, list[str]]] = [(True, [])]
 
@@ -125,6 +147,9 @@ class FakeProcessor:
     def _safe_unlink(self, path: Path) -> None:
         self.unlinked.append(path)
 
+    def _write_stage_json(self, name: str, payload: Any) -> None:
+        self.stage_json[name] = payload
+
 
 class Stage11RunnerTests(unittest.TestCase):
     def _run_with_processor(self, processor: FakeProcessor) -> FakeProcessor:
@@ -147,6 +172,19 @@ class Stage11RunnerTests(unittest.TestCase):
             _name, status, _dur, message = processor.results[-1]
             self.assertEqual(status, "skipped")
             self.assertIn("SEESTAR_AI_ENABLED not enabled", message)
+
+    def test_stage11_skips_review_only_stage10_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            processor = FakeProcessor(Path(td))
+            processor._final_output_review_only = True
+
+            self._run_with_processor(processor)
+
+            _name, status, _dur, message = processor.results[-1]
+            self.assertEqual(status, "skipped")
+            self.assertIn("review-only", message)
+            self.assertFalse(processor.cmd_calls)
+            self.assertFalse(processor.ai_outputs_generated)
 
     def test_stage11_skipped_when_required_env_missing(self):
         with tempfile.TemporaryDirectory() as td:
