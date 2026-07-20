@@ -12,10 +12,19 @@ set -euo pipefail
 #                        [--config-template /path/to/config.1.4.ini.template]
 #                        [--ai-env /path/to/ai.env]
 #                        [--siril-src /path/to/Siril.app]
+#                        [--codesign-identity "Developer ID Application: ..."]
+#                        [--bundle-profile full|core]
+#                        [--offline-resource-pack-dir DIR]
 #                        [--help]
 
 APP_NAME="SeestarSuperimpose"
 BUILD_PYTHON=""
+APP_BUNDLE_ID="StarunC"
+APP_SHORT_VERSION="0.1"
+APP_BUILD_VERSION="1"
+MACOS_MIN_VERSION="14.0"
+REQUIRED_APP_ARCH="arm64"
+CODESIGN_IDENTITY="-"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -29,7 +38,9 @@ LOCAL_TEMPLATE="$PROJECT_ROOT/resources/config.1.4.ini.template"
 CONFIG_TEMPLATE_IN="$LOCAL_TEMPLATE"
 DEFAULT_ENV_SRC="$PROJECT_ROOT/resources/default.env"
 AI_ENV_SRC="$PROJECT_ROOT/resources/ai.env"
+AI_CREDENTIAL_PACKAGER="$PROJECT_ROOT/build/package_ai_credentials.py"
 SIRIL_PLUGIN_DIR_SRC="$PROJECT_ROOT/resources/siril_plugins"
+SIRIL_SPCC_DATABASE_SEED_SRC="$PROJECT_ROOT/resources/siril_spcc_database"
 APP_REQUIREMENTS="$PROJECT_ROOT/requirements.lock"
 SIRIL_PLUGIN_REQUIREMENTS="$SIRIL_PLUGIN_DIR_SRC/requirements.lock"
 SIRIL_PLUGIN_DOWNLOADS_DIR="$SIRIL_PLUGIN_DIR_SRC/downloads"
@@ -38,6 +49,8 @@ USER_CONFIG="$HOME/Library/Application Support/org.siril.Siril/siril/config.1.4.
 PYTHON_PKG="$PACKAGES_DIR/python-3.13.12-macos11.pkg"
 SIRIL_DMG="$PACKAGES_DIR/siril-1.4.3-arm64.dmg"
 SIRIL_SRC_APP=""
+BUNDLE_PROFILE="full"
+OFFLINE_RESOURCE_PACK_DIR=""
 SIRIL_RUNTIME_STATE="$HOME/Library/Application Support/org.siril.Siril/siril"
 SIRIL_SEED_VENV="$SIRIL_RUNTIME_STATE/venv"
 SIRIL_SEED_MODULE="$SIRIL_RUNTIME_STATE/.python_module"
@@ -49,6 +62,9 @@ Usage:
                    [--gui-entry PATH] [--pipeline-src PATH]
                    [--config-template PATH] [--ai-env PATH]
                    [--siril-src /path/to/Siril.app]
+                   [--codesign-identity IDENTITY]
+                   [--bundle-profile full|core]
+                   [--offline-resource-pack-dir DIR]
 
 This script requires the following package files in:
   $PACKAGES_DIR
@@ -91,6 +107,18 @@ while [[ $# -gt 0 ]]; do
       SIRIL_SRC_APP="$2"
       shift 2
       ;;
+    --codesign-identity)
+      CODESIGN_IDENTITY="$2"
+      shift 2
+      ;;
+    --bundle-profile)
+      BUNDLE_PROFILE="$2"
+      shift 2
+      ;;
+    --offline-resource-pack-dir)
+      OFFLINE_RESOURCE_PACK_DIR="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown argument: $1" >&2
       usage >&2
@@ -108,6 +136,19 @@ CONFIG_TEMPLATE_IN="${CONFIG_TEMPLATE_IN/#\~/$HOME}"
 AI_ENV_SRC="${AI_ENV_SRC/#\~/$HOME}"
 SIRIL_PLUGIN_DIR_SRC="${SIRIL_PLUGIN_DIR_SRC/#\~/$HOME}"
 SIRIL_SRC_APP="${SIRIL_SRC_APP/#\~/$HOME}"
+OFFLINE_RESOURCE_PACK_DIR="${OFFLINE_RESOURCE_PACK_DIR/#\~/$HOME}"
+
+case "$BUNDLE_PROFILE" in
+  full|core) ;;
+  *)
+    echo "Unknown bundle profile: $BUNDLE_PROFILE (expected full or core)" >&2
+    exit 1
+    ;;
+esac
+
+if [[ "$BUNDLE_PROFILE" == "core" && -z "$OFFLINE_RESOURCE_PACK_DIR" ]]; then
+  OFFLINE_RESOURCE_PACK_DIR="$OUTPUT_DIR/${APP_NAME}-OfflineResources"
+fi
 
 die() {
   echo "Error: $*" >&2
@@ -203,23 +244,86 @@ require_executable() {
   fi
 }
 
+require_apple_silicon_host() {
+  local host_arch
+  host_arch="$(uname -m)"
+  if [[ "$host_arch" != "$REQUIRED_APP_ARCH" ]]; then
+    die "[BUILD] Apple Silicon build host required; detected architecture: $host_arch"
+  fi
+}
+
 macos_wheel_platform_tag() {
   case "$(uname -m)" in
-    arm64|aarch64)
+    arm64)
       echo "macosx_14_0_arm64"
       ;;
-    x86_64|amd64)
-      echo "macosx_10_15_x86_64"
-      ;;
     *)
-      die "[BUILD] Unsupported macOS architecture for wheel download: $(uname -m)"
+      die "[BUILD] Apple Silicon arm64 is required for wheel download: $(uname -m)"
       ;;
   esac
 }
 
+configure_app_bundle_metadata() {
+  local app_path="$1"
+  local info_plist="$app_path/Contents/Info.plist"
+  local app_binary="$app_path/Contents/MacOS/$APP_NAME"
+  local actual_bundle_id
+  local actual_short_version
+  local actual_build_version
+  local actual_min_version
+  local actual_archs
+
+  require_file "$info_plist" "Generated app Info.plist"
+  require_executable "$app_binary" "Generated app main binary"
+
+  /usr/bin/plutil -replace CFBundleIdentifier \
+    -string "$APP_BUNDLE_ID" "$info_plist"
+  /usr/bin/plutil -replace CFBundleShortVersionString \
+    -string "$APP_SHORT_VERSION" "$info_plist"
+  /usr/bin/plutil -replace CFBundleVersion \
+    -string "$APP_BUILD_VERSION" "$info_plist"
+  /usr/bin/plutil -replace LSMinimumSystemVersion \
+    -string "$MACOS_MIN_VERSION" "$info_plist"
+  /usr/bin/plutil -lint "$info_plist" >/dev/null
+
+  actual_bundle_id="$(
+    /usr/bin/plutil -extract CFBundleIdentifier raw -o - "$info_plist"
+  )"
+  actual_short_version="$(
+    /usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$info_plist"
+  )"
+  actual_build_version="$(
+    /usr/bin/plutil -extract CFBundleVersion raw -o - "$info_plist"
+  )"
+  actual_min_version="$(
+    /usr/bin/plutil -extract LSMinimumSystemVersion raw -o - "$info_plist"
+  )"
+  if [[ "$actual_bundle_id" != "$APP_BUNDLE_ID" ]]; then
+    die "[BUILD] Unexpected CFBundleIdentifier: $actual_bundle_id"
+  fi
+  if [[ "$actual_short_version" != "$APP_SHORT_VERSION" ]]; then
+    die "[BUILD] Unexpected CFBundleShortVersionString: $actual_short_version"
+  fi
+  if [[ "$actual_build_version" != "$APP_BUILD_VERSION" ]]; then
+    die "[BUILD] Unexpected CFBundleVersion: $actual_build_version"
+  fi
+  if [[ "$actual_min_version" != "$MACOS_MIN_VERSION" ]]; then
+    die "[BUILD] Unexpected LSMinimumSystemVersion: $actual_min_version"
+  fi
+
+  actual_archs="$(/usr/bin/lipo -archs "$app_binary")"
+  if [[ "$actual_archs" != "$REQUIRED_APP_ARCH" ]]; then
+    die "[BUILD] App must be thin arm64; generated architectures: $actual_archs"
+  fi
+
+  log "[BUILD] Bundle metadata: id=$APP_BUNDLE_ID, version=$APP_SHORT_VERSION ($APP_BUILD_VERSION)"
+  log "[BUILD] Platform requirement: macOS $MACOS_MIN_VERSION or later"
+  log "[BUILD] CPU requirement: Apple Silicon ($REQUIRED_APP_ARCH only)"
+}
+
 prune_offline_python_wheels() {
   local download_dir="$1"
-  local target_abi="cp313"
+  local target_abi="cp312"
 
   "$BUILD_PYTHON" - "$download_dir" "$target_abi" <<'PY'
 from __future__ import annotations
@@ -231,6 +335,7 @@ from pip._vendor.packaging.utils import canonicalize_name, parse_wheel_filename
 
 download_dir = Path(sys.argv[1])
 target_abi = sys.argv[2]
+target_version = int(target_abi.removeprefix("cp"))
 allowed_interpreters = {target_abi, "py3"}
 allowed_abis = {target_abi, "abi3", "none"}
 removed = []
@@ -248,6 +353,8 @@ for wheel in sorted(download_dir.glob("*.whl")):
         )
         or (
             tag.interpreter.startswith("cp")
+            and tag.interpreter[2:].isdigit()
+            and int(tag.interpreter[2:]) <= target_version
             and tag.abi == "abi3"
         )
         for tag in tags
@@ -283,26 +390,26 @@ download_offline_python_packages() {
   mkdir -p "$SIRIL_PLUGIN_DOWNLOADS_DIR"
 
   platform_tag="$(macos_wheel_platform_tag)"
-  log "[BUILD] Downloading Python 3.13 offline wheels from: $APP_REQUIREMENTS"
+  log "[BUILD] Downloading Python 3.12 offline wheels from: $APP_REQUIREMENTS"
   "$BUILD_PYTHON" -m pip download \
     --require-hashes \
     --only-binary=:all: \
-    --python-version 313 \
+    --python-version 312 \
     --implementation cp \
-    --abi cp313 \
+    --abi cp312 \
     --abi abi3 \
     --platform "$platform_tag" \
     --index-url "https://pypi.org/simple" \
     --dest "$SIRIL_PLUGIN_DOWNLOADS_DIR" \
     -r "$APP_REQUIREMENTS"
 
-  log "[BUILD] Downloading Python 3.13 offline wheels from: $SIRIL_PLUGIN_REQUIREMENTS"
+  log "[BUILD] Downloading Python 3.12 offline wheels from: $SIRIL_PLUGIN_REQUIREMENTS"
   "$BUILD_PYTHON" -m pip download \
     --require-hashes \
     --only-binary=:all: \
-    --python-version 313 \
+    --python-version 312 \
     --implementation cp \
-    --abi cp313 \
+    --abi cp312 \
     --abi abi3 \
     --platform "$platform_tag" \
     --index-url "https://pypi.org/simple" \
@@ -617,10 +724,10 @@ fix_siril_python_runtime() {
   if [[ -d "$py_framework" ]]; then
     log "[SIRIL] Re-signing embedded Siril Python.framework runtime files..."
     while IFS= read -r -d '' signed_file; do
-      /usr/bin/codesign --force --sign - "$signed_file"
+      /usr/bin/codesign --force --sign "$CODESIGN_IDENTITY" "$signed_file"
     done < <(/usr/bin/find "$py_framework" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" -o -name "Python" \) -print0)
 
-    /usr/bin/codesign --force --deep --sign - "$py_framework"
+    /usr/bin/codesign --force --deep --sign "$CODESIGN_IDENTITY" "$py_framework"
 
     if [[ -x "$py_bin" ]]; then
       if ! "$py_bin" -V >/dev/null 2>&1; then
@@ -630,7 +737,7 @@ fix_siril_python_runtime() {
     fi
   fi
 
-  /usr/bin/codesign --force --deep --sign - "$siril_app"
+  /usr/bin/codesign --force --deep --sign "$CODESIGN_IDENTITY" "$siril_app"
 }
 
 embed_siril_offline_python_seed() {
@@ -673,11 +780,36 @@ embed_siril_offline_python_seed() {
 
   verify_siril_seed_runtime "$seed_root/venv"
 }
+
+embed_siril_spcc_database_seed() {
+  local app_resources="$1"
+  local seed_root="$app_resources/SirilSPCCDatabaseSeed"
+
+  require_dir "$SIRIL_SPCC_DATABASE_SEED_SRC" "Siril SPCC database seed source"
+  require_exists "$SIRIL_SPCC_DATABASE_SEED_SRC/manifest.json" "Siril SPCC seed manifest"
+  require_exists "$SIRIL_SPCC_DATABASE_SEED_SRC/VERSION.txt" "Siril SPCC seed version list"
+  require_exists "$SIRIL_SPCC_DATABASE_SEED_SRC/LICENSE.md" "Siril SPCC seed GPLv3 license"
+  if ! (
+    cd "$SIRIL_SPCC_DATABASE_SEED_SRC"
+    /usr/bin/shasum -a 256 -c SHA256SUMS
+  ); then
+    die "Siril SPCC database seed checksum verification failed"
+  fi
+
+  rm -rf "$seed_root"
+  mkdir -p "$seed_root"
+  cp -R "$SIRIL_SPCC_DATABASE_SEED_SRC/." "$seed_root/"
+  log "[SIRIL] Embedded fixed SPCC database seed: $seed_root"
+}
+require_apple_silicon_host
 require_exists "$PROJECT_ROOT" "Project root"
 require_exists "$GUI_ENTRY" "GUI entry"
 require_file "$APP_LOGO_PNG" "App logo PNG"
 require_file "$PIPELINE_SRC" "Pipeline script"
 require_file "$STAGE11_MODULE_SRC" "Stage11 module script"
+require_dir "$SIRIL_SPCC_DATABASE_SEED_SRC" "Siril SPCC database seed source"
+require_file "$SIRIL_SPCC_DATABASE_SEED_SRC/manifest.json" "Siril SPCC seed manifest"
+require_file "$SIRIL_SPCC_DATABASE_SEED_SRC/SHA256SUMS" "Siril SPCC seed checksums"
 require_dir "$PACKAGES_DIR" "Packages directory"
 require_file "$PYTHON_PKG" "Python package"
 if [[ -n "$SIRIL_SRC_APP" ]]; then
@@ -758,11 +890,26 @@ else
 EOCONFIG
 fi
 
+AI_PACKAGE_SOURCE="$AI_ENV_SRC"
+if [[ ! -f "$AI_PACKAGE_SOURCE" ]]; then
+  AI_PACKAGE_SOURCE="$DEFAULT_ENV_SRC"
+fi
+AI_SANITIZED_ENV="$RES_STAGING/ai.env"
+AI_BOOTSTRAP="$RES_STAGING/ai-trial.bootstrap"
+require_file "$AI_CREDENTIAL_PACKAGER" "[BUILD] AI credential packager"
+require_file "$AI_PACKAGE_SOURCE" "[BUILD] AI configuration source"
+"$BUILD_PYTHON" "$AI_CREDENTIAL_PACKAGER" package \
+  --source "$AI_PACKAGE_SOURCE" \
+  --sanitized-env "$AI_SANITIZED_ENV" \
+  --bootstrap "$AI_BOOTSTRAP"
+
 log "[BUILD] Building base app with PyInstaller..."
 "$BUILD_PYTHON" -m PyInstaller \
   --noconfirm \
   --clean \
   --windowed \
+  --osx-bundle-identifier "$APP_BUNDLE_ID" \
+  --target-architecture "$REQUIRED_APP_ARCH" \
   --icon "$APP_ICON_ICNS" \
   --name "$APP_NAME" \
   --distpath "$OUTPUT_DIR" \
@@ -773,6 +920,8 @@ log "[BUILD] Building base app with PyInstaller..."
 if [[ ! -d "$APP_PATH" ]]; then
   die "Build failed: app not generated at $APP_PATH"
 fi
+
+configure_app_bundle_metadata "$APP_PATH"
 
 # PyInstaller may leave a sibling onedir folder; remove it to avoid confusion.
 if [[ -d "$ONEDIR_PATH" ]]; then
@@ -793,6 +942,7 @@ else
 fi
 fix_siril_python_runtime "$APP_RESOURCES/Siril.app"
 embed_siril_offline_python_seed "$APP_RESOURCES"
+embed_siril_spcc_database_seed "$APP_RESOURCES"
 
 log "[BUILD] Embedding pipeline/config resources..."
 cp "$CONFIG_TEMPLATE" "$APP_RESOURCES/config.1.4.ini.template"
@@ -815,17 +965,20 @@ if [[ -f "$DEFAULT_ENV_SRC" ]]; then
   cp "$DEFAULT_ENV_SRC" "$APP_RESOURCES/default.env"
   log "[BUILD] Embedded default env file: $DEFAULT_ENV_SRC"
 fi
-if [[ -f "$AI_ENV_SRC" ]]; then
-  cp "$AI_ENV_SRC" "$APP_RESOURCES/ai.env"
-  log "[BUILD] Embedded AI env file: $AI_ENV_SRC"
-elif [[ -f "$DEFAULT_ENV_SRC" ]]; then
-  cp "$DEFAULT_ENV_SRC" "$APP_RESOURCES/ai.env"
-  log "[BUILD] Embedded default env as ai.env: $DEFAULT_ENV_SRC"
-else
-  log "[BUILD] Env file not found, skip embedding: $AI_ENV_SRC"
+cp "$AI_SANITIZED_ENV" "$APP_RESOURCES/ai.env"
+log "[BUILD] Embedded sanitized AI config: $AI_PACKAGE_SOURCE"
+if [[ -f "$AI_BOOTSTRAP" ]]; then
+  cp "$AI_BOOTSTRAP" "$APP_RESOURCES/ai-trial.bootstrap"
+  # App resources may become root-owned after installation; the encrypted
+  # bootstrap must remain readable by the signed app running as the user.
+  chmod 644 "$APP_RESOURCES/ai-trial.bootstrap"
+  log "[BUILD] Embedded obfuscated Keychain bootstrap"
 fi
 if [[ -d "$SIRIL_PLUGIN_DIR_SRC" ]]; then
   require_glob_exists "$SIRIL_PLUGIN_DIR_SRC/downloads/setiastrosuitepro-*.whl" "[BUILD] setiastrosuitepro wheel (run resources/siril_plugins/download_siril_plugins.sh)"
+  require_glob_exists "$SIRIL_PLUGIN_DIR_SRC/downloads/appdirs-*.whl" "[BUILD] appdirs wheel (run resources/siril_plugins/download_siril_plugins.sh)"
+  require_glob_exists "$SIRIL_PLUGIN_DIR_SRC/downloads/ml_dtypes-*.whl" "[BUILD] ml-dtypes wheel (run resources/siril_plugins/download_siril_plugins.sh)"
+  require_glob_exists "$SIRIL_PLUGIN_DIR_SRC/downloads/onnx-*.whl" "[BUILD] onnx wheel (run resources/siril_plugins/download_siril_plugins.sh)"
   require_glob_exists "$SIRIL_PLUGIN_DIR_SRC/downloads/onnxruntime-*.whl" "[BUILD] onnxruntime wheel (run resources/siril_plugins/download_siril_plugins.sh)"
   require_any_glob_exists \
     "[BUILD] PyQt6 wheel missing (run resources/siril_plugins/download_siril_plugins.sh)" \
@@ -893,11 +1046,24 @@ if [[ -d "$SIRIL_PLUGIN_DIR_SRC" ]]; then
   require_file "$SIRIL_PLUGIN_DIR_SRC/cosmic_clarity/deep_nonstellar_sharp_conditional_psf_AI4.pth" "[BUILD] CosmicClarity nonstellar sharpen model"
   require_executable "$SIRIL_PLUGIN_DIR_SRC/bin/CosmicClarity" "[BUILD] CosmicClarity classic wrapper"
   rm -rf "$APP_RESOURCES/siril_plugins"
-  ditto "$SIRIL_PLUGIN_DIR_SRC" "$APP_RESOURCES/siril_plugins"
-  "$BUILD_PYTHON" "$APP_RESOURCES/siril_plugins/patches/apply_graxpert_ai_runtime_patch.py" \
-    "$APP_RESOURCES/siril_plugins"
-  log "[BUILD] Runtime plugin wheels will be installed lazily from bundled cache on first app run."
-  log "[BUILD] Embedded Siril plugin dir: $SIRIL_PLUGIN_DIR_SRC"
+  if [[ "$BUNDLE_PROFILE" == "full" ]]; then
+    ditto "$SIRIL_PLUGIN_DIR_SRC" "$APP_RESOURCES/siril_plugins"
+    "$BUILD_PYTHON" "$APP_RESOURCES/siril_plugins/patches/apply_graxpert_ai_runtime_patch.py" \
+      "$APP_RESOURCES/siril_plugins"
+    log "[BUILD] Full Offline profile: plugin wheels and models are embedded in the app."
+  else
+    [[ -n "$OFFLINE_RESOURCE_PACK_DIR" ]] || die "Core profile resource pack path is empty"
+    [[ "$OFFLINE_RESOURCE_PACK_DIR" != "/" ]] || die "Refusing to use / as the resource pack path"
+    rm -rf "$OFFLINE_RESOURCE_PACK_DIR"
+    mkdir -p "$OFFLINE_RESOURCE_PACK_DIR"
+    ditto "$SIRIL_PLUGIN_DIR_SRC" "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins"
+    "$BUILD_PYTHON" \
+      "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/patches/apply_graxpert_ai_runtime_patch.py" \
+      "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins"
+    log "[BUILD] Core profile: app excludes offline plugin wheels and models."
+    log "[BUILD] Offline resource pack: $OFFLINE_RESOURCE_PACK_DIR"
+  fi
+  log "[BUILD] Runtime plugin wheels will be installed lazily from the offline cache on first app run."
 else
   log "[BUILD] Siril plugin dir not found, skip embedding: $SIRIL_PLUGIN_DIR_SRC"
 fi
@@ -912,14 +1078,47 @@ verify_python_wrapper "$APP_RESOURCES/python/bin/python3.13"
 require_exists "$APP_RESOURCES/Siril.app" "[VERIFY] Embedded Siril"
 require_exists "$APP_RESOURCES/SirilPythonSeed/venv/bin/python3.12" "[VERIFY] Embedded Siril offline venv seed"
 require_exists "$APP_RESOURCES/SirilPythonSeed/.python_module/sirilpy" "[VERIFY] Embedded Siril offline module seed"
+require_exists "$APP_RESOURCES/SirilSPCCDatabaseSeed/manifest.json" "[VERIFY] Embedded Siril SPCC seed manifest"
+require_exists "$APP_RESOURCES/SirilSPCCDatabaseSeed/VERSION.txt" "[VERIFY] Embedded Siril SPCC seed version list"
+require_exists "$APP_RESOURCES/SirilSPCCDatabaseSeed/LICENSE.md" "[VERIFY] Embedded Siril SPCC seed GPLv3 license"
+require_exists "$APP_RESOURCES/SirilSPCCDatabaseSeed/osc_sensors/Sony_IMX585.json" "[VERIFY] Embedded Sony IMX585 SPCC response"
+require_exists "$APP_RESOURCES/SirilSPCCDatabaseSeed/osc_filters/ZWO_Seestar_LP.json" "[VERIFY] Embedded ZWO Seestar LP SPCC response"
+require_exists "$APP_RESOURCES/SirilSPCCDatabaseSeed/osc_filters/No_filter.json" "[VERIFY] Embedded no-filter SPCC response"
+require_exists "$APP_RESOURCES/SirilSPCCDatabaseSeed/wb_refs/Average_spiral_galaxy.json" "[VERIFY] Embedded average spiral galaxy white reference"
+require_exists "$APP_RESOURCES/SirilSPCCDatabaseSeed/wb_refs/Star_g2v.json" "[VERIFY] Embedded G2V white reference"
 require_exists "$APP_FRAMEWORKS/Python.framework/Versions/3.13" "[VERIFY] Embedded Python framework"
 require_executable "$APP_RESOURCES/python/bin/python3.13" "[VERIFY] Embedded Python wrapper"
+if [[ "$BUNDLE_PROFILE" == "full" ]]; then
+  require_dir "$APP_RESOURCES/siril_plugins/downloads" "[VERIFY] Embedded offline wheels"
+  require_file "$APP_RESOURCES/siril_plugins/syqon_starless/zenith.pt" "[VERIFY] Embedded SyQon model"
+  require_dir "$APP_RESOURCES/siril_plugins/cosmic_clarity" "[VERIFY] Embedded CosmicClarity models"
+else
+  require_dir "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/downloads" "[VERIFY] Core offline resource wheels"
+  require_file "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/syqon_starless/zenith.pt" "[VERIFY] Core offline resource SyQon model"
+  require_dir "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/cosmic_clarity" "[VERIFY] Core offline resource CosmicClarity models"
+fi
 
-log "[BUILD] Applying ad-hoc deep signing for local execution..."
+AI_CREDENTIAL_SCAN_ARGS=(
+  --scan "$APP_RESOURCES/ai.env"
+  --scan "$APP_PATH/Contents/MacOS/$APP_NAME"
+)
+if [[ -f "$APP_RESOURCES/ai-trial.bootstrap" ]]; then
+  AI_CREDENTIAL_SCAN_ARGS+=(--scan "$APP_RESOURCES/ai-trial.bootstrap")
+fi
+"$BUILD_PYTHON" "$AI_CREDENTIAL_PACKAGER" verify \
+  --source "$AI_PACKAGE_SOURCE" \
+  --sanitized-env "$APP_RESOURCES/ai.env" \
+  --bootstrap "$APP_RESOURCES/ai-trial.bootstrap" \
+  "${AI_CREDENTIAL_SCAN_ARGS[@]}"
+
+log "[BUILD] Applying deep signing with identity: $CODESIGN_IDENTITY"
 /usr/bin/xattr -cr "$APP_PATH" >/dev/null 2>&1 || true
-codesign --force --deep --sign - "$APP_PATH"
+codesign --force --deep --sign "$CODESIGN_IDENTITY" "$APP_PATH"
 codesign --verify --deep --strict "$APP_PATH"
 
 echo
 log "Build complete."
 log "App path: $APP_PATH"
+if [[ "$BUNDLE_PROFILE" == "core" ]]; then
+  log "Offline resource pack: $OFFLINE_RESOURCE_PACK_DIR"
+fi
