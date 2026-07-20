@@ -294,9 +294,10 @@ def build_target_profile(
     target_confidence = visual_confidence
     target_type = visual_type
     method = visual_method
+    diagnostics: List[str] = []
     warnings: List[str] = []
     if auto_hint:
-        warnings.append(f"auto_target_hint={auto_hint}")
+        diagnostics.append(f"auto_target_hint={auto_hint}")
         if (
             visual_type
             in {
@@ -327,7 +328,9 @@ def build_target_profile(
         if item.get("features"):
             catalog_score = min(0.98, catalog_score + 0.08 * feature_overlap / max(len(item["features"]), 1))
         if catalog_type != visual_type:
-            warnings.append(f"catalog_visual_type_conflict: catalog={catalog_type}, visual={visual_type}")
+            diagnostics.append(
+                f"catalog_visual_type_resolution: catalog={catalog_type}, visual={visual_type}"
+            )
         if coord_match or catalog_score >= visual_confidence:
             target_name = str(item.get("name") or "")
             target_type = catalog_type
@@ -338,7 +341,7 @@ def build_target_profile(
                 else match_method
             )
             if match_distance is not None:
-                warnings.append(f"catalog_coordinate_distance_deg={match_distance:.4f}")
+                diagnostics.append(f"catalog_coordinate_distance_deg={match_distance:.4f}")
 
     if (
         auto_hint
@@ -352,7 +355,7 @@ def build_target_profile(
         }
         and target_confidence <= 0.72
     ):
-        warnings.append(f"auto_target_hint_override: {target_type}->{auto_hint}")
+        diagnostics.append(f"auto_target_hint_override: {target_type}->{auto_hint}")
         target_type = auto_hint
         target_confidence = max(target_confidence, 0.66)
         method = "auto_target_hint_plus_visual_features"
@@ -403,6 +406,7 @@ def build_target_profile(
             "chroma_noise": features.chroma_noise_score,
             "color_balance_score": features.color_balance_score,
         },
+        "diagnostics": diagnostics,
         "warnings": warnings,
     }
     profile["policy"] = policy_for_profile(profile)

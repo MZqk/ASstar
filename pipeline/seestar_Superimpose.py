@@ -5,13 +5,14 @@ Optimized for Siril 1.4+
 
 详细流程说明见同目录文档: seestar_Superimpose_workflow.md
 
-处理顺序遵循天文后期最佳实践:
-  线性阶段 (拉伸前): 背景提取 → 色彩校准 → 降噪
-  非线性阶段 (拉伸后): 星点分离 → 星云增强 → 星点混合 → 导出
+处理顺序遵循 starless-first 天文后期链路:
+  线性阶段: 背景提取 → 色彩校准 → 降噪 → 星点分离
+  非线性阶段: Starless 主体拉伸 → 星云增强 → 星点层拉伸与回混 → 导出
 """
 import json
 import importlib
 import hashlib
+import errno
 import math
 import os
 import platform
@@ -79,6 +80,7 @@ from save_utils import (
     write_png_rgb16,
     write_stage_json,
 )
+from ui_preview import write_raw_preview
 
 try:
     from stage11_ai_postprocess import run_stage11_ai_postprocess
@@ -86,6 +88,13 @@ try:
 except (ImportError, RuntimeError) as stage11_import_exc:
     run_stage11_ai_postprocess = None
     STAGE11_IMPORT_ERROR = stage11_import_exc
+
+try:
+    from ai_artistic_derivative import run_ai_artistic_derivative
+    AI_ARTISTIC_IMPORT_ERROR = None
+except (ImportError, RuntimeError) as artistic_import_exc:
+    run_ai_artistic_derivative = None
+    AI_ARTISTIC_IMPORT_ERROR = artistic_import_exc
 
 try:
     import numpy as np
@@ -169,8 +178,10 @@ ENV_COSMIC_CLASSIC_ENABLE_KEY = "SEESTAR_COSMIC_CLASSIC_ENABLE"
 INPUT_MODE_AUTO = "auto"
 INPUT_MODE_LINEAR_RESUME = "result_linear_resume"
 INPUT_MODE_STAGE2_CORRECTED_RESUME = "stage2_corrected_resume"
+INPUT_MODE_STAGE4_PSOLVED_RESUME = "stage4_psolved_resume"
 LINEAR_RESUME_INPUT_NAME = "result_linear.fit"
 STAGE2_CORRECTED_INPUT_NAME = "stage2_corrected.fit"
+STAGE4_PSOLVED_INPUT_NAME = "stage4_psolved.fit"
 DEFAULT_AI_PROMPT = (
     "Conservative deep-sky astrophotography enhancement only. "
     "Preserve astronomical realism, faint structures, and natural star colors. "
@@ -181,6 +192,101 @@ RESULT_BASENAME_TEMPLATE = (
     "$OBJECT:%s$_$STACKCNT:%d$x$EXPTIME:%d$sec"
     "_$DATE-OBS:dm12$_processed"
 )
+
+SIRIL_NATIVE_PROCESS_TERMINATED_MARKER = "[SIRIL_NATIVE_PROCESS_TERMINATED]"
+_SIRIL_NATIVE_DEATH_ERRNOS = frozenset(
+    value
+    for value in (
+        getattr(errno, "EPIPE", None),
+        getattr(errno, "ECONNRESET", None),
+        getattr(errno, "ECONNABORTED", None),
+        getattr(errno, "ENOTCONN", None),
+        getattr(errno, "ESHUTDOWN", None),
+    )
+    if value is not None
+)
+_SIRIL_NATIVE_DEATH_HINTS = (
+    "broken pipe",
+    "connection closed",
+    "connection was closed",
+    "connection reset",
+    "connection aborted",
+    "connection lost",
+    "socket closed",
+    "socket is closed",
+    "pipe is closed",
+    "end of file",
+    "unexpected eof",
+    "server disconnected",
+    "process exited",
+    "process has exited",
+    "siril has exited",
+    "siril process terminated",
+)
+
+
+class SirilNativeProcessTerminated(BaseException):
+    """Fatal control flow: the connected Siril native process is no longer usable."""
+
+    def __init__(self, command: str, cause: BaseException):
+        self.command = command
+        self.cause = cause
+        super().__init__(
+            f"Siril native process terminated during '{command}': "
+            f"{type(cause).__name__}: {cause}"
+        )
+
+
+def _is_siril_native_process_termination(error: BaseException) -> bool:
+    if isinstance(
+        error,
+        (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, EOFError),
+    ):
+        return True
+    if type(error).__name__ == "SirilConnectionError":
+        return True
+    error_number = getattr(error, "errno", None)
+    if error_number in _SIRIL_NATIVE_DEATH_ERRNOS:
+        return True
+    lowered = str(error).strip().lower()
+    return any(hint in lowered for hint in _SIRIL_NATIVE_DEATH_HINTS)
+
+
+class _FatalSirilInterfaceProxy:
+    """Turn native connection death from any sirilpy API into fatal control flow."""
+
+    def __init__(self, owner, interface):
+        self._owner = owner
+        self._interface = interface
+
+    def __getattr__(self, name: str):
+        attribute = getattr(self._interface, name)
+        if not callable(attribute):
+            return attribute
+
+        def guarded(*args, **kwargs):
+            owner = self._owner
+            if owner._siril_process_terminated:
+                fatal = owner._siril_process_termination_error
+                if fatal is None:
+                    fatal = SirilNativeProcessTerminated(
+                        name,
+                        RuntimeError("Siril connection was already closed"),
+                    )
+                    owner._siril_process_termination_error = fatal
+                raise fatal
+            try:
+                return attribute(*args, **kwargs)
+            except Exception as error:
+                initial_connect = name == "connect" and not owner._siril_ever_connected
+                if (
+                    not initial_connect
+                    and _is_siril_native_process_termination(error)
+                ):
+                    owner._raise_siril_native_process_terminated(name, error)
+                raise
+
+        return guarded
 
 
 # ============================================================
@@ -230,6 +336,7 @@ AUTO_CLAMP_FIELDS = (
     "final_saturation",
     "ai_timeout_sec",
     "ai_strength",
+    "ai_artistic_timeout_sec",
     "ai_bg_median_delta_max",
     "ai_color_ratio_delta_max",
     "ai_core_growth_ratio_max",
@@ -238,6 +345,10 @@ AUTO_CLAMP_FIELDS = (
     "stage6_black_pixel_ratio_max",
     "stage6_highlight_clip_ratio_max",
     "stage6_star_growth_ratio_max",
+    "stage7_stretch_chroma_noise_score_max",
+    "stage7_stretch_background_mottling_score_max",
+    "stage7_stretch_chroma_load_growth_max",
+    "stage7_stretch_chroma_load_low_absolute_max",
     "stage7_quality_retry_max",
     "stage7_edge_black_warn",
     "stage7_edge_black_high",
@@ -254,10 +365,14 @@ AUTO_CLAMP_FIELDS = (
     "stage7_starmask_width_ratio_max",
     "stage7_starless_dynamic_range_min_ratio",
     "stage7_starless_peak_signal_min",
+    "stage7_starless_peak_background_ratio_min",
     "stage7_starmask_background_floor_percentile",
     "stage7_starmask_halo_blur_strength",
     "stage7_starmask_small_star_scale",
     "stage7_starmask_nebula_suppression",
+    "stage7_starmask_cleanup_noise_sigma",
+    "stage7_starmask_compact_retention_min",
+    "stage7_starmask_diffuse_residual_ratio_max",
     "mild_prestretch_strength",
     "stage7_conservative_asinh_stretch",
     "stage7_ultra_conservative_asinh_stretch",
@@ -267,11 +382,38 @@ AUTO_CLAMP_FIELDS = (
     "stage7_starless_halo_repair_strength",
     "stage7_starless_chroma_denoise_strength",
     "stage7_starless_repair_max_score_growth",
+    "stage7_starless_repair_chroma_reduction_min",
+    "stage7_starless_repair_chroma_delta_min",
     "stage8_mask_signal_coverage_min",
     "stage8_blue_excess_max",
     "stage8_saturation_growth_ratio_max",
     "stage8_microcontrast_growth_ratio_max",
     "stage8_highlight_clip_ratio_max",
+    "stage9_highlight_clip_ratio_max",
+    "stage9_highlight_clip_growth_max",
+    "stage9_bright_pixel_growth_max",
+    "stage9_background_lift_max",
+    "stage9_background_mottling_growth_max",
+    "stage9_mottling_exemption_changed_pixel_ratio_max",
+    "stage9_changed_pixel_ratio_max",
+    "stage9_starmask_predicted_change_ratio_max",
+    "stage9_darkening_ratio_max",
+    "stage9_local_component_peak_min",
+    "stage9_local_component_area_max",
+    "stage9_local_component_aspect_ratio_max",
+    "stage9_local_component_fill_ratio_min",
+    "stage9_local_single_pixel_ratio_max",
+    "stage9_local_cyan_blue_peak_min",
+    "stage9_local_cyan_blue_saturation_min",
+    "stage9_local_cyan_blue_component_area_max",
+    "stage9_core_percentile",
+    "stage9_core_color_jump_min",
+    "stage9_core_color_jump_component_area_max",
+    "stage10_chroma_focus_score_min",
+    "stage10_separate_chroma_score_min",
+    "stage10_full_bg_std_min",
+    "stage10_full_mottling_score_min",
+    "stage10_stage9_local_color_risk_strength",
 )
 
 CLAMP_RULES: list[tuple[str, type, float, float]] = [
@@ -316,6 +458,7 @@ CLAMP_RULES: list[tuple[str, type, float, float]] = [
     ("final_saturation", float, 0.05, 0.25),
     ("ai_timeout_sec", int, 15, 300),
     ("ai_strength", float, 0.05, 0.25),
+    ("ai_artistic_timeout_sec", int, 30, 600),
     ("ai_bg_median_delta_max", float, 0.01, 0.06),
     ("ai_color_ratio_delta_max", float, 0.08, 0.35),
     ("ai_core_growth_ratio_max", float, 1.05, 1.80),
@@ -324,6 +467,10 @@ CLAMP_RULES: list[tuple[str, type, float, float]] = [
     ("stage6_black_pixel_ratio_max", float, 0.10, 0.70),
     ("stage6_highlight_clip_ratio_max", float, 0.001, 0.050),
     ("stage6_star_growth_ratio_max", float, 1.05, 1.80),
+    ("stage7_stretch_chroma_noise_score_max", float, 0.10, 0.80),
+    ("stage7_stretch_background_mottling_score_max", float, 0.10, 1.00),
+    ("stage7_stretch_chroma_load_growth_max", float, 1.00, 3.00),
+    ("stage7_stretch_chroma_load_low_absolute_max", float, 0.01, 0.15),
     ("stage7_quality_retry_max", int, 0, 3),
     ("stage7_edge_black_warn", float, 0.04, 0.30),
     ("stage7_bg_median_high", float, 0.08, 0.35),
@@ -338,10 +485,14 @@ CLAMP_RULES: list[tuple[str, type, float, float]] = [
     ("stage7_starmask_width_ratio_max", float, 1.10, 3.00),
     ("stage7_starless_dynamic_range_min_ratio", float, 0.20, 0.90),
     ("stage7_starless_peak_signal_min", float, 0.0015, 0.0300),
+    ("stage7_starless_peak_background_ratio_min", float, 1.5, 12.0),
     ("stage7_starmask_background_floor_percentile", float, 20.0, 80.0),
     ("stage7_starmask_halo_blur_strength", float, 0.0, 0.80),
     ("stage7_starmask_small_star_scale", float, 0.50, 1.00),
     ("stage7_starmask_nebula_suppression", float, 0.0, 0.95),
+    ("stage7_starmask_cleanup_noise_sigma", float, 1.0, 6.0),
+    ("stage7_starmask_compact_retention_min", float, 0.60, 0.98),
+    ("stage7_starmask_diffuse_residual_ratio_max", float, 0.01, 0.50),
     ("mild_prestretch_strength", float, 1.05, 1.80),
     ("stage7_conservative_asinh_stretch", float, 1.60, 2.60),
     ("stage7_conservative_asinh_offset", float, 0.0005, 0.0060),
@@ -349,11 +500,38 @@ CLAMP_RULES: list[tuple[str, type, float, float]] = [
     ("stage7_starless_halo_repair_strength", float, 0.0, 0.90),
     ("stage7_starless_chroma_denoise_strength", float, 0.0, 0.90),
     ("stage7_starless_repair_max_score_growth", float, 0.0, 0.20),
+    ("stage7_starless_repair_chroma_reduction_min", float, 0.05, 0.80),
+    ("stage7_starless_repair_chroma_delta_min", float, 0.00001, 0.05000),
     ("stage8_mask_signal_coverage_min", float, 0.001, 0.050),
     ("stage8_blue_excess_max", float, 0.02, 0.30),
     ("stage8_saturation_growth_ratio_max", float, 1.05, 2.50),
     ("stage8_microcontrast_growth_ratio_max", float, 1.05, 2.80),
     ("stage8_highlight_clip_ratio_max", float, 0.001, 0.060),
+    ("stage9_highlight_clip_ratio_max", float, 0.001, 0.10),
+    ("stage9_highlight_clip_growth_max", float, 0.0, 0.05),
+    ("stage9_bright_pixel_growth_max", float, 0.0, 0.10),
+    ("stage9_background_lift_max", float, 0.0, 0.05),
+    ("stage9_background_mottling_growth_max", float, 1.0, 3.0),
+    ("stage9_mottling_exemption_changed_pixel_ratio_max", float, 0.02, 0.35),
+    ("stage9_changed_pixel_ratio_max", float, 0.05, 0.80),
+    ("stage9_starmask_predicted_change_ratio_max", float, 0.05, 0.60),
+    ("stage9_darkening_ratio_max", float, 0.0, 0.05),
+    ("stage9_local_component_peak_min", float, 0.002, 0.10),
+    ("stage9_local_component_area_max", int, 16, 4096),
+    ("stage9_local_component_aspect_ratio_max", float, 1.2, 10.0),
+    ("stage9_local_component_fill_ratio_min", float, 0.02, 0.80),
+    ("stage9_local_single_pixel_ratio_max", float, 0.0, 0.90),
+    ("stage9_local_cyan_blue_peak_min", float, 0.002, 0.10),
+    ("stage9_local_cyan_blue_saturation_min", float, 0.20, 0.95),
+    ("stage9_local_cyan_blue_component_area_max", int, 4, 2048),
+    ("stage9_core_percentile", float, 70.0, 99.0),
+    ("stage9_core_color_jump_min", float, 0.03, 0.50),
+    ("stage9_core_color_jump_component_area_max", int, 4, 2048),
+    ("stage10_chroma_focus_score_min", float, 0.10, 0.80),
+    ("stage10_separate_chroma_score_min", float, 0.35, 1.50),
+    ("stage10_full_bg_std_min", float, 0.001, 0.10),
+    ("stage10_full_mottling_score_min", float, 0.10, 1.00),
+    ("stage10_stage9_local_color_risk_strength", float, 0.0, 1.0),
 ]
 
 DENOISE_MOD_MIN = 0.20
@@ -744,7 +922,7 @@ def format_config_summary(cfg: PipelineConfig) -> str:
     return (
         "crop_margin={:.3f}, bg_samples={}, bg_tol={:.2f}, bg_smooth={:.2f}, "
         "denoise={}({:.2f}), asinh=({:.2f},{:.4f}), ghs=({:.2f},{:.2f}), "
-        "nebula_sat={:.2f}, star_mode={}, mild_prestretch={:.2f}, "
+        "nebula_sat={:.2f}, star_mode={}, star_input_domain=linear, "
         "star_intensity={:.2f}, final_sat={:.2f}, "
         "ai_enabled={}, ai_strength={:.2f}"
     ).format(
@@ -760,7 +938,6 @@ def format_config_summary(cfg: PipelineConfig) -> str:
         cfg.ghs_stretchamount,
         cfg.nebula_saturation,
         cfg.star_separation_mode,
-        cfg.mild_prestretch_strength,
         cfg.star_intensity,
         cfg.final_saturation,
         cfg.ai_post_enabled,
@@ -802,6 +979,8 @@ class SeestarPostProcessor(
     _SCRIPT_PREREQUISITE_MODULES = {
         # These scripts call ensure_installed() and will emit traceback noise in
         # offline runtime when dependencies are unavailable.
+        "GraXpert-AI.py": ("onnx", "onnxruntime", "appdirs", "cv2", "PyQt6"),
+        "AutoBGE.py": ("cv2", "scipy", "PyQt6"),
         "CosmicClarity_Sharpen.py": (
             "PyQt6", "tiffile", "lz4", "zstandard", "exifread", "cv2"
         ),
@@ -820,7 +999,7 @@ class SeestarPostProcessor(
         self.initial_cfg = copy.deepcopy(self.cfg)
         self.base_cfg = copy.deepcopy(self.initial_cfg)
         self.log = PipelineLogger('DEBUG' if self.cfg.debug_mode else 'INFO')
-        self.siril = s.SirilInterface()
+        self.siril = _FatalSirilInterfaceProxy(self, s.SirilInterface())
         self.results = []
         self.work_dir = None
         self.process_dir = None
@@ -832,6 +1011,8 @@ class SeestarPostProcessor(
         self.auto_tune_result = None
         self.platesolve_ok = False
         self.ai_outputs_generated = False
+        self.ai_artistic_output_generated = False
+        self.ai_artistic_output_path: Optional[Path] = None
         self.workflow_command_used: Dict[str, str] = {}
         self.sasp_starless_exchange: Optional[Path] = None
         self.sasp_starmask_exchange: Optional[Path] = None
@@ -861,7 +1042,13 @@ class SeestarPostProcessor(
         self._stage9_star_intensity_scale: float = 1.0
         self._stage9_star_intensity_reason: str = ""
         self._stage9_bypassed_bad_starless: bool = False
+        self._stage9_stars_required: bool = True
+        self._stage9_stars_applied: bool = False
+        self._stage9_stars_application_mode: str = "pending"
         self._stage9_final_source: str = ""
+        self._star_preserve_target_bypass: bool = False
+        self._stage5_denoise_applied: bool = False
+        self._saturation_boost_applied: float = 0.0
         self._debug_quality_metric_index: int = 0
         self.target_profile: Dict[str, Any] = {}
         self.pipeline_policy: Dict[str, Any] = copy.deepcopy(DEFAULT_POLICY)
@@ -869,6 +1056,11 @@ class SeestarPostProcessor(
         self.color_calibration_report: Dict[str, Any] = {}
         self.input_mode: str = INPUT_MODE_AUTO
         self._stage1_input_mode: str = "unknown"
+        self._siril_process_terminated: bool = False
+        self._siril_process_termination_error: Optional[
+            SirilNativeProcessTerminated
+        ] = None
+        self._siril_ever_connected: bool = False
         plugin_dir_raw = os.getenv("SEESTAR_SIRIL_PLUGIN_DIR", "").strip()
         self.siril_plugin_dir = (
             Path(plugin_dir_raw).expanduser()
@@ -897,11 +1089,33 @@ class SeestarPostProcessor(
             details.append(f"message={self._short_text(text)}")
         return ", ".join(details)
 
+    def _raise_siril_native_process_terminated(self, command: str, error):
+        fatal = SirilNativeProcessTerminated(command, error)
+        self._siril_process_terminated = True
+        self._siril_process_termination_error = fatal
+        if hasattr(self.log, "set_sink"):
+            self.log.set_sink(None)
+        self.log.error(
+            f"{SIRIL_NATIVE_PROCESS_TERMINATED_MARKER} "
+            f"{fatal}; aborting pipeline without fallback or save"
+        )
+        raise fatal from error
+
     def cmd_with_check(self, *args, quiet=False):
         """执行 Siril 命令，带基于状态码与错误文本的智能重试"""
         cmd_str = ' '.join(map(str, args))
         cmd_name = str(args[0]).lower() if args else ''
         max_attempts = self.cfg.max_retries + 1
+
+        if self._siril_process_terminated:
+            fatal = self._siril_process_termination_error
+            if fatal is None:
+                fatal = SirilNativeProcessTerminated(
+                    cmd_str,
+                    RuntimeError("Siril connection was already closed"),
+                )
+                self._siril_process_termination_error = fatal
+            raise fatal
 
         for attempt in range(1, max_attempts + 1):
             started = time.time()
@@ -916,6 +1130,8 @@ class SeestarPostProcessor(
                 return True
             except CommandError as e:
                 elapsed = time.time() - started
+                if _is_siril_native_process_termination(e):
+                    self._raise_siril_native_process_terminated(cmd_str, e)
                 self.log.debug(
                     "  ✗ Siril command error "
                     f"({elapsed:.2f}s): {cmd_str} "
@@ -943,6 +1159,8 @@ class SeestarPostProcessor(
                 raise
             except (DataError, SirilError) as e:
                 elapsed = time.time() - started
+                if _is_siril_native_process_termination(e):
+                    self._raise_siril_native_process_terminated(cmd_str, e)
                 self.log.debug(
                     "  ✗ Siril command failed "
                     f"({elapsed:.2f}s): {cmd_str} "
@@ -952,6 +1170,10 @@ class SeestarPostProcessor(
                     self.log.debug(f"失败: {cmd_str} ({e})")
                 else:
                     self.log.error(f"失败: {cmd_str}\n    错误: {e}")
+                raise
+            except Exception as e:
+                if _is_siril_native_process_termination(e):
+                    self._raise_siril_native_process_terminated(cmd_str, e)
                 raise
 
     def _try_cmd(self, *args):
@@ -1022,7 +1244,133 @@ class SeestarPostProcessor(
                 self.cmd_with_check("cd", f'"{self.process_dir}"')
 
     def _record_stage(self, name, status, duration=0.0, message=''):
-        self.results.append(StageResult(name, status, duration, message))
+        result = StageResult(name, status, duration, message)
+        self.results.append(result)
+        stage_match = re.match(r"^阶段\s+(\d+)\s*:\s*(.*)$", str(name).strip())
+        if stage_match:
+            stage_number = int(stage_match.group(1))
+            stage_title = stage_match.group(2).strip()
+            try:
+                duration_seconds = max(0.0, float(duration))
+            except (TypeError, ValueError):
+                duration_seconds = 0.0
+            event_status = {
+                "ok_with_fallback": "degraded",
+                "ok_skipped_optional": "skipped",
+            }.get(result.display_status, str(status).strip().lower())
+            self.log.info(
+                "[PIPELINE_STAGE_RESULT] "
+                f"stage={stage_number} "
+                f"status={event_status} "
+                f"duration={duration_seconds:.1f} "
+                f"title={stage_title}"
+            )
+            try:
+                self._publish_stage_preview(
+                    stage_number,
+                    stage_title,
+                    str(status).strip().lower(),
+                )
+            except Exception as exc:
+                # Preview is an observer-only UI feature. No unexpected decode,
+                # filesystem, or runtime error may change a scientific stage result.
+                reason = self._short_text(exc, 180)
+                self.log.warn(
+                    f"Stage {stage_number} 预览观察链路异常，继续主流程："
+                    f"{reason}"
+                )
+                try:
+                    self._emit_preview_event(
+                        stage_number,
+                        stage_title,
+                        "unavailable",
+                        reason,
+                    )
+                except Exception:
+                    pass
+
+    def _stage_preview_candidates(self, stage: int) -> List[Path]:
+        """Return accepted stage artifacts in strict preference order."""
+        if stage == 11:
+            if not bool(getattr(self, "ai_outputs_generated", False)):
+                return []
+            return [self.work_dir / "result_final_ai.fit"] if self.work_dir else []
+        if not self.process_dir:
+            return []
+        stems = {
+            1: ("stage1_prepared",),
+            2: ("stage2_corrected",),
+            3: ("stage3_bgremoved",),
+            4: ("stage4_color", "stage4_colorbalanced", "stage4_psolved"),
+            5: ("stage5_linear", "stage5_denoised"),
+            6: ("stage6_starless", "stage7_starless"),
+            7: ("stage7_stretched",),
+            8: ("stage8_enhanced", "starless_enhanced"),
+            9: ("stage9_remixed",),
+            10: ("stage10_final",),
+        }.get(stage, ())
+        return [self.process_dir / f"{stem}.fit" for stem in stems]
+
+    def _emit_preview_event(
+        self,
+        stage: int,
+        title: str,
+        status: str,
+        payload: str,
+    ) -> None:
+        self.log.info(
+            "[PIPELINE_PREVIEW] "
+            + json.dumps(
+                {
+                    "stage": int(stage),
+                    "title": str(title),
+                    "status": str(status),
+                    "payload": str(payload),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+
+    def _publish_stage_preview(self, stage: int, title: str, status: str) -> None:
+        """Publish the accepted stage image without changing pipeline quality state."""
+        if status not in {"ok", "degraded"}:
+            return
+        candidates = self._stage_preview_candidates(stage)
+        source = next((path for path in candidates if path.is_file()), None)
+        if source is None:
+            reason = "accepted stage artifact is unavailable"
+            self.log.warn(f"Stage {stage} 预览不可用：{reason}")
+            self._emit_preview_event(stage, title, "unavailable", reason)
+            return
+
+        try:
+            self.cmd_with_check("cd", f'"{source.parent}"')
+            self.cmd_with_check("load", source.stem)
+            image_data = self.siril.get_image_pixeldata(preview=False)
+            if image_data is None:
+                raise RuntimeError("accepted stage image buffer is empty")
+            preview_path = self.process_dir / "ui_preview" / "latest.png"
+            write_raw_preview(image_data, preview_path)
+            self._emit_preview_event(stage, title, "ready", str(preview_path))
+        except (
+            CommandError,
+            DataError,
+            SirilError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            reason = self._short_text(exc, 180)
+            self.log.warn(f"Stage {stage} 预览生成失败，继续主流程：{reason}")
+            self._emit_preview_event(stage, title, "unavailable", reason)
+        finally:
+            if self.process_dir:
+                try:
+                    self.cmd_with_check("cd", f'"{self.process_dir}"')
+                except (CommandError, DataError, SirilError):
+                    pass
 
     def _record_skipped_stage(self, name: str, message: str) -> None:
         self.log.info(f"{name} 已跳过: {message}")
@@ -1162,6 +1510,77 @@ class SeestarPostProcessor(
                 except OSError as e:
                     self.log.debug(f"Unable to remove temp stage2 input {temp_source.name}: {e}")
 
+    def _stage4_psolved_resume_candidates(self) -> List[Path]:
+        candidates = [
+            self.work_dir / "process" / STAGE4_PSOLVED_INPUT_NAME,
+            self.work_dir / STAGE4_PSOLVED_INPUT_NAME,
+        ]
+        seen = set()
+        unique: List[Path] = []
+        for path in candidates:
+            resolved = path.resolve() if path.exists() else path
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            unique.append(path)
+        return unique
+
+    def _prepare_stage4_psolved_resume_input(self) -> None:
+        source_path = next(
+            (
+                path
+                for path in self._stage4_psolved_resume_candidates()
+                if path.is_file() and path.stat().st_size > 0
+            ),
+            None,
+        )
+        if source_path is None:
+            searched = ", ".join(
+                str(path) for path in self._stage4_psolved_resume_candidates()
+            )
+            raise SirilError(
+                f"未找到 SPCC 崩溃恢复输入 {STAGE4_PSOLVED_INPUT_NAME}，已检查: {searched}"
+            )
+
+        temp_source: Optional[Path] = None
+        source_for_copy = source_path
+        process_dir_candidate = self.work_dir / "process"
+        try:
+            if process_dir_candidate in source_path.parents:
+                fd, temp_name = tempfile.mkstemp(
+                    prefix="seestar_stage4_psolved_",
+                    suffix=".fit",
+                    dir=str(self.work_dir),
+                )
+                os.close(fd)
+                temp_source = Path(temp_name)
+                shutil.copy2(source_path, temp_source)
+                source_for_copy = temp_source
+
+            self._prepare_process_dir()
+            psolved_file = self.process_dir / STAGE4_PSOLVED_INPUT_NAME
+            shutil.copy2(source_for_copy, psolved_file)
+            self.source_file = psolved_file
+            self.linear_intermediate_path = None
+            self._stage1_input_mode = INPUT_MODE_STAGE4_PSOLVED_RESUME
+            self._stage1_registration_stats = None
+            self.platesolve_ok = True
+
+            self.log.info(
+                f"SPCC 崩溃恢复输入: {source_path}; 从 Stage 4 校色检查点继续"
+            )
+            self.cmd_with_check("cd", f'"{self.process_dir}"')
+            self.cmd_with_check("load", "stage4_psolved")
+        finally:
+            if temp_source is not None:
+                try:
+                    temp_source.unlink()
+                except OSError as e:
+                    self.log.debug(
+                        "Unable to remove temp stage4 psolved input "
+                        f"{temp_source.name}: {e}"
+                    )
+
     def _apply_forced_runtime_switches(self):
         if self._force_denoise_enabled is not None:
             if self.cfg.denoise_enabled != self._force_denoise_enabled:
@@ -1218,7 +1637,15 @@ class SeestarPostProcessor(
 
             if result.notes:
                 for note in result.notes:
-                    self.log.warn(f"[AUTO] {note}")
+                    if note.startswith(
+                        (
+                            "Target type is diagnostic only",
+                            "Target type detection is UNKNOWN",
+                        )
+                    ):
+                        self.log.info(f"[AUTO] {note}")
+                    else:
+                        self.log.warn(f"[AUTO] {note}")
 
             self.log.info(f"[AUTO] Final tuned config: {format_config_summary(self.cfg)}")
 
@@ -1245,7 +1672,10 @@ class SeestarPostProcessor(
         self.log.info("正在连接 Siril...")
         try:
             self.siril.connect()
+            self._siril_ever_connected = True
             self.work_dir = Path(self.siril.get_siril_wd())
+            self.log.set_file_path(self.work_dir / "seestar_pipeline_python.log")
+            self.log.set_sink(self.siril.log)
             self.log.info(f"已连接，工作目录: {self.work_dir}")
         except SirilConnectionError as e:
             self.log.error(f"连接失败: {e}")
@@ -1306,6 +1736,8 @@ class SeestarPostProcessor(
                     f"[{source}] FITS metadata source: "
                     f"{metadata.get('_header_source', 'unknown')}"
                 )
+            for diagnostic in profile.get("diagnostics", []) or []:
+                self.log.info(f"[{source}] {diagnostic}")
             for warning in profile.get("warnings", []) or []:
                 self.log.warn(f"[{source}] {warning}")
             self.log.info(
@@ -1508,9 +1940,91 @@ class SeestarPostProcessor(
             write_png_rgb16_func=write_png_rgb16,
         )
 
+    def ai_artistic_derivative_experiment(self):
+        """Run the non-stage artistic branch without changing Stage 1-11 results."""
+        self.ai_artistic_output_generated = False
+        self.ai_artistic_output_path = None
+        if not self.cfg.ai_artistic_derivative_enabled:
+            return
+        if run_ai_artistic_derivative is None:
+            self.log.warn(
+                "[AI-Artistic] isolated module unavailable; experiment skipped: "
+                f"{AI_ARTISTIC_IMPORT_ERROR}"
+            )
+            return
+        run_ai_artistic_derivative(
+            self,
+            write_png_rgb16_func=write_png_rgb16,
+        )
+
     # ========================================
     # 清理
     # ========================================
+    def _archive_diagnostics(self) -> Optional[Path]:
+        """在清理中间文件前归档轻量诊断产物；归档失败不影响主任务。"""
+        if not self.process_dir or not self.process_dir.exists():
+            return None
+
+        work_dir = self.work_dir or self.process_dir.parent
+        archive_path = work_dir / "seestar_diagnostics.zip"
+        temporary_path = archive_path.with_suffix(".zip.tmp")
+        diagnostic_suffixes = {
+            ".json", ".jsonl", ".log", ".txt", ".csv", ".png",
+        }
+        candidates = [
+            path
+            for path in self.process_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() in diagnostic_suffixes
+        ]
+        log_path = getattr(self.log, "_file_path", None)
+        if isinstance(log_path, Path) and log_path.is_file():
+            candidates.append(log_path)
+
+        unique_candidates = sorted(set(candidates), key=lambda path: str(path))
+        if not unique_candidates:
+            return None
+
+        archived_names: List[str] = []
+        try:
+            temporary_path.unlink(missing_ok=True)
+            with zipfile.ZipFile(
+                temporary_path,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+            ) as archive:
+                for path in unique_candidates:
+                    try:
+                        relative = path.relative_to(work_dir)
+                    except ValueError:
+                        relative = Path("logs") / path.name
+                    archive_name = relative.as_posix()
+                    archive.write(path, archive_name)
+                    archived_names.append(archive_name)
+                archive.writestr(
+                    "manifest.json",
+                    json.dumps(
+                        {
+                            "schema": "seestar.diagnostics.v1",
+                            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                            "files": archived_names,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                )
+            temporary_path.replace(archive_path)
+            self.log.info(
+                f"诊断归档已生成: {archive_path.name} ({len(archived_names)} 个文件)"
+            )
+            return archive_path
+        except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as e:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.log.warn(f"诊断归档生成失败，继续清理: {e}")
+            return None
+
     def cleanup(self):
         """清理处理目录中的中间文件"""
         self.log.stage_start("清理中间文件")
@@ -1519,6 +2033,7 @@ class SeestarPostProcessor(
             elapsed = self.log.stage_end("清理")
             return
 
+        self._archive_diagnostics()
         deleted_count = self._cleanup_lightsrc_intermediates()
 
         if self.cfg.debug_mode:
@@ -1529,7 +2044,14 @@ class SeestarPostProcessor(
             return
 
         # 保留关键文件
-        keep_files = {'starless.fit', 'starmask.fit'}
+        keep_files = {
+            'starless.fit',
+            'starmask.fit',
+            'starmask_raw.fit',
+            'starmask_clean.fit',
+            'starmask_external_raw.fit',
+            'starmask_stretched.fit',
+        }
         if self.stretched_name:
             keep_files.add(f"{self.stretched_name}_starmask.fit")
 
@@ -1572,17 +2094,20 @@ class SeestarPostProcessor(
             self.cfg = copy.deepcopy(self.initial_cfg)
             self._force_denoise_enabled = None
             self.input_mode = INPUT_MODE_AUTO
+            self._siril_process_terminated = False
+            self._siril_process_termination_error = None
+            self._siril_ever_connected = False
             self._apply_runtime_env_overrides()
             self.base_cfg = copy.deepcopy(self.cfg)
 
             self.connect()
 
             try:
-                self.siril.cmd("requires", "1.4.0")
+                self.cmd_with_check("requires", "1.4.0")
             except (CommandError, SirilError) as e:
                 self.log.error(f"版本检查失败: {e}")
                 self.log.error("此脚本需要 Siril 1.4.0 或更高版本")
-                return
+                raise RuntimeError("Siril version check failed") from e
 
             self.log.info("")
             self.log.info("#" * 50)
@@ -1594,6 +2119,8 @@ class SeestarPostProcessor(
             self.log.info(f"输入模式: {self.input_mode}")
             self.platesolve_ok = False
             self.ai_outputs_generated = False
+            self.ai_artistic_output_generated = False
+            self.ai_artistic_output_path = None
             self._stage8_final_source = "starless_enhanced"
             self._stage8_fallback_used = False
             self._stage8_final_quality = "unknown"
@@ -1606,13 +2133,26 @@ class SeestarPostProcessor(
             self._stage9_star_intensity_scale = 1.0
             self._stage9_star_intensity_reason = ""
             self._stage9_bypassed_bad_starless = False
+            self._stage9_stars_required = True
+            self._stage9_stars_applied = False
+            self._stage9_stars_application_mode = "pending"
             self._stage9_final_source = ""
+            self._star_preserve_target_bypass = False
+            self._stage5_denoise_applied = False
+            self._saturation_boost_applied = 0.0
 
             if self.cfg.ai_post_enabled:
                 self.log.info(
                     "[AI] Enabled for stage6-8 parameter optimization and optional stage11: "
                     f"endpoint={self.cfg.ai_endpoint}, model={self.cfg.ai_model}, "
                     f"timeout={self.cfg.ai_timeout_sec}s, strength={self.cfg.ai_strength}"
+                )
+            if self.cfg.ai_artistic_derivative_enabled:
+                self.log.info(
+                    "[AI-Artistic] isolated experiment enabled "
+                    f"model={self.cfg.ai_artistic_model or 'unset'}, "
+                    f"timeout={self.cfg.ai_artistic_timeout_sec}s; "
+                    "output will not re-enter Siril"
                 )
 
             if self.input_mode == INPUT_MODE_LINEAR_RESUME:
@@ -1639,6 +2179,23 @@ class SeestarPostProcessor(
                     PipelineStage.LINEAR_DENOISE.label,
                     "skipped by linear resume mode",
                 )
+            elif self.input_mode == INPUT_MODE_STAGE4_PSOLVED_RESUME:
+                self._record_skipped_stage(
+                    PipelineStage.PREPARATION.label,
+                    "skipped by stage4 psolved crash-resume mode",
+                )
+                self._record_skipped_stage(
+                    PipelineStage.VIEW_CORRECTION.label,
+                    "skipped by stage4 psolved crash-resume mode",
+                )
+                self._record_skipped_stage(
+                    PipelineStage.BACKGROUND_EXTRACTION.label,
+                    "skipped by stage4 psolved crash-resume mode",
+                )
+                self._prepare_stage4_psolved_resume_input()
+                self._auto_tune_for_current_input()
+                self.stage4_color_calibration()
+                self.stage5_linear_denoise()
             elif self.input_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
                 self._prepare_stage2_corrected_resume_input()
                 self._auto_tune_for_current_input()
@@ -1664,6 +2221,8 @@ class SeestarPostProcessor(
             self.stage9_star_remixing()
             self.stage10_export()
             self.stage11_ai_postprocess()
+            if bool(getattr(self.cfg, "ai_artistic_derivative_enabled", False)):
+                self.ai_artistic_derivative_experiment()
 
             self.cleanup()
 
@@ -1692,22 +2251,40 @@ class SeestarPostProcessor(
             self.log.info(f"总耗时: {duration:.2f} 分钟")
 
             failed = [r for r in self.results if r.status == 'failed']
-            degraded = [r for r in self.results if r.status == 'degraded']
+            degraded = [
+                r
+                for r in self.results
+                if r.status == 'degraded' or r.display_status == 'ok_with_fallback'
+            ]
             if failed:
                 self.log.warn(f"{len(failed)} 个阶段失败")
             if degraded:
-                self.log.warn(f"{len(degraded)} 个阶段降级完成")
+                self.log.warn(f"{len(degraded)} 个阶段降级或回退完成")
             if not failed and not degraded:
                 self.log.info("所有阶段成功完成")
+            self.log.info(
+                "[PIPELINE_RUN_SUMMARY] "
+                f"failed={len(failed)} degraded={len(degraded)}"
+            )
 
             self.log.info(f"输出目录: {self.work_dir}")
             self.log.info("生成文件:")
             base_name = (self.main_output_basename_template or RESULT_BASENAME_TEMPLATE)
+            fit_base_name = getattr(
+                self,
+                "main_output_fit_basename_template",
+                base_name + "_final",
+            )
             self.log.info(f"  - {base_name}.tif  (16-bit Astro-TIFF)")
             self.log.info(f"  - {base_name}.png  (Preview PNG)")
-            self.log.info(f"  - {base_name}_final.fit (FITS archive)")
+            self.log.info(f"  - {fit_base_name}.fit (FITS archive)")
             fallback_line = "result_processed.tif / result_processed.png / result_final.fit"
-            if self._stage1_input_mode == "linear_resume":
+            if bool(getattr(self, "_final_output_review_only", False)):
+                fallback_line = (
+                    f"{base_name}.tif / {base_name}.png / {fit_base_name}.fit "
+                    "(review-only)"
+                )
+            elif self._stage1_input_mode == "linear_resume":
                 fallback_line = (
                     "result_processed_linear.tif / result_processed_linear.png / "
                     "result_final_linear.fit"
@@ -1719,17 +2296,32 @@ class SeestarPostProcessor(
                 self.log.info("  - result_processed_ai.tif (16-bit Astro-TIFF, AI)")
                 self.log.info("  - result_processed_ai.png (Preview PNG, AI)")
                 self.log.info("  - result_final_ai.fit (AI 后期 FITS 存档)")
+            if self.ai_artistic_output_generated and self.ai_artistic_output_path:
+                self.log.info(
+                    "  - "
+                    f"{self.ai_artistic_output_path} "
+                    "(AI artistic derivative; non-scientific isolated output)"
+                )
 
+        except SirilNativeProcessTerminated as e:
+            self.log.error(
+                "Siril 原生进程或连接已终止；当前流水线立即中止，"
+                "不会继续降级、保存或执行后续阶段。"
+            )
+            raise
         except KeyboardInterrupt:
             self.log.warn("用户中断操作")
+            raise
         except Exception as e:
             self.log.error(f"程序中断: {e}")
             self.log.error(traceback.format_exc())
+            raise
         finally:
-            try:
-                self.siril.disconnect()
-            except (CommandError, DataError, SirilError, OSError, RuntimeError) as e:
-                self.log.warn(f"Siril 断开连接失败: {e}")
+            if not self._siril_process_terminated and self._siril_ever_connected:
+                try:
+                    self.siril.disconnect()
+                except (CommandError, DataError, SirilError, OSError, RuntimeError) as e:
+                    self.log.warn(f"Siril 断开连接失败: {e}")
 
 
 if __name__ == "__main__":

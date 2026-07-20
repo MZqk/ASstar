@@ -425,6 +425,7 @@ def _stage3_graxpert_runtime_error_reason(
         "graxpert ai",
         "background extraction",
         "too many indices for array",
+        "onnx",
         "onnxruntime",
         "error initializing application",
         "traceback",
@@ -435,17 +436,75 @@ def _stage3_graxpert_runtime_error_reason(
     return None
 
 
+def _stage3_pyscript_path(command: Tuple[str, ...]) -> Optional[Path]:
+    if len(command) < 2 or str(command[0]).lower() != "pyscript":
+        return None
+    raw_path = str(command[1]).strip()
+    if len(raw_path) >= 2 and raw_path[0] == raw_path[-1] == '"':
+        raw_path = raw_path[1:-1]
+    raw_path = raw_path.replace('\\"', '"').replace("\\\\", "\\")
+    return Path(raw_path) if raw_path else None
+
+
+def _stage3_image_fingerprint(pipeline) -> Optional[str]:
+    if not hasattr(pipeline, "_current_image_fingerprint"):
+        return None
+    try:
+        return pipeline._current_image_fingerprint()
+    except (CommandError, SirilError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        if hasattr(pipeline, "log"):
+            pipeline.log.debug(f"stage3 image fingerprint skipped: {exc}")
+        return None
+
+
 def _stage3_try_background_command(
     pipeline,
     label: str,
     command: Tuple[str, ...],
     source: str,
 ) -> Tuple[bool, Optional[str]]:
+    is_graxpert = _stage3_is_graxpert_attempt(label, command, source)
+    script_path = _stage3_pyscript_path(command)
+    runtime_error_prefix = (
+        "graxpert_runtime_error" if is_graxpert else "plugin_runtime_error"
+    )
+    if script_path is not None and hasattr(
+        pipeline,
+        "_validate_plugin_script_prerequisites",
+    ):
+        try:
+            prerequisites_ok, prerequisites_reason = (
+                pipeline._validate_plugin_script_prerequisites(script_path)
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            prerequisites_ok = False
+            prerequisites_reason = f"prerequisite check failed: {exc}"
+        if not prerequisites_ok:
+            return False, (
+                f"{runtime_error_prefix}: prerequisites unavailable: "
+                f"{prerequisites_reason or 'unknown reason'}"
+            )
+
+    before_fingerprint = (
+        _stage3_image_fingerprint(pipeline) if script_path is not None else None
+    )
     try:
         pipeline.cmd_with_check(*command, quiet=True)
+        after_fingerprint = (
+            _stage3_image_fingerprint(pipeline) if script_path is not None else None
+        )
+        if (
+            before_fingerprint
+            and after_fingerprint
+            and before_fingerprint == after_fingerprint
+        ):
+            return False, (
+                f"{runtime_error_prefix}: command returned success "
+                "but image did not change"
+            )
         return True, None
     except (CommandError, SirilError, OSError, RuntimeError) as exc:
-        if _stage3_is_graxpert_attempt(label, command, source):
+        if is_graxpert:
             reason = _stage3_graxpert_runtime_error_reason(exc, command)
             if reason is None:
                 reason = f"graxpert_command_failed: {str(exc).strip() or type(exc).__name__}"
@@ -698,11 +757,20 @@ def run_stage3_background_extraction(pipeline) -> None:
                     and failure_reason
                     and failure_reason.startswith("graxpert_runtime_error:")
                 )
+                is_plugin_runtime = bool(
+                    failure_reason
+                    and failure_reason.startswith("plugin_runtime_error:")
+                )
                 if is_graxpert_runtime:
                     graxpert_runtime_error = True
                     graxpert_error_reasons.append(failure_reason)
                     pipeline.log.warn(
                         f"{label} 运行失败，自动切换到下一个背景提取候选: {failure_reason}"
+                    )
+                elif is_plugin_runtime:
+                    pipeline.log.warn(
+                        f"{label} 未产生有效图像变更，自动切换到下一个背景提取候选: "
+                        f"{failure_reason}"
                     )
                 attempt_records.append(
                     {
@@ -712,10 +780,16 @@ def run_stage3_background_extraction(pipeline) -> None:
                         "status": (
                             "graxpert_runtime_error"
                             if is_graxpert_runtime
-                            else "command_failed"
+                            else (
+                                "plugin_runtime_error"
+                                if is_plugin_runtime
+                                else "command_failed"
+                            )
                         ),
                         "failure_reason": failure_reason,
-                        "fallback_triggered": bool(is_graxpert),
+                        "fallback_triggered": bool(
+                            is_graxpert or is_plugin_runtime
+                        ),
                     }
                 )
                 continue
@@ -970,6 +1044,21 @@ def run_stage3_background_extraction(pipeline) -> None:
             if stage_message
             else "stage3 输出保存失败"
         )
+    elif hasattr(pipeline, "_create_stage_review_bundle"):
+        review = pipeline._create_stage_review_bundle(
+            "stage3_background_extraction",
+            baseline_stem,
+            "stage3_bgremoved",
+            context={
+                "method": selected_label or None,
+                "quality": "warning" if fallback_warning else ("ok" if bg_ok else "degraded"),
+            },
+            candidates=attempt_records,
+            selected_candidate=selected_label or None,
+        )
+        if review.get("report_path"):
+            review_note = f"review_bundle={review['report_path']}"
+            stage_message = f"{stage_message}; {review_note}" if stage_message else review_note
 
     elapsed = pipeline.log.stage_end(stage_label)
     if bg_ok:

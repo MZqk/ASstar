@@ -4,6 +4,7 @@ import copy
 import json
 import re
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
@@ -11,6 +12,8 @@ from urllib import request as urllib_request
 
 from image_metrics import format_feature_summary
 from models import TargetType
+from review_bundle import image_data_to_data_url, image_path_to_data_url
+from sirilpy.exceptions import CommandError, DataError, SirilError
 
 
 DEFAULT_AI_PROMPT = (
@@ -20,6 +23,15 @@ DEFAULT_AI_PROMPT = (
     "do not increase star size, and avoid halos or artificial sharpening artifacts."
 )
 ENV_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+VISUAL_ACCEPTANCE_STAGE_KEYS = frozenset(
+    {
+        "stage3_background_extraction",
+        "stage6_star_separation",
+        "stage7_stretching",
+        "stage8_nebula_enhancement",
+        "stage11_ai_postprocess",
+    }
+)
 
 
 def _clamp_float(value: object, min_value: float, max_value: float) -> float:
@@ -107,6 +119,47 @@ def build_ai_chat_endpoint_candidates(endpoint: str) -> List[str]:
         if item not in deduped:
             deduped.append(item)
     return deduped
+
+
+def advisor_mode(pipeline: object) -> str:
+    mode = str(getattr(pipeline.cfg, "ai_advisor_mode", "text") or "text").strip().lower()
+    return mode if mode in {"text", "multimodal"} else "text"
+
+
+def _current_image_data_url(pipeline: object) -> Optional[str]:
+    try:
+        image_data = pipeline.siril.get_image_pixeldata(preview=False)
+        if image_data is None:
+            return None
+        return image_data_to_data_url(image_data)
+    except (
+        CommandError,
+        DataError,
+        SirilError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        AttributeError,
+    ) as error:
+        pipeline.log.warn(f"[AI] multimodal preview unavailable; using text advisor: {error}")
+        return None
+
+
+def _multimodal_user_content(
+    prompt: str,
+    image_data_urls: List[Tuple[str, str]],
+) -> List[Dict[str, Any]]:
+    content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for label, data_url in image_data_urls:
+        content.append({"type": "text", "text": label})
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": data_url, "detail": "high"},
+            }
+        )
+    return content
 
 
 def extract_chat_content(pipeline: object, response_obj: Dict[str, Any]) -> str:
@@ -473,6 +526,8 @@ def request_stage_ai_advisory(
     observations: Dict[str, Any],
     *,
     max_tokens: int = 700,
+    image_paths: Optional[List[Tuple[str, Path]]] = None,
+    allow_text_fallback: bool = True,
 ) -> Dict[str, Any]:
     breaker_reason = pipeline._ai_stage_circuit_breaker.get(stage_name)
     if breaker_reason:
@@ -503,7 +558,7 @@ def request_stage_ai_advisory(
         f"{schema_text}\n"
         "Final answer must be one minified JSON object only. No markdown."
     )
-    payload_base = {
+    text_payload_base = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -511,90 +566,117 @@ def request_stage_ai_advisory(
         ],
         "max_tokens": max_tokens,
     }
+    payload_variants: List[Tuple[str, Dict[str, Any]]] = []
+    if advisor_mode(pipeline) == "multimodal":
+        image_data_urls: List[Tuple[str, str]] = []
+        for label, path in image_paths or []:
+            try:
+                image_data_urls.append((label, image_path_to_data_url(Path(path))))
+            except OSError as error:
+                pipeline.log.warn(f"[AI] visual evidence unavailable ({path}): {error}")
+        if image_paths is None:
+            current_url = _current_image_data_url(pipeline)
+            if current_url:
+                image_data_urls.append(("Current stage image", current_url))
+        if image_data_urls:
+            vision_payload = copy.deepcopy(text_payload_base)
+            vision_payload["messages"][1]["content"] = _multimodal_user_content(
+                user_prompt,
+                image_data_urls,
+            )
+            payload_variants.append(("multimodal", vision_payload))
+    if allow_text_fallback:
+        payload_variants.append(("text", text_payload_base))
+    elif not payload_variants:
+        raise RuntimeError(f"{stage_name} multimodal evidence unavailable")
 
     temperatures = (1.0,) if "kimi" in model.lower() else (0.1, 1.0)
     attempt_errors: List[str] = []
     parse_failures: List[str] = []
     for endpoint_url in endpoint_candidates:
-        for temperature in temperatures:
-            for json_mode in (True, False):
-                payload = copy.deepcopy(payload_base)
-                payload["temperature"] = temperature
-                if json_mode:
-                    payload["response_format"] = {"type": "json_object"}
-                try:
-                    response_obj = pipeline._post_json_with_auth(
-                        endpoint_url, payload, api_key, timeout_sec
-                    )
-                    content = pipeline._extract_chat_content(response_obj)
-                    pipeline._write_ai_raw_response(
-                        stage_name,
-                        endpoint_url=endpoint_url,
-                        temperature=temperature,
-                        json_mode=json_mode,
-                        response_obj=response_obj,
-                        content=content,
-                    )
+        for request_mode, payload_base in payload_variants:
+            if request_mode == "text" and payload_variants[0][0] == "multimodal":
+                pipeline.log.warn(f"[AI] {stage_name} falling back to text-only advisor")
+            for temperature in temperatures:
+                for json_mode in (True, False):
+                    payload = copy.deepcopy(payload_base)
+                    payload["temperature"] = temperature
+                    if json_mode:
+                        payload["response_format"] = {"type": "json_object"}
                     try:
-                        plan_obj = pipeline._extract_first_json_object(content)
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        parse_failures.append(
-                            f"endpoint={endpoint_url},temperature={temperature},json_mode={json_mode}"
+                        response_obj = pipeline._post_json_with_auth(
+                            endpoint_url, payload, api_key, timeout_sec
                         )
-                        plan_obj = pipeline._extract_stage_advisory_from_text(
-                            stage_name, content
+                        content = pipeline._extract_chat_content(response_obj)
+                        pipeline._write_ai_raw_response(
+                            stage_name,
+                            endpoint_url=endpoint_url,
+                            temperature=temperature,
+                            json_mode=json_mode,
+                            response_obj=response_obj,
+                            content=content,
                         )
-                        if plan_obj is None:
-                            raise
-                        pipeline.log.warn(
-                            f"[AI] {stage_name} parsed advisory from non-JSON text"
-                        )
-                    if temperature != 0.1:
-                        pipeline.log.warn(
-                            f"[AI] {stage_name} advisory used temperature fallback={temperature}"
-                        )
-                    return plan_obj
-                except (OSError, RuntimeError, TypeError, ValueError) as e:
-                    if "response_obj" in locals() or "content" in locals():
                         try:
-                            pipeline._write_ai_raw_response(
-                                stage_name,
-                                endpoint_url=endpoint_url,
-                                temperature=temperature,
-                                json_mode=json_mode,
-                                response_obj=locals().get("response_obj"),
-                                content=locals().get("content"),
-                                error_text=str(e),
+                            plan_obj = pipeline._extract_first_json_object(content)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            parse_failures.append(
+                                f"endpoint={endpoint_url},mode={request_mode},"
+                                f"temperature={temperature},json_mode={json_mode}"
                             )
-                        except (OSError, RuntimeError, TypeError, ValueError):
-                            pass
-                    attempt_errors.append(
-                        "endpoint="
-                        f"{endpoint_url},temperature={temperature},"
-                        f"json_mode={json_mode},error={e}"
-                    )
-                    err_text = str(e).lower()
-                    if json_mode and (
-                        "response_format" in err_text
-                        or "json_object" in err_text
-                        or "unsupported" in err_text
-                    ):
-                        continue
-                    if temperature == 0.1 and "only 1 is allowed for this model" in err_text:
-                        pipeline.log.warn(
-                            f"[AI] {stage_name} model requires temperature=1, retrying"
+                            plan_obj = pipeline._extract_stage_advisory_from_text(
+                                stage_name, content
+                            )
+                            if plan_obj is None:
+                                raise
+                            pipeline.log.warn(
+                                f"[AI] {stage_name} parsed advisory from non-JSON text"
+                            )
+                        if temperature != 0.1:
+                            pipeline.log.warn(
+                                f"[AI] {stage_name} advisory used temperature fallback={temperature}"
+                            )
+                        return plan_obj
+                    except (OSError, RuntimeError, TypeError, ValueError) as e:
+                        if "response_obj" in locals() or "content" in locals():
+                            try:
+                                pipeline._write_ai_raw_response(
+                                    stage_name,
+                                    endpoint_url=endpoint_url,
+                                    temperature=temperature,
+                                    json_mode=json_mode,
+                                    response_obj=locals().get("response_obj"),
+                                    content=locals().get("content"),
+                                    error_text=str(e),
+                                )
+                            except (OSError, RuntimeError, TypeError, ValueError):
+                                pass
+                        attempt_errors.append(
+                            "endpoint="
+                            f"{endpoint_url},mode={request_mode},temperature={temperature},"
+                            f"json_mode={json_mode},error={e}"
                         )
-                        break
-                    pipeline.log.warn(
-                        f"[AI] {stage_name} advisory failed "
-                        f"(endpoint={endpoint_url}, temperature={temperature}, "
-                        f"json_mode={json_mode}): {e}"
-                    )
-                finally:
-                    if "response_obj" in locals():
-                        del response_obj
-                    if "content" in locals():
-                        del content
+                        err_text = str(e).lower()
+                        if json_mode and (
+                            "response_format" in err_text
+                            or "json_object" in err_text
+                            or "unsupported" in err_text
+                        ):
+                            continue
+                        if temperature == 0.1 and "only 1 is allowed for this model" in err_text:
+                            pipeline.log.warn(
+                                f"[AI] {stage_name} model requires temperature=1, retrying"
+                            )
+                            break
+                        pipeline.log.warn(
+                            f"[AI] {stage_name} advisory failed "
+                            f"(endpoint={endpoint_url}, mode={request_mode}, "
+                            f"temperature={temperature}, json_mode={json_mode}): {e}"
+                        )
+                    finally:
+                        if "response_obj" in locals():
+                            del response_obj
+                        if "content" in locals():
+                            del content
     if parse_failures:
         reason = "json parse failed"
         pipeline._ai_stage_circuit_breaker[stage_name] = reason
@@ -604,6 +686,116 @@ def request_stage_ai_advisory(
     if attempt_errors:
         raise RuntimeError(" | ".join(attempt_errors[-3:]))
     raise RuntimeError(f"{stage_name} AI advisory failed")
+
+
+def request_visual_acceptance(
+    pipeline: object,
+    stage_key: str,
+    review_payload: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Ask a vision model to review the selected candidate without blocking the pipeline."""
+    if stage_key not in VISUAL_ACCEPTANCE_STAGE_KEYS:
+        return None
+    if advisor_mode(pipeline) != "multimodal":
+        return None
+    if not bool(getattr(pipeline.cfg, "ai_post_enabled", False)):
+        return None
+    if not (
+        pipeline.cfg.ai_endpoint.strip()
+        and pipeline.cfg.ai_model.strip()
+        and pipeline.cfg.ai_api_key.strip()
+    ):
+        return None
+
+    previews = review_payload.get("previews") or {}
+    image_paths: List[Tuple[str, Path]] = []
+    for key, label in (
+        ("before_preview", "Before processing"),
+        ("after_preview", "Selected candidate after processing"),
+        ("signed_luminance_difference", "Signed luminance difference: red=increased, blue=decreased"),
+    ):
+        path_text = previews.get(key)
+        if path_text:
+            image_paths.append((label, Path(str(path_text))))
+    if len(image_paths) < 2:
+        raise RuntimeError("visual acceptance requires before and after previews")
+
+    candidates = review_payload.get("candidates") or []
+    observations = {
+        "stage": stage_key,
+        "context": review_payload.get("context") or {},
+        "metrics": review_payload.get("metrics") or {},
+        "candidates": [
+            {
+                key: candidate.get(key)
+                for key in (
+                    "id",
+                    "name",
+                    "label",
+                    "attempt",
+                    "method",
+                    "status",
+                    "quality_ok",
+                    "risk_score",
+                    "selection_status",
+                )
+                if candidate.get(key) is not None
+            }
+            for candidate in candidates
+        ],
+    }
+    schema = (
+        "{\n"
+        '  "visual_acceptance": {\n'
+        '    "verdict": "accept|review_required|reject",\n'
+        '    "confidence": 0.0,\n'
+        '    "summary": "short visual assessment",\n'
+        '    "issues": ["visible issue"],\n'
+        '    "recommended_parameter_ranges": {"parameter": "safe range"}\n'
+        "  }\n"
+        "}"
+    )
+    raw = request_stage_ai_advisory(
+        pipeline,
+        f"{stage_key}_visual_acceptance",
+        schema,
+        observations,
+        max_tokens=700,
+        image_paths=image_paths,
+        allow_text_fallback=False,
+    )
+    result = raw.get("visual_acceptance") if isinstance(raw, dict) else None
+    if not isinstance(result, dict):
+        result = raw if isinstance(raw, dict) else {}
+    verdict = str(result.get("verdict") or "review_required").strip().lower()
+    aliases = {
+        "ok": "accept",
+        "accepted": "accept",
+        "pass": "accept",
+        "review": "review_required",
+        "warning": "review_required",
+        "rejected": "reject",
+        "fail": "reject",
+    }
+    verdict = aliases.get(verdict, verdict)
+    if verdict not in {"accept", "review_required", "reject"}:
+        verdict = "review_required"
+    issues = result.get("issues")
+    if not isinstance(issues, list):
+        issues = [str(issues)] if issues else []
+    ranges = result.get("recommended_parameter_ranges")
+    if not isinstance(ranges, dict):
+        ranges = {}
+    return {
+        "verdict": verdict,
+        "confidence": _clamp_float(result.get("confidence", 0.0), 0.0, 1.0),
+        "summary": pipeline._short_text(str(result.get("summary") or ""), 240),
+        "issues": [pipeline._short_text(str(item), 180) for item in issues[:6]],
+        "recommended_parameter_ranges": {
+            pipeline._short_text(str(key), 80): pipeline._short_text(str(value), 120)
+            for key, value in list(ranges.items())[:12]
+        },
+    }
 
 
 def normalize_stage6_ai_plan(pipeline: object, obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -826,8 +1018,26 @@ def request_stage7_quality_ai(
         "}"
     )
     try:
+        vision_paths: Optional[List[Tuple[str, Path]]] = None
+        if advisor_mode(pipeline) == "multimodal":
+            try:
+                pipeline.cmd_with_check("load", "starless")
+            except (
+                CommandError,
+                DataError,
+                SirilError,
+                OSError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+                AttributeError,
+            ) as error:
+                pipeline.log.warn(
+                    f"[AI] stage7 starless preview load failed; using text advisor: {error}"
+                )
+                vision_paths = []
         raw = pipeline._request_stage_ai_advisory(
-            "stage7_quality", schema, observations
+            "stage7_quality", schema, observations, image_paths=vision_paths
         )
         return pipeline._normalize_stage7_ai_quality(raw)
     except (OSError, RuntimeError, TypeError, ValueError) as e:
@@ -958,8 +1168,26 @@ def request_stage8_quality_ai(
         "}"
     )
     try:
+        vision_paths: Optional[List[Tuple[str, Path]]] = None
+        if advisor_mode(pipeline) == "multimodal":
+            try:
+                pipeline.cmd_with_check("load", "stage8_enhanced")
+            except (
+                CommandError,
+                DataError,
+                SirilError,
+                OSError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+                AttributeError,
+            ) as error:
+                pipeline.log.warn(
+                    f"[AI] stage8 candidate preview load failed; using text advisor: {error}"
+                )
+                vision_paths = []
         raw = pipeline._request_stage_ai_advisory(
-            "stage8_quality", schema, observations
+            "stage8_quality", schema, observations, image_paths=vision_paths
         )
         return pipeline._normalize_stage8_ai_quality(raw)
     except (OSError, RuntimeError, TypeError, ValueError) as e:
@@ -1125,7 +1353,7 @@ def request_ai_adjustments(
         "}\n"
         "JSON only, no markdown."
     )
-    payload_base = {
+    text_payload_base = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -1133,86 +1361,100 @@ def request_ai_adjustments(
         ],
         "max_tokens": 600,
     }
+    payload_variants: List[Tuple[str, Dict[str, Any]]] = []
+    if advisor_mode(pipeline) == "multimodal":
+        current_url = _current_image_data_url(pipeline)
+        if current_url:
+            vision_payload = copy.deepcopy(text_payload_base)
+            vision_payload["messages"][1]["content"] = _multimodal_user_content(
+                user_prompt,
+                [("Current final-stage image", current_url)],
+            )
+            payload_variants.append(("multimodal", vision_payload))
+    payload_variants.append(("text", text_payload_base))
 
     temperatures = (1.0,) if "kimi" in model.lower() else (0.1, 1.0)
     last_error: Optional[Exception] = None
     attempt_errors: List[str] = []
     successful_response_count = 0
     for endpoint_url in endpoint_candidates:
-        for temperature in temperatures:
-            for json_mode in (True, False):
-                payload = copy.deepcopy(payload_base)
-                payload["temperature"] = temperature
-                if json_mode:
-                    payload["response_format"] = {"type": "json_object"}
-                try:
-                    response_obj = pipeline._post_json_with_auth(
-                        endpoint_url, payload, api_key, timeout_sec
-                    )
-                    successful_response_count += 1
-                    content = pipeline._extract_chat_content(response_obj)
-                    pipeline._write_ai_raw_response(
-                        "stage11_adjustment_plan",
-                        endpoint_url=endpoint_url,
-                        temperature=temperature,
-                        json_mode=json_mode,
-                        response_obj=response_obj,
-                        content=content,
-                    )
-                    plan_obj = pipeline._extract_first_json_object(content)
-                    adjustments = pipeline._normalize_ai_adjustments(plan_obj)
-                    summary = str(plan_obj.get("summary", "")).strip()
-                    pipeline._ai_plan_parse_fallback = False
-                    pipeline._ai_plan_parse_fallback_reason = None
-                    if temperature != 0.1:
-                        pipeline.log.warn(
-                            f"[AI] Plan request used temperature fallback={temperature}"
+        for request_mode, payload_base in payload_variants:
+            if request_mode == "text" and payload_variants[0][0] == "multimodal":
+                pipeline.log.warn("[AI] Stage11 falling back to text-only advisor")
+            for temperature in temperatures:
+                for json_mode in (True, False):
+                    payload = copy.deepcopy(payload_base)
+                    payload["temperature"] = temperature
+                    if json_mode:
+                        payload["response_format"] = {"type": "json_object"}
+                    try:
+                        response_obj = pipeline._post_json_with_auth(
+                            endpoint_url, payload, api_key, timeout_sec
                         )
-                    return adjustments, summary
-                except (OSError, RuntimeError, TypeError, ValueError) as e:
-                    if "response_obj" in locals() or "content" in locals():
-                        try:
-                            pipeline._write_ai_raw_response(
-                                "stage11_adjustment_plan",
-                                endpoint_url=endpoint_url,
-                                temperature=temperature,
-                                json_mode=json_mode,
-                                response_obj=locals().get("response_obj"),
-                                content=locals().get("content"),
-                                error_text=str(e),
+                        successful_response_count += 1
+                        content = pipeline._extract_chat_content(response_obj)
+                        pipeline._write_ai_raw_response(
+                            "stage11_adjustment_plan",
+                            endpoint_url=endpoint_url,
+                            temperature=temperature,
+                            json_mode=json_mode,
+                            response_obj=response_obj,
+                            content=content,
+                        )
+                        plan_obj = pipeline._extract_first_json_object(content)
+                        adjustments = pipeline._normalize_ai_adjustments(plan_obj)
+                        summary = str(plan_obj.get("summary", "")).strip()
+                        pipeline._ai_plan_parse_fallback = False
+                        pipeline._ai_plan_parse_fallback_reason = None
+                        if temperature != 0.1:
+                            pipeline.log.warn(
+                                f"[AI] Plan request used temperature fallback={temperature}"
                             )
-                        except (OSError, RuntimeError, TypeError, ValueError):
-                            pass
-                    last_error = e
-                    attempt_errors.append(
-                        "endpoint="
-                        f"{endpoint_url},temperature={temperature},"
-                        f"json_mode={json_mode},error={e}"
-                    )
-                    err_text = str(e).lower()
-                    if json_mode and (
-                        "response_format" in err_text
-                        or "json_object" in err_text
-                        or "unsupported" in err_text
-                    ):
-                        continue
-                    if temperature == 0.1 and "only 1 is allowed for this model" in err_text:
-                        pipeline.log.warn(
-                            "[AI] Model requires temperature=1, retrying with fallback"
+                        return adjustments, summary
+                    except (OSError, RuntimeError, TypeError, ValueError) as e:
+                        if "response_obj" in locals() or "content" in locals():
+                            try:
+                                pipeline._write_ai_raw_response(
+                                    "stage11_adjustment_plan",
+                                    endpoint_url=endpoint_url,
+                                    temperature=temperature,
+                                    json_mode=json_mode,
+                                    response_obj=locals().get("response_obj"),
+                                    content=locals().get("content"),
+                                    error_text=str(e),
+                                )
+                            except (OSError, RuntimeError, TypeError, ValueError):
+                                pass
+                        last_error = e
+                        attempt_errors.append(
+                            "endpoint="
+                            f"{endpoint_url},mode={request_mode},temperature={temperature},"
+                            f"json_mode={json_mode},error={e}"
                         )
-                        break
-                    if temperature == 1.0 and "only 1 is allowed for this model" in err_text:
-                        break
-                    pipeline.log.warn(
-                        "[AI] Plan request failed "
-                        f"(endpoint={endpoint_url}, temperature={temperature}, "
-                        f"json_mode={json_mode}): {e}"
-                    )
-                finally:
-                    if "response_obj" in locals():
-                        del response_obj
-                    if "content" in locals():
-                        del content
+                        err_text = str(e).lower()
+                        if json_mode and (
+                            "response_format" in err_text
+                            or "json_object" in err_text
+                            or "unsupported" in err_text
+                        ):
+                            continue
+                        if temperature == 0.1 and "only 1 is allowed for this model" in err_text:
+                            pipeline.log.warn(
+                                "[AI] Model requires temperature=1, retrying with fallback"
+                            )
+                            break
+                        if temperature == 1.0 and "only 1 is allowed for this model" in err_text:
+                            break
+                        pipeline.log.warn(
+                            "[AI] Plan request failed "
+                            f"(endpoint={endpoint_url}, mode={request_mode}, "
+                            f"temperature={temperature}, json_mode={json_mode}): {e}"
+                        )
+                    finally:
+                        if "response_obj" in locals():
+                            del response_obj
+                        if "content" in locals():
+                            del content
 
     if successful_response_count > 0:
         pipeline.log.warn(

@@ -30,6 +30,51 @@ except ImportError:  # Tests may import with lightweight fakes.
     CommandError = RuntimeError
     SirilError = RuntimeError
 
+
+def stage7_dynamic_range_assessment(
+    cfg,
+    *,
+    dynamic_range_ratio: float,
+    peak_signal: float,
+    background_level: float,
+) -> Dict[str, Any]:
+    """Calibrate the linear starless collapse gate against its background floor."""
+    dynamic_range_ratio = float(dynamic_range_ratio)
+    peak_signal = float(peak_signal)
+    background_level = float(background_level)
+    if not math.isfinite(dynamic_range_ratio):
+        dynamic_range_ratio = 0.0
+    if not math.isfinite(peak_signal):
+        peak_signal = 0.0
+    if not math.isfinite(background_level):
+        background_level = 0.0
+    dynamic_range_ratio = max(dynamic_range_ratio, 0.0)
+    peak_signal = max(peak_signal, 0.0)
+    background_level = max(background_level, 0.0)
+    dynamic_threshold = float(
+        getattr(cfg, "stage7_starless_dynamic_range_min_ratio", 0.55)
+    )
+    peak_threshold = float(
+        getattr(cfg, "stage7_starless_peak_signal_min", 0.006)
+    )
+    peak_background_ratio_threshold = float(
+        getattr(cfg, "stage7_starless_peak_background_ratio_min", 4.0)
+    )
+    peak_background_ratio = peak_signal / max(background_level, 1e-4)
+    collapsed = bool(
+        dynamic_range_ratio < dynamic_threshold
+        and peak_signal < peak_threshold
+        and peak_background_ratio < peak_background_ratio_threshold
+    )
+    return {
+        "collapsed": collapsed,
+        "dynamic_range_ratio_min": dynamic_threshold,
+        "peak_signal_min": peak_threshold,
+        "peak_background_ratio": peak_background_ratio,
+        "peak_background_ratio_min": peak_background_ratio_threshold,
+    }
+
+
 def stage7_starless_artifact_scores(
     pipeline,
     source_data: Optional[np.ndarray],
@@ -390,20 +435,21 @@ def stage7_quality_assessment(
             "starless_noise_gain "
             f"{starless_noise_gain:.3f}>{pipeline.cfg.stage7_starless_noise_gain_max:.3f}"
         )
-    dynamic_range_threshold = float(
-        getattr(pipeline.cfg, "stage7_starless_dynamic_range_min_ratio", 0.55)
+    dynamic_assessment = stage7_dynamic_range_assessment(
+        pipeline.cfg,
+        dynamic_range_ratio=starless_dynamic_range_ratio,
+        peak_signal=starless_peak_signal,
+        background_level=float(starless_features.bg_median),
     )
-    peak_signal_threshold = float(
-        getattr(pipeline.cfg, "stage7_starless_peak_signal_min", 0.006)
-    )
-    if (
-        starless_dynamic_range_ratio < dynamic_range_threshold
-        and starless_peak_signal < peak_signal_threshold
-    ):
+    if dynamic_assessment["collapsed"]:
         issues.append(
             "starless_dynamic_range_collapse "
-            f"{starless_dynamic_range_ratio:.3f}<{dynamic_range_threshold:.3f}, "
-            f"peak={starless_peak_signal:.5f}<{peak_signal_threshold:.5f}"
+            f"{starless_dynamic_range_ratio:.3f}<"
+            f"{dynamic_assessment['dynamic_range_ratio_min']:.3f}, "
+            f"peak={starless_peak_signal:.5f}<"
+            f"{dynamic_assessment['peak_signal_min']:.5f}, "
+            f"peak/bg={dynamic_assessment['peak_background_ratio']:.2f}<"
+            f"{dynamic_assessment['peak_background_ratio_min']:.2f}"
         )
     if starmask_data is None:
         issues.append("starmask_missing")
@@ -446,6 +492,11 @@ def stage7_quality_assessment(
             "starless_dynamic_range": artifact_scores.get("starless_dynamic_range", 0.0),
             "source_peak_signal": artifact_scores.get("source_peak_signal", 0.0),
             "starless_peak_signal": starless_peak_signal,
+            "starless_background_level": float(starless_features.bg_median),
+            "starless_peak_background_ratio": dynamic_assessment[
+                "peak_background_ratio"
+            ],
+            "dynamic_range_collapse": dynamic_assessment["collapsed"],
             "starmask_coverage_ratio": starmask_coverage_ratio,
             "starmask_width_ratio": starmask_width_ratio,
             "halo_threshold": halo_threshold,
@@ -503,10 +554,17 @@ def stage7_quality_score(pipeline, quality: Optional[Dict[str, Any]]) -> float:
         contamination - pipeline.cfg.stage7_starmask_contamination_max,
     )
     noise_penalty = max(0.0, noise_gain - pipeline.cfg.stage7_starless_noise_gain_max)
-    dynamic_threshold = float(getattr(pipeline.cfg, "stage7_starless_dynamic_range_min_ratio", 0.55))
-    peak_threshold = float(getattr(pipeline.cfg, "stage7_starless_peak_signal_min", 0.006))
     dynamic_penalty = 0.0
-    if dynamic_range_ratio < dynamic_threshold and peak_signal < peak_threshold:
+    dynamic_threshold = float(
+        getattr(pipeline.cfg, "stage7_starless_dynamic_range_min_ratio", 0.55)
+    )
+    collapse = derived.get("dynamic_range_collapse")
+    if collapse is None:
+        peak_threshold = float(
+            getattr(pipeline.cfg, "stage7_starless_peak_signal_min", 0.006)
+        )
+        collapse = dynamic_range_ratio < dynamic_threshold and peak_signal < peak_threshold
+    if bool(collapse):
         dynamic_penalty = (dynamic_threshold - dynamic_range_ratio) * 2.0
     return (
         residual
@@ -552,11 +610,15 @@ def stage7_repair_triggers(pipeline, quality: Optional[Dict[str, Any]]) -> List[
         triggers.append("halo_residue")
     if black_hole > float(pipeline.cfg.stage7_black_hole_score_max):
         triggers.append("black_hole")
-    if (
-        dynamic_range_ratio
-        < float(getattr(pipeline.cfg, "stage7_starless_dynamic_range_min_ratio", 0.55))
-        and peak_signal < float(getattr(pipeline.cfg, "stage7_starless_peak_signal_min", 0.006))
-    ):
+    collapse = derived.get("dynamic_range_collapse")
+    if collapse is None:
+        collapse = (
+            dynamic_range_ratio
+            < float(getattr(pipeline.cfg, "stage7_starless_dynamic_range_min_ratio", 0.55))
+            and peak_signal
+            < float(getattr(pipeline.cfg, "stage7_starless_peak_signal_min", 0.006))
+        )
+    if bool(collapse):
         triggers.append("dynamic_range_collapse")
     return triggers
 

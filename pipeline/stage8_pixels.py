@@ -368,18 +368,117 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
     metrics = pipeline._background_quality_metrics(image_data)
     issues: List[str] = []
     halo_residue = pipeline._stage7_halo_residue_score()
+    selected_stage7_quality = getattr(pipeline, "_stage7_selected_quality", None)
+    stage7_quality_derived = (
+        selected_stage7_quality.get("derived") or {}
+        if isinstance(selected_stage7_quality, dict)
+        else {}
+    )
+    try:
+        compact_halo_residue = float(
+            stage7_quality_derived.get("compact_halo_residue_score", 0.0) or 0.0
+        )
+    except (TypeError, ValueError):
+        compact_halo_residue = 0.0
+    try:
+        global_halo_residue = float(
+            stage7_quality_derived.get("global_halo_residue_score", halo_residue)
+            or 0.0
+        )
+    except (TypeError, ValueError):
+        global_halo_residue = halo_residue
+    stage7_halo_limit = 0.70
+    if hasattr(pipeline, "_stage7_effective_halo_threshold"):
+        try:
+            stage7_halo_limit = float(pipeline._stage7_effective_halo_threshold())
+        except (TypeError, ValueError):
+            stage7_halo_limit = 0.70
+    compact_halo_limit_exceeded = bool(
+        compact_halo_residue > stage7_halo_limit
+    )
     bypassed_bad_starless = bool(getattr(pipeline, "_stage9_bypassed_bad_starless", False))
+    stage9_contract_known = hasattr(pipeline, "_stage9_stars_applied")
+    stage9_stars_required = bool(
+        getattr(pipeline, "_stage9_stars_required", False)
+    )
+    stage9_stars_applied = bool(
+        getattr(pipeline, "_stage9_stars_applied", False)
+    )
+    stage9_missing_required_stars = bool(
+        stage9_contract_known
+        and stage9_stars_required
+        and not stage9_stars_applied
+    )
+    stage9_starmask_stretch_failed = bool(
+        getattr(pipeline, "_stage9_starmask_stretch_failed", False)
+    )
+    selected_stage9_quality = getattr(
+        pipeline,
+        "_stage9_selected_remix_quality",
+        None,
+    )
+    stage9_quality_metrics = (
+        selected_stage9_quality.get("metrics") or {}
+        if isinstance(selected_stage9_quality, dict)
+        else {}
+    )
+    stage9_quality_limits = (
+        selected_stage9_quality.get("limits") or {}
+        if isinstance(selected_stage9_quality, dict)
+        else {}
+    )
+    stage9_chromatic_addition_ratio = None
+    if "chromatic_star_addition_ratio" in stage9_quality_metrics:
+        try:
+            stage9_chromatic_addition_ratio = float(
+                stage9_quality_metrics["chromatic_star_addition_ratio"]
+            )
+        except (TypeError, ValueError):
+            stage9_chromatic_addition_ratio = None
+    try:
+        stage9_local_color_risk_score = float(
+            stage9_quality_metrics.get("local_color_risk_score", 0.0) or 0.0
+        )
+    except (TypeError, ValueError):
+        stage9_local_color_risk_score = 0.0
+    stage10_saturation_guard = getattr(
+        pipeline,
+        "_stage10_saturation_guard",
+        None,
+    )
+    stage9_chromatic_addition_limit_value = stage9_quality_limits.get(
+        "chromatic_star_addition_ratio",
+        getattr(
+            getattr(pipeline, "cfg", None),
+            "stage9_chromatic_addition_ratio_max",
+            0.003,
+        ),
+    )
+    try:
+        stage9_chromatic_addition_limit = float(
+            stage9_chromatic_addition_limit_value
+        )
+    except (TypeError, ValueError):
+        stage9_chromatic_addition_limit = 0.003
     conservative_stage8_skip = (
         str(getattr(pipeline, "_stage8_final_quality", "")) == "conservative_skipped"
     )
     strict_gate = (
         (
             bool(getattr(pipeline, "_stage8_fallback_used", False))
-            and not bypassed_bad_starless
             and not conservative_stage8_skip
         )
+        or bypassed_bad_starless
+        or stage9_missing_required_stars
+        or stage9_starmask_stretch_failed
         or halo_residue > 0.70
+        or compact_halo_limit_exceeded
     )
+    if compact_halo_limit_exceeded:
+        issues.append(
+            "stage7_compact_halo_residue_score "
+            f"{compact_halo_residue:.3f}>{stage7_halo_limit:.3f}"
+        )
     if not metrics:
         issues.append("final_quality_metrics_unavailable")
     else:
@@ -403,7 +502,34 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
         if artifact > artifact_limit:
             issues.append(f"starless_artifact_score {artifact:.3f}>{artifact_limit:.3f}")
         if strict_gate and not issues:
-            issues.append("strict_gate_requires_review_due_to_stage8_fallback_or_stage7_halo")
+            if stage9_missing_required_stars:
+                issues.append("stage9_required_stars_not_applied")
+            elif stage9_starmask_stretch_failed:
+                issues.append("stage9_starmask_stretch_failed")
+            else:
+                issues.append(
+                    "strict_gate_requires_review_due_to_stage8_fallback_"
+                    "or_stage9_bypass_or_stage7_halo"
+                )
+    if (
+        stage9_missing_required_stars
+        and "stage9_required_stars_not_applied" not in issues
+    ):
+        issues.append("stage9_required_stars_not_applied")
+    if (
+        stage9_starmask_stretch_failed
+        and "stage9_starmask_stretch_failed" not in issues
+    ):
+        issues.append("stage9_starmask_stretch_failed")
+    if (
+        stage9_chromatic_addition_ratio is not None
+        and stage9_chromatic_addition_ratio > stage9_chromatic_addition_limit
+    ):
+        issues.append(
+            "stage9_chromatic_star_addition_ratio "
+            f"{stage9_chromatic_addition_ratio:.6f}>"
+            f"{stage9_chromatic_addition_limit:.6f}"
+        )
     normalized_metrics = {
         "background_chroma_noise_score": metrics.get("chroma_noise_score") if metrics else None,
         "background_mottling_score": metrics.get("background_mottling_score") if metrics else None,
@@ -412,9 +538,48 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
         "core_clip_score": metrics.get("core_clip_score") if metrics else None,
         "starless_artifact_score": metrics.get("starless_artifact_score") if metrics else None,
         "halo_artifact_score": halo_residue,
+        "stage7_global_halo_residue_score": global_halo_residue,
+        "stage7_compact_halo_residue_score": compact_halo_residue,
+        "stage7_halo_residue_score_max": stage7_halo_limit,
         "bg_dirty_score": metrics.get("bg_dirty_score") if metrics else None,
         "bg_std": metrics.get("bg_std") if metrics else None,
         "stage9_bypassed_bad_starless": bypassed_bad_starless,
+        "stage9_stars_required": stage9_stars_required,
+        "stage9_stars_applied": stage9_stars_applied,
+        "stage9_starmask_stretch_failed": stage9_starmask_stretch_failed,
+        "stage9_chromatic_star_addition_ratio": stage9_chromatic_addition_ratio,
+        "stage9_chromatic_star_addition_ratio_max": (
+            stage9_chromatic_addition_limit
+        ),
+        "stage9_local_quality_status": str(
+            stage9_quality_metrics.get("local_quality_status", "not_available")
+        ),
+        "stage9_local_color_risk_score": stage9_local_color_risk_score,
+        "stage9_local_connected_component_max_area": stage9_quality_metrics.get(
+            "local_connected_component_max_area"
+        ),
+        "stage9_local_single_pixel_component_ratio": stage9_quality_metrics.get(
+            "local_single_pixel_component_ratio"
+        ),
+        "stage9_local_cyan_blue_component_max_area": stage9_quality_metrics.get(
+            "local_cyan_blue_component_max_area"
+        ),
+        "stage9_core_color_jump_component_max_area": stage9_quality_metrics.get(
+            "core_color_jump_component_max_area"
+        ),
+        "stage10_stage9_saturation_factor": (
+            stage10_saturation_guard.get("saturation_factor")
+            if isinstance(stage10_saturation_guard, dict)
+            else None
+        ),
+        "stage10_effective_final_saturation": (
+            stage10_saturation_guard.get("effective_saturation")
+            if isinstance(stage10_saturation_guard, dict)
+            else None
+        ),
+        "stage9_stars_application_mode": str(
+            getattr(pipeline, "_stage9_stars_application_mode", "unknown")
+        ),
         "stage8_conservative_skipped": conservative_stage8_skip,
     }
     return {
@@ -492,9 +657,25 @@ def stage8_input_enhancement_guard(pipeline) -> Dict[str, Any]:
     except (CommandError, SirilError, OSError, RuntimeError, TypeError, ValueError) as e:
         reasons.append(f"stage8_mask_guard_unavailable={pipeline._short_text(e, 120)}")
 
+    conservative_skip = bool(
+        reasons
+        and (
+            bool(getattr(pipeline, "_stage8_conservative_mode", False))
+            or "stage8_conservative_mode_after_stage7_starless_repair" in reasons
+        )
+    )
+    skip_status = (
+        "conservative_skipped"
+        if conservative_skip
+        else "skipped"
+        if reasons
+        else "ok"
+    )
     return {
         "skip_enhancement": bool(reasons),
         "conservative_mode": bool(getattr(pipeline, "_stage8_conservative_mode", False)),
+        "status": skip_status,
+        "final_quality": skip_status,
         "reasons": reasons,
         "mask_coverage": coverage,
         "mask_signal_coverage": mask_signal_coverage,

@@ -172,10 +172,10 @@ save stage3_bgremoved
 
 ```text
 load stage3_bgremoved
-platesolve -focal=160 -pixelsize=2.90 -catalog=gaia -order=3
+platesolve -noflip -focal=160 -pixelsize=2.90 -catalog=gaia -order=3
 save stage4_psolved
 setcpu 1
-spcc "-oscsensor=Sony IMX585" "-oscfilter=ZWO Seestar LP" "-whiteref=Average Spiral Galaxy" -limitmag=10.5
+spcc -catalog=localgaia "-oscsensor=Sony IMX585" "-oscfilter=ZWO Seestar LP" "-whiteref=Average Spiral Galaxy" -limitmag=10.5
 setcpu <restore_cpu>
 save stage4_color
 save stage4_colorbalanced
@@ -184,13 +184,13 @@ save stage4_colorbalanced
 无 LP 滤镜时，把 SPCC 命令替换为：
 
 ```text
-spcc "-oscsensor=Sony IMX585" "-oscfilter=No filter" "-whiteref=Average Spiral Galaxy" -limitmag=10.5
+spcc -catalog=localgaia "-oscsensor=Sony IMX585" "-oscfilter=No filter" "-whiteref=Average Spiral Galaxy" -limitmag=10.5
 ```
 
 窄带或双窄带时，把 SPCC 命令替换为：
 
 ```text
-spcc "-oscsensor=Sony IMX585" "-whiteref=Average Spiral Galaxy" -narrowband -rwl=656.28 -rbw=20 -gwl=500.70 -gbw=30 -bwl=500.70 -bbw=30 -limitmag=10.5
+spcc -catalog=localgaia "-oscsensor=Sony IMX585" "-whiteref=Average Spiral Galaxy" -narrowband -rwl=656.28 -rbw=20 -gwl=500.70 -gbw=30 -bwl=500.70 -bbw=30 -limitmag=10.5
 ```
 
 解析失败但 header 有中心坐标时重试：
@@ -281,33 +281,33 @@ load stage5_linear
 save stage6_input
 ```
 
-在 Siril 中运行 `SyQon-Starless.py`，输入当前 `stage5_linear`，输出 `starless.fit` 和 `starmask.fit`。成功后执行：
+在 Siril 中运行 `SyQon-Starless.py`，输入当前 `stage5_linear`，输出 `starless.fit` 和 `starmask.fit`。成功后先保留不可变原始层：
 
 ```text
 load starless
 save stage6_starless
 save stage7_starless
+load starmask
+save starmask_raw
 ```
 
-如果线性图去星失败，生成轻微预拉伸输入后重试 `SyQon-Starless.py`：
+保持 `stage5_linear` 为 SyQon 的输入，不在外部执行 Asinh 预拉伸。当前内置 SyQon 会在脚本内部执行临时、可逆的 IHS 预拉伸，并在输出前恢复线性域；外部再次预拉伸会让输入域含义混乱，并使后续 Stage 7 存在重复拉伸风险。
 
-```text
-load stage5_linear
-asinh 1.35 0.0025
-save stage6_mild_prestretch_star_input
-```
+质量不理想时，仍加载同一个 `stage5_linear`，只调整 SyQon 的 tile/overlap 或模型参数后重试。
+
+检查 `starmask_raw.fit` 时应区分紧致星点与低频弥散残差：只压低大尺度平滑背景、星云残留和彩色底噪，不要按主体图亮区整体擦除，也不要对所有小星统一降强。清理结果另存 `starmask_clean.fit`，不得覆盖 raw；若使用脚本自动清理，RGB 三通道会共用同一空间权重以保护星色，紧致星点保留率不达标时继续使用 raw。
 
 参数来源：
 
 - SyQon 默认模型：Zenith v1。
+- 选择 Axiom 时使用 Axiom 2.1（CLI 参数 `--axiom21`）；缓存模型名为 `Axiom2_1.pt`，用户数据回退名为 `axiom21.pt`。
 - SyQon 默认 tile/overlap：`512 / 64`。
-- 轻微预拉伸强度来自 `SEESTAR_MILD_PRESTRETCH_STRENGTH`，默认 `1.35`。
 - GPU 开关来自 `SEESTAR_SYQON_GPU`。
+- `SEESTAR_MILD_PRESTRETCH_STRENGTH` 仅为旧配置兼容字段，当前 Stage 6 不使用。
 
 回退：
 
-- SyQon 失败时尝试轻微预拉伸输入。
-- 仍失败时可用 SASP Dark Star 手工去星。
+- SyQon 失败时可用 SASP Dark Star 手工去星，输入仍保持线性。
 - 所有去星工具失败时，退化为不真正去星：
 
 ```text
@@ -321,7 +321,7 @@ save stage7_starless
 
 ## 8. 主体拉伸
 
-生成预览和两个正式候选：
+生成预览和两个正式候选。以下是通用目标的基线命令：
 
 ```text
 load stage6_starless
@@ -343,20 +343,25 @@ save stage7_stretched
 
 参数来源：
 
-- `asinh_stretch/asinh_offset` 来自自动调参；普通背景默认约 `2.2 / 0.002`。
+- `asinh_stretch/asinh_offset` 来自背景统计、preview 标尺和 `target_profile.json` / `pipeline_policy.json`；普通背景默认约 `2.2 / 0.002`。
 - `autoghs` amount 普通默认约 `1.05`。
-- 极低背景时降低 Asinh 强度并提高 offset，但 offset 不应高于有效信号范围。
+- 极低背景时保持足够 Asinh 强度，并用 `p01`、背景中值和噪声底限制 offset，使其低于有效信号范围。
+
+目标感知调整：
+
+- 亮核心发射/反射星云：下调 P50/P99 目标；A 候选在 Asinh 后局部抬升弱云气、压缩亮核，B 候选把 GHS 限制在约 `1.00`。
+- 暗云：适度提高 P50 目标，让尘埃剪影有可见背景承载；A 候选使用保守的局部弱信号抬升和更强核心保护。
+- 大/小星系：收紧 P99 并降低 GHS，兼顾核心与外围 halo。
+- 球状/疏散星团及 M45 类反射星云星团：A/B 都只用 Asinh，不执行 GHS，优先保护星色和星点尺寸。
+- 大视场发射星云：适度提高 P50 目标，保留弥散弱信号，但 GHS 仍限制在温和范围。
+
+候选验收还应查看目标局部区域，而不只看全图直方图：亮核目标检查核心 P99 和裁剪；星系、发射星云及暗云检查弱结构相对背景 SNR；暗云再检查明暗分离。任一局部指标明显越界时拒绝该候选，即使全局分布看似正常。
 
 回退：
 
 - `stage7_cand_b` 过曝或发白时选 `stage7_cand_a`。
-- 两个候选都不理想时选动态范围更正常、核心不过曝、背景不死黑的候选。
-- 所有拉伸失败时：
-
-```text
-load stage6_starless
-save stage7_stretched
-```
+- 两个候选都不理想时不强行生成 `stage7_stretched.fit`；记录风险最低的拒绝候选用于诊断，并让后续阶段从 `starless.fit` / `stage6_starless.fit` 保守回退。
+- 所有拉伸命令失败时回载 `stage6_starless`，Stage 7 记为 failed，但不终止后续回退链。
 
 ## 9. Starless 增强
 
@@ -398,6 +403,7 @@ save stage8_enhanced
 
 ```text
 load sasp_starmask
+save starmask_external_raw
 save starmask
 ```
 
@@ -405,27 +411,29 @@ save starmask
 
 ```text
 load starmask
-asinh 2.000 0.00100
+asinh <adaptive_star_stretch> 0.00100
 save starmask_stretched
 ```
 
 回混：
 
 ```text
-load starless_enhanced
-pm $starless_enhanced$ + $starmask_stretched$ * <intensity>
+star_term = clamp(starmask_stretched * <intensity>, 0, 1)
+stage9_candidate = 1 - (1 - starless_enhanced) * (1 - star_term)
 save stage9_remixed
 ```
 
+这里使用 Screen，而不是直接执行 `starless + stars`。Screen 会根据主体图已有亮度保留高光余量，减少亮星核心和亮星云叠加后的硬裁剪。
+
 参数来源：
 
-- starmask Asinh 默认来自 `SEESTAR_STAGE9_STARMASK_ASINH_STRETCH=2.00` 和 `SEESTAR_STAGE9_STARMASK_ASINH_OFFSET=0.001`。
+- `<adaptive_star_stretch>` 应只从与紧致星核连通的窄星翼采样，不能把全图低幅残差当作弱星；让弱星接近目标亮度、限制亮星高百分位后，还要把预测显著变化覆盖控制在 `0.30` 以内。统计不可用时才回退 `2.00 / 0.001`。
 - `<intensity>` 来自 `star_intensity`，自动调参后上限 `1.05`。
 - 残星明显时降低 `<intensity>`，避免二次星点。
 
 回退：
 
-- 主强度回混星点太重时，改用 `star_fallback_intensity` 或人工降低到 `0.45-0.80`。
+- 主强度候选先检查高光裁剪、亮像素扩张、暗背景抬升、变化覆盖和异常变暗；不通过时必须重新加载 `starless_enhanced`，再依次尝试 `0.75 / 0.55 / 0.40`，不能在被拒绝的候选上重复叠加。
 - 没有 starmask 时：
 
 ```text
@@ -433,7 +441,7 @@ load starless_enhanced
 save stage9_remixed
 ```
 
-- 回混失败时继续使用 `starless_enhanced`。
+- 所有回混档位都失败或未通过门控时继续使用 `starless_enhanced`；自动流程会把指标写入 `stage9_remix_quality.json`。
 
 ## 11. 最终降噪与导出
 
@@ -465,7 +473,7 @@ save stage10_final
 可选最终降噪：
 
 ```text
-pyscript "<siril-scripts>/processing/CosmicClarity_Denoise.py" -denoising_mode luminance -denoise_strength 0.5 -use_gpu <classic_executable_args>
+pyscript "<siril-scripts>/processing/CosmicClarity_Denoise.py" -denoising_mode <full|separate> -denoise_strength 0.5 -use_gpu <classic_executable_args>
 save stage10_final
 ```
 
@@ -536,7 +544,7 @@ save result_final_ai
 2. `stage3_bgremoved.fit`：背景平整，但星云/暗云气没有被扣空。
 3. `stage4_color.fit`：星色自然，背景不过度偏绿/偏蓝/偏红。
 4. `stage5_linear.fit`：反卷积没有明显星环，背景噪声没有被放大。
-5. `stage6_starless.fit`：主体保留，残星不过多；`starmask.fit` 不应包含大量星云结构。
+5. `stage6_starless.fit`：主体保留，残星不过多；`starmask_raw.fit` 可回溯原始分层，`starmask_clean.fit` 不应包含大量低频星云结构且不能明显丢失弱星。
 6. `stage7_stretched.fit`：主体可见，核心不过曝，背景不死黑。
 7. `stage8_enhanced.fit`：增强不过度，背景不脏，蓝偏不过量。
 8. `stage9_remixed.fit`：回星不重复、不膨胀、不压过星云主体。

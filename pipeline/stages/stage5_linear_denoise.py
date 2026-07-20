@@ -1,10 +1,17 @@
 """Stage 5 linear cleanup: optional RL deconvolution first, then light denoise."""
 from __future__ import annotations
 
+import os
+import re
+from pathlib import Path
 from typing import List, Optional
 
 from models import PipelineStage
 from sirilpy.exceptions import CommandError, SirilError
+
+
+GRAXPERT_OBJECT_MODEL_ENV = "SEESTAR_GRAXPERT_OBJECT_MODEL_PATH"
+_GRAXPERT_MODEL_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 
 
 def _stage5_background_risk(adaptive: dict, stage5_policy: dict) -> bool:
@@ -167,7 +174,6 @@ def _run_stage5_rl_deconvolution(
     if not bool(getattr(pipeline.cfg, "stage5_deconvolution_enabled", True)):
         messages.append("Stage5 RL deconvolution disabled")
         return False
-
     maxstars = max(20, min(1000, int(getattr(pipeline.cfg, "stage5_rl_maxstars", 200))))
     kernel_size = max(9, min(99, int(getattr(pipeline.cfg, "stage5_rl_psf_kernel_size", 33))))
     if kernel_size % 2 == 0:
@@ -218,11 +224,233 @@ def _run_stage5_rl_deconvolution(
         return False
 
 
+def _stage5_graxpert_model_version(model: Path) -> Optional[tuple[int, int, int]]:
+    match = _GRAXPERT_MODEL_VERSION_RE.fullmatch(model.parent.name)
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def _stage5_graxpert_models_from_path(path: Path) -> List[Path]:
+    def nonempty_model(candidate: Path) -> bool:
+        try:
+            return (
+                candidate.name == "model.onnx"
+                and candidate.is_file()
+                and candidate.stat().st_size > 0
+            )
+        except OSError:
+            return False
+
+    try:
+        if path.is_file():
+            return [path] if nonempty_model(path) else []
+        if not path.is_dir():
+            return []
+    except OSError:
+        return []
+
+    roots = [path]
+    family_root = path / "deconvolution-object-ai-models"
+    try:
+        if family_root.is_dir():
+            roots.insert(0, family_root)
+    except OSError:
+        pass
+    candidates: List[Path] = []
+    for root in roots:
+        direct_model = root / "model.onnx"
+        if nonempty_model(direct_model):
+            candidates.append(direct_model)
+        try:
+            candidates.extend(
+                model
+                for model in root.glob("*/model.onnx")
+                if nonempty_model(model)
+            )
+        except OSError:
+            continue
+    return list(dict.fromkeys(candidates))
+
+
+def _stage5_latest_graxpert_model(candidates: List[Path]) -> Optional[Path]:
+    versioned = [
+        (version, model)
+        for model in candidates
+        if (version := _stage5_graxpert_model_version(model)) is not None
+    ]
+    return max(versioned, key=lambda item: item[0])[1] if versioned else None
+
+
+def _stage5_install_user_graxpert_model(source: Path, home: Path) -> tuple[Optional[Path], str]:
+    version = _stage5_graxpert_model_version(source)
+    if version is None:
+        return None, "model_version_directory_must_be_semver"
+    target = (
+        home
+        / "Library"
+        / "Application Support"
+        / "GraXpert"
+        / "deconvolution-object-ai-models"
+        / ".".join(str(part) for part in version)
+        / "model.onnx"
+    )
+    try:
+        if target.exists():
+            if target.samefile(source):
+                return target, ""
+            return None, "model_version_conflicts_with_isolated_home"
+        if target.is_symlink():
+            return None, "isolated_home_model_symlink_is_broken"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(source.resolve())
+        return target, ""
+    except OSError as error:
+        return None, f"model_link_failed:{error}"
+
+
+def _stage5_graxpert_object_model() -> tuple[Optional[Path], dict]:
+    home = Path(os.environ.get("HOME") or Path.home())
+    details = {
+        "configured_path": "",
+        "source": "",
+        "resolved_model_path": "",
+        "discovery_reason": "",
+    }
+    configured_path = os.environ.get(GRAXPERT_OBJECT_MODEL_ENV, "").strip()
+    if configured_path:
+        configured = Path(configured_path).expanduser()
+        if not configured.is_absolute():
+            configured = Path.cwd() / configured
+        details["configured_path"] = str(configured)
+        configured_models = _stage5_graxpert_models_from_path(configured)
+        user_model = _stage5_latest_graxpert_model(configured_models)
+        if user_model is not None:
+            installed, reason = _stage5_install_user_graxpert_model(user_model, home)
+            if installed is not None:
+                details["source"] = "user_provided"
+                return installed, details
+            details["discovery_reason"] = reason
+        elif configured_models:
+            details["discovery_reason"] = "model_version_directory_must_be_semver"
+        else:
+            details["discovery_reason"] = "configured_model_not_found_or_invalid"
+        return None, details
+
+    model_roots = (
+        home / "Library" / "Application Support" / "GraXpert"
+        / "deconvolution-object-ai-models",
+        home / ".local" / "share" / "GraXpert"
+        / "deconvolution-object-ai-models",
+        home / "AppData" / "Local" / "GraXpert"
+        / "deconvolution-object-ai-models",
+    )
+    local_model = _stage5_latest_graxpert_model(
+        [
+            model
+            for root in model_roots
+            for model in _stage5_graxpert_models_from_path(root)
+        ]
+    )
+    if local_model is not None:
+        details["source"] = "isolated_home"
+        return local_model, details
+    return None, details
+
+
+def _run_stage5_graxpert_deconvolution(
+    pipeline,
+    messages: List[str],
+) -> tuple[bool, dict]:
+    details = {
+        "attempted": False,
+        "available": False,
+        "model": None,
+        "strength": max(
+            0.20,
+            min(
+                0.40,
+                float(getattr(pipeline.cfg, "stage5_graxpert_deconv_strength", 0.30)),
+            ),
+        ),
+        "psf_size": 5.0,
+        "reason": "",
+        "configured_path": "",
+        "source": "",
+        "resolved_model_path": "",
+    }
+    if not bool(getattr(pipeline.cfg, "stage5_deconvolution_enabled", True)):
+        details["reason"] = "deconvolution_disabled"
+        return False, details
+
+    script = pipeline._find_plugin_script(("processing/GraXpert-AI.py",))
+    if script is None:
+        details["reason"] = "script_missing"
+        return False, details
+    model, discovery = _stage5_graxpert_object_model()
+    details.update(discovery)
+    if model is None:
+        details["reason"] = (
+            discovery.get("discovery_reason")
+            or "object_deconvolution_model_missing"
+        )
+        if discovery.get("configured_path"):
+            messages.append(
+                "Stage5 GraXpert user model unavailable: "
+                f"{details['reason']} ({discovery['configured_path']})"
+            )
+        else:
+            messages.append("Stage5 GraXpert object deconvolution unavailable: local model missing")
+        return False, details
+
+    details.update({
+        "attempted": True,
+        "available": True,
+        "model": model.parent.name,
+        "resolved_model_path": str(model),
+    })
+    used = pipeline._run_plugin_script_by_path(
+        "Stage5 GraXpert反卷积",
+        "GraXpert AI Object Deconvolution",
+        script,
+        args=(
+            "-deconv_obj",
+            "-strength", f"{details['strength']:.2f}",
+            "-psfsize", f"{details['psf_size']:.1f}",
+            "-model", model.parent.name,
+            "-nogpu",
+        ),
+    )
+    if not used:
+        details["reason"] = (
+            getattr(pipeline, "_last_plugin_script_error", None)
+            or "plugin_failed_or_noop"
+        )
+        messages.append(
+            "Stage5 GraXpert object deconvolution failed; falling back to Siril RL: "
+            f"{pipeline._short_text(details['reason'], 160)}"
+        )
+        try:
+            pipeline.cmd_with_check("load", "stage5_input_linear")
+        except (CommandError, SirilError) as load_error:
+            pipeline.log.warn(
+                f"[Stage5] reload baseline after GraXpert failure failed: {load_error}"
+            )
+        return False, details
+
+    pipeline._save_stage_output("stage5_graxpert_deconv")
+    messages.append(
+        "Stage5 GraXpert object deconvolution applied "
+        f"(model={model.parent.name}, strength={details['strength']:.2f}, psf=5.0)"
+    )
+    return True, details
+
+
 def run_stage5_linear_denoise(pipeline) -> None:
     """
     阶段 5: 线性整理
-    - 输入固定为 stage4_color，先用原始线性数据生成 PSF 并执行可选 RL 反卷积。
-    - RL 后再做轻量线性降噪，最终保存 stage5_linear。
+    - 输入固定为 stage4_color，优先 GraXpert Object Deconvolution，失败回退 RL。
+    - 反卷积后再做轻量线性降噪，最终保存 stage5_linear。
     - 不再默认执行全局锐化，避免在线性暗背景中放大彩噪和星环。
     """
     stage_name = PipelineStage.LINEAR_DENOISE.label
@@ -241,6 +469,9 @@ def run_stage5_linear_denoise(pipeline) -> None:
     guard_reason = ""
     denoise_used = "none"
     deconv_applied = False
+    deconv_method = "none"
+    deconv_attempted_method = "none"
+    graxpert_details = {}
     denoise_input = "stage5_input_linear"
     final_stem = "stage5_linear"
 
@@ -264,13 +495,27 @@ def run_stage5_linear_denoise(pipeline) -> None:
     )
     background_risk = _stage5_background_risk(before_adaptive, stage5_policy)
 
-    deconv_applied = _run_stage5_rl_deconvolution(
+    deconv_applied, graxpert_details = _run_stage5_graxpert_deconvolution(
         pipeline,
         messages,
-        fallback_stem="stage5_input_linear",
     )
     if deconv_applied:
-        denoise_input = "stage5_deconv"
+        deconv_method = "graxpert_object"
+        deconv_attempted_method = "graxpert_object"
+        denoise_input = "stage5_graxpert_deconv"
+    else:
+        if bool(getattr(pipeline.cfg, "stage5_deconvolution_enabled", True)):
+            deconv_attempted_method = "siril_rl"
+        deconv_applied = _run_stage5_rl_deconvolution(
+            pipeline,
+            messages,
+            fallback_stem="stage5_input_linear",
+        )
+        if deconv_applied:
+            deconv_method = "siril_rl"
+    if deconv_applied:
+        if deconv_method == "siril_rl":
+            denoise_input = "stage5_deconv"
         after_deconv_adaptive = (
             pipeline._adaptive_features_current()
             if hasattr(pipeline, "_adaptive_features_current")
@@ -281,21 +526,27 @@ def run_stage5_linear_denoise(pipeline) -> None:
             after_deconv_adaptive,
         )
         if guard_triggered:
-            pipeline.log.warn(f"[Stage5] background guard dropped RL result: {guard_reason}")
-            messages.append(f"Stage5 background guard dropped RL result: {guard_reason}")
+            pipeline.log.warn(
+                f"[Stage5] background guard dropped {deconv_method} result: {guard_reason}"
+            )
+            messages.append(
+                f"Stage5 background guard dropped {deconv_method} result: {guard_reason}"
+            )
             try:
                 pipeline.cmd_with_check("load", "stage5_input_linear")
                 denoise_input = "stage5_input_linear"
                 deconv_applied = False
+                deconv_method = "none"
             except (CommandError, SirilError) as e:
                 status = "degraded"
                 messages.append(f"Stage5 background guard reload failed: {pipeline._short_text(e, 160)}")
 
     if not deconv_applied and pipeline.process_dir:
         try:
-            (pipeline.process_dir / "stage5_deconv.fit").unlink(missing_ok=True)
+            for stale_name in ("stage5_deconv.fit", "stage5_graxpert_deconv.fit"):
+                (pipeline.process_dir / stale_name).unlink(missing_ok=True)
         except OSError as e:
-            pipeline.log.warn(f"[Stage5] stale stage5_deconv cleanup failed: {e}")
+            pipeline.log.warn(f"[Stage5] stale deconvolution output cleanup failed: {e}")
 
     if _run_builtin_linear_denoise(pipeline, messages):
         denoise_used = "siril_builtin"
@@ -316,6 +567,7 @@ def run_stage5_linear_denoise(pipeline) -> None:
             )
 
     linear_saved = pipeline._save_stage_output("stage5_linear")
+    pipeline._stage5_denoise_applied = denoise_used != "none"
     if not linear_saved:
         status = "degraded"
         messages.append("stage5_linear save failed")
@@ -323,6 +575,18 @@ def run_stage5_linear_denoise(pipeline) -> None:
         diff_note = pipeline._stage_diff_note("stage5_linear", denoise_input)
         if diff_note:
             messages.append(diff_note)
+        if hasattr(pipeline, "_create_stage_review_bundle"):
+            review = pipeline._create_stage_review_bundle(
+                "stage5_linear_cleanup",
+                "stage5_input_linear",
+                "stage5_linear",
+                context={
+                    "denoise_method": denoise_used,
+                    "deconvolution_applied": deconv_applied,
+                },
+            )
+            if review.get("report_path"):
+                messages.append(f"review_bundle={review['report_path']}")
 
     linear_export_ok = pipeline._export_linear_intermediate()
     if not linear_export_ok:
@@ -340,10 +604,6 @@ def run_stage5_linear_denoise(pipeline) -> None:
         status = "degraded"
         messages.append("stage5_denoised compatibility save failed")
 
-    graxpert_strength = max(
-        0.20,
-        min(0.40, float(getattr(pipeline.cfg, "stage5_graxpert_deconv_strength", 0.30))),
-    )
     pipeline._write_stage_json(
         "stage5_linear_report.json",
         {
@@ -354,7 +614,8 @@ def run_stage5_linear_denoise(pipeline) -> None:
             "processing_order": [
                 "load stage4_color",
                 "save stage5_input_linear",
-                "findstar/makepsf/rl if enabled",
+                "GraXpert object deconvolution when local model is available",
+                "findstar/makepsf/rl fallback if enabled",
                 "denoise",
                 "save stage5_linear",
             ],
@@ -382,15 +643,16 @@ def run_stage5_linear_denoise(pipeline) -> None:
             },
             "deconvolution": {
                 "enabled": bool(getattr(pipeline.cfg, "stage5_deconvolution_enabled", True)),
-                "method": "siril_rl",
+                "method": deconv_method,
+                "attempted_method": deconv_attempted_method,
                 "applied": deconv_applied,
-                "output": "stage5_deconv" if deconv_applied else None,
+                "output": denoise_input if deconv_applied else None,
                 "runs_before_denoise": True,
-                "graxpert_strength_mapping": graxpert_strength,
-                "graxpert_note": (
-                    "GraXpert deconvolution is intentionally not auto-invoked here; "
-                    "wire the exact local invocation only after the installed tool protocol is confirmed."
-                ),
+                "graxpert": {
+                    **graxpert_details,
+                    "accepted": deconv_applied and deconv_method == "graxpert_object",
+                },
+                "fallback": "siril_rl" if deconv_method == "siril_rl" else None,
             },
             "background_guard": {
                 "risk": background_risk,

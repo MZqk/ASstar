@@ -41,26 +41,28 @@ flowchart TD
     N --> O[stage9 星点处理与合成]
     O --> P[stage10 最终降噪与导出]
     P --> Q[stage11 AI后期(可选)]
-    Q --> R[cleanup 清理]
+    Q --> T[AI艺术衍生实验(可选/非正式/只读Stage10)]
+    T --> R[cleanup 清理]
     R --> S[汇总阶段结果]
 ```
 
 其中：
 
 - 正式阶段编号固定为 Stage 1-11，代码统一由 `models.PipelineStage` 提供阶段身份和显示标签
-- 阶段 1-5 视为线性阶段，目标画像与 policy 选择合并到 Stage 3/4 preflight，不再单独占一个阶段；`stage2_5_target_profiler()` 仅是兼容别名
+- AI 艺术衍生是 Stage 11 后的非正式隔离分支，不新增 Stage 12，也不改变正式阶段结果
+- 阶段 1-6 视为线性阶段，目标画像与 policy 选择合并到 Stage 3/4 preflight，不再单独占一个阶段；`stage2_5_target_profiler()` 仅是兼容别名
 - 阶段 6 是线性去星与星点层准备，先在线性图上分离星点；阶段 7 再拉伸 starless，避免拉伸放大的脏背景进入去星模型
 - 主类正式入口为 `stage6_star_separation()` / `stage7_stretching()`；旧的 `stage7_star_separation()` / `stage6_stretching()` 仅为兼容别名
 - 因此阶段 7-10 是 starless-first 非线性核心处理
 - 默认 starless-first 路径下只记录一个 Stage 7 兼容检查点（非正式阶段）；旧的去星前质量门控仍保留给非默认/调试路径，`stage6_5_pre_starless_gate()` 仅是兼容别名
-- 阶段 6 去星、阶段 8 增强和阶段 11 可在 AI 总开关开启且凭据齐全时启用参数优化与诊断记录；当前阶段 7 主体拉伸固定为本地两候选，不再让 AI 或 policy 扩展候选集合
+- 阶段 6 去星、阶段 8 增强和阶段 11 可在 AI 总开关开启且凭据齐全时启用参数优化与诊断记录；当前阶段 7 主体拉伸固为本地两个主候选，AI 或 policy 不扩展候选集合，仅允许在背景色度门控失败时追加确定性救援候选
 - 自动调参发生在阶段 1 完成之后、阶段 2 开始之前
 - 脚本不会因为单个非致命阶段失败就立刻退出，而是尽量记录 `ok / degraded / failed / skipped` 后继续处理
 - 当 `SEESTAR_INPUT_MODE=stage2_corrected_resume` 时，会使用工作目录根下或旧 `process/` 下的 `stage2_corrected.fit` 作为已完成裁切/视场修正的叠加后中间结果：
-  `prepare stage2_corrected.fit -> auto tune -> stage3 background -> stage4 color -> stage5 linear -> stage6 starless -> stage7 stretch -> compatibility checkpoint skipped -> stage8 -> stage9 -> stage10 -> stage11 -> cleanup`
+  `prepare stage2_corrected.fit -> auto tune -> stage3 background -> stage4 color -> stage5 linear -> stage6 starless -> stage7 stretch -> compatibility checkpoint skipped -> stage8 -> stage9 -> stage10 -> stage11 -> optional isolated artistic derivative -> cleanup`
   同时把阶段 1 记录为 `skipped`，阶段 2 记录为加载既有中间结果
 - 当 `SEESTAR_INPUT_MODE=result_linear_resume` 时，会改走显式续跑分支：
-  `prepare result_linear.fit -> auto tune -> target preflight -> stage6 starless -> stage7 stretch -> compatibility checkpoint skipped -> stage8 -> stage9 -> stage10 -> stage11 -> cleanup`
+  `prepare result_linear.fit -> auto tune -> target preflight -> stage6 starless -> stage7 stretch -> compatibility checkpoint skipped -> stage8 -> stage9 -> stage10 -> stage11 -> optional isolated artistic derivative -> cleanup`
   同时把阶段 2、3、4、5 记录为 `skipped`
 
 ### 2.1 实际天文后期逻辑总览
@@ -72,13 +74,24 @@ flowchart TD
 | 输入统一 | Stage 1 / `working.fit`、`stage1_prepared.fit` | 得到一张可处理的线性 FITS | 优先使用最新叠加 FITS；没有叠加图时隔离 `Light_` 单帧并执行 debayer、register、stack |
 | 画面边界 | Stage 2 / `stage2_corrected.fit` | 去掉黑边和窄幅彩色边缘，避免污染背景建模和去星 | 自动扫描四边近黑/暗边界/红蓝叠加伪影并独立裁切，再按 `edge_black_ratio` 迭代复检 |
 | 目标策略 | Stage 3/4 preflight / `target_profile.json`、`pipeline_policy.json` | 根据目标类型保护真实星云、暗云气、星系核心或星团星色 | 用像素特征、FITS metadata、目标库和路径上下文生成 profile；Stage 4 platesolve 后再刷新一次 |
-| 线性校正 | Stage 3-5 / `stage3_bgremoved.fit`、`stage4_color.fit`、`stage5_linear.fit` | 在线性域完成背景、校色、可选反卷积和轻降噪 | 背景按 `GraXpert/ADBE/DBE/subsky RBF/NOX` 理论效果顺序尝试；有 Siril scripts 缓存时 GraXpert/ADBE/DBE/AutoDBE 通过 `pyscript` 调用 `GraXpert-AI.py` / `AutoBGE.py`，所有候选必须通过保留门控；校色按 platesolve 成功时 SPCC -> 多星表 PCC，解析失败时先尝试 header 坐标辅助解析 / PCC header fallback，再进入本地回退；Stage 5 先 PSF/RL，再 post-RL denoise |
-| 线性去星 | Stage 6 / `stage6_starless.fit`、`starmask.fit` | 在噪声未被非线性放大前拆出主体和星点层 | 默认用最终 `stage5_linear` 做 SyQon，`stage5_deconv` 仅作检查点/回退；失败可轻微预拉伸重试，再回退 SASP；全部失败则把当前 Stage 6 输入保存为 `starless.fit` 继续 |
-| 主体拉伸 | Stage 7 / `stage7_stretched.fit` | 把 starless 主体拉到可视亮度，同时避免黑场压死和核心过曝 | 只比较 `stage7_cand_a` 与 `stage7_cand_b`，`stage7_preview_ref` 只供参考；候选需通过像素分布和质量门控 |
-| Starless 增强 | Stage 8 / `stage8_enhanced.fit`、`starless_enhanced.fit` | 分区提升星云主体和外围弱信号，保护背景与亮核 | 优先接收外部/SASP starless；默认 soft mask 分区增强，必要时 conservative skip、蓝偏修正或回滚 |
-| 回星合成 | Stage 9 / `stage9_remixed.fit` | 把星点按质量诊断受控回混，避免二次星点、halo 或坏蒙版污染 | 可处理外部 starmask；残星/halo 风险高时绕过 StarComposer，改用像素级 `starless + stretched_starmask * intensity` |
+| 线性校正 | Stage 3-5 / `stage3_bgremoved.fit`、`stage4_color.fit`、`stage5_linear.fit` | 在线性域完成背景、校色、可选反卷积和轻降噪 | 背景按 `GraXpert/ADBE/DBE/subsky RBF/NOX` 理论效果顺序尝试；有 Siril scripts 缓存时 GraXpert/ADBE/DBE/AutoDBE 通过 `pyscript` 调用 `GraXpert-AI.py` / `AutoBGE.py`，所有候选必须通过保留门控；校色按 platesolve 成功时本地 Gaia DR3 xp_sampled SPCC -> 多星表 PCC，解析失败时先尝试 header 坐标辅助解析 / PCC header fallback，再进入本地回退；Stage 5 先 PSF/RL，再 post-RL denoise |
+| 线性去星 | Stage 6 / `stage6_starless.fit`、`starmask_raw.fit`、`starmask_clean.fit` | 在噪声未被非线性放大前拆出主体和星点层 | 固定用最终可用线性检查点做 SyQon；质量重试只调整 SyQon 参数并复用同一线性输入；原始星点层与清理层分开保存，执行失败再回退 SASP |
+| 主体拉伸 | Stage 7 / `stage7_stretched.fit` | 把 starless 主体拉到可视亮度，同时避免黑场压死和核心过曝 | 主选固定比较 `stage7_cand_a` 与 `stage7_cand_b`；仅因背景色度门控失败时追加受控救援候选；目标画像/policy 约束候选方法、P50/P99 标尺和核心/弱信号保护，所有候选都要通过核心、弱结构或暗云局部指标门控；`stage7_preview_ref` 不参与最终选择 |
+| Starless 增强 | Stage 8 / `stage8_enhanced.fit`、`starless_enhanced.fit` | 分区提升星云主体和外围弱信号，保护背景与亮核 | 优先加载本轮验收通过的 `stage7_stretched`；Stage 7 失败时依次回退 `starless`、`stage6_starless`；默认 soft mask 分区增强，必要时 conservative skip、蓝偏修正或回滚 |
+| 回星合成 | Stage 9 / `stage9_remixed.fit` | 把星点按质量诊断受控回混，避免二次星点、halo 或坏蒙版污染 | 从原始含星图建立独立星表并匹配 starmask；星点作为上层、Starless 作为底层执行受支持层约束的 Alpha+Screen，候选不通过 post-remix 门控时降强度重试或回滚无星底图 |
 | 交付导出 | Stage 10 / `stage10_final.fit` | 生成可交付 TIFF/PNG/FITS | 按 `stage9_remixed -> starless_enhanced -> stage7_stretched` 选择最终图，做最终饱和度、降噪回退链和格式导出 |
 | 可选 AI 副本 | Stage 11 / `result_processed_ai.*` | 在不覆盖主结果的前提下生成保守 AI 后期副本 | 只写 `*_ai`，先本地应用模型建议参数，再质量门控和降强度重试 |
+
+### 2.2 GUI 最新阶段预览协议
+
+阶段预览是只读观察链路，不参与候选选择、质量门控、阶段状态或最终导出：
+
+- `_record_stage()` 先写 `[PIPELINE_STAGE_RESULT]`；summary-only 的 `ok_with_fallback` 对 GUI 映射为 `degraded`，`ok_skipped_optional` 映射为 `skipped`，但不改变流水线内部控制状态。仅当内部状态为 `ok` 或 `degraded` 时，才从该阶段已经验收并保存的最终产物生成预览。
+- Stage 1-10 依次使用 `stage1_prepared`、`stage2_corrected`、`stage3_bgremoved`、`stage4_color`、`stage5_linear`、`stage6_starless/stage7_starless`、`stage7_stretched`、`stage8_enhanced`、`stage9_remixed`、`stage10_final`；Stage 11 仅在 AI 产物真实生成后使用工作目录下的 `result_final_ai.fit`。兼容别名只作为同阶段候选回退，不允许使用未验收候选。
+- 像素直接映射为有界 16-bit RGB PNG，不执行 autostretch、Asinh、GHS、Gamma 或百分位归一化。Stage 1-6 属于线性数据，GUI 中偏暗是预期表现；Stage 7 以后显示阶段本身已有的非线性结果，但不增加额外显示拉伸。
+- 预览先写临时文件，再原子替换 `process/ui_preview/latest.png`。成功时输出 `[PIPELINE_PREVIEW] {"stage":...,"title":...,"status":"ready","payload":".../latest.png"}`；读取或写出失败时输出 `status=unavailable` 和轻量原因。
+- `failed/skipped` 阶段不发布新预览。预览生成失败只记录警告，GUI 保留上一张可靠图像，不展开失败流程，也不改变该阶段的 `ok/degraded` 结果。
+- Stage 0 不属于正式 pipeline 阶段，由 GUI 异步读取实际输入：完整处理优先选择排序后的首个可读 `Light_` 样本，否则选择最近的可处理叠加 FITS；续跑模式直接使用 `stage2_corrected.fit` 或 `result_linear.fit`。
 
 ## 3. 核心对象分工
 
@@ -91,11 +104,12 @@ flowchart TD
 - 裁切：`crop_margin`
 - 背景提取：`bg_samples`、`bg_tolerance`、`bg_smooth`、`bg_quality_gate_enabled`、`bg_std_worsen_ratio_max`、`bg_median_drop_ratio_min`、`bg_object_preserve_ratio_min`、`bg_edge_black_rise_max`、`bg_star_preserve_ratio_min`、`bg_nebula_mean_change_max`，以及 policy 中的 `stage3_background.max_bg_std_growth`
 - 线性降噪：`denoise_enabled`、`denoise_mod`、`denoise_safety_max`
-- 拉伸：`asinh_stretch`、`asinh_offset`、`ghs_shadowsclip`、`ghs_stretchamount`
+- 拉伸：`asinh_stretch`、`asinh_offset`、`ghs_shadowsclip`、`ghs_stretchamount`，以及 `stage7_target_aware_stretch_enabled`、Stage 7 preview 标尺开关、两个 P50 目标比例、Asinh 强度上限和目标局部质量阈值
 - 星云增强：`nebula_saturation`、`nebula_bg_factor`
-- 星点混合：`star_intensity`、`star_fallback_intensity`（`remix_safe_blend`、`remix_nebula_weight` 为旧配置兼容字段）
+- 星点混合：`star_intensity`、`stage9_fallback_intensity_levels`、兼容上限 `star_fallback_intensity`，以及混合星场单调多锚点曲线的弱/中/亮/极亮目标和预测覆盖上限（非混合场仍保留 Asinh 回退；`remix_safe_blend`、`remix_nebula_weight` 为旧配置兼容字段）
 - 最终导出：`final_saturation`、`final_bg_factor`
-- AI：`ai_post_enabled`、`ai_endpoint`、`ai_model`、`ai_api_key`、`ai_timeout_sec`、`ai_strength`、`ai_prompt`、`ai_stage6_enabled`、`ai_stage7_enabled`、`ai_stage8_enabled`
+- AI：`ai_post_enabled`、`ai_endpoint`、`ai_model`、`ai_api_key`、`ai_timeout_sec`、`ai_strength`、`ai_prompt`、`ai_advisor_mode`、`ai_stage6_enabled`、`ai_stage7_enabled`、`ai_stage8_enabled`
+- AI 艺术衍生实验：`ai_artistic_derivative_enabled`、`ai_artistic_endpoint`、`ai_artistic_model`、`ai_artistic_api_key`、`ai_artistic_prompt`、`ai_artistic_timeout_sec`
 - AI 诊断与 Stage11 门控：`ai_bg_median_delta_max`、`ai_color_ratio_delta_max`、`ai_core_growth_ratio_max`、`ai_star_growth_ratio_max`，以及阶段 6-8 的背景/裁剪/星点/蓝偏/饱和度/微对比诊断阈值
 - 运行行为：`checkpoint_mode`、`debug_mode`、`auto_tune_enabled`、`auto_tune_debug`
 - 工作流插件控制：`workflow_plugin_probe_enabled`（默认 `False`，仅在显式启用时探测插件命令）、`spcc_enabled`（默认 `True`，可通过 `SEESTAR_SPCC_ENABLE=0` 禁用）、`aberration_api_enabled`（默认 `False`，API 路径在 siril-cli 线程所有权场景下可能失败）、`optional_color_transform_enabled`（默认 `False`，启用时阶段 8/9 尝试可选调色插件）
@@ -130,7 +144,7 @@ Stage 3/4 preflight 会生成运行时目标画像和策略：
 - 内置策略来自 `policy_selector.py`，配置文件来自 `pipeline/configs/policies/*.yaml`
 - 若 profiler、metadata 或自适应特征读取失败，会回退为 `generic_low_snr_safe`
 
-目标画像识别不是独立 Stage 2.5，而是 Stage 3/4 内部 preflight，不记录到 stage summary。`stage2_5_target_profiler()` 仅为旧调用方保留，实际转发到 `target_profile_preflight()`。Stage 3 背景提取前先生成初始 `target_profile.json` / `pipeline_policy.json`，Stage 4 在 `platesolve -focal=160 -pixelsize=2.90 -catalog=gaia -order=3` 后会再次基于 `stage4_psolved.fit` metadata 刷新目标画像，若 target type 或 policy 改变，会覆盖上述 JSON 并记录告警。
+目标画像识别不是独立 Stage 2.5，而是 Stage 3/4 内部 preflight，不记录到 stage summary。`stage2_5_target_profiler()` 仅为旧调用方保留，实际转发到 `target_profile_preflight()`。Stage 3 背景提取前先生成初始 `target_profile.json` / `pipeline_policy.json`，Stage 4 在 `platesolve -noflip -focal=160 -pixelsize=2.90 -catalog=gaia -order=3` 后会再次基于 `stage4_psolved.fit` metadata 刷新目标画像，若 target type 或 policy 改变，会覆盖上述 JSON 并记录告警。
 
 ### 3.5 `PipelineLogger`
 
@@ -156,8 +170,10 @@ Stage 3/4 preflight 会生成运行时目标画像和策略：
 
 | 脚本                         | 前置模块                           |
 |------------------------------|-------------------------------------|
-| `CosmicClarity_Sharpen.py`   | `PyQt6`, `tiffile`                 |
-| `CosmicClarity_Denoise.py`   | `PyQt6`, `tiffile`                 |
+| `GraXpert-AI.py`             | `onnx`, `onnxruntime`, `appdirs`, `cv2`, `PyQt6` |
+| `AutoBGE.py`                 | `cv2`, `scipy`, `PyQt6`             |
+| `CosmicClarity_Sharpen.py`   | `PyQt6`, `tiffile`, `lz4`, `zstandard`, `exifread`, `cv2` |
+| `CosmicClarity_Denoise.py`   | `PyQt6`, `tiffile`, `lz4`, `zstandard`, `exifread`, `cv2` |
 | `SyQon-Starless.py`          | `PyQt6`, `PySide6`, `astropy`, `scipy` |
 
 ## 4. 自动调参逻辑
@@ -222,7 +238,7 @@ Stage 3/4 preflight 会生成运行时目标画像和策略：
 - 边缘黑边明显：Stage 2 自动识别四边黑边和叠加伪影后裁切
 - 主体覆盖面积大：降低 `bg_samples` 并提高 `bg_smooth`
 
-`TargetType` 仍会识别并记录日志，但在当前版本中仅用于诊断说明，不再直接驱动 preset 套参。
+`TargetType` 仍会识别并记录日志，但在当前版本中仅用于诊断说明，不再直接驱动 preset 套参。目录坐标、视觉特征和自动提示的选择过程写入 `target_profile.json -> diagnostics` 并按 INFO 输出；只有会影响策略可靠性的异常才进入 `warnings`。
 
 ### 4.5 强制运行时开关
 
@@ -331,7 +347,7 @@ link -> calibrate -debayer -> register -2pass -> seqapplyreg -filter-round=2.5k 
 1. 保存阶段 3 输入基线 `stage3_bg_input`，用于质量门控后回滚
 2. 按理论背景建模效果构建统一候选链：`GraXpert/GXP -> GraXpert-BGE -> ADBE -> DBE -> AutoDBE -> subsky -rbf 参数组 -> NOX -> VeraLux NOX -> subsky 1 安全兜底`。当 `resources/siril_plugins/vendor/siril-scripts` 可用时，GraXpert 使用 `pyscript GraXpert-AI.py -bge`，ADBE/DBE/AutoDBE 使用不同参数的 `pyscript AutoBGE.py`，避免把不存在的 `gxp/adbe/dbe/autodbe` 当作 Siril 原生命令。
 3. `subsky -rbf` 会基于当前噪声/星密度/目标覆盖动态生成多组参数变体；若 target profile 识别为大面积/弥散发射星云，或像素统计显示暗弱星云信号（默认 `object_area_ratio >= 0.15`、`nebulosity_area_ratio >= 0.18`、`faint_structure_score >= 0.65`；另有 `nebulosity_area_ratio > 0.10 && faint_structure_score > 0.40` 的 `faint_nebula_protection` 通路不依赖 `target_type`），`subsky 1` 会排在 RBF 前，降低 RBF 过拟合吞掉大尺度星云或暗弱边缘的风险
-4. 每个候选都从 `stage3_bg_input` 基线重新加载后执行；若命令失败，直接 fallback 到下一个候选。GraXpert/GraXpert-BGE 会额外识别 `GraXpert-AI.py`、ONNX runtime、`too many indices for array` 等脚本运行时错误，记录为 `graxpert_runtime_error`，并立即触发 ADBE/DBE/subsky 等后续背景提取候选，不再把该次 GraXpert 输出进入质量评估
+4. 每个候选都从 `stage3_bg_input` 基线重新加载后执行；若命令失败，直接 fallback 到下一个候选。所有 `pyscript` 候选都会先检查对应 Python 模块，并比较执行前后图像指纹；即使 Siril 外层返回成功，只要图像未变化，也会记录为 `graxpert_runtime_error` 或 `plugin_runtime_error` 并立即尝试后续候选，不再把原图作为背景提取成果进入质量评估。GraXpert 另外识别 `GraXpert-AI.py`、ONNX runtime、`too many indices for array` 等运行时错误
 5. 每个候选成功后都会做背景质量门控（背景噪声、背景中值、目标覆盖、边缘黑场、星点保留率、星云/弥散信号均值变化）；满足门控且达到“充分质量”时立即完成 Stage 3
 6. 通过门控但未达到充分质量的候选会保存为 `stage3_candidate_*.fit`，并按残余脏背景分数、低频梯度、背景彩噪、背景噪声增长、颜色偏移，以及星点/星云保留惩罚计算 `background_score`；暗弱星云信号越强，`nebula_mean_change_ratio` 的惩罚权重会从默认 `1.6` 线性提高到最高 `2.5`
 7. 若候选不充分，自动回滚到基线并继续尝试下一个候选；所有候选都不充分但存在通过门控的候选时，最终回载 `background_score` 最低的候选作为 `stage3_bgremoved.fit`
@@ -352,19 +368,19 @@ RBF 参数变体：脚本会以 `bg_samples` / `bg_tolerance` / `bg_smooth` 为�
 
 职责：执行天文定位（platesolve）并完成线性阶段的色彩平衡。
 
-当前版本阶段 4 拆分为解析检查点与校色检查点：`stage3_bgremoved.fit -> stage4_psolved.fit -> stage4_color.fit`。解析命令固定使用 `platesolve -focal=160 -pixelsize=2.90 -catalog=gaia -order=3`，对应 Seestar S30 Pro 远摄光路：160mm 焦距、Sony IMX585、2.9um 像元。Stage 2 裁边只改变当前图像宽高和视场范围，不改变焦距或像元尺寸；Stage 4 会把 Stage 2 累计裁切和裁切后视场写入 `color_calibration_report.json`。
+当前版本阶段 4 拆分为解析检查点与校色检查点：`stage3_bgremoved.fit -> stage4_psolved.fit -> stage4_color.fit`。解析命令固定使用 `platesolve -noflip -focal=160 -pixelsize=2.90 -catalog=gaia -order=3`；`-noflip` 保留用户原始构图方向，解算只写入 WCS，不翻转像素。其余参数对应 Seestar S30 Pro 远摄光路：160mm 焦距、Sony IMX585、2.9um 像元。Stage 2 裁边只改变当前图像宽高和视场范围，不改变焦距或像元尺寸；Stage 4 会把 Stage 2 累计裁切和裁切后视场写入 `color_calibration_report.json`。
 
 顺序：
 
 1. `load stage3_bgremoved`
 2. 基于当前裁切后图像记录 Stage 4 几何：S30 Pro / Sony IMX585 / 160mm / 2.9um，以及 Stage 2 累计裁边
-3. 默认使用 Gaia 星表做一次解析：`platesolve -focal=160 -pixelsize=2.90 -catalog=gaia -order=3`；如需多星表候选，可通过 `SEESTAR_STAGE4_PLATESOLVE_CATALOGS` 显式覆盖
-4. 若普通解析候选全部失败且 FITS header 有 `RA/DEC`、`OBJCTRA/OBJCTDEC` 或 `CRVAL1/CRVAL2`，会追加一轮 header-center platesolve 候选：`platesolve <ra>,<dec> -focal=160 -pixelsize=2.90 -catalog=<catalog> -order=3`；可通过 `SEESTAR_STAGE4_PLATESOLVE_HEADER_RADIUS` 额外传入 `-radius=...`
+3. 默认使用 Gaia 星表做一次解析：`platesolve -noflip -focal=160 -pixelsize=2.90 -catalog=gaia -order=3`；如需多星表候选，可通过 `SEESTAR_STAGE4_PLATESOLVE_CATALOGS` 显式覆盖
+4. 若普通解析候选全部失败且 FITS header 有 `RA/DEC`、`OBJCTRA/OBJCTDEC` 或 `CRVAL1/CRVAL2`，会追加一轮 header-center platesolve 候选：`platesolve <ra>,<dec> -noflip -focal=160 -pixelsize=2.90 -catalog=<catalog> -order=3`；可通过 `SEESTAR_STAGE4_PLATESOLVE_HEADER_RADIUS` 额外传入 `-radius=...`
 5. `save stage4_psolved`
 6. Stage4 preflight 刷新 `target_profile.json` 和 `pipeline_policy.json`
-7. 若 platesolve 成功，OSC 默认使用 Siril 数据库项 `spcc "-oscsensor=Sony IMX585" "-oscfilter=ZWO Seestar LP" "-whiteref=Average Spiral Galaxy" -limitmag=10.5`；若 FITS header/path/profile 或显式配置显示无 LP 滤镜，则使用 `"-oscfilter=No filter"`；若显示 Ha/OIII 窄带或双窄带，则不传 `oscfilter`，改用 `spcc "-oscsensor=Sony IMX585" "-whiteref=Average Spiral Galaxy" -narrowband -rwl=656.28 -rbw=20 -gwl=500.70 -gbw=30 -bwl=500.70 -bbw=30 -limitmag=10.5`；SPCC sensor/filter/white reference 固定整段加引号；默认 bgtol 不显式传入
+7. 若 platesolve 成功，先直接解析隔离运行目录的 SPCC 数据库 JSON：必须能从非空数组中精确找到配置的 sensor、filter 和 white reference，且每条光谱的 wavelength/response 数组非空、等长、为有限数值；预检通过后才允许用 `spcc_list` 初始化 Siril 元数据并调用 `spcc`。SPCC 固定传入 `-catalog=localgaia`，只查询本地 Gaia DR3 `xp_sampled` 星表；OSC 默认使用 Siril 数据库项 `spcc -catalog=localgaia "-oscsensor=Sony IMX585" "-oscfilter=ZWO Seestar LP" "-whiteref=Average Spiral Galaxy" -limitmag=10.5`；若 FITS header/path/profile 或显式配置显示无 LP 滤镜，则使用 `"-oscfilter=No filter"`；若显示 Ha/OIII 窄带或双窄带，则不传 `oscfilter`，改用对应 narrowband 参数；元数据预检失败、本地星表缺失、覆盖不足或 SPCC 失败时直接进入 PCC，不访问在线 SPCC
 8. Mono/LRGB：改用 `-monosensor`、`-rfilter`、`-gfilter`、`-bfilter`
-9. 若 SPCC 失败：按 `SEESTAR_STAGE4_PCC_CATALOGS` 依次尝试 PCC，默认 `localgaia,gaia,nomad,apass`；PCC 使用 Siril 默认 bgtol（默认即 -2.8/+2.0），避免 Siril 1.4.x CLI 对显式负数 tuple 参数报 invalid argument
+9. 若 SPCC 失败：按 `SEESTAR_STAGE4_PCC_CATALOGS` 依次尝试 PCC，默认 `localgaia,gaia,nomad,apass`；调用 `localgaia` 前必须存在有效 `siril_cat_healpix8_astro.dat`，否则跳过该候选；`SEESTAR_NETWORK_MODE=0` 时跳过其余在线候选。PCC 使用 Siril 默认 bgtol（默认即 -2.8/+2.0），避免 Siril 1.4.x CLI 对显式负数 tuple 参数报 invalid argument
 10. 若 platesolve 仍失败但 FITS header 有中心坐标，且 `SEESTAR_STAGE4_PCC_HEADER_FALLBACK_ENABLE=1`，会尝试同一组 PCC catalog 作为 header-coordinate fallback；当前 Siril 1.4.x `pcc` 文档仍要求 WCS，失败会记录后继续本地回退
 11. 若 PCC 失败：执行本地保守回退；先做背景中性化；背景采样默认使用 luminance Q5-Q45，但会根据 `target_profile.object_area_ratio` 动态收窄，大面积目标收窄到 Q5-Q25，target-aware 星云还会把 `nebulosity_area_ratio` 纳入有效覆盖率；非 target-aware 目标在未饱和、低色差、中等亮度星点样本足够时再做星点白平衡；发射/双窄带 target-aware 目标默认跳过本地星点白平衡以保护 Hα/OIII 色彩
 12. `save stage4_color`，并保留兼容别名 `stage4_colorbalanced`
@@ -379,8 +395,12 @@ SPCC 运行时保护：
 - OSC/SPCC 默认使用 `Sony IMX585` + `ZWO Seestar LP` + `Average Spiral Galaxy`。`SEESTAR_STAGE4_SPCC_OSC_FILTER=No filter` 或 header/path/profile 的 `No filter` / `clear` / `no lp` 线索会改用 `Sony IMX585` + `No filter`；`Ha+OIII` / `narrowband` / `dualband` / `L-eXtreme` 等线索会改用 Siril `-narrowband` 参数组，不再传 `oscfilter`
 - `SEESTAR_STAGE4_SPCC_LIMITMAG` 默认 `10.5`，限制 Gaia SPCC 星表查询星等，避免超宽视场一次性对数千颗星做 aperture photometry
 - 每次执行 `spcc` 前都会先运行 Siril 1.4.x 支持的 `setcpu 1`，SPCC 成功或失败后都会尝试恢复到 `SEESTAR_STAGE4_SPCC_RESTORE_CPU`；默认 `0` 表示恢复到当前机器 CPU 数
-- S30 Pro 默认 LP 模式的硬兼容命令形态为：`spcc "-oscsensor=Sony IMX585" "-oscfilter=ZWO Seestar LP" "-whiteref=Average Spiral Galaxy" -limitmag=10.5`；该 sensor/filter 均为 Siril SPCC 数据库精确项，避免旧的 `Optolong L-eNhance` 映射进入 Siril `get_spectrum_from_args` 空谱崩溃路径
-- GUI 写入临时 Siril 配置时会清空旧版 `catalogue_gaia_photo=/.../gaia_photometric.dat` 文件路径；该项在 Siril 1.4.x 中应为有效 SPCC Gaia 目录或留空，错误文件路径会导致 CLI 目录访问警告
+- `spcc` 返回成功状态后会比较执行前后的 Siril 日志增量；若出现 `The photometric color calibration seems to have found an imprecise solution...`（中文界面为“测光法色彩校准似乎不能精确校准...”），不会把它当作高置信度成功：报告写入 `spcc.solution_quality.status=imprecise`，SPCC 置信度降至 `0.45`，回载未校色的 `stage4_psolved.fit` 并优先走 PCC 备用校色。PCC 恢复成功后的综合色彩置信度为 `0.62`；若回载失败才保留低置信度 SPCC 并把阶段标记为降级
+- S30 Pro 默认 LP 模式的硬兼容命令形态为：`spcc -catalog=localgaia "-oscsensor=Sony IMX585" "-oscfilter=ZWO Seestar LP" "-whiteref=Average Spiral Galaxy" -limitmag=10.5`；该 sensor/filter 均为 Siril SPCC 数据库精确项，避免旧的 `Optolong L-eNhance` 映射进入 Siril `get_spectrum_from_args` 空谱崩溃路径
+- `spcc_list` 的成功返回只用于完成 Siril 内部元数据初始化，不能证明数据可用。Stage 4 会在执行任何 `spcc_list` / `spcc` 前扫描 `SEESTAR_SPCC_DATABASE_DIR`（GUI 固定为隔离 runtime HOME 的 Siril 标准目录），验证所选 sensor/filter/white reference 精确存在，并拒绝不可解析 JSON、非数组/空数组、空或不等长的光谱数组；任一失败直接进入 PCC。预检详情写入 `color_calibration_report.json -> spcc.metadata_database`
+- GUI 写入临时 Siril 配置时，将 `catalogue_gaia_photo` 固定指向 runtime HOME 下的 `~/.local/share/siril/siril_cat1_healpix8_xpsamp/`，并将 `catalogue_gaia_astro` 指向同级 `siril_cat_healpix8_astro.dat`。两类数据都需由 Siril Catalog Installer 安装
+- SPCC 预检只接受命名为 `siril_cat1_healpix8_xpsamp_<pixel>.dat` 的有效分块，并以 platesolve 后中心坐标和当前裁切视场计算所需 level-1 nested HEALPix。空目录、无法确认坐标或任一所需分块缺失时，Stage 4 在调用 Siril 前跳过 SPCC 并进入 PCC；结果写入 `color_calibration_report.json -> spcc.local_catalog`
+- platesolve/PCC 的 `localgaia` 候选只在有效 `siril_cat_healpix8_astro.dat` 存在时调用；网络模式关闭时，在线 `gaia/nomad/apass` 候选不会执行。星表状态和网络决策写入 `color_calibration_report.json -> pcc`
 - SPCC 白参考默认是 `Average Spiral Galaxy`；`SEESTAR_STAGE4_SPCC_ADAPTIVE_WHITE_REF=1` 时，发射星云/双窄带目标可自动改用 `SEESTAR_STAGE4_SPCC_NEBULA_WHITE_REF`，但默认关闭以匹配 Siril SPCC 常规方案
 - SPCC 要求当前图像已 platesolve；PCC 正常路径也要求 WCS。若 Stage 4 解析失败或被禁用，会跳过 SPCC，只在 header 坐标存在且 header fallback 开启时尝试 PCC，失败后改走本地背景中性化/星点白平衡，避免 Siril 报 `Command requires plate-solved image`
 - 发射星云/双窄带目标启用 target-aware color mapping 后，若该白参考下 SPCC 失败，不再回退到普通星系白参考；后续改走 PCC 或本地背景中性化/星点白平衡
@@ -388,7 +408,8 @@ SPCC 运行时保护：
 - 可通过 `SEESTAR_STAGE4_SPCC_SENSOR_MODE=mono_lrgb` 切换 Mono/LRGB，并配置 `SEESTAR_STAGE4_SPCC_MONO_SENSOR`、`SEESTAR_STAGE4_SPCC_R_FILTER`、`SEESTAR_STAGE4_SPCC_G_FILTER`、`SEESTAR_STAGE4_SPCC_B_FILTER`
 - 当输入来自 `Light_` 预处理模式时，默认仍尝试 `spcc`，因为 Stage 4 的 SPCC/PCC 是线性校色关键步骤
 - 如需规避特定 `siril-cli` 环境下的 SPCC 崩溃风险，可设置 `SEESTAR_SPCC_ALLOW_LIGHT_PREPROCESS=0`，此时直接走 `pcc -> 本地保守回退`
-- GUI 运行时若检测到 `siril-cli` 在 SPCC 阶段以 `-11` 退出，会自动禁用 SPCC 重试一次完整流水线，使 Stage 4 改走 PCC/本地校色回退，而不是让整次处理失败
+- Python 侧一旦收到 `SirilConnectionError`、Broken Pipe、连接关闭或原生进程已退出信号，会把它提升为不可降级的终止事件：立即退出当前流水线，不恢复 `setcpu`、不尝试 PCC/本地校色、不保存 `stage4_color`、不记录 Stage 4 完成，也不会进入 Stage 5
+- GUI 运行时若检测到 SPCC 期间的原生连接终止标记，或 `siril-cli` 以 `-11` 退出，仍会自动禁用 SPCC 重试一次；若确认本次运行已生成有效 `process/stage4_psolved.fit`，重启使用内部 `stage4_psolved_resume` 模式，跳过 Stage 1-3 和重复 platesolve，从 Stage 4 校色检查点进入 PCC/本地校色后继续 Stage 5。只有检查点缺失时才退回禁用 SPCC 的完整流水线安全重试
 
 回退逻辑：
 
@@ -404,35 +425,39 @@ SPCC 运行时保护：
 
 ### 5.5 阶段 5：线性反卷积 / 轻降噪
 
-职责：在线性图像上先用未降噪的星点建立 PSF 并执行受控 RL 反卷积，再做轻量线性降噪，为后续线性去星提供保留微反差且背景不过度放大的输入。
+职责：在线性图像上优先执行本地 GraXpert Object Deconvolution；模型或脚本不可用、执行失败/空跑时用未降噪星点建立 PSF 并执行受控 Siril RL 回退，再做轻量线性降噪，为后续线性去星提供保留微反差且背景不过度放大的输入。
 
 逻辑要点：
 
 - 输入固定优先 `stage4_color.fit`，阶段开始保存 `stage5_input_linear.fit`
-- 默认 Siril 内核链路：`findstar -maxstars=200` -> `makepsf stars -sym -ks=33 -savepsf=stage5_psf.fit` -> `rl -loadpsf=stage5_psf.fit -iters=8 -alpha=3000 -tv -gdstep=0.0005 -stop=0.001` -> `save stage5_deconv` -> `denoise -mod=0.50 -indep` -> `save stage5_linear`
+- 首选 GraXpert 链路：检测隔离运行目录中的 `deconvolution-object-ai-models/<version>/model.onnx`；也可通过 `SEESTAR_GRAXPERT_OBJECT_MODEL_PATH` 提供外部 `model.onnx`、语义版本目录或模型家族目录，运行时会只读链接到隔离 HOME。版本目录必须使用官方语义格式（例如 `1.0.1`）。随后调用 `GraXpert-AI.py -deconv_obj -strength 0.30 -psfsize 5.0 -model <version> -nogpu`，成功后保存 `stage5_graxpert_deconv.fit`
+- GraXpert 不可用或失败时进入 Siril 内核回退：`findstar -maxstars=200` -> `makepsf stars -sym -ks=33 -savepsf=stage5_psf.fit` -> `rl -loadpsf=stage5_psf.fit -iters=8 -alpha=3000 -tv -gdstep=0.0005 -stop=0.001` -> `save stage5_deconv` -> `denoise -mod=0.50 -indep` -> `save stage5_linear`
 - `result_linear.fit` 在 `stage5_linear` 保存后导出，供 GUI 显式续跑模式使用
 - Stage5 不再默认执行全局锐化、unsharp 或星点矫正，避免在线性暗背景中提前放大彩噪、星环和 halo
 - CosmicClarity Denoise 只作为 Siril 内置降噪失败后的回退，强度映射限制在 `0.20~0.30`；`chroma_first` 使用 `0.30`，`luma_chroma_balanced` 使用 `0.25`
-- GraXpert 反卷积只允许映射到 Stage5，建议强度 `0.20~0.40`；当前代码只记录配置占位，不在未确认本机工具调用协议时自动执行
-- 若 RL 后背景指标明显变差，背景保护会丢弃 `stage5_deconv`，重新回到 `stage5_input_linear` 后再执行轻降噪；因此 `stage5_linear.fit` 始终是 Stage 5 的最终线性输出
+- GraXpert 反卷积只映射到 Stage5，强度限制为 `0.20~0.40`；模型不随此链路在线下载，缺失时稳定降级到 Siril RL
+- 若 GraXpert 或 RL 后背景指标明显变差，背景保护会丢弃反卷积结果，重新回到 `stage5_input_linear` 后再执行轻降噪；因此 `stage5_linear.fit` 始终是 Stage 5 的最终线性输出
 
 当前 Stage 5 不执行可选转色。`optional_color_transform_enabled=True` 的可选颜色插件只在 Stage 8/9 使用，避免在线性阶段提前改变窄带/双窄带颜色语义。
 
-阶段检查点：`stage5_linear.fit` 是最终线性输出；可选 `stage5_deconv.fit` 是 RL 后、降噪前检查点；兼容别名仍保存 `stage5_denoised.fit`
+阶段检查点：`stage5_linear.fit` 是最终线性输出；可选 `stage5_graxpert_deconv.fit` 或 `stage5_deconv.fit` 是反卷积后、降噪前检查点；兼容别名仍保存 `stage5_denoised.fit`
 
 阶段额外产物：`result_linear.fit`（位于工作目录根目录，默认不会被下一轮输入扫描命中；可供 GUI 显式续跑模式继续执行阶段 6-11）
 
-诊断输出：`stage5_linear_report.json` 会记录处理顺序、输入/输出、Siril 降噪参数、CosmicClarity 回退强度、RL 反卷积参数与 `background_guard` 的 before/after 自适应背景指标。
+诊断输出：`stage5_linear_report.json` 会记录处理顺序、输入/输出、Siril 降噪参数、CosmicClarity 回退强度、GraXpert 模型/失败原因、最终反卷积方法与 `background_guard` 的 before/after 自适应背景指标。
 
 ### 5.6 阶段 6：去星与星点层准备
 
-职责：调用去星工具生成去星图，并尽量构造一个可控的星点层。当前默认在阶段 7 拉伸前执行，优先使用 `stage5_linear.fit`；`stage5_deconv.fit` 仅在最终线性输出缺失时作为回退检查点；`result_linear.fit` 续跑时会使用续跑加载得到的线性检查点。收益是避免非线性拉伸把低频脏背景、色斑和噪声放大后再交给去星模型；副作用是星点层也来自线性图，后续阶段 9 需要通过星点拉伸/回混强度控制恢复星点亮度。
+职责：调用去星工具生成去星图，并尽量构造一个可控的星点层。当前默认在阶段 7 拉伸前执行，优先使用 `stage5_linear.fit`；GraXpert/RL 反卷积检查点仅在最终线性输出缺失时作为回退；`result_linear.fit` 续跑时会使用续跑加载得到的线性检查点。收益是避免非线性拉伸把低频脏背景、色斑和噪声放大后再交给去星模型；副作用是星点层也来自线性图，后续阶段 9 需要通过星点拉伸/回混强度控制恢复星点亮度。
 
 星点分离输入模式：
 
-- `linear_star_separation`：默认模式，直接用 Stage 5 线性结果去星，最能减少拉伸后星点膨胀、星色丢失和背景伪影。
-- `mild_prestretch_star_separation`：仅为去星模型生成 `stage6_mild_prestretch_star_input.fit`，用轻微 Asinh 预拉伸帮助模型识别弱星；后续仍分别处理 starless 与 starmask，不把该预拉伸当作最终主体拉伸。
-- 若线性 SyQon 初次失败，或虽然成功但质量门控发现 `starless` 动态范围塌缩（相对输入范围过低且峰值信号过低），且 `star_separation_fallback_to_mild_prestretch=True` / 保守重试开启，会自动生成轻微/保守预拉伸输入重试；失败原因、动态范围指标和最终 source 写入 `stage6_starless_quality.json` / `stage7_quality.json`。
+- `linear_star_separation` 是当前唯一生效模式。Stage 6 直接使用 Stage 5 的最终线性结果；输入域在质量报告中明确记录为 `input_domain=linear`。
+- 当前内置 SyQon 会在脚本内部对线性图执行临时、可逆的 IHS 预拉伸，并在输出前逆变换回线性域。因此主流程不再额外执行 Asinh 预拉伸，避免 SyQon 内部变换与 Stage 7 主体拉伸叠加。
+- `mild_prestretch_star_separation`、`star_separation_fallback_to_mild_prestretch` 和 `mild_prestretch_strength` 仅保留为旧配置兼容字段；即使旧配置启用，也不会生成或选择 `stage6_mild_prestretch_star_input.fit`。
+- 动态范围塌缩同时参考绝对峰值和峰值/背景比：极低背景下仍保留足够相对信号时不误报。若确认塌缩，只尝试切换 Zenith/Axiom 模型；不再仅修改 `tile_size`/`overlap` 重复运行同一模型。其他残星、halo 或黑洞问题仍可在同一线性 source 上调整参数补救。
+
+目标感知旁路：当 target profile 为 `globular_cluster`、`open_cluster` 或 `reflection_nebula_cluster`（包括 M45 类星点主体）时，默认不调用 SyQon/SASP。Stage 6 会把线性输入作为保星检查点继续交给 Stage 7 拉伸，不生成 `starmask`；Stage 8 随后跳过 Starless 专用增强，Stage 9 因无星点层不再回混。可通过 `PipelineConfig.stage6_star_preserve_target_bypass_enabled=False` 显式关闭此保守旁路。
 
 说明：阶段 6 会导出新命名产物 `stage6_starless.fit`、`stage6_starless_quality.json`；同时保留旧别名 `stage7_starless.fit`、`stage7_quality.json`，用于兼容外部工具、续跑和旧报告。
 
@@ -449,24 +474,29 @@ SyQon 路径补充逻辑：
 正常路径（去星成功后）：
 
 1. 保存 `starless.fit`
-2. 优先手动构建星点层：`stretched - starless`
+2. 优先手动构建线性星点层：`stage6_input - starless`，并立即保存不可变的 `starmask_raw.fit`
 3. 手动失败时，从可能的 `starmask` / `*_stars` 文件中兜底查找
 4. 再不行则扫描 `process/` 中最新的星点蒙版
-5. 导出 SASP 交换文件（`sasp_starless_input.fit`、`sasp_starmask_input.fit`）
+5. 对 raw 星点层自身做多尺度清理：估计背景/MAD 噪声，分离紧致星点结构与低频弥散残差，只用统一标量权重修改 RGB，避免改变星色
+6. 清理后验收紧致星核/星翼保留率和弥散残留；通过时另存 `starmask_clean.fit` 并令兼容别名 `starmask.fit` 指向 clean。紧致结构保留不足时回滚 raw；`diffuse_residual_ratio` 超过硬上限 `0.08` 时则禁用当前候选的 starmask，不允许用仍带弥散污染的 raw 继续回星。任何清理都不得覆盖 `starmask_raw.fit`
+7. 导出 SASP 交换文件（`sasp_starless_input.fit`、`sasp_starmask_input.fit`）
+
+星点层清理不再根据主体图的亮区直接判定“星云污染”，因此不会因为星点位于 M42 核心、发射星云丝状结构或星系盘面上就统一降权；也不再对全部小星额外降强或在 halo 区直接做模糊。现有兼容字段的新语义是：`stage7_starmask_small_star_scale` 为紧致弱星最低保留比例，`stage7_starmask_halo_blur_strength` 为非紧致宽 halo/低频残差衰减强度，`stage7_starmask_nebula_suppression` 为星点层自身的弥散污染扣除强度。清理指标及 `diffuse_hard_gate_failed` 写入 `stage6_starless_quality.json.starmask_cleanup`；硬门失败同时把所选 Stage 6 质量标为 `poor`，Stage 9 进入无 starmask 的安全降级路径。
 
 AI 参数优化（`SEESTAR_AI_ENABLED=1` 且 endpoint/model/key 齐全时）：
 
-- 去星前会先请求 `stage7_starless_plan`，将 AI 建议的 `tile_size`、`overlap`、`use_axiom` 实际传给 SyQon CLI；Axiom 只在本地模型存在时允许；`tile_size` 下限为 512、`overlap` 下限为 64，不再把 `tile=256/overlap=32` 作为优化方向
-- 每次得到 `starless.fit` / `starmask.fit` 后生成一次质量记录，最终写入 `process/stage6_starless_quality.json`，并保留兼容别名 `process/stage7_quality.json`
-- 本地指标先判断 `starless` 残星、动态范围塌缩、低峰值信号、`starmask` 缺星和 `starmask` 过宽，再把指标发给 AI 做保守裁判
-- 若残星、动态范围塌缩、缺星或蒙版过宽指标偏差，会在 `SEESTAR_STAGE7_QUALITY_RETRY_MAX` 预算内用其他 SyQon 参数组合或保守输入重跑，并把质量分最低的 `starless.fit` / `starmask.fit` 恢复为最终阶段产物
+- 去星前会先请求 `stage7_starless_plan`，将 AI 建议的 `tile_size`、`overlap`、`use_axiom` 实际传给 SyQon CLI；`use_axiom` 映射为 SyQon Axiom 2.1 的 `--axiom21`，仅在缓存中存在 `vendor/siril-scripts/Axiom2_1.pt` 或用户数据目录 `syqon_starless/axiom21.pt` 时启用；`tile_size` 下限为 512、`overlap` 下限为 64
+- 每次得到 `starless.fit` / raw/clean starmask 后生成一次质量记录，最终写入 `process/stage6_starless_quality.json`，并保留兼容别名 `process/stage7_quality.json`
+- 本地指标先判断 `starless` 残星、动态范围塌缩、低峰值信号、峰值/背景比、`starmask` 缺星和 `starmask` 过宽，再把指标发给 AI 做保守裁判。峰值/背景比默认下限为 `4.0`，可用 `SEESTAR_STAGE7_STARLESS_PEAK_BACKGROUND_RATIO_MIN` 调整
+- 若残星、缺星或蒙版过宽指标偏差，会在 `SEESTAR_STAGE7_QUALITY_RETRY_MAX` 预算内用其他 SyQon 参数组合重跑；仅动态范围塌缩时最多切换一次可用模型，无备选模型则直接保留初次产物和降级诊断
 - 若最终 `residual_star_score` 仍高于阈值，AI 可返回 `residual_suppression_strength` 和 `stage9_star_intensity_scale`；脚本会做安全限幅后结合 `starmask` 与拉伸层 residual map 实际修改 `starless.fit` 抑制残星，并把最终阶段 9 回混缩放写入 `stage6_starless_quality.json.stage9_star_remix`
+- 最终 starless 质量仍差时允许执行背景综合色噪像素修复；除原有“残星或 halo 明显改善”路径外，当综合色噪下降比例和绝对下降量同时达标，且残星与 halo 均未恶化时也接受修复，诊断写入 `starless_pixel_repairs[].chroma_acceptance` 与 `acceptance_path`
 - 质量诊断不再把成功的 SyQon/SASP 结果直接降级为拉伸检查点；只有所有去星工具失败才走退化路径
 
 回退逻辑：
 
 - 如果所有去星命令都失败，阶段记为 `degraded`
-- 同时把当前 Stage 6 输入检查点（通常是 `stage5_linear`、`stage5_deconv` 或轻微预拉伸输入）重新保存成 `starless.fit`，让阶段 7-10 仍然可以继续执行
+- 同时把当前线性 Stage 6 输入检查点（通常是 `stage5_linear`，缺失时使用更早的线性检查点）重新保存成 `starless.fit`，让阶段 7-10 仍然可以继续执行
 - 因此去星工具不可用时，脚本退化为"不做真正去星"的流程
 
 阶段检查点：`stage6_starless.fit`（兼容别名：`stage7_starless.fit`）
@@ -474,7 +504,7 @@ AI 参数优化（`SEESTAR_AI_ENABLED=1` 且 endpoint/model/key 齐全时）：
 阶段输出：
 
 - `starless.fit`
-- 可能存在的 `starmask.fit`
+- 可能存在的 `starmask_raw.fit`、`starmask_clean.fit`；`starmask.fit` 是兼容别名
 - `sasp_starless_input.fit`（工作目录，供外部工具使用）
 - `sasp_starmask_input.fit`（工作目录，供外部工具使用）
 
@@ -484,22 +514,33 @@ AI 参数优化（`SEESTAR_AI_ENABLED=1` 且 endpoint/model/key 齐全时）：
 
 说明：阶段 7 只使用 Stage7 命名，不再把主体拉伸候选同时写成 `stage6_candidate_*` 与 `stage7_candidate_*`。
 
-候选收缩为固定两条，另保留一个 preview 参考；候选名称固定，但参数会根据 `stage6_starless` 的 baseline 背景自适应：
+候选收缩为固定两条，另保留一个 preview 参考；候选名称固定，但方法和参数会同时读取 Stage 3/4 的 `target_profile` / `pipeline_policy.stage6_stretch`，再根据 `stage6_starless` 的 baseline 背景自适应：
 
-1. `stage7_cand_a.fit`: `load stage6_starless` -> `asinh <adaptive_stretch> <adaptive_offset>`；普通背景默认 `2.2 / 0.002`
-2. `stage7_cand_b.fit`: `load stage6_starless` -> `asinh <adaptive_stretch> <adaptive_offset>` -> `autoghs -linked -2.1 <adaptive_amount>`；普通背景默认 `2.1 / 0.002 / 1.05`
-3. `stage7_preview_ref.fit`: `load stage6_starless` -> `autostretch -linked`，仅作参考，不允许成为最终图
+1. `stage7_cand_a.fit`: 通用目标为 `asinh <adaptive_stretch> <adaptive_offset>`；亮核心星云/暗云目标改用同一 Asinh 后的局部弱信号抬升、背景彩噪抑制和核心压缩；普通背景默认 `2.2 / 0.002`
+2. `stage7_cand_b.fit`: 通用目标为 `asinh <adaptive_stretch> <adaptive_offset>` -> `autoghs -linked -2.1 <adaptive_amount>`；星团与反射星云星团改为第二条纯 Asinh 候选，避免 GHS 放大星点；普通背景默认 `2.1 / 0.002 / 1.05`
+3. `stage7_preview_ref.fit`: `load stage6_starless` -> `autostretch -linked`，读取其 P50/P99 作为候选参数标尺，但不允许成为最终图
 
 关键行为：
 
-- 当 baseline `bg_median <= 0.005` 时启用极低背景保护：降低 Asinh 强度并提高 offset；若 `stage6_starless` 的 `p99/max` 很低，会把 offset 重新限制到有效信号范围以下，避免 offset 高于整图信号导致候选全黑
+- 当 baseline `bg_median <= 0.005` 时启用极低背景保护：保持足够的 Asinh 强度，并用 `p01`、背景中值和背景噪声共同限制 offset，使其低于背景底部，避免弱信号被裁成黑场
 - 当 baseline `0.005 < bg_median < 0.010` 时使用中等低背景保护，参数在默认值与极低背景值之间平滑过渡
+- 通用目标以 preview P50 的约 35% / 25% 标定 A/B；亮核心星云和星团下调 P50 目标并把 preview P99 高光标尺从 90% 收紧到约 82%，星系收紧到约 85%，防止亮核/星核过曝
+- 暗云提高 P50 目标但限制 GHS，用可见背景承载尘埃剪影；大视场发射星云适度提高 P50 目标以保留弥散弱信号；目标画像不可用时保持原通用参数
+- `stage7_target_aware_stretch_enabled=False` 可关闭上述目标映射，只保留背景和 preview 自适应
+- preview 生成后按 Siril Asinh 公式在 `1-1000` 范围内反解候选强度，并由各目标 profile 的 P99 标尺限制高光
+- preview 标定有效时，正式候选实际 P50 默认必须处于标定目标的 55%–150%；低于下限或高于上限的候选会被拒绝，也不能作为“仅色度超限”的救援源；救援候选也会重新检查该上限
+- preview 标尺无效或读取失败时保留原有背景自适应参数，不影响离线主流程继续运行
 - 候选像素分布若命中 `is_nearly_black`、`is_visibility_too_low`、`is_nearly_white` 或 `invalid_dynamic_range`，会被标记为非正常最终候选
-- 若两个正式候选均未通过质量门控，但至少有一个候选成功保存，会选择风险较低者作为 degraded fallback
-- 无论拉伸是否成功，最终只保存 `stage7_stretched.fit`
-- 如果所有拉伸方法都失败，阶段状态记为 `failed`
-- 但 `run()` 不会因此立即退出，后续阶段仍会继续尝试使用这个检查点
-- 诊断输出 `stage7_stretch_quality.json` 和 `stretch_candidates_report.json`，记录两个正式候选、唯一 preview、`baseline_pixel_stats`、`stretch_adaptation`、候选像素分布和最终选择
+- 每个正式候选使用最终交付同口径的暗背景采样检查绝对综合色噪、低频背景斑驳，以及综合色偏差相对背景亮度的放大倍数；任一超限即 `quality_ok=false`，明暗结构、裁切与星点指标即使正常也不能进入正式 `stage7_stretched`
+- 默认从线性 baseline 构建背景、暗结构、弱结构和亮核局部区域；亮核目标检查核心 P99/裁剪，星系、发射星云和暗云检查弱结构相对背景 SNR，暗云额外检查明暗分离。局部风险会并入候选总风险，超阈值时直接拒绝候选；指标不可用时只记录 unavailable，不阻断离线回退
+- 若两个正式候选仅因背景综合色噪/色度负载增长超限而被拒绝，先以风险最低候选生成 `0.35 / 0.55 / 0.65` 三档背景限定、保亮度的色度抑制救援候选；星云、弱信号和核心 mask 受到保护，每档仍重新执行可见性、背景、核心和弱结构全部门控
+- 主候选与本轮实际生成的全部救援候选统一执行“硬门优先、质量排序”择优：只有 `allowed_as_final=true` 的候选可进入正式选择，再按硬问题数、归一化超限量、风险分和背景质量负载选取最优项；通过门控的最优救援候选可保存为正式 `stage7_stretched` 并继续 Stage 8/9，Stage 7 状态保留为 `degraded`，但 `_stage7_stretch_accepted=true`
+- 若救援仍未通过，不再按固定 A/B 文件顺序回退：先排除非有限值、近黑/近白、动态范围异常、核心裁剪或弱结构失败的候选，再从仅亮度上限/可复核色度问题的安全候选中选择 `actual_p50 / target_p50` 最低者作为 `_stage7_review_source`；该路径 Stage 7 记为 `degraded`、`_stage7_stretch_accepted=false`，后续仅允许导出 `result_review*`，不生成正常 `result_processed/result_final`
+- 只有通过质量门控的候选才保存为 `stage7_stretched.fit`
+- 如果所有拉伸方法都失败，阶段状态记为 `failed`，并回载 `stage6_starless`
+- `run()` 不会因此立即退出，后续阶段继续使用各自已有的保守回退源
+- 诊断输出 `stage7_stretch_quality.json` 和 `stretch_candidates_report.json`，记录两个正式候选、实际生成的救援候选、唯一 preview、`baseline_pixel_stats`、`stretch_adaptation.target_aware`、每个候选的 `preview_target_attainment`、`target_local_quality`、像素分布、`selection_rank`、`selection_role` 和最终/复核选择
+- 候选背景硬门控的指标、阈值和拒绝原因记录在每个候选的 `background_quality_gate` 字段
 
 这意味着阶段 7 的 `failed` 更像"拉伸目标未达成"，而不是"整条链路终止"。
 
@@ -507,15 +548,15 @@ AI 参数优化（`SEESTAR_AI_ENABLED=1` 且 endpoint/model/key 齐全时）：
 
 该检查点不是正式 Stage 6.5 或 Stage 7.5，不改变 Stage 1-11 的编号。职责是保留旧流程的去星前质量门控兼容点。当前默认 starless-first 顺序已经在 Stage 7 拉伸前完成 Stage 6 去星，因此主流程会把 “Stage 7 兼容检查点” 记录为 `skipped`。
 
-旧的非默认/调试路径仍可使用以下逻辑：在调用 SyQon/SASP 前判断当前拉伸图是否适合去星，并选择更安全的 starless 输入。
+旧的非默认/调试路径仍可计算以下诊断，并可能生成历史 Asinh 候选文件；这些非线性候选不再进入正式 Stage 6，主流程始终保留已选定的线性输入。
 
 处理逻辑：
 
 1. 以 `stage7_stretched` 或当前 `stretched_name` 为源读取自适应特征
 2. 合并当前质量指标：黑场比例、高光裁剪、星点尺寸、边缘黑边等
 3. 使用 `target_profile` 和历史兼容 policy key `pipeline_policy.stage6_5_pre_starless_gate` 评估 `ready_for_starless`
-4. 当 policy 推荐 `stage7_conservative_asinh` 或 `stage7_ultra_conservative_asinh` 时，生成更保守的去星输入候选
-5. 若推荐文件缺失，会回退到可用的保守输入或原始阶段 7 拉伸检查点
+4. 当旧 policy 推荐 `stage7_conservative_asinh` 或 `stage7_ultra_conservative_asinh` 时，可生成兼容诊断候选
+5. Stage 6 记录并忽略非线性推荐，不会将 `stretched_name` 切换到这些候选
 
 阶段输出：
 
@@ -530,6 +571,12 @@ AI 参数优化（`SEESTAR_AI_ENABLED=1` 且 endpoint/model/key 齐全时）：
 ### 5.8 阶段 8：Starless 深加工
 
 职责：对去星结果做增强处理。阶段 8 默认生成 Starless soft masks 后分区增强，保护亮核心和背景区域；SASP WaveScale Dark Enhancer API 仍可作为增强源，但输出会通过 mask 回混，避免整图锐化/提亮。打包环境不再探测实验性 `sasp_*` Siril 命令，因为这些命令未由当前 SASP wheel 注册到 Siril CLI；API 不可用时直接使用确定性的内置分区增强链。
+
+输入选择固定为：本轮 `_stage7_stretch_accepted=true` 且文件存在时使用 `stage7_stretched.fit`；否则依次尝试 `starless.fit`、`stage6_starless.fit`。仅存在旧 `stage7_stretched.fit` 不足以被选中，避免失败任务误吃历史残留产物；实际选择写入日志、`stage8_input_selection.json` 和 Stage 8 报告的 `stage8_input_source/input_source`。
+
+当 Stage 7 已请求 `_stage8_conservative_mode=true` 且输入门控决定跳过增强时，内部 `_stage8_final_quality`、`stage8_quality.json` 和 `stage8_enhancement_report.json` 统一记录 `conservative_skipped`；即使同时存在 `stage7_quality_status=poor` 等附加诊断原因也不改回普通 `skipped`。非保守模式触发的输入风险跳过仍记录 `skipped`。Stage 10 据此把保守跳过识别为已知安全旁路，不误启用 Stage 8 fallback 严格门限。
+
+若 Stage 6 已命中星团/M45 保星旁路，本阶段只保存 `stage8_enhanced.fit` / `starless_enhanced.fit` 兼容检查点，不执行 Starless mask、锐化、局部对比或饱和度增强。
 
 外部回写导入：
 
@@ -561,6 +608,7 @@ AI 参数优化（`SEESTAR_AI_ENABLED=1` 且 endpoint/model/key 齐全时）：
 
 1. 处理前保存 `stage8_input_starless.fit`；启用分区增强时即使 AI 关闭也会保存，用于本地质量诊断
 2. 基于输入 Starless 特征请求 `stage8_processing_plan`，并把 AI 生成的 `saturation/bg_factor/unsharp_radius/unsharp_amount/apply_after_plugins` 实际用于 Siril 命令
+   - `saturation` 在执行前还会受到 Stage 4 `max_allowed_saturation_boost` 总预算限制；校色报告要求降饱和时预算减半。该预算由 Stage 8、10、11 共享，模型建议不能绕过。
 3. 插件链可用时，默认在插件处理后追加分区像素增强；AI 明确返回 `apply_after_plugins=false` 时才保留插件 mask 回混结果不追加
 4. 插件链或内置增强前会先按信号区 R/G、B/G 做蓝偏预抑制并同步降低饱和度，后置 `ccm` 只处理残余明显蓝偏
 5. 再判断蓝偏、饱和度增长、微对比增长、高亮裁剪、背景噪声增长、背景提亮、核心裁剪增长和纹理伪影增长，并把指标写入 `stage8_quality.json`；AI 开启时同时发给 AI 生成诊断
@@ -574,7 +622,7 @@ AI 参数优化（`SEESTAR_AI_ENABLED=1` 且 endpoint/model/key 齐全时）：
 外部回写导入：
 
 - 阶段开始时会查找 `sasp_starmask.fit` / `starmask_sasp.fit` / `starmask_from_sasp.fit`
-- 若存在外部回写文件，导入并覆盖 `starmask.fit`
+- 若存在外部回写文件，导入为独立的 `starmask_external_raw.fit`，并更新当前兼容别名 `starmask.fit`；Stage 6 的 `starmask_raw.fit` / `starmask_clean.fit` 不被覆盖
 
 星点预处理链（当 `workflow_plugin_probe_enabled=True` 且有 starmask 时）：
 
@@ -589,26 +637,63 @@ Starless 二次细化（在合成前）：
 2. 可选调色：`VeraLux Vectra` / `Vectra`（当 `optional_color_transform_enabled=True`）
 3. `VeraLux Curves` / `Curves`
 
-星点合成优先级：
+星点合成路径：
 
-1. `VeraLux StarComposer` / `StarComposer`（当 `workflow_plugin_probe_enabled=True` 且 Stage7 未要求降低星点强度）
-2. 上一阶段 Starless 图像的像素级 `starmask_stretched` 回混
-3. 使用备用星点强度再次回混
-4. 放弃回星，直接使用无星结果
+1. 固定以上一阶段 Starless 为底层、`starmask_stretched` 为上层执行像素级 Alpha+Screen；正式路径不再调用顺序不可验证的 StarComposer
+2. 主强度未通过门控时，回滚 Stage 8 source 并按 `0.75 / 0.55 / 0.40` 逐档降低亮星强度；弱星强度默认保持不低于 `1.05`
+3. 所有候选均未通过时，放弃回星并把 Stage 8 无星结果保存为降级产物
 
 默认回混公式：
 
 ```text
-starmask_stretched = asinh(starmask, stretch=2.00, offset=0.001)
-final = starless_enhanced + starmask_stretched * intensity
+source_reference = compact_local_detail_components(stage5_linear, percentile=98.0, area >= 1)
+if source_reference.single_pixel_ratio > 0.20 or (
+    source_reference.density_per_megapixel > 2500
+    and source_reference.single_pixel_ratio > 0.10
+):
+    reject_catalog_and_keep_stage8_source()
+reference = match_5x5(source_reference.positions, original_starmask > background + 5σ)
+weak_stars = lower_80_percent(reference.matched_starmask_peaks)
+bright_stars = upper_20_percent(reference.matched_starmask_peaks)
+compact_support = weak_cores(+1px) + bright_cores(+3px)  # strict: +1px / +2px
+compact_starmask = where(compact_support, cleaned_starmask, 0)
+if bright_peak_median / weak_peak_median >= 4 and weak_count >= 20 and bright_count >= 3:
+    input_anchors = percentiles(reference.matched_starmask_peaks, [40, 80, 90, 99.7])
+    output_anchors = [0.26, 0.50, 0.75, 0.90]
+    starmask_stretched = color_preserving_monotonic_log_curve(
+        compact_starmask, input_anchors -> output_anchors
+    )
+else:
+    starmask_stretched = asinh(compact_starmask, bounded_single_layer_stretch)
+intensity_map = weak_support * max(intensity, 1.05) + bright_support * intensity
+star_term = clamp(starmask_stretched * intensity_map, 0, 1)
+screened = 1 - (1 - starless_enhanced) * (1 - star_term)
+final = alpha_over(starless_enhanced, screened, alpha=compact_support)
 ```
 
-若 `SASP Star Stretch` / `NB to RGB Stars` 已经成功处理星点层，阶段 9 会把插件处理后的星点层另存为 `starmask_stretched.fit`，避免二次拉伸；否则使用内置温和 Asinh。这样避免把线性域 starmask 直接加到已经拉伸的 `starless_enhanced` 上，减少星点过暗或被星云背景吞没的问题。可通过 `SEESTAR_STAGE9_STARMASK_STRETCH_ENABLE=0` 关闭，或用 `SEESTAR_STAGE9_STARMASK_ASINH_STRETCH` / `SEESTAR_STAGE9_STARMASK_ASINH_OFFSET` 调整。
+旧的直接相加会在亮星核心和亮星云重叠区域快速耗尽高光余量；Screen 公式随底图亮度自动减小新增量，仍保留星色和星点可见度，但更不容易把核心推到硬裁剪。
+
+若 `SASP Star Stretch` / `NB to RGB Stars` 已经成功处理星点层，阶段 9 会把插件处理后的星点层另存为 `starmask_stretched.fit`，避免二次拉伸且不覆盖 raw/clean。目录不再由待验收的 starmask 自我定义：默认从 `stage5_linear.fit` 的局部高频细节建立独立紧致星表，再在原始 starmask 的 `5×5` 邻域内匹配有效星点。单像素弱星仍允许进入目录，但单像素组件比例超过 `0.20`，或组件密度超过 `2500/百万像素` 且伴随单像素噪点证据时，先把局部细节检测百分位从配置值按 `0.5` 逐档收紧到 `99.5`；只有全部档位仍疑似噪声/星云纹理污染才 fail-closed，不能通过放宽污染门限恢复回星。正常支持层扩张弱星 1 像素、亮星 3 像素，严格层为弱星 1 像素、亮星 2 像素。支持区外的广域低幅残差清零后保存 `starmask_compact.fit`，像素写回始终在 Siril `image_lock` 内执行。compact 支持层默认至少保留 `80%` 的弱星组件；旧支持层不足时按同一目录重建，禁止通过提高检测阈值丢弃已确认星表中的弱星核心。混合星场不再分别拉伸弱/亮层：统一以原始星峰的 `40 / 80 / 90 / 99.7` 分位建立对数输入轴上的单调多锚点曲线，映射到 `0.26 / 0.50 / 0.75 / 0.90`，并对 RGB 使用同一标量增益，因此亮度排序和星色同时保留。独立源图不可用时保留旧 starmask 目录兼容路径；目录、保留率或像素写回不可用时不会把未经验证的 raw starmask 作为正式交付候选，而是保留 Stage 8 source 并进入 review-only 降级路径。
 
 Stage7 联动：
 
-- 若 `stage6_starless_quality.json`（兼容别名：`stage7_quality.json`）显示残星超标，阶段 9 会跳过不可控的 StarComposer，改走像素级回混
-- 实际 `intensity` 和备用强度会乘以 Stage7 计算出的 `intensity_scale`，降低残星与回混星点叠加造成的二次星点风险
+- 阶段 9 正式路径固定跳过不可控的 StarComposer，避免插件内部图层顺序与合成模式不可验证
+- 实际主强度和各档备用强度会乘以 Stage7 计算出的 `intensity_scale`，降低残星与回混星点叠加造成的二次星点风险
+- 线性 Starless 仅因相对动态范围/峰值偏低而被标记 `poor`，但 `stage7_stretched.fit` 已通过可见性、背景、核心和弱结构门控时，该早期诊断降为 advisory；Stage 9 仍使用现有 starmask 执行受控 Screen 回星。残星、halo、噪声或拉伸未验收等硬风险仍可触发安全旁路
+
+Stage 9 保存前门控：
+
+- 对主强度和各档备用强度 Alpha+Screen 候选比较 Stage 8 base，检查非有限像素、高光裁剪总量/增长、亮像素覆盖增长、暗背景抬升、低频背景斑驳增长、显著变化覆盖和异常变暗。斑驳评分只排除本次实际 Alpha 支持区；支持覆盖默认不得超过 `0.12`，支持区外显著变化不得超过 `0.01`，防止污染 starmask 反过来豁免自身斑驳
+- 同一门控在 `candidate - Stage8` 的正增量中检查每颗独立参考星的 `3×3` 峰值、`7×7` 孔径通量和星翼通量，并检查回星后参考邻域的残余暗坑；默认要求弱星恢复率至少 `0.70`、全部星点与孔径通量恢复率至少 `0.75`、星翼恢复率至少 `0.65`，残余暗坑比例不超过 `0.15`。质量门开启且目录/恢复指标不可用时 fail-closed；显式关闭质量门时仍记录指标与 `gate_enabled=false`
+- 候选还会对 `candidate - Stage8` 的显著正增量做独立连通形态检查：默认亮度增量超过 `0.05` 的闭合环内部空心面积不得超过 `64` 像素。该指标不依赖星表恢复率，用于拦截新生成的星环、空心星核和块状闭合结构
+- 局部质量门不再依赖全图占比稀释：对亮度增量超过 `0.01` 的连通块检查最大面积 `256`、最长/最短边比例 `3.0`、包围盒填充率 `0.15` 和单像素组件比例 `0.20`；对局部青蓝增量团块限制单块面积 `64`；以 Stage 8 信号区第 `90` 百分位定义星云核心，归一化 RGB 跳变超过 `0.10` 的单块面积不得超过 `64`。任一局部指标超限即拒绝候选；局部连通分析不可用时 fail-closed
+- `local_color_risk_score` 取青蓝团块和核心颜色突变相对各自面积上限的较大值并限幅到 `0–1`，既用于 Stage 9 报告，也作为 Stage 10 正向饱和度的风险输入
+- 主候选不通过时立即回载 Stage 8 source。若是背景、高光或覆盖上限失败，可先换严格 compact 支持并按 `0.75 -> 0.55 -> 0.40` 逐级降低强度；若是星点恢复量不足则停止降 Screen 强度，因为继续降强度只会让恢复量更低。每个有效候选都从同一 Stage 8 source 重新回混，不得在已拒绝候选上叠加星点
+- 所有候选和阈值写入 `stage9_remix_quality.json`；全部拒绝时阶段状态为 `degraded`，`stage9_remixed.fit` 保存回滚后的 Stage 8 source
+- `stage9_remixed.fit` 保存成功后生成 `review_bundles/stage9_star_remixing/`，包含 Stage 8 source 与最终接受/回滚图像的 before、after、绝对/有符号 difference 和 `review.json`；JSON 保留全部候选状态、星表污染指标、starmask 标定与拒绝原因。复核包不参与确定性门控，生成失败只记录警告
+- `stage9_remix_quality.json` 同时记录 `stars_required / stars_applied / stars_application_mode / starmask_stretch_failed`；只有 Alpha+Screen 候选通过且 `stage9_remixed.fit` 保存成功时，`stars_applied=true`
+- `unsafe_starless_bypass`、`no_starmask`、`rejected_keep_starless` 及候选保存失败都必须保持 `stars_applied=false`；保星目标旁路另记 `stars_required=false`，不会被误判为缺星
+- Stage 7 拉伸未验收时，Stage 9 不再向线性 Starless 继续回星；优先加载 Stage 7 对全部候选质量排序得到的 `_stage7_review_source`，只保存复核候选并记录 `degraded`，同时让最终质量报告强制进入 `needs_conservative_rerun`
 
 设计意图：
 
@@ -616,16 +701,16 @@ Stage7 联动：
 - 不再用旧拉伸检查点与 `starless_enhanced` 做安全混合，避免 `pm` 多文件表达式成功返回但实际保存回拉伸阶段图像
 - 合成后同时记录 `stage9_remixed` 对 `stage8_enhanced` 与阶段 7 拉伸检查点的差异，便于排查阶段 9 是否真正生效
 
-回混存在两层强度：
+回混强度结构：
 
 1. `star_intensity`：自动调参和最终有效强度上限为 `1.05`
-2. `star_fallback_intensity`：自动调参和最终有效强度上限为 `1.05`
+2. `stage9_fallback_intensity_levels`：默认 `0.75 / 0.55 / 0.40`；`star_fallback_intensity` 仅作为兼容上限
 
 阶段状态判断：
 
-- StarComposer 或上一阶段像素级回混成功时为 `ok`
+- StarComposer 或 Screen 像素回混成功且通过门控时为 `ok`
 - 没有 `starmask` 时为 `skipped`
-- 两轮像素级回混都失败时为 `degraded`
+- 所有像素级回混档位执行失败或均被门控拒绝时为 `degraded`
 
 阶段检查点：`stage9_remixed.fit`
 
@@ -647,27 +732,38 @@ Stage7 联动：
 satu <final_saturation> <final_bg_factor>
 ```
 
+`final_saturation` 不是独立叠加额度：脚本会扣除 Stage 8 已使用的正向饱和度，只执行 Stage 4 色彩策略剩余的预算；预算耗尽时直接跳过本次 `satu`。正向剩余额度还会乘以 `1 - local_color_risk_score × stage10_stage9_local_color_risk_strength`（默认强度 `1.0`）；Stage 9 必须回星但未应用，或已接受候选缺少局部色彩指标时，风险按 `1.0` 处理并跳过最终增饱和。负向去饱和不受该门限制。诊断写入 `stage10_saturation_guard.json`。
+
 最终降噪优先链：
 
-1. `CosmicClarity_Denoise.py` in-process script（复用已验证更稳定的 Siril 内执行路径，使用 classic 参数）
-2. 若 in-process 失败，再尝试 `CosmicClarity_Denoise.py` CLI 子进程模式
-3. 若 classic Denoise 不可用或失败，尝试 CosmicClarity Native Denoise，再尝试 `Siril-SCUNet Denoise`
-4. 若 `Siril-SCUNet Denoise` 不可用且 `aberration_api_enabled=True`，再回退 `SASP Aberration API`
-5. 若 `aberration_api_enabled=False`（默认），跳过 Aberration API 回退
+0. 若进入 `review-only`（Stage 9 不安全旁路、starmask 拉伸失败或必须回星但未应用），直接跳过 CosmicClarity/SCUNet/Aberration 最终降噪链并快速导出复核源，避免为不可正式交付的结果继续等待耗时模型；否则，Stage 5 已成功降噪、Stage 8 最终质量为 `ok`/保星安全旁路且没有使用不安全 fallback 时，重复降噪保护会跳过 Stage 10 降噪链。
+1. 读取最终降噪输入的 `chroma_noise_score`、`bg_std` 与 `background_mottling_score`，动态选择 `full/chroma/separate/skip`。`chroma` 路径用 CosmicClarity `full` 模型获得降噪色度后恢复输入亮度，因为打包版本原生只接受 `full/luminance/separate`，不能传入不存在的 `chroma` 参数
+2. `CosmicClarity_Denoise.py` in-process script（复用已验证更稳定的 Siril 内执行路径，使用上述动态模式和 classic 参数）
+3. 若 in-process 失败，再尝试 `CosmicClarity_Denoise.py` CLI 子进程模式
+4. 若 classic Denoise 不可用或失败，尝试 CosmicClarity Native Denoise，再尝试 `Siril-SCUNet Denoise`；若 Native 已超时，为避免再次等待 300 秒，不再级联启动 SCUNet
+5. 若 `Siril-SCUNet Denoise` 不可用且 `aberration_api_enabled=True`，再回退 `SASP Aberration API`
+6. 若 `aberration_api_enabled=False`（默认），跳过 Aberration API 回退
+
+模式规则与诊断：综合色噪达到 `0.70` 时使用 `separate`；达到 `0.34` 且亮度背景仍稳定时使用 `chroma`；综合色噪同时伴随 `bg_std>=0.018` 或斑驳分数 `>=0.45` 时使用 `full`。仅当有效彩色输入的综合色噪低于 `0.34`、`bg_std` 低于 `0.018` 且斑驳分数低于 `0.45` 时，Stage 10 以 `skip` 正常跳过昂贵的最终降噪；灰度输入或指标不可用仍保守使用 `full`。输入指标、原因、请求模式、底层 CosmicClarity 模式、最终有效模式及低噪声跳过标记写入 `stage10_denoise_plan.json`。
 
 状态规则：
 
+- 三项有效噪声指标均低于门限时以 `skipped_safe` 保持阶段 `ok`，不启动任何最终降噪模型
 - `CosmicClarity_Denoise.py`、`Siril-SCUNet Denoise`、`SASP Aberration API` 任一成功，阶段保持 `ok`（除非其他导出步骤失败）
 - 仅当以上路径都不可用时，阶段记为 `degraded`（当 `aberration_api_enabled=True`）或记录跳过信息（当 `aberration_api_enabled=False`）
 - 阶段结果 `message` 会写入最终降噪与导出失败原因，便于日志排查
 
 阶段检查点：`stage10_final.fit`
 
-然后切回原工作目录导出三类文件；当前导出顺序为 TIFF、FITS、PNG：
+然后切回原工作目录导出三类文件；当前导出顺序为 TIFF、FITS、PNG。执行动态命名前会先检查 `OBJECT / STACKCNT / EXPTIME / DATE-OBS`。完整时使用 Siril 动态模板；仅缺少 `STACKCNT` 等次要字段时，用已有的 `OBJECT / EXPTIME / DATE-OBS` 生成安全字面名称（例如 `M_42_60sec_20260216_140234_processed`）；目标身份或日期也不可用时才退回通用名称，避免未解析占位符和不同任务相互覆盖：
 
 - TIFF：优先使用基于 FITS 元数据的动态命名，失败时回退 `result_processed.tif`
 - PNG：优先动态命名，失败时回退 `result_processed.png`
 - FITS：优先动态命名并追加 `_final`，失败时回退 `result_final.fit`
+
+PNG 默认直接使用已通过 Stage 7 门控的非线性渲染，不再对 TIFF/FITS 对应画面做第二次 autostretch；只有 Stage 7 未验收、导出诊断回退源时才执行 `autostretch -linked`，避免 PNG 与 TIFF/FITS 出现不同亮度和色彩关系。
+
+若 `final_quality_report.json` 设置 `needs_conservative_rerun=true`，Stage 9 已因不安全 Starless 旁路回星、`starmask_stretch_failed=true`，回星契约表明 `stars_required=true` 但 `stars_applied=false`，或显式设置 `SEESTAR_FORCE_REVIEW_ONLY_OUTPUT=1`，本轮只导出 `result_review.tif/png` 与 `result_review_final.fit`；线性续跑对应 `result_review_linear.*`。已在进入 Stage 10 前确定的复核输出会跳过耗时最终降噪。复核产物不会占用普通 `result_processed/result_final` 名称，Stage 11 也不会把它提升为 AI 正常成品。
 
 若本轮输入模式是 `result_linear_resume`：
 
@@ -711,10 +807,26 @@ $OBJECT:%s$_$STACKCNT:%d$x$EXPTIME:%d$sec_$DATE-OBS:dm12$_processed
 3. 使用本地 Python/Numpy 执行实际增强，并写出 `stage11_ai_output.png`（16-bit RGB PNG）
 4. 将本地增强结果转换为 FITS，再做保守混合：`final = source*(1-strength) + ai*strength`
 5. 执行质量门控，必要时自动降强度（减半）重混一次
+   - Stage 11 的正向饱和度、红/蓝通道增益继续受 Stage 4 色彩策略和剩余饱和度预算限制。
 6. 通过门控后导出：
    - `result_processed_ai.tif`
    - `result_processed_ai.png`
    - `result_final_ai.fit`
+
+AI advisor 模式：
+
+- `SEESTAR_AI_ADVISOR_MODE=text`（默认）保持现有纯指标/文本参数顾问。
+- `SEESTAR_AI_ADVISOR_MODE=multimodal` 会把当前阶段的安全拉伸预览随参数请求发送给兼容图片输入的 OpenAI-compatible 模型；图片请求失败或模型不支持时，参数建议自动回退文本请求。
+- 多模态模式会把预览图数据发送到用户配置的 `SEESTAR_AI_ENDPOINT`；需要完全离线或不希望外发图像时保持 `text`。
+- Stage 3、6、7、8、11 的 review bundle 记录候选列表、算法选择状态和 `not_requested / unavailable / accepted / review_required / rejected` 视觉验收状态。未启用多模态时为 `not_requested`，同步调用无结论或失败时为 `unavailable`，不再留下无含义的长期 `pending`；视觉结论始终非阻断，不替代本地质量门控。
+
+AI 艺术衍生实验（Stage 11 后的非正式分支）：
+
+- 默认关闭，只有 `SEESTAR_AI_ARTISTIC_DERIVATIVE_ENABLED=1` 且独立 endpoint/model/key 全部配置时运行；不复用 advisor/Stage11 凭据。
+- 固定只读 `process/stage10_final.fit`，生成显示预览后调用 OpenAI-compatible `/v1/images/edits`；接受 `b64_json` 或结果 URL。
+- 只写 `<work_dir>/ai_artistic_derivative/source_preview.png`、`result_artistic_derivative.*` 和 `artistic_report.json`。
+- 返回图片不会载入 Siril，不参与候选、验收、回混、导出或任何 Stage 状态；接口失败只写实验报告。
+- 该输出明确标记为非科学、非校准的艺术衍生图，不能替代 Stage 10/11 天文处理结果。
 
 AI Plan 解析容错：
 
@@ -748,19 +860,19 @@ AI Plan 解析容错：
 
 项目默认 env 会先从 `resources/default.env` 读入，再叠加 `resources/ai.env` 和当前目录 `.seestar_ai.env`；已有进程环境变量不会被覆盖。GUI 运行时额外读取 App Resources、runtime home 和工作目录的 `.seestar_ai.env`，然后再强制写入界面开关对应的 Debug、输入模式和 AI 开关。
 
-`_apply_runtime_env_overrides()` 在 `run()` 入口处（连接 Siril 之前）集中读取并覆盖配置：
+`_apply_runtime_env_overrides()` 在 `run()` 入口处（连接 Siril 之前）集中读取并覆盖配置。下表变量均为可选；未设置时使用 `PipelineConfig` 和 `resources/default.env` 中列出的默认值：
 
 | 环境变量 | 对应配置 | 默认值 | 说明 |
 |---|---|---|---|
 | `SEESTAR_DEBUG_MODE` | `debug_mode` | `False` | 开启后保留 stage* 中间文件 |
 | `SEESTAR_INPUT_MODE` | `input_mode` | `auto` | `auto` 正常流程；`stage2_corrected_resume` 从 `stage2_corrected.fit` 进入 stage 3；`result_linear_resume` 从 `result_linear.fit` 进入 stage 6 |
 | `SEESTAR_OUTPUT_FORMAT` | `output_format` | `all` | 最终导出格式，可为 `all` 或逗号分隔 `tif/png/fit` |
-| `SEESTAR_STAR_SEPARATION_MODE` | `star_separation_mode` | `linear_star_separation` | 阶段 6 去星输入模式；可设 `mild_prestretch_star_separation` |
-| `SEESTAR_MILD_PRESTRETCH_STRENGTH` | `mild_prestretch_strength` | `1.35` | 轻微预拉伸去星强度，限幅 `1.05~1.80` |
-| `SEESTAR_STAR_SEPARATION_FALLBACK_TO_MILD_PRESTRETCH` | `star_separation_fallback_to_mild_prestretch` | `True` | 线性去星失败时是否用轻微预拉伸输入重试 |
+| `SEESTAR_STAR_SEPARATION_MODE` | `star_separation_mode` | `linear_star_separation` | 阶段 6 固定线性输入；旧值 `mild_prestretch_star_separation` 会归一化为线性模式 |
+| `SEESTAR_MILD_PRESTRETCH_STRENGTH` | `mild_prestretch_strength` | `1.35` | 旧配置兼容字段，当前 Stage 6 不使用 |
+| `SEESTAR_STAR_SEPARATION_FALLBACK_TO_MILD_PRESTRETCH` | `star_separation_fallback_to_mild_prestretch` | `False` | 旧配置兼容字段；运行时强制关闭，不再用外部预拉伸重试 |
 | `SEESTAR_WORKFLOW_PLUGIN_PROBE` | `workflow_plugin_probe_enabled` | `False` | 启用后允许 `run_first_available_command` 路径探测更广泛的实验插件命令；Stage 6 的 SASP Dark Star fallback 可在关闭时运行，Stage 8 固定使用 SASP Python API，不探测未注册的实验性 `sasp_*` Siril 命令 |
 | `SEESTAR_SPCC_ENABLE` | `spcc_enabled` | `True` | 设为 0 可全局禁用 SPCC |
-| `SEESTAR_STAGE4_PLATESOLVE_ENABLE` | `stage4_platesolve_enabled` | `True` | 默认执行 `platesolve -focal=160 -pixelsize=2.90 -catalog=gaia -order=3` |
+| `SEESTAR_STAGE4_PLATESOLVE_ENABLE` | `stage4_platesolve_enabled` | `True` | 默认执行 `platesolve -noflip -focal=160 -pixelsize=2.90 -catalog=gaia -order=3`，保留原始图像方向 |
 | `SEESTAR_STAGE4_PLATESOLVE_CATALOGS` / `SEESTAR_STAGE4_PLATESOLVE_ORDER` | env only | `gaia` / `3` | Stage 4 platesolve 星表候选顺序和多项式阶数 |
 | `SEESTAR_STAGE4_PCC_CATALOGS` / `SEESTAR_STAGE4_PCC_HEADER_FALLBACK_ENABLE` | env only / `stage4_pcc_header_fallback_enabled` | `localgaia,gaia,nomad,apass` / `True` | PCC 星表候选顺序；platesolve 失败但 header 有坐标时允许尝试 PCC header fallback |
 | `SEESTAR_STAGE4_SPCC_SENSOR_MODE` | `stage4_spcc_sensor_mode` | `osc` | SPCC 传感器模式：`osc` 或 `mono_lrgb` |
@@ -776,27 +888,82 @@ AI Plan 解析容错：
 | `SEESTAR_ABERRATION_PROVIDER` | — | — | SASP Aberration API provider 选择；可设 `cpu` 强制 CPU |
 | `SEESTAR_DENOISE_ENABLE` | `denoise_enabled` | `False` | 启用内置线性降噪 |
 | `SEESTAR_DENOISE_FORCE` | `_force_denoise_enabled` | — | 自动调参后强制覆盖 denoise_enabled |
-| `SEESTAR_AI_ENABLED` | `ai_post_enabled` | `False` | AI 总开关：启用阶段 6 去星、阶段 8 增强诊断/参数建议与阶段 11 AI 副本；阶段 7 拉伸当前仍固定本地两候选 |
+| `SEESTAR_AI_ENABLED` | `ai_post_enabled` | `False` | AI 总开关：启用阶段 6 去星、阶段 8 增强诊断/参数建议与阶段 11 AI 副本；阶段 7 固定本地两个主候选和非 AI 色度救援 |
 | `SEESTAR_AI_ENDPOINT` | `ai_endpoint` | `""` | AI API endpoint |
 | `SEESTAR_AI_MODEL` | `ai_model` | `""` | AI 模型名 |
 | `SEESTAR_AI_API_KEY` | `ai_api_key` | `""` | AI API 密钥 |
 | `SEESTAR_AI_PROMPT` | `ai_prompt` | `""` | 自定义 AI 提示词 |
 | `SEESTAR_AI_TIMEOUT_SEC` | `ai_timeout_sec` | `90` | API 超时（限幅 15–300） |
 | `SEESTAR_AI_STRENGTH` | `ai_strength` | `0.12` | AI 混合强度（限幅 0.05–0.25） |
-| `SEESTAR_AI_STAGE6_ENABLE` | `ai_stage6_enabled` | `True` | 保留的拉伸顾问开关；当前阶段 7 主体拉伸固定使用本地两候选，不扩展 AI 候选 |
+| `SEESTAR_AI_ADVISOR_MODE` | `ai_advisor_mode` | `text` | AI 顾问模式：`text` 或 `multimodal`；多模态参数请求失败自动回退文本 |
+| `SEESTAR_AI_STAGE6_ENABLE` | `ai_stage6_enabled` | `True` | 保留的拉伸顾问开关；当前阶段 7 主体拉伸固定使用本地两个主候选，不扩展 AI 候选，色度救援始终为确定性本地路径 |
 | `SEESTAR_AI_STAGE7_ENABLE` | `ai_stage7_enabled` | `True` | 单独控制阶段 7 AI SyQon 参数计划、诊断与重试择优 |
 | `SEESTAR_AI_STAGE8_ENABLE` | `ai_stage8_enabled` | `True` | 单独控制阶段 8 AI Starless 参数计划、蓝色修正与保守重跑 |
+| `SEESTAR_AI_ARTISTIC_DERIVATIVE_ENABLED` | `ai_artistic_derivative_enabled` | `False` | 完全隔离的艺术衍生实验开关；不受 Stage11 advisor 开关隐式开启 |
+| `SEESTAR_AI_ARTISTIC_ENDPOINT` | `ai_artistic_endpoint` | `""` | 独立图片编辑 endpoint/base URL；base URL 自动补 `/v1/images/edits` |
+| `SEESTAR_AI_ARTISTIC_MODEL` | `ai_artistic_model` | `""` | 独立图片编辑/生成模型名 |
+| `SEESTAR_AI_ARTISTIC_API_KEY` | `ai_artistic_api_key` | `""` | 独立 API key，不回退复用 advisor key |
+| `SEESTAR_AI_ARTISTIC_PROMPT` | `ai_artistic_prompt` | `""` | 艺术衍生提示词；为空使用带非科学声明的默认提示词 |
+| `SEESTAR_AI_ARTISTIC_TIMEOUT_SEC` | `ai_artistic_timeout_sec` | `180` | 图片编辑请求超时，限幅 30–600 秒 |
 | `SEESTAR_STAGE7_QUALITY_RETRY_MAX` | `stage7_quality_retry_max` | `2` | 阶段 6 去星参数优化预算配置（限幅 0–3）；变量名保留 `stage7` 以兼容旧配置 |
 | `SEESTAR_STAGE7_SKIP_UNREADY_STARLESS` | `stage7_skip_unready_starless` | `True` | 兼容门控判定不适合去星时是否跳过 SyQon/SASP |
-| `SEESTAR_STAGE7_SOFT_STARLESS_ASINH_STRETCH` | `stage7_soft_starless_asinh_stretch` | `1.35` | 阶段 6 质量差时追加更轻去星输入强度（限幅 1.05–ultra conservative） |
+| `SEESTAR_STAGE7_SOFT_STARLESS_ASINH_STRETCH` | `stage7_soft_starless_asinh_stretch` | `1.35` | 旧预拉伸重试兼容字段，当前正式 Stage 6 不使用 |
 | `SEESTAR_STAGE7_BRIGHT_NEBULA_HALO_RESIDUE_SCORE_MAX` | `stage7_bright_nebula_halo_residue_score_max` | `0.60` | M42/亮核心星云 halo 验收上限 |
 | `SEESTAR_STAGE7_STARLESS_REPAIR_STRENGTH` | `stage7_starless_repair_strength` | `0.68` | starless 小尺度残星修复强度（限幅 0–0.85） |
 | `SEESTAR_STAGE7_STARLESS_HALO_REPAIR_STRENGTH` | `stage7_starless_halo_repair_strength` | `0.70` | starless 亮星 halo 修复强度（限幅 0–0.90） |
 | `SEESTAR_STAGE7_STARLESS_CHROMA_DENOISE_STRENGTH` | `stage7_starless_chroma_denoise_strength` | `0.55` | starless 背景彩噪修复强度（限幅 0–0.90） |
+| `SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_REDUCTION_MIN` | `stage7_starless_repair_chroma_reduction_min` | `0.20` | 综合色噪专用验收路径要求的最低下降比例（限幅 0.05–0.80） |
+| `SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_DELTA_MIN` | `stage7_starless_repair_chroma_delta_min` | `0.0005` | 综合色噪专用验收路径要求的最小绝对下降量 |
+| `SEESTAR_STAGE7_STARMASK_DIFFUSE_RESIDUAL_RATIO_MAX` | `stage7_starmask_diffuse_residual_ratio_max` | `0.08` | starmask 清理后弥散残留比例硬上限；超限禁用该候选星点层，不回退使用 raw 回星 |
 | `SEESTAR_STAGE7_STARLESS_PIXEL_REPAIR_ENABLE` | `stage7_starless_pixel_repair_enabled` | `True` | 是否启用阶段 6 starless 像素修复 |
 | `SEESTAR_STAGE8_FORCE_CONSERVATIVE_AFTER_STAGE7_REPAIR` | `stage8_force_conservative_after_stage7_repair` | `True` | 阶段 6 修复或不安全时是否强制 Stage 8 conservative skip |
 | `SEESTAR_STAGE9_STARMASK_STRETCH_ENABLE` | `stage9_starmask_stretch_enabled` | `True` | 阶段 9 像素回混前是否把 starmask 拉伸到非线性域 |
-| `SEESTAR_STAGE9_STARMASK_ASINH_STRETCH` / `SEESTAR_STAGE9_STARMASK_ASINH_OFFSET` | `stage9_starmask_asinh_stretch` / `stage9_starmask_asinh_offset` | `2.00` / `0.001` | 阶段 9 starmask 温和 Asinh 拉伸参数 |
+| `SEESTAR_STAGE9_STARMASK_ADAPTIVE_STRETCH_ENABLE` | `stage9_starmask_adaptive_stretch_enabled` | `True` | 混合星场启用单调多锚点曲线；非混合场保留自适应 Asinh 回退 |
+| `SEESTAR_STAGE9_COMPACT_STARMASK_ENABLE` | `stage9_compact_starmask_enabled` | `True` | Asinh 前只保留连通紧致星核/窄星翼；覆盖异常时先重建严格紧致层再降强度 |
+| `SEESTAR_STAGE9_SOURCE_STAR_DETAIL_PERCENTILE` | `stage9_source_star_detail_percentile` | `98.0` | 从原始含星图局部细节建立独立星表的百分位阈值（限幅 97–99.5） |
+| `SEESTAR_STAGE9_SOURCE_COMPONENT_DENSITY_MAX` / `SEESTAR_STAGE9_SOURCE_SINGLE_PIXEL_RATIO_MAX` | 对应同名小写配置 | `2500.0` / `0.20` | 单像素比例独立超限，或组件密度超限且单像素比例高于 `0.10` 时，先提高细节百分位；达到 `99.5` 仍有污染则 fail-closed，避免把真实高密星场误判成噪声 |
+| `SEESTAR_STAGE9_STAR_REFERENCE_SIGMA` | `stage9_star_reference_sigma` | `5.0` | 原始 starmask 星点目录阈值：背景加该倍数噪声标准差（限幅 3–8） |
+| `SEESTAR_STAGE9_COMPACT_WEAK_STAR_RETENTION_MIN` | `stage9_compact_weak_star_retention_min` | `0.80` | compact 支持层必须保留的弱星组件数量比例下限 |
+| `SEESTAR_STAGE9_MIXED_STAR_PEAK_RATIO_MIN` | `stage9_mixed_star_peak_ratio_min` | `4.0` | 亮星组/弱星组峰值中位数达到该倍率时才启用多锚点曲线 |
+| `SEESTAR_STAGE9_MIXED_STAR_WEAK_COUNT_MIN` / `SEESTAR_STAGE9_MIXED_STAR_BRIGHT_COUNT_MIN` | 对应同名小写配置 | `20` / `3` | 启用混合亮星/弱星场多锚点曲线所需的最少组件数 |
+| `SEESTAR_STAGE9_STARMASK_ASINH_STRETCH_MAX` | `stage9_starmask_asinh_stretch_max` | `1000.0` | 自适应 Asinh 强度反解上限 |
+| `SEESTAR_STAGE9_STARMASK_FAINT_TARGET` / `SEESTAR_STAGE9_STARMASK_MID_TARGET` / `SEESTAR_STAGE9_STARMASK_BRIGHT_TARGET` / `SEESTAR_STAGE9_STARMASK_PEAK_TARGET` | 对应同名小写配置 | `0.26 / 0.50 / 0.75 / 0.90` | 多锚点曲线弱、中、亮、极亮星的有序输出目标；运行时保证至少相差 0.03 |
+| `SEESTAR_STAGE9_STARMASK_CHROMA_REGULARIZATION_ENABLE` | `stage9_starmask_chroma_regularization_enabled` | `True` | 多锚点拉伸时以邻域星色约束低信号星翼，避免把单通道残差放大成蓝紫色块 |
+| `SEESTAR_STAGE9_STARMASK_FAINT_CHROMA_MAX` / `SEESTAR_STAGE9_STARMASK_BRIGHT_CHROMA_MAX` | 对应同名小写配置 | `0.35` / `0.60` | 微弱星翼与亮星核心允许的最大通道跨度；随原始星点亮度连续过渡 |
+| `SEESTAR_STAGE9_STARMASK_PREDICTED_CHANGE_RATIO_MAX` | `stage9_starmask_predicted_change_ratio_max` | `0.30` | 自适应拉伸求解阶段的预测显著变化覆盖上限；还会受正式 Stage 9 门控上限约束 |
+| `SEESTAR_STAGE9_STARMASK_ASINH_STRETCH` / `SEESTAR_STAGE9_STARMASK_ASINH_OFFSET` | `stage9_starmask_asinh_stretch` / `stage9_starmask_asinh_offset` | `2.00` / `0.001` | 自适应统计不可用或关闭时的固定回退参数 |
+| `SEESTAR_STAGE7_TARGET_LOCAL_METRICS_ENABLE` | `stage7_target_local_metrics_enabled` | `True` | 是否把目标局部核心、弱结构和暗云指标纳入 Stage 7 候选门控 |
+| `SEESTAR_STAGE7_LOCAL_CORE_CLIP_RATIO_MAX` | `stage7_local_core_clip_ratio_max` | `0.12` | 亮核局部裁剪比例上限 |
+| `SEESTAR_STAGE7_LOCAL_FAINT_SNR_MIN` / `SEESTAR_STAGE7_LOCAL_DARK_SEPARATION_MIN` | 对应同名小写配置 | `0.25` / `0.001` | 弱结构相对背景 SNR 与暗云明暗分离下限 |
+| `SEESTAR_STAGE7_STRETCH_CHROMA_NOISE_SCORE_MAX` | `stage7_stretch_chroma_noise_score_max` | `0.34` | 正式拉伸候选的背景绝对综合色噪上限 |
+| `SEESTAR_STAGE7_STRETCH_BACKGROUND_MOTTLING_SCORE_MAX` | `stage7_stretch_background_mottling_score_max` | `0.45` | 正式拉伸候选的低频背景斑驳上限 |
+| `SEESTAR_STAGE7_STRETCH_CHROMA_LOAD_GROWTH_MAX` | `stage7_stretch_chroma_load_growth_max` | `1.35` | 拉伸后综合色偏差相对背景亮度的最大放大倍数 |
+| `SEESTAR_STAGE7_STRETCH_CHROMA_LOAD_LOW_ABSOLUTE_MAX` | `stage7_stretch_chroma_load_low_absolute_max` | `0.05` | 候选绝对 chroma load 不高于此值时，不因极低线性基线放大出的相对增长倍数单独拒绝；绝对色噪和斑驳门控仍生效 |
+| `SEESTAR_STAGE7_PREVIEW_TARGET_P50_MIN_RATIO` | `stage7_preview_target_p50_min_ratio` | `0.55` | preview 标定有效时，正式候选实际 P50 相对目标 P50 的最低比例（限幅 0.25–0.90） |
+| `SEESTAR_STAGE7_PREVIEW_TARGET_P50_MAX_RATIO` | `stage7_preview_target_p50_max_ratio` | `1.50` | preview 标定有效时，正式候选实际 P50 相对目标 P50 的最高比例（限幅 1.00–3.00） |
+| `SEESTAR_STAGE7_CHROMA_RESCUE_ENABLE` | `stage7_chroma_rescue_enabled` | `True` | 两个主候选仅因背景色度门控失败时，是否允许默认 `0.35 / 0.55 / 0.65` 三档背景限定、保亮度的确定性救援；生成后与主候选统一质量择优 |
+| `SEESTAR_STAGE9_QUALITY_GATE_ENABLE` | `stage9_quality_gate_enabled` | `True` | 是否启用 Stage 9 保存前回混门控与拒绝回滚 |
+| `SEESTAR_STAGE9_HIGHLIGHT_CLIP_RATIO_MAX` / `SEESTAR_STAGE9_HIGHLIGHT_CLIP_GROWTH_MAX` | 对应同名小写配置 | `0.015` / `0.006` | 回混后高光裁剪总量与相对 Stage 8 增长上限 |
+| `SEESTAR_STAGE9_BRIGHT_PIXEL_GROWTH_MAX` / `SEESTAR_STAGE9_BACKGROUND_LIFT_MAX` | 对应同名小写配置 | `0.025` / `0.010` | 亮像素扩张与暗背景中位抬升上限 |
+| `SEESTAR_STAGE9_BACKGROUND_MOTTLING_GROWTH_MAX` | `stage9_background_mottling_growth_max` | `1.35` | Stage 9 候选相对 Stage 8 的低频背景斑驳评分增长倍数上限 |
+| `SEESTAR_STAGE9_MOTTLING_EXEMPTION_CHANGED_PIXEL_RATIO_MAX` | `stage9_mottling_exemption_changed_pixel_ratio_max` | `0.12` | 低绝对斑驳豁免允许的最大显著变化覆盖；超过时仍执行斑驳增长门控 |
+| `SEESTAR_STAGE9_CHANGED_PIXEL_RATIO_MAX` / `SEESTAR_STAGE9_DARKENING_RATIO_MAX` | 对应同名小写配置 | `0.35` / `0.005` | 显著变化覆盖和异常变暗像素占比上限 |
+| `SEESTAR_STAGE9_WEAK_STAR_RECOVERY_RATIO_MIN` | `stage9_weak_star_recovery_ratio_min` | `0.70` | 候选相对 Stage 8 必须恢复的弱星组件数量比例下限 |
+| `SEESTAR_STAGE9_STAR_RECOVERY_RATIO_MIN` | `stage9_star_recovery_ratio_min` | `0.75` | 候选相对 Stage 8 必须恢复的全部星点组件数量比例下限 |
+| `SEESTAR_STAGE9_WEAK_STAR_SCREEN_INTENSITY_MIN` | `stage9_weak_star_screen_intensity_min` | `0.40` | 弱星 Screen 强度下限（限幅 0.10–1.05）；默认允许质量失败后的降强度阶梯真实生效，弱星恢复率门控防止过度降级 |
+| `SEESTAR_STAGE9_STAR_SUPPORT_RATIO_MAX` / `SEESTAR_STAGE9_UNMATCHED_CHANGED_RATIO_MAX` | 对应同名小写配置 | `0.12` / `0.01` | 实际 Alpha 星点支持覆盖与支持区外显著变化比例上限 |
+| `SEESTAR_STAGE9_CHROMATIC_ADDITION_PEAK_MIN` / `SEESTAR_STAGE9_CHROMATIC_ADDITION_SATURATION_MIN` / `SEESTAR_STAGE9_CHROMATIC_ADDITION_RATIO_MAX` | 对应同名小写配置 | `0.02` / `0.70` / `0.003` | 统计 Stage 9 相对 Stage 8 的强新增且高饱和像素；占比超限时拒绝候选，并在最终质量报告中二次拦截 |
+| `SEESTAR_STAGE9_STAR_APERTURE_RECOVERY_RATIO_MIN` / `SEESTAR_STAGE9_STAR_WING_RECOVERY_RATIO_MIN` | 对应同名小写配置 | `0.75` / `0.65` | 独立星表的 7×7 孔径通量与星翼最低恢复比例 |
+| `SEESTAR_STAGE9_RESIDUAL_DARK_HOLE_RATIO_MAX` | `stage9_residual_dark_hole_ratio_max` | `0.15` | 星点支持区回混后残余暗坑比例上限 |
+| `SEESTAR_STAGE9_HOLLOW_STRUCTURE_DELTA_MIN` / `SEESTAR_STAGE9_NEW_HOLLOW_STRUCTURE_AREA_MAX` | 对应同名小写配置 | `0.05` / `64` | 新增闭合环/空心结构的最小亮度变化与最大允许空心面积 |
+| `SEESTAR_STAGE9_LOCAL_COMPONENT_PEAK_MIN` / `SEESTAR_STAGE9_LOCAL_COMPONENT_AREA_MAX` | 对应同名小写配置 | `0.01` / `256` | Stage 9 局部新增连通块检测阈值与单块面积上限 |
+| `SEESTAR_STAGE9_LOCAL_COMPONENT_ASPECT_RATIO_MAX` / `SEESTAR_STAGE9_LOCAL_COMPONENT_FILL_RATIO_MIN` / `SEESTAR_STAGE9_LOCAL_SINGLE_PIXEL_RATIO_MAX` | 对应同名小写配置 | `3.0` / `0.15` / `0.20` | 非星形细长/稀疏连通块和单像素碎片比例门限 |
+| `SEESTAR_STAGE9_LOCAL_CYAN_BLUE_PEAK_MIN` / `SEESTAR_STAGE9_LOCAL_CYAN_BLUE_SATURATION_MIN` / `SEESTAR_STAGE9_LOCAL_CYAN_BLUE_COMPONENT_AREA_MAX` | 对应同名小写配置 | `0.01` / `0.50` / `64` | 局部青蓝增量团块的峰值、色彩跨度与最大单块面积 |
+| `SEESTAR_STAGE9_CORE_PERCENTILE` / `SEESTAR_STAGE9_CORE_COLOR_JUMP_MIN` / `SEESTAR_STAGE9_CORE_COLOR_JUMP_COMPONENT_AREA_MAX` | 对应同名小写配置 | `90` / `0.10` / `64` | 星云核心定义百分位、归一化 RGB 突变阈值及最大突变块面积 |
+| `SEESTAR_FORCE_REVIEW_ONLY_OUTPUT` | `force_review_only_output` | `0`（`resources/default.env` 为 `1`） | 可选；不设置时使用配置默认值，设为 `1` 时仅生成 `result_review*`，不占用正式结果名 |
+| `SEESTAR_STAGE10_CHROMA_FOCUS_SCORE_MIN` / `SEESTAR_STAGE10_SEPARATE_CHROMA_SCORE_MIN` | 对应同名小写配置 | `0.34` / `0.70` | Stage 10 选择 chroma 色度专用模式和 severe separate 模式的综合色噪门限 |
+| `SEESTAR_STAGE10_FULL_BG_STD_MIN` / `SEESTAR_STAGE10_FULL_MOTTLING_SCORE_MIN` | 对应同名小写配置 | `0.018` / `0.45` | 色噪同时伴随亮度噪声或低频斑驳时切换为 full 模式的门限 |
+| `SEESTAR_STAGE10_STAGE9_LOCAL_COLOR_RISK_STRENGTH` | `stage10_stage9_local_color_risk_strength` | `1.0` | Stage 10 按 Stage 9 局部青蓝/核心颜色风险缩减正向最终饱和度的强度（0–1） |
 | `SEESTAR_SPCC_ALLOW_LIGHT_PREPROCESS` | — | `"1"` | 允许 Light_ 模式下尝试 SPCC；设为 `0` 时跳过 SPCC 直接走 PCC |
 | `SEESTAR_SIRIL_PLUGIN_DIR` | `siril_plugin_dir` | — | 插件目录路径 |
 | `SEESTAR_COSMIC_CLASSIC_ENABLE` | — | `0` | 是否启用 classic CosmicClarity executable 路径；默认使用 Native/SCUNet |
@@ -864,10 +1031,10 @@ AI Plan 解析容错：
 - `stage3_bgremoved.fit`
 - `stage4_psolved.fit`
 - `stage4_color.fit`（兼容别名：`stage4_colorbalanced.fit`）
-- `stage5_linear.fit`、`stage5_deconv.fit`（可选）、`stage5_denoised.fit`（兼容别名）
+- `stage5_linear.fit`、`stage5_graxpert_deconv.fit` / `stage5_deconv.fit`（二选一，可选）、`stage5_denoised.fit`（兼容别名）
 - `stage6_starless_quality.json`（兼容别名：`stage7_quality.json`）
 - `stage6_starless.fit`（兼容别名：`stage7_starless.fit`）
-- `stage7_conservative_asinh.fit`、`stage7_ultra_conservative_asinh.fit`（去星前门控需要时）
+- `stage7_conservative_asinh.fit`、`stage7_ultra_conservative_asinh.fit`（旧去星前门控可能生成的诊断产物，不进入正式 Stage 6）
 - `stage7_cand_a.fit`、`stage7_cand_b.fit`、`stage7_preview_ref.fit`
 - `stage7_stretch_quality.json`、`stretch_candidates_report.json`
 - `stage7_stretched.fit`
@@ -876,13 +1043,16 @@ AI Plan 解析容错：
 - `stage8_input_starless.fit`、`stage8_quality.json`、`stage8_enhancement_report.json`
 - `starless_enhanced.fit`
 - `stage8_enhanced.fit`
-- `starmask.fit`
+- `starmask_raw.fit`、`starmask_clean.fit`（若清理通过）、`starmask_external_raw.fit`（若导入外部层）、`starmask.fit`（当前层兼容别名）
 - `starmask_stretched.fit`
+- `stage9_remix_quality.json`
 - `stage9_remixed.fit`
 - `stage10_final.fit`
 - `result_linear.fit`（工作目录中的拉伸前线性中间文件）
 - `sasp_starless_input.fit`、`sasp_starmask_input.fit`（工作目录中的 SASP 交换文件）
 - `stage11_ai_source.fit`、`stage11_ai_output.png`、`stage11_ai_output_fit.fit`、`stage11_ai_blended.fit`（仅阶段 11 运行时出现）
+- `<work_dir>/ai_artistic_derivative/source_preview.png`、`result_artistic_derivative.*`、`artistic_report.json`（仅隔离艺术实验显式开启时出现；不属于 Stage 产物）
+- `review_bundles/<stage>/before.png`、`after.png`、`difference.png`、`signed_difference.png`、`review.json`：Stage 3-10 和可选 Stage 11 的统一视觉复核包；包含 before/after 指标、指标差值、目标策略上下文和待复核 checklist。Stage 3、6、7、8、9、11 还包含候选及觉验收状态；Stage 9 为确定性 P0 门控的非阻断证据包，多模态开启也不改写门控结论。生成或视觉调用失败只记录警告，不阻断离线主流程；可用 `PipelineConfig.review_bundle_enabled=False` 关闭。
 
 是否保留取决于：
 
@@ -890,6 +1060,8 @@ AI Plan 解析容错：
 - `checkpoint_mode=True`：只保存关键检查点
 - `debug_mode=True`：保留 `stage*` 等中间文件，但会清理 `*lightsrc*` 预处理序列
 - `debug_mode=False`：清理阶段会删除大多数中间文件
+
+无论是否开启 Debug，只要存在轻量诊断文件，清理前都会在工作目录原子生成 `seestar_diagnostics.zip`。归档包含 JSON/JSONL、日志、CSV/TXT 和 review bundle PNG，不包含 FITS 等大体积科学图像；`manifest.json` 列出归档文件。归档失败只记警告，不中止主任务。
 
 Debug 模式下，每次 `_save_stage_output()` 成功保存阶段 FIT 后，会按统一格式输出质量指标：
 
@@ -903,9 +1075,9 @@ JSON 结构固定包含 `schema`、`sequence`、`stem`、`file`、`metrics`、`f
 
 `cleanup()` 在非调试模式下会：
 
-- 先通过 `_cleanup_lightsrc_intermediates()` 清理 `process/` 内 `*lightsrc*` 相关文件和 `_light_input/` 目录
+- 先生成工作目录下的 `seestar_diagnostics.zip`，再通过 `_cleanup_lightsrc_intermediates()` 清理 `process/` 内 `*lightsrc*` 相关文件和 `_light_input/` 目录
 - 清理 `process/` 内大部分 `fit/fits/seq/log/csv/lst`
-- 默认保留 `starless.fit`、`starmask.fit`
+- 默认保留 `starless.fit`、各 raw/clean starmask、`starmask.fit` 和 `starmask_stretched.fit`（存在时）
 - 如果存在拉伸名，还保留对应的拉伸星点蒙版检查点
 - 不会删除工作目录中的 `result_linear.fit`
 - 阶段 11 临时文件会在非调试模式下由 `stage11_ai_postprocess.py` 主动删除

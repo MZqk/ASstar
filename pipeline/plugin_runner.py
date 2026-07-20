@@ -20,6 +20,26 @@ from sirilpy.exceptions import CommandError, DataError, SirilError
 
 ENV_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 ENV_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+_INHERITED_QT_ENV_KEYS = (
+    "QT_PLUGIN_PATH",
+    "QT_QPA_PLATFORM_PLUGIN_PATH",
+    "QT_QPA_PLATFORM",
+    "QML2_IMPORT_PATH",
+    "QML_IMPORT_PATH",
+    "QTWEBENGINEPROCESS_PATH",
+    "QTWEBENGINE_RESOURCES_PATH",
+    "QTWEBENGINE_LOCALES_PATH",
+    "QT_API",
+)
+
+
+def isolated_plugin_subprocess_env(source: dict[str, str]) -> dict[str, str]:
+    """Return a headless Qt environment isolated from the frozen GUI."""
+    env = source.copy()
+    for key in _INHERITED_QT_ENV_KEYS:
+        env.pop(key, None)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    return env
 
 
 def run_first_available_command(
@@ -187,14 +207,30 @@ def run_plugin_script_by_path(
 
 def current_image_fingerprint(pipeline) -> Optional[str]:
     try:
-        image_data = pipeline.siril.get_image_pixeldata(preview=False)
+        # Plugin no-op detection does not need a second full-resolution FITS
+        # transfer. Siril's preview is much smaller and a distributed sample
+        # still detects processing changes deterministically.
+        try:
+            image_data = pipeline.siril.get_image_pixeldata(preview=True)
+        except (TypeError, ValueError):
+            image_data = pipeline.siril.get_image_pixeldata(preview=False)
         if image_data is None:
             return None
         arr = np.asarray(image_data)
         digest = hashlib.sha256()
         digest.update(str(arr.shape).encode("ascii", errors="ignore"))
         digest.update(str(arr.dtype).encode("ascii", errors="ignore"))
-        digest.update(np.ascontiguousarray(arr).view(np.uint8))
+        flat = arr.reshape(-1)
+        sample_count = min(flat.size, 65536)
+        if sample_count:
+            if flat.size > sample_count:
+                indices = np.linspace(
+                    0, flat.size - 1, num=sample_count, dtype=np.int64
+                )
+                sample = flat[indices]
+            else:
+                sample = flat
+            digest.update(np.ascontiguousarray(sample).view(np.uint8))
         return digest.hexdigest()
     except (AttributeError, TypeError, ValueError, IndexError, FloatingPointError) as e:
         pipeline.log.debug(f"图像指纹采样跳过: {e}")
@@ -343,7 +379,7 @@ def run_plugin_script_cli_subprocess(
     cmd = [python_cli, str(script_path), *args]
     before_fingerprint = pipeline._current_image_fingerprint() if verify_image_change else None
 
-    env = os.environ.copy()
+    env = isolated_plugin_subprocess_env(os.environ)
     env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
     raw_timeout = str(env.get("SEESTAR_SIRILPY_TIMEOUT_SEC", "")).strip()
@@ -356,13 +392,26 @@ def run_plugin_script_cli_subprocess(
     pipeline.log.info(f"{step_key} 使用 CLI 子进程: {script_path.name}")
     pipeline.log.debug(f"{step_key} CLI 命令: {' '.join(cmd)}")
     parent_was_connected = bool(getattr(pipeline.siril, "connected", False))
+    log_sink_paused = False
     if parent_was_connected:
         try:
+            set_log_sink = getattr(pipeline.log, "set_sink", None)
+            if callable(set_log_sink):
+                # The parent Siril connection is intentionally unavailable while
+                # the child owns it. Keep heartbeat/status logs file-only until
+                # the parent reconnects, otherwise the Siril sink marks the
+                # expected disconnect as a native-process failure.
+                set_log_sink(None)
+                log_sink_paused = True
             pipeline.siril.disconnect()
             pipeline.log.debug(
                 f"{step_key} CLI 子进程前已临时释放 Siril 连接"
             )
         except (CommandError, DataError, SirilError, OSError, RuntimeError) as e:
+            if log_sink_paused and bool(
+                getattr(pipeline.siril, "connected", False)
+            ):
+                pipeline.log.set_sink(pipeline.siril.log)
             pipeline._last_plugin_script_error = (
                 f"{script_path.name}: failed to release parent Siril "
                 f"connection before CLI subprocess: {pipeline._short_text(e, 160)}"
@@ -421,6 +470,8 @@ def run_plugin_script_cli_subprocess(
         if parent_was_connected:
             try:
                 pipeline.siril.connect()
+                if log_sink_paused:
+                    pipeline.log.set_sink(pipeline.siril.log)
                 pipeline.log.debug(
                     f"{step_key} CLI 子进程后已恢复 Siril 连接"
                 )

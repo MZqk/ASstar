@@ -20,12 +20,14 @@ import numpy as np
 import ai_advisory
 import cosmic_clarity
 import plugin_runner
+import review_bundle
 import sasp_runner
 import scunet_denoise
 import syqon_starless
 import stage7_quality
 import stage7_repair
 import stage8_pixels
+import stage9_quality
 from image_metrics import (
     _box_blur_gray,
     _clamp_float,
@@ -565,6 +567,8 @@ class Stage7ServiceMixin:
         if not self.starmask_file and not self._build_manual_starmask():
             self.log.warn("手动星点层失败，尝试自动 starmask 回退...")
             candidates = [
+                self.process_dir / "starmask_clean.fit",
+                self.process_dir / "starmask_raw.fit",
                 self.process_dir / f"{self.stretched_name}_starmask.fit",
                 self.process_dir / f"{self.stretched_name}_starmask.fits",
                 self.process_dir / "starmask.fit",
@@ -602,7 +606,12 @@ class Stage7ServiceMixin:
 
 
     def _stage7_snapshot_current_outputs(self, suffix: str) -> Dict[str, Optional[str]]:
-        snapshot: Dict[str, Optional[str]] = {"starless": None, "starmask": None}
+        snapshot: Dict[str, Optional[str]] = {
+            "starless": None,
+            "starmask": None,
+            "starmask_raw": None,
+            "starmask_kind": None,
+        }
         if not self.process_dir:
             return snapshot
         if self.starless_file and self.starless_file.exists():
@@ -613,6 +622,14 @@ class Stage7ServiceMixin:
             target = self.process_dir / f"starmask_{suffix}.fit"
             shutil.copy2(self.starmask_file, target)
             snapshot["starmask"] = target.stem
+            snapshot["starmask_kind"] = (
+                "clean" if self.starmask_file.stem == "starmask_clean" else "raw"
+            )
+        raw_starmask = self.process_dir / "starmask_raw.fit"
+        if raw_starmask.exists():
+            target_raw = self.process_dir / f"starmask_raw_{suffix}.fit"
+            shutil.copy2(raw_starmask, target_raw)
+            snapshot["starmask_raw"] = target_raw.stem
         return snapshot
 
 
@@ -621,16 +638,35 @@ class Stage7ServiceMixin:
             return
         starless_src = self.process_dir / f"{snapshot['starless']}.fit"
         target_starless = self.process_dir / "starless.fit"
-        shutil.copy2(starless_src, target_starless)
-        self.starless_file = target_starless
+        restore_plan: List[Tuple[Path, Path]] = [(starless_src, target_starless)]
+        raw_starmask_stem = snapshot.get("starmask_raw")
+        if raw_starmask_stem:
+            raw_src = self.process_dir / f"{raw_starmask_stem}.fit"
+            restore_plan.append((raw_src, self.process_dir / "starmask_raw.fit"))
         starmask_stem = snapshot.get("starmask")
+        restored_starmask: Optional[Path] = None
         if starmask_stem:
             starmask_src = self.process_dir / f"{starmask_stem}.fit"
-            target_starmask = self.process_dir / "starmask.fit"
-            shutil.copy2(starmask_src, target_starmask)
-            self.starmask_file = target_starmask
-        else:
-            self.starmask_file = None
+            compatibility_starmask = self.process_dir / "starmask.fit"
+            restore_plan.append((starmask_src, compatibility_starmask))
+            if snapshot.get("starmask_kind") == "clean":
+                target_starmask = self.process_dir / "starmask_clean.fit"
+                restore_plan.append((starmask_src, target_starmask))
+                restored_starmask = target_starmask
+            else:
+                restored_starmask = compatibility_starmask
+
+        missing_sources = [source for source, _target in restore_plan if not source.is_file()]
+        if missing_sources:
+            missing_names = ", ".join(source.name for source in missing_sources)
+            raise FileNotFoundError(f"Stage7 snapshot is incomplete: {missing_names}")
+
+        # Validate every source before replacing any live output.  A corrupt
+        # snapshot must not leave starless and starmask from different retries.
+        for source, target in restore_plan:
+            shutil.copy2(source, target)
+        self.starless_file = target_starless
+        self.starmask_file = restored_starmask
 
 
     def _stage7_build_conservative_starless_inputs(self) -> List[Dict[str, Any]]:
@@ -1052,6 +1088,14 @@ class AiPostServiceMixin:
         return ai_advisory.request_ai_adjustments(self, source_features)
 
 
+    def _request_visual_acceptance(
+        self,
+        stage_key: str,
+        review_payload: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        return ai_advisory.request_visual_acceptance(self, stage_key, review_payload)
+
+
     def _box_blur_rgb(self, rgb: np.ndarray) -> np.ndarray:
         arr = np.asarray(rgb, dtype=np.float32)
         if arr.ndim != 3 or arr.shape[0] != 3:
@@ -1181,6 +1225,78 @@ class AiPostServiceMixin:
 
 
 class StageSupportMixin:
+    def _create_stage_review_bundle(
+        self,
+        stage_key: str,
+        before_stem: str,
+        after_stem: str,
+        *,
+        context: Optional[Dict[str, Any]] = None,
+        candidates: Optional[List[Dict[str, Any]]] = None,
+        selected_candidate: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Write non-blocking visual evidence for later human or multimodal review."""
+        try:
+            payload = review_bundle.create_stage_review_bundle(
+                self,
+                stage_key=stage_key,
+                before_stem=before_stem,
+                after_stem=after_stem,
+                context={
+                    "target_type": (
+                        self._active_target_type()
+                        if hasattr(self, "_active_target_type")
+                        else "generic_low_snr_safe"
+                    ),
+                    "policy": (
+                        self._active_policy_name()
+                        if hasattr(self, "_active_policy_name")
+                        else "generic_low_snr_safe"
+                    ),
+                    **(context or {}),
+                },
+                candidates=candidates,
+                selected_candidate=selected_candidate,
+            )
+            if payload.get("status") == "ready":
+                advisor_mode = ai_advisory.advisor_mode(self)
+                if (
+                    bool(getattr(self.cfg, "ai_post_enabled", False))
+                    and stage_key in ai_advisory.VISUAL_ACCEPTANCE_STAGE_KEYS
+                ):
+                    try:
+                        verdict = ai_advisory.request_visual_acceptance(
+                            self,
+                            stage_key,
+                            payload,
+                        )
+                        payload = review_bundle.apply_visual_acceptance(
+                            payload,
+                            verdict,
+                            advisor_mode=advisor_mode,
+                        )
+                    except (OSError, RuntimeError, TypeError, ValueError) as error:
+                        self.log.warn(
+                            f"[{stage_key}] multimodal visual acceptance unavailable: {error}"
+                        )
+                        payload = review_bundle.apply_visual_acceptance(
+                            payload,
+                            None,
+                            advisor_mode=advisor_mode,
+                            error=self._short_text(error, 180),
+                        )
+                self.log.info(
+                    f"[{stage_key}] review bundle ready: {payload.get('report_path')}"
+                )
+            return payload
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self.log.warn(f"[{stage_key}] review bundle skipped: {error}")
+            return {
+                "stage": stage_key,
+                "status": "unavailable",
+                "reason": self._short_text(error, 180),
+            }
+
     def _is_candidate_stacked(self, f):
         """判断文件是否为候选叠加文件（排除中间产物）"""
         name_lower = f.name.lower()
@@ -1273,7 +1389,6 @@ class StageSupportMixin:
             if base_data is None:
                 raise RuntimeError(f"{source_stem} image buffer is empty")
             base = np.asarray(base_data)
-            base_dtype = base.dtype
 
             self.cmd_with_check("load", starmask_name)
             star_data = self.siril.get_image_pixeldata(preview=False)
@@ -1281,26 +1396,50 @@ class StageSupportMixin:
                 raise RuntimeError(f"{starmask_name} image buffer is empty")
             stars = self._match_star_layer_shape(np.asarray(star_data), base)
 
-            base_float = np.nan_to_num(
-                base.astype(np.float32, copy=False),
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
+            weak_mask = None
+            bright_mask = None
+            alpha_mask = None
+            catalog = getattr(self, "_stage9_star_reference_catalog", None)
+            if isinstance(catalog, dict) and catalog.get("status") == "ok":
+                calibration = dict(
+                    getattr(self, "_stage9_starmask_calibration", {}) or {}
+                )
+                strict_overlay = str(calibration.get("support_mode") or "") == (
+                    "strict_recovery"
+                )
+                weak_mask, bright_mask, alpha_mask = (
+                    stage9_quality.build_star_overlay_masks(
+                        catalog,
+                        strict=strict_overlay,
+                    )
+                )
+            configured_weak_intensity = max(
+                0.10,
+                min(
+                    1.05,
+                    float(
+                        getattr(
+                            self.cfg,
+                            "stage9_weak_star_screen_intensity_min",
+                            0.40,
+                        )
+                    ),
+                ),
             )
-            stars_float = np.nan_to_num(
-                stars.astype(np.float32, copy=False),
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
+            weak_intensity = max(float(intensity), configured_weak_intensity)
+            mixed = stage9_quality.screen_blend(
+                base,
+                stars,
+                intensity,
+                alpha_mask=alpha_mask,
+                weak_mask=weak_mask,
+                bright_mask=bright_mask,
+                weak_intensity=weak_intensity,
             )
-            stars_float = np.clip(stars_float, 0.0, None)
-            mixed = np.clip(base_float + stars_float * float(intensity), 0.0, None)
-
-            if np.issubdtype(base_dtype, np.integer):
-                info = np.iinfo(base_dtype)
-                mixed = np.clip(mixed, info.min, info.max).astype(base_dtype, copy=False)
-            else:
-                mixed = mixed.astype(np.float32, copy=False)
+            self._stage9_last_star_overlay_mask = alpha_mask
+            self._stage9_last_weak_overlay_mask = weak_mask
+            self._stage9_last_bright_overlay_mask = bright_mask
+            self._stage9_last_star_layer = np.array(stars, copy=True)
 
             # After reading starmask, switch the active Siril image back to the
             # stage-8 base before replacing its pixels with the composed result.
@@ -1315,13 +1454,73 @@ class StageSupportMixin:
                 )
                 self.siril.set_image_pixeldata(mixed)
             self.log.info(
-                "阶段9 使用上一阶段 Starless 图像回混星点 "
-                f"(source={source_stem}, starmask={starmask_name}, intensity={intensity})"
+                "阶段9 使用显式上层 Alpha+Screen 向 Starless 底图回混星点 "
+                f"(source={source_stem}, starmask={starmask_name}, "
+                f"bright_intensity={intensity}, weak_intensity={weak_intensity})"
             )
             return True
         except (CommandError, SirilError, DataError, RuntimeError, ValueError) as e:
             self.log.warn(f"上一阶段星点合成失败: {e}")
             return False
+
+    def _stage9_assess_current_remix(
+        self,
+        source_stem: str,
+        *,
+        attempt: str,
+        formula: str,
+    ) -> Dict[str, Any]:
+        """Measure the active Stage 9 candidate, restoring it after loading its base."""
+        try:
+            candidate_data = self.siril.get_image_pixeldata(preview=False)
+            if candidate_data is None:
+                raise RuntimeError("Stage9 candidate image buffer is empty")
+            candidate = np.array(candidate_data, copy=True)
+
+            self.cmd_with_check("load", source_stem)
+            base_data = self.siril.get_image_pixeldata(preview=False)
+            if base_data is None:
+                raise RuntimeError(f"{source_stem} image buffer is empty")
+            base = np.array(base_data, copy=True)
+            report = stage9_quality.assess_remix(
+                base,
+                candidate,
+                self.cfg,
+                attempt=attempt,
+                formula=formula,
+                star_reference=getattr(
+                    self,
+                    "_stage9_star_reference_catalog",
+                    None,
+                ),
+                star_overlay_mask=getattr(
+                    self,
+                    "_stage9_last_star_overlay_mask",
+                    None,
+                ),
+            )
+
+            self.cmd_with_check("load", source_stem)
+            lock_factory = getattr(self.siril, "image_lock", None)
+            if callable(lock_factory):
+                with lock_factory():
+                    self.siril.set_image_pixeldata(candidate)
+            else:
+                self.siril.set_image_pixeldata(candidate)
+            return report
+        except (CommandError, SirilError, DataError, RuntimeError, ValueError) as e:
+            self.log.warn(f"Stage9 remix quality assessment failed: {e}")
+            return {
+                "attempt": attempt,
+                "formula": formula,
+                "status": "rejected",
+                "accepted": False,
+                "gate_enabled": bool(
+                    getattr(self.cfg, "stage9_quality_gate_enabled", True)
+                ),
+                "issues": [self._short_text(e, 180)],
+                "metrics": {},
+            }
 
     # --------------------------------------------------
     # 连接
@@ -1721,13 +1920,44 @@ class StageSupportMixin:
 
     def _stage9_bad_starless_reason(self) -> str:
         reasons: List[str] = []
+        advisories: List[str] = []
+        accepted_stretch = bool(
+            getattr(self, "_stage7_stretch_accepted", False)
+        )
+        accepted_stretch_stem = str(
+            getattr(self, "_stage7_stretch_output", None)
+            or getattr(self, "stretched_name", None)
+            or ""
+        ).strip()
+        process_dir = getattr(self, "process_dir", None)
+        if accepted_stretch and accepted_stretch_stem and process_dir is not None:
+            accepted_stretch = (
+                process_dir / f"{accepted_stretch_stem}.fit"
+            ).is_file()
+        else:
+            accepted_stretch = False
+        if not accepted_stretch:
+            reasons.append("stage7_stretch_not_accepted")
         if bool(getattr(self, "_stage7_starless_skipped", False)):
             reasons.append("stage7_starless_skipped")
         quality = getattr(self, "_stage7_selected_quality", None)
         if isinstance(quality, dict):
             status = str(quality.get("status", "") or "").lower()
+            quality_issues = [
+                str(item).strip().lower()
+                for item in (quality.get("issues") or [])
+                if str(item).strip()
+            ]
+            dynamic_range_only = bool(quality_issues) and all(
+                item.startswith("starless_dynamic_range_collapse")
+                for item in quality_issues
+            )
             if status and status != "ok":
-                reasons.append(f"stage7_quality_status={status}")
+                status_reason = f"stage7_quality_status={status}"
+                if accepted_stretch and dynamic_range_only:
+                    advisories.append(status_reason)
+                else:
+                    reasons.append(status_reason)
             derived = quality.get("derived") if isinstance(quality.get("derived"), dict) else {}
             residual = float(derived.get("residual_star_score", 0.0) or 0.0)
             halo = float(derived.get("halo_residue_score", 0.0) or 0.0)
@@ -1755,22 +1985,44 @@ class StageSupportMixin:
             peak_threshold = float(
                 getattr(self.cfg, "stage7_starless_peak_signal_min", 0.006)
             )
-            if dynamic_range_ratio < dynamic_threshold and peak_signal < peak_threshold:
-                reasons.append(
+            collapse = derived.get("dynamic_range_collapse")
+            if collapse is None:
+                collapse = (
+                    dynamic_range_ratio < dynamic_threshold
+                    and peak_signal < peak_threshold
+                )
+            if bool(collapse):
+                dynamic_reason = (
                     "stage7_starless_dynamic_range "
                     f"{dynamic_range_ratio:.3f}<{dynamic_threshold:.3f}, "
                     f"peak={peak_signal:.5f}<{peak_threshold:.5f}"
                 )
+                if accepted_stretch:
+                    advisories.append(dynamic_reason)
+                else:
+                    reasons.append(dynamic_reason)
+        self._stage9_starless_advisories = list(dict.fromkeys(advisories))
         return ", ".join(dict.fromkeys(reasons))
 
 
     def _stage9_review_safe_source(self) -> str:
-        candidates = [
-            self.stretched_name or "stage7_stretched",
-            "stage7_stretched",
-            "stage7_cand_a",
-            "stage7_cand_b",
+        candidates: List[Optional[str]] = [
+            getattr(self, "_stage7_review_source", None)
         ]
+        if bool(getattr(self, "_stage7_stretch_accepted", False)):
+            candidates.extend(
+                [getattr(self, "_stage7_stretch_output", None), "stage7_stretched"]
+            )
+        candidates.extend(
+            [
+                "stage7_cand_rescue_3",
+                "stage7_cand_rescue_2",
+                "stage7_cand_rescue_1",
+                "stage7_cand_b",
+                "stage7_cand_a",
+                self.stretched_name,
+            ]
+        )
         seen = set()
         for stem in candidates:
             if not stem or stem in seen:

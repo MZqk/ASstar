@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import starmask_cleanup
 
 from image_metrics import (
     _box_blur_gray,
@@ -42,156 +43,50 @@ def stage7_clean_starmask(
         "reason": "",
         "metrics": {},
     }
-    if not pipeline.cfg.stage7_starmask_clean_enabled:
-        result["reason"] = "disabled"
-        return result
     if not pipeline.starmask_file or not pipeline.starmask_file.exists():
         result["reason"] = "starmask_missing"
         return result
 
-    source_stem = source_stem or pipeline.stretched_name or "stage7_stretched"
+    process_dir = getattr(pipeline, "process_dir", None) or pipeline.starmask_file.parent
+    raw_path = process_dir / "starmask_raw.fit"
     try:
-        source_data = pipeline._read_image_by_stem(source_stem)
-        if source_data is None:
-            result["reason"] = "source_unavailable"
-            return result
+        if pipeline.starmask_file != raw_path:
+            shutil.copy2(pipeline.starmask_file, raw_path)
+        result["raw_file"] = raw_path.name
+    except OSError as e:
+        result["status"] = "failed"
+        result["reason"] = f"raw starmask preservation failed: {pipeline._short_text(e, 160)}"
+        return result
+    if not pipeline.cfg.stage7_starmask_clean_enabled:
+        result["reason"] = "disabled; raw starmask preserved"
+        return result
 
+    try:
         pipeline.cmd_with_check("load", pipeline.starmask_file.stem)
         starmask_data = pipeline.siril.get_image_pixeldata(preview=False)
         if starmask_data is None:
             result["reason"] = "starmask_buffer_empty"
             return result
-
-        stars_arr = np.asarray(starmask_data)
-        output_dtype = stars_arr.dtype
-        stars = np.nan_to_num(
-            stars_arr.astype(np.float32, copy=False),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
+        output, metrics = starmask_cleanup.clean_starmask_pixels(
+            np.asarray(starmask_data),
+            pipeline.cfg,
         )
-        stars = np.clip(stars, 0.0, None)
-        if not stars.size or float(np.max(stars)) <= 1e-8:
-            result["reason"] = "starmask_empty"
-            return result
-
-        source = pipeline._match_star_layer_shape(np.asarray(source_data), stars)
-        source_rgb = _to_rgb_float_image(source, max_side=100_000)
-        source_gray = (
-            0.2126 * source_rgb[0]
-            + 0.7152 * source_rgb[1]
-            + 0.0722 * source_rgb[2]
-        ).astype(np.float32)
-        stars_rgb = _to_rgb_float_image(stars, max_side=100_000)
-        stars_gray = (
-            0.2126 * stars_rgb[0]
-            + 0.7152 * stars_rgb[1]
-            + 0.0722 * stars_rgb[2]
-        ).astype(np.float32)
-        if source_gray.shape != stars_gray.shape:
-            result["reason"] = "shape_mismatch"
-            return result
-
-        cleaned = stars.copy()
-        positive = stars_gray[stars_gray > 1e-7]
-        if positive.size:
-            floor = float(np.percentile(
-                positive,
-                pipeline.cfg.stage7_starmask_background_floor_percentile,
-            ))
-            high = float(np.percentile(positive, 99.5))
-            if math.isfinite(floor) and math.isfinite(high) and high > floor:
-                keep_weight = np.clip((stars_gray - floor) / (high - floor), 0.0, 1.0)
-                keep_weight = keep_weight ** 0.70
-                cleaned *= (
-                    keep_weight[None, :, :]
-                    if cleaned.ndim == 3
-                    else keep_weight
-                )
-            small_limit = float(np.percentile(positive, 90.0))
-            small_region = (stars_gray > floor) & (stars_gray < small_limit)
-            if int(np.count_nonzero(small_region)) > 0:
-                small_weight = (
-                    np.broadcast_to(small_region, cleaned.shape)
-                    if cleaned.ndim == 3
-                    else small_region
-                )
-                cleaned = np.where(
-                    small_weight,
-                    cleaned * float(pipeline.cfg.stage7_starmask_small_star_scale),
-                    cleaned,
-                )
-        else:
-            floor = 0.0
-
-        source_features = measure_image_features(source)
-        source_bg = float(source_features.bg_median)
-        source_std = max(float(source_features.bg_std), 1e-5)
-        core_threshold = max(
-            float(np.quantile(source_gray, 0.995)),
-            source_bg + max(6.0 * source_std, 0.08),
-        )
-        core_mask = source_gray > core_threshold
-        halo_region = np.zeros_like(source_gray, dtype=bool)
-        if int(np.count_nonzero(core_mask)) > 0:
-            halo_weight = core_mask.astype(np.float32)
-            for _ in range(4):
-                halo_weight = _box_blur_gray(halo_weight)
-            halo_region = halo_weight > 0.006
-            if (
-                int(np.count_nonzero(halo_region)) > 16
-                and pipeline.cfg.stage7_starmask_halo_blur_strength > 1e-4
-            ):
-                blur_strength = float(pipeline.cfg.stage7_starmask_halo_blur_strength)
-                if cleaned.ndim == 3:
-                    blurred = np.empty_like(cleaned)
-                    for idx in range(cleaned.shape[0]):
-                        blurred[idx] = _box_blur_gray(cleaned[idx])
-                    halo_weight_3d = np.broadcast_to(halo_region, cleaned.shape)
-                    cleaned = np.where(
-                        halo_weight_3d,
-                        cleaned * (1.0 - blur_strength) + blurred * blur_strength,
-                        cleaned,
-                    )
-                else:
-                    blurred = _box_blur_gray(cleaned)
-                    cleaned = np.where(
-                        halo_region,
-                        cleaned * (1.0 - blur_strength) + blurred * blur_strength,
-                        cleaned,
-                    )
-
-        object_threshold = max(
-            float(np.quantile(source_gray, 0.70)),
-            source_bg + max(1.8 * source_std, 0.02),
-        )
-        diffuse_mask = source_gray > object_threshold
-        star_weight = core_mask.astype(np.float32)
-        for _ in range(4):
-            star_weight = _box_blur_gray(star_weight)
-        nebula_mask = diffuse_mask & (star_weight <= 0.003)
-        nebula_pixels = int(np.count_nonzero(nebula_mask))
-        if nebula_pixels > 16 and pipeline.cfg.stage7_starmask_nebula_suppression > 1e-4:
-            suppression = float(pipeline.cfg.stage7_starmask_nebula_suppression)
-            nebula_weight = (
-                np.broadcast_to(nebula_mask, cleaned.shape)
-                if cleaned.ndim == 3
-                else nebula_mask
+        result["metrics"] = metrics
+        result["source_stem"] = source_stem or pipeline.stretched_name or "stage5_linear"
+        if not bool(metrics.get("accepted", False)):
+            hard_gate_failed = bool(
+                metrics.get("diffuse_hard_gate_failed", False)
             )
-            cleaned = np.where(
-                nebula_weight,
-                cleaned * (1.0 - suppression),
-                cleaned,
+            result["status"] = (
+                "hard_rejected" if hard_gate_failed else "rolled_back"
             )
-
-        before_signal = float(np.sum(stars))
-        after_signal = float(np.sum(cleaned))
-        cleaned = np.clip(cleaned, 0.0, None)
-        if np.issubdtype(output_dtype, np.integer):
-            info = np.iinfo(output_dtype)
-            output = np.clip(cleaned, info.min, info.max).astype(output_dtype, copy=False)
-        else:
-            output = cleaned.astype(np.float32, copy=False)
+            result["hard_gate_failed"] = hard_gate_failed
+            result["reason"] = ", ".join(str(item) for item in metrics.get("issues", []))
+            pipeline.log.warn(
+                "Stage6 starmask cleanup rejected; original mask retained "
+                f"(label={label}, reason={result['reason']})"
+            )
+            return result
 
         pipeline.cmd_with_check("load", pipeline.starmask_file.stem)
         lock_factory = getattr(pipeline.siril, "image_lock", None)
@@ -200,32 +95,26 @@ def stage7_clean_starmask(
                 pipeline.siril.set_image_pixeldata(output)
         else:
             pipeline.siril.set_image_pixeldata(output)
+        pipeline.cmd_with_check("save", "starmask_clean")
+        # Keep starmask.fit as a compatibility alias, but never use it as the
+        # only copy of either the raw or cleaned layer.
         pipeline.cmd_with_check("save", "starmask")
-        pipeline.starmask_file = pipeline.process_dir / "starmask.fit"
+        pipeline.starmask_file = process_dir / "starmask_clean.fit"
+        result["clean_file"] = "starmask_clean.fit"
+        result["compatibility_file"] = "starmask.fit"
 
-        result.update(
-            {
-                "status": "applied",
-                "metrics": {
-                    "background_floor": float(floor),
-                    "signal_before": before_signal,
-                    "signal_after": after_signal,
-                    "signal_ratio": after_signal / max(before_signal, 1e-7),
-                    "halo_pixels": int(np.count_nonzero(halo_region)),
-                    "nebula_suppressed_pixels": nebula_pixels,
-                },
-            }
-        )
+        result["status"] = "applied"
         pipeline.log.info(
-            "Stage7 starmask cleanup applied "
-            f"(label={label}, signal_ratio={result['metrics']['signal_ratio']:.3f}, "
-            f"nebula_pixels={nebula_pixels})"
+            "Stage6 starmask multi-scale cleanup applied "
+            f"(label={label}, signal_ratio={metrics['signal_ratio']:.3f}, "
+            f"compact_retention={metrics['compact_retention']:.3f}, "
+            f"diffuse_residual={metrics['diffuse_residual_ratio']:.3f})"
         )
         return result
     except (CommandError, SirilError, DataError, RuntimeError, ValueError) as e:
         result["status"] = "failed"
         result["reason"] = pipeline._short_text(e, 180)
-        pipeline.log.warn(f"Stage7 starmask cleanup failed: {e}")
+        pipeline.log.warn(f"Stage6 starmask cleanup failed: {e}")
         return result
 
 def apply_stage7_residual_suppression(
@@ -558,6 +447,8 @@ def apply_stage7_starless_pixel_repair(
         repaired = repaired * (1.0 - bg_blend[None, :, :]) + bg_smooth * bg_blend[None, :, :]
 
         output = pipeline._stage8_restore_rgb_like(starless_arr, np.clip(repaired, 0.0, 1.0))
+        background_quality_before = pipeline._background_quality_metrics(starless_arr)
+        background_quality_after = pipeline._background_quality_metrics(output)
         pipeline.cmd_with_check("load", "starless")
         pipeline._set_current_image_pixeldata(
             output,
@@ -576,6 +467,8 @@ def apply_stage7_starless_pixel_repair(
             "residual_strength": residual_strength,
             "halo_strength": halo_strength,
             "chroma_strength": chroma_strength,
+            "background_quality_before": background_quality_before,
+            "background_quality_after": background_quality_after,
         }
         result.update({"status": "applied", "metrics": metrics})
         pipeline.log.info(

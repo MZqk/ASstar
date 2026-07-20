@@ -5,12 +5,60 @@ from sirilpy.exceptions import CommandError, SirilError
 
 from image_metrics import format_feature_summary
 from models import PipelineStage
+from pipeline_safety import color_safety_limits, clamp_saturation_boost
+
+
+def _load_stage8_input(pipeline, messages: List[str]) -> str:
+    """Load this run's accepted Stage 7 output, then conservative fallbacks."""
+    preferred = str(
+        getattr(pipeline, "_stage7_stretch_output", None)
+        or getattr(pipeline, "stretched_name", None)
+        or "stage7_stretched"
+    )
+    stage7_accepted = bool(getattr(pipeline, "_stage7_stretch_accepted", False))
+    candidates: List[str] = []
+    if stage7_accepted:
+        preferred_path = pipeline.process_dir / f"{preferred}.fit"
+        if preferred_path.exists():
+            candidates.append(preferred)
+        else:
+            messages.append(
+                f"stage8 preferred Stage7 input missing: {preferred}.fit; using fallback"
+            )
+    else:
+        messages.append("stage8 Stage7 output not accepted; using linear starless fallback")
+
+    for fallback in ("starless", "stage6_starless"):
+        if fallback not in candidates:
+            candidates.append(fallback)
+
+    last_error: Optional[Exception] = None
+    for source_stem in candidates:
+        try:
+            pipeline.cmd_with_check("load", source_stem)
+            pipeline._stage8_input_source = source_stem
+            pipeline._stage8_input_fallback_used = source_stem != preferred
+            pipeline.starless_file = pipeline.process_dir / f"{source_stem}.fit"
+            messages.append(f"stage8_input_source={source_stem}")
+            pipeline.log.info(f"Stage8 输入源: {source_stem}")
+            return source_stem
+        except (CommandError, SirilError) as error:
+            last_error = error
+            messages.append(
+                f"stage8 input load failed: {source_stem}: "
+                f"{pipeline._short_text(error, 160)}"
+            )
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Stage8 has no usable input source")
 
 
 def run_stage8_nebula_enhancement(pipeline) -> None:
     """
     阶段 8: Starless 深加工（含外部回写）
-    - 优先读取外部工具回写的 starless
+    - 优先使用本轮通过质量门的 stage7_stretched
+    - Stage 7 不合格时回退 starless / stage6_starless
     - SASP WaveScale/DSE 输出必须经 Starless soft mask 回混
     - 插件不可用时回退到内置分区增强
     """
@@ -21,10 +69,92 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
     pipeline._stage8_final_source = "starless_enhanced"
     pipeline._stage8_fallback_used = False
     pipeline._stage8_final_quality = "unknown"
+    pipeline._stage8_input_source = None
+    pipeline._stage8_input_fallback_used = False
     stage8_initial_quality = "unknown"
     stage8_reject_reason = ""
+    color_limits = color_safety_limits(
+        getattr(pipeline, "pipeline_policy", {}) or {},
+        getattr(pipeline, "color_calibration_report", {}) or {},
+    )
+    effective_stage8_saturation = 0.0
+    stage8_ai_plan_applied = False
     if bool(getattr(pipeline, "_stage8_conservative_mode", False)):
         messages.append("stage8 conservative mode requested by Stage7 starless repair/quality gate")
+
+    if (
+        bool(getattr(pipeline, "_star_preserve_target_bypass", False))
+        and bool(getattr(pipeline, "_stage7_stretch_accepted", False))
+    ):
+        source_stem = pipeline.stretched_name or "stage7_stretched"
+        try:
+            pipeline.cmd_with_check("load", source_stem)
+            pipeline._stage8_input_source = source_stem
+            pipeline._stage8_input_fallback_used = False
+            saved = pipeline._save_stage_output("starless_enhanced")
+            stage8_saved = pipeline._save_stage_output("stage8_enhanced") if saved else False
+            pipeline._stage8_final_source = "stage8_enhanced" if stage8_saved else source_stem
+            pipeline._stage8_final_quality = "star_preserve_bypass"
+            pipeline._stage8_fallback_used = False
+            pipeline.starless_file = pipeline.process_dir / f"{pipeline._stage8_final_source}.fit"
+            report = {
+                "stage": "stage8_nebula_enhancement",
+                "status": "skipped",
+                "mode": "star_preserve_target_bypass",
+                "source": source_stem,
+                "final_source": pipeline._stage8_final_source,
+                "target_type": (
+                    pipeline._active_target_type()
+                    if hasattr(pipeline, "_active_target_type")
+                    else "generic_low_snr_safe"
+                ),
+            }
+            pipeline._write_stage_json("stage8_enhancement_report.json", report)
+            messages.append(
+                "star-preserve target bypassed Starless-only enhancement "
+                f"(source={source_stem})"
+            )
+            if stage8_saved and hasattr(pipeline, "_create_stage_review_bundle"):
+                review = pipeline._create_stage_review_bundle(
+                    "stage8_nebula_enhancement",
+                    source_stem,
+                    "stage8_enhanced",
+                    context={"mode": "star_preserve_target_bypass"},
+                    candidates=[
+                        {
+                            "name": "star_preserve_bypass",
+                            "stem": "stage8_enhanced",
+                            "status": "skipped",
+                            "selected": True,
+                        }
+                    ],
+                    selected_candidate="star_preserve_bypass",
+                )
+                if review.get("report_path"):
+                    messages.append(f"review_bundle={review['report_path']}")
+            elapsed = pipeline.log.stage_end(stage_label)
+            pipeline._record_stage(
+                stage_label,
+                "skipped" if stage8_saved else "degraded",
+                elapsed,
+                "；".join(messages),
+            )
+            return
+        except (CommandError, SirilError) as error:
+            pipeline._star_preserve_target_bypass = False
+            pipeline.log.warn(
+                "Star-preserve Stage8 bypass failed; using conservative Stage8 path: "
+                f"{error}"
+            )
+            messages.append(
+                "star-preserve Stage8 bypass failed: "
+                f"{pipeline._short_text(error, 160)}"
+            )
+    elif bool(getattr(pipeline, "_star_preserve_target_bypass", False)):
+        pipeline._star_preserve_target_bypass = False
+        messages.append(
+            "star-preserve Stage8 bypass disabled because Stage7 output was not accepted"
+        )
 
     external_starless = pipeline._find_external_fit(
         [
@@ -45,8 +175,24 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
             pipeline.log.warn(f"导入外部 Starless 失败，继续使用本地 starless: {e}")
             messages.append(f"外部 Starless 导入失败: {pipeline._short_text(e, 160)}")
 
-    pipeline.log.info("加载去星图像...")
-    pipeline.cmd_with_check("load", "starless")
+    pipeline.log.info("加载 Stage8 输入图像...")
+    stage8_input_source = _load_stage8_input(pipeline, messages)
+    pipeline._write_stage_json(
+        "stage8_input_selection.json",
+        {
+            "stage": "stage8_input_selection",
+            "stage7_accepted": bool(
+                getattr(pipeline, "_stage7_stretch_accepted", False)
+            ),
+            "preferred_source": (
+                getattr(pipeline, "_stage7_stretch_output", None)
+                or getattr(pipeline, "stretched_name", None)
+                or "stage7_stretched"
+            ),
+            "selected_source": stage8_input_source,
+            "fallback_used": bool(pipeline._stage8_input_fallback_used),
+        },
+    )
     pipeline._last_stage8_masked_diagnostics = {}
     stage8_quality_enabled = pipeline._ai_stage_advisory_enabled("ai_stage8_enabled")
     stage8_masked_enabled = bool(
@@ -73,14 +219,18 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                 guard_reasons = [
                     str(item) for item in stage8_guard_report.get("reasons", []) if item
                 ]
-                conservative_only_skip = guard_reasons == [
-                    "stage8_conservative_mode_after_stage7_starless_repair"
-                ]
+                conservative_skip = bool(
+                    getattr(pipeline, "_stage8_conservative_mode", False)
+                    or stage8_guard_report.get("conservative_mode", False)
+                    or "stage8_conservative_mode_after_stage7_starless_repair"
+                    in guard_reasons
+                )
+                guard_status = (
+                    "conservative_skipped" if conservative_skip else "skipped"
+                )
                 pipeline._stage8_final_source = "stage8_input_starless"
                 pipeline._stage8_fallback_used = True
-                pipeline._stage8_final_quality = (
-                    "conservative_skipped" if conservative_only_skip else "skipped"
-                )
+                pipeline._stage8_final_quality = guard_status
                 pipeline.cmd_with_check("load", "stage8_input_starless")
                 pipeline._save_stage_output("starless_enhanced")
                 pipeline._save_stage_output("stage8_enhanced")
@@ -91,14 +241,13 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                     + (stage8_reject_reason or "unsafe starless input")
                 )
                 guard_payload = {
+                    **stage8_guard_report,
                     "stage": "stage8_input_guard",
-                    "status": (
-                        "conservative_skipped" if conservative_only_skip else "skipped"
-                    ),
+                    "status": guard_status,
+                    "input_source": stage8_input_source,
                     "final_source": pipeline._stage8_final_source,
                     "fallback_used": pipeline._stage8_fallback_used,
                     "final_quality": pipeline._stage8_final_quality,
-                    **stage8_guard_report,
                 }
                 pipeline._write_stage_json(
                     "stage8_quality.json",
@@ -109,10 +258,32 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                     },
                 )
                 pipeline._write_stage_json("stage8_enhancement_report.json", guard_payload)
+                if hasattr(pipeline, "_create_stage_review_bundle"):
+                    review = pipeline._create_stage_review_bundle(
+                        "stage8_nebula_enhancement",
+                        "stage8_input_starless",
+                        "stage8_enhanced",
+                        context={
+                            "mode": "input_guard_skip",
+                            "reasons": guard_reasons,
+                        },
+                        candidates=[
+                            {
+                                "name": "input_guard_skip",
+                                "stem": "stage8_enhanced",
+                                "status": guard_payload["status"],
+                                "issues": guard_reasons,
+                                "selected": True,
+                            }
+                        ],
+                        selected_candidate="input_guard_skip",
+                    )
+                    if review.get("report_path"):
+                        messages.append(f"review_bundle={review['report_path']}")
                 elapsed = pipeline.log.stage_end(stage_label)
                 pipeline._record_stage(
                     stage_label,
-                    "ok" if conservative_only_skip else "degraded",
+                    "ok" if conservative_skip else "degraded",
                     elapsed,
                     "；".join(messages),
                 )
@@ -151,6 +322,35 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
             messages.append("stage8_input_starless 保存失败，跳过阶段8质量诊断")
             stage8_quality_enabled = False
             stage8_diagnostics_enabled = False
+
+    stage8_ai_plan_applied = stage8_processing_plan is not None
+    requested_saturation = float(
+        (stage8_processing_plan or {}).get(
+            "saturation",
+            pipeline.cfg.nebula_saturation,
+        )
+    )
+    effective_stage8_saturation = clamp_saturation_boost(
+        requested_saturation,
+        already_applied=float(getattr(pipeline, "_saturation_boost_applied", 0.0)),
+        limits=color_limits,
+    )
+    effective_plan: Dict[str, Any] = {
+        "saturation": effective_stage8_saturation,
+        "bg_factor": pipeline.cfg.nebula_bg_factor,
+        "unsharp_radius": 0.8,
+        "unsharp_amount": 0.35,
+    }
+    effective_plan.update(stage8_processing_plan or {})
+    effective_plan["saturation"] = effective_stage8_saturation
+    effective_plan["color_policy_limits"] = color_limits
+    stage8_processing_plan = effective_plan
+    if effective_stage8_saturation != requested_saturation:
+        messages.append(
+            "Stage4 color policy capped Stage8 saturation "
+            f"{requested_saturation:.3f}->{effective_stage8_saturation:.3f} "
+            f"(budget={color_limits['max_saturation_boost']:.3f})"
+        )
 
     processed = False
     sasp_api_used = None if stage8_high_risk else pipeline._run_sasp_stage8_api(stage8_processing_plan)
@@ -202,7 +402,7 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
             messages.extend(
                 pipeline._apply_stage8_builtin_enhancement(
                     builtin_plan,
-                    label="AI" if stage8_processing_plan else "内置",
+                    label="AI" if stage8_ai_plan_applied else "内置",
                 )
             )
             pipeline.log.info("Starless 内置增强链完成")
@@ -218,7 +418,7 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
             status = 'degraded'
             messages.append("stage8 输出保存失败")
         else:
-            diff_note = pipeline._stage_diff_note("stage8_enhanced", "stage7_starless")
+            diff_note = pipeline._stage_diff_note("stage8_enhanced", "stage8_input_starless")
             if diff_note:
                 messages.append(diff_note)
             feature = pipeline._measure_current_features()
@@ -423,6 +623,10 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                         pipeline._stage8_fallback_used = True
                         pipeline._stage8_final_quality = "poor"
                 enhancement_report["final_source"] = pipeline._stage8_final_source
+                enhancement_report["input_source"] = stage8_input_source
+                enhancement_report["input_fallback_used"] = bool(
+                    pipeline._stage8_input_fallback_used
+                )
                 enhancement_report["fallback_used"] = pipeline._stage8_fallback_used
                 enhancement_report["final_quality"] = pipeline._stage8_final_quality
                 if enhancement_report.get("issues"):
@@ -436,6 +640,10 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
     if pipeline._stage8_final_quality == "unknown":
         pipeline._stage8_final_quality = "ok" if status == "ok" else status
     summary_fields = {
+        "stage8_input_source": stage8_input_source,
+        "stage8_input_fallback_used": str(
+            bool(pipeline._stage8_input_fallback_used)
+        ).lower(),
         "stage8_initial_quality": stage8_initial_quality,
         "stage8_final_quality": pipeline._stage8_final_quality,
         "stage8_final_source": pipeline._stage8_final_source,
@@ -448,6 +656,69 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
         pipeline.log.info(f"[Stage8] {line}")
         messages.append(line)
     pipeline.starless_file = pipeline.process_dir / f"{pipeline._stage8_final_source}.fit"
+    applied_saturation = effective_stage8_saturation
+    safe_sat = locals().get("safe_sat")
+    if isinstance(safe_sat, (int, float)):
+        applied_saturation = min(applied_saturation, float(safe_sat))
+    if pipeline._stage8_final_source == "stage8_input_starless":
+        applied_saturation = 0.0
+    pipeline._saturation_boost_applied = float(
+        getattr(pipeline, "_saturation_boost_applied", 0.0)
+    ) + max(0.0, applied_saturation)
+    if hasattr(pipeline, "_create_stage_review_bundle"):
+        stage8_candidates: List[Dict[str, Any]] = [
+            {
+                "name": "initial_enhancement",
+                "stem": "stage8_enhanced",
+                "status": stage8_initial_quality,
+            }
+        ]
+        quality_payload_value = locals().get("quality_payload")
+        if isinstance(quality_payload_value, dict):
+            if quality_payload_value.get("color_correction"):
+                stage8_candidates.append(
+                    {
+                        "name": "color_corrected",
+                        "stem": "stage8_enhanced",
+                        "status": str(
+                            quality_payload_value["color_correction"].get("status", "unknown")
+                        ),
+                    }
+                )
+            if quality_payload_value.get("conservative_rerun"):
+                rerun_record = quality_payload_value["conservative_rerun"]
+                stage8_candidates.append(
+                    {
+                        "name": "conservative_rerun",
+                        "stem": "stage8_conservative_enhanced",
+                        "status": str(rerun_record.get("status", "unknown")),
+                        "safe_saturation": rerun_record.get("safe_saturation"),
+                    }
+                )
+        stage8_candidates.append(
+            {
+                "name": "final",
+                "stem": pipeline._stage8_final_source,
+                "status": pipeline._stage8_final_quality,
+                "fallback_used": pipeline._stage8_fallback_used,
+                "selected": True,
+            }
+        )
+        review = pipeline._create_stage_review_bundle(
+            "stage8_nebula_enhancement",
+            "stage8_input_starless",
+            pipeline._stage8_final_source,
+            context={
+                "input_source": stage8_input_source,
+                "final_quality": pipeline._stage8_final_quality,
+                "fallback_used": pipeline._stage8_fallback_used,
+                "color_policy_limits": color_limits,
+            },
+            candidates=stage8_candidates,
+            selected_candidate="final",
+        )
+        if review.get("report_path"):
+            messages.append(f"review_bundle={review['report_path']}")
 
     elapsed = pipeline.log.stage_end(stage_label)
     pipeline._record_stage(stage_label, status, elapsed, "；".join(messages))

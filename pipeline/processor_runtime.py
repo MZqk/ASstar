@@ -122,6 +122,7 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_STAGE5_RL_GDSTEP",
         "SEESTAR_STAGE5_RL_STOP",
         "SEESTAR_STAGE5_GRAXPERT_DECONV_STRENGTH",
+        "SEESTAR_GRAXPERT_OBJECT_MODEL_PATH",
         "SEESTAR_AI_ENABLED",
         "SEESTAR_AI_ENDPOINT",
         "SEESTAR_AI_MODEL",
@@ -129,9 +130,16 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_AI_TIMEOUT_SEC",
         "SEESTAR_AI_STRENGTH",
         "SEESTAR_AI_PROMPT",
+        "SEESTAR_AI_ADVISOR_MODE",
         "SEESTAR_AI_STAGE6_ENABLE",
         "SEESTAR_AI_STAGE7_ENABLE",
         "SEESTAR_AI_STAGE8_ENABLE",
+        "SEESTAR_AI_ARTISTIC_DERIVATIVE_ENABLED",
+        "SEESTAR_AI_ARTISTIC_ENDPOINT",
+        "SEESTAR_AI_ARTISTIC_MODEL",
+        "SEESTAR_AI_ARTISTIC_API_KEY",
+        "SEESTAR_AI_ARTISTIC_PROMPT",
+        "SEESTAR_AI_ARTISTIC_TIMEOUT_SEC",
         "SEESTAR_STAGE7_QUALITY_RETRY_MAX",
         "SEESTAR_STAGE7_SKIP_UNREADY_STARLESS",
         "SEESTAR_STAR_SEPARATION_MODE",
@@ -142,11 +150,58 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_STAGE7_STARLESS_REPAIR_STRENGTH",
         "SEESTAR_STAGE7_STARLESS_HALO_REPAIR_STRENGTH",
         "SEESTAR_STAGE7_STARLESS_CHROMA_DENOISE_STRENGTH",
+        "SEESTAR_STAGE7_PREVIEW_TARGET_P50_MIN_RATIO",
+        "SEESTAR_STAGE7_PREVIEW_TARGET_P50_MAX_RATIO",
         "SEESTAR_STAGE7_STARLESS_PIXEL_REPAIR_ENABLE",
         "SEESTAR_STAGE8_FORCE_CONSERVATIVE_AFTER_STAGE7_REPAIR",
         "SEESTAR_STAGE9_STARMASK_STRETCH_ENABLE",
+        "SEESTAR_STAGE9_STARMASK_ADAPTIVE_STRETCH_ENABLE",
+        "SEESTAR_STAGE9_SOURCE_STAR_DETAIL_PERCENTILE",
+        "SEESTAR_STAGE9_SOURCE_COMPONENT_DENSITY_MAX",
+        "SEESTAR_STAGE9_SOURCE_SINGLE_PIXEL_RATIO_MAX",
         "SEESTAR_STAGE9_STARMASK_ASINH_STRETCH",
         "SEESTAR_STAGE9_STARMASK_ASINH_OFFSET",
+        "SEESTAR_STAGE9_STARMASK_ASINH_STRETCH_MAX",
+        "SEESTAR_STAGE9_STARMASK_FAINT_TARGET",
+        "SEESTAR_STAGE9_STARMASK_MID_TARGET",
+        "SEESTAR_STAGE9_STARMASK_BRIGHT_TARGET",
+        "SEESTAR_STAGE9_STARMASK_PEAK_TARGET",
+        "SEESTAR_STAGE9_STARMASK_CHROMA_REGULARIZATION_ENABLE",
+        "SEESTAR_STAGE9_STARMASK_FAINT_CHROMA_MAX",
+        "SEESTAR_STAGE9_STARMASK_BRIGHT_CHROMA_MAX",
+        "SEESTAR_STAGE9_STARMASK_PREDICTED_CHANGE_RATIO_MAX",
+        "SEESTAR_STAGE9_STAR_REFERENCE_SIGMA",
+        "SEESTAR_STAGE9_COMPACT_WEAK_STAR_RETENTION_MIN",
+        "SEESTAR_STAGE9_MIXED_STAR_PEAK_RATIO_MIN",
+        "SEESTAR_STAGE9_MIXED_STAR_WEAK_COUNT_MIN",
+        "SEESTAR_STAGE9_MIXED_STAR_BRIGHT_COUNT_MIN",
+        "SEESTAR_STAGE7_TARGET_LOCAL_METRICS_ENABLE",
+        "SEESTAR_STAGE7_LOCAL_CORE_CLIP_RATIO_MAX",
+        "SEESTAR_STAGE7_LOCAL_FAINT_SNR_MIN",
+        "SEESTAR_STAGE7_LOCAL_DARK_SEPARATION_MIN",
+        "SEESTAR_STAGE9_QUALITY_GATE_ENABLE",
+        "SEESTAR_STAGE9_HIGHLIGHT_CLIP_RATIO_MAX",
+        "SEESTAR_STAGE9_HIGHLIGHT_CLIP_GROWTH_MAX",
+        "SEESTAR_STAGE9_BRIGHT_PIXEL_GROWTH_MAX",
+        "SEESTAR_STAGE9_BACKGROUND_LIFT_MAX",
+        "SEESTAR_STAGE9_BACKGROUND_MOTTLING_GROWTH_MAX",
+        "SEESTAR_STAGE9_MOTTLING_EXEMPTION_CHANGED_PIXEL_RATIO_MAX",
+        "SEESTAR_STAGE9_CHANGED_PIXEL_RATIO_MAX",
+        "SEESTAR_STAGE9_DARKENING_RATIO_MAX",
+        "SEESTAR_STAGE9_WEAK_STAR_RECOVERY_RATIO_MIN",
+        "SEESTAR_STAGE9_STAR_RECOVERY_RATIO_MIN",
+        "SEESTAR_STAGE9_WEAK_STAR_SCREEN_INTENSITY_MIN",
+        "SEESTAR_STAGE9_STAR_SUPPORT_RATIO_MAX",
+        "SEESTAR_STAGE9_UNMATCHED_CHANGED_RATIO_MAX",
+        "SEESTAR_STAGE9_CHROMATIC_ADDITION_PEAK_MIN",
+        "SEESTAR_STAGE9_CHROMATIC_ADDITION_SATURATION_MIN",
+        "SEESTAR_STAGE9_CHROMATIC_ADDITION_RATIO_MAX",
+        "SEESTAR_STAGE9_STAR_APERTURE_RECOVERY_RATIO_MIN",
+        "SEESTAR_STAGE9_STAR_WING_RECOVERY_RATIO_MIN",
+        "SEESTAR_STAGE9_RESIDUAL_DARK_HOLE_RATIO_MAX",
+        "SEESTAR_STAGE9_HOLLOW_STRUCTURE_DELTA_MIN",
+        "SEESTAR_STAGE9_NEW_HOLLOW_STRUCTURE_AREA_MAX",
+        "SEESTAR_FORCE_REVIEW_ONLY_OUTPUT",
         "SEESTAR_COSMIC_CLASSIC_ENABLE",
         "SEESTAR_COSMIC_CLARITY_EXECUTABLE",
         "SEESTAR_COSMIC_CLASSIC_GPU",
@@ -162,10 +217,52 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
 INPUT_MODE_AUTO = "auto"
 INPUT_MODE_LINEAR_RESUME = "result_linear_resume"
 INPUT_MODE_STAGE2_CORRECTED_RESUME = "stage2_corrected_resume"
+INPUT_MODE_STAGE4_PSOLVED_RESUME = "stage4_psolved_resume"
 RESULT_BASENAME_TEMPLATE = (
     "$OBJECT:%s$_$STACKCNT:%d$x$EXPTIME:%d$sec"
     "_$DATE-OBS:dm12$_processed"
 )
+
+
+def _safe_output_token(value: Any, *, fallback: str = "") -> str:
+    token = re.sub(r"[^A-Za-z0-9]+", "_", str(value or "").strip()).strip("_")
+    return token or fallback
+
+
+def _partial_metadata_output_basename(
+    metadata: Dict[str, Any],
+    *,
+    linear_resume: bool,
+) -> str:
+    """Build a useful literal filename when Siril's full template cannot resolve."""
+    object_token = _safe_output_token(metadata.get("OBJECT"))
+    date_digits = re.sub(r"[^0-9]+", "", str(metadata.get("DATE-OBS") or ""))
+    if not object_token or len(date_digits) < 8:
+        return ""
+
+    parts = [object_token]
+    try:
+        stack_count = int(float(metadata.get("STACKCNT")))
+    except (TypeError, ValueError):
+        stack_count = 0
+    if stack_count > 0:
+        parts.append(f"{stack_count}x")
+
+    try:
+        exposure = float(metadata.get("EXPTIME"))
+    except (TypeError, ValueError):
+        exposure = 0.0
+    if math.isfinite(exposure) and exposure > 0.0:
+        exposure_token = f"{exposure:g}".replace(".", "p")
+        parts.append(f"{exposure_token}sec")
+
+    date_token = date_digits[:8]
+    if len(date_digits) >= 14:
+        date_token += f"_{date_digits[8:14]}"
+    parts.extend((date_token, "processed"))
+    base = "_".join(parts)
+    return f"{base}_linear" if linear_resume else base
+
 
 def _clamp_int(value: int, lower: int, upper: int) -> int:
     return max(lower, min(upper, int(value)))
@@ -223,10 +320,47 @@ class ProcessorRuntimeMixin:
 
 
     def _result_output_basename(self) -> str:
-        base_filename = RESULT_BASENAME_TEMPLATE
-        if self._stage1_input_mode == "linear_resume":
-            base_filename += "_linear"
+        linear_resume = self._stage1_input_mode == "linear_resume"
+        fallback_base = "result_processed_linear" if linear_resume else "result_processed"
+        fallback_fit_base = "result_final_linear" if linear_resume else "result_final"
+        metadata = self._read_fits_header_metadata(
+            "stage10_final",
+            "stage9_remixed",
+            "stage2_corrected",
+            getattr(self, "source_file", None),
+        )
+        required_keys = ("OBJECT", "STACKCNT", "EXPTIME", "DATE-OBS")
+        missing_keys = [
+            key for key in required_keys if not str(metadata.get(key, "")).strip()
+        ]
+        if missing_keys:
+            partial_base = _partial_metadata_output_basename(
+                metadata,
+                linear_resume=linear_resume,
+            )
+            if partial_base:
+                base_filename = partial_base
+                fit_base_filename = partial_base + "_final"
+                self.log.warn(
+                    "输出命名所需 FITS 头不完整，使用已有目标元数据生成安全名称，"
+                    "避免未解析占位符和通用结果名覆盖: "
+                    + ", ".join(missing_keys)
+                )
+            else:
+                base_filename = fallback_base
+                fit_base_filename = fallback_fit_base
+                self.log.warn(
+                    "输出命名所需 FITS 头缺失，使用安全回退名，避免输出 "
+                    "$OBJECT/$STACKCNT 等未解析占位符: "
+                    + ", ".join(missing_keys)
+                )
+        else:
+            base_filename = RESULT_BASENAME_TEMPLATE
+            if linear_resume:
+                base_filename += "_linear"
+            fit_base_filename = base_filename + "_final"
         self.main_output_basename_template = base_filename
+        self.main_output_fit_basename_template = fit_base_filename
         return base_filename
 
 
@@ -377,6 +511,7 @@ class ProcessorRuntimeMixin:
                 INPUT_MODE_AUTO,
                 INPUT_MODE_LINEAR_RESUME,
                 INPUT_MODE_STAGE2_CORRECTED_RESUME,
+                INPUT_MODE_STAGE4_PSOLVED_RESUME,
             }:
                 self.input_mode = normalized
             else:
@@ -674,6 +809,52 @@ class ProcessorRuntimeMixin:
         if prompt is not None:
             self.cfg.ai_prompt = prompt.strip()
 
+        advisor_mode = os.getenv("SEESTAR_AI_ADVISOR_MODE")
+        if advisor_mode is not None:
+            normalized_mode = advisor_mode.strip().lower()
+            if normalized_mode in {"text", "multimodal"}:
+                self.cfg.ai_advisor_mode = normalized_mode
+            else:
+                self.log.warn(
+                    "Invalid SEESTAR_AI_ADVISOR_MODE="
+                    f"{advisor_mode!r}; expected text or multimodal"
+                )
+
+        artistic_enabled_raw = os.getenv("SEESTAR_AI_ARTISTIC_DERIVATIVE_ENABLED")
+        if artistic_enabled_raw is not None:
+            parsed = self._parse_env_bool(
+                artistic_enabled_raw,
+                self.cfg.ai_artistic_derivative_enabled,
+            )
+            self.cfg.ai_artistic_derivative_enabled = parsed
+            if artistic_enabled_raw.strip().lower() not in (
+                ENV_TRUE_VALUES | ENV_FALSE_VALUES
+            ):
+                self.log.warn(
+                    "SEESTAR_AI_ARTISTIC_DERIVATIVE_ENABLED has invalid value; "
+                    "keeping current setting"
+                )
+
+        for env_key, attr_name in (
+            ("SEESTAR_AI_ARTISTIC_ENDPOINT", "ai_artistic_endpoint"),
+            ("SEESTAR_AI_ARTISTIC_MODEL", "ai_artistic_model"),
+            ("SEESTAR_AI_ARTISTIC_API_KEY", "ai_artistic_api_key"),
+            ("SEESTAR_AI_ARTISTIC_PROMPT", "ai_artistic_prompt"),
+        ):
+            value = os.getenv(env_key)
+            if value is not None:
+                setattr(self.cfg, attr_name, value.strip())
+
+        artistic_timeout_raw = os.getenv("SEESTAR_AI_ARTISTIC_TIMEOUT_SEC")
+        if artistic_timeout_raw is not None:
+            try:
+                self.cfg.ai_artistic_timeout_sec = int(artistic_timeout_raw.strip())
+            except ValueError:
+                self.log.warn(
+                    "Invalid SEESTAR_AI_ARTISTIC_TIMEOUT_SEC="
+                    f"{artistic_timeout_raw!r}; using current value"
+                )
+
         timeout_raw = os.getenv("SEESTAR_AI_TIMEOUT_SEC")
         if timeout_raw is not None:
             try:
@@ -717,11 +898,14 @@ class ProcessorRuntimeMixin:
         star_mode_raw = os.getenv("SEESTAR_STAR_SEPARATION_MODE")
         if star_mode_raw is not None:
             normalized_mode = star_mode_raw.strip().lower()
-            if normalized_mode in {
-                "linear_star_separation",
-                "mild_prestretch_star_separation",
-            }:
+            if normalized_mode == "linear_star_separation":
                 self.cfg.star_separation_mode = normalized_mode
+            elif normalized_mode == "mild_prestretch_star_separation":
+                self.log.warn(
+                    "SEESTAR_STAR_SEPARATION_MODE=mild_prestretch_star_separation "
+                    "is a legacy compatibility value and is ignored; Stage 6 remains linear"
+                )
+                self.cfg.star_separation_mode = "linear_star_separation"
             else:
                 self.log.warn(
                     "Invalid SEESTAR_STAR_SEPARATION_MODE="
@@ -736,12 +920,17 @@ class ProcessorRuntimeMixin:
                 star_fallback_raw,
                 self.cfg.star_separation_fallback_to_mild_prestretch,
             )
-            self.cfg.star_separation_fallback_to_mild_prestretch = parsed
             if star_fallback_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
                 self.log.warn(
                     "SEESTAR_STAR_SEPARATION_FALLBACK_TO_MILD_PRESTRETCH has invalid value; "
                     "keeping current setting"
                 )
+            elif parsed:
+                self.log.warn(
+                    "SEESTAR_STAR_SEPARATION_FALLBACK_TO_MILD_PRESTRETCH is ignored; "
+                    "Stage 6 quality retries keep the same linear input"
+                )
+            self.cfg.star_separation_fallback_to_mild_prestretch = False
 
         mild_prestretch_raw = os.getenv("SEESTAR_MILD_PRESTRETCH_STRENGTH")
         if mild_prestretch_raw is not None:
@@ -759,8 +948,72 @@ class ProcessorRuntimeMixin:
             ("SEESTAR_STAGE7_STARLESS_REPAIR_STRENGTH", "stage7_starless_repair_strength"),
             ("SEESTAR_STAGE7_STARLESS_HALO_REPAIR_STRENGTH", "stage7_starless_halo_repair_strength"),
             ("SEESTAR_STAGE7_STARLESS_CHROMA_DENOISE_STRENGTH", "stage7_starless_chroma_denoise_strength"),
+            ("SEESTAR_STAGE7_STRETCH_CHROMA_NOISE_SCORE_MAX", "stage7_stretch_chroma_noise_score_max"),
+            ("SEESTAR_STAGE7_STRETCH_BACKGROUND_MOTTLING_SCORE_MAX", "stage7_stretch_background_mottling_score_max"),
+            ("SEESTAR_STAGE7_STRETCH_CHROMA_LOAD_GROWTH_MAX", "stage7_stretch_chroma_load_growth_max"),
+            ("SEESTAR_STAGE7_STRETCH_CHROMA_LOAD_LOW_ABSOLUTE_MAX", "stage7_stretch_chroma_load_low_absolute_max"),
+            ("SEESTAR_STAGE7_PREVIEW_TARGET_P50_MIN_RATIO", "stage7_preview_target_p50_min_ratio"),
+            ("SEESTAR_STAGE7_PREVIEW_TARGET_P50_MAX_RATIO", "stage7_preview_target_p50_max_ratio"),
+            ("SEESTAR_STAGE7_STARLESS_PEAK_BACKGROUND_RATIO_MIN", "stage7_starless_peak_background_ratio_min"),
+            ("SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_REDUCTION_MIN", "stage7_starless_repair_chroma_reduction_min"),
+            ("SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_DELTA_MIN", "stage7_starless_repair_chroma_delta_min"),
+            ("SEESTAR_STAGE7_STARMASK_DIFFUSE_RESIDUAL_RATIO_MAX", "stage7_starmask_diffuse_residual_ratio_max"),
             ("SEESTAR_STAGE9_STARMASK_ASINH_STRETCH", "stage9_starmask_asinh_stretch"),
             ("SEESTAR_STAGE9_STARMASK_ASINH_OFFSET", "stage9_starmask_asinh_offset"),
+            ("SEESTAR_STAGE9_STARMASK_ASINH_STRETCH_MAX", "stage9_starmask_asinh_stretch_max"),
+            ("SEESTAR_STAGE9_STARMASK_FAINT_TARGET", "stage9_starmask_faint_target"),
+            ("SEESTAR_STAGE9_STARMASK_MID_TARGET", "stage9_starmask_mid_target"),
+            ("SEESTAR_STAGE9_STARMASK_BRIGHT_TARGET", "stage9_starmask_bright_target"),
+            ("SEESTAR_STAGE9_STARMASK_PEAK_TARGET", "stage9_starmask_peak_target"),
+            ("SEESTAR_STAGE9_STARMASK_FAINT_CHROMA_MAX", "stage9_starmask_faint_chroma_max"),
+            ("SEESTAR_STAGE9_STARMASK_BRIGHT_CHROMA_MAX", "stage9_starmask_bright_chroma_max"),
+            ("SEESTAR_STAGE9_STARMASK_PREDICTED_CHANGE_RATIO_MAX", "stage9_starmask_predicted_change_ratio_max"),
+            ("SEESTAR_STAGE9_STAR_REFERENCE_SIGMA", "stage9_star_reference_sigma"),
+            ("SEESTAR_STAGE9_COMPACT_WEAK_STAR_RETENTION_MIN", "stage9_compact_weak_star_retention_min"),
+            ("SEESTAR_STAGE9_MIXED_STAR_PEAK_RATIO_MIN", "stage9_mixed_star_peak_ratio_min"),
+            ("SEESTAR_STAGE7_LOCAL_CORE_CLIP_RATIO_MAX", "stage7_local_core_clip_ratio_max"),
+            ("SEESTAR_STAGE7_LOCAL_FAINT_SNR_MIN", "stage7_local_faint_snr_min"),
+            ("SEESTAR_STAGE7_LOCAL_DARK_SEPARATION_MIN", "stage7_local_dark_separation_min"),
+            ("SEESTAR_STAGE9_HIGHLIGHT_CLIP_RATIO_MAX", "stage9_highlight_clip_ratio_max"),
+            ("SEESTAR_STAGE9_HIGHLIGHT_CLIP_GROWTH_MAX", "stage9_highlight_clip_growth_max"),
+            ("SEESTAR_STAGE9_BRIGHT_PIXEL_GROWTH_MAX", "stage9_bright_pixel_growth_max"),
+            ("SEESTAR_STAGE9_BACKGROUND_LIFT_MAX", "stage9_background_lift_max"),
+            ("SEESTAR_STAGE9_BACKGROUND_MOTTLING_GROWTH_MAX", "stage9_background_mottling_growth_max"),
+            ("SEESTAR_STAGE9_MOTTLING_EXEMPTION_CHANGED_PIXEL_RATIO_MAX", "stage9_mottling_exemption_changed_pixel_ratio_max"),
+            ("SEESTAR_STAGE9_CHANGED_PIXEL_RATIO_MAX", "stage9_changed_pixel_ratio_max"),
+            ("SEESTAR_STAGE9_DARKENING_RATIO_MAX", "stage9_darkening_ratio_max"),
+            ("SEESTAR_STAGE9_WEAK_STAR_RECOVERY_RATIO_MIN", "stage9_weak_star_recovery_ratio_min"),
+            ("SEESTAR_STAGE9_STAR_RECOVERY_RATIO_MIN", "stage9_star_recovery_ratio_min"),
+            ("SEESTAR_STAGE9_SOURCE_STAR_DETAIL_PERCENTILE", "stage9_source_star_detail_percentile"),
+            ("SEESTAR_STAGE9_SOURCE_COMPONENT_DENSITY_MAX", "stage9_source_component_density_max"),
+            ("SEESTAR_STAGE9_SOURCE_SINGLE_PIXEL_RATIO_MAX", "stage9_source_single_pixel_ratio_max"),
+            ("SEESTAR_STAGE9_WEAK_STAR_SCREEN_INTENSITY_MIN", "stage9_weak_star_screen_intensity_min"),
+            ("SEESTAR_STAGE9_STAR_SUPPORT_RATIO_MAX", "stage9_star_support_ratio_max"),
+            ("SEESTAR_STAGE9_UNMATCHED_CHANGED_RATIO_MAX", "stage9_unmatched_changed_ratio_max"),
+            ("SEESTAR_STAGE9_CHROMATIC_ADDITION_PEAK_MIN", "stage9_chromatic_addition_peak_min"),
+            ("SEESTAR_STAGE9_CHROMATIC_ADDITION_SATURATION_MIN", "stage9_chromatic_addition_saturation_min"),
+            ("SEESTAR_STAGE9_CHROMATIC_ADDITION_RATIO_MAX", "stage9_chromatic_addition_ratio_max"),
+            ("SEESTAR_STAGE9_STAR_APERTURE_RECOVERY_RATIO_MIN", "stage9_star_aperture_recovery_ratio_min"),
+            ("SEESTAR_STAGE9_STAR_WING_RECOVERY_RATIO_MIN", "stage9_star_wing_recovery_ratio_min"),
+            ("SEESTAR_STAGE9_RESIDUAL_DARK_HOLE_RATIO_MAX", "stage9_residual_dark_hole_ratio_max"),
+            ("SEESTAR_STAGE9_HOLLOW_STRUCTURE_DELTA_MIN", "stage9_hollow_structure_delta_min"),
+            ("SEESTAR_STAGE9_NEW_HOLLOW_STRUCTURE_AREA_MAX", "stage9_new_hollow_structure_area_max"),
+            ("SEESTAR_STAGE9_LOCAL_COMPONENT_PEAK_MIN", "stage9_local_component_peak_min"),
+            ("SEESTAR_STAGE9_LOCAL_COMPONENT_AREA_MAX", "stage9_local_component_area_max"),
+            ("SEESTAR_STAGE9_LOCAL_COMPONENT_ASPECT_RATIO_MAX", "stage9_local_component_aspect_ratio_max"),
+            ("SEESTAR_STAGE9_LOCAL_COMPONENT_FILL_RATIO_MIN", "stage9_local_component_fill_ratio_min"),
+            ("SEESTAR_STAGE9_LOCAL_SINGLE_PIXEL_RATIO_MAX", "stage9_local_single_pixel_ratio_max"),
+            ("SEESTAR_STAGE9_LOCAL_CYAN_BLUE_PEAK_MIN", "stage9_local_cyan_blue_peak_min"),
+            ("SEESTAR_STAGE9_LOCAL_CYAN_BLUE_SATURATION_MIN", "stage9_local_cyan_blue_saturation_min"),
+            ("SEESTAR_STAGE9_LOCAL_CYAN_BLUE_COMPONENT_AREA_MAX", "stage9_local_cyan_blue_component_area_max"),
+            ("SEESTAR_STAGE9_CORE_PERCENTILE", "stage9_core_percentile"),
+            ("SEESTAR_STAGE9_CORE_COLOR_JUMP_MIN", "stage9_core_color_jump_min"),
+            ("SEESTAR_STAGE9_CORE_COLOR_JUMP_COMPONENT_AREA_MAX", "stage9_core_color_jump_component_area_max"),
+            ("SEESTAR_STAGE10_CHROMA_FOCUS_SCORE_MIN", "stage10_chroma_focus_score_min"),
+            ("SEESTAR_STAGE10_SEPARATE_CHROMA_SCORE_MIN", "stage10_separate_chroma_score_min"),
+            ("SEESTAR_STAGE10_FULL_BG_STD_MIN", "stage10_full_bg_std_min"),
+            ("SEESTAR_STAGE10_FULL_MOTTLING_SCORE_MIN", "stage10_full_mottling_score_min"),
+            ("SEESTAR_STAGE10_STAGE9_LOCAL_COLOR_RISK_STRENGTH", "stage10_stage9_local_color_risk_strength"),
         ):
             raw_value = os.getenv(env_key)
             if raw_value is None:
@@ -771,9 +1024,28 @@ class ProcessorRuntimeMixin:
                 self.log.warn(f"Invalid {env_key}={raw_value!r}; using current value")
 
         for env_key, attr_name in (
+            ("SEESTAR_STAGE9_MIXED_STAR_WEAK_COUNT_MIN", "stage9_mixed_star_weak_count_min"),
+            ("SEESTAR_STAGE9_MIXED_STAR_BRIGHT_COUNT_MIN", "stage9_mixed_star_bright_count_min"),
+        ):
+            raw_value = os.getenv(env_key)
+            if raw_value is None:
+                continue
+            try:
+                setattr(self.cfg, attr_name, int(raw_value.strip()))
+            except ValueError:
+                self.log.warn(f"Invalid {env_key}={raw_value!r}; using current value")
+
+        for env_key, attr_name in (
             ("SEESTAR_STAGE7_STARLESS_PIXEL_REPAIR_ENABLE", "stage7_starless_pixel_repair_enabled"),
+            ("SEESTAR_STAGE7_CHROMA_RESCUE_ENABLE", "stage7_chroma_rescue_enabled"),
             ("SEESTAR_STAGE8_FORCE_CONSERVATIVE_AFTER_STAGE7_REPAIR", "stage8_force_conservative_after_stage7_repair"),
             ("SEESTAR_STAGE9_STARMASK_STRETCH_ENABLE", "stage9_starmask_stretch_enabled"),
+            ("SEESTAR_STAGE9_STARMASK_ADAPTIVE_STRETCH_ENABLE", "stage9_starmask_adaptive_stretch_enabled"),
+            ("SEESTAR_STAGE9_COMPACT_STARMASK_ENABLE", "stage9_compact_starmask_enabled"),
+            ("SEESTAR_STAGE9_STARMASK_CHROMA_REGULARIZATION_ENABLE", "stage9_starmask_chroma_regularization_enabled"),
+            ("SEESTAR_STAGE9_QUALITY_GATE_ENABLE", "stage9_quality_gate_enabled"),
+            ("SEESTAR_FORCE_REVIEW_ONLY_OUTPUT", "force_review_only_output"),
+            ("SEESTAR_STAGE7_TARGET_LOCAL_METRICS_ENABLE", "stage7_target_local_metrics_enabled"),
         ):
             raw_value = os.getenv(env_key)
             if raw_value is None:
@@ -839,6 +1111,113 @@ class ProcessorRuntimeMixin:
             0.0005,
             0.0060,
         )
+        for attr_name, lower, upper in (
+            ("stage7_stretch_chroma_noise_score_max", 0.10, 0.80),
+            ("stage7_stretch_background_mottling_score_max", 0.10, 1.00),
+            ("stage7_stretch_chroma_load_growth_max", 1.00, 3.00),
+            ("stage7_stretch_chroma_load_low_absolute_max", 0.01, 0.15),
+            ("stage7_preview_target_p50_min_ratio", 0.25, 0.90),
+            ("stage7_preview_target_p50_max_ratio", 1.00, 3.00),
+            ("stage7_starless_peak_background_ratio_min", 1.5, 12.0),
+            ("stage7_starless_repair_chroma_reduction_min", 0.05, 0.80),
+            ("stage7_starless_repair_chroma_delta_min", 0.00001, 0.05000),
+            ("stage7_starmask_diffuse_residual_ratio_max", 0.01, 0.50),
+            ("stage9_highlight_clip_ratio_max", 0.001, 0.10),
+            ("stage9_highlight_clip_growth_max", 0.0, 0.05),
+            ("stage9_bright_pixel_growth_max", 0.0, 0.10),
+            ("stage9_background_lift_max", 0.0, 0.05),
+            ("stage9_background_mottling_growth_max", 1.0, 3.0),
+            ("stage9_changed_pixel_ratio_max", 0.05, 0.80),
+            ("stage9_starmask_predicted_change_ratio_max", 0.05, 0.60),
+            ("stage9_darkening_ratio_max", 0.0, 0.05),
+            ("stage9_star_reference_sigma", 3.0, 8.0),
+            ("stage9_compact_weak_star_retention_min", 0.50, 0.98),
+            ("stage9_mixed_star_peak_ratio_min", 2.0, 20.0),
+            ("stage9_weak_star_recovery_ratio_min", 0.40, 0.95),
+            ("stage9_star_recovery_ratio_min", 0.40, 0.98),
+            ("stage9_source_star_detail_percentile", 97.0, 99.5),
+            ("stage9_source_component_density_max", 500.0, 10000.0),
+            ("stage9_source_single_pixel_ratio_max", 0.10, 0.90),
+            ("stage9_starmask_faint_target", 0.08, 0.40),
+            ("stage9_starmask_mid_target", 0.30, 0.70),
+            ("stage9_starmask_bright_target", 0.50, 0.88),
+            ("stage9_starmask_peak_target", 0.75, 0.95),
+            ("stage9_starmask_faint_chroma_max", 0.10, 0.80),
+            ("stage9_starmask_bright_chroma_max", 0.10, 0.90),
+            ("stage9_weak_star_screen_intensity_min", 0.10, 1.05),
+            ("stage9_star_support_ratio_max", 0.03, 0.20),
+            ("stage9_unmatched_changed_ratio_max", 0.0, 0.05),
+            ("stage9_chromatic_addition_peak_min", 0.002, 0.25),
+            ("stage9_chromatic_addition_saturation_min", 0.30, 0.95),
+            ("stage9_chromatic_addition_ratio_max", 0.0, 0.05),
+            ("stage9_star_aperture_recovery_ratio_min", 0.40, 0.98),
+            ("stage9_star_wing_recovery_ratio_min", 0.30, 0.95),
+            ("stage9_residual_dark_hole_ratio_max", 0.0, 0.50),
+            ("stage9_hollow_structure_delta_min", 0.01, 0.25),
+            ("stage9_new_hollow_structure_area_max", 4.0, 4096.0),
+            ("stage9_local_component_peak_min", 0.002, 0.10),
+            ("stage9_local_component_area_max", 16.0, 4096.0),
+            ("stage9_local_component_aspect_ratio_max", 1.2, 10.0),
+            ("stage9_local_component_fill_ratio_min", 0.02, 0.80),
+            ("stage9_local_single_pixel_ratio_max", 0.0, 0.90),
+            ("stage9_local_cyan_blue_peak_min", 0.002, 0.10),
+            ("stage9_local_cyan_blue_saturation_min", 0.20, 0.95),
+            ("stage9_local_cyan_blue_component_area_max", 4.0, 2048.0),
+            ("stage9_core_percentile", 70.0, 99.0),
+            ("stage9_core_color_jump_min", 0.03, 0.50),
+            ("stage9_core_color_jump_component_area_max", 4.0, 2048.0),
+            ("stage10_chroma_focus_score_min", 0.10, 0.80),
+            ("stage10_separate_chroma_score_min", 0.35, 1.50),
+            ("stage10_full_bg_std_min", 0.001, 0.10),
+            ("stage10_full_mottling_score_min", 0.10, 1.00),
+            ("stage10_stage9_local_color_risk_strength", 0.0, 1.0),
+        ):
+            old_value = float(getattr(self.cfg, attr_name))
+            new_value = _clamp_float(old_value, lower, upper)
+            setattr(self.cfg, attr_name, new_value)
+            if old_value != new_value:
+                self.log.warn(
+                    f"{attr_name} clamped: {old_value} -> {new_value}"
+                )
+        faint_star_target = float(self.cfg.stage9_starmask_faint_target)
+        mid_star_target = max(
+            float(self.cfg.stage9_starmask_mid_target),
+            faint_star_target + 0.03,
+        )
+        bright_star_target = max(
+            float(self.cfg.stage9_starmask_bright_target),
+            mid_star_target + 0.03,
+        )
+        peak_star_target = max(
+            float(self.cfg.stage9_starmask_peak_target),
+            bright_star_target + 0.03,
+        )
+        (
+            self.cfg.stage9_starmask_faint_target,
+            self.cfg.stage9_starmask_mid_target,
+            self.cfg.stage9_starmask_bright_target,
+            self.cfg.stage9_starmask_peak_target,
+        ) = (
+            faint_star_target,
+            mid_star_target,
+            bright_star_target,
+            peak_star_target,
+        )
+        self.cfg.stage9_starmask_bright_chroma_max = max(
+            float(self.cfg.stage9_starmask_bright_chroma_max),
+            float(self.cfg.stage9_starmask_faint_chroma_max),
+        )
+        for attr_name, lower, upper in (
+            ("stage9_mixed_star_weak_count_min", 4, 1000),
+            ("stage9_mixed_star_bright_count_min", 1, 100),
+        ):
+            old_value = int(getattr(self.cfg, attr_name))
+            new_value = _clamp_int(old_value, lower, upper)
+            setattr(self.cfg, attr_name, new_value)
+            if old_value != new_value:
+                self.log.warn(
+                    f"{attr_name} clamped: {old_value} -> {new_value}"
+                )
         if old_timeout != self.cfg.ai_timeout_sec:
             self.log.warn(
                 f"AI timeout clamped: {old_timeout} -> {self.cfg.ai_timeout_sec}"

@@ -71,18 +71,18 @@ class PipelineConfig:
     denoise_mod: float = 0.35       # 降噪强度参数（0~1），越大降噪越强
     denoise_safety_max: float = 0.55  # 降噪强度安全上限，防止细节被抹平
     stage5_builtin_denoise_mod: float = 0.50  # Stage5 Siril 内置线性降噪强度，默认 denoise -mod=0.50 -indep
-    stage5_deconvolution_enabled: bool = True  # Stage5 是否在线性降噪前执行 Siril RL 反卷积
+    stage5_deconvolution_enabled: bool = True  # Stage5 是否在线性降噪前执行 GraXpert/RL 反卷积
     stage5_rl_maxstars: int = 200  # RL 反卷积 PSF 找星数量上限
     stage5_rl_psf_kernel_size: int = 33  # RL 反卷积 makepsf kernel size
     stage5_rl_iters: int = 8  # RL 反卷积迭代次数，过高易放大噪声和星环
     stage5_rl_alpha: float = 3000.0  # RL TV 正则 alpha，越高越保守
     stage5_rl_gdstep: float = 0.0005  # RL 梯度下降步长
     stage5_rl_stop: float = 0.001  # RL 提前停止阈值
-    stage5_graxpert_deconv_strength: float = 0.30  # GraXpert 反卷积建议强度占位；默认不自动调用外部工具
+    stage5_graxpert_deconv_strength: float = 0.30  # 本地 Object Deconvolution 模型可用时的 GraXpert 强度
     optional_color_transform_enabled: bool = False  # 是否启用可选转色（Alchemy/Hubble）
     workflow_plugin_probe_enabled: bool = False  # Probe broad workflow plugin commands only when explicitly enabled; stage8 has a narrow safe SASP probe
-    spcc_enabled: bool = True  # Prefer SPCC first by default; can be disabled via SEESTAR_SPCC_ENABLE=0
-    stage4_platesolve_enabled: bool = True  # 阶段4默认执行 platesolve -focal=160 -pixelsize=2.90 -catalog=gaia -order=3
+    spcc_enabled: bool = True  # 默认优先本地 Gaia DR3 xp_sampled SPCC；失败后 PCC，可由 SEESTAR_SPCC_ENABLE=0 禁用
+    stage4_platesolve_enabled: bool = True  # 阶段4默认执行 platesolve -noflip，解算时保留原始图像方向
     stage4_spcc_sensor_mode: str = "osc"  # SPCC 传感器模式：osc 或 mono_lrgb
     stage4_spcc_osc_sensor: str = "Sony IMX585"  # OSC/SPCC oscsensor 名称；Seestar S30 Pro 使用 Sony IMX585
     stage4_spcc_osc_filter: str = ""  # OSC/SPCC oscfilter 显式覆盖；为空时按内置双带光害滤镜开关自动选择
@@ -104,7 +104,7 @@ class PipelineConfig:
     stage4_local_star_wb_target_aware_enabled: bool = False  # 发射/双窄带目标默认跳过本地星点白平衡以保护 Hα/OIII 色彩
     aberration_api_enabled: bool = False  # Disabled by default: API path may fail in siril-cli thread ownership context
 
-    # 阶段 6: 拉伸
+    # 阶段 7: Starless 主体拉伸
     asinh_stretch: float = 3.0      # Asinh 拉伸强度（越大整体越亮）
     asinh_offset: float = 0.001     # Asinh 偏移，影响暗部起拉位置
     ghs_shadowsclip: float = -2.8   # GHS 阴影裁剪，控制黑场压暗程度（回退方案用）
@@ -125,18 +125,78 @@ class PipelineConfig:
 
     # 阶段 9: 星点混合
     star_intensity: float = 1.0     # 传统回混时星点层主强度
-    star_fallback_intensity: float = 0.95  # 主强度失败时的回退星点强度
+    star_fallback_intensity: float = 0.95  # 兼容字段；作为 Stage 9 首档回退强度的上限
+    stage9_fallback_intensity_levels: Tuple[float, ...] = (0.75, 0.55, 0.40)  # 主候选拒绝后逐档降低回星强度
     stage9_starmask_stretch_enabled: bool = True  # 阶段9像素回混前默认把线性 starmask 独立 Asinh 拉伸到非线性域
+    stage9_starmask_adaptive_stretch_enabled: bool = True  # 根据星点层有效信号分布反解 Asinh 强度，而不是固定套用单一参数
+    stage9_compact_starmask_enabled: bool = True  # Asinh 前仅保留连通紧致星核和窄星翼；覆盖异常时允许重建更严格支持层
+    stage9_source_star_detail_percentile: float = 98.0  # 从原始含星图提取独立星核目录的局部细节百分位
+    stage9_source_component_density_max: float = 2500.0  # 独立星表紧致组件密度上限；伴随单像素噪点证据时自适应收紧或 fail-closed
+    stage9_source_single_pixel_ratio_max: float = 0.20  # 独立星表单像素组件比例上限，单项超限即自适应收紧或 fail-closed
+    stage9_star_reference_sigma: float = 5.0  # 原始 starmask 星点目录检测阈值，使用背景加该倍数噪声标准差
+    stage9_compact_weak_star_retention_min: float = 0.80  # compact 支持层必须保留的弱星组件数量比例下限
+    stage9_mixed_star_peak_ratio_min: float = 4.0  # 亮星组峰值中位数相对弱星组的倍率达到该值时启用多锚点曲线
+    stage9_mixed_star_weak_count_min: int = 20  # 启用混合星场多锚点曲线所需的最少弱星组件数
+    stage9_mixed_star_bright_count_min: int = 3  # 启用混合星场多锚点曲线所需的最少亮星组件数
     stage9_starmask_asinh_stretch: float = 2.0  # 阶段9 starmask 温和 Asinh 拉伸强度，保护星色并避免星核过曝
     stage9_starmask_asinh_offset: float = 0.001  # 阶段9 starmask Asinh 偏移
-    remix_safe_blend: bool = True   # 兼容旧配置；阶段 9 当前固定使用上一阶段 starless + starmask
+    stage9_starmask_asinh_stretch_max: float = 1000.0  # 自适应星点拉伸反解上限；亮星目标约束优先，统计不可用时仍回退固定强度
+    stage9_starmask_faint_target: float = 0.26  # 多锚点曲线弱星中位目标亮度
+    stage9_starmask_mid_target: float = 0.50  # 多锚点曲线中亮星目标亮度
+    stage9_starmask_bright_target: float = 0.75  # 多锚点曲线亮星目标亮度
+    stage9_starmask_peak_target: float = 0.90  # 多锚点曲线极亮星上限，保留高光和星色余量
+    stage9_starmask_chroma_regularization_enabled: bool = True  # 多锚点拉伸时用邻域星色约束微弱星翼，避免把单像素通道噪声放大成蓝紫色块
+    stage9_starmask_faint_chroma_max: float = 0.35  # 微弱星翼允许的最大通道跨度比例，优先抑制低信号伪色
+    stage9_starmask_bright_chroma_max: float = 0.60  # 亮星核心允许的最大通道跨度比例，保留真实星色同时限制极端色边
+    stage9_starmask_predicted_change_ratio_max: float = 0.30  # 拉伸求解时预测的显著变化覆盖上限，给正式门控预留余量
+    stage9_quality_gate_enabled: bool = True  # 阶段9保存前验收星点回混，高风险候选回滚并降强度重试
+    stage9_highlight_clip_ratio_max: float = 0.015  # 阶段9回混后高光裁剪占比上限
+    stage9_highlight_clip_growth_max: float = 0.006  # 阶段9相对 Stage8 的高光裁剪增长上限
+    stage9_bright_pixel_growth_max: float = 0.025  # 阶段9亮像素覆盖增长上限，限制星点膨胀/光晕
+    stage9_background_lift_max: float = 0.010  # 阶段9暗背景中位抬升上限，限制 starmask 污染
+    stage9_background_mottling_growth_max: float = 1.35  # 阶段9相对 Stage8 的低频背景斑驳增长倍数上限
+    stage9_mottling_exemption_changed_pixel_ratio_max: float = 0.12  # 仅局部变化时才允许低绝对斑驳豁免，防止大面积星点/背景污染漏过门控
+    stage9_changed_pixel_ratio_max: float = 0.35  # 阶段9显著变化像素占比上限
+    stage9_darkening_ratio_max: float = 0.005  # 阶段9异常变暗像素占比上限
+    stage9_weak_star_recovery_ratio_min: float = 0.70  # 候选相对 Stage8 至少恢复的弱星组件数量比例
+    stage9_star_recovery_ratio_min: float = 0.75  # 候选相对 Stage8 至少恢复的全部星点组件数量比例
+    stage9_weak_star_screen_intensity_min: float = 0.40  # 弱星 Screen 强度下限；恢复率门控负责防止 fallback 过度压低弱星
+    stage9_star_support_ratio_max: float = 0.12  # 独立星表生成的实际回混支持层最大覆盖
+    stage9_unmatched_changed_ratio_max: float = 0.01  # 星点支持层之外允许发生显著变化的最大比例
+    stage9_chromatic_addition_peak_min: float = 0.02  # 局部伪色门控只统计高于该新增峰值的回星像素
+    stage9_chromatic_addition_saturation_min: float = 0.70  # 新增星点通道跨度达到该比例时视为极端局部色彩
+    stage9_chromatic_addition_ratio_max: float = 0.003  # 极端局部色彩新增像素占全图的最大比例，超限回滚候选
+    stage9_local_component_peak_min: float = 0.01  # 局部连通块门控使用的最低新增峰值
+    stage9_local_component_area_max: int = 256  # 单个新增连通块最大面积，限制非星形大片结构
+    stage9_local_component_aspect_ratio_max: float = 3.0  # 新增连通块最长/最短边上限
+    stage9_local_component_fill_ratio_min: float = 0.15  # 新增连通块最低包围盒填充率，排除细长/碎裂结构
+    stage9_local_single_pixel_ratio_max: float = 0.20  # Stage 9 新增连通块中单像素组件比例上限
+    stage9_local_cyan_blue_peak_min: float = 0.01  # 局部青蓝色团块最低新增峰值
+    stage9_local_cyan_blue_saturation_min: float = 0.50  # 局部青蓝色团块最低新增色彩跨度
+    stage9_local_cyan_blue_component_area_max: int = 64  # 单个局部青蓝色团块最大面积
+    stage9_core_percentile: float = 90.0  # 以 Stage 8 底图信号区该亮度百分位定义星云核心
+    stage9_core_color_jump_min: float = 0.10  # 核心区域归一化 RGB 单通道最大突变量
+    stage9_core_color_jump_component_area_max: int = 64  # 核心颜色突变连通块最大面积
+    stage9_star_aperture_recovery_ratio_min: float = 0.75  # 7x7 星点孔径通量最低恢复数量比例
+    stage9_star_wing_recovery_ratio_min: float = 0.65  # 参考星翼最低恢复数量比例
+    stage9_residual_dark_hole_ratio_max: float = 0.15  # 回星后星点邻域残余暗坑像素比例上限
+    stage9_hollow_structure_delta_min: float = 0.05  # 检测新增环状/空心结构的星层最小亮度变化
+    stage9_new_hollow_structure_area_max: int = 64  # 新增闭合环内部允许的最大空心面积，超限候选回滚
+    remix_safe_blend: bool = True   # 兼容旧配置；阶段 9 当前固定使用上一阶段 starless 与 starmask 的 Screen 回混
     remix_nebula_weight: float = 0.18  # 兼容旧自动调参字段；阶段 9 不再用于 stage6/starless 安全混合
 
     # 阶段 10: 最终饱和度
     final_saturation: float = 0.15  # 导出前最终全图饱和度微调量
     final_bg_factor: int = 1        # 最终饱和度背景抑制系数（Siril `satu` 第二参数）
+    stage10_chroma_focus_score_min: float = 0.34  # Stage10 综合色噪达到该值时优先保护亮度、只处理色度
+    stage10_separate_chroma_score_min: float = 0.70  # Stage10 严重通道色噪启用逐通道降噪的门限
+    stage10_full_bg_std_min: float = 0.018  # Stage10 色噪伴随亮度背景噪声时改用 full 的 bg_std 门限
+    stage10_full_mottling_score_min: float = 0.45  # Stage10 色噪伴随背景斑驳时改用 full 的斑驳门限
+    stage10_stage9_local_color_risk_strength: float = 1.0  # 按 Stage9 局部青蓝/核心突变风险比例压低正向最终饱和度
+    force_review_only_output: bool = False  # 显式启用时 Stage10 仅写 result_review*，不写正式结果名
 
     # Stage 11: Optional AI postprocess
+    review_bundle_enabled: bool = True  # 为关键阶段生成 before/after/diff/metrics 视觉复核包
     ai_post_enabled: bool = False   # Enable optional AI postprocess stage
     ai_endpoint: str = ""           # OpenAI-compatible image edit endpoint
     ai_model: str = ""              # User-provided model name
@@ -144,9 +204,18 @@ class PipelineConfig:
     ai_timeout_sec: int = 90        # API request timeout in seconds
     ai_strength: float = 0.12       # Conservative blend ratio for AI result
     ai_prompt: str = ""             # Custom prompt; empty uses default conservative prompt
+    ai_advisor_mode: str = "text"  # AI 顾问模式：text 或 multimodal；多模态失败时参数建议自动回退文本
     ai_stage6_enabled: bool = True  # AI 总开关开启且凭据齐全时，允许阶段6使用 AI 拉伸顾问
     ai_stage7_enabled: bool = True  # AI 总开关开启且凭据齐全时，允许阶段7使用 AI SyQon 参数优化
     ai_stage8_enabled: bool = True  # AI 总开关开启且凭据齐全时，允许阶段8使用 AI Starless 参数优化
+
+    # Stage 11 后：完全隔离的 AI 艺术衍生实验（不属于正式阶段）
+    ai_artistic_derivative_enabled: bool = False  # 显式开启后才上传 Stage10 预览并生成独立艺术衍生图
+    ai_artistic_endpoint: str = ""  # 独立 OpenAI-compatible /images/edits endpoint，不复用 advisor endpoint
+    ai_artistic_model: str = ""  # 独立图像编辑/生成模型名
+    ai_artistic_api_key: str = ""  # 独立 API 密钥，不复用 advisor 密钥
+    ai_artistic_prompt: str = ""  # 艺术衍生提示词；为空使用带非科学声明的默认提示词
+    ai_artistic_timeout_sec: int = 180  # 艺术衍生请求超时，安全限幅 30–600 秒
 
     # Stage 11: Quality gate thresholds
     ai_bg_median_delta_max: float = 0.03    # Allowed background median drift
@@ -159,7 +228,24 @@ class PipelineConfig:
     stage6_black_pixel_ratio_max: float = 0.35  # 阶段6验收：近黑像素占比上限
     stage6_highlight_clip_ratio_max: float = 0.010  # 阶段6验收：高亮裁剪占比上限
     stage6_star_growth_ratio_max: float = 1.25  # 阶段6验收：星点中位尺寸增长上限
-    stage7_quality_retry_max: int = 2  # 阶段7质量差时最多追加的 SyQon/SASP 补救尝试次数
+    stage7_preview_calibration_enabled: bool = True  # 阶段7用 linked preview 的 P50/P99 标定正式 Asinh 候选
+    stage7_target_aware_stretch_enabled: bool = True  # 阶段7按 target profile/policy 收紧核心保护或增强弱信号，但保持固定双候选
+    stage7_preview_cand_a_p50_ratio: float = 0.35  # cand_a 目标背景相对 preview P50 的保守比例
+    stage7_preview_cand_b_p50_ratio: float = 0.25  # cand_b 后接 GHS，Asinh 目标比例更低
+    stage7_preview_asinh_stretch_max: float = 1000.0  # preview 反解 Asinh 强度安全上限（Siril 常用范围上限）
+    stage7_preview_target_p50_min_ratio: float = 0.55  # 实际 P50 至少达到标定目标的比例，避免上限饱和后仍接受过暗候选
+    stage7_preview_target_p50_max_ratio: float = 1.50  # 实际 P50 不得超过标定目标的比例，避免过亮候选进入正式交付
+    stage7_target_local_metrics_enabled: bool = True  # Stage 7 用线性源构建核心/弱结构/暗云局部区域并参与候选门控
+    stage7_local_core_clip_ratio_max: float = 0.12  # 亮核局部区域允许的裁剪像素比例上限
+    stage7_local_faint_snr_min: float = 0.25  # 目标弱结构相对局部背景的最低可分离信噪比
+    stage7_local_dark_separation_min: float = 0.001  # 暗云周围亮云与暗结构的最低局部亮度分离
+    stage7_stretch_chroma_noise_score_max: float = 0.34  # Stage 7 正式拉伸候选的背景绝对色噪上限
+    stage7_stretch_background_mottling_score_max: float = 0.45  # Stage 7 正式拉伸候选的背景斑驳上限
+    stage7_stretch_chroma_load_growth_max: float = 1.35  # Stage 7 拉伸后综合色偏差相对背景亮度的最大放大倍数
+    stage7_stretch_chroma_load_low_absolute_max: float = 0.05  # 绝对 chroma load 低于此值时豁免极低基线导致的相对增长失真
+    stage7_chroma_rescue_enabled: bool = True  # 双候选仅因背景色噪被拒绝时，允许生成背景限定的保亮度色度抑制救援候选
+    stage7_chroma_rescue_strength_levels: Tuple[float, ...] = (0.35, 0.55, 0.65)  # 救援按低到高三档抑制背景色度；运行时强制限幅到 0.10–0.75
+    stage7_quality_retry_max: int = 2  # Stage 6 去星质量差时最多追加的同源 SyQon 参数重试次数
     stage7_edge_black_warn: float = 0.10  # 阶段7去星前黑边风险提示阈值
     stage7_edge_black_high: float = 0.18  # 阶段7去星前高风险黑边阈值
     stage7_bg_median_high: float = 0.16  # 阶段7去星前高背景中值阈值
@@ -171,29 +257,36 @@ class PipelineConfig:
     stage7_black_hole_score_max: float = 0.08  # 阶段7验收：去星暗坑/暗环评分上限
     stage7_starmask_contamination_max: float = 0.25  # 阶段7验收：星点层星云污染评分上限
     stage7_starless_noise_gain_max: float = 1.25  # 阶段7验收：starless 背景噪声增益上限
-    stage7_starmask_coverage_min_ratio: float = 0.35  # 阶段7验收：starmask 覆盖相对 stage6 星点覆盖的下限
-    stage7_starmask_width_ratio_max: float = 1.80  # 阶段7验收：starmask 中位宽度相对 stage6 星点宽度上限
-    stage7_starless_dynamic_range_min_ratio: float = 0.55  # 阶段7验收：starless 相对输入的有效动态范围下限，防止去星输出塌缩
-    stage7_starless_peak_signal_min: float = 0.006  # 阶段7验收：低动态范围 starless 的最低峰值信号，低于此值触发保守重试
-    stage7_starmask_clean_enabled: bool = True  # 阶段7默认清理星点层，避免背景/星云残差直接回混
-    stage7_starmask_background_floor_percentile: float = 55.0  # 阶段7星点层低亮背景残差软阈值百分位
-    stage7_starmask_halo_blur_strength: float = 0.35  # 阶段7亮星 halo 区域轻微平滑强度
-    stage7_starmask_small_star_scale: float = 0.88  # 阶段7小/弱星点层保守降强比例
-    stage7_starmask_nebula_suppression: float = 0.75  # 阶段7星云主体区域星点层降权强度
-    stage7_conservative_repair_enabled: bool = True  # 阶段7质量差时允许用较轻拉伸输入重跑去星
+    stage7_starmask_coverage_min_ratio: float = 0.35  # Stage 6 验收：starmask 覆盖相对输入星点覆盖的下限
+    stage7_starmask_width_ratio_max: float = 1.80  # Stage 6 验收：starmask 中位宽度相对输入星点宽度上限
+    stage7_starless_dynamic_range_min_ratio: float = 0.55  # Stage 6 验收：starless 相对输入的有效动态范围下限，防止去星输出塌缩
+    stage7_starless_peak_signal_min: float = 0.006  # Stage 6 验收：低动态范围 starless 的最低峰值信号，低于此值触发参数重试
+    stage7_starless_peak_background_ratio_min: float = 4.0  # 极低背景下峰值至少高于背景此倍数，避免固定峰值线误报塌缩
+    stage7_starmask_clean_enabled: bool = True  # Stage 6 默认清理星点层，避免背景/星云残差直接回混
+    stage7_starmask_background_floor_percentile: float = 55.0  # Stage 6 星点层背景噪声样本百分位
+    stage7_starmask_halo_blur_strength: float = 0.35  # Stage 6 非紧致宽 halo/低频残差衰减强度（不再直接模糊星点）
+    stage7_starmask_small_star_scale: float = 0.88  # Stage 6 紧致弱星最低保留比例，不再对小星统一降强
+    stage7_starmask_nebula_suppression: float = 0.75  # Stage 6 星点层自身低频弥散污染扣除强度
+    stage7_starmask_cleanup_noise_sigma: float = 2.5  # Stage 6 多尺度清理的背景噪声检测倍数
+    stage7_starmask_compact_retention_min: float = 0.82  # 清理后紧致星核/星翼最低保留比例，低于则回滚
+    stage7_starmask_diffuse_residual_ratio_max: float = 0.08  # 清理后弥散残留能量比例硬上限，超限时禁用该星点层
+    stage7_conservative_repair_enabled: bool = True  # Stage 6 去星质量差时允许在同一线性输入上调整 SyQon 参数重试
     stage7_skip_unready_starless: bool = True  # Stage6.5 判定不适合去星时，默认跳过去星并进入 review export
-    star_separation_mode: str = "linear_star_separation"  # 星点分离输入模式：linear_star_separation 或 mild_prestretch_star_separation
-    star_separation_fallback_to_mild_prestretch: bool = True  # 线性去星失败时是否自动改用轻微预拉伸输入重试
-    mild_prestretch_strength: float = 1.35  # 轻微预拉伸去星强度；仅用于去星输入，不替代后续主体拉伸
-    stage7_conservative_asinh_stretch: float = 2.00  # 阶段7保守去星输入的轻拉伸强度
-    stage7_ultra_conservative_asinh_stretch: float = 1.65  # 阶段7更保守去星输入的极轻拉伸强度
-    stage7_soft_starless_asinh_stretch: float = 1.35  # 阶段7质量差时追加更低强度去星输入，减少黑洞和彩色残渣
-    stage7_conservative_asinh_offset: float = 0.0025  # 阶段7保守去星输入的 Asinh 偏移
+    star_separation_mode: str = "linear_star_separation"  # Stage 6 固定线性输入；mild_prestretch 值仅作旧配置兼容并忽略
+    star_separation_fallback_to_mild_prestretch: bool = False  # 旧配置兼容字段；当前 SyQon 路径不做外部预拉伸
+    mild_prestretch_strength: float = 1.35  # 旧配置兼容字段；当前 Stage 6 不使用
+    stage7_conservative_asinh_stretch: float = 2.00  # 旧去星前兼容门禁的诊断候选参数，不进入正式 Stage 6
+    stage7_ultra_conservative_asinh_stretch: float = 1.65  # 旧去星前兼容门禁的诊断候选参数，不进入正式 Stage 6
+    stage7_soft_starless_asinh_stretch: float = 1.35  # 旧去星前兼容参数；当前 Stage 6 不使用预拉伸重试
+    stage7_conservative_asinh_offset: float = 0.0025  # 旧去星前兼容门禁的 Asinh 偏移
     stage7_starless_pixel_repair_enabled: bool = True  # 阶段7质量差时对 starless 做残星/halo/背景彩噪局部修复
     stage7_starless_repair_strength: float = 0.68  # 阶段7残星小尺度修复强度
     stage7_starless_halo_repair_strength: float = 0.70  # 阶段7亮星 halo 平滑修补强度
     stage7_starless_chroma_denoise_strength: float = 0.55  # 阶段7背景 chroma noise reduction 强度
+    stage6_star_preserve_target_bypass_enabled: bool = True  # 星团/M45 类主体默认绕过去星与 Starless 专用增强
     stage7_starless_repair_max_score_growth: float = 0.00  # 阶段7像素修复不得让综合质量评分变差
+    stage7_starless_repair_chroma_reduction_min: float = 0.20  # 背景综合色噪至少下降此比例时允许走专用验收路径
+    stage7_starless_repair_chroma_delta_min: float = 0.0005  # 背景综合色噪专用验收所需的最小绝对下降量
     stage8_force_conservative_after_stage7_repair: bool = True  # Stage7 修复/不安全时 Stage8 禁止细节增强
     stage8_mask_signal_coverage_min: float = 0.002  # Stage8 增强前信号 mask 覆盖下限，小视场 M42 等紧凑目标保守放行
     stage8_blue_excess_max: float = 0.08  # 阶段8验收：蓝色相对红/绿通道的过量上限
@@ -276,7 +369,7 @@ class AutoTuneResult:
 
 @dataclass
 class Stage6StretchStrategy:
-    """阶段 6 拉伸策略。"""
+    """拉伸策略；类名为历史兼容命名，当前用于阶段 7。"""
     name: str
     summary: str
     candidates: List[Dict[str, Any]]

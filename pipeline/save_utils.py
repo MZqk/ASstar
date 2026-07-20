@@ -165,9 +165,11 @@ def export_final_outputs(
     log: Any,
     *,
     base_filename: str,
+    fit_filename: Optional[str],
     fallback_base: str,
     fallback_fit_base: str,
     output_format: str = "all",
+    png_preview_stretch: bool = True,
     status: str,
     messages: List[str],
 ) -> Tuple[str, List[str]]:
@@ -201,7 +203,7 @@ def export_final_outputs(
     if "fit" in requested:
         log.info("保存 FITS 存档...")
         try:
-            cmd_with_check("save", base_filename + "_final")
+            cmd_with_check("save", fit_filename or (base_filename + "_final"))
             log.info("FITS 存档已保存")
         except (CommandError, DataError, SirilError, OSError, RuntimeError):
             try:
@@ -214,12 +216,18 @@ def export_final_outputs(
 
     if "png" in requested:
         log.info("导出 PNG 预览...")
-        try:
-            cmd_with_check("autostretch")
-            messages.append("PNG preview stretch applied")
-        except (CommandError, DataError, SirilError, OSError, RuntimeError) as e:
-            log.warn(f"PNG 预览拉伸跳过: {e}")
-            messages.append(f"PNG preview stretch failed: {e}")
+        if png_preview_stretch:
+            try:
+                cmd_with_check("autostretch", "-linked")
+                messages.append("PNG preview stretch applied (linked diagnostic fallback)")
+            except (CommandError, DataError, SirilError, OSError, RuntimeError) as e:
+                log.warn(f"PNG 预览拉伸跳过: {e}")
+                messages.append(f"PNG preview stretch failed: {e}")
+        else:
+            messages.append(
+                "PNG preview uses accepted nonlinear Stage7 rendering; "
+                "second autostretch skipped"
+            )
         try:
             cmd_with_check("savepng", base_filename)
             log.info("PNG 已导出")

@@ -2,7 +2,87 @@
 from typing import Any, Dict, List, Optional, Tuple
 
 from models import PipelineStage
+from pipeline_safety import should_bypass_star_separation
 from sirilpy.exceptions import CommandError, SirilError
+
+
+def _stage7_chroma_repair_acceptance(
+    cfg,
+    before: Dict[str, Any],
+    after: Dict[str, Any],
+    *,
+    residual_not_worse: bool,
+    halo_not_worse: bool,
+) -> Dict[str, Any]:
+    before_chroma = max(float(before.get("chroma_noise_score", 0.0) or 0.0), 0.0)
+    after_chroma = max(float(after.get("chroma_noise_score", 0.0) or 0.0), 0.0)
+    chroma_delta = max(before_chroma - after_chroma, 0.0)
+    chroma_reduction = chroma_delta / max(before_chroma, 1e-7)
+    min_reduction = float(
+        getattr(cfg, "stage7_starless_repair_chroma_reduction_min", 0.20)
+    )
+    min_delta = float(
+        getattr(cfg, "stage7_starless_repair_chroma_delta_min", 0.0005)
+    )
+    significant = (
+        before_chroma > 0.0
+        and chroma_delta >= min_delta
+        and chroma_reduction >= min_reduction
+    )
+    accepted = significant and residual_not_worse and halo_not_worse
+    return {
+        "accepted": accepted,
+        "significant": significant,
+        "before": before_chroma,
+        "after": after_chroma,
+        "delta": chroma_delta,
+        "reduction_ratio": chroma_reduction,
+        "minimum_delta": min_delta,
+        "minimum_reduction_ratio": min_reduction,
+        "residual_not_worse": residual_not_worse,
+        "halo_not_worse": halo_not_worse,
+    }
+
+
+def _apply_starmask_cleanup_hard_gate(
+    quality: Dict[str, Any],
+    cleanup: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Carry the diffuse-residual hard gate into Stage 6 candidate quality."""
+    if not isinstance(quality, dict):
+        return quality
+    cleanup_metrics = (
+        cleanup.get("metrics") or {}
+        if isinstance(cleanup, dict)
+        else {}
+    )
+    hard_failed = bool(cleanup_metrics.get("diffuse_hard_gate_failed", False))
+    derived = dict(quality.get("derived") or {})
+    limits = cleanup_metrics.get("limits") or {}
+    derived.update(
+        {
+            "starmask_diffuse_residual_ratio": float(
+                cleanup_metrics.get("diffuse_residual_ratio", 0.0) or 0.0
+            ),
+            "starmask_diffuse_residual_ratio_max": float(
+                limits.get("max_diffuse_residual_ratio", 0.08) or 0.08
+            ),
+            "starmask_cleanup_hard_failed": hard_failed,
+        }
+    )
+    quality["derived"] = derived
+    if hard_failed:
+        issue = (
+            "starmask_diffuse_residual_ratio "
+            f"{derived['starmask_diffuse_residual_ratio']:.3f}>"
+            f"{derived['starmask_diffuse_residual_ratio_max']:.3f}"
+        )
+        issues = list(quality.get("issues") or [])
+        if issue not in issues:
+            issues.append(issue)
+        quality["issues"] = issues
+        quality["status"] = "poor"
+    return quality
 
 
 def _select_stage7_source(pipeline) -> str:
@@ -12,6 +92,7 @@ def _select_stage7_source(pipeline) -> str:
     for fallback in (
         "stage5_linear",
         "stage5_denoised",
+        "stage5_graxpert_deconv",
         "stage5_deconv",
         "stage4_color",
         "stage4_colorbalanced",
@@ -31,10 +112,36 @@ def _select_stage7_source(pipeline) -> str:
     return source_stem
 
 
+def _syqon_refinement_variants(
+    pipeline,
+    *,
+    repair_triggers: List[str],
+    initial_variant: Tuple[int, int, bool],
+) -> List[Tuple[int, int, bool]]:
+    """Return only variants capable of addressing the observed failure mode."""
+    initial_tile, initial_overlap, initial_axiom = initial_variant
+    if repair_triggers == ["dynamic_range_collapse"]:
+        if initial_axiom:
+            return [(initial_tile, initial_overlap, False)]
+        if pipeline._syqon_axiom_model_available():
+            return [(initial_tile, initial_overlap, True)]
+        return []
+
+    variants: List[Tuple[int, int, bool]] = [
+        (512, 96, False),
+        (1024, 64, False),
+        (1024, 96, False),
+    ]
+    if pipeline._syqon_axiom_model_available():
+        variants.append((512, 64, True))
+    return variants
+
+
 def _stage7_linear_source(pipeline) -> str:
     for stem in (
         "stage5_linear",
         "stage5_denoised",
+        "stage5_graxpert_deconv",
         "stage5_deconv",
         "stage4_color",
         "stage4_colorbalanced",
@@ -49,104 +156,48 @@ def _stage7_linear_source(pipeline) -> str:
 
 
 def _prepare_star_separation_source(pipeline) -> Tuple[str, str, List[Dict[str, Any]]]:
-    mode = str(
+    requested_mode = str(
         getattr(pipeline.cfg, "star_separation_mode", "linear_star_separation")
     ).strip().lower()
-    if mode not in {"linear_star_separation", "mild_prestretch_star_separation"}:
+    if requested_mode not in {"linear_star_separation", "mild_prestretch_star_separation"}:
         pipeline.log.warn(
             "Invalid star_separation_mode="
-            f"{mode!r}; falling back to linear_star_separation"
+            f"{requested_mode!r}; falling back to linear_star_separation"
         )
-        mode = "linear_star_separation"
+        requested_mode = "linear_star_separation"
 
     linear_source = _stage7_linear_source(pipeline)
     records: List[Dict[str, Any]] = [
         {
             "mode": "linear_star_separation",
             "source_stem": linear_source,
-            "status": "selected" if mode == "linear_star_separation" else "available",
+            "status": "selected",
             "method": "linear",
+            "domain": "linear",
         }
     ]
     pipeline.cmd_with_check("load", linear_source)
     pipeline._save_stage_output("stage6_input")
-
-    if mode == "linear_star_separation":
-        pipeline.stretched_name = linear_source
-        return linear_source, mode, records
-
-    mild_stem = "stage6_mild_prestretch_star_input"
-    stretch = max(
-        1.05,
-        min(1.80, float(getattr(pipeline.cfg, "mild_prestretch_strength", 1.35))),
-    )
-    offset = float(getattr(pipeline.cfg, "stage7_conservative_asinh_offset", 0.0025))
-    try:
-        pipeline.cmd_with_check("load", linear_source)
-        pipeline.cmd_with_check("asinh", str(stretch), str(offset))
-        saved = pipeline._save_stage_output(mild_stem)
+    if requested_mode == "mild_prestretch_star_separation":
+        reason = (
+            "external mild prestretch disabled: bundled SyQon performs its own "
+            "temporary reversible IHS; Stage 6 must remain linear"
+        )
+        pipeline.log.warn(reason)
         records.append(
             {
                 "mode": "mild_prestretch_star_separation",
-                "source_stem": mild_stem,
+                "source_stem": None,
                 "linear_source_stem": linear_source,
-                "status": "selected" if saved else "failed",
-                "method": "asinh",
-                "asinh_stretch": stretch,
-                "asinh_offset": offset,
+                "status": "ignored_compatibility",
+                "method": "disabled",
+                "domain": "nonlinear",
+                "reason": reason,
             }
         )
-        if saved:
-            pipeline.stretched_name = mild_stem
-            return mild_stem, mode, records
-    except (CommandError, SirilError) as e:
-        records.append(
-            {
-                "mode": "mild_prestretch_star_separation",
-                "source_stem": mild_stem,
-                "linear_source_stem": linear_source,
-                "status": "failed",
-                "method": "asinh",
-                "asinh_stretch": stretch,
-                "asinh_offset": offset,
-                "reason": pipeline._short_text(e, 180),
-            }
-        )
-        pipeline.log.warn(f"轻微预拉伸去星输入生成失败，回退线性输入: {e}")
 
     pipeline.stretched_name = linear_source
     return linear_source, "linear_star_separation", records
-
-
-def _switch_to_mild_prestretch_after_failure(
-    pipeline,
-    *,
-    current_source: str,
-    stage_messages: List[str],
-    conservative_input_records: List[Dict[str, Any]],
-) -> Optional[str]:
-    if current_source == "stage6_mild_prestretch_star_input":
-        return None
-    if not bool(getattr(pipeline.cfg, "star_separation_fallback_to_mild_prestretch", True)):
-        return None
-    previous_mode = getattr(pipeline.cfg, "star_separation_mode", "linear_star_separation")
-    try:
-        pipeline.cfg.star_separation_mode = "mild_prestretch_star_separation"
-        source_stem, mode, records = _prepare_star_separation_source(pipeline)
-        conservative_input_records.extend(records)
-        if source_stem == current_source:
-            return None
-        stage_messages.append(
-            "linear star separation failed; retrying with mild prestretch input "
-            f"(source={source_stem}, strength={pipeline.cfg.mild_prestretch_strength:.2f})"
-        )
-        pipeline.log.warn(
-            "线性去星失败，改用轻微预拉伸输入重试: "
-            f"{source_stem}"
-        )
-        return source_stem if mode == "mild_prestretch_star_separation" else None
-    finally:
-        pipeline.cfg.star_separation_mode = previous_mode
 
 
 def run_stage7_star_separation(pipeline) -> None:
@@ -162,25 +213,104 @@ def run_stage7_star_separation(pipeline) -> None:
     selected_source_stem, star_separation_mode, mode_input_records = (
         _prepare_star_separation_source(pipeline)
     )
+    target_type = (
+        pipeline._active_target_type()
+        if hasattr(pipeline, "_active_target_type")
+        else "generic_low_snr_safe"
+    )
+    if should_bypass_star_separation(
+        target_type,
+        enabled=bool(
+            getattr(pipeline.cfg, "stage6_star_preserve_target_bypass_enabled", True)
+        ),
+    ):
+        message_parts = [
+            f"star-preserve target bypassed SyQon/SASP ({target_type})",
+            f"source={selected_source_stem}",
+        ]
+        try:
+            pipeline.cmd_with_check("load", selected_source_stem)
+            pipeline.cmd_with_check("save", "starless")
+            pipeline.starless_file = pipeline.process_dir / "starless.fit"
+            pipeline.starmask_file = None
+            pipeline._stage7_starless_skipped = True
+            pipeline._star_preserve_target_bypass = True
+            quality_record = {
+                "attempt": "star_preserve_target_bypass",
+                "tool_label": "none",
+                "status": "skipped",
+                "issues": ["stars are part of the target subject"],
+                "derived": {
+                    "residual_star_score": 0.0,
+                    "halo_residue_score": 0.0,
+                    "starmask_contamination": 0.0,
+                },
+            }
+            pipeline._write_stage_json(
+                "stage7_quality.json",
+                {
+                    "attempts": [quality_record],
+                    "selected": quality_record,
+                    "mode": "star_preserve_target_bypass",
+                    "target_type": target_type,
+                    "star_separation_mode": star_separation_mode,
+                    "input_domain": "linear",
+                    "selected_source_stem": selected_source_stem,
+                    "conservative_inputs": mode_input_records,
+                    "stage9_star_remix": {
+                        "scale": 1.0,
+                        "reason": "no remix required for star-preserve target",
+                    },
+                    "retry_max": 0,
+                },
+            )
+            stage_saved = pipeline._save_stage_output("stage7_starless")
+            if stage_saved and hasattr(pipeline, "_create_stage_review_bundle"):
+                review = pipeline._create_stage_review_bundle(
+                    "stage6_star_separation",
+                    "stage6_input",
+                    "stage7_starless",
+                    context={"mode": "star_preserve_target_bypass"},
+                    candidates=[quality_record],
+                    selected_candidate=str(quality_record.get("attempt")),
+                )
+                if review.get("report_path"):
+                    message_parts.append(f"review_bundle={review['report_path']}")
+            if not stage_saved:
+                message_parts.append("stage6 star-preserve output save failed")
+            elapsed = pipeline.log.stage_end(stage_label)
+            pipeline._record_stage(
+                stage_label,
+                "skipped" if stage_saved else "degraded",
+                elapsed,
+                "；".join(message_parts),
+            )
+            return
+        except (CommandError, SirilError) as error:
+            pipeline.log.warn(
+                "Star-preserve bypass failed; continuing with regular star separation: "
+                f"{error}"
+            )
+            pipeline._star_preserve_target_bypass = False
+
     gate_report = getattr(pipeline, "pre_starless_gate_report", {}) or {}
     recommended = str(gate_report.get("recommended_starless_input") or "").strip()
     if recommended.endswith(".fit"):
         recommended = recommended[:-4]
     if recommended and pipeline.process_dir and (pipeline.process_dir / f"{recommended}.fit").exists():
-        previous_stretched = pipeline.stretched_name or "stage7_stretched"
-        if recommended != previous_stretched:
-            pipeline.log.info(
-                "[Stage6] Using pre-starless recommended input: "
-                f"{recommended} (previous={previous_stretched})"
+        if recommended != selected_source_stem:
+            pipeline.log.warn(
+                "[Stage6] Ignoring legacy pre-starless input recommendation "
+                f"{recommended}; retaining linear source {selected_source_stem}"
             )
-            pipeline.stretched_name = recommended
+    pipeline.stretched_name = selected_source_stem
 
     if (
         gate_report
         and not bool(gate_report.get("ready_for_starless", True))
         and bool(getattr(pipeline.cfg, "stage7_skip_unready_starless", True))
     ):
-        source_stem = pipeline.stretched_name or "stage7_stretched"
+        source_stem = selected_source_stem
         reasons = [str(item) for item in gate_report.get("reason", []) if item]
         message_parts = [
             "Stage6.5 ready_for_starless=false; skipped SyQon/SASP starless",
@@ -213,6 +343,7 @@ def run_stage7_star_separation(pipeline) -> None:
                     "selected": quality_record,
                     "mode": "skipped_by_pre_starless_gate",
                     "star_separation_mode": star_separation_mode,
+                    "input_domain": "linear",
                     "selected_source_stem": source_stem,
                     "conservative_inputs": mode_input_records,
                     "pre_starless_gate": gate_report,
@@ -222,6 +353,17 @@ def run_stage7_star_separation(pipeline) -> None:
             )
             pipeline._export_sasp_exchange_files()
             stage_saved = pipeline._save_stage_output("stage7_starless")
+            if stage_saved and hasattr(pipeline, "_create_stage_review_bundle"):
+                review = pipeline._create_stage_review_bundle(
+                    "stage6_star_separation",
+                    "stage6_input",
+                    "stage7_starless",
+                    context={"mode": "skipped_by_pre_starless_gate"},
+                    candidates=[quality_record],
+                    selected_candidate=str(quality_record.get("attempt")),
+                )
+                if review.get("report_path"):
+                    message_parts.append(f"review_bundle={review['report_path']}")
             if not stage_saved:
                 message_parts.append("stage7 输出保存失败")
             elapsed = pipeline.log.stage_end(stage_label)
@@ -239,6 +381,7 @@ def run_stage7_star_separation(pipeline) -> None:
     try:
         pipeline.starless_file = None
         pipeline.starmask_file = None
+        pipeline._stage7_starmask_cleanup_hard_failed = False
         syqon_failure_reason: Optional[str] = None
         stage_messages: List[str] = []
         quality_records: List[Dict[str, Any]] = []
@@ -253,7 +396,8 @@ def run_stage7_star_separation(pipeline) -> None:
         selected_source_stem = pipeline.stretched_name or selected_source_stem
         stage_messages.append(
             "star_separation_mode="
-            f"{star_separation_mode}; source={selected_source_stem}"
+            f"{star_separation_mode}; input_domain=linear; "
+            f"external_prestretch=false; source={selected_source_stem}"
         )
 
         if hasattr(pipeline, "_stage7_preflight_check"):
@@ -304,7 +448,7 @@ def run_stage7_star_separation(pipeline) -> None:
                 axiom=plan_axiom,
             )
             if syqon_used:
-                syqon_model_note = "Axiom v2" if plan_axiom else "Zenith v1"
+                syqon_model_note = "Axiom 2.1" if plan_axiom else "Zenith v1"
                 stage_messages.append(f"SyQon model: {syqon_model_note} ({syqon_device_note})")
                 if pipeline.starmask_file:
                     pipeline.log.info("SyQon 产物已归一化: starless.fit, starmask.fit")
@@ -316,28 +460,17 @@ def run_stage7_star_separation(pipeline) -> None:
                     getattr(pipeline, "_last_plugin_script_error", None)
                     or f"SyQon 脚本执行失败: {syqon_script.name}"
                 )
-                retry_source = _switch_to_mild_prestretch_after_failure(
-                    pipeline,
-                    current_source=selected_source_stem,
-                    stage_messages=stage_messages,
-                    conservative_input_records=conservative_input_records,
-                )
-                if retry_source:
-                    selected_source_stem = retry_source
-                    syqon_used = pipeline._stage7_try_syqon_variant(
-                        syqon_script,
-                        attempt_name="mild_prestretch_fallback",
-                        tile_size=plan_tile_size,
-                        overlap=plan_overlap,
-                        axiom=plan_axiom,
+                if bool(
+                    getattr(
+                        pipeline.cfg,
+                        "star_separation_fallback_to_mild_prestretch",
+                        False,
                     )
-                    if syqon_used:
-                        syqon_failure_reason = None
-                        starless_used = syqon_used
-                        star_separation_mode = "mild_prestretch_star_separation"
-                        stage_messages.append(
-                            "mild prestretch star separation fallback succeeded"
-                        )
+                ):
+                    stage_messages.append(
+                        "external mild-prestretch fallback ignored to preserve the "
+                        "linear Stage6 domain"
+                    )
         else:
             syqon_failure_reason = "SyQon-Starless.py 缺失，回退到 SASP Dark Star"
 
@@ -376,8 +509,19 @@ def run_stage7_star_separation(pipeline) -> None:
         if starmask_cleanup.get("status") == "applied":
             metrics = starmask_cleanup.get("metrics") or {}
             stage_messages.append(
-                "stage7 starmask cleanup applied "
-                f"(signal_ratio={float(metrics.get('signal_ratio', 1.0)):.3f})"
+                "stage6 starmask multi-scale cleanup applied "
+                f"(signal_ratio={float(metrics.get('signal_ratio', 1.0)):.3f}, "
+                f"compact_retention={float(metrics.get('compact_retention', 1.0)):.3f})"
+            )
+        elif starmask_cleanup.get("status") in {
+            "rolled_back",
+            "hard_rejected",
+            "failed",
+        }:
+            stage_messages.append(
+                "stage6 starmask cleanup retained original mask "
+                f"(status={starmask_cleanup.get('status')}, "
+                f"reason={starmask_cleanup.get('reason') or 'quality gate'})"
             )
 
         quality_enabled = pipeline._ai_stage_advisory_enabled("ai_stage7_enabled")
@@ -387,8 +531,13 @@ def run_stage7_star_separation(pipeline) -> None:
             use_ai=quality_enabled,
             source_stem=selected_source_stem,
         )
+        selected_quality = _apply_starmask_cleanup_hard_gate(
+            selected_quality,
+            starmask_cleanup,
+        )
         quality_records.append(selected_quality)
         best_quality = selected_quality
+        best_cleanup = starmask_cleanup
         best_snapshot = (
             pipeline._stage7_snapshot_current_outputs("ai_best_initial")
             if quality_enabled or pipeline.cfg.stage7_conservative_repair_enabled
@@ -404,130 +553,56 @@ def run_stage7_star_separation(pipeline) -> None:
             )
 
         repair_triggers = pipeline._stage7_repair_triggers(selected_quality)
-        repair_attempts_done = 0
+        parameter_retries_done = 0
         if (
-            repair_triggers
-            and pipeline.cfg.stage7_conservative_repair_enabled
-            and syqon_script is not None
-            and pipeline.cfg.stage7_quality_retry_max > 0
+            selected_quality["status"] != "ok"
+            and bool(pipeline.cfg.stage7_conservative_repair_enabled)
         ):
-            conservative_input_records = pipeline._stage7_build_conservative_starless_inputs()
-            candidates = pipeline._stage7_conservative_input_candidates()
-            if candidates:
-                stage_messages.append(
-                    "stage7_quality triggers conservative starless retry: "
-                    + ",".join(repair_triggers)
-                )
-            for source_candidate in candidates:
-                if repair_attempts_done >= max(1, int(pipeline.cfg.stage7_quality_retry_max)):
-                    break
-                repair_attempts_done += 1
-                attempt_name = (
-                    f"conservative_repair_{repair_attempts_done}_"
-                    f"{source_candidate}"
-                )
-                used = pipeline._stage7_try_syqon_with_source(
-                    syqon_script,
-                    source_stem=source_candidate,
-                    attempt_name=attempt_name,
-                    tile_size=int(stage7_plan.get("tile_size", 512)) if stage7_plan else 512,
-                    overlap=int(stage7_plan.get("overlap", 64)) if stage7_plan else 64,
-                    axiom=bool(stage7_plan.get("use_axiom", False)) if stage7_plan else False,
-                )
-                if not used:
-                    repair_record = {
-                        "attempt": attempt_name,
-                        "source_stem": source_candidate,
-                        "status": "failed",
-                        "triggers": repair_triggers,
-                        "issues": [
-                            getattr(
-                                pipeline,
-                                "_last_plugin_script_error",
-                                "conservative starless retry failed",
-                            )
-                        ],
-                    }
-                    repair_records.append(repair_record)
-                    quality_records.append(repair_record)
-                    continue
-                retry_cleanup = pipeline._stage7_clean_starmask(
-                    label=attempt_name,
-                    source_stem=source_candidate,
-                )
-                starmask_cleanup_records.append(retry_cleanup)
-                retry_quality = pipeline._stage7_quality_assessment(
-                    attempt_name,
-                    tool_label=used,
-                    use_ai=quality_enabled,
-                    source_stem=source_candidate,
-                )
-                quality_records.append(retry_quality)
-                retry_snapshot = pipeline._stage7_snapshot_current_outputs(
-                    f"ai_best_{attempt_name}"
-                )
-                retry_score = pipeline._stage7_quality_score(retry_quality)
-                best_score = pipeline._stage7_quality_score(best_quality)
-                repair_record = {
-                    "attempt": attempt_name,
-                    "source_stem": source_candidate,
-                    "status": "ok",
-                    "triggers": repair_triggers,
-                    "score": retry_score,
-                    "selected": retry_score < best_score,
-                }
-                repair_records.append(repair_record)
-                if retry_score < best_score:
-                    best_quality = retry_quality
-                    best_snapshot = retry_snapshot
-                    best_label = attempt_name
-                    best_source_stem = source_candidate
-
-            if repair_attempts_done > 0 and best_snapshot is not None:
-                pipeline._stage7_restore_snapshot(best_snapshot)
-                selected_quality = best_quality
-                selected_source_stem = best_source_stem
-                stage_messages.append(
-                    "stage7_quality selected repaired starless "
-                    f"({best_label}, source={selected_source_stem}, "
-                    f"score={pipeline._stage7_quality_score(best_quality):.3f})"
-                )
-
-        if quality_enabled and selected_quality["status"] != "ok":
             retry_limit = max(
                 0,
-                int(pipeline.cfg.stage7_quality_retry_max) - repair_attempts_done,
+                int(pipeline.cfg.stage7_quality_retry_max),
             )
             if retry_limit <= 0:
                 stage_messages.append("stage7_quality refinement skipped: retry budget consumed")
             elif syqon_script is not None:
-                stage_messages.append("stage7_quality triggers SyQon parameter refinement")
-                variants: List[Tuple[int, int, bool]] = [
-                    (512, 96, False),
-                    (1024, 64, False),
-                    (1024, 96, False),
-                ]
-                if pipeline._syqon_axiom_model_available():
-                    variants.append((512, 64, True))
+                trigger_note = ",".join(repair_triggers) if repair_triggers else "quality_issues"
+                stage_messages.append(
+                    "stage7_quality triggers same-linear-source SyQon parameter refinement: "
+                    + trigger_note
+                )
+                initial_variant = (
+                    int(stage7_plan.get("tile_size", 512)) if stage7_plan else 512,
+                    int(stage7_plan.get("overlap", 64)) if stage7_plan else 64,
+                    bool(stage7_plan.get("use_axiom", False)) if stage7_plan else False,
+                )
+                variants = _syqon_refinement_variants(
+                    pipeline,
+                    repair_triggers=repair_triggers,
+                    initial_variant=initial_variant,
+                )
+                if repair_triggers == ["dynamic_range_collapse"]:
+                    if variants:
+                        stage_messages.append(
+                            "dynamic-range collapse refinement switches SyQon model; "
+                            "tile/overlap-only retries skipped"
+                        )
+                    else:
+                        stage_messages.append(
+                            "dynamic-range collapse refinement skipped: no alternate "
+                            "SyQon model; tile/overlap-only retries are ineffective"
+                        )
 
-                seen_variants = {
-                    (
-                        int(stage7_plan.get("tile_size", 512)) if stage7_plan else 512,
-                        int(stage7_plan.get("overlap", 64)) if stage7_plan else 64,
-                        bool(stage7_plan.get("use_axiom", False)) if stage7_plan else False,
-                    )
-                }
-                retries_done = 0
+                seen_variants = {initial_variant}
                 for tile_size, overlap, axiom in variants:
-                    if retries_done >= retry_limit:
+                    if parameter_retries_done >= retry_limit:
                         break
                     variant_key = (tile_size, overlap, axiom)
                     if variant_key in seen_variants:
                         continue
                     seen_variants.add(variant_key)
-                    retries_done += 1
+                    parameter_retries_done += 1
                     attempt_name = (
-                        f"syqon_refine_{retries_done}_tile{tile_size}_"
+                        f"syqon_refine_{parameter_retries_done}_tile{tile_size}_"
                         f"overlap{overlap}{'_axiom' if axiom else ''}"
                     )
                     used = pipeline._stage7_try_syqon_variant(
@@ -557,8 +632,12 @@ def run_stage7_star_separation(pipeline) -> None:
                     retry_quality = pipeline._stage7_quality_assessment(
                         attempt_name,
                         tool_label=used,
-                        use_ai=True,
-                        source_stem=pipeline.stretched_name or "stage7_stretched",
+                        use_ai=quality_enabled,
+                        source_stem=selected_source_stem,
+                    )
+                    retry_quality = _apply_starmask_cleanup_hard_gate(
+                        retry_quality,
+                        retry_cleanup,
                     )
                     quality_records.append(retry_quality)
                     retry_snapshot = pipeline._stage7_snapshot_current_outputs(
@@ -566,13 +645,15 @@ def run_stage7_star_separation(pipeline) -> None:
                     )
                     if pipeline._stage7_quality_score(retry_quality) < pipeline._stage7_quality_score(best_quality):
                         best_quality = retry_quality
+                        best_cleanup = retry_cleanup
                         best_snapshot = retry_snapshot
                         best_label = attempt_name
-                        best_source_stem = pipeline.stretched_name or "stage7_stretched"
+                        best_source_stem = selected_source_stem
 
                 if best_snapshot is not None:
                     pipeline._stage7_restore_snapshot(best_snapshot)
                 selected_quality = best_quality
+                starmask_cleanup = best_cleanup
                 selected_source_stem = best_source_stem
                 stage_messages.append(
                     "stage7_quality selected optimized starless "
@@ -597,10 +678,18 @@ def run_stage7_star_separation(pipeline) -> None:
                     use_ai=False,
                     source_stem=selected_source_stem,
                 )
+                selected_quality = _apply_starmask_cleanup_hard_gate(
+                    selected_quality,
+                    starmask_cleanup,
+                )
                 quality_records.append(selected_quality)
             quality_mode = "parameter_optimization"
         else:
-            quality_mode = "local_quality"
+            quality_mode = (
+                "local_parameter_optimization"
+                if parameter_retries_done
+                else "local_quality"
+            )
 
         if (
             selected_quality
@@ -622,6 +711,10 @@ def run_stage7_star_separation(pipeline) -> None:
                     use_ai=False,
                     source_stem=selected_source_stem,
                 )
+                repaired_quality = _apply_starmask_cleanup_hard_gate(
+                    repaired_quality,
+                    starmask_cleanup,
+                )
                 quality_records.append(repaired_quality)
                 repaired_score = pipeline._stage7_quality_score(repaired_quality)
                 max_growth = float(pipeline.cfg.stage7_starless_repair_max_score_growth)
@@ -635,15 +728,33 @@ def run_stage7_star_separation(pipeline) -> None:
                 halo_improved = after_halo < before_halo - 0.005
                 residual_not_worse = after_residual <= before_residual + 0.002
                 halo_not_worse = after_halo <= before_halo + 0.002
-                accepted = (
+                legacy_accepted = (
                     repaired_score <= before_repair_score + max_growth
                     and residual_not_worse
                     and halo_not_worse
                     and (residual_improved or halo_improved)
                 )
+                repair_metrics = pixel_repair.get("metrics") or {}
+                chroma_acceptance = _stage7_chroma_repair_acceptance(
+                    pipeline.cfg,
+                    repair_metrics.get("background_quality_before") or {},
+                    repair_metrics.get("background_quality_after") or {},
+                    residual_not_worse=residual_not_worse,
+                    halo_not_worse=halo_not_worse,
+                )
+                accepted = legacy_accepted or bool(chroma_acceptance.get("accepted"))
+                acceptance_path = (
+                    "chroma_reduction"
+                    if chroma_acceptance.get("accepted")
+                    else "residual_or_halo"
+                    if legacy_accepted
+                    else "rejected"
+                )
                 pixel_repair.update(
                     {
                         "accepted": accepted,
+                        "acceptance_path": acceptance_path,
+                        "chroma_acceptance": chroma_acceptance,
                         "score_before": before_repair_score,
                         "score_after": repaired_score,
                         "residual_before": before_residual,
@@ -661,7 +772,11 @@ def run_stage7_star_separation(pipeline) -> None:
                     )
                     stage_messages.append(
                         "stage7 starless pixel repair accepted "
-                        f"(score {before_repair_score:.3f}->{repaired_score:.3f})"
+                        f"via {acceptance_path} "
+                        f"(score {before_repair_score:.3f}->{repaired_score:.3f}, "
+                        "chroma "
+                        f"{float(chroma_acceptance.get('before', 0.0)):.5f}->"
+                        f"{float(chroma_acceptance.get('after', 0.0)):.5f})"
                     )
                 else:
                     pipeline._stage7_restore_snapshot(repair_snapshot)
@@ -675,6 +790,22 @@ def run_stage7_star_separation(pipeline) -> None:
                     "stage7 starless pixel repair skipped: "
                     f"{pixel_repair.get('reason')}"
                 )
+
+        selected_derived = (
+            selected_quality.get("derived") or {}
+            if isinstance(selected_quality, dict)
+            else {}
+        )
+        cleanup_hard_failed = bool(
+            selected_derived.get("starmask_cleanup_hard_failed", False)
+        )
+        pipeline._stage7_starmask_cleanup_hard_failed = cleanup_hard_failed
+        if cleanup_hard_failed:
+            pipeline.starmask_file = None
+            stage_messages.append(
+                "stage6 starmask diffuse-residual hard gate disabled star remix "
+                "for this candidate"
+            )
 
         if selected_quality and selected_quality.get("status") != "ok":
             pipeline._stage8_conservative_mode = bool(
@@ -707,6 +838,7 @@ def run_stage7_star_separation(pipeline) -> None:
                 "selected": selected_quality,
                 "mode": quality_mode,
                 "star_separation_mode": star_separation_mode,
+                "input_domain": "linear",
                 "selected_source_stem": selected_source_stem,
                 "preflight": stage7_preflight,
                 "starmask_cleanup": starmask_cleanup_records,
@@ -731,6 +863,17 @@ def run_stage7_star_separation(pipeline) -> None:
         pipeline._export_sasp_exchange_files()
         pipeline.cmd_with_check("load", pipeline.starless_file.stem)
         stage_saved = pipeline._save_stage_output("stage7_starless")
+        if stage_saved and hasattr(pipeline, "_create_stage_review_bundle"):
+            review = pipeline._create_stage_review_bundle(
+                "stage6_star_separation",
+                "stage6_input",
+                "stage7_starless",
+                context={"mode": quality_mode},
+                candidates=quality_records,
+                selected_candidate=str((selected_quality or {}).get("attempt") or ""),
+            )
+            if review.get("report_path"):
+                stage_messages.append(f"review_bundle={review['report_path']}")
         stage_message_text = "；".join(stage_messages)
 
         elapsed = pipeline.log.stage_end(stage_label)
@@ -753,7 +896,7 @@ def run_stage7_star_separation(pipeline) -> None:
         pipeline.starless_file = None
         pipeline.starmask_file = None
         pipeline._stage7_update_star_remix_from_quality(None)
-        # 使用拉伸后图像作为 starless 继续
+        # 使用固定的线性 Stage 6 输入作为 starless 继续。
         pipeline.cmd_with_check("load", pipeline.stretched_name)
         pipeline.cmd_with_check("save", "starless")
         pipeline.starless_file = pipeline.process_dir / "starless.fit"
@@ -774,6 +917,8 @@ def run_stage7_star_separation(pipeline) -> None:
                         "status": "degraded",
                     },
                     "mode": "degraded_fallback",
+                    "input_domain": "linear",
+                    "selected_source_stem": pipeline.stretched_name,
                     "preflight": locals().get("stage7_preflight"),
                     "starmask_cleanup": locals().get("starmask_cleanup_records", []),
                     "repairs": locals().get("repair_records", []),
@@ -787,7 +932,7 @@ def run_stage7_star_separation(pipeline) -> None:
         stage_saved = pipeline._save_stage_output("stage7_starless")
 
         elapsed = pipeline.log.stage_end(stage_label)
-        message = "无可用去星工具，已退化为直接使用拉伸图继续"
+        message = "无可用去星工具，已退化为直接使用线性 Stage 6 输入继续"
         if not stage_saved:
             message += "；stage7 输出保存失败"
         pipeline._record_stage(

@@ -59,7 +59,7 @@ def syqon_starless_cli_options(
             elif hasattr(torch_mod, "xpu") and torch_mod.xpu.is_available():
                 accel_available = True
                 accel_name = "XPU"
-        except (OSError, RuntimeError, TypeError, ValueError) as e:
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as e:
             pipeline.log.warn(
                 "SyQon GPU backend probe failed; script will decide device: "
                 f"{pipeline._short_text(e, 120)}"
@@ -85,7 +85,7 @@ def syqon_starless_cli_options(
     if not use_gpu:
         args.append("--no_gpu")
     if axiom:
-        args.append("--axiom")
+        args.append("--axiom21")
     if not use_gpu:
         device_note = "CPU forced"
     elif accel_available:
@@ -93,7 +93,7 @@ def syqon_starless_cli_options(
     else:
         device_note = "GPU requested but no torch backend detected; CPU fallback expected"
     if axiom:
-        device_note += "; Axiom v2"
+        device_note += "; Axiom 2.1"
     device_note += f"; tile={tile_size}; overlap={overlap}"
     return tuple(args), timeout_sec, device_note
 
@@ -181,7 +181,16 @@ def clear_star_separation_outputs(pipeline: object) -> None:
         for path in pipeline.process_dir.glob(pattern):
             if path in seen or not path.is_file():
                 continue
-            if path.stem.startswith(("starless_ai_best_", "starmask_ai_best_")):
+            # Candidate snapshots must survive later refinement attempts.  The
+            # raw starmask has a distinct prefix, so protect it explicitly as
+            # well as the visible starless/starmask snapshots.
+            if path.stem.startswith(
+                (
+                    "starless_ai_best_",
+                    "starmask_ai_best_",
+                    "starmask_raw_ai_best_",
+                )
+            ):
                 continue
             seen.add(path)
             pipeline._safe_unlink(path)
@@ -192,13 +201,19 @@ def syqon_axiom_model_available(pipeline: object) -> bool:
     if pipeline.siril_plugin_dir:
         candidates.extend(
             [
-                pipeline.siril_plugin_dir / "syqon_starless" / "Siril_axiomv2.pt",
+                pipeline.siril_plugin_dir / "vendor" / "siril-scripts" / "Axiom2_1.pt",
+                pipeline.siril_plugin_dir / "syqon_starless" / "axiom21.pt",
                 pipeline.siril_plugin_dir
-                / "vendor"
-                / "syqon_starless"
-                / "Siril_axiomv2.pt",
+                / "vendor" / "syqon_starless" / "axiom21.pt",
             ]
         )
+    siril = getattr(pipeline, "siril", None)
+    user_data_getter = getattr(siril, "get_siril_userdatadir", None)
+    if callable(user_data_getter):
+        try:
+            candidates.append(Path(user_data_getter()) / "syqon_starless" / "axiom21.pt")
+        except (OSError, RuntimeError, TypeError, ValueError):
+            pass
     for candidate in candidates:
         if candidate.is_file():
             return True
