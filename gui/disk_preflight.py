@@ -12,6 +12,7 @@ try:
         LIGHT_FRAME_EXPANSION_FACTOR,
         LIGHT_PREPROCESS_SEQUENCE_COPIES,
         LINEAR_RESUME_STAGE_ARTIFACT_COPIES,
+        STAGE2_RESUME_STAGE_ARTIFACT_COPIES,
         STACKED_STAGE_ARTIFACT_COPIES,
     )
 except ImportError:
@@ -22,6 +23,7 @@ except ImportError:
         LIGHT_FRAME_EXPANSION_FACTOR,
         LIGHT_PREPROCESS_SEQUENCE_COPIES,
         LINEAR_RESUME_STAGE_ARTIFACT_COPIES,
+        STAGE2_RESUME_STAGE_ARTIFACT_COPIES,
         STACKED_STAGE_ARTIFACT_COPIES,
     )
 
@@ -36,6 +38,19 @@ class DiskSpaceEstimate:
     required_free_bytes: int
     available_bytes: int
     selected_input_label: str
+
+
+@dataclass(frozen=True)
+class RuntimeDiskEstimate:
+    volume_path: Path
+    volume_device: int
+    current_runtime_bytes: int
+    seed_growth_bytes: int
+    support_growth_bytes: int
+    dependency_growth_bytes: int
+    required_free_bytes: int
+    available_bytes: int
+    bootstrap_cache_hit: bool
 
 
 def format_bytes(num_bytes: int) -> str:
@@ -79,3 +94,11 @@ def directory_size_bytes(path: Path) -> int:
             except OSError:
                 continue
     return total
+
+
+def existing_volume_anchor(path: Path) -> Path:
+    """Return the nearest existing parent suitable for disk_usage/stat."""
+    candidate = path.expanduser()
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return candidate

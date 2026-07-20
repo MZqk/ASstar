@@ -32,6 +32,15 @@ def scrub_python_env(env: dict[str, str]) -> dict[str, str]:
         "DYLD_FALLBACK_FRAMEWORK_PATH",
         "DYLD_LIBRARY_PATH",
         "LD_LIBRARY_PATH",
+        "QT_PLUGIN_PATH",
+        "QT_QPA_PLATFORM_PLUGIN_PATH",
+        "QT_QPA_PLATFORM",
+        "QML2_IMPORT_PATH",
+        "QML_IMPORT_PATH",
+        "QTWEBENGINEPROCESS_PATH",
+        "QTWEBENGINE_RESOURCES_PATH",
+        "QTWEBENGINE_LOCALES_PATH",
+        "QT_API",
     }
     for key in list(env.keys()):
         if key in drop_exact or key.startswith("PYINSTALLER_"):

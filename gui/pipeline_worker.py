@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import queue
+import re
 import signal
 import shutil
 import subprocess
@@ -41,6 +43,52 @@ TEMP_CLEANUP_TIMEOUT_ENV = "SEESTAR_TEMP_CLEANUP_TIMEOUT_SEC"
 DEFAULT_TEMP_CLEANUP_TIMEOUT_SEC = 30
 MIN_TEMP_CLEANUP_TIMEOUT_SEC = 1
 MAX_TEMP_CLEANUP_TIMEOUT_SEC = 300
+WATCHDOG_IDLE_TIMEOUT_ENV = "SEESTAR_WATCHDOG_IDLE_TIMEOUT_SEC"
+DEFAULT_WATCHDOG_IDLE_TIMEOUT_SEC = 900
+MIN_WATCHDOG_IDLE_TIMEOUT_SEC = 60
+MAX_WATCHDOG_IDLE_TIMEOUT_SEC = 7200
+EXPORT_TAIL_TIMEOUT_ENV = "SEESTAR_EXPORT_TAIL_TIMEOUT_SEC"
+DEFAULT_EXPORT_TAIL_TIMEOUT_SEC = 120
+MIN_EXPORT_TAIL_TIMEOUT_SEC = 60
+MAX_EXPORT_TAIL_TIMEOUT_SEC = 120
+WATCHDOG_ARTIFACT_SUFFIXES = frozenset({
+    ".fit", ".fits", ".fts", ".tif", ".tiff", ".png", ".jpg", ".jpeg", ".json",
+})
+_PIPELINE_STAGE_RE = re.compile(
+    r"\[(?:INFO|WARN|ERROR|DEBUG)\]\s+阶段\s+(\d+)\s*:\s*([^\r\n]*)",
+    re.IGNORECASE,
+)
+_PIPELINE_STAGE_RESULT_RE = re.compile(
+    r"\[PIPELINE_STAGE_RESULT\]\s+"
+    r"stage=(\d+)\s+status=([a-z_]+)\s+"
+    r"duration=([0-9]+(?:\.[0-9]+)?)\s+title=([^\r\n]*)",
+    re.IGNORECASE,
+)
+_PIPELINE_RUN_SUMMARY_RE = re.compile(
+    r"\[PIPELINE_RUN_SUMMARY\]\s+failed=(\d+)\s+degraded=(\d+)",
+    re.IGNORECASE,
+)
+_SIRIL_PROGRESS_RE = re.compile(
+    r"^\s*(?:log:\s*)?progress:\s*(.*?)(?:,\s*)?"
+    r"([0-9]+(?:\.[0-9]+)?)%\s*$",
+    re.IGNORECASE,
+)
+_PLUGIN_PROGRESS_RE = re.compile(
+    r"\[([^\]\r\n]+\.py)\]\s+\[[#-]+\]\s+"
+    r"([0-9]+(?:\.[0-9]+)?)%\s+([^\r\n]+)",
+    re.IGNORECASE,
+)
+_SIRIL_ICC_HDU_SKIP_RE = re.compile(
+    r"^\s*(?:log:\s*)?Skipping HDU \d+ with EXTNAME=ICCProfile\s*$",
+    re.IGNORECASE,
+)
+_SIRIL_DENOISE_SRC_DIAGNOSTIC_RE = re.compile(
+    r"^\s*(?:log:\s*)?error:\s*no suitable data in src fits\s*$",
+    re.IGNORECASE,
+)
+_AI_CREDENTIAL_ENV_KEYS = frozenset(
+    {"SEESTAR_AI_API_KEY", "SEESTAR_AI_ARTISTIC_API_KEY"}
+)
 
 
 class PipelineWorker(QThread):
@@ -48,6 +96,8 @@ class PipelineWorker(QThread):
 
     log = Signal(str)
     state = Signal(str)
+    progress = Signal(int, str, str)
+    preview = Signal(int, str, str, str)
     done = Signal(str, int, bool, str)
 
     def __init__(
@@ -63,6 +113,7 @@ class PipelineWorker(QThread):
         debug_mode: bool = False,
         network_mode: bool = True,
         ai_stage_enabled: bool = False,
+        ai_runtime_overrides: dict[str, str] | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -85,9 +136,15 @@ class PipelineWorker(QThread):
         self.debug_mode = bool(debug_mode)
         self.network_mode = bool(network_mode)
         self.ai_stage_enabled = bool(ai_stage_enabled)
+        self.ai_runtime_overrides = {
+            str(key): str(value)
+            for key, value in (ai_runtime_overrides or {}).items()
+            if str(key) in AI_ENV_ALLOWED_KEYS
+        }
 
         self._stop_event = threading.Event()
         self._proc: subprocess.Popen[str] | None = None
+        self._proc_pgid: int | None = None
         self._active_mode = "python"
         self._run_had_errors = False
         self._last_output_ts = 0.0
@@ -96,31 +153,119 @@ class PipelineWorker(QThread):
         self._python_env_issue = False
         self._python_env_repair_attempted = False
         self._spcc_seen_in_run = False
+        self._native_process_terminated_detected = False
+        self._current_pipeline_stage: int | None = None
+        self._pipeline_stage_states: dict[int, str] = {}
+        self._pipeline_stage_durations: dict[int, float] = {}
+        self._native_termination_stage: int | None = None
+        self._native_termination_command = ""
+        self._pipeline_summary_failed = 0
+        self._pipeline_summary_degraded = 0
         self._spcc_cli_crash_detected = False
         self._spcc_crash_retry_attempted = False
         self._force_disable_spcc_for_retry = False
+        self._resume_stage4_psolved_for_retry = False
+        self._spcc_seed_warning_emitted = False
         self._recent_process_output: deque[str] = deque(maxlen=80)
+        self._last_command = ""
         self._last_spcc_command = ""
+        self._saving_png_seen_at: float | None = None
+        self._export_tail_ready_at: float | None = None
+        self._export_tail_disarmed = False
+        self._export_tail_timeout_recovered = False
+        self._artifact_snapshot: dict[Path, tuple[int, int]] = {}
+        self._last_artifact_scan_ts = 0.0
         self._ai_env_sources: list[str] = []
         self._ai_env_applied_keys: list[str] = []
         self._ai_env_warnings: list[str] = []
         self._runtime_plugin_dir: Path | None = None
         self._temp_cleanup_timeout_sec = DEFAULT_TEMP_CLEANUP_TIMEOUT_SEC
+        self._watchdog_idle_timeout_sec = DEFAULT_WATCHDOG_IDLE_TIMEOUT_SEC
+        self._export_tail_timeout_sec = DEFAULT_EXPORT_TAIL_TIMEOUT_SEC
+        self._progress_log_state: dict[str, tuple[float, int]] = {}
+        self._native_log_notice_keys: set[str] = set()
 
     def stop(self) -> None:
         self._stop_event.set()
-        proc = self._proc
-        if proc and proc.poll() is None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
+        self._signal_active_processes(signal.SIGTERM)
 
     def _timestamp(self) -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def _append_event(self, msg: str) -> None:
         self.log.emit(f"[{self._timestamp()}] {msg}\n")
+
+    def _progress_log_signature(self, text: str) -> tuple[str, float] | None:
+        plugin_match = _PLUGIN_PROGRESS_RE.search(text)
+        if plugin_match:
+            label = (
+                f"plugin:{plugin_match.group(1).strip().lower()}:"
+                f"{plugin_match.group(3).strip().lower()}"
+            )
+            return label, float(plugin_match.group(2))
+
+        siril_match = _SIRIL_PROGRESS_RE.match(text)
+        if not siril_match:
+            return None
+        label = siril_match.group(1).strip(" ,").lower() or "unnamed"
+        return f"siril:{label}", float(siril_match.group(2))
+
+    def _should_emit_process_output(self, text: str) -> bool:
+        progress = self._progress_log_signature(text)
+        if progress is None:
+            return True
+
+        label, percent = progress
+        stage_key = self._current_pipeline_stage or 0
+        key = f"stage:{stage_key}:{label}"
+        bucket = max(0, min(10, int(percent // 10)))
+        previous = self._progress_log_state.get(key)
+        if previous is None:
+            self._progress_log_state[key] = (percent, bucket)
+            return True
+
+        previous_percent, previous_bucket = previous
+        restarted = previous_percent >= 90.0 and percent <= 10.0
+        emit = restarted or bucket > previous_bucket or (
+            percent >= 100.0 and previous_percent < 100.0
+        )
+        if restarted:
+            self._progress_log_state[key] = (percent, bucket)
+        else:
+            self._progress_log_state[key] = (
+                max(previous_percent, percent),
+                max(previous_bucket, bucket),
+            )
+        return emit
+
+    def _native_output_notice(self, text: str) -> tuple[str, str] | None:
+        if _SIRIL_ICC_HDU_SKIP_RE.match(text):
+            return (
+                "icc_profile_hdu",
+                "log: [INFO] Siril 已忽略非图像 ICCProfile FITS 扩展（重复行已折叠）\n",
+            )
+        if (
+            self._current_pipeline_stage == 5
+            and "denoise" in self._last_command.lower()
+            and _SIRIL_DENOISE_SRC_DIAGNOSTIC_RE.match(text)
+        ):
+            return (
+                "stage5_denoise_src",
+                "log: [INFO] Siril NL-Bayes 初始化未使用可选 src FITS 数据；"
+                "主图像处理继续，最终以 Stage 5 结果为准。\n",
+            )
+        return None
+
+    def _emit_process_output(self, text: str) -> None:
+        native_notice = self._native_output_notice(text)
+        if native_notice is not None:
+            key, replacement = native_notice
+            if key not in self._native_log_notice_keys:
+                self._native_log_notice_keys.add(key)
+                self.log.emit(replacement)
+            return
+        if self._should_emit_process_output(text):
+            self.log.emit(text)
 
     def _ai_env_candidates(self) -> list[Path]:
         return [
@@ -139,6 +284,8 @@ class PipelineWorker(QThread):
             if not path.exists() or not path.is_file():
                 continue
             parsed, parse_warnings = parse_ai_env_file(path)
+            for secret_key in _AI_CREDENTIAL_ENV_KEYS:
+                parsed.pop(secret_key, None)
             sources.append(str(path))
             merged.update(parsed)
             warnings.extend(parse_warnings)
@@ -148,8 +295,95 @@ class PipelineWorker(QThread):
     def _inspect_output_for_errors(self, text: str) -> None:
         lowered = text.lower()
         stripped = text.strip()
-        if stripped:
+        if (
+            stripped
+            and self._progress_log_signature(text) is None
+            and self._native_output_notice(text) is None
+        ):
             self._recent_process_output.append(stripped)
+        stage_match = _PIPELINE_STAGE_RE.search(text)
+        if stage_match:
+            previous_stage = self._current_pipeline_stage
+            current_stage = int(stage_match.group(1))
+            self._current_pipeline_stage = current_stage
+            if (
+                current_stage != previous_stage
+                or self._pipeline_stage_states.get(current_stage) != "running"
+            ):
+                self._pipeline_stage_states[current_stage] = "running"
+                self.progress.emit(
+                    current_stage,
+                    stage_match.group(2).strip(),
+                    "running",
+                )
+        result_match = _PIPELINE_STAGE_RESULT_RE.search(text)
+        if result_match:
+            stage = int(result_match.group(1))
+            raw_state = result_match.group(2).strip().lower()
+            duration_seconds = float(result_match.group(3))
+            state = {
+                "ok": "completed",
+                "degraded": "degraded",
+                "failed": "failed",
+                "skipped": "skipped",
+            }.get(raw_state, raw_state)
+            self._current_pipeline_stage = stage
+            self._pipeline_stage_states[stage] = state
+            self._pipeline_stage_durations[stage] = (
+                self._pipeline_stage_durations.get(stage, 0.0) + duration_seconds
+            )
+            self.progress.emit(stage, result_match.group(4).strip(), state)
+        preview_marker = "[PIPELINE_PREVIEW]"
+        preview_index = text.find(preview_marker)
+        if preview_index >= 0:
+            raw_payload = text[preview_index + len(preview_marker):].strip()
+            try:
+                preview_payload = json.loads(raw_payload)
+                preview_stage = int(preview_payload.get("stage", 0))
+                preview_title = str(preview_payload.get("title") or "").strip()
+                preview_status = str(
+                    preview_payload.get("status") or "unavailable"
+                ).strip().lower()
+                preview_value = str(preview_payload.get("payload") or "").strip()
+                if preview_stage < 1 or preview_status not in {"ready", "unavailable"}:
+                    raise ValueError("invalid preview event fields")
+                if preview_status == "ready" and not Path(preview_value).is_file():
+                    preview_status = "unavailable"
+                    preview_value = "preview file is missing"
+                self.preview.emit(
+                    preview_stage,
+                    preview_title,
+                    preview_status,
+                    preview_value,
+                )
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                self._append_event(f"忽略无效的阶段预览事件：{exc}")
+        summary_match = _PIPELINE_RUN_SUMMARY_RE.search(text)
+        if summary_match:
+            self._pipeline_summary_failed = int(summary_match.group(1))
+            self._pipeline_summary_degraded = int(summary_match.group(2))
+        command_markers = (
+            "running command:",
+            "running command ",
+            "input command:",
+            "siril command:",
+        )
+        if stripped and any(marker in lowered for marker in command_markers):
+            self._last_command = stripped
+        if (
+            "saving png" in lowered
+            or (
+                "savepng" in lowered
+                and any(marker in lowered for marker in command_markers)
+            )
+        ):
+            if self._saving_png_seen_at is None:
+                self._saving_png_seen_at = time.time()
+        if self._saving_png_seen_at is not None and (
+            (self.ai_stage_enabled and ("阶段 11:" in lowered or "stage 11" in lowered))
+            or "[ai-artistic]" in lowered
+        ):
+            self._export_tail_disarmed = True
         error_markers = (
             "script execution failed",
             "failed to install python module",
@@ -161,6 +395,9 @@ class PipelineWorker(QThread):
             "error in line",
             "unknown error",
             "exiting batch processing",
+            "程序中断:",
+            "[siril_native_process_terminated]",
+            "sirilnativeprocessterminated",
         )
         python_env_markers = (
             "failed to install python module",
@@ -178,6 +415,14 @@ class PipelineWorker(QThread):
         )
         if any(marker in lowered for marker in error_markers):
             self._run_had_errors = True
+        if (
+            "[siril_native_process_terminated]" in lowered
+            or "sirilnativeprocessterminated" in lowered
+        ):
+            self._native_process_terminated_detected = True
+            if self._native_termination_stage is None:
+                self._native_termination_stage = self._current_pipeline_stage
+                self._native_termination_command = self._last_command
         if any(marker in lowered for marker in python_env_markers):
             self._python_env_issue = True
             # Treat Python environment problems as hard pipeline errors even when
@@ -206,17 +451,75 @@ class PipelineWorker(QThread):
             self._pipeline_output_seen = True
 
     def _append_spcc_crash_diagnostics(self, exit_code: int) -> None:
-        self._append_event(
-            "SPCC 崩溃诊断: siril-cli 在执行 SPCC 后以 "
-            f"{exit_code} 退出，通常表示 Siril 原生测光/SPCC 代码段错误，"
-            "Python 侧不会产生 CommandError。"
-        )
+        if exit_code == -11:
+            summary = (
+                "siril-cli 在执行 SPCC 后以 -11 退出，通常表示 "
+                "Siril 原生测光/SPCC 代码段错误"
+            )
+        else:
+            summary = (
+                "SPCC 执行期间检测到 Siril 原生连接或进程终止，"
+                f"siril-cli exit={exit_code}"
+            )
+        self._append_event(f"SPCC 崩溃诊断: {summary}。")
         if self._last_spcc_command:
             self._append_event(f"SPCC 崩溃前命令标记: {self._last_spcc_command}")
         if self._recent_process_output:
             self._append_event("SPCC 崩溃前最后输出（最多 25 行）:")
             for line in list(self._recent_process_output)[-25:]:
                 self._append_event(f"  {line}")
+
+    def _is_spcc_crash_context(self, exit_code: int) -> bool:
+        """Only attribute a native failure to SPCC while Stage 4 is active."""
+        if not self._spcc_seen_in_run:
+            return False
+        failure_stage = (
+            self._native_termination_stage
+            if self._native_process_terminated_detected
+            else self._current_pipeline_stage
+        )
+        if failure_stage != 4:
+            return False
+        if exit_code == -11:
+            return True
+        command = self._native_termination_command.lower()
+        return self._native_process_terminated_detected and (
+            not command or "spcc" in command
+        )
+
+    def _stage4_psolved_retry_path(
+        self,
+        *,
+        require_current_run: bool = False,
+    ) -> Path | None:
+        candidates = (
+            self.work_dir / "process" / STAGE4_PSOLVED_INPUT_NAME,
+            self.work_dir / STAGE4_PSOLVED_INPUT_NAME,
+        )
+        for path in candidates:
+            signature = self._artifact_signature(path)
+            if signature is None or signature[1] <= 0:
+                continue
+            if require_current_run and self._artifact_snapshot.get(path) == signature:
+                continue
+            return path
+        return None
+
+    def _prepare_spcc_crash_retry(self) -> Path | None:
+        self._force_disable_spcc_for_retry = True
+        checkpoint = self._stage4_psolved_retry_path(require_current_run=True)
+        self._resume_stage4_psolved_for_retry = checkpoint is not None
+        if checkpoint is not None:
+            self._append_event(
+                "已确认本次运行的 stage4_psolved.fit 检查点；"
+                "重启后将跳过 Stage 1-3 和重复 platesolve，从 Stage 4 校色继续。"
+            )
+        else:
+            self._append_event(
+                "未找到本次运行生成的 stage4_psolved.fit；"
+                "仍保留禁用 SPCC 的完整流水线安全重试。"
+            )
+        return checkpoint
 
     def _siril_venv_dir(self) -> Path:
         return self._siril_state_root() / "venv"
@@ -464,10 +767,43 @@ class PipelineWorker(QThread):
         self._runtime_plugin_dir = None
         if self.siril_plugin_dir.exists() and self.siril_plugin_dir.is_dir():
             plugin_dst = temp_dir / "siril_plugins"
-            shutil.copytree(self.siril_plugin_dir, plugin_dst, dirs_exist_ok=True)
+            shared_resource_names = {
+                "downloads",
+                "syqon_starless",
+                "cosmic_clarity",
+                "model_v2_0_1.onnx",
+            }
+
+            def ignore_large_resources(path: str, names: list[str]) -> list[str]:
+                if Path(path) != self.siril_plugin_dir:
+                    return []
+                return [name for name in names if name in shared_resource_names]
+
+            shutil.copytree(
+                self.siril_plugin_dir,
+                plugin_dst,
+                dirs_exist_ok=True,
+                ignore=ignore_large_resources,
+            )
+            linked_resources: list[str] = []
+            for name in sorted(shared_resource_names):
+                source = self.siril_plugin_dir / name
+                if not source.exists():
+                    continue
+                target = plugin_dst / name
+                target.symlink_to(
+                    source.resolve(),
+                    target_is_directory=source.is_dir(),
+                )
+                linked_resources.append(name)
             if apply_siril_runtime_patches(plugin_dst):
                 self._append_event("已应用 GraXpert-AI 运行时兼容补丁")
             self._runtime_plugin_dir = plugin_dst
+            if linked_resources:
+                self._append_event(
+                    "运行时插件覆盖层已就绪；大资源保持只读引用: "
+                    + ", ".join(linked_resources)
+                )
 
         ssf_lines = [
             "requires 1.4.0",
@@ -486,21 +822,59 @@ class PipelineWorker(QThread):
         template_text = self.config_template.read_text(
             encoding="utf-8", errors="replace"
         )
-        patched = normalize_siril_config_template(template_text)
+        local_spcc_catalog = (
+            self.runtime_home
+            / ".local"
+            / "share"
+            / "siril"
+            / "siril_cat1_healpix8_xpsamp"
+        )
+        local_astrometric_catalog = (
+            self.runtime_home
+            / ".local"
+            / "share"
+            / "siril"
+            / "siril_cat_healpix8_astro.dat"
+        )
+        patched = normalize_siril_config_template(
+            template_text,
+            gaia_photo_catalog=local_spcc_catalog,
+            gaia_astro_catalog=local_astrometric_catalog,
+        )
         run_ini.write_text(patched, encoding="utf-8")
         return run_ssf, run_ini, run_py
 
     def _build_env(self, siril_cli: Path) -> dict[str, str]:
         env = scrub_python_env(os.environ.copy())
+        for secret_key in _AI_CREDENTIAL_ENV_KEYS:
+            env.pop(secret_key, None)
         ai_env, ai_sources, ai_warnings = self._load_ai_env_overrides()
         applied_keys: list[str] = []
         for key, value in ai_env.items():
             if not env.get(key):
                 env[key] = value
                 applied_keys.append(key)
+        for key, value in self.ai_runtime_overrides.items():
+            env[key] = value
+            if key not in applied_keys:
+                applied_keys.append(key)
         self._ai_env_sources = ai_sources
         self._ai_env_applied_keys = sorted(applied_keys)
         self._ai_env_warnings = ai_warnings
+
+        user_graxpert_model = env.get("SEESTAR_GRAXPERT_OBJECT_MODEL_PATH", "").strip()
+        if user_graxpert_model:
+            expanded_model = Path(os.path.expandvars(user_graxpert_model)).expanduser()
+            if not expanded_model.is_absolute():
+                expanded_model = self.work_dir / expanded_model
+            env["SEESTAR_GRAXPERT_OBJECT_MODEL_PATH"] = str(expanded_model)
+            if expanded_model.exists():
+                self._append_event(f"已配置用户 GraXpert 对象反卷积模型：{expanded_model}")
+            else:
+                self._append_event(
+                    "用户 GraXpert 对象反卷积模型路径不存在；"
+                    f"Stage 5 将安全回退 Siril RL：{expanded_model}"
+                )
 
         # Finder-launched apps may lack UTF-8 locale vars.
         env["HOME"] = str(self.runtime_home)
@@ -510,6 +884,10 @@ class PipelineWorker(QThread):
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"
+        # Siril pyscript plugins are non-interactive.  Keep them on their own
+        # runtime Qt and prevent a Cocoa plugin from pulling the frozen GUI's
+        # PySide6 frameworks into a PyQt6 process.
+        env["QT_QPA_PLATFORM"] = "offscreen"
         env.setdefault(
             BOOTSTRAP_TIMEOUT_ENV,
             str(DEFAULT_BOOTSTRAP_TIMEOUT_SEC),
@@ -517,6 +895,14 @@ class PipelineWorker(QThread):
         env.setdefault(
             TEMP_CLEANUP_TIMEOUT_ENV,
             str(DEFAULT_TEMP_CLEANUP_TIMEOUT_SEC),
+        )
+        env.setdefault(
+            WATCHDOG_IDLE_TIMEOUT_ENV,
+            str(DEFAULT_WATCHDOG_IDLE_TIMEOUT_SEC),
+        )
+        env.setdefault(
+            EXPORT_TAIL_TIMEOUT_ENV,
+            str(DEFAULT_EXPORT_TAIL_TIMEOUT_SEC),
         )
         try:
             cleanup_timeout = int(round(float(env[TEMP_CLEANUP_TIMEOUT_ENV])))
@@ -530,6 +916,20 @@ class PipelineWorker(QThread):
             MIN_TEMP_CLEANUP_TIMEOUT_SEC,
             min(MAX_TEMP_CLEANUP_TIMEOUT_SEC, cleanup_timeout),
         )
+        self._watchdog_idle_timeout_sec = self._bounded_timeout_from_env(
+            env,
+            WATCHDOG_IDLE_TIMEOUT_ENV,
+            DEFAULT_WATCHDOG_IDLE_TIMEOUT_SEC,
+            MIN_WATCHDOG_IDLE_TIMEOUT_SEC,
+            MAX_WATCHDOG_IDLE_TIMEOUT_SEC,
+        )
+        self._export_tail_timeout_sec = self._bounded_timeout_from_env(
+            env,
+            EXPORT_TAIL_TIMEOUT_ENV,
+            DEFAULT_EXPORT_TAIL_TIMEOUT_SEC,
+            MIN_EXPORT_TAIL_TIMEOUT_SEC,
+            MAX_EXPORT_TAIL_TIMEOUT_SEC,
+        )
         env.setdefault("SEESTAR_SIRILPY_TIMEOUT_SEC", "120")
         env["PIP_NO_INDEX"] = "1"
         env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
@@ -537,6 +937,9 @@ class PipelineWorker(QThread):
         bundled_downloads = self.resources / "siril_plugins" / "downloads"
         if bundled_downloads.is_dir():
             pip_find_links.append(str(bundled_downloads))
+        plugin_downloads = self.siril_plugin_dir / "downloads"
+        if plugin_downloads.is_dir():
+            pip_find_links.append(str(plugin_downloads))
         if self._runtime_plugin_dir:
             runtime_downloads = self._runtime_plugin_dir / "downloads"
             if runtime_downloads.is_dir():
@@ -573,13 +976,70 @@ class PipelineWorker(QThread):
                 env["SIRIL_SCRIPTS_DIR"] = str(scripts_dir)
                 env["SIRIL_SCRIPTS_PATH"] = str(scripts_dir)
 
+        syqon_models = self.siril_plugin_dir / SYQON_STARLESS_BUNDLE_REL
+        if (syqon_models / "zenith.pt").is_file():
+            env["SEESTAR_SYQON_MODEL_DIR"] = str(syqon_models)
+        cosmic_models = self.siril_plugin_dir / COSMIC_CLARITY_BUNDLE_REL
+        if cosmic_models.is_dir():
+            env["SEESTAR_COSMIC_CLARITY_MODEL_DIR"] = str(cosmic_models)
+
         env["SEESTAR_DEBUG_MODE"] = "1" if self.debug_mode else "0"
-        env["SEESTAR_INPUT_MODE"] = self.input_mode
+        env["SEESTAR_INPUT_MODE"] = (
+            INPUT_MODE_STAGE4_PSOLVED_RESUME
+            if self._resume_stage4_psolved_for_retry
+            else self.input_mode
+        )
+        env["SEESTAR_NETWORK_MODE"] = "1" if self.network_mode else "0"
+        local_catalog_root = self.runtime_home / ".local" / "share" / "siril"
+        env["SEESTAR_GAIA_PHOTO_CATALOG"] = str(
+            local_catalog_root / "siril_cat1_healpix8_xpsamp"
+        )
+        env["SEESTAR_GAIA_ASTRO_CATALOG"] = str(
+            local_catalog_root / "siril_cat_healpix8_astro.dat"
+        )
+        env["SEESTAR_SPCC_DATABASE_DIR"] = str(
+            siril_spcc_database_root_from_home(self.runtime_home)
+        )
         # GUI toggle is the highest-priority control for optional stage11 execution.
         env["SEESTAR_AI_ENABLED"] = "1" if self.ai_stage_enabled else "0"
-        if self._force_disable_spcc_for_retry:
+        spcc_seed_ready, spcc_seed_detail = verify_siril_spcc_database_seed(
+            default_siril_spcc_database_seed_dir(self.resources),
+            self.runtime_home,
+        )
+        if not spcc_seed_ready:
+            env["SEESTAR_SPCC_ENABLE"] = "0"
+            if not self._spcc_seed_warning_emitted:
+                self._spcc_seed_warning_emitted = True
+                self._append_event(
+                    "Siril SPCC 固定数据库不可用，已在启动 Siril 前禁用 SPCC；"
+                    f"Stage 4 将改走 PCC：{spcc_seed_detail}"
+                )
+        elif self._force_disable_spcc_for_retry:
             env["SEESTAR_SPCC_ENABLE"] = "0"
         return env
+
+    def _bounded_timeout_from_env(
+        self,
+        env: dict[str, str],
+        key: str,
+        default: int,
+        minimum: int,
+        maximum: int,
+    ) -> int:
+        raw_value = env.get(key, str(default))
+        try:
+            parsed = int(round(float(raw_value)))
+        except (OverflowError, TypeError, ValueError):
+            parsed = default
+            self._append_event(
+                f"{key}={raw_value!r} 无效，使用默认值 {default}s。"
+            )
+        bounded = max(minimum, min(maximum, parsed))
+        if bounded != parsed:
+            self._append_event(
+                f"{key}={parsed}s 超出范围，已限制为 {bounded}s。"
+            )
+        return bounded
 
     def _bootstrap_input_size_bytes(self) -> int:
         if not self.work_dir.is_dir():
@@ -670,16 +1130,277 @@ class PipelineWorker(QThread):
             return False
         return True
 
+    def _signal_active_processes(self, sig: signal.Signals) -> bool:
+        """Signal only the process group created for the current run."""
+        pgid = self._proc_pgid
+        if pgid is not None:
+            try:
+                os.killpg(pgid, sig)
+                return True
+            except ProcessLookupError:
+                return False
+            except (OSError, PermissionError):
+                pass
+
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return False
+        try:
+            proc.send_signal(sig)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+    def _process_group_alive(self) -> bool:
+        pgid = self._proc_pgid
+        if pgid is None:
+            proc = self._proc
+            return bool(proc is not None and proc.poll() is None)
+        try:
+            os.killpg(pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+
+    def _terminate_active_processes(self, grace_sec: float = 5.0) -> None:
+        """Terminate Siril and every child in this run's isolated process group."""
+        self._signal_active_processes(signal.SIGTERM)
+        deadline = time.monotonic() + max(0.0, grace_sec)
+        while self._process_group_alive() and time.monotonic() < deadline:
+            proc = self._proc
+            if proc is not None:
+                proc.poll()
+            time.sleep(0.1)
+        if self._process_group_alive():
+            self._signal_active_processes(signal.SIGKILL)
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def _artifact_paths(self) -> list[Path]:
+        paths: list[Path] = []
+        try:
+            for path in self.work_dir.iterdir():
+                if path.is_file() and path.suffix.lower() in WATCHDOG_ARTIFACT_SUFFIXES:
+                    paths.append(path)
+        except OSError:
+            pass
+
+        process_dir = self.work_dir / "process"
+        if process_dir.is_dir():
+            try:
+                paths.extend(
+                    path
+                    for path in process_dir.rglob("*")
+                    if path.is_file()
+                    and path.suffix.lower() in WATCHDOG_ARTIFACT_SUFFIXES
+                )
+            except OSError:
+                pass
+        return sorted(set(paths), key=lambda path: str(path))
+
+    @staticmethod
+    def _artifact_signature(path: Path) -> tuple[int, int] | None:
+        try:
+            stat_result = path.stat()
+            return stat_result.st_mtime_ns, stat_result.st_size
+        except OSError:
+            return None
+
+    def _capture_artifact_snapshot(self) -> None:
+        self._artifact_snapshot = {
+            path: signature
+            for path in self._artifact_paths()
+            if (signature := self._artifact_signature(path)) is not None
+        }
+
+    def _generated_artifacts(self) -> list[Path]:
+        generated: list[Path] = []
+        for path in self._artifact_paths():
+            signature = self._artifact_signature(path)
+            if signature is None or signature[1] <= 0:
+                continue
+            if self._artifact_snapshot.get(path) != signature:
+                generated.append(path)
+        return generated
+
+    def _refresh_export_tail_state(self, now: float) -> None:
+        if (
+            self._saving_png_seen_at is None
+            or self._export_tail_ready_at is not None
+            or self._export_tail_disarmed
+            or now - self._last_artifact_scan_ts < 1.0
+        ):
+            return
+        self._last_artifact_scan_ts = now
+        generated_pngs = [
+            path
+            for path in self._generated_artifacts()
+            if path.parent == self.work_dir and path.suffix.lower() == ".png"
+        ]
+        if not generated_pngs:
+            return
+        self._export_tail_ready_at = now
+        names = ", ".join(path.name for path in generated_pngs[:3])
+        self._append_event(
+            "Watchdog 已确认 PNG 导出产物："
+            f"{names}；若持续无输出且进程未退出，将在 "
+            f"{self._export_tail_timeout_sec}s 后清理收尾残留进程。"
+        )
+
+    def _watchdog_timeout_reason(self, now: float) -> tuple[str, float] | None:
+        if self._export_tail_ready_at is not None and not self._export_tail_disarmed:
+            tail_progress_ts = max(self._export_tail_ready_at, self._last_output_ts)
+            tail_idle_sec = max(0.0, now - tail_progress_ts)
+            if tail_idle_sec >= self._export_tail_timeout_sec:
+                return "export_tail", tail_idle_sec
+
+        idle_sec = max(0.0, now - self._last_output_ts)
+        if idle_sec >= self._watchdog_idle_timeout_sec:
+            return "idle", idle_sec
+        return None
+
+    def _process_group_snapshot(self) -> list[str]:
+        pgid = self._proc_pgid
+        proc = self._proc
+        root_pid = proc.pid if proc is not None else None
+        if pgid is None and root_pid is None:
+            return []
+        try:
+            cp = subprocess.run(
+                [
+                    "/bin/ps",
+                    "-ax",
+                    "-o",
+                    "pid=,ppid=,pgid=,stat=,etime=,%cpu=,%mem=,command=",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if cp.returncode != 0:
+            return []
+
+        rows: list[str] = []
+        for raw_line in cp.stdout.splitlines():
+            fields = raw_line.strip().split(maxsplit=7)
+            if len(fields) != 8:
+                continue
+            try:
+                pid = int(fields[0])
+                row_pgid = int(fields[2])
+            except ValueError:
+                continue
+            if (pgid is not None and row_pgid != pgid) or (
+                pgid is None and pid != root_pid
+            ):
+                continue
+            rows.append(
+                "pid={pid} ppid={ppid} pgid={pgid} stat={stat} "
+                "etime={etime} cpu={cpu}% mem={mem}% cmd={command}".format(
+                    pid=fields[0],
+                    ppid=fields[1],
+                    pgid=fields[2],
+                    stat=fields[3],
+                    etime=fields[4],
+                    cpu=fields[5],
+                    mem=fields[6],
+                    command=fields[7],
+                )
+            )
+        return rows
+
+    def _append_watchdog_diagnostics(
+        self,
+        *,
+        reason: str,
+        idle_sec: float,
+    ) -> None:
+        reason_label = {
+            "bootstrap": "pyscript 启动超时",
+            "idle": "流水线长时间无输出",
+            "export_tail": "导出完成后收尾未退出",
+        }.get(reason, reason)
+        self._append_event(
+            f"Watchdog 触发：{reason_label}（无输出 {idle_sec:.1f}s）。"
+        )
+        self._append_event(f"Watchdog 最后命令：{self._last_command or '<未识别>'}")
+
+        proc = self._proc
+        poll_state = proc.poll() if proc is not None else None
+        process_rows = self._process_group_snapshot()
+        self._append_event(
+            "Watchdog 进程状态："
+            f"root_pid={proc.pid if proc is not None else '<无>'}, "
+            f"pgid={self._proc_pgid if self._proc_pgid is not None else '<无>'}, "
+            f"poll={poll_state if poll_state is not None else 'running'}"
+        )
+        if process_rows:
+            for row in process_rows:
+                self._append_event(f"  {row}")
+        else:
+            self._append_event("  <未发现存活的本次运行进程>")
+
+        artifacts = self._generated_artifacts()
+        self._append_event("Watchdog 已生成产物：")
+        if not artifacts:
+            self._append_event("  <未检测到本次运行新建或改写的产物>")
+            return
+        for path in artifacts[:40]:
+            try:
+                display_path = path.relative_to(self.work_dir)
+            except ValueError:
+                display_path = path
+            self._append_event(
+                f"  {display_path} ({format_bytes(safe_file_size(path))})"
+            )
+        if len(artifacts) > 40:
+            self._append_event(f"  ... 另有 {len(artifacts) - 40} 个产物")
+
+    def _completed_run_status(self) -> str:
+        if (
+            self._export_tail_timeout_recovered
+            or self._pipeline_summary_failed > 0
+            or self._pipeline_summary_degraded > 0
+        ):
+            return "CompletedWithWarning"
+        return "Completed"
+
     def _run_once(self, siril_cli: Path, run_ssf: Path, run_ini: Path) -> tuple[bool, int]:
         self._run_had_errors = False
         self._python_env_issue = False
         self._pyscript_seen_at = None
         self._pipeline_output_seen = False
         self._spcc_seen_in_run = False
+        self._native_process_terminated_detected = False
+        self._current_pipeline_stage = None
+        self._native_termination_stage = None
+        self._native_termination_command = ""
+        self._pipeline_summary_failed = 0
+        self._pipeline_summary_degraded = 0
         self._spcc_cli_crash_detected = False
         self._recent_process_output.clear()
+        self._last_command = ""
         self._last_spcc_command = ""
+        self._saving_png_seen_at = None
+        self._export_tail_ready_at = None
+        self._export_tail_disarmed = False
+        self._export_tail_timeout_recovered = False
+        self._progress_log_state.clear()
+        self._native_log_notice_keys.clear()
+        self._last_artifact_scan_ts = 0.0
+        self._proc_pgid = None
         self._last_output_ts = time.time()
+        self._capture_artifact_snapshot()
 
         cmd = build_siril_cli_command(
             siril_cli=siril_cli,
@@ -702,7 +1423,9 @@ class PipelineWorker(QThread):
         self._append_event(
             f"联网模式: {'ON' if self.network_mode else 'OFF'}"
         )
-        self._append_event(f"输入模式: {self.input_mode}")
+        self._append_event(
+            f"输入模式: {proc_env.get('SEESTAR_INPUT_MODE', self.input_mode)}"
+        )
         self._append_event(
             f"AI 阶段开关: {'ON' if self.ai_stage_enabled else 'OFF'} "
             "(controls stage11)"
@@ -715,6 +1438,11 @@ class PipelineWorker(QThread):
             f"{bootstrap_timeout_sec}s "
             f"(base={bootstrap_base_sec}s, FITS={format_bytes(bootstrap_input_bytes)}, "
             f"rate={BOOTSTRAP_TIMEOUT_SEC_PER_GIB}s/GiB)"
+        )
+        self._append_event(
+            "运行 watchdog: "
+            f"普通无输出={self._watchdog_idle_timeout_sec}s，"
+            f"PNG 导出后收尾无输出={self._export_tail_timeout_sec}s"
         )
         if self._ai_env_sources:
             self._append_event(
@@ -735,7 +1463,9 @@ class PipelineWorker(QThread):
                 text=True,
                 bufsize=1,
                 env=proc_env,
+                start_new_session=True,
             )
+            self._proc_pgid = self._proc.pid
         except Exception as e:
             self._append_event(f"启动进程失败：{e}")
             self._run_had_errors = True
@@ -751,7 +1481,9 @@ class PipelineWorker(QThread):
         reader_t.start()
 
         bootstrap_timeout = False
+        watchdog_timeout: str | None = None
         reader_done = False
+        stop_termination_requested = False
 
         while True:
             drained = False
@@ -766,20 +1498,17 @@ class PipelineWorker(QThread):
                     break
                 self._last_output_ts = time.time()
                 self._inspect_output_for_errors(item)
-                self.log.emit(item)
+                self._emit_process_output(item)
 
             proc_ret = self._proc.poll()
 
-            if self._stop_event.is_set() and proc_ret is None:
+            if self._stop_event.is_set() and not stop_termination_requested:
+                stop_termination_requested = True
                 self._append_event("已请求停止...")
-                self._proc.terminate()
-                try:
-                    self._proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self._append_event("进程未能正常退出，正在强制结束。")
-                    self._proc.kill()
+                self._terminate_active_processes()
 
             now = time.time()
+            self._refresh_export_tail_state(now)
             if (
                 proc_ret is None
                 and self._active_mode == "python"
@@ -798,11 +1527,30 @@ class PipelineWorker(QThread):
                     "提示：关闭 Siril，删除 "
                     f"'{self._siril_venv_dir()}' 后重试。"
                 )
-                self._proc.terminate()
-                try:
-                    self._proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self._proc.kill()
+                self._append_watchdog_diagnostics(
+                    reason="bootstrap",
+                    idle_sec=now - self._pyscript_seen_at,
+                )
+                self._terminate_active_processes()
+
+            process_pending = proc_ret is None or not reader_done
+            watchdog_reason = self._watchdog_timeout_reason(now)
+            if (
+                process_pending
+                and watchdog_timeout is None
+                and not bootstrap_timeout
+                and not self._stop_event.is_set()
+                and watchdog_reason is not None
+            ):
+                watchdog_timeout, idle_sec = watchdog_reason
+                self._run_had_errors = True
+                if watchdog_timeout == "export_tail":
+                    self._export_tail_timeout_recovered = True
+                self._append_watchdog_diagnostics(
+                    reason=watchdog_timeout,
+                    idle_sec=idle_sec,
+                )
+                self._terminate_active_processes()
 
             proc_ret = self._proc.poll()
             if proc_ret is not None and reader_done and out_queue.empty():
@@ -820,7 +1568,7 @@ class PipelineWorker(QThread):
             if item is None:
                 continue
             self._inspect_output_for_errors(item)
-            self.log.emit(item)
+            self._emit_process_output(item)
 
         try:
             self._proc.stdout.close()
@@ -830,11 +1578,20 @@ class PipelineWorker(QThread):
 
         exit_code = self._proc.returncode if self._proc.returncode is not None else -1
         self._proc = None
+        self._proc_pgid = None
 
         if bootstrap_timeout:
             return False, exit_code
+        if watchdog_timeout == "export_tail":
+            self._append_event(
+                "最终导出产物已确认；残留进程已终止，"
+                "本次按“导出成功、收尾异常”完成。"
+            )
+            return True, exit_code
+        if watchdog_timeout is not None:
+            return False, exit_code
 
-        if exit_code == -11 and self._spcc_seen_in_run:
+        if self._is_spcc_crash_context(exit_code):
             self._spcc_cli_crash_detected = True
             self._run_had_errors = True
             self._append_spcc_crash_diagnostics(exit_code)
@@ -876,22 +1633,33 @@ class PipelineWorker(QThread):
                     break
 
                 if success:
-                    run_status = "Completed"
+                    run_status = self._completed_run_status()
                     break
 
                 if self._spcc_cli_crash_detected and not self._spcc_crash_retry_attempted:
                     self._spcc_crash_retry_attempted = True
-                    self._force_disable_spcc_for_retry = True
+                    checkpoint = self._prepare_spcc_crash_retry()
+                    retry_scope = (
+                        f"从 {checkpoint} 恢复 Stage 4"
+                        if checkpoint is not None
+                        else "重试完整流水线"
+                    )
+                    crash_reason = (
+                        "退出码 -11"
+                        if exit_code == -11
+                        else f"原生连接终止，exit={exit_code}"
+                    )
                     self._append_event(
-                        "检测到 Siril 在 SPCC 测光阶段崩溃（退出码 -11）。"
-                        "正在禁用 SPCC 并重试完整流水线，Stage 4 将改走 PCC/本地校色回退。"
+                        f"检测到 Siril 在 SPCC 测光阶段崩溃（{crash_reason}）。"
+                        f"正在禁用 SPCC 并{retry_scope}，"
+                        "Stage 4 将改走 PCC/本地校色回退。"
                     )
                     success, exit_code = self._run_once(siril_cli, run_ssf, run_ini)
                     if self._stop_event.is_set():
                         run_status = "Stopped"
                         break
                     if success:
-                        run_status = "Completed"
+                        run_status = self._completed_run_status()
                         break
 
                 if self._python_env_issue and not self._python_env_repair_attempted:
@@ -906,7 +1674,7 @@ class PipelineWorker(QThread):
                             run_status = "Stopped"
                             break
                         if success:
-                            run_status = "Completed"
+                            run_status = self._completed_run_status()
                             break
                     else:
                         self._append_event(

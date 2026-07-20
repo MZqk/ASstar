@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -24,6 +26,7 @@ __all__ = [
     "INPUT_MODE_AUTO",
     "INPUT_MODE_LINEAR_RESUME",
     "INPUT_MODE_STAGE2_CORRECTED_RESUME",
+    "INPUT_MODE_STAGE4_PSOLVED_RESUME",
     "LINEAR_RESUME_INPUT_NAME",
     "PIPELINE_EXCLUDE_PREFIXES",
     "PIPELINE_EXCLUDE_SUBSTRINGS",
@@ -31,10 +34,12 @@ __all__ = [
     "PIPELINE_RESOURCE_REL",
     "SIRIL_COSMIC_REQUIRED_WHEEL_LABELS",
     "SIRIL_PLUGIN_RESOURCE_REL",
+    "SIRIL_SPCC_DATABASE_SEED_REL",
     "SIRIL_REQUIRED_SITE_PACKAGES",
     "SIRIL_STARLESS_REQUIRED_WHEEL_LABELS",
     "SIRIL_VENDOR_FALLBACK_PACKAGES",
     "STAGE2_CORRECTED_INPUT_NAME",
+    "STAGE4_PSOLVED_INPUT_NAME",
     "SYQON_STARLESS_BUNDLE_REL",
     "apply_siril_runtime_patches",
     "build_siril_cli_command",
@@ -42,6 +47,7 @@ __all__ = [
     "default_pipeline_path",
     "default_runtime_home",
     "default_siril_plugin_dir",
+    "default_siril_spcc_database_seed_dir",
     "is_frozen",
     "normalize_siril_config_template",
     "parse_ai_env_file",
@@ -54,6 +60,9 @@ __all__ = [
     "scrub_python_env",
     "shell_quote_path",
     "siril_state_root_from_home",
+    "siril_spcc_database_root_from_home",
+    "sync_siril_spcc_database_seed",
+    "verify_siril_spcc_database_seed",
     "verify_siril_offline_seed_venv",
 ]
 
@@ -107,6 +116,8 @@ use_checksum=false
 copyright=
 graxpert_path=
 asnet_dir=
+catalogue_gaia_astro=
+catalogue_gaia_photo=
 fftw_timelimit=60
 fftw_conv_fft_cutoff=15
 fftwf_strategy=0
@@ -300,16 +311,27 @@ def _normalize_gaia_photo_catalog(value: str) -> str:
     return stripped
 
 
-def normalize_siril_config_template(config_text: str) -> str:
+def normalize_siril_config_template(
+    config_text: str,
+    *,
+    gaia_photo_catalog: Path | None = None,
+    gaia_astro_catalog: Path | None = None,
+) -> str:
     removed_keys = {"starnet_exe", "starnet_weights"}
     lines = []
     for raw_line in config_text.splitlines():
         key = raw_line.split("=", 1)[0].strip().lower() if "=" in raw_line else ""
         if key in removed_keys:
             continue
+        if key == "catalogue_gaia_astro" and gaia_astro_catalog is not None:
+            lines.append(f"catalogue_gaia_astro={gaia_astro_catalog.expanduser()}")
+            continue
         if key == "catalogue_gaia_photo":
-            value = raw_line.split("=", 1)[1]
-            lines.append(f"catalogue_gaia_photo={_normalize_gaia_photo_catalog(value)}")
+            if gaia_photo_catalog is not None:
+                lines.append(f"catalogue_gaia_photo={gaia_photo_catalog.expanduser()}")
+            else:
+                value = raw_line.split("=", 1)[1]
+                lines.append(f"catalogue_gaia_photo={_normalize_gaia_photo_catalog(value)}")
             continue
         lines.append(raw_line)
 
@@ -320,15 +342,42 @@ def normalize_siril_config_template(config_text: str) -> str:
     ]
     has_key_value = any("=" in line and not line.startswith("[") for line in meaningful_lines)
     if not lines or not has_key_value:
-        return DEFAULT_SIRIL_CONFIG_TEMPLATE
+        return normalize_siril_config_template(
+            DEFAULT_SIRIL_CONFIG_TEMPLATE,
+            gaia_photo_catalog=gaia_photo_catalog,
+            gaia_astro_catalog=gaia_astro_catalog,
+        )
     if not any(line.strip() == "[core]" for line in lines):
         lines.extend(["", "[core]"])
+
+    existing_keys = {
+        line.split("=", 1)[0].strip().lower()
+        for line in lines
+        if "=" in line
+    }
+    missing_catalog_lines = []
+    if gaia_astro_catalog is not None and "catalogue_gaia_astro" not in existing_keys:
+        missing_catalog_lines.append(
+            f"catalogue_gaia_astro={gaia_astro_catalog.expanduser()}"
+        )
+    if gaia_photo_catalog is not None and "catalogue_gaia_photo" not in existing_keys:
+        missing_catalog_lines.append(
+            f"catalogue_gaia_photo={gaia_photo_catalog.expanduser()}"
+        )
+    if missing_catalog_lines:
+        core_index = next(
+            index for index, line in enumerate(lines) if line.strip() == "[core]"
+        )
+        lines[core_index + 1 : core_index + 1] = missing_catalog_lines
 
     return "\n".join(lines) + "\n"
 
 
 PIPELINE_RESOURCE_REL = Path("pipeline") / "seestar_Superimpose.py"
 SIRIL_PLUGIN_RESOURCE_REL = Path("resources") / "siril_plugins"
+SIRIL_SPCC_DATABASE_SEED_REL = Path("SirilSPCCDatabaseSeed")
+SIRIL_SPCC_DATABASE_SEED_SCHEMA = "seestar.siril-spcc-database-seed.v1"
+SIRIL_SPCC_DATABASE_VERSION_MARKER = ".seestar-superimpose-spcc-seed"
 SYQON_STARLESS_BUNDLE_REL = Path("syqon_starless")
 COSMIC_CLARITY_BUNDLE_REL = Path("cosmic_clarity")
 COSMIC_CLARITY_REQUIRED_MODEL_FILES = (
@@ -350,15 +399,24 @@ AI_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_AI_TIMEOUT_SEC",
         "SEESTAR_AI_STRENGTH",
         "SEESTAR_AI_PROMPT",
+        "SEESTAR_AI_ADVISOR_MODE",
         "SEESTAR_AI_STAGE6_ENABLE",
         "SEESTAR_AI_STAGE7_ENABLE",
         "SEESTAR_AI_STAGE8_ENABLE",
+        "SEESTAR_AI_ARTISTIC_DERIVATIVE_ENABLED",
+        "SEESTAR_AI_ARTISTIC_ENDPOINT",
+        "SEESTAR_AI_ARTISTIC_MODEL",
+        "SEESTAR_AI_ARTISTIC_API_KEY",
+        "SEESTAR_AI_ARTISTIC_PROMPT",
+        "SEESTAR_AI_ARTISTIC_TIMEOUT_SEC",
         "SEESTAR_OUTPUT_FORMAT",
         "SEESTAR_DENOISE_ENABLE",
         "SEESTAR_DENOISE_FORCE",
         "SEESTAR_SYQON_GPU",
         "SEESTAR_SYQON_TIMEOUT_SEC",
         "SEESTAR_BOOTSTRAP_TIMEOUT_SEC",
+        "SEESTAR_WATCHDOG_IDLE_TIMEOUT_SEC",
+        "SEESTAR_EXPORT_TAIL_TIMEOUT_SEC",
         "SEESTAR_TEMP_CLEANUP_TIMEOUT_SEC",
         "SEESTAR_SIRILPY_TIMEOUT_SEC",
         "SEESTAR_WORKFLOW_PLUGIN_PROBE",
@@ -378,9 +436,13 @@ AI_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_STAGE4_SPCC_NEBULA_WHITE_REF",
         "SEESTAR_STAGE4_SPCC_BGTOL",
         "SEESTAR_STAGE4_SPCC_LIMITMAG",
+        "SEESTAR_STAGE4_SPCC_RESTORE_CPU",
+        "SEESTAR_STAGE4_PCC_CATALOGS",
+        "SEESTAR_STAGE4_PCC_HEADER_FALLBACK_ENABLE",
         "SEESTAR_STAGE4_LOCAL_STAR_WB_ENABLE",
         "SEESTAR_STAGE4_LOCAL_STAR_WB_MIN_PIXELS",
         "SEESTAR_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT",
+        "SEESTAR_STAGE4_LOCAL_STAR_WB_TARGET_AWARE_ENABLE",
         "SEESTAR_SPCC_ALLOW_LIGHT_PREPROCESS",
         "SEESTAR_ABERRATION_API_ENABLE",
         "SEESTAR_ABERRATION_PROVIDER",
@@ -398,6 +460,7 @@ AI_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_STAGE5_RL_GDSTEP",
         "SEESTAR_STAGE5_RL_STOP",
         "SEESTAR_STAGE5_GRAXPERT_DECONV_STRENGTH",
+        "SEESTAR_GRAXPERT_OBJECT_MODEL_PATH",
         "SEESTAR_STAGE7_QUALITY_RETRY_MAX",
         "SEESTAR_STAGE7_SKIP_UNREADY_STARLESS",
         "SEESTAR_STAR_SEPARATION_MODE",
@@ -425,8 +488,32 @@ def default_pipeline_path(resources: Path) -> Path:
 
 def default_siril_plugin_dir(resources: Path) -> Path:
     if is_frozen():
-        return resources / "siril_plugins"
+        env_override = os.environ.get("SEESTAR_OFFLINE_RESOURCE_ROOT", "").strip()
+        env_candidates: list[Path] = []
+        if env_override:
+            override = Path(env_override).expanduser()
+            env_candidates.extend((override / "siril_plugins", override))
+
+        app_name = resources.parent.parent.stem
+        distribution_root = resources.parent.parent.parent
+        external_candidates = [
+            distribution_root / f"{app_name}-OfflineResources" / "siril_plugins",
+            distribution_root / "SeestarSuperimpose-OfflineResources" / "siril_plugins",
+            Path.home()
+            / "Library/Application Support/SeestarSuperimpose/offline_resources/siril_plugins",
+        ]
+        embedded = resources / "siril_plugins"
+        candidates = [*env_candidates, embedded, *external_candidates]
+        return next((path for path in candidates if path.is_dir()), embedded)
     return project_root() / SIRIL_PLUGIN_RESOURCE_REL
+
+
+def default_siril_spcc_database_seed_dir(resources: Path) -> Path:
+    candidates = (
+        resources / SIRIL_SPCC_DATABASE_SEED_REL,
+        resources / "siril_spcc_database",
+    )
+    return next((path for path in candidates if path.is_dir()), candidates[0])
 
 
 def resolve_existing_path(candidates: list[Path]) -> Path:
@@ -442,6 +529,147 @@ def default_runtime_home() -> Path:
 
 def siril_state_root_from_home(runtime_home: Path) -> Path:
     return runtime_home / "Library/Application Support/org.siril.Siril/siril"
+
+
+def siril_spcc_database_root_from_home(runtime_home: Path) -> Path:
+    return (
+        runtime_home
+        / "Library/Application Support/org.siril.Siril/siril-spcc-database"
+    )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_siril_spcc_database_seed_manifest(
+    seed_root: Path,
+) -> tuple[dict, list[tuple[Path, str]]]:
+    manifest_path = seed_root / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"SPCC seed manifest 无法读取：{manifest_path} ({exc})") from exc
+
+    if not isinstance(manifest, dict):
+        raise ValueError(f"SPCC seed manifest 格式无效：{manifest_path}")
+    if manifest.get("schema") != SIRIL_SPCC_DATABASE_SEED_SCHEMA:
+        raise ValueError(
+            "SPCC seed manifest schema 不受支持："
+            f"{manifest.get('schema')!r}"
+        )
+
+    source = manifest.get("source")
+    commit = source.get("commit") if isinstance(source, dict) else None
+    if not isinstance(commit, str) or len(commit) != 40:
+        raise ValueError("SPCC seed manifest 缺少固定的 40 位 source commit")
+
+    raw_files = manifest.get("files")
+    if not isinstance(raw_files, list) or not raw_files:
+        raise ValueError("SPCC seed manifest 未列出任何文件")
+
+    entries: list[tuple[Path, str]] = []
+    seen: set[Path] = set()
+    for item in raw_files:
+        if not isinstance(item, dict):
+            raise ValueError("SPCC seed manifest files 条目格式无效")
+        relative = Path(str(item.get("path") or ""))
+        expected_sha256 = str(item.get("sha256") or "").lower()
+        if (
+            not relative.parts
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or relative in seen
+        ):
+            raise ValueError(f"SPCC seed manifest 文件路径无效：{relative}")
+        if len(expected_sha256) != 64 or any(
+            char not in "0123456789abcdef" for char in expected_sha256
+        ):
+            raise ValueError(f"SPCC seed manifest SHA-256 无效：{relative}")
+        seen.add(relative)
+        entries.append((relative, expected_sha256))
+    return manifest, entries
+
+
+def verify_siril_spcc_database_seed(
+    seed_root: Path,
+    runtime_home: Path,
+) -> tuple[bool, str]:
+    try:
+        manifest, entries = _load_siril_spcc_database_seed_manifest(seed_root)
+        target_root = siril_spcc_database_root_from_home(runtime_home)
+        for relative, expected_sha256 in entries:
+            source = seed_root / relative
+            if not source.is_file():
+                return False, f"bundled SPCC seed 文件缺失：{source}"
+            if _file_sha256(source) != expected_sha256:
+                return False, f"bundled SPCC seed 校验失败：{source}"
+            target = target_root / relative
+            if not target.is_file():
+                return False, f"runtime SPCC 数据文件缺失：{target}"
+            if _file_sha256(target) != expected_sha256:
+                return False, f"runtime SPCC 数据校验失败：{target}"
+        commit = manifest["source"]["commit"]
+        return True, f"commit={commit}; files={len(entries)}; path={target_root}"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def sync_siril_spcc_database_seed(
+    seed_root: Path,
+    runtime_home: Path,
+) -> dict[str, object]:
+    manifest, entries = _load_siril_spcc_database_seed_manifest(seed_root)
+    target_root = siril_spcc_database_root_from_home(runtime_home)
+    target_root.mkdir(parents=True, exist_ok=True)
+
+    copied: list[str] = []
+    for relative, expected_sha256 in entries:
+        source = seed_root / relative
+        if not source.is_file():
+            raise FileNotFoundError(f"bundled SPCC seed 文件缺失：{source}")
+        if _file_sha256(source) != expected_sha256:
+            raise ValueError(f"bundled SPCC seed 校验失败：{source}")
+
+        target = target_root / relative
+        if target.is_file() and _file_sha256(target) == expected_sha256:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.seestar-tmp")
+        try:
+            shutil.copy2(source, temporary)
+            if _file_sha256(temporary) != expected_sha256:
+                raise ValueError(f"runtime SPCC 临时文件校验失败：{temporary}")
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        copied.append(str(relative))
+
+    commit = manifest["source"]["commit"]
+    marker = target_root / SIRIL_SPCC_DATABASE_VERSION_MARKER
+    marker_text = (
+        f"schema={SIRIL_SPCC_DATABASE_SEED_SCHEMA}\n"
+        f"source_commit={commit}\n"
+        f"managed_files={len(entries)}\n"
+    )
+    if not marker.is_file() or marker.read_text(
+        encoding="utf-8", errors="replace"
+    ) != marker_text:
+        marker.write_text(marker_text, encoding="utf-8")
+
+    ready, detail = verify_siril_spcc_database_seed(seed_root, runtime_home)
+    if not ready:
+        raise RuntimeError(detail)
+    return {
+        "source_commit": commit,
+        "target_root": target_root,
+        "managed_files": len(entries),
+        "copied_files": copied,
+    }
 
 
 SIRIL_REQUIRED_SITE_PACKAGES = ("sirilpy", "numpy", "packaging", "requests")
@@ -477,8 +705,10 @@ SIRIL_STARLESS_REQUIRED_WHEEL_LABELS = (
 INPUT_MODE_AUTO = "auto"
 INPUT_MODE_LINEAR_RESUME = "result_linear_resume"
 INPUT_MODE_STAGE2_CORRECTED_RESUME = "stage2_corrected_resume"
+INPUT_MODE_STAGE4_PSOLVED_RESUME = "stage4_psolved_resume"
 LINEAR_RESUME_INPUT_NAME = "result_linear.fit"
 STAGE2_CORRECTED_INPUT_NAME = "stage2_corrected.fit"
+STAGE4_PSOLVED_INPUT_NAME = "stage4_psolved.fit"
 PIPELINE_EXCLUDE_PREFIXES = (
     "light_",
     "pp_",
@@ -563,6 +793,19 @@ def scrub_python_env(env: dict[str, str]) -> dict[str, str]:
         "DYLD_FALLBACK_FRAMEWORK_PATH",
         "DYLD_LIBRARY_PATH",
         "LD_LIBRARY_PATH",
+        # The frozen GUI uses PySide6, while Siril scripts use their own
+        # PyQt6/PySide6 wheels.  Inheriting the GUI's Qt plugin paths makes a
+        # PyQt6 script load the app-bundled PySide6 Qt frameworks as well,
+        # which aborts Cocoa/offscreen plugin initialization on macOS.
+        "QT_PLUGIN_PATH",
+        "QT_QPA_PLATFORM_PLUGIN_PATH",
+        "QT_QPA_PLATFORM",
+        "QML2_IMPORT_PATH",
+        "QML_IMPORT_PATH",
+        "QTWEBENGINEPROCESS_PATH",
+        "QTWEBENGINE_RESOURCES_PATH",
+        "QTWEBENGINE_LOCALES_PATH",
+        "QT_API",
     }
     for key in list(env.keys()):
         if key in drop_exact or key.startswith("PYINSTALLER_"):
