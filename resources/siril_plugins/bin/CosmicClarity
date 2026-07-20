@@ -143,10 +143,10 @@ def _prepare_model_runtime(plugin_root: Path) -> None:
             if target.exists() or target.is_symlink():
                 target.unlink()
             target.symlink_to(source)
-        except OSError:
-            import shutil
-
-            shutil.copy2(source, target)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot create read-only model link {target} -> {source}: {exc}"
+            ) from exc
 
 
 def _build_preset(args: argparse.Namespace) -> tuple[str, dict[str, object]]:

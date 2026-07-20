@@ -7,8 +7,8 @@ VENDOR_DIR="${ROOT_DIR}/vendor"
 SYQON_DIR="${ROOT_DIR}/syqon_starless"
 WHEEL_LOCK_FILE="${ROOT_DIR}/requirements-macos-arm64.lock"
 ASSET_CHECKSUM_FILE="${ROOT_DIR}/asset-checksums.sha256"
-TARGET_PYTHON_VERSION="313"
-TARGET_ABI="cp313"
+TARGET_PYTHON_VERSION="312"
+TARGET_ABI="cp312"
 TARGET_PLATFORM="macosx_14_0_arm64"
 
 SIRIL_ARCHIVE="${DOWNLOAD_DIR}/siril-scripts.tar.gz"
@@ -88,7 +88,7 @@ tar -xzf "${SIRIL_ARCHIVE}" -C "${SIRIL_UNPACK_DIR}.tmp" --strip-components=1
 rm -rf "${SIRIL_UNPACK_DIR}"
 mv "${SIRIL_UNPACK_DIR}.tmp" "${SIRIL_UNPACK_DIR}"
 
-echo "[3/4] Downloading hash-locked Python 3.13 wheels..."
+echo "[3/4] Downloading hash-locked Python 3.12 wheels..."
 python3 -m pip download \
   --no-deps \
   --require-hashes \
@@ -101,6 +101,60 @@ python3 -m pip download \
   --index-url "https://pypi.org/simple" \
   --dest "${DOWNLOAD_DIR}" \
   -r "${WHEEL_LOCK_FILE}"
+
+python3 - "${DOWNLOAD_DIR}" "${TARGET_ABI}" <<'PY'
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+from pip._vendor.packaging.utils import canonicalize_name, parse_wheel_filename
+
+download_dir = Path(sys.argv[1])
+target_abi = sys.argv[2]
+target_version = int(target_abi.removeprefix("cp"))
+removed = []
+groups = {}
+
+for wheel in sorted(download_dir.glob("*.whl")):
+    try:
+        name, version, _build, tags = parse_wheel_filename(wheel.name)
+    except Exception:
+        continue
+    compatible = any(
+        (tag.interpreter in {target_abi, "py3", "py2.py3"} and tag.abi in {target_abi, "abi3", "none"})
+        or (
+            tag.interpreter.startswith("cp")
+            and tag.interpreter[2:].isdigit()
+            and int(tag.interpreter[2:]) <= target_version
+            and tag.abi == "abi3"
+        )
+        for tag in tags
+    )
+    if not compatible:
+        wheel.unlink()
+        removed.append(wheel.name)
+        continue
+    groups.setdefault(canonicalize_name(name), []).append((version, wheel))
+
+for name, candidates in sorted(groups.items()):
+    candidates.sort(key=lambda item: (item[0], item[1].name))
+    if name == "setuptools":
+        supported = [item for item in candidates if item[0].major < 82]
+        keep = supported[-1] if supported else candidates[-1]
+    else:
+        keep = candidates[-1]
+    for _version, wheel in candidates:
+        if wheel == keep[1]:
+            continue
+        wheel.unlink()
+        removed.append(wheel.name)
+
+print(
+    f"Pruned wheel cache for {target_abi}: "
+    f"removed={len(removed)}, kept={len(groups)}"
+)
+PY
 
 echo "[4/4] Downloading and verifying SyQon Starless offline cache..."
 download_verified \
@@ -132,6 +186,9 @@ echo "Plugin download complete."
 echo "Downloaded files:"
 echo "  - ${SIRIL_ARCHIVE}"
 echo "  - ${DOWNLOAD_DIR}/setiastrosuitepro-*.whl"
+echo "  - ${DOWNLOAD_DIR}/appdirs-*.whl"
+echo "  - ${DOWNLOAD_DIR}/ml_dtypes-*.whl"
+echo "  - ${DOWNLOAD_DIR}/onnx-*.whl"
 echo "  - ${DOWNLOAD_DIR}/onnxruntime-*.whl"
 echo "  - ${DOWNLOAD_DIR}/pyqt6-*.whl"
 echo "  - ${DOWNLOAD_DIR}/pyqt6_qt6-*.whl"

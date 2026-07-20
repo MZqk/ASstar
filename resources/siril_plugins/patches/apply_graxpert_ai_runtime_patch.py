@@ -209,7 +209,41 @@ NEW_PRE_INFERENCE = """\
 
         # Run inference
         background, session = onnx_helper.run(session, ai_path, None, \\
+                    {"gen_input_image": onnx_input.astype(np.float32)},
+                    return_first_output=True)
+        # ONNXHelper normally returns a list of outputs. Request the first
+        # output explicitly before removing the GraXpert batch dimension.
+        background = np.asarray(background)
+        if background.ndim == 4:
+            if background.shape[0] != 1:
+                raise RuntimeError(f"Unexpected GraXpert batch shape: {background.shape}")
+            background = background[0]
+        if is_nchw and background.ndim == 3:
+            background = np.transpose(background, (1, 2, 0))
+        elif background.ndim == 2:
+            background = np.expand_dims(background, -1)
+        if (background.ndim != 3 or background.size == 0
+                or background.shape[0] <= 2 * padding
+                or background.shape[1] <= 2 * padding
+                or background.shape[2] not in (1, 3)):
+            raise RuntimeError(f"Invalid GraXpert background shape: {background.shape}")
+        if not np.all(np.isfinite(background)):
+            raise RuntimeError("GraXpert background contains non-finite values")
+"""
+
+
+OLD_PATCHED_RUN_SUFFIX = """\
                     {"gen_input_image": onnx_input.astype(np.float32)})
+"""
+
+
+NEW_PATCHED_RUN_SUFFIX = """\
+                    {"gen_input_image": onnx_input.astype(np.float32)},
+                    return_first_output=True)
+"""
+
+
+OLD_PATCHED_OUTPUT_NORMALIZATION = """\
         # Remove only the batch dimension. GraXpert v2 BGE returns [1, 1, H, W];
         # removing both leading axes collapses it to 2D before HWC processing.
         background = background[0]
@@ -217,6 +251,28 @@ NEW_PRE_INFERENCE = """\
             background = np.transpose(background, (1, 2, 0))
         elif background.ndim == 2:
             background = np.expand_dims(background, -1)
+"""
+
+
+NEW_PATCHED_OUTPUT_NORMALIZATION = """\
+        # ONNXHelper normally returns a list of outputs. Request the first
+        # output explicitly before removing the GraXpert batch dimension.
+        background = np.asarray(background)
+        if background.ndim == 4:
+            if background.shape[0] != 1:
+                raise RuntimeError(f"Unexpected GraXpert batch shape: {background.shape}")
+            background = background[0]
+        if is_nchw and background.ndim == 3:
+            background = np.transpose(background, (1, 2, 0))
+        elif background.ndim == 2:
+            background = np.expand_dims(background, -1)
+        if (background.ndim != 3 or background.size == 0
+                or background.shape[0] <= 2 * padding
+                or background.shape[1] <= 2 * padding
+                or background.shape[2] not in (1, 3)):
+            raise RuntimeError(f"Invalid GraXpert background shape: {background.shape}")
+        if not np.all(np.isfinite(background)):
+            raise RuntimeError("GraXpert background contains non-finite values")
 """
 
 
@@ -251,6 +307,21 @@ def apply_patch(path: Path) -> bool:
     patched = text
     if OLD_PRE_INFERENCE in patched:
         patched = patched.replace(OLD_PRE_INFERENCE, NEW_PRE_INFERENCE, 1)
+    else:
+        # Upgrade runtime trees that already contain the first-generation
+        # model-layout patch without recopying the upstream script.
+        if OLD_PATCHED_RUN_SUFFIX in patched:
+            patched = patched.replace(
+                OLD_PATCHED_RUN_SUFFIX,
+                NEW_PATCHED_RUN_SUFFIX,
+                1,
+            )
+        if OLD_PATCHED_OUTPUT_NORMALIZATION in patched:
+            patched = patched.replace(
+                OLD_PATCHED_OUTPUT_NORMALIZATION,
+                NEW_PATCHED_OUTPUT_NORMALIZATION,
+                1,
+            )
     if OLD_PADDING in patched:
         patched = patched.replace(OLD_PADDING, NEW_PADDING, 1)
     changed = patched != text

@@ -196,8 +196,20 @@ def models_dir_override() -> Optional[Path]:
 
 
 def init_models_dir(siril_iface) -> Path:
-    global _MODELS_DIR
+    global _MODELS_DIR, _MODELS_DIR_IS_OVERRIDE
+    bundled_raw = os.environ.get(
+        "SEESTAR_COSMIC_CLARITY_MODEL_DIR",
+        "",
+    ).strip()
+    if bundled_raw:
+        bundled_dir = Path(bundled_raw).expanduser()
+        if bundled_dir.is_dir():
+            _MODELS_DIR = bundled_dir
+            _MODELS_DIR_IS_OVERRIDE = True
+            print(f"Using read-only bundled CosmicClarity models: {_MODELS_DIR}")
+            return _MODELS_DIR
     _MODELS_DIR = Path(siril_iface.get_siril_userdatadir()) / "cosmic_clarity"
+    _MODELS_DIR_IS_OVERRIDE = False
     _MODELS_DIR.mkdir(parents=True, exist_ok=True)
     return _MODELS_DIR
 
@@ -4011,4 +4023,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

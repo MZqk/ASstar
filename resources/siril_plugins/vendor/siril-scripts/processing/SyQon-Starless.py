@@ -3029,8 +3029,24 @@ def main():
         print(f"Warning: Could not get Siril user data directory: {e}. Using ~/.siril")
         user_datadir = str(Path.home() / ".siril")
 
-    engine_dir = Path(user_datadir) / "syqon_starless"
-    engine_dir.mkdir(parents=True, exist_ok=True)
+    writable_engine_dir = Path(user_datadir) / "syqon_starless"
+    bundled_engine_raw = os.environ.get("SEESTAR_SYQON_MODEL_DIR", "").strip()
+    bundled_engine_dir = (
+        Path(bundled_engine_raw).expanduser()
+        if bundled_engine_raw
+        else None
+    )
+    using_bundled_engine = bool(
+        bundled_engine_dir
+        and bundled_engine_dir.is_dir()
+        and (bundled_engine_dir / "zenith.pt").is_file()
+    )
+    if using_bundled_engine:
+        engine_dir = bundled_engine_dir
+        print(f"Using read-only bundled SyQon model: {engine_dir / 'zenith.pt'}")
+    else:
+        engine_dir = writable_engine_dir
+        engine_dir.mkdir(parents=True, exist_ok=True)
 
     # Set global model paths
     global ZENITH_MODEL_PATH, AXIOM21_MODEL_PATH
@@ -3041,8 +3057,25 @@ def main():
         print(f"Using bundled Axiom 2.1 model: {AXIOM21_MODEL_PATH}")
 
     # Setup / download Zenith model
-    should_check = should_check_for_updates(engine_dir, args.force_update_check)
-    setup_model_torch(engine_dir, siril, should_check)
+    if using_bundled_engine:
+        bundled_model = engine_dir / "zenith.pt"
+        bundled_checksum = engine_dir / "zenith.pt.sha256"
+        if bundled_checksum.is_file() and not verify_shasum(
+            bundled_model,
+            bundled_checksum,
+        ):
+            print(
+                f"Error: Bundled Zenith model checksum failed: {bundled_model}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print("Bundled Zenith model is ready; update checks are disabled.")
+    else:
+        should_check = should_check_for_updates(
+            engine_dir,
+            args.force_update_check,
+        )
+        setup_model_torch(engine_dir, siril, should_check)
 
     # Determine selected model
     selected_model = "axiom21" if args.axiom21 else "zenith"
