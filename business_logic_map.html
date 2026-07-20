@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Seestar Superimpose — 业务逻辑梳理</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2128; --border:#30363d;
+    --text:#e6edf3; --muted:#9da7b3; --blue:#58a6ff; --green:#3fb950;
+    --amber:#d29922; --red:#f85149; --purple:#bc8cff; --teal:#39c5cf;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+    line-height:1.6;font-size:14px;}
+  header{padding:28px 32px 18px;border-bottom:1px solid var(--border);}
+  header h1{margin:0;font-size:22px;font-weight:600;letter-spacing:.3px;}
+  header p{margin:8px 0 0;color:var(--muted);font-size:13px;}
+  .wrap{max-width:1180px;margin:0 auto;padding:24px 32px 80px;}
+  section{margin-top:40px;}
+  h2{font-size:17px;font-weight:600;margin:0 0 6px;
+     padding-left:12px;border-left:3px solid var(--blue);}
+  .sub{color:var(--muted);font-size:13px;margin:0 0 18px;padding-left:15px;}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;
+        padding:20px;overflow-x:auto;margin-bottom:18px;}
+  svg{display:block;max-width:100%;height:auto;}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;margin:4px 0 16px;font-size:12px;color:var(--muted);}
+  .legend span{display:inline-flex;align-items:center;gap:6px;}
+  .sw{width:14px;height:14px;border-radius:3px;display:inline-block;border:1px solid var(--border);}
+  table{width:100%;border-collapse:collapse;font-size:13px;}
+  th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:top;}
+  th{color:var(--muted);font-weight:600;background:var(--panel2);position:sticky;top:0;}
+  td code,th code{color:var(--teal);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;}
+  tr:hover td{background:var(--panel2);}
+  .tag{display:inline-block;padding:1px 7px;border-radius:6px;font-size:11px;margin:1px 2px;white-space:nowrap;}
+  .t-mod{background:#21262d;color:var(--blue);border:1px solid #21405e;}
+  .t-io{background:#21262d;color:var(--green);border:1px solid #1d4d30;}
+  .t-ex{background:#2d1b1b;color:var(--red);border:1px solid #5e2121;}
+  .t-br{background:#2a2310;color:var(--amber);border:1px solid #5e4a14;}
+  .t-data{background:#14241c;color:var(--teal);border:1px solid #1d4d4a;}
+  .note{font-size:12px;color:var(--muted);margin-top:10px;}
+  .phase{font-size:12px;color:var(--amber);font-weight:600;text-transform:uppercase;letter-spacing:.5px;}
+  ul.tight{margin:6px 0 0;padding-left:18px;}
+  ul.tight li{margin:3px 0;}
+  a{color:var(--blue);}
+</style>
+</head>
+<body>
+<header>
+  <h1>Seestar Superimpose — 业务逻辑梳理</h1>
+  <p>面向 SeeStar 深空天文图像的自动后期流水线 · 单线程主流程编排 + GUI 子进程运行 · 11 阶段 starless-first 链路</p>
+</header>
+
+<div class="wrap">
+
+<!-- ============ 图1：主业务阶段流 ============ -->
+<section>
+  <h2>一、主业务阶段流（含分支判断与异常路径）</h2>
+  <p class="sub">纵向为执行顺序；菱形为关键分支/质量门控；红色为异常/降级出口；绿色为数据产物。注意 stage6/7 方法名与枚举标签存在历史错位（starless-first 重构）。</p>
+  <div class="legend">
+    <span><i class="sw" style="background:#1f3a5f"></i>业务阶段</span>
+    <span><i class="sw" style="background:#5e4a14"></i>分支/门控</span>
+    <span><i class="sw" style="background:#1d4d30"></i>数据产物</span>
+    <span><i class="sw" style="background:#5e2121"></i>异常/降级</span>
+    <span><i class="sw" style="background:#3a2a5e"></i>可选 AI</span>
+  </div>
+  <div class="card">
+    <svg viewBox="0 0 1000 1560" width="1000" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif">
+      <defs>
+        <marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M2 1L8 5L2 9" fill="none" stroke="#9da7b3" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </marker>
+        <style>
+          .stg{fill:#1f3a5f;stroke:#58a6ff;stroke-width:1;}
+          .br{fill:#5e4a14;stroke:#d29922;stroke-width:1;}
+          .dt{fill:#1d4d30;stroke:#3fb950;stroke-width:1;}
+          .ex{fill:#5e2121;stroke:#f85149;stroke-width:1;}
+          .ai{fill:#3a2a5e;stroke:#bc8cff;stroke-width:1;}
+          .t{fill:#e6edf3;font-size:12.5px;} .ts{fill:#9da7b3;font-size:10.5px;}
+          .th{fill:#e6edf3;font-size:13px;font-weight:600;}
+          .arr{stroke:#9da7b3;stroke-width:1.4;fill:none;}
+        </style>
+      </defs>
+
+      <!-- Entry / preflight -->
+      <rect class="stg" x="350" y="20" width="300" height="54" rx="9"/>
+      <text class="th" x="500" y="40" text-anchor="middle">GUI 预检 preflight</text>
+      <text class="ts" x="500" y="58" text-anchor="middle">Siril/config/pipeline/输入/磁盘空间</text>
+      <path class="arr" d="M500 74 L500 96" marker-end="url(#a)"/>
+      <polygon class="ex" points="500,96 540,116 500,136 460,116"/>
+      <text class="t" x="500" y="120" text-anchor="middle" font-size="11">缺失→弹窗终止</text>
+
+      <!-- mode branch -->
+      <rect class="br" x="345" y="150" width="310" height="50" rx="9"/>
+      <text class="th" x="500" y="180" text-anchor="middle">输入模式判定 (SEESTAR_INPUT_MODE)</text>
+      <path class="arr" d="M500 200 L500 224" marker-end="url(#a)"/>
+
+      <!-- three mode arrows -->
+      <path class="arr" d="M360 175 L150 175 L150 250" marker-end="url(#a)"/>
+      <text class="ts" x="250" y="168" text-anchor="middle">linear_resume</text>
+      <path class="arr" d="M500 200 L500 224" marker-end="url(#a)"/>
+      <text class="ts" x="560" y="214" text-anchor="start">auto（默认）</text>
+      <path class="arr" d="M640 175 L850 175 L850 250" marker-end="url(#a)"/>
+      <text class="ts" x="740" y="168" text-anchor="middle">stage2_corrected_resume</text>
+
+      <!-- mode boxes -->
+      <rect class="stg" x="40" y="250" width="220" height="46" rx="9"/>
+      <text class="t" x="150" y="277" text-anchor="middle">需 result_linear.fit</text>
+      <text class="ts" x="150" y="291" text-anchor="middle">跳过 1-5，从 stage6 起</text>
+
+      <rect class="stg" x="390" y="250" width="220" height="46" rx="9"/>
+      <text class="t" x="500" y="277" text-anchor="middle">运行 stage1→5</text>
+      <text class="ts" x="500" y="291" text-anchor="middle">完整预处理链</text>
+
+      <rect class="stg" x="740" y="250" width="220" height="46" rx="9"/>
+      <text class="t" x="850" y="277" text-anchor="middle">需 stage2_corrected.fit</text>
+      <text class="ts" x="850" y="291" text-anchor="middle">从 stage3 起</text>
+
+      <path class="arr" d="M150 296 L150 330 L470 330 L470 356" marker-end="url(#a)"/>
+      <path class="arr" d="M500 296 L500 356" marker-end="url(#a)"/>
+      <path class="arr" d="M850 296 L850 330 L530 330 L530 356" marker-end="url(#a)"/>
+
+      <!-- Stage 1-5 block -->
+      <rect class="stg" x="330" y="356" width="340" height="300" rx="10" stroke-dasharray="4 3"/>
+      <text class="th" x="500" y="378" text-anchor="middle">预处理链 Stage 1–5</text>
+
+      <rect class="stg" x="360" y="392" width="280" height="40" rx="7"/>
+      <text class="t" x="500" y="416" text-anchor="middle">1 准备：stacked vs Light 单帧</text>
+      <polygon class="br" points="640,412 660,424 640,436 620,424"/>
+      <text class="ts" x="668" y="427" text-anchor="start">Light→去拜耳+对齐+叠加</text>
+
+      <rect class="stg" x="360" y="440" width="280" height="40" rx="7"/>
+      <text class="t" x="500" y="464" text-anchor="middle">2 视图校正：自适应裁切</text>
+
+      <rect class="stg" x="360" y="488" width="280" height="40" rx="7"/>
+      <text class="t" x="500" y="512" text-anchor="middle">3 背景提取（候选链+质量门控）</text>
+      <polygon class="ex" points="640,508 660,520 640,532 620,520"/>
+      <text class="ts" x="668" y="523" text-anchor="start">GraXpert→ADBE→DBE→subsky</text>
+
+      <rect class="stg" x="360" y="536" width="280" height="40" rx="7"/>
+      <text class="t" x="500" y="560" text-anchor="middle">4 色彩校准 platesolve+SPCC</text>
+      <polygon class="ex" points="640,556 660,568 640,580 620,568"/>
+      <text class="ts" x="668" y="571" text-anchor="start">PCC→local 回退</text>
+
+      <rect class="stg" x="360" y="584" width="280" height="40" rx="7"/>
+      <text class="t" x="500" y="608" text-anchor="middle">5 线性降噪 反卷积+CC</text>
+      <text class="ts" x="500" y="624" text-anchor="middle">RL/GraXpert → CosmicClarity 原生回退</text>
+
+      <path class="arr" d="M500 656 L500 686" marker-end="url(#a)"/>
+
+      <!-- Stage 6 star separation -->
+      <rect class="stg" x="320" y="686" width="360" height="48" rx="9"/>
+      <text class="th" x="500" y="706" text-anchor="middle">6 去星分离 (stage7_star_separation)</text>
+      <text class="ts" x="500" y="722" text-anchor="middle">SyQon → SASP Dark Star → mild-prestretch</text>
+      <polygon class="ex" points="680,710 700,722 680,734 660,722"/>
+      <text class="ts" x="708" y="725" text-anchor="start">全失败→SirilError</text>
+      <path class="arr" d="M500 734 L500 760" marker-end="url(#a)"/>
+
+      <!-- data artifact -->
+      <rect class="dt" x="330" y="760" width="340" height="38" rx="8"/>
+      <text class="t" x="500" y="783" text-anchor="middle">★ starless.fit + starmask.fit</text>
+      <path class="arr" d="M500 798 L500 822" marker-end="url(#a)"/>
+
+      <!-- Stage 7 stretch -->
+      <rect class="stg" x="320" y="822" width="360" height="46" rx="9"/>
+      <text class="th" x="500" y="841" text-anchor="middle">7 主体拉伸 (stage6_stretching)</text>
+      <text class="ts" x="500" y="857" text-anchor="middle">可选 AI 顾问拉伸候选</text>
+      <polygon class="ex" points="680,845 700,857 680,869 660,857"/>
+      <text class="ts" x="708" y="860" text-anchor="start">全失败→failed</text>
+      <path class="arr" d="M500 868 L500 892" marker-end="url(#a)"/>
+
+      <!-- Stage 8 enhancement -->
+      <rect class="stg" x="320" y="892" width="360" height="46" rx="9"/>
+      <text class="th" x="500" y="911" text-anchor="middle">8 星云增强 (stage8)</text>
+      <text class="ts" x="500" y="927" text-anchor="middle">SASP WaveScale/DSE + 蓝色门控回滚</text>
+      <polygon class="ex" points="680,915 700,927 680,939 660,927"/>
+      <text class="ts" x="708" y="930" text-anchor="start">深加工失败→_stage8_fallback</text>
+      <path class="arr" d="M500 938 L500 962" marker-end="url(#a)"/>
+
+      <!-- Stage 9 remix -->
+      <rect class="stg" x="320" y="962" width="360" height="46" rx="9"/>
+      <text class="th" x="500" y="981" text-anchor="middle">9 星点重混 (stage9)</text>
+      <text class="ts" x="500" y="997" text-anchor="middle">导入 starmask，受 _stage8_fallback 约束</text>
+      <path class="arr" d="M500 1008 L500 1032" marker-end="url(#a)"/>
+
+      <!-- Stage 10 export -->
+      <rect class="stg" x="320" y="1032" width="360" height="52" rx="9"/>
+      <text class="th" x="500" y="1052" text-anchor="middle">10 导出 (stage10)</text>
+      <text class="ts" x="500" y="1068" text-anchor="middle">四级降噪回退 → TIFF/PNG/FITS</text>
+      <polygon class="ex" points="680,1058 700,1070 680,1082 660,1070"/>
+      <text class="ts" x="708" y="1071" text-anchor="start">质量门控非ok→degraded</text>
+      <path class="arr" d="M500 1084 L500 1110" marker-end="url(#a)"/>
+
+      <!-- data final -->
+      <rect class="dt" x="320" y="1110" width="360" height="38" rx="8"/>
+      <text class="t" x="500" y="1133" text-anchor="middle">result_processed.{tif,png} / result_final.fit</text>
+      <path class="arr" d="M500 1148 L500 1172" marker-end="url(#a)"/>
+
+      <!-- Stage 11 AI -->
+      <rect class="ai" x="320" y="1172" width="360" height="50" rx="9"/>
+      <text class="th" x="500" y="1192" text-anchor="middle">11 AI 后期 (可选, stage11)</text>
+      <text class="ts" x="500" y="1208" text-anchor="middle">缺env→skipped；质量门控降强度重试</text>
+      <polygon class="ex" points="680,1197 700,1209 680,1221 660,1209"/>
+      <text class="ts" x="708" y="1210" text-anchor="start">失败/降级→不阻断stage10</text>
+      <path class="arr" d="M500 1222 L500 1246" marker-end="url(#a)"/>
+
+      <!-- AI data -->
+      <rect class="dt" x="320" y="1246" width="360" height="34" rx="8"/>
+      <text class="t" x="500" y="1268" text-anchor="middle">result_processed_ai.* / result_final_ai.fit</text>
+      <path class="arr" d="M500 1280 L500 1304" marker-end="url(#a)"/>
+
+      <!-- cleanup -->
+      <rect class="stg" x="350" y="1304" width="300" height="44" rx="9"/>
+      <text class="t" x="500" y="1324" text-anchor="middle">cleanup() 清理中间 .fit/.seq</text>
+      <text class="ts" x="500" y="1339" text-anchor="middle">保留 starless.fit / starmask.fit</text>
+      <path class="arr" d="M500 1348 L500 1372" marker-end="url(#a)"/>
+
+      <!-- top-level exception -->
+      <rect class="ex" x="350" y="1372" width="300" height="46" rx="9"/>
+      <text class="th" x="500" y="1392" text-anchor="middle">顶层异常拦截</text>
+      <text class="ts" x="500" y="1407" text-anchor="middle">KeyboardInterrupt/Exception → finally 断开 Siril</text>
+      <path class="arr" d="M850 396 L900 396 L900 1395 L800 1395" marker-end="url(#a)" stroke-dasharray="5 4"/>
+      <text class="ts" x="905" y="900" text-anchor="start">任意阶段抛错</text>
+
+      <!-- side: GUI worker fault tolerance -->
+      <rect class="ex" x="700" y="1290" width="250" height="118" rx="9" stroke-dasharray="4 3"/>
+      <text class="th" x="825" y="1310" text-anchor="middle" fill="#f85149">GUI 子进程容错</text>
+      <text class="ts" x="712" y="1330" text-anchor="start">· bootstrap 超时→环境异常</text>
+      <text class="ts" x="712" y="1348" text-anchor="start">· SPCC 崩溃(-11)→禁SPCC重跑</text>
+      <text class="ts" x="712" y="1366" text-anchor="start">· venv 重置+离线seed重试</text>
+      <text class="ts" x="712" y="1384" text-anchor="start">· 备用 Siril 运行时遍历重试</text>
+    </svg>
+  </div>
+  <p class="note">说明：stage 编号以 <code>PipelineStage</code> 枚举标签为准（见 pipeline/models.py）。方法名 <code>stage6_star_separation</code> 实际调用 <code>run_stage7_star_separation</code>，<code>stage7_stretching</code> 调用 <code>run_stage6_stretching</code>；环境变量 <code>STAGE7_*</code> 为历史兼容别名。</p>
+</section>
+
+<!-- ============ 图2：编排调用链 ============ -->
+<section>
+  <h2>二、模块调用顺序 / 编排链路</h2>
+  <p class="sub">GUI 不在进程内调用 run()，而是将整个 pipeline 作为 siril-cli 子进程运行；进度经 Signal 回传。核心编排器为 SeestarPostProcessor.run()。</p>
+  <div class="card">
+    <svg viewBox="0 0 1000 720" width="1000" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif">
+      <defs>
+        <marker id="b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M2 1L8 5L2 9" fill="none" stroke="#9da7b3" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </marker>
+        <style>
+          .g{fill:#1c2128;stroke:#58a6ff;stroke-width:1;}
+          .g2{fill:#1c2128;stroke:#39c5cf;stroke-width:1;}
+          .g3{fill:#1c2128;stroke:#bc8cff;stroke-width:1;}
+          .t{fill:#e6edf3;font-size:12.5px;} .ts{fill:#9da7b3;font-size:10.5px;} .th{fill:#e6edf3;font-size:13px;font-weight:600;}
+          .arr{stroke:#9da7b3;stroke-width:1.4;fill:none;}
+        </style>
+      </defs>
+
+      <rect class="g" x="360" y="20" width="280" height="50" rx="9"/>
+      <text class="th" x="500" y="40" text-anchor="middle">GUI 主窗口 main_window</text>
+      <text class="ts" x="500" y="56" text-anchor="middle">_preflight_errors + _start_run</text>
+      <path class="arr" d="M500 70 L500 96" marker-end="url(#b)"/>
+
+      <rect class="g" x="350" y="96" width="300" height="50" rx="9"/>
+      <text class="th" x="500" y="116" text-anchor="middle">PipelineWorker (QThread)</text>
+      <text class="ts" x="500" y="132" text-anchor="middle">复制 *.py/stages/插件→临时目录</text>
+      <path class="arr" d="M500 146 L500 172" marker-end="url(#b)"/>
+
+      <rect class="g2" x="330" y="172" width="340" height="50" rx="9"/>
+      <text class="th" x="500" y="192" text-anchor="middle">subprocess: siril-cli</text>
+      <text class="ts" x="500" y="208" text-anchor="middle">pyscript run_job_embedded.ssf</text>
+      <path class="arr" d="M500 222 L500 248" marker-end="url(#b)"/>
+
+      <rect class="g3" x="320" y="248" width="360" height="54" rx="9"/>
+      <text class="th" x="500" y="268" text-anchor="middle">seestar_Superimpose.py</text>
+      <text class="ts" x="500" y="284" text-anchor="middle">SeestarPostProcessor.run() 编排</text>
+      <path class="arr" d="M500 302 L500 328" marker-end="url(#b)"/>
+
+      <!-- runtime mixin -->
+      <rect class="g" x="320" y="328" width="360" height="46" rx="9"/>
+      <text class="th" x="500" y="347" text-anchor="middle">ProcessorRuntimeMixin</text>
+      <text class="ts" x="500" y="363" text-anchor="middle">env 覆盖(80+SEESTAR_*) · 质量度量 · FITS 头</text>
+      <path class="arr" d="M500 374 L500 400" marker-end="url(#b)"/>
+
+      <!-- stages cluster -->
+      <rect class="g" x="300" y="400" width="400" height="120" rx="10" stroke-dasharray="4 3"/>
+      <text class="th" x="500" y="420" text-anchor="middle" fill="#39c5cf">pipeline/stages/ 阶段纯函数</text>
+      <text class="ts" x="320" y="442" text-anchor="start">stage1..stage10 各 run_stageN_*()</text>
+      <text class="ts" x="320" y="462" text-anchor="start">stage11_ai_postprocess.py（可选）</text>
+      <text class="ts" x="320" y="482" text-anchor="start">quality_gate / stage7_quality / stage8_pixels</text>
+      <text class="ts" x="320" y="502" text-anchor="start">target_profiler / policy_selector / image_metrics</text>
+      <path class="arr" d="M500 520 L500 546" marker-end="url(#b)"/>
+
+      <!-- external plugins -->
+      <rect class="g" x="300" y="546" width="190" height="92" rx="9"/>
+      <text class="th" x="395" y="566" text-anchor="middle">外部插件封装</text>
+      <text class="ts" x="312" y="586" text-anchor="start">plugin_runner</text>
+      <text class="ts" x="312" y="604" text-anchor="start">sasp_runner</text>
+      <text class="ts" x="312" y="622" text-anchor="start">syqon_starless</text>
+      <text class="ts" x="312" y="640" text-anchor="start">cosmic_clarity / scunet</text>
+
+      <rect class="g" x="510" y="546" width="190" height="92" rx="9"/>
+      <text class="th" x="605" y="566" text-anchor="middle">Siril 引擎</text>
+      <text class="ts" x="522" y="586" text-anchor="start">self.siril.cmd()</text>
+      <text class="ts" x="522" y="604" text-anchor="start">cmd_with_check()</text>
+      <text class="ts" x="522" y="622" text-anchor="start">FITS 缓冲读写</text>
+      <text class="ts" x="522" y="640" text-anchor="start">pyscript 插件链</text>
+
+      <path class="arr" d="M490 592 L510 592" marker-end="url(#b)"/>
+      <path class="arr" d="M510 600 L490 600" marker-end="url(#b)"/>
+
+      <!-- save + signals -->
+      <path class="arr" d="M500 638 L500 664" marker-end="url(#b)"/>
+      <rect class="g" x="330" y="664" width="340" height="44" rx="9"/>
+      <text class="th" x="500" y="683" text-anchor="middle">save_utils.export_final_outputs</text>
+      <text class="ts" x="500" y="699" text-anchor="middle">tif/png/fit + fallback 命名</text>
+      <path class="arr" d="M500 708 L500 730" marker-end="url(#b)"/>
+
+      <!-- signal back -->
+      <rect class="g3" x="350" y="730" width="300" height="40" rx="9"/>
+      <text class="th" x="500" y="755" text-anchor="middle">Signal(log/state/done) → GUI</text>
+    </svg>
+  </div>
+</section>
+
+<!-- ============ 图3：数据流向 ============ -->
+<section>
+  <h2>三、阶段间数据流向（FITS 产物链）</h2>
+  <p class="sub">所有中间/最终图像以 Siril 当前图像缓冲在内存传递，并落盘为 process_dir 下的 .fit 文件；阶段间通过“保存 → 按名 load”衔接。绿色框为共享状态/外部交换文件。</p>
+  <div class="card">
+    <svg viewBox="0 0 1000 640" width="1000" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif">
+      <defs>
+        <marker id="c" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M2 1L8 5L2 9" fill="none" stroke="#9da7b3" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </marker>
+        <style>
+          .n{fill:#1c2128;stroke:#58a6ff;stroke-width:1;} .dt{fill:#14241c;stroke:#39c5cf;stroke-width:1;}
+          .t{fill:#e6edf3;font-size:12px;} .ts{fill:#9da7b3;font-size:10.5px;} .th{fill:#e6edf3;font-size:13px;font-weight:600;}
+          .arr{stroke:#9da7b3;stroke-width:1.4;fill:none;}
+        </style>
+      </defs>
+
+      <!-- column headers -->
+      <text class="ts" x="60" y="34" text-anchor="middle">输入</text>
+      <text class="ts" x="320" y="34" text-anchor="middle">预处理 (1-5)</text>
+      <text class="ts" x="560" y="34" text-anchor="middle">去星/拉伸/增强 (6-8)</text>
+      <text class="ts" x="820" y="34" text-anchor="middle">合成/导出 (9-11)</text>
+
+      <rect class="n" x="20" y="50" width="180" height="40" rx="7"/>
+      <text class="t" x="110" y="75" text-anchor="middle">.fit/.fits 输入</text>
+
+      <rect class="n" x="240" y="50" width="160" height="40" rx="7"/>
+      <text class="t" x="320" y="75" text-anchor="middle">stage1_prepared.fit</text>
+      <path class="arr" d="M200 70 L240 70" marker-end="url(#c)"/>
+
+      <rect class="n" x="240" y="110" width="160" height="40" rx="7"/>
+      <text class="t" x="320" y="135" text-anchor="middle">stage2_corrected.fit</text>
+      <path class="arr" d="M320 90 L320 110" marker-end="url(#c)"/>
+
+      <rect class="n" x="240" y="170" width="160" height="40" rx="7"/>
+      <text class="t" x="320" y="195" text-anchor="middle">stage3_bgremoved.fit</text>
+      <path class="arr" d="M320 150 L320 170" marker-end="url(#c)"/>
+
+      <rect class="n" x="240" y="230" width="160" height="40" rx="7"/>
+      <text class="t" x="320" y="255" text-anchor="middle">stage4_color.fit</text>
+      <path class="arr" d="M320 210 L320 230" marker-end="url(#c)"/>
+
+      <rect class="n" x="240" y="290" width="160" height="40" rx="7"/>
+      <text class="t" x="320" y="315" text-anchor="middle">stage5_denoised.fit</text>
+      <path class="arr" d="M320 270 L320 290" marker-end="url(#c)"/>
+
+      <!-- stage6 output to starless -->
+      <rect class="dt" x="480" y="290" width="170" height="40" rx="7"/>
+      <text class="t" x="565" y="315" text-anchor="middle">stage6_input.fit</text>
+      <path class="arr" d="M400 310 L480 310" marker-end="url(#c)"/>
+
+      <rect class="dt" x="480" y="350" width="170" height="44" rx="7" stroke="#3fb950"/>
+      <text class="t" x="565" y="368" text-anchor="middle">★ starless.fit</text>
+      <text class="ts" x="565" y="383" text-anchor="middle">+ starmask.fit（外部交换）</text>
+      <path class="arr" d="M565 330 L565 350" marker-end="url(#c)"/>
+
+      <rect class="dt" x="480" y="414" width="170" height="40" rx="7"/>
+      <text class="t" x="565" y="439" text-anchor="middle">stage7_stretched.fit</text>
+      <path class="arr" d="M565 394 L565 414" marker-end="url(#c)"/>
+
+      <rect class="dt" x="480" y="474" width="170" height="40" rx="7"/>
+      <text class="t" x="565" y="499" text-anchor="middle">stage8_enhanced.fit</text>
+      <path class="arr" d="M565 454 L565 474" marker-end="url(#c)"/>
+
+      <!-- stage9 -->
+      <rect class="n" x="740" y="474" width="180" height="40" rx="7"/>
+      <text class="t" x="830" y="499" text-anchor="middle">stage9_remixed.fit</text>
+      <path class="arr" d="M650 494 L740 494" marker-end="url(#c)"/>
+
+      <rect class="n" x="740" y="534" width="180" height="40" rx="7"/>
+      <text class="t" x="830" y="559" text-anchor="middle">stage10_final.fit</text>
+      <path class="arr" d="M830 514 L830 534" marker-end="url(#c)"/>
+
+      <rect class="dt" x="740" y="594" width="180" height="40" rx="7" stroke="#3fb950"/>
+      <text class="t" x="830" y="619" text-anchor="middle">result_processed.*</text>
+      <path class="arr" d="M830 574 L830 594" marker-end="url(#c)"/>
+
+      <!-- shared state side notes -->
+      <rect class="dt" x="20" y="350" width="180" height="92" rx="8" stroke-dasharray="4 3"/>
+      <text class="th" x="110" y="370" text-anchor="middle" fill="#39c5cf">共享状态</text>
+      <text class="ts" x="32" y="390" text-anchor="start">pipeline.stretched_name</text>
+      <text class="ts" x="32" y="408" text-anchor="start">pipeline.starmask_file</text>
+      <text class="ts" x="32" y="426" text-anchor="start">target_profile / policy</text>
+
+      <path class="arr" d="M200 396 L480 370" marker-end="url(#c)" stroke-dasharray="4 3"/>
+      <path class="arr" d="M200 420 L480 372" marker-end="url(#c)" stroke-dasharray="4 3"/>
+    </svg>
+  </div>
+</section>
+
+<!-- ============ 模块职责表 ============ -->
+<section>
+  <h2>四、核心模块职责与输入输出</h2>
+  <p class="sub">按层划分；标注主要输入(I)、输出(O)、关键分支(B)与异常/降级(X)。</p>
+  <div class="card" style="padding:0;">
+  <table>
+    <thead>
+      <tr><th style="width:230px">模块 / 文件</th><th>职责</th><th style="width:300px">输入 → 输出</th><th style="width:230px">分支 / 异常要点</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>main_window.py</code><br><span class="tag t-mod">GUI 入口</span></td>
+        <td>PySide6 主窗口；装配预检、模式/开关选择、启动 Worker</td>
+        <td>I: 工作目录、模式、AI/Debug/联网开关<br>O: PipelineWorker 实例、进度/日志信号</td>
+        <td><span class="tag t-ex">预检失败弹窗终止</span><span class="tag t-br">磁盘空间不足取消</span></td>
+      </tr>
+      <tr>
+        <td><code>pipeline_worker.py</code><br><span class="tag t-mod">运行层</span></td>
+        <td>QThread；以 siril-cli 子进程运行 pipeline；多层容错与错误嗅探</td>
+        <td>I: 临时目录副本、env、Siril 路径<br>O: log/state/done Signal、退出状态</td>
+        <td><span class="tag t-ex">bootstrap超时</span><span class="tag t-ex">SPCC崩溃(-11)禁重跑</span><span class="tag t-ex">venv重置+离线seed</span><span class="tag t-ex">备用Siril重试</span><span class="tag t-ex">_stop_event终止</span></td>
+      </tr>
+      <tr>
+        <td><code>seestar_Superimpose.py</code><br><span class="tag t-mod">编排器</span></td>
+        <td>SeestarPostProcessor.run()：连接、env、阶段包装、顶层异常</td>
+        <td>I: work_dir、env、输入.fit<br>O: 11 阶段产物、stage 状态、summary</td>
+        <td><span class="tag t-br">三模式分支</span><span class="tag t-ex">版本&lt;1.4.0返回</span><span class="tag t-ex">KeyboardInterrupt/Exception→finally断开</span></td>
+      </tr>
+      <tr>
+        <td><code>processor_runtime.py</code><br><span class="tag t-mod">基础服务</span></td>
+        <td>ProcessorRuntimeMixin：80+ SEESTAR_* env 覆盖、质量度量、FITS 头解析、像素读写、JSON 落盘</td>
+        <td>I: env、FITS 缓冲<br>O: cfg、质量指标、诊断 JSON</td>
+        <td><span class="tag t-br">env clamp 边界</span></td>
+      </tr>
+      <tr>
+        <td><code>stages/stage1..10.py</code><br><span class="tag t-mod">阶段实现</span></td>
+        <td>各阶段纯函数：预处理、背景、色彩、降噪、去星、拉伸、增强、重混、导出</td>
+        <td>I: processor、上一阶段 .fit<br>O: 本阶段 .fit + 质量 JSON</td>
+        <td>见各阶段分支（下表展开）</td>
+      </tr>
+      <tr>
+        <td><code>stage11_ai_postprocess.py</code><br><span class="tag t-mod">可选AI</span></td>
+        <td>远程 AI 生成调整计划→本地应用→混合→质量门控</td>
+        <td>I: stage10 产物、AI env<br>O: result_*_ai.{tif,png,fit}</td>
+        <td><span class="tag t-br">缺env→skipped</span><span class="tag t-ex">质量失败降强度重试</span><span class="tag t-ex">降级不阻断stage10</span></td>
+      </tr>
+      <tr>
+        <td><code>save_utils.py</code><br><span class="tag t-mod">IO</span></td>
+        <td>save_stage_output / export_final_outputs：导出 tif/png/fit + fallback 命名</td>
+        <td>I: 最终图像缓冲、格式配置<br>O: result_processed.* / result_final.fit</td>
+        <td><span class="tag t-br">续跑_linear fallback</span></td>
+      </tr>
+      <tr>
+        <td><code>target_profiler / policy_selector</code><br><span class="tag t-mod">策略</span></td>
+        <td>目标分类（深空类型）→ 处理策略；写入 target_profile.json / pipeline_policy.json</td>
+        <td>I: 图像特征<br>O: policy、target_profile</td>
+        <td><span class="tag t-br">target fallback</span><span class="tag t-br">dirty background 保护</span></td>
+      </tr>
+      <tr>
+        <td><code>plugin_runner / sasp_runner / syqon_starless / cosmic_clarity / scunet_denoise</code><br><span class="tag t-mod">外部封装</span></td>
+        <td>外部 Siril 插件 / 子进程封装（去星、降噪、校色）</td>
+        <td>I: 图像、插件参数<br>O: 处理后图像、starmask</td>
+        <td><span class="tag t-ex">命令缺失→降级链</span><span class="tag t-ex">子进程超时</span></td>
+      </tr>
+      <tr>
+        <td><code>quality_gate / stage7_quality / stage8_pixels / image_metrics</code><br><span class="tag t-mod">质量服务</span></td>
+        <td>阶段质量门控、去星修复、像素处理、特征度量</td>
+        <td>I: 图像、阈值配置<br>O: 质量判定、修复后图像</td>
+        <td><span class="tag t-br">门控非ok→降级/回滚</span></td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- ============ 阶段分支细化 ============ -->
+<section>
+  <h2>五、关键阶段分支 / 降级路径细化</h2>
+  <p class="sub">几乎每个外部依赖都有“主路径→回退→再回退”链路，这是系统工程复杂度的核心。</p>
+  <div class="card">
+    <table>
+      <thead><tr><th style="width:130px">阶段</th><th>主路径</th><th>回退链（降级顺序）</th><th>异常出口</th></tr></thead>
+      <tbody>
+        <tr><td>1 准备</td><td>stacked 直接准备</td><td>light → 去拜耳+对齐+叠加</td><td><span class="tag t-ex">无输入→SirilError；注册失败率门控</span></td></tr>
+        <tr><td>3 背景提取</td><td>GraXpert-AI / AutoBGE</td><td>ADBE → DBE → subsky -rbf → subsky 1</td><td><span class="tag t-ex">质量门控 bg_ok 否→fallback 保留/回滚</span></td></tr>
+        <tr><td>4 色彩校准</td><td>SPCC（platesolve 后）</td><td>PCC header 坐标 → 本地校色 _stage4_local_color_fallback</td><td><span class="tag t-ex">全程 except 降级</span></td></tr>
+        <tr><td>5 线性降噪</td><td>RL 反卷积</td><td>重载 stage5_input → GraXpert → CosmicClarity 原生</td><td><span class="tag t-ex">反卷积失败重载输入</span></td></tr>
+        <tr><td>6 去星</td><td>SyQon-Starless</td><td>SASP Dark Star → mild-prestretch 重试</td><td><span class="tag t-ex">全失败→SirilError("未找到可用去星命令")</span></td></tr>
+        <tr><td>7 拉伸</td><td>固定/AI 两候选</td><td>AI 顾问候选（allow_ai）</td><td><span class="tag t-ex">全失败→stage failed</span></td></tr>
+        <tr><td>8 增强</td><td>SASP WaveScale/DSE + 内置链</td><td>蓝色门控回滚到门控前；深加工失败→_stage8_fallback_used</td><td><span class="tag t-br">降级源替代</span></td></tr>
+        <tr><td>9 重混</td><td>Starless 二次细化 + 回混</td><td>_stage8_fallback 时跳细化、限强度；外部 starmask 失败沿用本地</td><td><span class="tag t-br">降强度混合</span></td></tr>
+        <tr><td>10 导出</td><td>CosmicClarity 脚本降噪</td><td>CLI 子进程 → Native → SCUNet → Aberration API</td><td><span class="tag t-ex">全失败→degraded 跳过；最终质量门控非ok→degraded</span></td></tr>
+        <tr><td>11 AI</td><td>远程计划→本地混合</td><td>质量门控降 blend 强度重试</td><td><span class="tag t-ex">失败/降级→不阻断 stage10</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">Stage 状态枚举：<code>ok / degraded / failed / skipped</code>；summary 可显示 <code>ok_with_fallback</code>、<code>ok_skipped_optional</code>。cleanup 后保留 <code>starless.fit</code> / <code>starmask.fit</code>（白名单）。</p>
+</section>
+
+<footer style="margin-top:50px;border-top:1px solid var(--border);padding-top:18px;color:var(--muted);font-size:12px;">
+  生成依据：README.md / AGENTS.md / INTEGRATION_README.md 与 pipeline 代码静态探查（seestar_Superimpose.py、stages/、gui/）。编号以 PipelineStage 枚举为准，方法名错位已标注。
+</footer>
+
+</div>
+</body>
+</html>
