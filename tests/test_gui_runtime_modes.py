@@ -62,12 +62,14 @@ def _ensure_fake_pyside6() -> None:
         "QComboBox",
         "QDialog",
         "QDialogButtonBox",
+        "QDoubleSpinBox",
         "QFileDialog",
         "QFormLayout",
         "QFrame",
         "QGraphicsScene",
         "QGraphicsView",
         "QGridLayout",
+        "QGroupBox",
         "QHBoxLayout",
         "QLabel",
         "QLineEdit",
@@ -79,6 +81,7 @@ def _ensure_fake_pyside6() -> None:
         "QScrollArea",
         "QSizePolicy",
         "QSplitter",
+        "QSpinBox",
         "QStackedWidget",
         "QToolBar",
         "QVBoxLayout",
@@ -112,9 +115,264 @@ def _load_gui_module():
 
 gui_module = _load_gui_module()
 bootstrap_module = sys.modules[gui_module.BootstrapWorker.__module__]
+pipeline_worker_module = sys.modules[gui_module.PipelineWorker.__module__]
 
 
 class GuiRuntimeModesTests(unittest.TestCase):
+    def test_processing_parameters_expand_inside_task_sheet(self):
+        class _Widget:
+            def __init__(self):
+                self.visible = False
+                self.text = ""
+                self.accessible_name = ""
+
+            def setVisible(self, visible):
+                self.visible = bool(visible)
+
+            def setText(self, text):
+                self.text = str(text)
+
+            def setAccessibleName(self, name):
+                self.accessible_name = str(name)
+
+        panel = _Widget()
+        button = _Widget()
+        proxy = SimpleNamespace(
+            processing_parameters_expanded=False,
+            processing_params_panel=panel,
+            processing_params_btn=button,
+            advanced_toggle_btn=SimpleNamespace(isChecked=lambda: True),
+            _restoring_settings=True,
+            _update_processing_sheet_availability=lambda: None,
+        )
+
+        gui_module.SeestarGui._set_processing_parameters_expanded(proxy, True)
+
+        self.assertTrue(proxy.processing_parameters_expanded)
+        self.assertTrue(panel.visible)
+        self.assertEqual(button.text, "收起处理参数")
+        self.assertEqual(button.accessible_name, "收起处理参数设置")
+
+    def test_processing_runtime_configuration_maps_safe_ui_settings(self):
+        proxy = SimpleNamespace(
+            output_formats=("tif", "png"),
+            review_only=True,
+            color_calibration="pcc",
+            filter_hint="seestar_lp",
+            denoise_mode="auto",
+            deconvolution_mode="rl",
+            graxpert_model_path="",
+            compute_mode="cpu",
+            pcc_timeout_sec=45,
+            local_wb_gain_limit=1.18,
+            builtin_denoise_strength=0.35,
+            graxpert_deconv_strength=0.26,
+            rl_iterations=12,
+            rl_maxstars=320,
+            starless_retry_max=3,
+            starless_repair_strength=0.60,
+            starless_halo_repair_strength=0.65,
+            starless_chroma_strength=0.45,
+            starmask_asinh_stretch=2.40,
+            weak_star_recovery_ratio=0.80,
+        )
+
+        overrides, unset_keys = (
+            gui_module.SeestarGui._processing_runtime_configuration(
+                proxy,
+                gui_module.INPUT_MODE_AUTO,
+            )
+        )
+
+        self.assertEqual(overrides["SEESTAR_OUTPUT_FORMAT"], "tif,png")
+        self.assertEqual(overrides["SEESTAR_FORCE_REVIEW_ONLY_OUTPUT"], "1")
+        self.assertEqual(
+            overrides["SEESTAR_STAGE4_FILTER_HINT"],
+            "broadband Seestar LP",
+        )
+        self.assertEqual(overrides["SEESTAR_STAGE5_DECONV_ENABLE"], "1")
+        self.assertEqual(
+            overrides["SEESTAR_STAGE5_GRAXPERT_DECONV_ENABLE"],
+            "0",
+        )
+        self.assertEqual(overrides["SEESTAR_SYQON_GPU"], "0")
+        self.assertEqual(overrides["SEESTAR_STAGE4_PCC_TIMEOUT_SEC"], "45")
+        self.assertEqual(
+            overrides["SEESTAR_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT"], "1.18"
+        )
+        self.assertEqual(overrides["SEESTAR_STAGE5_BUILTIN_DENOISE_MOD"], "0.35")
+        self.assertEqual(overrides["SEESTAR_STAGE5_RL_ITERS"], "12")
+        self.assertEqual(overrides["SEESTAR_STAGE5_RL_MAXSTARS"], "320")
+        self.assertEqual(overrides["SEESTAR_STAGE7_QUALITY_RETRY_MAX"], "3")
+        self.assertEqual(
+            overrides["SEESTAR_STAGE9_WEAK_STAR_RECOVERY_RATIO_MIN"], "0.80"
+        )
+        self.assertIn("SEESTAR_DENOISE_FORCE", unset_keys)
+        self.assertIn("SEESTAR_GRAXPERT_OBJECT_MODEL_PATH", unset_keys)
+
+    def test_processing_runtime_configuration_omits_completed_linear_stages(self):
+        proxy = SimpleNamespace(
+            output_formats=("fit",),
+            review_only=False,
+            color_calibration="pcc",
+            filter_hint="no_filter",
+            denoise_mode="on",
+            deconvolution_mode="off",
+            graxpert_model_path="/tmp/model.onnx",
+            compute_mode="auto",
+            pcc_timeout_sec=30,
+            local_wb_gain_limit=1.20,
+            builtin_denoise_strength=0.50,
+            graxpert_deconv_strength=0.30,
+            rl_iterations=8,
+            rl_maxstars=200,
+            starless_retry_max=2,
+            starless_repair_strength=0.68,
+            starless_halo_repair_strength=0.70,
+            starless_chroma_strength=0.55,
+            starmask_asinh_stretch=2.00,
+            weak_star_recovery_ratio=0.70,
+        )
+
+        overrides, unset_keys = (
+            gui_module.SeestarGui._processing_runtime_configuration(
+                proxy,
+                gui_module.INPUT_MODE_LINEAR_RESUME,
+            )
+        )
+
+        self.assertEqual(overrides["SEESTAR_OUTPUT_FORMAT"], "fit")
+        self.assertNotIn("SEESTAR_STAGE4_FILTER_HINT", overrides)
+        self.assertNotIn("SEESTAR_STAGE4_PCC_TIMEOUT_SEC", overrides)
+        self.assertNotIn("SEESTAR_STAGE5_RL_ITERS", overrides)
+        self.assertNotIn("SEESTAR_DENOISE_FORCE", overrides)
+        self.assertNotIn("SEESTAR_STAGE5_DECONV_ENABLE", overrides)
+        self.assertEqual(overrides["SEESTAR_STAGE7_QUALITY_RETRY_MAX"], "2")
+        self.assertEqual(
+            overrides["SEESTAR_STAGE9_STARMASK_ASINH_STRETCH"], "2.00"
+        )
+        self.assertFalse(unset_keys)
+
+    def test_processing_professional_settings_are_safely_clamped(self):
+        proxy = SimpleNamespace(_sync_processing_controls_from_state=lambda: None)
+
+        gui_module.SeestarGui._restore_processing_settings(
+            proxy,
+            {
+                "pcc_timeout_sec": 999,
+                "local_wb_gain_limit": 9.0,
+                "builtin_denoise_strength": -1.0,
+                "graxpert_deconv_strength": "invalid",
+                "rl_iterations": 99,
+                "rl_maxstars": 1,
+                "starless_retry_max": 9,
+                "starless_repair_strength": 2.0,
+                "starless_halo_repair_strength": -1.0,
+                "starless_chroma_strength": 2.0,
+                "starmask_asinh_stretch": 9.0,
+                "weak_star_recovery_ratio": 0.1,
+            },
+        )
+
+        self.assertEqual(proxy.pcc_timeout_sec, 120)
+        self.assertEqual(proxy.local_wb_gain_limit, 1.50)
+        self.assertEqual(proxy.builtin_denoise_strength, 0.20)
+        self.assertEqual(proxy.graxpert_deconv_strength, 0.30)
+        self.assertEqual(proxy.rl_iterations, 40)
+        self.assertEqual(proxy.rl_maxstars, 20)
+        self.assertEqual(proxy.starless_retry_max, 3)
+        self.assertEqual(proxy.starless_repair_strength, 0.85)
+        self.assertEqual(proxy.starless_halo_repair_strength, 0.0)
+        self.assertEqual(proxy.starless_chroma_strength, 0.90)
+        self.assertEqual(proxy.starmask_asinh_stretch, 3.00)
+        self.assertEqual(proxy.weak_star_recovery_ratio, 0.40)
+
+    def test_pipeline_worker_runtime_overrides_can_unset_env_values(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worker = gui_module.PipelineWorker(
+                work_dir=root / "work",
+                config_template=root / "config.ini",
+                pipeline_path=root / "pipeline.py",
+                siril_plugin_dir=root / "plugins",
+                resources=root / "resources",
+                runtime_home=root / "runtime_home",
+                siril_candidates=[],
+                runtime_overrides={"SEESTAR_OUTPUT_FORMAT": "tif,png"},
+                runtime_unset_keys={"SEESTAR_DENOISE_FORCE"},
+            )
+
+            with patch.dict(
+                os.environ,
+                {"SEESTAR_DENOISE_FORCE": "1"},
+                clear=False,
+            ):
+                env = worker._build_env(Path("/tmp/siril-cli"))
+
+            self.assertEqual(env["SEESTAR_OUTPUT_FORMAT"], "tif,png")
+            self.assertNotIn("SEESTAR_DENOISE_FORCE", env)
+
+    def test_pipeline_worker_prefers_bundled_graxpert_object_model(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            plugin_dir = root / "plugins"
+            bundled_model = (
+                plugin_dir
+                / "deconvolution-object-ai-models"
+                / "1.2.3"
+                / "model.onnx"
+            )
+            bundled_model.parent.mkdir(parents=True)
+            bundled_model.write_bytes(b"bundled-model")
+            user_model = root / "user" / "9.9.9" / "model.onnx"
+            user_model.parent.mkdir(parents=True)
+            user_model.write_bytes(b"user-model")
+            worker = gui_module.PipelineWorker(
+                work_dir=root / "work",
+                config_template=root / "config.ini",
+                pipeline_path=root / "pipeline.py",
+                siril_plugin_dir=plugin_dir,
+                resources=root / "resources",
+                runtime_home=root / "runtime_home",
+                siril_candidates=[],
+                runtime_overrides={
+                    "SEESTAR_STAGE5_GRAXPERT_DECONV_ENABLE": "1",
+                    "SEESTAR_GRAXPERT_OBJECT_MODEL_PATH": str(user_model),
+                },
+            )
+
+            env = worker._build_env(Path("/tmp/siril-cli"))
+
+            self.assertEqual(
+                env["SEESTAR_GRAXPERT_OBJECT_MODEL_PATH"],
+                str(bundled_model),
+            )
+
+    def test_default_graxpert_model_uses_installed_app_model(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            app_model = (
+                root
+                / "home"
+                / "Library"
+                / "Application Support"
+                / "GraXpert"
+                / "GraXpert"
+                / "deconvolution-object-ai-models"
+                / "1.0.1"
+                / "model.onnx"
+            )
+            app_model.parent.mkdir(parents=True)
+            app_model.write_bytes(b"graxpert-app-model")
+
+            selected, source = pipeline_worker_module.default_graxpert_object_model(
+                root / "plugins",
+                user_home=root / "home",
+            )
+
+            self.assertEqual(selected, app_model)
+            self.assertEqual(source, "graxpert_app")
+
     def test_result_preview_uses_newest_known_output_across_name_families(self):
         with tempfile.TemporaryDirectory() as td:
             work_dir = Path(td)
@@ -753,7 +1011,8 @@ class GuiRuntimeModesTests(unittest.TestCase):
             self.assertEqual(env.get("SEESTAR_EXPORT_TAIL_TIMEOUT_SEC"), "120")
             self.assertEqual(env.get("SEESTAR_TEMP_CLEANUP_TIMEOUT_SEC"), "30")
             self.assertEqual(env.get("SEESTAR_NETWORK_MODE"), "1")
-            self.assertEqual(env.get("SEESTAR_SPCC_ENABLE"), "0")
+            self.assertNotIn("SEESTAR_SPCC_ENABLE", env)
+            self.assertNotIn("SEESTAR_GAIA_PHOTO_CATALOG", env)
 
     def test_pipeline_worker_uses_keychain_runtime_override_not_env_file_key(self):
         with tempfile.TemporaryDirectory() as td:
@@ -794,17 +1053,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             self.assertEqual(env["SEESTAR_AI_API_KEY"], "keychain-runtime-key")
             self.assertNotIn("plaintext-file-key", env.values())
             self.assertNotIn("parent-process-key", env.values())
-            self.assertEqual(
-                env.get("SEESTAR_GAIA_PHOTO_CATALOG"),
-                str(
-                    root
-                    / "runtime_home"
-                    / ".local"
-                    / "share"
-                    / "siril"
-                    / "siril_cat1_healpix8_xpsamp"
-                ),
-            )
+            self.assertNotIn("SEESTAR_GAIA_PHOTO_CATALOG", env)
             self.assertEqual(
                 env.get("SEESTAR_GAIA_ASTRO_CATALOG"),
                 str(
@@ -816,17 +1065,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
                     / "siril_cat_healpix8_astro.dat"
                 ),
             )
-            self.assertEqual(
-                env.get("SEESTAR_SPCC_DATABASE_DIR"),
-                str(
-                    root
-                    / "runtime_home"
-                    / "Library"
-                    / "Application Support"
-                    / "org.siril.Siril"
-                    / "siril-spcc-database"
-                ),
-            )
+            self.assertNotIn("SEESTAR_SPCC_DATABASE_DIR", env)
             self.assertEqual(worker._temp_cleanup_timeout_sec, 30)
             self.assertEqual(worker._watchdog_idle_timeout_sec, 900)
             self.assertEqual(worker._export_tail_timeout_sec, 120)
@@ -1491,28 +1730,19 @@ class GuiRuntimeModesTests(unittest.TestCase):
             downloads = plugin_dir / "downloads"
             downloads.mkdir(parents=True)
             (downloads / "deps.whl").write_bytes(b"x" * 100)
-            spcc_seed = root / "spcc"
-            spcc_seed.mkdir()
-            method_globals = gui_module.SeestarGui._estimate_runtime_disk_space.__globals__
-            original_verify = method_globals["verify_siril_spcc_database_seed"]
-            method_globals["verify_siril_spcc_database_seed"] = lambda *_args: (True, "ok")
             proxy = SimpleNamespace(
                 runtime_home=runtime_home,
                 siril_seed_dir=seed_dir,
-                siril_spcc_seed_dir=spcc_seed,
                 siril_plugin_dir=plugin_dir,
                 _siril_state_root=lambda: state_root,
                 _runtime_siril_scripts_repo_dir=lambda: runtime_home / "scripts",
                 _bootstrap_state_is_current=lambda _fingerprint: False,
                 _plugin_downloads_dir=lambda: downloads,
             )
-            try:
-                estimate = gui_module.SeestarGui._estimate_runtime_disk_space(
-                    proxy,
-                    {"fingerprint": "changed"},
-                )
-            finally:
-                method_globals["verify_siril_spcc_database_seed"] = original_verify
+            estimate = gui_module.SeestarGui._estimate_runtime_disk_space(
+                proxy,
+                {"fingerprint": "changed"},
+            )
 
             self.assertEqual(estimate.seed_growth_bytes, 0)
             self.assertEqual(estimate.support_growth_bytes, 0)
@@ -1559,6 +1789,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 resolver_globals["is_frozen"] = original_is_frozen
             self.assertEqual(resolved_full, embedded_plugins)
 
+    @unittest.skip("SPCC runtime and crash-retry path retired")
     def test_pipeline_worker_spcc_crash_retry_env_disables_spcc(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1577,6 +1808,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
 
             self.assertEqual(env.get("SEESTAR_SPCC_ENABLE"), "0")
 
+    @unittest.skip("SPCC runtime and crash-retry path retired")
     def test_pipeline_worker_spcc_crash_retry_resumes_current_stage4_checkpoint(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1608,6 +1840,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 gui_module.INPUT_MODE_STAGE4_PSOLVED_RESUME,
             )
 
+    @unittest.skip("SPCC runtime and crash-retry path retired")
     def test_pipeline_worker_does_not_resume_stale_stage4_checkpoint(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1653,6 +1886,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             self.assertTrue(worker._run_had_errors)
             self.assertTrue(worker._native_process_terminated_detected)
 
+    @unittest.skip("SPCC runtime and crash-retry path retired")
     def test_pipeline_worker_keeps_minus11_retry_and_uses_stage4_resume(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1702,6 +1936,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             self.assertEqual(done_calls[-1][0], "Completed")
             self.assertIn("stage4_psolved.fit 检查点", "".join(events))
 
+    @unittest.skip("SPCC runtime and crash-retry path retired")
     def test_pipeline_worker_detects_spcc_command_marker(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1719,6 +1954,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
 
             self.assertTrue(worker._spcc_seen_in_run)
 
+    @unittest.skip("SPCC runtime and crash-retry path retired")
     def test_pipeline_worker_does_not_misattribute_stage6_native_failure_to_spcc(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1742,6 +1978,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             self.assertEqual(worker._native_termination_stage, 6)
             self.assertFalse(worker._is_spcc_crash_context(0))
 
+    @unittest.skip("SPCC runtime and crash-retry path retired")
     def test_pipeline_worker_attributes_stage4_native_failure_to_spcc(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1782,6 +2019,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
 
             self.assertEqual(worker._completed_run_status(), "CompletedWithWarning")
 
+    @unittest.skip("SPCC runtime and crash-retry path retired")
     def test_pipeline_worker_spcc_crash_diagnostics_include_recent_output(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1842,15 +2080,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             _run_ssf, run_ini, _run_py = worker._prepare_runtime_files(temp_dir)
             rendered = run_ini.read_text(encoding="utf-8")
 
-        expected = (
-            root
-            / "runtime_home"
-            / ".local"
-            / "share"
-            / "siril"
-            / "siril_cat1_healpix8_xpsamp"
-        )
-        self.assertIn(f"catalogue_gaia_photo={expected}\n", rendered)
+        self.assertIn("catalogue_gaia_photo=\n", rendered)
         expected_astro = (
             root
             / "runtime_home"
@@ -1901,11 +2131,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             runtime_catalog_root = (
                 root / "runtime_home" / ".local" / "share" / "siril"
             )
-            self.assertIn(
-                "catalogue_gaia_photo="
-                f"{runtime_catalog_root / 'siril_cat1_healpix8_xpsamp'}\n",
-                rendered,
-            )
+            self.assertIn("catalogue_gaia_photo=\n", rendered)
             self.assertIn(
                 "catalogue_gaia_astro="
                 f"{runtime_catalog_root / 'siril_cat_healpix8_astro.dat'}\n",

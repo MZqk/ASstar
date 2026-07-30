@@ -40,7 +40,6 @@ DEFAULT_ENV_SRC="$PROJECT_ROOT/resources/default.env"
 AI_ENV_SRC="$PROJECT_ROOT/resources/ai.env"
 AI_CREDENTIAL_PACKAGER="$PROJECT_ROOT/build/package_ai_credentials.py"
 SIRIL_PLUGIN_DIR_SRC="$PROJECT_ROOT/resources/siril_plugins"
-SIRIL_SPCC_DATABASE_SEED_SRC="$PROJECT_ROOT/resources/siril_spcc_database"
 APP_REQUIREMENTS="$PROJECT_ROOT/requirements.lock"
 SIRIL_PLUGIN_REQUIREMENTS="$SIRIL_PLUGIN_DIR_SRC/requirements.lock"
 SIRIL_PLUGIN_DOWNLOADS_DIR="$SIRIL_PLUGIN_DIR_SRC/downloads"
@@ -781,35 +780,12 @@ embed_siril_offline_python_seed() {
   verify_siril_seed_runtime "$seed_root/venv"
 }
 
-embed_siril_spcc_database_seed() {
-  local app_resources="$1"
-  local seed_root="$app_resources/SirilSPCCDatabaseSeed"
-
-  require_dir "$SIRIL_SPCC_DATABASE_SEED_SRC" "Siril SPCC database seed source"
-  require_exists "$SIRIL_SPCC_DATABASE_SEED_SRC/manifest.json" "Siril SPCC seed manifest"
-  require_exists "$SIRIL_SPCC_DATABASE_SEED_SRC/VERSION.txt" "Siril SPCC seed version list"
-  require_exists "$SIRIL_SPCC_DATABASE_SEED_SRC/LICENSE.md" "Siril SPCC seed GPLv3 license"
-  if ! (
-    cd "$SIRIL_SPCC_DATABASE_SEED_SRC"
-    /usr/bin/shasum -a 256 -c SHA256SUMS
-  ); then
-    die "Siril SPCC database seed checksum verification failed"
-  fi
-
-  rm -rf "$seed_root"
-  mkdir -p "$seed_root"
-  cp -R "$SIRIL_SPCC_DATABASE_SEED_SRC/." "$seed_root/"
-  log "[SIRIL] Embedded fixed SPCC database seed: $seed_root"
-}
 require_apple_silicon_host
 require_exists "$PROJECT_ROOT" "Project root"
 require_exists "$GUI_ENTRY" "GUI entry"
 require_file "$APP_LOGO_PNG" "App logo PNG"
 require_file "$PIPELINE_SRC" "Pipeline script"
 require_file "$STAGE11_MODULE_SRC" "Stage11 module script"
-require_dir "$SIRIL_SPCC_DATABASE_SEED_SRC" "Siril SPCC database seed source"
-require_file "$SIRIL_SPCC_DATABASE_SEED_SRC/manifest.json" "Siril SPCC seed manifest"
-require_file "$SIRIL_SPCC_DATABASE_SEED_SRC/SHA256SUMS" "Siril SPCC seed checksums"
 require_dir "$PACKAGES_DIR" "Packages directory"
 require_file "$PYTHON_PKG" "Python package"
 if [[ -n "$SIRIL_SRC_APP" ]]; then
@@ -942,7 +918,6 @@ else
 fi
 fix_siril_python_runtime "$APP_RESOURCES/Siril.app"
 embed_siril_offline_python_seed "$APP_RESOURCES"
-embed_siril_spcc_database_seed "$APP_RESOURCES"
 
 log "[BUILD] Embedding pipeline/config resources..."
 cp "$CONFIG_TEMPLATE" "$APP_RESOURCES/config.1.4.ini.template"
@@ -1078,14 +1053,6 @@ verify_python_wrapper "$APP_RESOURCES/python/bin/python3.13"
 require_exists "$APP_RESOURCES/Siril.app" "[VERIFY] Embedded Siril"
 require_exists "$APP_RESOURCES/SirilPythonSeed/venv/bin/python3.12" "[VERIFY] Embedded Siril offline venv seed"
 require_exists "$APP_RESOURCES/SirilPythonSeed/.python_module/sirilpy" "[VERIFY] Embedded Siril offline module seed"
-require_exists "$APP_RESOURCES/SirilSPCCDatabaseSeed/manifest.json" "[VERIFY] Embedded Siril SPCC seed manifest"
-require_exists "$APP_RESOURCES/SirilSPCCDatabaseSeed/VERSION.txt" "[VERIFY] Embedded Siril SPCC seed version list"
-require_exists "$APP_RESOURCES/SirilSPCCDatabaseSeed/LICENSE.md" "[VERIFY] Embedded Siril SPCC seed GPLv3 license"
-require_exists "$APP_RESOURCES/SirilSPCCDatabaseSeed/osc_sensors/Sony_IMX585.json" "[VERIFY] Embedded Sony IMX585 SPCC response"
-require_exists "$APP_RESOURCES/SirilSPCCDatabaseSeed/osc_filters/ZWO_Seestar_LP.json" "[VERIFY] Embedded ZWO Seestar LP SPCC response"
-require_exists "$APP_RESOURCES/SirilSPCCDatabaseSeed/osc_filters/No_filter.json" "[VERIFY] Embedded no-filter SPCC response"
-require_exists "$APP_RESOURCES/SirilSPCCDatabaseSeed/wb_refs/Average_spiral_galaxy.json" "[VERIFY] Embedded average spiral galaxy white reference"
-require_exists "$APP_RESOURCES/SirilSPCCDatabaseSeed/wb_refs/Star_g2v.json" "[VERIFY] Embedded G2V white reference"
 require_exists "$APP_FRAMEWORKS/Python.framework/Versions/3.13" "[VERIFY] Embedded Python framework"
 require_executable "$APP_RESOURCES/python/bin/python3.13" "[VERIFY] Embedded Python wrapper"
 if [[ "$BUNDLE_PROFILE" == "full" ]]; then

@@ -17,40 +17,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PIPELINE_MAIN = REPO_ROOT / "pipeline" / "seestar_Superimpose.py"
 PIPELINE_STAGE11 = REPO_ROOT / "pipeline" / "stage11_ai_postprocess.py"
 
-DEFAULT_INPUT_FIT = Path.home() / "SeeStar" / "IC 2177_sub" / "IC_2177_355x30sec_2026-01-12_processed_final.fit"
-DEFAULT_AI_ENV_FILE = (
-    Path.home()
-    / "Library/Application Support/SeestarSuperimpose/runtime_home/.seestar_ai.env"
-)
-DEFAULT_SIRIL_CLI = (
-    REPO_ROOT
-    / "release"
-    / "SeestarSuperimpose.app"
-    / "Contents"
-    / "Resources"
-    / "Siril.app"
-    / "Contents"
-    / "MacOS"
-    / "siril-cli"
-)
-DEFAULT_SIRIL_PYTHON_CLI = (
-    REPO_ROOT
-    / "release"
-    / "SeestarSuperimpose.app"
-    / "Contents"
-    / "Resources"
-    / "Siril.app"
-    / "Contents"
-    / "Frameworks"
-    / "Python.framework"
-    / "Versions"
-    / "3.12"
-    / "bin"
-    / "python3.12"
-)
-DEFAULT_RUNTIME_HOME = (
-    Path.home()
-    / "Library/Application Support/SeestarSuperimpose/runtime_home"
+REQUIRED_STAGE11_ENV = (
+    "STAGE11_TEST_INPUT_FILE",
+    "STAGE11_TEST_AI_ENV_FILE",
+    "STAGE11_TEST_SIRIL_CLI",
+    "STAGE11_TEST_SIRIL_PYTHON_CLI",
+    "STAGE11_TEST_RUNTIME_HOME",
 )
 
 
@@ -86,19 +58,23 @@ def tail_lines(text: str, n: int = 80) -> str:
 
 class Stage11RealDataIntegrationTest(unittest.TestCase):
     def test_stage11_realdata_not_skipped(self):
-        input_fit = Path(
-            os.getenv("STAGE11_TEST_INPUT_FILE", str(DEFAULT_INPUT_FIT))
-        ).expanduser().resolve()
+        configured = {
+            key: os.getenv(key, "").strip() for key in REQUIRED_STAGE11_ENV
+        }
+        missing = [key for key, value in configured.items() if not value]
+        if missing:
+            self.skipTest(
+                "requires explicit external Stage11 test configuration: "
+                + ", ".join(missing)
+            )
+
+        input_fit = Path(configured["STAGE11_TEST_INPUT_FILE"]).expanduser().resolve()
         self.assertTrue(input_fit.exists(), f"input FIT not found: {input_fit}")
 
-        siril_cli = Path(
-            os.getenv("STAGE11_TEST_SIRIL_CLI", str(DEFAULT_SIRIL_CLI))
-        ).expanduser().resolve()
+        siril_cli = Path(configured["STAGE11_TEST_SIRIL_CLI"]).expanduser().resolve()
         self.assertTrue(siril_cli.exists(), f"siril-cli not found: {siril_cli}")
 
-        ai_env_file = Path(
-            os.getenv("STAGE11_TEST_AI_ENV_FILE", str(DEFAULT_AI_ENV_FILE))
-        ).expanduser().resolve()
+        ai_env_file = Path(configured["STAGE11_TEST_AI_ENV_FILE"]).expanduser().resolve()
         ai_env = parse_simple_env_file(ai_env_file)
         required_ai_keys = (
             "SEESTAR_AI_ENABLED",
@@ -179,21 +155,13 @@ class Stage11RealDataIntegrationTest(unittest.TestCase):
             env.update(ai_env)
             env["STAGE11_TEST_INPUT_FILE"] = str(input_fit)
             env["HOME"] = str(
-                Path(
-                    os.getenv(
-                        "STAGE11_TEST_RUNTIME_HOME",
-                        str(DEFAULT_RUNTIME_HOME),
-                    )
-                ).expanduser().resolve()
+                Path(configured["STAGE11_TEST_RUNTIME_HOME"]).expanduser().resolve()
             )
             bundled_py = Path(
-                os.getenv(
-                    "STAGE11_TEST_SIRIL_PYTHON_CLI",
-                    str(DEFAULT_SIRIL_PYTHON_CLI),
-                )
+                configured["STAGE11_TEST_SIRIL_PYTHON_CLI"]
             ).expanduser().resolve()
-            if bundled_py.exists():
-                env["SIRIL_PYTHON_CLI"] = str(bundled_py)
+            self.assertTrue(bundled_py.exists(), f"Siril Python not found: {bundled_py}")
+            env["SIRIL_PYTHON_CLI"] = str(bundled_py)
 
             cmd = [
                 str(siril_cli),

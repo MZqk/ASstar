@@ -156,16 +156,6 @@ def _stage7_linear_source(pipeline) -> str:
 
 
 def _prepare_star_separation_source(pipeline) -> Tuple[str, str, List[Dict[str, Any]]]:
-    requested_mode = str(
-        getattr(pipeline.cfg, "star_separation_mode", "linear_star_separation")
-    ).strip().lower()
-    if requested_mode not in {"linear_star_separation", "mild_prestretch_star_separation"}:
-        pipeline.log.warn(
-            "Invalid star_separation_mode="
-            f"{requested_mode!r}; falling back to linear_star_separation"
-        )
-        requested_mode = "linear_star_separation"
-
     linear_source = _stage7_linear_source(pipeline)
     records: List[Dict[str, Any]] = [
         {
@@ -178,29 +168,12 @@ def _prepare_star_separation_source(pipeline) -> Tuple[str, str, List[Dict[str, 
     ]
     pipeline.cmd_with_check("load", linear_source)
     pipeline._save_stage_output("stage6_input")
-    if requested_mode == "mild_prestretch_star_separation":
-        reason = (
-            "external mild prestretch disabled: bundled SyQon performs its own "
-            "temporary reversible IHS; Stage 6 must remain linear"
-        )
-        pipeline.log.warn(reason)
-        records.append(
-            {
-                "mode": "mild_prestretch_star_separation",
-                "source_stem": None,
-                "linear_source_stem": linear_source,
-                "status": "ignored_compatibility",
-                "method": "disabled",
-                "domain": "nonlinear",
-                "reason": reason,
-            }
-        )
 
     pipeline.stretched_name = linear_source
     return linear_source, "linear_star_separation", records
 
 
-def run_stage7_star_separation(pipeline) -> None:
+def run_stage6_star_separation(pipeline) -> None:
     """
     阶段 6: 去星与星点层准备
     - 优先 SyQon-Starless.py / SASP Dark Star
@@ -460,17 +433,6 @@ def run_stage7_star_separation(pipeline) -> None:
                     getattr(pipeline, "_last_plugin_script_error", None)
                     or f"SyQon 脚本执行失败: {syqon_script.name}"
                 )
-                if bool(
-                    getattr(
-                        pipeline.cfg,
-                        "star_separation_fallback_to_mild_prestretch",
-                        False,
-                    )
-                ):
-                    stage_messages.append(
-                        "external mild-prestretch fallback ignored to preserve the "
-                        "linear Stage6 domain"
-                    )
         else:
             syqon_failure_reason = "SyQon-Starless.py 缺失，回退到 SASP Dark Star"
 
@@ -937,3 +899,11 @@ def run_stage7_star_separation(pipeline) -> None:
             message += "；stage7 输出保存失败"
         pipeline._record_stage(
             stage_label, 'degraded', elapsed, message)
+
+
+def run_stage7_star_separation(pipeline) -> None:
+    """Deprecated compatibility alias for the formal Stage 6 star separation."""
+    pipeline.log.warn(
+        "run_stage7_star_separation() is a legacy alias; use run_stage6_star_separation()"
+    )
+    return run_stage6_star_separation(pipeline)

@@ -36,7 +36,7 @@ from pipeline_safety import (  # noqa: E402
     should_bypass_star_separation,
     should_skip_final_denoise,
 )
-from stages.stage7_star_separation import run_stage7_star_separation  # noqa: E402
+from stages.stage7_star_separation import run_stage6_star_separation  # noqa: E402
 from stages.stage8_nebula_enhancement import run_stage8_nebula_enhancement  # noqa: E402
 from stages.stage9_star_remixing import run_stage9_star_remixing  # noqa: E402
 
@@ -61,7 +61,6 @@ class _StarPreservePipeline:
         self.process_dir.mkdir(parents=True, exist_ok=True)
         (self.process_dir / "stage5_linear.fit").write_bytes(b"FIT")
         self.cfg = SimpleNamespace(
-            star_separation_mode="linear_star_separation",
             stage6_star_preserve_target_bypass_enabled=True,
         )
         self.log = _Log()
@@ -186,7 +185,7 @@ class PipelineSafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             pipeline = _StarPreservePipeline(Path(tmpdir))
 
-            run_stage7_star_separation(pipeline)
+            run_stage6_star_separation(pipeline)
 
             self.assertTrue(pipeline._star_preserve_target_bypass)
             self.assertTrue(pipeline._stage7_starless_skipped)
@@ -196,6 +195,8 @@ class PipelineSafetyTests(unittest.TestCase):
 
             pipeline.stretched_name = "stage7_stretched"
             (pipeline.process_dir / "stage7_stretched.fit").write_bytes(b"FIT")
+            pipeline._stage7_stretch_accepted = True
+            pipeline._stage7_stretch_output = "stage7_stretched"
             run_stage8_nebula_enhancement(pipeline)
 
             self.assertEqual(pipeline._stage8_final_quality, "star_preserve_bypass")

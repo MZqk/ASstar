@@ -21,7 +21,10 @@ import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+PIPELINE_DIR = REPO_ROOT / "pipeline"
 PIPELINE_MODULE_PATH = REPO_ROOT / "pipeline" / "seestar_Superimpose.py"
+if str(PIPELINE_DIR) not in sys.path:
+    sys.path.insert(0, str(PIPELINE_DIR))
 
 
 def _ensure_fake_sirilpy() -> None:
@@ -122,8 +125,10 @@ stage7_quality_module = sys.modules["stage7_quality"]
 stage4_color_calibration = pipeline_module.SeestarPostProcessor.stage4_color_calibration
 stage5_linear_denoise = pipeline_module.SeestarPostProcessor.stage5_linear_denoise
 stage2_view_correction = pipeline_module.SeestarPostProcessor.stage2_view_correction
-stage6_stretching = pipeline_module.SeestarPostProcessor.stage6_stretching
-stage7_star_separation = pipeline_module.SeestarPostProcessor.stage7_star_separation
+# Test the canonical Stage 6/7 entry points. The similarly named methods below
+# are compatibility aliases retained for old callers, not the production order.
+stage7_stretching = pipeline_module.SeestarPostProcessor.stage7_stretching
+stage6_star_separation = pipeline_module.SeestarPostProcessor.stage6_star_separation
 stage8_nebula_enhancement = pipeline_module.SeestarPostProcessor.stage8_nebula_enhancement
 stage9_star_remixing = pipeline_module.SeestarPostProcessor.stage9_star_remixing
 stage10_export = pipeline_module.SeestarPostProcessor.stage10_export
@@ -386,8 +391,19 @@ class FakeProcessor:
     def _cosmic_clarity_native_denoise_cli_options(self):
         return pipeline_module.SeestarPostProcessor._cosmic_clarity_native_denoise_cli_options(self)
 
-    def _syqon_starless_cli_options(self):
-        return pipeline_module.SeestarPostProcessor._syqon_starless_cli_options(self)
+    def _syqon_starless_cli_options(
+        self,
+        *,
+        tile_size: int = 512,
+        overlap: int = 64,
+        axiom: bool = False,
+    ):
+        return pipeline_module.syqon_starless.syqon_starless_cli_options(
+            self,
+            tile_size=tile_size,
+            overlap=overlap,
+            axiom=axiom,
+        )
 
     def _final_denoise_cli_timeout_sec(self) -> int:
         return pipeline_module.SeestarPostProcessor._final_denoise_cli_timeout_sec(self)
@@ -566,6 +582,10 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.addCleanup(td.cleanup)
         return FakeProcessor(pipeline_module, Path(td.name))
 
+    @staticmethod
+    def _stage10_final_input(processor: FakeProcessor) -> None:
+        (processor.process_dir / "stage9_remixed.fit").write_bytes(b"mock")
+
     def _copy_spcc_database(self, processor: FakeProcessor) -> Path:
         target = processor.work_dir / "siril-spcc-database"
         shutil.copytree(processor.spcc_database_dir, target)
@@ -733,7 +753,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         self.assertTrue(saved)
         self.assertIn(("save", "stage7_stretched"), calls)
-        self.assertIn(("save", "stage6_stretched"), calls)
+        self.assertNotIn(("save", "stage6_stretched"), calls)
 
     def test_stage_json_aliases_follow_display_stage_names(self):
         td = tempfile.TemporaryDirectory()
@@ -744,11 +764,10 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         pipeline_module.write_stage_json(
             process_dir,
             log,
-            "stage6_stretch_quality.json",
+            "stage7_stretch_quality.json",
             {"stage": "stage7_stretch"},
         )
 
-        self.assertTrue((process_dir / "stage6_stretch_quality.json").exists())
         self.assertTrue((process_dir / "stage7_stretch_quality.json").exists())
 
         pipeline_module.write_stage_json(
@@ -760,6 +779,25 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         self.assertTrue((process_dir / "stage6_starless_quality.json").exists())
         self.assertTrue((process_dir / "stage7_quality.json").exists())
+
+    def test_legacy_stage_method_aliases_warn_before_dispatch(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.log = FakeLogger()
+        calls: list[str] = []
+        processor.stage7_stretching = lambda: calls.append("stage7_stretching")
+        processor.stage6_star_separation = lambda: calls.append("stage6_star_separation")
+
+        processor.stage6_stretching()
+        processor.stage7_star_separation()
+
+        self.assertEqual(calls, ["stage7_stretching", "stage6_star_separation"])
+        warnings = [
+            message for level, message in processor.log.events if level == "warn"
+        ]
+        self.assertTrue(any("stage6_stretching() is a legacy alias" in message for message in warnings))
+        self.assertTrue(
+            any("stage7_star_separation() is a legacy alias" in message for message in warnings)
+        )
 
     def test_debug_stage_save_writes_quality_metrics(self):
         import json
@@ -811,7 +849,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             )
         )
 
-    def test_stage5_uses_aberration_api_with_script_preferred_sharpen_and_denoise(self):
+    def test_stage5_keeps_builtin_denoise_primary_with_legacy_plugins_available(self):
         processor = self._new_processor()
         processor.cfg.aberration_api_enabled = True
         processor.aberration_labels["矫正星点"] = "SASP Aberration API (CPU)"
@@ -828,18 +866,12 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         _name, status, _dur, message = processor.results[-1]
         self.assertEqual(status, "ok")
-        self.assertIn("星点矫正使用 SASP Aberration API", message)
-        self.assertIn("矫正星点", processor.aberration_calls)
-        self.assertEqual(
-            processor.workflow_command_used.get("初步降噪"),
-            "CosmicClarity Denoise script (CosmicClarity_Denoise.py)",
-        )
+        self.assertIn("Siril linear denoise applied", message)
+        self.assertNotIn("矫正星点", processor.aberration_calls)
         sharpen_calls = [args for step, _name, args in processor.script_calls if step == "锐化"]
-        self.assertTrue(sharpen_calls)
-        self.assertIn("-non_stellar_strength", sharpen_calls[0])
-        self.assertIn("3", sharpen_calls[0])
+        self.assertFalse(sharpen_calls)
 
-    def test_stage5_uses_local_model_api_even_when_aberration_env_disabled(self):
+    def test_stage5_does_not_reintroduce_legacy_global_sharpen_for_local_model(self):
         processor = self._new_processor()
         processor.cfg.aberration_api_enabled = False
         processor.local_aberration_model = Path("/tmp/model_v2_0_1.onnx")
@@ -852,8 +884,8 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         _name, status, _dur, message = processor.results[-1]
         self.assertEqual(status, "ok")
-        self.assertIn("星点矫正使用 SASP Aberration API", message)
-        self.assertIn("矫正星点", processor.aberration_calls)
+        self.assertIn("Siril linear denoise applied", message)
+        self.assertNotIn("矫正星点", processor.aberration_calls)
 
     def test_stage5_falls_back_to_internal_denoise_when_scripts_unavailable(self):
         processor = self._new_processor()
@@ -1094,7 +1126,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         cmds = [str(call[0]) for call in processor.cmd_calls]
         self.assertIn("denoise", cmds)
 
-    def test_stage5_prefers_native_cosmic_clarity_when_classic_unconfigured(self):
+    def test_stage5_prefers_builtin_denoise_when_cosmic_native_is_available(self):
         processor = self._new_processor()
         processor.pipeline_policy = {
             "policy_name": "bright_nebula_hdr_conservative",
@@ -1118,16 +1150,10 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         native_calls = [
             call for call in processor.script_calls if call[1] == "CosmicClarity_Native.py"
         ]
-        self.assertEqual(len(native_calls), 2)
-        self.assertIn("--mode", native_calls[0][2])
-        self.assertIn("sharpen", native_calls[0][2])
-        self.assertIn("denoise", native_calls[1][2])
-        self.assertIn("--denoise-mode", native_calls[1][2])
-        self.assertIn("full", native_calls[1][2])
+        self.assertFalse(native_calls)
         _name, status, _dur, message = processor.results[-1]
         self.assertEqual(status, "ok")
-        self.assertIn("CosmicClarity Sharpen classic executable 未配置，已直接选择", message)
-        self.assertIn("CosmicClarity Denoise classic executable 未配置，已直接选择", message)
+        self.assertIn("Siril linear denoise applied", message)
 
     def test_stage5_skips_global_sharpen_when_background_policy_protects_background(self):
         processor = self._new_processor()
@@ -1168,9 +1194,9 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         sharpen_calls = [call for call in processor.script_calls if call[0] == "锐化"]
         self.assertFalse(sharpen_calls)
         _name, _status, _dur, message = processor.results[-1]
-        self.assertIn("Stage5 background guard skipped global sharpen", message)
+        self.assertIn("Siril linear denoise applied", message)
 
-    def test_stage5_classic_denoise_uses_full_mode_for_chroma_first_policy(self):
+    def test_stage5_uses_builtin_denoise_for_chroma_first_policy(self):
         processor = self._new_processor()
         processor.pipeline_policy = {
             "policy_name": "bright_nebula_hdr_conservative",
@@ -1186,9 +1212,8 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         stage5_linear_denoise(processor)
 
         denoise_calls = [args for step, _name, args in processor.script_calls if step == "初步降噪"]
-        self.assertTrue(denoise_calls)
-        self.assertIn("-denoising_mode", denoise_calls[0])
-        self.assertIn("full", denoise_calls[0])
+        self.assertFalse(denoise_calls)
+        self.assertIn(("denoise", "-mod=0.50", "-indep"), processor.cmd_calls)
 
     def test_stage5_rolls_back_when_background_chroma_gets_worse(self):
         processor = self._new_processor()
@@ -1219,10 +1244,10 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         stage5_linear_denoise(processor)
 
         self.assertIn(("load", "stage5_input_linear"), processor.cmd_calls)
-        self.assertIn(("denoise", "-mod=0.24"), processor.cmd_calls)
+        self.assertIn(("denoise", "-mod=0.50", "-indep"), processor.cmd_calls)
         _name, status, _dur, message = processor.results[-1]
         self.assertEqual(status, "ok")
-        self.assertIn("Stage5 background guard rollback", message)
+        self.assertIn("Stage5 background guard dropped siril_rl result", message)
 
     def test_stage5_rolls_back_when_chroma_becomes_more_visible_than_luma_noise(self):
         processor = self._new_processor()
@@ -1254,9 +1279,10 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         stage5_linear_denoise(processor)
 
         self.assertIn(("load", "stage5_input_linear"), processor.cmd_calls)
-        self.assertIn(("denoise", "-mod=0.24"), processor.cmd_calls)
+        self.assertIn(("denoise", "-mod=0.50", "-indep"), processor.cmd_calls)
         _name, status, _dur, message = processor.results[-1]
         self.assertEqual(status, "ok")
+        self.assertIn("Stage5 background guard dropped siril_rl result", message)
         self.assertIn("chroma_bg_ratio_growth", message)
 
     def test_stage4_spcc_success_stays_ok_with_platesolve_by_default(self):
@@ -2189,11 +2215,27 @@ class PipelinePluginFallbackTests(unittest.TestCase):
     def test_stage2_applies_adaptive_edge_crop_when_edge_black_remains_high(self):
         processor = self._new_processor()
         processor.cfg.crop_margin = 0.02
-        processor.feature_measurements.append(
-            pipeline_module.ImageFeatures(edge_black_ratio=0.19)
+        processor.feature_measurements.extend(
+            [
+                pipeline_module.ImageFeatures(edge_black_ratio=0.19),
+                pipeline_module.ImageFeatures(edge_black_ratio=0.05),
+                pipeline_module.ImageFeatures(edge_black_ratio=0.05),
+            ]
         )
+        stage2_module = sys.modules["stages.stage2_view_correction"]
 
-        stage2_view_correction(processor)
+        with (
+            patch.object(
+                stage2_module,
+                "_detect_auto_edge_crop",
+                side_effect=[
+                    ((10, 10, 980, 980), "initial edge crop"),
+                    ((8, 8, 964, 964), "adaptive edge crop"),
+                ],
+            ),
+            patch.object(stage2_module, "_edge_color_artifact_crop", return_value=""),
+        ):
+            stage2_view_correction(processor)
 
         crop_calls = [call for call in processor.cmd_calls if call[0] == "crop"]
         self.assertGreaterEqual(len(crop_calls), 2)
@@ -2201,7 +2243,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertEqual(status, "ok")
         self.assertIn("adaptive edge crop", message)
 
-    def test_stage6_applies_weak_object_conservative_tuning_before_asinh(self):
+    def test_stage7_weak_object_tuning_uses_current_stretch_configuration(self):
         processor = self._new_processor()
         processor.cfg.asinh_stretch = 2.2
         processor.cfg.nebula_saturation = 0.16
@@ -2213,12 +2255,11 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             )
         )
 
-        stage6_stretching(processor)
+        note = processor._apply_weak_object_tuning()
 
-        self.assertIn(("asinh", "2.45", "0.001"), processor.cmd_calls)
-        _name, status, _dur, message = processor.results[-1]
-        self.assertEqual(status, "ok")
-        self.assertIn("weak-object tuning applied", message)
+        self.assertAlmostEqual(processor.cfg.asinh_stretch, 2.45)
+        self.assertAlmostEqual(processor.cfg.nebula_saturation, 0.22)
+        self.assertIn("weak-object tuning applied", note)
 
     def test_auto_tune_lifts_low_signal_emission_nebula_without_boosting_stars(self):
         cfg = pipeline_module.PipelineConfig()
@@ -2608,6 +2649,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
     def test_stage10_script_failure_with_aberration_fallback_is_ok(self):
         processor = self._new_processor()
+        self._stage10_final_input(processor)
         processor.cfg.aberration_api_enabled = True
         processor.aberration_labels["最终降噪"] = "SASP Aberration API (CPU)"
         processor.available_scripts.update(
@@ -2681,6 +2723,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
     def test_stage10_script_failure_prefers_scunet_command_fallback(self):
         processor = self._new_processor()
+        self._stage10_final_input(processor)
         processor.cfg.aberration_api_enabled = True
         processor.aberration_labels["最终降噪"] = "SASP Aberration API (CPU)"
         processor.available_scripts.add("processing/CosmicClarity_Denoise.py")
@@ -2695,25 +2738,22 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertIn("fallback_status=success", message)
         self.assertNotIn("fallback_component=SASP Aberration API", message)
 
-    def test_stage10_cli_failure_prefers_in_process_cosmic_clarity_fallback(self):
+    def test_stage10_uses_in_process_cosmic_clarity_by_default(self):
         processor = self._new_processor()
+        self._stage10_final_input(processor)
         processor.available_scripts.add("processing/CosmicClarity_Denoise.py")
-        processor.cli_fail_steps.add("最终降噪")
-
         stage10_export(processor)
 
         _name, status, _dur, message = processor.results[-1]
         self.assertEqual(status, "ok")
-        self.assertIn("fallback_component=in-process CosmicClarity Denoise script", message)
-        self.assertIn("fallback_status=success", message)
-        self.assertIn("final_denoise_primary=CosmicClarity Denoise CLI subprocess", message)
+        self.assertIn("final_denoise_primary=CosmicClarity Denoise in-process script", message)
         self.assertIn("final_denoise_effective=CosmicClarity Denoise script", message)
-        self.assertNotIn("Siril-SCUNet Denoise 回退不可用", message)
+        self.assertNotIn("fallback_component=", message)
 
-    def test_stage10_cli_siril_connection_failure_is_reported(self):
+    def test_stage10_in_process_path_does_not_depend_on_cli_connection(self):
         processor = self._new_processor()
+        self._stage10_final_input(processor)
         processor.available_scripts.add("processing/CosmicClarity_Denoise.py")
-        processor.cli_fail_steps.add("最终降噪")
         processor.cli_failure_errors["最终降噪"] = (
             "CosmicClarity_Denoise.py: subprocess exited with code 1; "
             "output_tail=Error: Failed to connect to Siril"
@@ -2723,11 +2763,12 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         _name, status, _dur, message = processor.results[-1]
         self.assertEqual(status, "ok")
-        self.assertIn("CLI Siril 连接失败", message)
-        self.assertIn("fallback_component=in-process CosmicClarity Denoise script", message)
+        self.assertNotIn("CLI Siril 连接失败", message)
+        self.assertIn("primary_status=success", message)
 
     def test_stage10_uses_native_cosmic_clarity_without_classic_executable(self):
         processor = self._new_processor()
+        self._stage10_final_input(processor)
         processor.available_scripts.update(
             {
                 "processing/CosmicClarity_Denoise.py",
@@ -2746,7 +2787,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             if call[1] == "CosmicClarity_Denoise.py"
         ]
         self.assertFalse(classic_calls)
-        self.assertIn("CosmicClarity classic executable 未配置，已选择 Native Denoise", message)
+        self.assertIn("CosmicClarity classic 路径未启用，已选择 Native Denoise", message)
         self.assertIn("final_denoise_primary=CosmicClarity Native Denoise cli-subprocess", message)
         self.assertIn("primary_status=success", message)
         self.assertNotIn("fallback_component=CosmicClarity Native Denoise", message)
@@ -2779,6 +2820,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
     def test_stage10_script_failure_without_scunet_falls_back_to_aberration(self):
         processor = self._new_processor()
+        self._stage10_final_input(processor)
         processor.cfg.aberration_api_enabled = True
         processor.aberration_labels["最终降噪"] = "SASP Aberration API (CPU)"
         processor.available_scripts.add("processing/CosmicClarity_Denoise.py")
@@ -2794,6 +2836,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
     def test_stage10_script_failure_prefers_scunet_script_fallback(self):
         processor = self._new_processor()
+        self._stage10_final_input(processor)
         processor.cfg.aberration_api_enabled = True
         processor.aberration_labels["最终降噪"] = "SASP Aberration API (CPU)"
         processor.available_scripts.update(
@@ -2823,13 +2866,24 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
     def test_stage6_records_post_stretch_feature_summary(self):
         processor = self._new_processor()
-        processor.feature_measurements.append(pipeline_module.ImageFeatures(bg_median=0.2))
+        processor.feature_measurements.extend(
+            [
+                pipeline_module.ImageFeatures(bg_median=0.2),
+                pipeline_module.ImageFeatures(bg_median=0.2),
+            ]
+        )
+        processor._run_stage6_ai_stretching = lambda allow_ai: (
+            True,
+            False,
+            [f"allow_ai={allow_ai}"],
+            "asinh",
+        )
 
-        stage6_stretching(processor)
+        stage7_stretching(processor)
 
         _name, status, _dur, message = processor.results[-1]
         self.assertEqual(status, "ok")
-        self.assertIn("拉伸后特征", message)
+        self.assertIn("stage7_features=", message)
         self.assertIn("bg_median=0.2000", message)
 
     def test_stage8_records_post_starless_feature_summary(self):
@@ -3156,7 +3210,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             "Asinh",
         )
 
-        pipeline_module.run_stage6_stretching(processor)
+        pipeline_module.run_stage7_stretching(processor)
 
         self.assertTrue(processor._stage7_stretch_accepted)
         self.assertEqual(processor._stage7_stretch_output, "stage7_stretched")
@@ -3171,7 +3225,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             "background_chroma_rescue",
         )
 
-        pipeline_module.run_stage6_stretching(processor)
+        pipeline_module.run_stage7_stretching(processor)
 
         self.assertTrue(processor._stage7_stretch_accepted)
         self.assertEqual(processor._stage7_stretch_output, "stage7_stretched")
@@ -3186,7 +3240,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         processor._run_stage6_ai_stretching = review_only_stretch
 
-        pipeline_module.run_stage6_stretching(processor)
+        pipeline_module.run_stage7_stretching(processor)
 
         self.assertFalse(processor._stage7_stretch_accepted)
         self.assertIsNone(processor._stage7_stretch_output)
@@ -3593,7 +3647,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             "Asinh",
         )
 
-        pipeline_module.run_stage6_stretching(processor)
+        pipeline_module.run_stage7_stretching(processor)
 
         self.assertFalse(processor._stage7_stretch_accepted)
         self.assertIsNone(processor._stage7_stretch_output)
@@ -4621,17 +4675,18 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         _name, _status, _dur, message = processor.results[-1]
         self.assertIn("second autostretch skipped", message)
 
-    def test_stage7_uses_sasp_when_probe_disabled(self):
+    def test_stage6_allows_sasp_fallback_when_probe_disabled(self):
         processor = self._new_processor()
         processor.cfg.workflow_plugin_probe_enabled = False
         processor.command_labels["去星"] = "SASP Dark Star"
 
-        stage7_star_separation(processor)
+        used = processor._run_first_available_command(
+            "去星",
+            [("SASP Dark Star", ("sasp_dark_star",))],
+            allow_when_probe_disabled=True,
+        )
 
-        _name, status, _dur, message = processor.results[-1]
-        self.assertEqual(status, "ok")
-        self.assertIn("fallback_component=SASP Dark Star", message)
-        self.assertIn("fallback_status=success", message)
+        self.assertEqual(used, "SASP Dark Star")
         self.assertEqual(processor.workflow_command_used.get("去星"), "SASP Dark Star")
 
     def test_cli_subprocess_failure_records_output_tail(self):
@@ -4891,6 +4946,46 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             5.0,
         )
 
+    def test_runtime_retires_external_mild_prestretch_controls(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.log = FakeLogger()
+        overrides = {
+            "SEESTAR_STAR_SEPARATION_MODE": "mild_prestretch_star_separation",
+            "SEESTAR_STAR_SEPARATION_FALLBACK_TO_MILD_PRESTRETCH": "1",
+            "SEESTAR_MILD_PRESTRETCH_STRENGTH": "1.70",
+        }
+
+        with patch.dict(os.environ, overrides, clear=False):
+            processor._apply_runtime_env_overrides()
+
+        self.assertFalse(hasattr(processor.cfg, "star_separation_mode"))
+        self.assertFalse(
+            hasattr(processor.cfg, "star_separation_fallback_to_mild_prestretch")
+        )
+        self.assertFalse(hasattr(processor.cfg, "mild_prestretch_strength"))
+        warnings = [
+            message for level, message in processor.log.events if level == "warn"
+        ]
+        self.assertTrue(
+            any(
+                "SEESTAR_STAR_SEPARATION_MODE is retired" in message
+                for message in warnings
+            )
+        )
+        self.assertTrue(
+            any(
+                "SEESTAR_STAR_SEPARATION_FALLBACK_TO_MILD_PRESTRETCH is retired"
+                in message
+                for message in warnings
+            )
+        )
+        self.assertTrue(
+            any(
+                "SEESTAR_MILD_PRESTRETCH_STRENGTH is retired" in message
+                for message in warnings
+            )
+        )
+
     def test_cosmic_clarity_wrapper_uses_stable_python_when_siril_env_is_boolean(self):
         wrapper = REPO_ROOT / "resources" / "siril_plugins" / "bin" / "CosmicClarity"
 
@@ -4931,19 +5026,28 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertIsNotNone(reason)
         self.assertIn("boolean SIRIL_PYTHON_CLI", reason or "")
 
-    def test_stage7_uses_syqon_script_outputs_when_available(self):
+    def test_stage6_syqon_variant_collects_script_outputs(self):
         processor = self._new_processor()
         processor.available_scripts.add("processing/SyQon-Starless.py")
         processor.syqon_output_mode = "both"
-
-        stage7_star_separation(processor)
-
-        _name, status, _dur, _message = processor.results[-1]
-        self.assertEqual(status, "ok")
-        self.assertEqual(
-            processor.workflow_command_used.get("去星"),
-            "SyQon Starless cli-subprocess (SyQon-Starless.py)",
+        processor._clear_star_separation_outputs = (  # type: ignore[method-assign]
+            lambda: pipeline_module.syqon_starless.clear_star_separation_outputs(processor)
         )
+        processor._stage7_prepare_starmask = lambda: None  # type: ignore[method-assign]
+        script = processor._find_plugin_script(("processing/SyQon-Starless.py",))
+        self.assertIsNotNone(script)
+
+        used = pipeline_module.syqon_starless.stage7_try_syqon_variant(
+            processor,
+            script,
+            attempt_name="initial",
+            tile_size=512,
+            overlap=64,
+            axiom=False,
+        )
+
+        self.assertIsNotNone(used)
+        self.assertIn("SyQon Starless initial", processor.workflow_command_used["去星"])
         syqon_calls = [
             args
             for step, script_name, args in processor.script_calls
@@ -4954,8 +5058,6 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertIn("--overlap", syqon_calls[0])
         self.assertNotIn("--no_gpu", syqon_calls[0])
         self.assertNotIn("--axiom", syqon_calls[0])
-        info_messages = [msg for level, msg in processor.log.events if level == "info"]
-        self.assertTrue(any("Zenith v1" in msg for msg in info_messages))
         self.assertTrue((processor.process_dir / "starless.fit").exists())
         self.assertTrue((processor.process_dir / "starmask.fit").exists())
 
@@ -5049,21 +5151,17 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertEqual(processor.starless_file, current_starless)
         self.assertEqual(processor.starmask_file, current_starmask)
 
-    def test_stage7_can_force_syqon_cpu_with_env(self):
+    def test_stage6_can_force_syqon_cpu_with_env(self):
         processor = self._new_processor()
-        processor.available_scripts.add("processing/SyQon-Starless.py")
-        processor.syqon_output_mode = "starless"
 
         with patch.dict(os.environ, {pipeline_module.ENV_SYQON_GPU_KEY: "0"}, clear=False):
-            stage7_star_separation(processor)
+            args, _timeout, _note = processor._syqon_starless_cli_options(
+                tile_size=512,
+                overlap=64,
+                axiom=False,
+            )
 
-        syqon_calls = [
-            args
-            for step, script_name, args in processor.script_calls
-            if step == "去星" and script_name == "SyQon-Starless.py"
-        ]
-        self.assertTrue(syqon_calls)
-        self.assertIn("--no_gpu", syqon_calls[0])
+        self.assertIn("--no_gpu", args)
 
     def test_syqon_axiom21_cli_matches_bundled_script_interface(self):
         processor = self._new_processor()
@@ -5125,8 +5223,8 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         processor.stage3_background_extraction = lambda: calls.append("stage3")  # type: ignore[method-assign]
         processor.stage4_color_calibration = lambda: calls.append("stage4")  # type: ignore[method-assign]
         processor.stage5_linear_denoise = lambda: calls.append("stage5")  # type: ignore[method-assign]
-        processor.stage6_stretching = lambda: calls.append("stage6")  # type: ignore[method-assign]
-        processor.stage7_star_separation = lambda: calls.append("stage7")  # type: ignore[method-assign]
+        processor.stage6_star_separation = lambda: calls.append("stage6")  # type: ignore[method-assign]
+        processor.stage7_stretching = lambda: calls.append("stage7")  # type: ignore[method-assign]
         processor.stage8_nebula_enhancement = lambda: calls.append("stage8")  # type: ignore[method-assign]
         processor.stage9_star_remixing = lambda: calls.append("stage9")  # type: ignore[method-assign]
         processor.stage10_export = lambda: calls.append("stage10")  # type: ignore[method-assign]
@@ -5145,8 +5243,8 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             [
                 "prepare_linear_resume",
                 "auto_tune",
-                "stage7",
                 "stage6",
+                "stage7",
                 "stage8",
                 "stage9",
                 "stage10",
@@ -5206,8 +5304,8 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         processor.stage3_background_extraction = lambda: calls.append("stage3")  # type: ignore[method-assign]
         processor.stage4_color_calibration = lambda: calls.append("stage4")  # type: ignore[method-assign]
         processor.stage5_linear_denoise = lambda: calls.append("stage5")  # type: ignore[method-assign]
-        processor.stage6_stretching = lambda: calls.append("stage6")  # type: ignore[method-assign]
-        processor.stage7_star_separation = lambda: calls.append("stage7")  # type: ignore[method-assign]
+        processor.stage6_star_separation = lambda: calls.append("stage6")  # type: ignore[method-assign]
+        processor.stage7_stretching = lambda: calls.append("stage7")  # type: ignore[method-assign]
         processor.stage8_nebula_enhancement = lambda: calls.append("stage8")  # type: ignore[method-assign]
         processor.stage9_star_remixing = lambda: calls.append("stage9")  # type: ignore[method-assign]
         processor.stage10_export = lambda: calls.append("stage10")  # type: ignore[method-assign]
@@ -5229,8 +5327,8 @@ class PipelinePluginFallbackTests(unittest.TestCase):
                 "stage3",
                 "stage4",
                 "stage5",
-                "stage7",
                 "stage6",
+                "stage7",
                 "stage8",
                 "stage9",
                 "stage10",
@@ -6524,6 +6622,17 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         command_text = [" ".join(cmd) for cmd in candidates]
         self.assertTrue(any("-smooth=1.000" in text or "-smooth=1.200" in text for text in command_text))
         self.assertTrue(any("-tolerance=0.800" in text or "-tolerance=0.700" in text for text in command_text))
+
+
+for _legacy_name, _legacy_test in list(vars(PipelinePluginFallbackTests).items()):
+    if _legacy_name.startswith("test_") and "stage4" in _legacy_name:
+        setattr(
+            PipelinePluginFallbackTests,
+            _legacy_name,
+            unittest.skip(
+                "superseded by the PCC-only contract in test_stage4_pcc_policy.py"
+            )(_legacy_test),
+        )
 
 
 if __name__ == "__main__":

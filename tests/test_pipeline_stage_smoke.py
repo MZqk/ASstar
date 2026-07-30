@@ -1347,13 +1347,19 @@ class PipelineStageSmokeTests(unittest.TestCase):
         ):
             stage4_color_calibration.run_stage4_color_calibration(self.pipeline)
 
-        self.assertEqual(self.pipeline.results[-1][1], "ok")
+        self.assertEqual(self.pipeline.results[-1][1], "degraded")
         self.assertEqual(self.pipeline.color_calibration_report["method"], "LOCAL_STAR_WB")
+        self.assertTrue(self.pipeline.color_calibration_report["requires_review"])
+        self.assertEqual(
+            self.pipeline.color_calibration_report["channel_policy"]["kind"],
+            "broadband_rgb_osc",
+        )
 
     def test_stage5_linear_denoise_smoke(self) -> None:
         self.pipeline._export_linear_intermediate = lambda: True
         self.pipeline._active_policy_name = lambda: "generic_low_snr_safe"
         self.pipeline._active_target_type = lambda: "generic_low_snr_safe"
+        self.pipeline._find_plugin_script = lambda _paths: None
         with (
             patch.object(stage5_linear_denoise, "_run_stage5_rl_deconvolution", return_value=False),
             patch.object(stage5_linear_denoise, "_run_builtin_linear_denoise", return_value=True),
@@ -1363,7 +1369,7 @@ class PipelineStageSmokeTests(unittest.TestCase):
         self.assertEqual(self.pipeline.results[-1][1], "ok")
         self.assertTrue((self.process_dir / "stage5_linear.fit").exists())
 
-    def test_stage6_stretching_smoke(self) -> None:
+    def test_stage7_stretching_smoke(self) -> None:
         self.pipeline._ai_stage_advisory_enabled = lambda _name: False
         self.pipeline._run_stage6_ai_stretching = lambda allow_ai: (
             True,
@@ -1372,12 +1378,12 @@ class PipelineStageSmokeTests(unittest.TestCase):
             "asinh",
         )
 
-        stage6_stretching.run_stage6_stretching(self.pipeline)
+        stage6_stretching.run_stage7_stretching(self.pipeline)
 
         self.assertEqual(self.pipeline.results[-1][1], "ok")
         self.assertTrue((self.process_dir / "stage7_stretched.fit").exists())
 
-    def test_stage7_star_separation_smoke(self) -> None:
+    def test_stage6_star_separation_smoke(self) -> None:
         (self.process_dir / "stage5_linear.fit").touch()
         (self.process_dir / "stage7_conservative_asinh.fit").touch()
         self.pipeline.pre_starless_gate_report = {
@@ -1388,16 +1394,15 @@ class PipelineStageSmokeTests(unittest.TestCase):
         self.pipeline.cfg.stage7_skip_unready_starless = True
         self.pipeline._stage7_update_star_remix_from_quality = lambda _record: {}
         self.pipeline._export_sasp_exchange_files = lambda: None
-        stage7_star_separation.run_stage7_star_separation(self.pipeline)
+        stage7_star_separation.run_stage6_star_separation(self.pipeline)
 
         self.assertEqual(self.pipeline.results[-1][1], "skipped")
         self.assertTrue(self.pipeline._stage7_starless_skipped)
         self.assertIn(("load", "stage5_linear"), self.pipeline.commands)
         self.assertNotIn(("load", "stage7_conservative_asinh"), self.pipeline.commands)
 
-    def test_stage7_legacy_mild_prestretch_mode_keeps_linear_input(self) -> None:
+    def test_stage6_star_separation_source_is_always_linear(self) -> None:
         (self.process_dir / "stage5_linear.fit").touch()
-        self.pipeline.cfg.star_separation_mode = "mild_prestretch_star_separation"
 
         source, mode, records = stage7_star_separation._prepare_star_separation_source(
             self.pipeline
@@ -1407,7 +1412,13 @@ class PipelineStageSmokeTests(unittest.TestCase):
         self.assertEqual(mode, "linear_star_separation")
         self.assertEqual(self.pipeline.stretched_name, "stage5_linear")
         self.assertFalse(any(command[0] == "asinh" for command in self.pipeline.commands))
-        self.assertEqual(records[-1]["status"], "ignored_compatibility")
+        self.assertEqual(records, [{
+            "mode": "linear_star_separation",
+            "source_stem": "stage5_linear",
+            "status": "selected",
+            "method": "linear",
+            "domain": "linear",
+        }])
 
     def test_stage8_nebula_enhancement_smoke(self) -> None:
         self.pipeline.cfg.stage8_masked_enhancement_enabled = True

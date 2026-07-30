@@ -27,7 +27,7 @@
 
 Stage 3 背景提取按候选质量门控自动选择：有 Siril scripts 缓存时优先通过 `pyscript GraXpert-AI.py` / `pyscript AutoBGE.py` 尝试 GraXpert、ADBE、DBE、AutoDBE；再尝试动态 `subsky -rbf` 和 `subsky 1` 兜底。GraXpert BGE 模型会从 `resources/siril_plugins/model_v2_0_1.onnx` 同步到运行时 GraXpert 模型目录。
 
-Stage 5 的 GraXpert 对象反卷积模型不随 App 分发，也不会在任务中联网下载。需要启用时，在工作目录或 runtime home 的 `.seestar_ai.env` 设置 `SEESTAR_GRAXPERT_OBJECT_MODEL_PATH`，指向用户从官方 GraXpert 获得的 `model.onnx`、语义版本目录（如 `1.0.1`）或 `deconvolution-object-ai-models` 目录。App 会把有效模型只读链接到隔离运行目录；无效或缺失时安全回退 Siril RL。
+Stage 5 不会在任务中联网下载 GraXpert 对象反卷积模型。自动模式优先使用 Seestar App 随包模型；随包模型缺失时读取本机 GraXpert 应用已安装的最新版模型，再尝试“处理参数…”里指定的官方 `model.onnx`、语义版本目录（如 `1.0.1`）或 `deconvolution-object-ai-models` 目录。App 会把有效模型只读链接到隔离运行目录；全部无效或缺失时安全回退 Siril RL。
 
 Stage 11 是可选 AI 后期，只生成 `*_ai` 副本，不覆盖 Stage 10 原始产物。Stage 状态为 `ok / degraded / failed / skipped`；summary 可显示 `ok_with_fallback`、`ok_skipped_optional`。
 
@@ -37,13 +37,13 @@ Stage 11 是可选 AI 后期，只生成 `*_ai` 副本，不覆盖 Stage 10 原�
 
 1. 启动 `SeestarSuperimpose.app`。首次启动或没有有效目录时会显示拖放空状态；已保存的有效目录会直接进入任务设置。
 2. 拖入或选择包含 `.fit/.fits` 的工作目录。应用会统计输入，并自动推荐“完整处理”“从裁切后继续”或“从线性处理后继续”，同时异步显示 Stage 0 输入预览。
-3. 保持“自动推荐”，或手动指定处理方式；高级设置中可启用 AI 后期、保留中间文件和允许联网。联网默认关闭。点击“模型配置…”可使用开发者默认试用模型，或填写自己的 endpoint、模型名称和 API Key；自定义 Key 只保存在 macOS Keychain。
+3. 保持“自动推荐”，或手动指定处理方式；展开高级设置后，“处理参数…”会在任务卡片下方展开为单页 sheet，同页配置输出格式、正式/复核输出、单次在线 Gaia PCC、拍摄滤镜、线性降噪、反卷积、GraXpert 对象模型和 CPU 兼容模式。下方“专业细节”进一步开放 PCC 超时、恒星白平衡增益、线性降噪强度、GraXpert 强度、RL 迭代/PSF 星数、去星重试、残星/星晕/彩噪修复、星点 Asinh 拉伸和弱星恢复门槛；所有数值均受安全范围限制。参数修改后自动保存，每项都可通过鼠标悬浮查看默认值、影响和回退路径。AI 后期能力仍保留在 pipeline 中，但当前 macOS UI 暂不开放。
 4. 点击开始；preflight 会分别检查运行环境所在卷与工作目录所在卷的磁盘空间。工作目录需求按处理方式、基准 FITS 大小和各阶段临时/调试产物数量估算，不使用固定容量门槛。
    运行环境准备在后台执行，可用“停止”取消；依赖锁、Siril Python ABI 与 App
    版本未变化时会复用已就绪 runtime，不重复执行 `pip install`。
    SyQon 与 CosmicClarity 模型直接从 App 或离线资源包只读使用，不再复制到
    `runtime_home`。
-5. 快速 preflight 通过后，界面立即切换为只读运行视图：左侧显示本次配置，中央只显示最新一张可靠预览，右侧完整列出 Stage 1-10（启用 AI 时追加 Stage 11）。每个成功或降级阶段完成后刷新中央预览；跳过、失败或预览生成失败时保留上一张。当前运行阶段与预览来源阶段分开标注。
+5. 快速 preflight 通过后，界面立即切换为只读运行视图：左侧显示冻结后的本次配置，中央只显示最新一张可靠预览，右侧完整列出 Stage 1-10。每个成功或降级阶段完成后刷新中央预览；跳过、失败或预览生成失败时保留上一张。当前运行阶段与预览来源阶段分开标注。
    Stage 0 和 Stage 1-6 预览按原始/线性像素显示，Stage 7-11 也不附加显示拉伸、Gamma 或直方图归一化。中央预览支持适合窗口、1:1、滚轮缩放与拖动。
    阶段列表显示等待、运行中、已完成、已降级、失败或已跳过，并显示本阶段耗时和总耗时；不提供百分比或预计剩余时间。
    `CompletedWithWarning` 会显示黄色复核卡片，可直接打开最终质量报告。
@@ -57,7 +57,7 @@ Stage 11 是可选 AI 后期，只生成 `*_ai` 副本，不覆盖 Stage 10 原�
 - FITS 头完整时输出名包含目标、叠加数、曝光和拍摄时间；仅缺少 `STACKCNT` 等次要字段时，仍使用已有目标与拍摄时间生成可识别名称，避免退回通用名称覆盖其他任务
 - `result_linear.fit`：stage 5 线性中间结果，可用于续跑
 - `*_linear.*`：`result_linear.fit` 续跑模式产物
-- `result_review*.tif/png/fit`：最终质量门要求保守重跑时生成的复核产物；此时不会写普通 `result_processed/result_final` 名称，并会跳过耗时的 Stage 10 最终降噪链
+- `result_review*.tif/png/fit`：最终质量门要求保守重跑，或显式设置 `SEESTAR_FORCE_REVIEW_ONLY_OUTPUT=1` 时生成的复核产物；此时不会写普通 `result_processed/result_final` 名称，并会跳过耗时的 Stage 10 最终降噪链
 - `process/stage*.fit`、`process/*.json`：开启“保留中间文件”后的阶段产物与诊断报告
 - `process/final_quality_report.json`：Stage 10 最终质量报告；降级完成时可从 GUI 警告卡片打开
 - `process/review_bundles/stage9_star_remixing/`：Stage 8 底图与 Stage 9 选中/回滚结果的 before/after/difference 复核包，`review.json` 同时记录星表、starmask 标定和候选拒绝原因
@@ -80,9 +80,6 @@ Required packages:
 Optional bundled resources:
 - `resources/ai.env`（开发者试用配置的构建输入；非空 Key 要求文件权限 `0600`）
 - `resources/siril_plugins/`（可用 `bash resources/siril_plugins/download_siril_plugins.sh` 准备）
-
-Required bundled SPCC metadata seed:
-- `resources/siril_spcc_database/`（固定到上游 commit，包含 Seestar 支持范围的 sensor/filter/white-reference 光谱、GPLv3 许可证与 SHA-256 清单）
 
 Default output: `release/SeestarSuperimpose.app`
 
@@ -129,7 +126,7 @@ PIP_CONFIG_FILE=/dev/null python3.12 -m piptools compile \
 
 ## Common Env
 
-项目会自动读取 `resources/default.env`；若存在 `resources/ai.env`、runtime home 或工作目录下的 `.seestar_ai.env`，也会叠加读取非敏感选项。GUI worker 不再从这些文件或父进程环境读取 API Key：开发者试用 Key 在首次使用时由构建载荷导入 macOS Keychain，自定义 Key 由“模型配置…”直接写入 Keychain。GUI 上的 Debug、处理模式、AI 开关和所选模型配置优先。
+项目会自动读取 `resources/default.env`；若存在 `resources/ai.env`、runtime home 或工作目录下的 `.seestar_ai.env`，也会叠加读取非敏感选项。GUI worker 不再从这些文件或父进程环境读取 API Key。GUI 上的 Debug、处理模式和“处理参数…”任务快照优先；当前 macOS UI 强制关闭未开放的 AI 后期入口。
 
 构建载荷用于避免安装包出现可直接搜索的明文 Key，但客户端仍包含恢复试用 Key 所需逻辑，只提高提取难度，不构成真正的凭据保密边界。正式长期发行仍应改为服务端代理或短期、可撤销的试用令牌。
 
@@ -138,22 +135,19 @@ PIP_CONFIG_FILE=/dev/null python3.12 -m piptools compile \
 | `SEESTAR_AI_*` | AI 总配置；开启后用于阶段 6 去星、阶段 8 增强诊断/参数建议和阶段 11 AI 副本；阶段 7 固定本地两个主候选，仅色度门控失败时追加三档确定性救援并统一质量择优 |
 | `SEESTAR_DEBUG_MODE` / `SEESTAR_INPUT_MODE` | GUI Debug 开关与处理模式；`stage2_corrected_resume` 从 `stage2_corrected.fit` 进入 stage 3，`result_linear_resume` 从 `result_linear.fit` 续跑 |
 | `SEESTAR_OUTPUT_FORMAT` | 最终导出格式：`all`（默认）或逗号分隔 `tif,png,fit` |
+| `SEESTAR_FORCE_REVIEW_ONLY_OUTPUT` | 默认 `0`；设为 `1` 时仅导出 `result_review*`，并跳过 Stage 11，适合人工复核而非正式交付 |
 | `SEESTAR_WATCHDOG_IDLE_TIMEOUT_SEC` / `SEESTAR_EXPORT_TAIL_TIMEOUT_SEC` | GUI 无输出 watchdog；普通阶段默认 900 秒，确认本轮 PNG 产物后的收尾默认 120 秒；超时会记录最后命令、进程状态和产物 |
-| `SEESTAR_STAR_SEPARATION_MODE` / `SEESTAR_STAGE7_*` | 阶段 6 去星输入、重试、质量阈值和修复控制；变量名保留 `STAGE7` 以兼容旧配置 |
+| `SEESTAR_STAGE7_*` | 阶段 6 去星重试、质量阈值和修复控制；输入固定保持线性，外部预拉伸配置已退役；变量名保留 `STAGE7` 以兼容旧配置 |
 | `SEESTAR_STAGE9_*` | Stage 9 starmask Asinh、Screen 回混及保存前质量门控开关/阈值 |
-| `SEESTAR_SPCC_ENABLE` / `SEESTAR_STAGE4_PLATESOLVE_ENABLE` / `SEESTAR_STAGE4_SPCC_*` | Stage 4 色彩校准；SPCC 固定优先本地 Gaia DR3 `xp_sampled` 星表，失败后回退 PCC，并保留 sensor/filter 与 target-aware white reference 行为 |
+| `SEESTAR_STAGE4_PLATESOLVE_ENABLE` / `SEESTAR_STAGE4_PCC_TIMEOUT_SEC` / `SEESTAR_STAGE4_FILTER_HINT` | Stage 4 色彩校准；仅在线性宽带 RGB/OSC 上单次调用 Gaia PCC（默认 30 秒），窄带/单色/非线性输入按策略跳过 |
 | `SEESTAR_ABERRATION_API_ENABLE` / `SEESTAR_ABERRATION_PROVIDER` | Stage 5/10 SASP Aberration API fallback；默认关闭 API，provider 可设 `cpu` |
 | `SEESTAR_WORKFLOW_PLUGIN_PROBE` / `SEESTAR_SIRIL_PLUGIN_DIR` | 实验插件命令探测与插件目录 |
 
 完整 pipeline env 说明见 `pipeline/seestar_Superimpose_workflow.md`；打包/runtime env 见 `INTEGRATION_README.md`。
 
-本地 Gaia 数据不随 App 打包。使用 Siril Catalog Installer 安装 Gaia DR3 SPCC 星表时，安装根目录选择 `~/Library/Application Support/SeestarSuperimpose/runtime_home/.local/share/siril`；安装器生成的 `siril_cat1_healpix8_xpsamp/` 会被 GUI 自动写入 Siril runtime 配置。Stage 4 只在 `siril_cat1_healpix8_xpsamp_*.dat` 覆盖当前目标天区时调用 SPCC；星表为空或覆盖不足会直接进入 PCC，不会让 Siril 自动查询在线 SPCC。
+Stage 4 在确认线性的宽带 RGB/OSC 输入上保存不可变的 `stage4_pre_pcc.fit`，然后以独立 Siril CLI 进程执行一次 `pcc -catalog=gaia`。超时、命令失败或目标感知质量门拒绝时，流水线必先回载该检查点，再仅通过星点软掩膜做局部颜色恢复；全图白平衡始终禁止，宽带回退结果会标记为需要复核。窄带、HOO/SHO、双窄带和单色输入不会调用 PCC。
 
-SPCC 的传感器、滤镜和白参考光谱元数据与 Gaia 星表相互独立。App 会把固定版本的 `SirilSPCCDatabaseSeed` 幂等复制到隔离 HOME 下的 `Library/Application Support/org.siril.Siril/siril-spcc-database`；不读取用户系统 Siril 的数据库，也不依赖首次联网克隆。资源缺失或校验失败时，Worker 会在启动 Siril 前禁用 SPCC并改走 PCC，避免 Siril 1.4.x 空列表原生崩溃。
-
-若 Siril 在 SPCC 中原生退出或关闭连接，当前流水线会立即中止，不再执行 CPU 恢复、PCC、保存或后续阶段；GUI 保留禁用 SPCC 的自动重试，并优先从本次生成的 `stage4_psolved.fit` 恢复 Stage 4，而不是重复 Stage 1-3 和 platesolve。
-
-完全离线的 platesolve/PCC 还需要由 Catalog Installer 在同一目录安装 `siril_cat_healpix8_astro.dat`。代码只有在该文件有效时才调用 `-catalog=localgaia`；`SEESTAR_NETWORK_MODE=0` 时不会继续尝试 `gaia`、`nomad` 或 `apass` 在线目录。
+完全离线的 platesolve 可由 Siril Catalog Installer 在 runtime 目录安装 `siril_cat_healpix8_astro.dat`。代码只有在该文件有效时才调用 `-catalog=localgaia`；PCC 本身固定使用在线 Gaia，因此关闭联网时按策略跳过并进入安全回退，不尝试其他在线目录。
 
 ## Limits
 

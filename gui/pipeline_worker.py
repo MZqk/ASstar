@@ -89,6 +89,70 @@ _SIRIL_DENOISE_SRC_DIAGNOSTIC_RE = re.compile(
 _AI_CREDENTIAL_ENV_KEYS = frozenset(
     {"SEESTAR_AI_API_KEY", "SEESTAR_AI_ARTISTIC_API_KEY"}
 )
+_SEMANTIC_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+
+
+def _newest_graxpert_object_model(family_roots: tuple[Path, ...]) -> Path | None:
+    candidates: list[tuple[tuple[int, int, int], Path]] = []
+    for family_root in family_roots:
+        try:
+            version_dirs = list(family_root.iterdir()) if family_root.is_dir() else []
+        except OSError:
+            continue
+        for version_dir in version_dirs:
+            match = _SEMANTIC_VERSION_RE.fullmatch(version_dir.name)
+            model = version_dir / "model.onnx"
+            try:
+                valid = model.is_file() and model.stat().st_size > 0
+            except OSError:
+                valid = False
+            if match and valid:
+                candidates.append(
+                    (tuple(int(part) for part in match.groups()), model)
+                )
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def default_graxpert_object_model(
+    plugin_dir: Path,
+    *,
+    user_home: Path | None = None,
+) -> tuple[Path | None, str]:
+    """Return the default app/GraXpert Object Deconvolution model."""
+    bundled_model = _newest_graxpert_object_model(
+        (
+            plugin_dir / "deconvolution-object-ai-models",
+            plugin_dir / "graxpert" / "deconvolution-object-ai-models",
+            plugin_dir / "models" / "deconvolution-object-ai-models",
+        )
+    )
+    if bundled_model is not None:
+        return bundled_model, "seestar_app"
+
+    if user_home is None:
+        return None, ""
+    home = user_home
+    graxpert_model = _newest_graxpert_object_model(
+        (
+            home
+            / "Library"
+            / "Application Support"
+            / "GraXpert"
+            / "GraXpert"
+            / "deconvolution-object-ai-models",
+            home
+            / "Library"
+            / "Application Support"
+            / "GraXpert"
+            / "deconvolution-object-ai-models",
+            home
+            / ".local"
+            / "share"
+            / "GraXpert"
+            / "deconvolution-object-ai-models",
+        )
+    )
+    return graxpert_model, "graxpert_app" if graxpert_model is not None else ""
 
 
 class PipelineWorker(QThread):
@@ -114,6 +178,9 @@ class PipelineWorker(QThread):
         network_mode: bool = True,
         ai_stage_enabled: bool = False,
         ai_runtime_overrides: dict[str, str] | None = None,
+        runtime_overrides: dict[str, str] | None = None,
+        runtime_unset_keys: set[str] | None = None,
+        graxpert_application_home: Path | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -141,6 +208,17 @@ class PipelineWorker(QThread):
             for key, value in (ai_runtime_overrides or {}).items()
             if str(key) in AI_ENV_ALLOWED_KEYS
         }
+        self.runtime_overrides = {
+            str(key): str(value)
+            for key, value in (runtime_overrides or {}).items()
+            if str(key) in AI_ENV_ALLOWED_KEYS
+        }
+        self.runtime_unset_keys = {
+            str(key)
+            for key in (runtime_unset_keys or set())
+            if str(key) in AI_ENV_ALLOWED_KEYS
+        }
+        self.graxpert_application_home = graxpert_application_home
 
         self._stop_event = threading.Event()
         self._proc: subprocess.Popen[str] | None = None
@@ -152,7 +230,6 @@ class PipelineWorker(QThread):
         self._pipeline_output_seen = False
         self._python_env_issue = False
         self._python_env_repair_attempted = False
-        self._spcc_seen_in_run = False
         self._native_process_terminated_detected = False
         self._current_pipeline_stage: int | None = None
         self._pipeline_stage_states: dict[int, str] = {}
@@ -161,14 +238,8 @@ class PipelineWorker(QThread):
         self._native_termination_command = ""
         self._pipeline_summary_failed = 0
         self._pipeline_summary_degraded = 0
-        self._spcc_cli_crash_detected = False
-        self._spcc_crash_retry_attempted = False
-        self._force_disable_spcc_for_retry = False
-        self._resume_stage4_psolved_for_retry = False
-        self._spcc_seed_warning_emitted = False
         self._recent_process_output: deque[str] = deque(maxlen=80)
         self._last_command = ""
-        self._last_spcc_command = ""
         self._saving_png_seen_at: float | None = None
         self._export_tail_ready_at: float | None = None
         self._export_tail_disarmed = False
@@ -429,15 +500,6 @@ class PipelineWorker(QThread):
             # siril-cli exits 0, so caller can retry/reset/fallback correctly.
             self._run_had_errors = True
         if (
-            "running command: spcc" in lowered
-            or "running command spcc" in lowered
-            or "input command:spcc" in lowered
-            or "input command: spcc" in lowered
-        ):
-            self._spcc_seen_in_run = True
-            if "spcc" in lowered:
-                self._last_spcc_command = stripped
-        if (
             ("running command: pyscript" in lowered or "running command pyscript" in lowered)
             and self._pyscript_seen_at is None
         ):
@@ -449,77 +511,6 @@ class PipelineWorker(QThread):
         pipeline_markers = ("stage 1", "阶段 1", "[info]")
         if any(marker in lowered for marker in pipeline_markers):
             self._pipeline_output_seen = True
-
-    def _append_spcc_crash_diagnostics(self, exit_code: int) -> None:
-        if exit_code == -11:
-            summary = (
-                "siril-cli 在执行 SPCC 后以 -11 退出，通常表示 "
-                "Siril 原生测光/SPCC 代码段错误"
-            )
-        else:
-            summary = (
-                "SPCC 执行期间检测到 Siril 原生连接或进程终止，"
-                f"siril-cli exit={exit_code}"
-            )
-        self._append_event(f"SPCC 崩溃诊断: {summary}。")
-        if self._last_spcc_command:
-            self._append_event(f"SPCC 崩溃前命令标记: {self._last_spcc_command}")
-        if self._recent_process_output:
-            self._append_event("SPCC 崩溃前最后输出（最多 25 行）:")
-            for line in list(self._recent_process_output)[-25:]:
-                self._append_event(f"  {line}")
-
-    def _is_spcc_crash_context(self, exit_code: int) -> bool:
-        """Only attribute a native failure to SPCC while Stage 4 is active."""
-        if not self._spcc_seen_in_run:
-            return False
-        failure_stage = (
-            self._native_termination_stage
-            if self._native_process_terminated_detected
-            else self._current_pipeline_stage
-        )
-        if failure_stage != 4:
-            return False
-        if exit_code == -11:
-            return True
-        command = self._native_termination_command.lower()
-        return self._native_process_terminated_detected and (
-            not command or "spcc" in command
-        )
-
-    def _stage4_psolved_retry_path(
-        self,
-        *,
-        require_current_run: bool = False,
-    ) -> Path | None:
-        candidates = (
-            self.work_dir / "process" / STAGE4_PSOLVED_INPUT_NAME,
-            self.work_dir / STAGE4_PSOLVED_INPUT_NAME,
-        )
-        for path in candidates:
-            signature = self._artifact_signature(path)
-            if signature is None or signature[1] <= 0:
-                continue
-            if require_current_run and self._artifact_snapshot.get(path) == signature:
-                continue
-            return path
-        return None
-
-    def _prepare_spcc_crash_retry(self) -> Path | None:
-        self._force_disable_spcc_for_retry = True
-        checkpoint = self._stage4_psolved_retry_path(require_current_run=True)
-        self._resume_stage4_psolved_for_retry = checkpoint is not None
-        if checkpoint is not None:
-            self._append_event(
-                "已确认本次运行的 stage4_psolved.fit 检查点；"
-                "重启后将跳过 Stage 1-3 和重复 platesolve，从 Stage 4 校色继续。"
-            )
-        else:
-            self._append_event(
-                "未找到本次运行生成的 stage4_psolved.fit；"
-                "仍保留禁用 SPCC 的完整流水线安全重试。"
-            )
-        return checkpoint
 
     def _siril_venv_dir(self) -> Path:
         return self._siril_state_root() / "venv"
@@ -822,13 +813,6 @@ class PipelineWorker(QThread):
         template_text = self.config_template.read_text(
             encoding="utf-8", errors="replace"
         )
-        local_spcc_catalog = (
-            self.runtime_home
-            / ".local"
-            / "share"
-            / "siril"
-            / "siril_cat1_healpix8_xpsamp"
-        )
         local_astrometric_catalog = (
             self.runtime_home
             / ".local"
@@ -838,7 +822,7 @@ class PipelineWorker(QThread):
         )
         patched = normalize_siril_config_template(
             template_text,
-            gaia_photo_catalog=local_spcc_catalog,
+            gaia_photo_catalog=None,
             gaia_astro_catalog=local_astrometric_catalog,
         )
         run_ini.write_text(patched, encoding="utf-8")
@@ -858,12 +842,35 @@ class PipelineWorker(QThread):
             env[key] = value
             if key not in applied_keys:
                 applied_keys.append(key)
+        for key in self.runtime_unset_keys:
+            env.pop(key, None)
+        for key, value in self.runtime_overrides.items():
+            env[key] = value
         self._ai_env_sources = ai_sources
         self._ai_env_applied_keys = sorted(applied_keys)
         self._ai_env_warnings = ai_warnings
 
+        default_object_model, default_model_source = default_graxpert_object_model(
+            self.siril_plugin_dir,
+            user_home=self.graxpert_application_home,
+        )
         user_graxpert_model = env.get("SEESTAR_GRAXPERT_OBJECT_MODEL_PATH", "").strip()
-        if user_graxpert_model:
+        if (
+            env.get("SEESTAR_STAGE5_GRAXPERT_DECONV_ENABLE", "1").strip().lower()
+            not in {"0", "false", "no", "off"}
+            and default_object_model is not None
+        ):
+            env["SEESTAR_GRAXPERT_OBJECT_MODEL_PATH"] = str(default_object_model)
+            source_label = (
+                "Seestar App 内"
+                if default_model_source == "seestar_app"
+                else "本机 GraXpert 应用"
+            )
+            self._append_event(
+                f"Stage 5 将优先使用{source_label}对象反卷积模型："
+                f"{default_object_model.parent.name}"
+            )
+        elif user_graxpert_model:
             expanded_model = Path(os.path.expandvars(user_graxpert_model)).expanduser()
             if not expanded_model.is_absolute():
                 expanded_model = self.work_dir / expanded_model
@@ -984,38 +991,14 @@ class PipelineWorker(QThread):
             env["SEESTAR_COSMIC_CLARITY_MODEL_DIR"] = str(cosmic_models)
 
         env["SEESTAR_DEBUG_MODE"] = "1" if self.debug_mode else "0"
-        env["SEESTAR_INPUT_MODE"] = (
-            INPUT_MODE_STAGE4_PSOLVED_RESUME
-            if self._resume_stage4_psolved_for_retry
-            else self.input_mode
-        )
+        env["SEESTAR_INPUT_MODE"] = self.input_mode
         env["SEESTAR_NETWORK_MODE"] = "1" if self.network_mode else "0"
         local_catalog_root = self.runtime_home / ".local" / "share" / "siril"
-        env["SEESTAR_GAIA_PHOTO_CATALOG"] = str(
-            local_catalog_root / "siril_cat1_healpix8_xpsamp"
-        )
         env["SEESTAR_GAIA_ASTRO_CATALOG"] = str(
             local_catalog_root / "siril_cat_healpix8_astro.dat"
         )
-        env["SEESTAR_SPCC_DATABASE_DIR"] = str(
-            siril_spcc_database_root_from_home(self.runtime_home)
-        )
         # GUI toggle is the highest-priority control for optional stage11 execution.
         env["SEESTAR_AI_ENABLED"] = "1" if self.ai_stage_enabled else "0"
-        spcc_seed_ready, spcc_seed_detail = verify_siril_spcc_database_seed(
-            default_siril_spcc_database_seed_dir(self.resources),
-            self.runtime_home,
-        )
-        if not spcc_seed_ready:
-            env["SEESTAR_SPCC_ENABLE"] = "0"
-            if not self._spcc_seed_warning_emitted:
-                self._spcc_seed_warning_emitted = True
-                self._append_event(
-                    "Siril SPCC 固定数据库不可用，已在启动 Siril 前禁用 SPCC；"
-                    f"Stage 4 将改走 PCC：{spcc_seed_detail}"
-                )
-        elif self._force_disable_spcc_for_retry:
-            env["SEESTAR_SPCC_ENABLE"] = "0"
         return env
 
     def _bounded_timeout_from_env(
@@ -1380,17 +1363,14 @@ class PipelineWorker(QThread):
         self._python_env_issue = False
         self._pyscript_seen_at = None
         self._pipeline_output_seen = False
-        self._spcc_seen_in_run = False
         self._native_process_terminated_detected = False
         self._current_pipeline_stage = None
         self._native_termination_stage = None
         self._native_termination_command = ""
         self._pipeline_summary_failed = 0
         self._pipeline_summary_degraded = 0
-        self._spcc_cli_crash_detected = False
         self._recent_process_output.clear()
         self._last_command = ""
-        self._last_spcc_command = ""
         self._saving_png_seen_at = None
         self._export_tail_ready_at = None
         self._export_tail_disarmed = False
@@ -1412,6 +1392,8 @@ class PipelineWorker(QThread):
         self._append_event(f"开始启动进程（{self._active_mode}），使用 {siril_cli}")
         self._append_event("命令：" + " ".join(cmd))
         proc_env = self._build_env(siril_cli)
+        proc_env["SEESTAR_SIRIL_CLI"] = str(siril_cli)
+        proc_env["SEESTAR_SIRIL_CONFIG"] = str(run_ini)
         self._append_event(f"Siril 运行时主目录：{proc_env.get('HOME', '')}")
         self._append_event(
             "Siril Python CLI："
@@ -1591,11 +1573,6 @@ class PipelineWorker(QThread):
         if watchdog_timeout is not None:
             return False, exit_code
 
-        if self._is_spcc_crash_context(exit_code):
-            self._spcc_cli_crash_detected = True
-            self._run_had_errors = True
-            self._append_spcc_crash_diagnostics(exit_code)
-
         if (
             self._active_mode == "python"
             and self._pyscript_seen_at is not None
@@ -1635,32 +1612,6 @@ class PipelineWorker(QThread):
                 if success:
                     run_status = self._completed_run_status()
                     break
-
-                if self._spcc_cli_crash_detected and not self._spcc_crash_retry_attempted:
-                    self._spcc_crash_retry_attempted = True
-                    checkpoint = self._prepare_spcc_crash_retry()
-                    retry_scope = (
-                        f"从 {checkpoint} 恢复 Stage 4"
-                        if checkpoint is not None
-                        else "重试完整流水线"
-                    )
-                    crash_reason = (
-                        "退出码 -11"
-                        if exit_code == -11
-                        else f"原生连接终止，exit={exit_code}"
-                    )
-                    self._append_event(
-                        f"检测到 Siril 在 SPCC 测光阶段崩溃（{crash_reason}）。"
-                        f"正在禁用 SPCC 并{retry_scope}，"
-                        "Stage 4 将改走 PCC/本地校色回退。"
-                    )
-                    success, exit_code = self._run_once(siril_cli, run_ssf, run_ini)
-                    if self._stop_event.is_set():
-                        run_status = "Stopped"
-                        break
-                    if success:
-                        run_status = self._completed_run_status()
-                        break
 
                 if self._python_env_issue and not self._python_env_repair_attempted:
                     self._python_env_repair_attempted = True

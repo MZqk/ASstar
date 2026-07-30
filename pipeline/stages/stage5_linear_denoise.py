@@ -339,6 +339,8 @@ def _stage5_graxpert_object_model() -> tuple[Optional[Path], dict]:
 
     model_roots = (
         home / "Library" / "Application Support" / "GraXpert"
+        / "GraXpert" / "deconvolution-object-ai-models",
+        home / "Library" / "Application Support" / "GraXpert"
         / "deconvolution-object-ai-models",
         home / ".local" / "share" / "GraXpert"
         / "deconvolution-object-ai-models",
@@ -381,6 +383,12 @@ def _run_stage5_graxpert_deconvolution(
     }
     if not bool(getattr(pipeline.cfg, "stage5_deconvolution_enabled", True)):
         details["reason"] = "deconvolution_disabled"
+        return False, details
+    if not bool(
+        getattr(pipeline.cfg, "stage5_graxpert_deconvolution_enabled", True)
+    ):
+        details["reason"] = "graxpert_deconvolution_disabled"
+        messages.append("Stage5 GraXpert object deconvolution disabled; using Siril RL")
         return False, details
 
     script = pipeline._find_plugin_script(("processing/GraXpert-AI.py",))
@@ -548,7 +556,9 @@ def run_stage5_linear_denoise(pipeline) -> None:
         except OSError as e:
             pipeline.log.warn(f"[Stage5] stale deconvolution output cleanup failed: {e}")
 
-    if _run_builtin_linear_denoise(pipeline, messages):
+    if not bool(getattr(pipeline.cfg, "denoise_enabled", False)):
+        messages.append("linear denoise skipped by configuration")
+    elif _run_builtin_linear_denoise(pipeline, messages):
         denoise_used = "siril_builtin"
     else:
         plugin_used = _run_cosmic_clarity_linear_denoise(

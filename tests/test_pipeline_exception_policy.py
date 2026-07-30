@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import unittest
+from collections import Counter
 from pathlib import Path
 
 
@@ -13,7 +14,7 @@ PIPELINE_DIR = REPO_ROOT / "pipeline"
 
 
 class PipelineExceptionPolicyTests(unittest.TestCase):
-    def test_only_pipeline_run_keeps_exception_catch_all(self) -> None:
+    def test_only_explicit_pipeline_boundaries_keep_exception_catch_all(self) -> None:
         catch_all_handlers: list[tuple[Path, ast.ExceptHandler, str]] = []
 
         for path in sorted(PIPELINE_DIR.rglob("*.py")):
@@ -40,12 +41,28 @@ class PipelineExceptionPolicyTests(unittest.TestCase):
                 ) else "<module>"
                 catch_all_handlers.append((path, node, owner_name))
 
-        self.assertEqual(len(catch_all_handlers), 1)
-        path, handler, owner_name = catch_all_handlers[0]
-        self.assertEqual(path.name, "seestar_Superimpose.py")
-        self.assertEqual(owner_name, "run")
-        self.assertEqual(handler.name, "e")
-        self.assertIn("traceback.format_exc()", ast.unparse(handler))
+        boundaries = Counter(
+            (path.name, owner_name) for path, _handler, owner_name in catch_all_handlers
+        )
+        self.assertEqual(
+            boundaries,
+            Counter(
+                {
+                    ("seestar_Superimpose.py", "guarded"): 1,
+                    ("seestar_Superimpose.py", "cmd_with_check"): 1,
+                    ("seestar_Superimpose.py", "_record_stage"): 2,
+                    ("seestar_Superimpose.py", "run"): 1,
+                }
+            ),
+        )
+
+        run_handler = next(
+            handler
+            for path, handler, owner_name in catch_all_handlers
+            if path.name == "seestar_Superimpose.py" and owner_name == "run"
+        )
+        self.assertEqual(run_handler.name, "e")
+        self.assertIn("traceback.format_exc()", ast.unparse(run_handler))
 
     def test_siril_import_fallbacks_do_not_alias_to_exception(self) -> None:
         offenders = []

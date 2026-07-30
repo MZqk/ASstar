@@ -72,6 +72,7 @@ class PipelineConfig:
     denoise_safety_max: float = 0.55  # 降噪强度安全上限，防止细节被抹平
     stage5_builtin_denoise_mod: float = 0.50  # Stage5 Siril 内置线性降噪强度，默认 denoise -mod=0.50 -indep
     stage5_deconvolution_enabled: bool = True  # Stage5 是否在线性降噪前执行 GraXpert/RL 反卷积
+    stage5_graxpert_deconvolution_enabled: bool = True  # Stage5 是否优先尝试本地 GraXpert 对象反卷积；关闭后直接使用 RL
     stage5_rl_maxstars: int = 200  # RL 反卷积 PSF 找星数量上限
     stage5_rl_psf_kernel_size: int = 33  # RL 反卷积 makepsf kernel size
     stage5_rl_iters: int = 8  # RL 反卷积迭代次数，过高易放大噪声和星环
@@ -81,27 +82,16 @@ class PipelineConfig:
     stage5_graxpert_deconv_strength: float = 0.30  # 本地 Object Deconvolution 模型可用时的 GraXpert 强度
     optional_color_transform_enabled: bool = False  # 是否启用可选转色（Alchemy/Hubble）
     workflow_plugin_probe_enabled: bool = False  # Probe broad workflow plugin commands only when explicitly enabled; stage8 has a narrow safe SASP probe
-    spcc_enabled: bool = True  # 默认优先本地 Gaia DR3 xp_sampled SPCC；失败后 PCC，可由 SEESTAR_SPCC_ENABLE=0 禁用
     stage4_platesolve_enabled: bool = True  # 阶段4默认执行 platesolve -noflip，解算时保留原始图像方向
-    stage4_spcc_sensor_mode: str = "osc"  # SPCC 传感器模式：osc 或 mono_lrgb
-    stage4_spcc_osc_sensor: str = "Sony IMX585"  # OSC/SPCC oscsensor 名称；Seestar S30 Pro 使用 Sony IMX585
-    stage4_spcc_osc_filter: str = ""  # OSC/SPCC oscfilter 显式覆盖；为空时按内置双带光害滤镜开关自动选择
-    stage4_spcc_builtin_dualband_filter_enabled: bool = False  # 是否开启 Seestar 内置双带光害滤镜；决定默认 SPCC oscfilter
-    stage4_spcc_mono_sensor: str = ""  # Mono/LRGB SPCC monosensor 名称；为空时回退 OSC 配置
-    stage4_spcc_r_filter: str = ""  # Mono/LRGB SPCC R filter 名称
-    stage4_spcc_g_filter: str = ""  # Mono/LRGB SPCC G filter 名称
-    stage4_spcc_b_filter: str = ""  # Mono/LRGB SPCC B filter 名称
-    stage4_spcc_white_ref: str = "Average Spiral Galaxy"  # SPCC white reference
-    stage4_spcc_adaptive_white_ref_enabled: bool = False  # 默认按 Siril SPCC 方案使用 Average Spiral Galaxy；需要时可显式开启星云白参考切换
-    stage4_spcc_nebula_white_ref: str = "Star, type G2(v)"  # 发射/双窄带星云默认 SPCC 星型白参考；可由 env 覆盖
-    stage4_spcc_bgtol: str = "-2.8,2.0"  # SPCC 背景容差参数；默认值不显式传入，PCC 使用 Siril 默认 bgtol
-    stage4_spcc_limitmag: str = "10.5"  # SPCC Gaia 查询极限星等；限制测光星数以降低 Siril 1.4.x SPCC 崩溃风险
-    stage4_spcc_restore_cpu: int = 0  # SPCC 前 setcpu 1；结束后恢复到该值，0 表示自动使用 CPU 数
-    stage4_pcc_header_fallback_enabled: bool = True  # platesolve 失败但 FITS 有 RA/DEC 时，允许尝试 PCC header 坐标回退
-    stage4_local_star_wb_enabled: bool = True  # SPCC/PCC 都失败时，允许基于未饱和星点做保守白平衡
+    stage4_pcc_timeout_sec: int = 30  # 在线 Gaia PCC 只尝试一次；独立 Siril 子进程达到该秒数即终止
+    stage4_pcc_quality_gate_enabled: bool = True  # PCC 候选必须通过目标感知色彩质量门，否则回到 pre_pcc
+    stage4_pcc_channel_gain_ratio_max: float = 1.80  # PCC 三通道相对增益最大跨度，限制异常色偏
+    stage4_pcc_clip_growth_max: float = 0.005  # PCC 相对 pre_pcc 允许新增的高光裁剪比例
+    stage4_local_star_wb_enabled: bool = True  # PCC 失败/拒绝时，仅在恒星软遮罩内做保守色彩恢复
     stage4_local_star_wb_min_pixels: int = 32  # 本地星点白平衡所需的最小白参考像素数
-    stage4_local_star_wb_gain_limit: float = 1.25  # 本地星点白平衡单通道增益限制，避免替代光度校准
-    stage4_local_star_wb_target_aware_enabled: bool = False  # 发射/双窄带目标默认跳过本地星点白平衡以保护 Hα/OIII 色彩
+    stage4_local_star_wb_gain_limit: float = 1.20  # 恒星软遮罩内单通道增益限制，避免替代光度校准
+    stage4_local_star_mask_radius: int = 2  # 恒星样本向星翼扩展的软遮罩半径，限制校色只影响局部
+    stage4_local_star_mask_coverage_max: float = 0.12  # 恒星软遮罩最大覆盖率，超限时保留输入颜色
     aberration_api_enabled: bool = False  # Disabled by default: API path may fail in siril-cli thread ownership context
 
     # 阶段 7: Starless 主体拉伸
@@ -272,9 +262,6 @@ class PipelineConfig:
     stage7_starmask_diffuse_residual_ratio_max: float = 0.08  # 清理后弥散残留能量比例硬上限，超限时禁用该星点层
     stage7_conservative_repair_enabled: bool = True  # Stage 6 去星质量差时允许在同一线性输入上调整 SyQon 参数重试
     stage7_skip_unready_starless: bool = True  # Stage6.5 判定不适合去星时，默认跳过去星并进入 review export
-    star_separation_mode: str = "linear_star_separation"  # Stage 6 固定线性输入；mild_prestretch 值仅作旧配置兼容并忽略
-    star_separation_fallback_to_mild_prestretch: bool = False  # 旧配置兼容字段；当前 SyQon 路径不做外部预拉伸
-    mild_prestretch_strength: float = 1.35  # 旧配置兼容字段；当前 Stage 6 不使用
     stage7_conservative_asinh_stretch: float = 2.00  # 旧去星前兼容门禁的诊断候选参数，不进入正式 Stage 6
     stage7_ultra_conservative_asinh_stretch: float = 1.65  # 旧去星前兼容门禁的诊断候选参数，不进入正式 Stage 6
     stage7_soft_starless_asinh_stretch: float = 1.35  # 旧去星前兼容参数；当前 Stage 6 不使用预拉伸重试

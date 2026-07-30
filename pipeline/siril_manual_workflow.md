@@ -168,30 +168,20 @@ save stage3_bgremoved
 
 ## 5. 图像解析与色彩校准
 
-默认解析和 SPCC：
+默认解析与线性宽带 PCC：
 
 ```text
 load stage3_bgremoved
 platesolve -noflip -focal=160 -pixelsize=2.90 -catalog=gaia -order=3
 save stage4_psolved
-setcpu 1
-spcc -catalog=localgaia "-oscsensor=Sony IMX585" "-oscfilter=ZWO Seestar LP" "-whiteref=Average Spiral Galaxy" -limitmag=10.5
-setcpu <restore_cpu>
+save stage4_pre_pcc
+pcc -catalog=gaia
+save stage4_pcc_candidate
 save stage4_color
 save stage4_colorbalanced
 ```
 
-无 LP 滤镜时，把 SPCC 命令替换为：
-
-```text
-spcc -catalog=localgaia "-oscsensor=Sony IMX585" "-oscfilter=No filter" "-whiteref=Average Spiral Galaxy" -limitmag=10.5
-```
-
-窄带或双窄带时，把 SPCC 命令替换为：
-
-```text
-spcc -catalog=localgaia "-oscsensor=Sony IMX585" "-whiteref=Average Spiral Galaxy" -narrowband -rwl=656.28 -rbw=20 -gwl=500.70 -gbw=30 -bwl=500.70 -bbw=30 -limitmag=10.5
-```
+自动流程会在独立 Siril CLI 中执行这一条 PCC，超时固定 30 秒且不重试。只有确认线性的宽带 RGB/OSC 输入允许调用；窄带、HOO/SHO、双窄带、单色或非线性输入直接跳过。
 
 解析失败但 header 有中心坐标时重试：
 
@@ -199,31 +189,28 @@ spcc -catalog=localgaia "-oscsensor=Sony IMX585" "-whiteref=Average Spiral Galax
 platesolve <ra>,<dec> -focal=160 -pixelsize=2.90 -catalog=gaia -order=3
 ```
 
-SPCC 失败时按顺序尝试 PCC：
+PCC 失败、超时或目标感知质量门拒绝时：
 
 ```text
-pcc -catalog=localgaia
-pcc -catalog=gaia
-pcc -catalog=nomad
-pcc -catalog=apass
+load stage4_pre_pcc
 save stage4_color
 save stage4_colorbalanced
 ```
+
+自动流程随后只允许通过星点软掩膜做局部颜色恢复；星点不足时原样保留。禁止对整幅图像做背景中性化或全图白平衡。
 
 参数来源：
 
 - 焦距和像元：Seestar S30 Pro 远摄光路 `160 mm / 2.90 um`。
 - 解析星表默认 `gaia`。
-- PCC 星表默认 `localgaia,gaia,nomad,apass`。
-- SPCC sensor 默认 `Sony IMX585`。
-- SPCC filter 来自显式配置、FITS header、路径/文件名或目标画像。
-- `<restore_cpu>` 默认机器 CPU 数。
+- PCC 星表固定为在线 `gaia`，只调用一次。
+- `OBJECT`（例如 `M 42`）、滤镜提示和目标画像共同决定宽带/窄带策略及质量门阈值。
 
 回退：
 
 - 普通 platesolve 失败后用 header 坐标重试。
-- SPCC 失败后用 PCC。
-- PCC 失败后人工做背景中性化；发射星云/双窄带目标不要强行星点白平衡。
+- PCC 失败后必须先回载 `stage4_pre_pcc`，不得继续使用失败候选。
+- 宽带局部回退标记为需要复核；窄带按策略正常跳过 PCC，禁止全图白平衡。
 
 ## 6. 线性反卷积与轻降噪
 
@@ -303,7 +290,7 @@ save starmask_raw
 - 选择 Axiom 时使用 Axiom 2.1（CLI 参数 `--axiom21`）；缓存模型名为 `Axiom2_1.pt`，用户数据回退名为 `axiom21.pt`。
 - SyQon 默认 tile/overlap：`512 / 64`。
 - GPU 开关来自 `SEESTAR_SYQON_GPU`。
-- `SEESTAR_MILD_PRESTRETCH_STRENGTH` 仅为旧配置兼容字段，当前 Stage 6 不使用。
+- Stage 6 固定使用线性输入；`SEESTAR_STAR_SEPARATION_MODE`、`SEESTAR_STAR_SEPARATION_FALLBACK_TO_MILD_PRESTRETCH` 和 `SEESTAR_MILD_PRESTRETCH_STRENGTH` 均已退役，不再参与配置。
 
 回退：
 

@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import importlib.util
-import hashlib
-import json
 import os
 import shutil
 import subprocess
@@ -26,7 +24,6 @@ __all__ = [
     "INPUT_MODE_AUTO",
     "INPUT_MODE_LINEAR_RESUME",
     "INPUT_MODE_STAGE2_CORRECTED_RESUME",
-    "INPUT_MODE_STAGE4_PSOLVED_RESUME",
     "LINEAR_RESUME_INPUT_NAME",
     "PIPELINE_EXCLUDE_PREFIXES",
     "PIPELINE_EXCLUDE_SUBSTRINGS",
@@ -34,12 +31,10 @@ __all__ = [
     "PIPELINE_RESOURCE_REL",
     "SIRIL_COSMIC_REQUIRED_WHEEL_LABELS",
     "SIRIL_PLUGIN_RESOURCE_REL",
-    "SIRIL_SPCC_DATABASE_SEED_REL",
     "SIRIL_REQUIRED_SITE_PACKAGES",
     "SIRIL_STARLESS_REQUIRED_WHEEL_LABELS",
     "SIRIL_VENDOR_FALLBACK_PACKAGES",
     "STAGE2_CORRECTED_INPUT_NAME",
-    "STAGE4_PSOLVED_INPUT_NAME",
     "SYQON_STARLESS_BUNDLE_REL",
     "apply_siril_runtime_patches",
     "build_siril_cli_command",
@@ -47,7 +42,6 @@ __all__ = [
     "default_pipeline_path",
     "default_runtime_home",
     "default_siril_plugin_dir",
-    "default_siril_spcc_database_seed_dir",
     "is_frozen",
     "normalize_siril_config_template",
     "parse_ai_env_file",
@@ -60,9 +54,6 @@ __all__ = [
     "scrub_python_env",
     "shell_quote_path",
     "siril_state_root_from_home",
-    "siril_spcc_database_root_from_home",
-    "sync_siril_spcc_database_seed",
-    "verify_siril_spcc_database_seed",
     "verify_siril_offline_seed_venv",
 ]
 
@@ -238,9 +229,7 @@ font_scale=100
 icon_symbolic=false
 script_path=
 use_scripts_repository=false
-use_spcc_repository=false
 auto_update_scripts=false
-auto_update_spcc=false
 selected_scripts=
 warn_scripts_run=true
 show_thumbnails=true
@@ -375,9 +364,6 @@ def normalize_siril_config_template(
 
 PIPELINE_RESOURCE_REL = Path("pipeline") / "seestar_Superimpose.py"
 SIRIL_PLUGIN_RESOURCE_REL = Path("resources") / "siril_plugins"
-SIRIL_SPCC_DATABASE_SEED_REL = Path("SirilSPCCDatabaseSeed")
-SIRIL_SPCC_DATABASE_SEED_SCHEMA = "seestar.siril-spcc-database-seed.v1"
-SIRIL_SPCC_DATABASE_VERSION_MARKER = ".seestar-superimpose-spcc-seed"
 SYQON_STARLESS_BUNDLE_REL = Path("syqon_starless")
 COSMIC_CLARITY_BUNDLE_REL = Path("cosmic_clarity")
 COSMIC_CLARITY_REQUIRED_MODEL_FILES = (
@@ -410,6 +396,7 @@ AI_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_AI_ARTISTIC_PROMPT",
         "SEESTAR_AI_ARTISTIC_TIMEOUT_SEC",
         "SEESTAR_OUTPUT_FORMAT",
+        "SEESTAR_FORCE_REVIEW_ONLY_OUTPUT",
         "SEESTAR_DENOISE_ENABLE",
         "SEESTAR_DENOISE_FORCE",
         "SEESTAR_SYQON_GPU",
@@ -420,30 +407,15 @@ AI_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_TEMP_CLEANUP_TIMEOUT_SEC",
         "SEESTAR_SIRILPY_TIMEOUT_SEC",
         "SEESTAR_WORKFLOW_PLUGIN_PROBE",
-        "SEESTAR_SPCC_ENABLE",
         "SEESTAR_STAGE4_PLATESOLVE_ENABLE",
         "SEESTAR_STAGE4_PLATESOLVE_CATALOGS",
-        "SEESTAR_STAGE4_SPCC_SENSOR_MODE",
-        "SEESTAR_STAGE4_SPCC_OSC_SENSOR",
-        "SEESTAR_STAGE4_SPCC_OSC_FILTER",
-        "SEESTAR_STAGE4_SPCC_BUILTIN_DUALBAND_FILTER",
-        "SEESTAR_STAGE4_SPCC_MONO_SENSOR",
-        "SEESTAR_STAGE4_SPCC_R_FILTER",
-        "SEESTAR_STAGE4_SPCC_G_FILTER",
-        "SEESTAR_STAGE4_SPCC_B_FILTER",
-        "SEESTAR_STAGE4_SPCC_WHITE_REF",
-        "SEESTAR_STAGE4_SPCC_ADAPTIVE_WHITE_REF",
-        "SEESTAR_STAGE4_SPCC_NEBULA_WHITE_REF",
-        "SEESTAR_STAGE4_SPCC_BGTOL",
-        "SEESTAR_STAGE4_SPCC_LIMITMAG",
-        "SEESTAR_STAGE4_SPCC_RESTORE_CPU",
-        "SEESTAR_STAGE4_PCC_CATALOGS",
-        "SEESTAR_STAGE4_PCC_HEADER_FALLBACK_ENABLE",
+        "SEESTAR_STAGE4_FILTER_HINT",
+        "SEESTAR_STAGE4_PCC_TIMEOUT_SEC",
         "SEESTAR_STAGE4_LOCAL_STAR_WB_ENABLE",
         "SEESTAR_STAGE4_LOCAL_STAR_WB_MIN_PIXELS",
         "SEESTAR_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT",
-        "SEESTAR_STAGE4_LOCAL_STAR_WB_TARGET_AWARE_ENABLE",
-        "SEESTAR_SPCC_ALLOW_LIGHT_PREPROCESS",
+        "SEESTAR_STAGE4_LOCAL_STAR_MASK_RADIUS",
+        "SEESTAR_STAGE4_LOCAL_STAR_MASK_COVERAGE_MAX",
         "SEESTAR_ABERRATION_API_ENABLE",
         "SEESTAR_ABERRATION_PROVIDER",
         "SEESTAR_OPTIONAL_COLOR_TRANSFORM",
@@ -453,6 +425,7 @@ AI_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_COSMIC_NATIVE_GPU",
         "SEESTAR_STAGE5_BUILTIN_DENOISE_MOD",
         "SEESTAR_STAGE5_DECONV_ENABLE",
+        "SEESTAR_STAGE5_GRAXPERT_DECONV_ENABLE",
         "SEESTAR_STAGE5_RL_MAXSTARS",
         "SEESTAR_STAGE5_RL_PSF_KS",
         "SEESTAR_STAGE5_RL_ITERS",
@@ -463,9 +436,6 @@ AI_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_GRAXPERT_OBJECT_MODEL_PATH",
         "SEESTAR_STAGE7_QUALITY_RETRY_MAX",
         "SEESTAR_STAGE7_SKIP_UNREADY_STARLESS",
-        "SEESTAR_STAR_SEPARATION_MODE",
-        "SEESTAR_STAR_SEPARATION_FALLBACK_TO_MILD_PRESTRETCH",
-        "SEESTAR_MILD_PRESTRETCH_STRENGTH",
         "SEESTAR_STAGE7_SOFT_STARLESS_ASINH_STRETCH",
         "SEESTAR_STAGE7_BRIGHT_NEBULA_HALO_RESIDUE_SCORE_MAX",
         "SEESTAR_STAGE7_STARLESS_REPAIR_STRENGTH",
@@ -508,14 +478,6 @@ def default_siril_plugin_dir(resources: Path) -> Path:
     return project_root() / SIRIL_PLUGIN_RESOURCE_REL
 
 
-def default_siril_spcc_database_seed_dir(resources: Path) -> Path:
-    candidates = (
-        resources / SIRIL_SPCC_DATABASE_SEED_REL,
-        resources / "siril_spcc_database",
-    )
-    return next((path for path in candidates if path.is_dir()), candidates[0])
-
-
 def resolve_existing_path(candidates: list[Path]) -> Path:
     for path in candidates:
         if path.exists():
@@ -529,147 +491,6 @@ def default_runtime_home() -> Path:
 
 def siril_state_root_from_home(runtime_home: Path) -> Path:
     return runtime_home / "Library/Application Support/org.siril.Siril/siril"
-
-
-def siril_spcc_database_root_from_home(runtime_home: Path) -> Path:
-    return (
-        runtime_home
-        / "Library/Application Support/org.siril.Siril/siril-spcc-database"
-    )
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _load_siril_spcc_database_seed_manifest(
-    seed_root: Path,
-) -> tuple[dict, list[tuple[Path, str]]]:
-    manifest_path = seed_root / "manifest.json"
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise ValueError(f"SPCC seed manifest 无法读取：{manifest_path} ({exc})") from exc
-
-    if not isinstance(manifest, dict):
-        raise ValueError(f"SPCC seed manifest 格式无效：{manifest_path}")
-    if manifest.get("schema") != SIRIL_SPCC_DATABASE_SEED_SCHEMA:
-        raise ValueError(
-            "SPCC seed manifest schema 不受支持："
-            f"{manifest.get('schema')!r}"
-        )
-
-    source = manifest.get("source")
-    commit = source.get("commit") if isinstance(source, dict) else None
-    if not isinstance(commit, str) or len(commit) != 40:
-        raise ValueError("SPCC seed manifest 缺少固定的 40 位 source commit")
-
-    raw_files = manifest.get("files")
-    if not isinstance(raw_files, list) or not raw_files:
-        raise ValueError("SPCC seed manifest 未列出任何文件")
-
-    entries: list[tuple[Path, str]] = []
-    seen: set[Path] = set()
-    for item in raw_files:
-        if not isinstance(item, dict):
-            raise ValueError("SPCC seed manifest files 条目格式无效")
-        relative = Path(str(item.get("path") or ""))
-        expected_sha256 = str(item.get("sha256") or "").lower()
-        if (
-            not relative.parts
-            or relative.is_absolute()
-            or ".." in relative.parts
-            or relative in seen
-        ):
-            raise ValueError(f"SPCC seed manifest 文件路径无效：{relative}")
-        if len(expected_sha256) != 64 or any(
-            char not in "0123456789abcdef" for char in expected_sha256
-        ):
-            raise ValueError(f"SPCC seed manifest SHA-256 无效：{relative}")
-        seen.add(relative)
-        entries.append((relative, expected_sha256))
-    return manifest, entries
-
-
-def verify_siril_spcc_database_seed(
-    seed_root: Path,
-    runtime_home: Path,
-) -> tuple[bool, str]:
-    try:
-        manifest, entries = _load_siril_spcc_database_seed_manifest(seed_root)
-        target_root = siril_spcc_database_root_from_home(runtime_home)
-        for relative, expected_sha256 in entries:
-            source = seed_root / relative
-            if not source.is_file():
-                return False, f"bundled SPCC seed 文件缺失：{source}"
-            if _file_sha256(source) != expected_sha256:
-                return False, f"bundled SPCC seed 校验失败：{source}"
-            target = target_root / relative
-            if not target.is_file():
-                return False, f"runtime SPCC 数据文件缺失：{target}"
-            if _file_sha256(target) != expected_sha256:
-                return False, f"runtime SPCC 数据校验失败：{target}"
-        commit = manifest["source"]["commit"]
-        return True, f"commit={commit}; files={len(entries)}; path={target_root}"
-    except Exception as exc:
-        return False, str(exc)
-
-
-def sync_siril_spcc_database_seed(
-    seed_root: Path,
-    runtime_home: Path,
-) -> dict[str, object]:
-    manifest, entries = _load_siril_spcc_database_seed_manifest(seed_root)
-    target_root = siril_spcc_database_root_from_home(runtime_home)
-    target_root.mkdir(parents=True, exist_ok=True)
-
-    copied: list[str] = []
-    for relative, expected_sha256 in entries:
-        source = seed_root / relative
-        if not source.is_file():
-            raise FileNotFoundError(f"bundled SPCC seed 文件缺失：{source}")
-        if _file_sha256(source) != expected_sha256:
-            raise ValueError(f"bundled SPCC seed 校验失败：{source}")
-
-        target = target_root / relative
-        if target.is_file() and _file_sha256(target) == expected_sha256:
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(f".{target.name}.seestar-tmp")
-        try:
-            shutil.copy2(source, temporary)
-            if _file_sha256(temporary) != expected_sha256:
-                raise ValueError(f"runtime SPCC 临时文件校验失败：{temporary}")
-            os.replace(temporary, target)
-        finally:
-            temporary.unlink(missing_ok=True)
-        copied.append(str(relative))
-
-    commit = manifest["source"]["commit"]
-    marker = target_root / SIRIL_SPCC_DATABASE_VERSION_MARKER
-    marker_text = (
-        f"schema={SIRIL_SPCC_DATABASE_SEED_SCHEMA}\n"
-        f"source_commit={commit}\n"
-        f"managed_files={len(entries)}\n"
-    )
-    if not marker.is_file() or marker.read_text(
-        encoding="utf-8", errors="replace"
-    ) != marker_text:
-        marker.write_text(marker_text, encoding="utf-8")
-
-    ready, detail = verify_siril_spcc_database_seed(seed_root, runtime_home)
-    if not ready:
-        raise RuntimeError(detail)
-    return {
-        "source_commit": commit,
-        "target_root": target_root,
-        "managed_files": len(entries),
-        "copied_files": copied,
-    }
 
 
 SIRIL_REQUIRED_SITE_PACKAGES = ("sirilpy", "numpy", "packaging", "requests")
@@ -705,10 +526,8 @@ SIRIL_STARLESS_REQUIRED_WHEEL_LABELS = (
 INPUT_MODE_AUTO = "auto"
 INPUT_MODE_LINEAR_RESUME = "result_linear_resume"
 INPUT_MODE_STAGE2_CORRECTED_RESUME = "stage2_corrected_resume"
-INPUT_MODE_STAGE4_PSOLVED_RESUME = "stage4_psolved_resume"
 LINEAR_RESUME_INPUT_NAME = "result_linear.fit"
 STAGE2_CORRECTED_INPUT_NAME = "stage2_corrected.fit"
-STAGE4_PSOLVED_INPUT_NAME = "stage4_psolved.fit"
 PIPELINE_EXCLUDE_PREFIXES = (
     "light_",
     "pp_",

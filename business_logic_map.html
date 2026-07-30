@@ -57,7 +57,7 @@
 <!-- ============ 图1：主业务阶段流 ============ -->
 <section>
   <h2>一、主业务阶段流（含分支判断与异常路径）</h2>
-  <p class="sub">纵向为执行顺序；菱形为关键分支/质量门控；红色为异常/降级出口；绿色为数据产物。注意 stage6/7 方法名与枚举标签存在历史错位（starless-first 重构）。</p>
+  <p class="sub">纵向为执行顺序；菱形为关键分支/质量门控；红色为异常/降级出口；绿色为数据产物。编号与当前 <code>PipelineStage</code> 正式入口一致；历史函数名仅保留兼容包装。</p>
   <div class="legend">
     <span><i class="sw" style="background:#1f3a5f"></i>业务阶段</span>
     <span><i class="sw" style="background:#5e4a14"></i>分支/门控</span>
@@ -139,20 +139,20 @@
       <text class="ts" x="668" y="523" text-anchor="start">GraXpert→ADBE→DBE→subsky</text>
 
       <rect class="stg" x="360" y="536" width="280" height="40" rx="7"/>
-      <text class="t" x="500" y="560" text-anchor="middle">4 色彩校准 platesolve+SPCC</text>
+      <text class="t" x="500" y="560" text-anchor="middle">4 色彩校准 platesolve+单次PCC</text>
       <polygon class="ex" points="640,556 660,568 640,580 620,568"/>
       <text class="ts" x="668" y="571" text-anchor="start">PCC→local 回退</text>
 
       <rect class="stg" x="360" y="584" width="280" height="40" rx="7"/>
-      <text class="t" x="500" y="608" text-anchor="middle">5 线性降噪 反卷积+CC</text>
-      <text class="ts" x="500" y="624" text-anchor="middle">RL/GraXpert → CosmicClarity 原生回退</text>
+      <text class="t" x="500" y="608" text-anchor="middle">5 线性整理：反卷积 + 轻量降噪</text>
+      <text class="ts" x="500" y="624" text-anchor="middle">GraXpert Object → Siril RL；内置 denoise → CC 回退</text>
 
       <path class="arr" d="M500 656 L500 686" marker-end="url(#a)"/>
 
       <!-- Stage 6 star separation -->
       <rect class="stg" x="320" y="686" width="360" height="48" rx="9"/>
-      <text class="th" x="500" y="706" text-anchor="middle">6 去星分离 (stage7_star_separation)</text>
-      <text class="ts" x="500" y="722" text-anchor="middle">SyQon → SASP Dark Star → mild-prestretch</text>
+      <text class="th" x="500" y="706" text-anchor="middle">6 去星分离 (run_stage6_star_separation)</text>
+      <text class="ts" x="500" y="722" text-anchor="middle">SyQon → SASP Dark Star（固定线性输入）</text>
       <polygon class="ex" points="680,710 700,722 680,734 660,722"/>
       <text class="ts" x="708" y="725" text-anchor="start">全失败→SirilError</text>
       <path class="arr" d="M500 734 L500 760" marker-end="url(#a)"/>
@@ -164,7 +164,7 @@
 
       <!-- Stage 7 stretch -->
       <rect class="stg" x="320" y="822" width="360" height="46" rx="9"/>
-      <text class="th" x="500" y="841" text-anchor="middle">7 主体拉伸 (stage6_stretching)</text>
+      <text class="th" x="500" y="841" text-anchor="middle">7 主体拉伸 (run_stage7_stretching)</text>
       <text class="ts" x="500" y="857" text-anchor="middle">可选 AI 顾问拉伸候选</text>
       <polygon class="ex" points="680,845 700,857 680,869 660,857"/>
       <text class="ts" x="708" y="860" text-anchor="start">全失败→failed</text>
@@ -173,34 +173,35 @@
       <!-- Stage 8 enhancement -->
       <rect class="stg" x="320" y="892" width="360" height="46" rx="9"/>
       <text class="th" x="500" y="911" text-anchor="middle">8 星云增强 (stage8)</text>
-      <text class="ts" x="500" y="927" text-anchor="middle">SASP WaveScale/DSE + 蓝色门控回滚</text>
+      <text class="ts" x="500" y="927" text-anchor="middle">SASP / 内置受掩增强 + 色彩与质量门控</text>
       <polygon class="ex" points="680,915 700,927 680,939 660,927"/>
-      <text class="ts" x="708" y="930" text-anchor="start">深加工失败→_stage8_fallback</text>
+      <text class="ts" x="708" y="930" text-anchor="start">质量差→保守重跑/回退</text>
       <path class="arr" d="M500 938 L500 962" marker-end="url(#a)"/>
 
       <!-- Stage 9 remix -->
       <rect class="stg" x="320" y="962" width="360" height="46" rx="9"/>
       <text class="th" x="500" y="981" text-anchor="middle">9 星点重混 (stage9)</text>
-      <text class="ts" x="500" y="997" text-anchor="middle">导入 starmask，受 _stage8_fallback 约束</text>
+      <text class="ts" x="500" y="997" text-anchor="middle">Starmask 拉伸/校色 + Screen 回混，质量门控</text>
       <path class="arr" d="M500 1008 L500 1032" marker-end="url(#a)"/>
 
       <!-- Stage 10 export -->
       <rect class="stg" x="320" y="1032" width="360" height="52" rx="9"/>
-      <text class="th" x="500" y="1052" text-anchor="middle">10 导出 (stage10)</text>
-      <text class="ts" x="500" y="1068" text-anchor="middle">四级降噪回退 → TIFF/PNG/FITS</text>
+      <text class="th" x="500" y="1052" text-anchor="middle">10 最终降噪与导出 (stage10)</text>
+      <text class="ts" x="500" y="1068" text-anchor="middle">降噪链可由低噪/重复/复核保护跳过 → TIFF/PNG/FITS</text>
       <polygon class="ex" points="680,1058 700,1070 680,1082 660,1070"/>
-      <text class="ts" x="708" y="1071" text-anchor="start">质量门控非ok→degraded</text>
+      <text class="ts" x="708" y="1071" text-anchor="start">需保守重跑→仅复核输出</text>
       <path class="arr" d="M500 1084 L500 1110" marker-end="url(#a)"/>
 
       <!-- data final -->
       <rect class="dt" x="320" y="1110" width="360" height="38" rx="8"/>
-      <text class="t" x="500" y="1133" text-anchor="middle">result_processed.{tif,png} / result_final.fit</text>
+      <text class="t" x="500" y="1129" text-anchor="middle">正常：result_processed.{tif,png} / result_final.fit</text>
+      <text class="ts" x="500" y="1142" text-anchor="middle">复核：result_review*（不写普通交付名称）</text>
       <path class="arr" d="M500 1148 L500 1172" marker-end="url(#a)"/>
 
       <!-- Stage 11 AI -->
       <rect class="ai" x="320" y="1172" width="360" height="50" rx="9"/>
       <text class="th" x="500" y="1192" text-anchor="middle">11 AI 后期 (可选, stage11)</text>
-      <text class="ts" x="500" y="1208" text-anchor="middle">缺env→skipped；质量门控降强度重试</text>
+      <text class="ts" x="500" y="1208" text-anchor="middle">关闭/缺配置/复核输出→skipped；质量失败降强度重试</text>
       <polygon class="ex" points="680,1197 700,1209 680,1221 660,1209"/>
       <text class="ts" x="708" y="1210" text-anchor="start">失败/降级→不阻断stage10</text>
       <path class="arr" d="M500 1222 L500 1246" marker-end="url(#a)"/>
@@ -212,14 +213,14 @@
 
       <!-- cleanup -->
       <rect class="stg" x="350" y="1304" width="300" height="44" rx="9"/>
-      <text class="t" x="500" y="1324" text-anchor="middle">cleanup() 清理中间 .fit/.seq</text>
-      <text class="ts" x="500" y="1339" text-anchor="middle">保留 starless.fit / starmask.fit</text>
+      <text class="t" x="500" y="1324" text-anchor="middle">cleanup() 归档诊断并清理中间文件</text>
+      <text class="ts" x="500" y="1339" text-anchor="middle">Debug 保留 stage*；常规保留星点层白名单</text>
       <path class="arr" d="M500 1348 L500 1372" marker-end="url(#a)"/>
 
       <!-- top-level exception -->
       <rect class="ex" x="350" y="1372" width="300" height="46" rx="9"/>
       <text class="th" x="500" y="1392" text-anchor="middle">顶层异常拦截</text>
-      <text class="ts" x="500" y="1407" text-anchor="middle">KeyboardInterrupt/Exception → finally 断开 Siril</text>
+      <text class="ts" x="500" y="1407" text-anchor="middle">记录并上抛异常；finally 断开 Siril</text>
       <path class="arr" d="M850 396 L900 396 L900 1395 L800 1395" marker-end="url(#a)" stroke-dasharray="5 4"/>
       <text class="ts" x="905" y="900" text-anchor="start">任意阶段抛错</text>
 
@@ -227,12 +228,12 @@
       <rect class="ex" x="700" y="1290" width="250" height="118" rx="9" stroke-dasharray="4 3"/>
       <text class="th" x="825" y="1310" text-anchor="middle" fill="#f85149">GUI 子进程容错</text>
       <text class="ts" x="712" y="1330" text-anchor="start">· bootstrap 超时→环境异常</text>
-      <text class="ts" x="712" y="1348" text-anchor="start">· SPCC 崩溃(-11)→禁SPCC重跑</text>
+      <text class="ts" x="712" y="1348" text-anchor="start">· PCC失败/超时→回载线性检查点</text>
       <text class="ts" x="712" y="1366" text-anchor="start">· venv 重置+离线seed重试</text>
       <text class="ts" x="712" y="1384" text-anchor="start">· 备用 Siril 运行时遍历重试</text>
     </svg>
   </div>
-  <p class="note">说明：stage 编号以 <code>PipelineStage</code> 枚举标签为准（见 pipeline/models.py）。方法名 <code>stage6_star_separation</code> 实际调用 <code>run_stage7_star_separation</code>，<code>stage7_stretching</code> 调用 <code>run_stage6_stretching</code>；环境变量 <code>STAGE7_*</code> 为历史兼容别名。</p>
+  <p class="note">说明：stage 编号以 <code>PipelineStage</code> 枚举标签为准（见 pipeline/models.py）。<code>stage6_star_separation</code> 调用 <code>run_stage6_star_separation</code>，<code>stage7_stretching</code> 调用 <code>run_stage7_stretching</code>；旧函数名、产物别名和 <code>STAGE7_*</code> 变量仅用于兼容。</p>
 </section>
 
 <!-- ============ 图2：编排调用链 ============ -->
@@ -277,7 +278,7 @@
       <!-- runtime mixin -->
       <rect class="g" x="320" y="328" width="360" height="46" rx="9"/>
       <text class="th" x="500" y="347" text-anchor="middle">ProcessorRuntimeMixin</text>
-      <text class="ts" x="500" y="363" text-anchor="middle">env 覆盖(80+SEESTAR_*) · 质量度量 · FITS 头</text>
+      <text class="ts" x="500" y="363" text-anchor="middle">SEESTAR_* env 覆盖 · 质量度量 · FITS 头</text>
       <path class="arr" d="M500 374 L500 400" marker-end="url(#b)"/>
 
       <!-- stages cluster -->
@@ -364,7 +365,8 @@
       <path class="arr" d="M320 210 L320 230" marker-end="url(#c)"/>
 
       <rect class="n" x="240" y="290" width="160" height="40" rx="7"/>
-      <text class="t" x="320" y="315" text-anchor="middle">stage5_denoised.fit</text>
+      <text class="t" x="320" y="310" text-anchor="middle">stage5_linear.fit</text>
+      <text class="ts" x="320" y="324" text-anchor="middle">兼容：stage5_denoised.fit</text>
       <path class="arr" d="M320 270 L320 290" marker-end="url(#c)"/>
 
       <!-- stage6 output to starless -->
@@ -382,7 +384,8 @@
       <path class="arr" d="M565 394 L565 414" marker-end="url(#c)"/>
 
       <rect class="dt" x="480" y="474" width="170" height="40" rx="7"/>
-      <text class="t" x="565" y="499" text-anchor="middle">stage8_enhanced.fit</text>
+      <text class="t" x="565" y="494" text-anchor="middle">stage8_enhanced.fit</text>
+      <text class="ts" x="565" y="507" text-anchor="middle">或保守回退源</text>
       <path class="arr" d="M565 454 L565 474" marker-end="url(#c)"/>
 
       <!-- stage9 -->
@@ -395,7 +398,8 @@
       <path class="arr" d="M830 514 L830 534" marker-end="url(#c)"/>
 
       <rect class="dt" x="740" y="594" width="180" height="40" rx="7" stroke="#3fb950"/>
-      <text class="t" x="830" y="619" text-anchor="middle">result_processed.*</text>
+      <text class="t" x="830" y="614" text-anchor="middle">result_processed.*</text>
+      <text class="ts" x="830" y="627" text-anchor="middle">或 result_review*</text>
       <path class="arr" d="M830 574 L830 594" marker-end="url(#c)"/>
 
       <!-- shared state side notes -->
@@ -431,7 +435,7 @@
         <td><code>pipeline_worker.py</code><br><span class="tag t-mod">运行层</span></td>
         <td>QThread；以 siril-cli 子进程运行 pipeline；多层容错与错误嗅探</td>
         <td>I: 临时目录副本、env、Siril 路径<br>O: log/state/done Signal、退出状态</td>
-        <td><span class="tag t-ex">bootstrap超时</span><span class="tag t-ex">SPCC崩溃(-11)禁重跑</span><span class="tag t-ex">venv重置+离线seed</span><span class="tag t-ex">备用Siril重试</span><span class="tag t-ex">_stop_event终止</span></td>
+        <td><span class="tag t-ex">bootstrap超时</span><span class="tag t-ex">PCC单次30秒超时</span><span class="tag t-ex">venv重置+离线seed</span><span class="tag t-ex">备用Siril重试</span><span class="tag t-ex">_stop_event终止</span></td>
       </tr>
       <tr>
         <td><code>seestar_Superimpose.py</code><br><span class="tag t-mod">编排器</span></td>
@@ -441,12 +445,12 @@
       </tr>
       <tr>
         <td><code>processor_runtime.py</code><br><span class="tag t-mod">基础服务</span></td>
-        <td>ProcessorRuntimeMixin：80+ SEESTAR_* env 覆盖、质量度量、FITS 头解析、像素读写、JSON 落盘</td>
+        <td>ProcessorRuntimeMixin：SEESTAR_* env 覆盖、质量度量、FITS 头解析、像素读写、JSON 落盘</td>
         <td>I: env、FITS 缓冲<br>O: cfg、质量指标、诊断 JSON</td>
         <td><span class="tag t-br">env clamp 边界</span></td>
       </tr>
       <tr>
-        <td><code>stages/stage1..10.py</code><br><span class="tag t-mod">阶段实现</span></td>
+        <td><code>stages/stage*_*.py</code><br><span class="tag t-mod">阶段实现</span></td>
         <td>各阶段纯函数：预处理、背景、色彩、降噪、去星、拉伸、增强、重混、导出</td>
         <td>I: processor、上一阶段 .fit<br>O: 本阶段 .fit + 质量 JSON</td>
         <td>见各阶段分支（下表展开）</td>
@@ -455,13 +459,13 @@
         <td><code>stage11_ai_postprocess.py</code><br><span class="tag t-mod">可选AI</span></td>
         <td>远程 AI 生成调整计划→本地应用→混合→质量门控</td>
         <td>I: stage10 产物、AI env<br>O: result_*_ai.{tif,png,fit}</td>
-        <td><span class="tag t-br">缺env→skipped</span><span class="tag t-ex">质量失败降强度重试</span><span class="tag t-ex">降级不阻断stage10</span></td>
+        <td><span class="tag t-br">关闭/缺 env/复核输出→skipped</span><span class="tag t-ex">质量失败降强度重试</span><span class="tag t-ex">降级不阻断stage10</span></td>
       </tr>
       <tr>
         <td><code>save_utils.py</code><br><span class="tag t-mod">IO</span></td>
         <td>save_stage_output / export_final_outputs：导出 tif/png/fit + fallback 命名</td>
-        <td>I: 最终图像缓冲、格式配置<br>O: result_processed.* / result_final.fit</td>
-        <td><span class="tag t-br">续跑_linear fallback</span></td>
+        <td>I: 最终图像缓冲、格式配置<br>O: 正常 result_processed.* / result_final.fit；复核 result_review*</td>
+        <td><span class="tag t-br">续跑_linear fallback</span><span class="tag t-br">复核输出隔离</span></td>
       </tr>
       <tr>
         <td><code>target_profiler / policy_selector</code><br><span class="tag t-mod">策略</span></td>
@@ -476,7 +480,7 @@
         <td><span class="tag t-ex">命令缺失→降级链</span><span class="tag t-ex">子进程超时</span></td>
       </tr>
       <tr>
-        <td><code>quality_gate / stage7_quality / stage8_pixels / image_metrics</code><br><span class="tag t-mod">质量服务</span></td>
+        <td><code>quality_gate / stage7_quality（兼容命名）/ stage8_pixels / image_metrics</code><br><span class="tag t-mod">质量服务</span></td>
         <td>阶段质量门控、去星修复、像素处理、特征度量</td>
         <td>I: 图像、阈值配置<br>O: 质量判定、修复后图像</td>
         <td><span class="tag t-br">门控非ok→降级/回滚</span></td>
@@ -496,22 +500,22 @@
       <tbody>
         <tr><td>1 准备</td><td>stacked 直接准备</td><td>light → 去拜耳+对齐+叠加</td><td><span class="tag t-ex">无输入→SirilError；注册失败率门控</span></td></tr>
         <tr><td>3 背景提取</td><td>GraXpert-AI / AutoBGE</td><td>ADBE → DBE → subsky -rbf → subsky 1</td><td><span class="tag t-ex">质量门控 bg_ok 否→fallback 保留/回滚</span></td></tr>
-        <tr><td>4 色彩校准</td><td>SPCC（platesolve 后）</td><td>PCC header 坐标 → 本地校色 _stage4_local_color_fallback</td><td><span class="tag t-ex">全程 except 降级</span></td></tr>
-        <tr><td>5 线性降噪</td><td>RL 反卷积</td><td>重载 stage5_input → GraXpert → CosmicClarity 原生</td><td><span class="tag t-ex">反卷积失败重载输入</span></td></tr>
-        <tr><td>6 去星</td><td>SyQon-Starless</td><td>SASP Dark Star → mild-prestretch 重试</td><td><span class="tag t-ex">全失败→SirilError("未找到可用去星命令")</span></td></tr>
+        <tr><td>4 色彩校准</td><td>线性宽带单次 Gaia PCC（platesolve 后）</td><td>回载 pre-PCC → 星点软掩膜局部恢复</td><td><span class="tag t-ex">目标感知质量门；禁止全图白平衡</span></td></tr>
+        <tr><td>5 线性整理</td><td>GraXpert Object 反卷积</td><td>Siril RL；背景风险→重载线性输入；内置 denoise → CosmicClarity 回退</td><td><span class="tag t-ex">处理不可用→保留当前线性图并标记 degraded</span></td></tr>
+        <tr><td>6 去星</td><td>SyQon-Starless（固定线性输入）</td><td>SASP Dark Star；星点主体/未就绪质量门可跳过去星并保留原图</td><td><span class="tag t-ex">常规路径全失败→SirilError("未找到可用去星命令")</span></td></tr>
         <tr><td>7 拉伸</td><td>固定/AI 两候选</td><td>AI 顾问候选（allow_ai）</td><td><span class="tag t-ex">全失败→stage failed</span></td></tr>
-        <tr><td>8 增强</td><td>SASP WaveScale/DSE + 内置链</td><td>蓝色门控回滚到门控前；深加工失败→_stage8_fallback_used</td><td><span class="tag t-br">降级源替代</span></td></tr>
-        <tr><td>9 重混</td><td>Starless 二次细化 + 回混</td><td>_stage8_fallback 时跳细化、限强度；外部 starmask 失败沿用本地</td><td><span class="tag t-br">降强度混合</span></td></tr>
-        <tr><td>10 导出</td><td>CosmicClarity 脚本降噪</td><td>CLI 子进程 → Native → SCUNet → Aberration API</td><td><span class="tag t-ex">全失败→degraded 跳过；最终质量门控非ok→degraded</span></td></tr>
-        <tr><td>11 AI</td><td>远程计划→本地混合</td><td>质量门控降 blend 强度重试</td><td><span class="tag t-ex">失败/降级→不阻断 stage10</span></td></tr>
+        <tr><td>8 增强</td><td>SASP / 内置受掩增强</td><td>蓝色和增强质量门控→保守重跑→回退到安全源</td><td><span class="tag t-br">降级源替代</span></td></tr>
+        <tr><td>9 重混</td><td>Starmask 拉伸/校色 + Screen 回混</td><td>坏去星→安全源并停止重混；外部 starmask 失败沿用本地；门控失败限强度/跳过</td><td><span class="tag t-br">降强度混合</span></td></tr>
+        <tr><td>10 最终导出</td><td>CosmicClarity 脚本或 Native 降噪</td><td>CLI 子进程 → Native → SCUNet → Aberration API；低噪/重复降噪/复核保护可跳过</td><td><span class="tag t-ex">需保守重跑→degraded，仅写 result_review*</span></td></tr>
+        <tr><td>11 AI</td><td>远程计划→本地混合</td><td>关闭、缺配置或 Stage10 复核输出→skipped；质量门控降 blend 强度重试</td><td><span class="tag t-ex">失败/降级→不阻断 stage10</span></td></tr>
       </tbody>
     </table>
   </div>
-  <p class="note">Stage 状态枚举：<code>ok / degraded / failed / skipped</code>；summary 可显示 <code>ok_with_fallback</code>、<code>ok_skipped_optional</code>。cleanup 后保留 <code>starless.fit</code> / <code>starmask.fit</code>（白名单）。</p>
+  <p class="note">Stage 状态枚举：<code>ok / degraded / failed / skipped</code>；summary 可显示 <code>ok_with_fallback</code>、<code>ok_skipped_optional</code>。cleanup 会先归档诊断；Debug 模式保留 <code>stage*</code>，常规模式保留 <code>starless.fit</code>、<code>starmask.fit</code> 等星点层白名单。</p>
 </section>
 
 <footer style="margin-top:50px;border-top:1px solid var(--border);padding-top:18px;color:var(--muted);font-size:12px;">
-  生成依据：README.md / AGENTS.md / INTEGRATION_README.md 与 pipeline 代码静态探查（seestar_Superimpose.py、stages/、gui/）。编号以 PipelineStage 枚举为准，方法名错位已标注。
+  生成依据：README.md / AGENTS.md / INTEGRATION_README.md 与 pipeline 代码静态探查（seestar_Superimpose.py、stages/、gui/）。编号和正式入口以 PipelineStage 枚举为准；历史函数名、产物别名和部分 <code>STAGE7_*</code> 配置只用于兼容。
 </footer>
 
 </div>

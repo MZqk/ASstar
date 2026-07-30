@@ -127,8 +127,11 @@ from stages.stage2_view_correction import run_stage2_view_correction
 from stages.stage3_background_extraction import run_stage3_background_extraction
 from stages.stage4_color_calibration import run_stage4_color_calibration
 from stages.stage5_linear_denoise import run_stage5_linear_denoise
-from stages.stage6_stretching import run_stage6_stretching
-from stages.stage7_star_separation import run_stage7_star_separation
+from stages.stage6_stretching import run_stage6_stretching, run_stage7_stretching
+from stages.stage7_star_separation import (
+    run_stage6_star_separation,
+    run_stage7_star_separation,
+)
 from stages.stage8_nebula_enhancement import run_stage8_nebula_enhancement
 from stages.stage9_star_remixing import run_stage9_star_remixing
 from stages.stage10_export import run_stage10_export
@@ -178,10 +181,8 @@ ENV_COSMIC_CLASSIC_ENABLE_KEY = "SEESTAR_COSMIC_CLASSIC_ENABLE"
 INPUT_MODE_AUTO = "auto"
 INPUT_MODE_LINEAR_RESUME = "result_linear_resume"
 INPUT_MODE_STAGE2_CORRECTED_RESUME = "stage2_corrected_resume"
-INPUT_MODE_STAGE4_PSOLVED_RESUME = "stage4_psolved_resume"
 LINEAR_RESUME_INPUT_NAME = "result_linear.fit"
 STAGE2_CORRECTED_INPUT_NAME = "stage2_corrected.fit"
-STAGE4_PSOLVED_INPUT_NAME = "stage4_psolved.fit"
 DEFAULT_AI_PROMPT = (
     "Conservative deep-sky astrophotography enhancement only. "
     "Preserve astronomical realism, faint structures, and natural star colors. "
@@ -373,7 +374,6 @@ AUTO_CLAMP_FIELDS = (
     "stage7_starmask_cleanup_noise_sigma",
     "stage7_starmask_compact_retention_min",
     "stage7_starmask_diffuse_residual_ratio_max",
-    "mild_prestretch_strength",
     "stage7_conservative_asinh_stretch",
     "stage7_ultra_conservative_asinh_stretch",
     "stage7_soft_starless_asinh_stretch",
@@ -493,7 +493,6 @@ CLAMP_RULES: list[tuple[str, type, float, float]] = [
     ("stage7_starmask_cleanup_noise_sigma", float, 1.0, 6.0),
     ("stage7_starmask_compact_retention_min", float, 0.60, 0.98),
     ("stage7_starmask_diffuse_residual_ratio_max", float, 0.01, 0.50),
-    ("mild_prestretch_strength", float, 1.05, 1.80),
     ("stage7_conservative_asinh_stretch", float, 1.60, 2.60),
     ("stage7_conservative_asinh_offset", float, 0.0005, 0.0060),
     ("stage7_starless_repair_strength", float, 0.0, 0.85),
@@ -922,7 +921,7 @@ def format_config_summary(cfg: PipelineConfig) -> str:
     return (
         "crop_margin={:.3f}, bg_samples={}, bg_tol={:.2f}, bg_smooth={:.2f}, "
         "denoise={}({:.2f}), asinh=({:.2f},{:.4f}), ghs=({:.2f},{:.2f}), "
-        "nebula_sat={:.2f}, star_mode={}, star_input_domain=linear, "
+        "nebula_sat={:.2f}, star_input_domain=linear, external_prestretch=false, "
         "star_intensity={:.2f}, final_sat={:.2f}, "
         "ai_enabled={}, ai_strength={:.2f}"
     ).format(
@@ -937,7 +936,6 @@ def format_config_summary(cfg: PipelineConfig) -> str:
         cfg.ghs_shadowsclip,
         cfg.ghs_stretchamount,
         cfg.nebula_saturation,
-        cfg.star_separation_mode,
         cfg.star_intensity,
         cfg.final_saturation,
         cfg.ai_post_enabled,
@@ -968,7 +966,7 @@ class SeestarPostProcessor(
     # 非幂等命令 - 不应自动重试
     _NON_IDEMPOTENT = frozenset({
         'stack', 'calibrate', 'register', 'seqapplyreg', 'link',
-        'save', 'savetif', 'savepng', 'savejpg', 'pm',
+        'save', 'savetif', 'savepng', 'savejpg', 'pm', 'pcc',
     })
 
     # 可重试的 CommandStatus 代码
@@ -1510,77 +1508,6 @@ class SeestarPostProcessor(
                 except OSError as e:
                     self.log.debug(f"Unable to remove temp stage2 input {temp_source.name}: {e}")
 
-    def _stage4_psolved_resume_candidates(self) -> List[Path]:
-        candidates = [
-            self.work_dir / "process" / STAGE4_PSOLVED_INPUT_NAME,
-            self.work_dir / STAGE4_PSOLVED_INPUT_NAME,
-        ]
-        seen = set()
-        unique: List[Path] = []
-        for path in candidates:
-            resolved = path.resolve() if path.exists() else path
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            unique.append(path)
-        return unique
-
-    def _prepare_stage4_psolved_resume_input(self) -> None:
-        source_path = next(
-            (
-                path
-                for path in self._stage4_psolved_resume_candidates()
-                if path.is_file() and path.stat().st_size > 0
-            ),
-            None,
-        )
-        if source_path is None:
-            searched = ", ".join(
-                str(path) for path in self._stage4_psolved_resume_candidates()
-            )
-            raise SirilError(
-                f"未找到 SPCC 崩溃恢复输入 {STAGE4_PSOLVED_INPUT_NAME}，已检查: {searched}"
-            )
-
-        temp_source: Optional[Path] = None
-        source_for_copy = source_path
-        process_dir_candidate = self.work_dir / "process"
-        try:
-            if process_dir_candidate in source_path.parents:
-                fd, temp_name = tempfile.mkstemp(
-                    prefix="seestar_stage4_psolved_",
-                    suffix=".fit",
-                    dir=str(self.work_dir),
-                )
-                os.close(fd)
-                temp_source = Path(temp_name)
-                shutil.copy2(source_path, temp_source)
-                source_for_copy = temp_source
-
-            self._prepare_process_dir()
-            psolved_file = self.process_dir / STAGE4_PSOLVED_INPUT_NAME
-            shutil.copy2(source_for_copy, psolved_file)
-            self.source_file = psolved_file
-            self.linear_intermediate_path = None
-            self._stage1_input_mode = INPUT_MODE_STAGE4_PSOLVED_RESUME
-            self._stage1_registration_stats = None
-            self.platesolve_ok = True
-
-            self.log.info(
-                f"SPCC 崩溃恢复输入: {source_path}; 从 Stage 4 校色检查点继续"
-            )
-            self.cmd_with_check("cd", f'"{self.process_dir}"')
-            self.cmd_with_check("load", "stage4_psolved")
-        finally:
-            if temp_source is not None:
-                try:
-                    temp_source.unlink()
-                except OSError as e:
-                    self.log.debug(
-                        "Unable to remove temp stage4 psolved input "
-                        f"{temp_source.name}: {e}"
-                    )
-
     def _apply_forced_runtime_switches(self):
         if self._force_denoise_enabled is not None:
             if self.cfg.denoise_enabled != self._force_denoise_enabled:
@@ -1799,10 +1726,13 @@ class SeestarPostProcessor(
         return run_stage5_linear_denoise(self)
 
     def stage7_stretching(self):
-        return run_stage6_stretching(self)
+        return run_stage7_stretching(self)
 
     def stage6_stretching(self):
         """Deprecated compatibility alias for stage7_stretching()."""
+        self.log.warn(
+            "stage6_stretching() is a legacy alias; use stage7_stretching()"
+        )
         return self.stage7_stretching()
 
     def pre_starless_compatibility_gate(self):
@@ -1843,20 +1773,15 @@ class SeestarPostProcessor(
             if recommended.endswith(".fit"):
                 recommended = recommended[:-4]
             if recommended != source_stem:
-                records = self._stage7_build_conservative_starless_inputs()
-                report["conservative_inputs"] = records
-                report["fallback_created"] = any(
-                    item.get("stem") == recommended and item.get("status") == "ok"
-                    for item in records
+                report["ignored_recommended_starless_input"] = recommended
+                recommended = source_stem
+                report["recommended_starless_input"] = recommended
+                report["fallback_created"] = False
+                report.setdefault("reason", []).append(
+                    "external pre-stretch is disabled; star separation keeps the "
+                    "linear source and lets the star-removal tool perform its own "
+                    "reversible pre-stretch"
                 )
-                if self.process_dir and not (self.process_dir / f"{recommended}.fit").exists():
-                    fallback = "stage7_conservative_asinh"
-                    if (self.process_dir / f"{fallback}.fit").exists():
-                        recommended = fallback
-                    else:
-                        recommended = source_stem
-                    report["recommended_starless_input"] = recommended
-                    report.setdefault("reason", []).append("recommended fallback missing; using available source")
             self.pre_starless_gate_report = report
             self._write_stage_json("pre_starless_gate_report.json", report)
             self.log.info(
@@ -1906,10 +1831,13 @@ class SeestarPostProcessor(
     # 阶段 6: 星点分离（starless-first，先于主体拉伸执行）
     # ========================================
     def stage6_star_separation(self):
-        return run_stage7_star_separation(self)
+        return run_stage6_star_separation(self)
 
     def stage7_star_separation(self):
         """Deprecated compatibility alias for stage6_star_separation()."""
+        self.log.warn(
+            "stage7_star_separation() is a legacy alias; use stage6_star_separation()"
+        )
         return self.stage6_star_separation()
 
     def stage8_nebula_enhancement(self):
@@ -2179,23 +2107,6 @@ class SeestarPostProcessor(
                     PipelineStage.LINEAR_DENOISE.label,
                     "skipped by linear resume mode",
                 )
-            elif self.input_mode == INPUT_MODE_STAGE4_PSOLVED_RESUME:
-                self._record_skipped_stage(
-                    PipelineStage.PREPARATION.label,
-                    "skipped by stage4 psolved crash-resume mode",
-                )
-                self._record_skipped_stage(
-                    PipelineStage.VIEW_CORRECTION.label,
-                    "skipped by stage4 psolved crash-resume mode",
-                )
-                self._record_skipped_stage(
-                    PipelineStage.BACKGROUND_EXTRACTION.label,
-                    "skipped by stage4 psolved crash-resume mode",
-                )
-                self._prepare_stage4_psolved_resume_input()
-                self._auto_tune_for_current_input()
-                self.stage4_color_calibration()
-                self.stage5_linear_denoise()
             elif self.input_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
                 self._prepare_stage2_corrected_resume_input()
                 self._auto_tune_for_current_input()

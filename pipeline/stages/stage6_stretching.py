@@ -4,7 +4,7 @@ from typing import List
 from models import PipelineStage
 
 
-def run_stage6_stretching(pipeline) -> None:
+def run_stage7_stretching(pipeline) -> None:
     """
     阶段 7: 主体拉伸
     - 输入固定为 stage6_starless.fit
@@ -97,3 +97,11 @@ def run_stage6_stretching(pipeline) -> None:
         else:
             message_text = "所有拉伸方法均失败"
         pipeline._record_stage(stage_label, 'failed', elapsed, message_text)
+
+
+def run_stage6_stretching(pipeline) -> None:
+    """Deprecated compatibility alias for the formal Stage 7 stretch."""
+    pipeline.log.warn(
+        "run_stage6_stretching() is a legacy alias; use run_stage7_stretching()"
+    )
+    return run_stage7_stretching(pipeline)

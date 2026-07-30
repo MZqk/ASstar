@@ -70,10 +70,12 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -85,6 +87,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSplitter,
+    QSpinBox,
     QStackedWidget,
     QToolBar,
     QVBoxLayout,
@@ -223,6 +226,37 @@ WORKSPACE_EMPTY = "empty"
 WORKSPACE_TASK = "task"
 WORKSPACE_RUN = "run"
 
+DEFAULT_PROCESSING_SETTINGS = {
+    "output_formats": ("tif", "png", "fit"),
+    "review_only": False,
+    "color_calibration": "pcc",
+    "filter_hint": "auto",
+    "denoise_mode": "auto",
+    "deconvolution_mode": "auto",
+    "graxpert_model_path": "",
+    "compute_mode": "auto",
+    "pcc_timeout_sec": 30,
+    "local_wb_gain_limit": 1.20,
+    "builtin_denoise_strength": 0.50,
+    "graxpert_deconv_strength": 0.30,
+    "rl_iterations": 8,
+    "rl_maxstars": 200,
+    "starless_retry_max": 2,
+    "starless_repair_strength": 0.68,
+    "starless_halo_repair_strength": 0.70,
+    "starless_chroma_strength": 0.55,
+    "starmask_asinh_stretch": 2.00,
+    "weak_star_recovery_ratio": 0.70,
+}
+VALID_OUTPUT_FORMATS = frozenset({"tif", "png", "fit"})
+VALID_COLOR_CALIBRATION_MODES = frozenset({"pcc"})
+VALID_FILTER_HINT_MODES = frozenset(
+    {"auto", "no_filter", "seestar_lp", "dual_narrowband"}
+)
+VALID_DENOISE_MODES = frozenset({"auto", "on", "off"})
+VALID_DECONVOLUTION_MODES = frozenset({"auto", "rl", "off"})
+VALID_COMPUTE_MODES = frozenset({"auto", "cpu"})
+
 
 class SeestarGui(QMainWindow):
     thread_log = Signal(str)
@@ -258,9 +292,6 @@ class SeestarGui(QMainWindow):
             self.resources / "Siril.app" / "Contents" / "MacOS" / "siril-cli"
         )
         self.siril_seed_dir = self.resources / "SirilPythonSeed"
-        self.siril_spcc_seed_dir = default_siril_spcc_database_seed_dir(
-            self.resources
-        )
         config_candidates = [
             self.resources / "config.1.4.ini.template",
         ]
@@ -291,6 +322,54 @@ class SeestarGui(QMainWindow):
         self.ai_custom_endpoint = ""
         self.ai_custom_model = ""
         self._pending_ai_runtime_overrides: dict[str, str] = {}
+        self._pending_runtime_overrides: dict[str, str] = {}
+        self._pending_runtime_unset_keys: set[str] = set()
+        self.processing_parameters_expanded = False
+        self._processing_controls_updating = False
+        self.output_formats = tuple(DEFAULT_PROCESSING_SETTINGS["output_formats"])
+        self.review_only = bool(DEFAULT_PROCESSING_SETTINGS["review_only"])
+        self.color_calibration = str(
+            DEFAULT_PROCESSING_SETTINGS["color_calibration"]
+        )
+        self.filter_hint = str(DEFAULT_PROCESSING_SETTINGS["filter_hint"])
+        self.denoise_mode = str(DEFAULT_PROCESSING_SETTINGS["denoise_mode"])
+        self.deconvolution_mode = str(
+            DEFAULT_PROCESSING_SETTINGS["deconvolution_mode"]
+        )
+        self.graxpert_model_path = str(
+            DEFAULT_PROCESSING_SETTINGS["graxpert_model_path"]
+        )
+        self.compute_mode = str(DEFAULT_PROCESSING_SETTINGS["compute_mode"])
+        self.pcc_timeout_sec = int(DEFAULT_PROCESSING_SETTINGS["pcc_timeout_sec"])
+        self.local_wb_gain_limit = float(
+            DEFAULT_PROCESSING_SETTINGS["local_wb_gain_limit"]
+        )
+        self.builtin_denoise_strength = float(
+            DEFAULT_PROCESSING_SETTINGS["builtin_denoise_strength"]
+        )
+        self.graxpert_deconv_strength = float(
+            DEFAULT_PROCESSING_SETTINGS["graxpert_deconv_strength"]
+        )
+        self.rl_iterations = int(DEFAULT_PROCESSING_SETTINGS["rl_iterations"])
+        self.rl_maxstars = int(DEFAULT_PROCESSING_SETTINGS["rl_maxstars"])
+        self.starless_retry_max = int(
+            DEFAULT_PROCESSING_SETTINGS["starless_retry_max"]
+        )
+        self.starless_repair_strength = float(
+            DEFAULT_PROCESSING_SETTINGS["starless_repair_strength"]
+        )
+        self.starless_halo_repair_strength = float(
+            DEFAULT_PROCESSING_SETTINGS["starless_halo_repair_strength"]
+        )
+        self.starless_chroma_strength = float(
+            DEFAULT_PROCESSING_SETTINGS["starless_chroma_strength"]
+        )
+        self.starmask_asinh_stretch = float(
+            DEFAULT_PROCESSING_SETTINGS["starmask_asinh_stretch"]
+        )
+        self.weak_star_recovery_ratio = float(
+            DEFAULT_PROCESSING_SETTINGS["weak_star_recovery_ratio"]
+        )
 
         self._init_ui()
         self._progress_timer = QTimer(self)
@@ -299,22 +378,6 @@ class SeestarGui(QMainWindow):
         self.thread_log.connect(self._append_text)
         self._load_settings()
         self._set_running(False)
-        try:
-            spcc_ready, spcc_detail = verify_siril_spcc_database_seed(
-                self.siril_spcc_seed_dir,
-                self.runtime_home,
-            )
-            if not spcc_ready:
-                self._append_event(
-                    "Siril SPCC 固定数据库将在任务开始前准备："
-                    + spcc_detail
-                )
-        except Exception as e:
-            self._append_event(
-                "Siril SPCC 固定数据库启动校验失败；"
-                f"任务开始前将重试，失败时改走 PCC：{e}"
-            )
-
         self._append_event("已就绪。请选择或拖入工作目录。")
 
     def _section_block(self, title: str, body_lines: list[str]) -> list[str]:
@@ -388,14 +451,12 @@ class SeestarGui(QMainWindow):
             "  - 处理过程包含预检、重试、降级回退和阶段状态记录。",
             "  - 输出高质量 TIFF、预览 PNG、拉伸前线性 FITS 和最终 FITS 归档。",
             f"  - 当前处理方式: {self._input_mode_label(self.input_mode)}。",
-            f"  - AI 后期: {'开启' if self.ai_stage_enabled else '关闭'}。",
             f"  - 保留中间文件: {'开启' if self.debug_mode_enabled else '关闭'}。",
             f"  - 允许联网: {'开启' if self.network_mode_enabled else '关闭'}。",
         ]))
         lines.extend(self._section_block("处理阶段总览", [
             "  线性阶段: 1.前期准备 -> 2.裁切 -> 3.背景提取 -> 4.图像解析+色彩校准 -> 5.线性降噪/反卷积",
             "  非线性阶段: 6.去星与星点层准备 -> 7.主体拉伸 -> 8.Starless 深加工 -> 9.星点处理与合成 -> 10.最终降噪与导出",
-            "  可选阶段: 11.AI 后期美化（可使用开发者试用或自定义模型）",
         ]))
         lines.extend(self._section_block("阶段文件命名", [
             "  - 阶段 6 去星: stage6_starless.fit / stage6_starless_quality.json。",
@@ -440,27 +501,6 @@ class SeestarGui(QMainWindow):
 
     def _siril_state_root(self) -> Path:
         return siril_state_root_from_home(self.runtime_home)
-
-    def _ensure_runtime_spcc_database_seed(self) -> dict[str, object]:
-        result = sync_siril_spcc_database_seed(
-            self.siril_spcc_seed_dir,
-            self.runtime_home,
-        )
-        copied = list(result.get("copied_files") or [])
-        commit = str(result.get("source_commit") or "unknown")
-        target_root = Path(result["target_root"])
-        if copied:
-            self._append_event(
-                "已同步 Siril SPCC 固定数据库到隔离运行目录："
-                f"commit={commit[:12]}, files={len(copied)}, "
-                f"path={self._display_path(target_root)}"
-            )
-        else:
-            self._append_event(
-                "Siril SPCC 固定数据库校验通过："
-                f"commit={commit[:12]}, path={self._display_path(target_root)}"
-            )
-        return result
 
     def _rewrite_seeded_venv(self, venv_dir: Path) -> None:
         py_bin = (
@@ -723,13 +763,13 @@ class SeestarGui(QMainWindow):
         for label in (
             self.linear_phase_label,
             self.nonlinear_phase_label,
-            self.ai_phase_label,
         ):
             label.setStyleSheet(
                 "padding: 9px 12px; border: 1px solid rgba(127,127,127,0.28);"
                 " border-radius: 8px;"
             )
             phase_row.addWidget(label, 1)
+        self.ai_phase_label.hide()
         phase_layout.addLayout(phase_row)
         page_layout.addWidget(phase_card)
         return page
@@ -786,6 +826,11 @@ class SeestarGui(QMainWindow):
         self.mode_combo.setAccessibleDescription(
             "选择自动推荐、完整处理或从已有阶段继续"
         )
+        self.mode_combo.setToolTip(
+            "用途：选择流水线起点；默认：自动推荐。完整处理执行 Stage 1–10；"
+            "从裁切后继续会跳过 Stage 1–2；从线性处理后继续会跳过 Stage 1–5，"
+            "因此色彩校准、降噪和反卷积设置不再生效。"
+        )
         self.mode_combo.addItem("自动推荐（完整处理）", UI_MODE_RECOMMENDED)
         self.mode_combo.addItem("完整处理", INPUT_MODE_AUTO)
         self.mode_combo.addItem("从裁切后继续", INPUT_MODE_STAGE2_CORRECTED_RESUME)
@@ -799,7 +844,7 @@ class SeestarGui(QMainWindow):
         self.advanced_toggle_btn = QPushButton("高级设置 ▸")
         self.advanced_toggle_btn.setAccessibleName("展开高级设置")
         self.advanced_toggle_btn.setAccessibleDescription(
-            "显示或隐藏 AI 后期、模型配置、保留中间文件和联网设置"
+            "显示或隐藏处理参数、保留中间文件和联网设置"
         )
         self.advanced_toggle_btn.setCheckable(True)
         self.advanced_toggle_btn.toggled.connect(self._on_advanced_toggled)
@@ -822,30 +867,52 @@ class SeestarGui(QMainWindow):
         self.ai_config_btn.clicked.connect(self._configure_ai_model)
         self.ai_provider_status_label = QLabel("开发者试用")
         self.ai_provider_status_label.setAccessibleName("当前 AI 模型配置")
+        self.processing_params_btn = QPushButton("处理参数…")
+        self.processing_params_btn.setAccessibleName("配置本次图像处理参数")
+        self.processing_params_btn.setAccessibleDescription(
+            "在当前任务设置下方展开或收起输出、色彩校准、线性处理和性能兼容选项"
+        )
+        self.processing_params_btn.setToolTip(
+            "在下方展开处理参数。所有非敏感参数会保存为下次默认值，"
+            "任务开始后将冻结为本次运行配置。"
+        )
+        self.processing_params_btn.clicked.connect(self._configure_processing_parameters)
         self.debug_btn = QCheckBox("保留中间文件")
         self.debug_btn.setAccessibleName("保留中间文件")
         self.debug_btn.setAccessibleDescription(
-            "保留各处理阶段的中间文件和诊断信息"
+            "用途：保留各处理阶段的 FITS 和诊断报告；默认：关闭。"
+            "开启便于质量复核和排障，但会显著增加磁盘占用。"
         )
+        self.debug_btn.setToolTip(self.debug_btn.accessibleDescription())
         self.debug_btn.setChecked(self.debug_mode_enabled)
         self.debug_btn.toggled.connect(self._on_debug_toggled)
         self.network_btn = QCheckBox("允许联网")
         self.network_btn.setAccessibleName("允许联网")
         network_description = (
-            "默认关闭；开启后允许在线星表查询、插件补齐和已配置的 AI 服务访问"
+            "默认关闭；开启后允许在线星表查询和插件资源补齐"
         )
         self.network_btn.setAccessibleDescription(network_description)
-        self.network_btn.setToolTip(network_description)
+        self.network_btn.setToolTip(
+            network_description
+            + "。默认：关闭。离线资源完整时主流程无需联网；关闭时不会尝试在线星表。"
+        )
         self.network_btn.setChecked(self.network_mode_enabled)
         self.network_btn.toggled.connect(self._on_network_toggled)
+        advanced_layout.addWidget(self.processing_params_btn)
         advanced_layout.addWidget(self.ai_btn)
         advanced_layout.addWidget(self.ai_config_btn)
         advanced_layout.addWidget(self.ai_provider_status_label)
         advanced_layout.addWidget(self.debug_btn)
         advanced_layout.addWidget(self.network_btn)
         advanced_layout.addStretch(1)
+        self.ai_btn.hide()
+        self.ai_config_btn.hide()
+        self.ai_provider_status_label.hide()
         self.advanced_panel.hide()
         source_layout.addWidget(self.advanced_panel)
+        self.processing_params_panel = self._build_processing_parameters_panel()
+        self.processing_params_panel.hide()
+        source_layout.addWidget(self.processing_params_panel)
         source_layout.addStretch(1)
         return source_card
 
@@ -1220,6 +1287,8 @@ class SeestarGui(QMainWindow):
         )
         self.ai_custom_endpoint = str(snapshot.get("ai_custom_endpoint") or "")
         self.ai_custom_model = str(snapshot.get("ai_custom_model") or "")
+        self.ai_stage_enabled = False
+        self._restore_processing_settings(snapshot.get("processing_settings"))
         self._update_ai_button_text()
         self._update_debug_button_text()
         self._update_network_button_text()
@@ -1252,9 +1321,9 @@ class SeestarGui(QMainWindow):
             "处理方式\n" + self._input_mode_label(input_mode)
         )
         options = [
-            f"AI 后期：{'开启' if self.ai_stage_enabled else '关闭'}",
             f"保留中间文件：{'开启' if self.debug_mode_enabled else '关闭'}",
             f"允许联网：{'开启' if self.network_mode_enabled else '关闭'}",
+            *self._processing_settings_summary_lines(input_mode),
         ]
         self.run_options_label.setText("高级设置\n" + "\n".join(options))
 
@@ -1394,8 +1463,30 @@ class SeestarGui(QMainWindow):
             self.recent_combo,
             self.mode_combo,
             self.advanced_toggle_btn,
-            self.ai_btn,
-            self.ai_config_btn,
+            self.processing_params_btn,
+            *self.output_format_checks.values(),
+            self.review_combo,
+            self.color_combo,
+            self.filter_combo,
+            self.denoise_combo,
+            self.deconv_combo,
+            self.graxpert_model_edit,
+            self.graxpert_model_file_btn,
+            self.graxpert_model_dir_btn,
+            self.compute_combo,
+            self.pcc_timeout_spin,
+            self.local_wb_gain_spin,
+            self.builtin_denoise_spin,
+            self.graxpert_strength_spin,
+            self.rl_iterations_spin,
+            self.rl_maxstars_spin,
+            self.starless_retry_spin,
+            self.starless_repair_spin,
+            self.starless_halo_spin,
+            self.starless_chroma_spin,
+            self.starmask_stretch_spin,
+            self.weak_star_recovery_spin,
+            self.processing_defaults_btn,
             self.debug_btn,
             self.network_btn,
             self.start_btn,
@@ -1583,6 +1674,8 @@ class SeestarGui(QMainWindow):
         self.recent_combo.setEnabled(not running)
         self.mode_combo.setEnabled(not running)
         self.advanced_toggle_btn.setEnabled(not running)
+        self.processing_params_btn.setEnabled(not running)
+        self.processing_params_panel.setEnabled(not running)
         self.ai_btn.setEnabled(not running)
         self.ai_config_btn.setEnabled(not running)
         self.debug_btn.setEnabled(not running)
@@ -1628,6 +1721,7 @@ class SeestarGui(QMainWindow):
 
     def _on_input_mode_changed(self, _index: int) -> None:
         self.input_mode = self._current_input_mode()
+        self._update_processing_sheet_availability()
         if not self._restoring_settings:
             self._append_event(
                 f"处理方式已切换为：{self._input_mode_label(self.input_mode)}"
@@ -1676,6 +1770,893 @@ class SeestarGui(QMainWindow):
         self.ai_provider_status_label.setText(label)
         self.ai_provider_status_label.setAccessibleDescription(
             f"当前 AI 配置：{label}"
+        )
+
+    @staticmethod
+    def _set_parameter_help(label: QLabel, control: QWidget, text: str) -> None:
+        """Expose the same detailed help to mouse hover and accessibility APIs."""
+        for widget in (label, control):
+            widget.setToolTip(text)
+            widget.setAccessibleDescription(text)
+
+    def _processing_settings_snapshot(self) -> dict[str, object]:
+        return {
+            "output_formats": list(self.output_formats),
+            "review_only": self.review_only,
+            "color_calibration": self.color_calibration,
+            "filter_hint": self.filter_hint,
+            "denoise_mode": self.denoise_mode,
+            "deconvolution_mode": self.deconvolution_mode,
+            "graxpert_model_path": self.graxpert_model_path,
+            "compute_mode": self.compute_mode,
+            "pcc_timeout_sec": self.pcc_timeout_sec,
+            "local_wb_gain_limit": self.local_wb_gain_limit,
+            "builtin_denoise_strength": self.builtin_denoise_strength,
+            "graxpert_deconv_strength": self.graxpert_deconv_strength,
+            "rl_iterations": self.rl_iterations,
+            "rl_maxstars": self.rl_maxstars,
+            "starless_retry_max": self.starless_retry_max,
+            "starless_repair_strength": self.starless_repair_strength,
+            "starless_halo_repair_strength": self.starless_halo_repair_strength,
+            "starless_chroma_strength": self.starless_chroma_strength,
+            "starmask_asinh_stretch": self.starmask_asinh_stretch,
+            "weak_star_recovery_ratio": self.weak_star_recovery_ratio,
+        }
+
+    def _restore_processing_settings(self, snapshot: object) -> None:
+        values = snapshot if isinstance(snapshot, dict) else {}
+        formats = tuple(
+            str(value)
+            for value in values.get(
+                "output_formats", DEFAULT_PROCESSING_SETTINGS["output_formats"]
+            )
+            if str(value) in VALID_OUTPUT_FORMATS
+        )
+        self.output_formats = formats or tuple(
+            DEFAULT_PROCESSING_SETTINGS["output_formats"]
+        )
+        self.review_only = bool(
+            values.get("review_only", DEFAULT_PROCESSING_SETTINGS["review_only"])
+        )
+
+        def valid_value(key: str, allowed: frozenset[str]) -> str:
+            value = str(values.get(key, DEFAULT_PROCESSING_SETTINGS[key]))
+            return value if value in allowed else str(DEFAULT_PROCESSING_SETTINGS[key])
+
+        self.color_calibration = valid_value(
+            "color_calibration", VALID_COLOR_CALIBRATION_MODES
+        )
+        self.filter_hint = valid_value("filter_hint", VALID_FILTER_HINT_MODES)
+        self.denoise_mode = valid_value("denoise_mode", VALID_DENOISE_MODES)
+        self.deconvolution_mode = valid_value(
+            "deconvolution_mode", VALID_DECONVOLUTION_MODES
+        )
+        self.graxpert_model_path = str(
+            values.get(
+                "graxpert_model_path",
+                DEFAULT_PROCESSING_SETTINGS["graxpert_model_path"],
+            )
+            or ""
+        ).strip()
+        self.compute_mode = valid_value("compute_mode", VALID_COMPUTE_MODES)
+
+        def bounded_value(
+            key: str,
+            lower: float,
+            upper: float,
+            caster,
+        ):
+            try:
+                value = caster(values.get(key, DEFAULT_PROCESSING_SETTINGS[key]))
+            except (TypeError, ValueError):
+                value = caster(DEFAULT_PROCESSING_SETTINGS[key])
+            return max(caster(lower), min(caster(upper), value))
+
+        self.pcc_timeout_sec = bounded_value("pcc_timeout_sec", 5, 120, int)
+        self.local_wb_gain_limit = bounded_value(
+            "local_wb_gain_limit", 1.01, 1.50, float
+        )
+        self.builtin_denoise_strength = bounded_value(
+            "builtin_denoise_strength", 0.20, 0.55, float
+        )
+        self.graxpert_deconv_strength = bounded_value(
+            "graxpert_deconv_strength", 0.20, 0.40, float
+        )
+        self.rl_iterations = bounded_value("rl_iterations", 1, 40, int)
+        self.rl_maxstars = bounded_value("rl_maxstars", 20, 1000, int)
+        self.starless_retry_max = bounded_value("starless_retry_max", 0, 3, int)
+        self.starless_repair_strength = bounded_value(
+            "starless_repair_strength", 0.0, 0.85, float
+        )
+        self.starless_halo_repair_strength = bounded_value(
+            "starless_halo_repair_strength", 0.0, 0.90, float
+        )
+        self.starless_chroma_strength = bounded_value(
+            "starless_chroma_strength", 0.0, 0.90, float
+        )
+        self.starmask_asinh_stretch = bounded_value(
+            "starmask_asinh_stretch", 1.10, 3.00, float
+        )
+        self.weak_star_recovery_ratio = bounded_value(
+            "weak_star_recovery_ratio", 0.40, 0.95, float
+        )
+        self._sync_processing_controls_from_state()
+
+    def _processing_runtime_configuration(
+        self,
+        input_mode: str,
+    ) -> tuple[dict[str, str], set[str]]:
+        overrides = {
+            "SEESTAR_OUTPUT_FORMAT": ",".join(self.output_formats),
+            "SEESTAR_FORCE_REVIEW_ONLY_OUTPUT": "1" if self.review_only else "0",
+            "SEESTAR_SYQON_GPU": "0" if self.compute_mode == "cpu" else "1",
+            "SEESTAR_COSMIC_NATIVE_GPU": "0" if self.compute_mode == "cpu" else "1",
+            "SEESTAR_COSMIC_CLASSIC_GPU": "0" if self.compute_mode == "cpu" else "1",
+            "SEESTAR_STAGE7_QUALITY_RETRY_MAX": str(self.starless_retry_max),
+            "SEESTAR_STAGE7_STARLESS_REPAIR_STRENGTH": (
+                f"{self.starless_repair_strength:.2f}"
+            ),
+            "SEESTAR_STAGE7_STARLESS_HALO_REPAIR_STRENGTH": (
+                f"{self.starless_halo_repair_strength:.2f}"
+            ),
+            "SEESTAR_STAGE7_STARLESS_CHROMA_DENOISE_STRENGTH": (
+                f"{self.starless_chroma_strength:.2f}"
+            ),
+            "SEESTAR_STAGE9_STARMASK_ASINH_STRETCH": (
+                f"{self.starmask_asinh_stretch:.2f}"
+            ),
+            "SEESTAR_STAGE9_WEAK_STAR_RECOVERY_RATIO_MIN": (
+                f"{self.weak_star_recovery_ratio:.2f}"
+            ),
+        }
+        unset_keys: set[str] = set()
+        if input_mode != INPUT_MODE_LINEAR_RESUME:
+            overrides.update(
+                {
+                    "SEESTAR_STAGE4_PCC_TIMEOUT_SEC": str(self.pcc_timeout_sec),
+                    "SEESTAR_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT": (
+                        f"{self.local_wb_gain_limit:.2f}"
+                    ),
+                    "SEESTAR_STAGE5_BUILTIN_DENOISE_MOD": (
+                        f"{self.builtin_denoise_strength:.2f}"
+                    ),
+                    "SEESTAR_STAGE5_GRAXPERT_DECONV_STRENGTH": (
+                        f"{self.graxpert_deconv_strength:.2f}"
+                    ),
+                    "SEESTAR_STAGE5_RL_ITERS": str(self.rl_iterations),
+                    "SEESTAR_STAGE5_RL_MAXSTARS": str(self.rl_maxstars),
+                }
+            )
+            filter_values = {
+                "auto": "",
+                "no_filter": "broadband no filter",
+                "seestar_lp": "broadband Seestar LP",
+                "dual_narrowband": "dualband Ha OIII",
+            }
+            overrides["SEESTAR_STAGE4_FILTER_HINT"] = filter_values[self.filter_hint]
+
+            if self.denoise_mode == "auto":
+                unset_keys.add("SEESTAR_DENOISE_FORCE")
+            else:
+                overrides["SEESTAR_DENOISE_FORCE"] = (
+                    "1" if self.denoise_mode == "on" else "0"
+                )
+
+            deconvolution_values = {
+                "auto": ("1", "1"),
+                "rl": ("1", "0"),
+                "off": ("0", "0"),
+            }
+            deconv_enabled, graxpert_enabled = deconvolution_values[
+                self.deconvolution_mode
+            ]
+            overrides["SEESTAR_STAGE5_DECONV_ENABLE"] = deconv_enabled
+            overrides["SEESTAR_STAGE5_GRAXPERT_DECONV_ENABLE"] = graxpert_enabled
+            if self.graxpert_model_path:
+                overrides["SEESTAR_GRAXPERT_OBJECT_MODEL_PATH"] = (
+                    self.graxpert_model_path
+                )
+            else:
+                unset_keys.add("SEESTAR_GRAXPERT_OBJECT_MODEL_PATH")
+        return overrides, unset_keys
+
+    def _processing_settings_summary_lines(self, input_mode: str) -> list[str]:
+        format_labels = {"tif": "TIFF", "png": "PNG", "fit": "FITS"}
+        color_labels = {"pcc": "单次在线 Gaia PCC（30 秒）"}
+        filter_labels = {
+            "auto": "自动识别",
+            "no_filter": "无滤镜",
+            "seestar_lp": "Seestar LP",
+            "dual_narrowband": "双窄带 Ha/OIII",
+        }
+        denoise_labels = {"auto": "自动", "on": "开启", "off": "关闭"}
+        deconv_labels = {
+            "auto": "自动 GraXpert→RL",
+            "rl": "仅 Siril RL",
+            "off": "关闭",
+        }
+        lines = [
+            "输出：" + "/".join(format_labels[value] for value in self.output_formats),
+            "输出用途：" + ("仅复核" if self.review_only else "正式结果"),
+            "计算：" + ("CPU 兼容" if self.compute_mode == "cpu" else "自动加速"),
+            (
+                "去星/合成：重试 "
+                f"{self.starless_retry_max} · 修复 "
+                f"{self.starless_repair_strength:.2f}/"
+                f"{self.starless_halo_repair_strength:.2f}/"
+                f"{self.starless_chroma_strength:.2f} · 星点 "
+                f"{self.starmask_asinh_stretch:.2f}/"
+                f"{self.weak_star_recovery_ratio:.2f}"
+            ),
+        ]
+        if input_mode == INPUT_MODE_LINEAR_RESUME:
+            lines.append("Stage 4–5 参数：续跑时不生效")
+        else:
+            lines.extend(
+                (
+                    "校色：" + color_labels[self.color_calibration],
+                    "滤镜：" + filter_labels[self.filter_hint],
+                    "线性降噪：" + denoise_labels[self.denoise_mode],
+                    "反卷积：" + deconv_labels[self.deconvolution_mode],
+                    (
+                        "专业线性：PCC "
+                        f"{self.pcc_timeout_sec}s · WB {self.local_wb_gain_limit:.2f}×"
+                        f" · 降噪 {self.builtin_denoise_strength:.2f}"
+                        f" · GraXpert {self.graxpert_deconv_strength:.2f}"
+                        f" · RL {self.rl_iterations}/{self.rl_maxstars}"
+                    ),
+                )
+            )
+        return lines
+
+    def _build_processing_parameters_panel(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("processingParametersSheet")
+        panel.setAccessibleName("处理参数设置面板")
+        panel.setStyleSheet(
+            "QFrame#processingParametersSheet {"
+            " border: 1px solid rgba(127,127,127,0.30);"
+            " border-radius: 9px; }"
+        )
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        title = QLabel("处理参数")
+        title.setStyleSheet("font-weight: 600;")
+        self.processing_sheet_note = QLabel()
+        self.processing_sheet_note.setWordWrap(True)
+        self.processing_sheet_note.setStyleSheet(
+            "color: rgba(127,127,127,0.95); padding-left: 8px;"
+        )
+        self.processing_defaults_btn = QPushButton("恢复安全默认值")
+        self.processing_defaults_btn.setAccessibleName("恢复处理参数安全默认值")
+        self.processing_defaults_btn.setToolTip(
+            "恢复 TIFF、PNG、FITS、正式输出、自动校色、自动降噪、"
+            "自动反卷积、自动加速，以及所有专业细节的保守默认值。"
+        )
+        header.addWidget(title)
+        header.addWidget(self.processing_sheet_note, 1)
+        header.addWidget(self.processing_defaults_btn)
+        layout.addLayout(header)
+
+        groups = QGridLayout()
+        groups.setContentsMargins(0, 0, 0, 0)
+        groups.setHorizontalSpacing(10)
+        groups.setVerticalSpacing(8)
+        groups.setColumnStretch(0, 2)
+        groups.setColumnStretch(1, 3)
+
+        output_group = QGroupBox("输出")
+        output_form = QFormLayout(output_group)
+        output_form.setContentsMargins(10, 8, 10, 8)
+        output_row = QWidget()
+        output_layout = QHBoxLayout(output_row)
+        output_layout.setContentsMargins(0, 0, 0, 0)
+        self.output_format_checks: dict[str, QCheckBox] = {}
+        output_help = (
+            "用途：选择最终交付文件；默认：TIFF、PNG、FITS 全部生成。"
+            "TIFF 适合后续编辑，PNG 适合快速查看，FITS 保留科学数据。"
+            "至少必须选择一种格式；所有处理方式均生效。"
+        )
+        for key, text in (("tif", "TIFF"), ("png", "PNG"), ("fit", "FITS")):
+            checkbox = QCheckBox(text)
+            checkbox.setAccessibleName(f"输出 {text}")
+            checkbox.setToolTip(output_help)
+            checkbox.setAccessibleDescription(output_help)
+            self.output_format_checks[key] = checkbox
+            output_layout.addWidget(checkbox)
+        output_layout.addStretch(1)
+        output_label = QLabel("输出文件")
+        self._set_parameter_help(output_label, output_row, output_help)
+        output_form.addRow(output_label, output_row)
+
+        self.review_combo = QComboBox()
+        self.review_combo.addItem("正式结果", False)
+        self.review_combo.addItem("仅生成待复核结果", True)
+        review_label = QLabel("输出用途")
+        self._set_parameter_help(
+            review_label,
+            self.review_combo,
+            "用途：决定是否占用正式 result_processed/result_final 文件名；"
+            "默认：正式结果。选择“仅复核”时只写 result_review*，"
+            "适合人工检查且不会覆盖正式结果；所有处理方式均生效。",
+        )
+        output_form.addRow(review_label, self.review_combo)
+        groups.addWidget(output_group, 0, 0)
+
+        self.processing_color_group = QGroupBox("色彩校准")
+        color_form = QFormLayout(self.processing_color_group)
+        color_form.setContentsMargins(10, 8, 10, 8)
+        self.color_combo = QComboBox()
+        self.color_combo.addItem("单次在线 Gaia PCC（30 秒，自动安全回退）", "pcc")
+        color_label = QLabel("校准方式")
+        self._set_parameter_help(
+            color_label,
+            self.color_combo,
+            "用途：Stage 4 仅对确认线性的宽带 RGB/OSC 执行一次在线 Gaia PCC。"
+            "30 秒超时、失败或目标感知质量门拒绝后会回到 pre_pcc 线性检查点；"
+            "从线性结果继续时不生效。",
+        )
+        color_form.addRow(color_label, self.color_combo)
+
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItem("自动识别", "auto")
+        self.filter_combo.addItem("无滤镜", "no_filter")
+        self.filter_combo.addItem("Seestar LP", "seestar_lp")
+        self.filter_combo.addItem("双窄带 Ha/OIII", "dual_narrowband")
+        filter_label = QLabel("拍摄滤镜")
+        self._set_parameter_help(
+            filter_label,
+            self.filter_combo,
+            "用途：补充 FITS FILTER 缺失时的通道语义；默认自动识别。"
+            "双窄带会跳过 PCC 和全图白平衡，只允许恒星软遮罩局部恢复；"
+            "从线性结果继续时不生效。",
+        )
+        color_form.addRow(filter_label, self.filter_combo)
+        groups.addWidget(self.processing_color_group, 0, 1)
+
+        performance_group = QGroupBox("性能兼容")
+        performance_form = QFormLayout(performance_group)
+        performance_form.setContentsMargins(10, 8, 10, 8)
+        self.compute_combo = QComboBox()
+        self.compute_combo.addItem("自动加速", "auto")
+        self.compute_combo.addItem("CPU 兼容模式", "cpu")
+        compute_label = QLabel("计算设备")
+        self._set_parameter_help(
+            compute_label,
+            self.compute_combo,
+            "用途：控制 SyQon 与 CosmicClarity 是否允许自动使用硬件加速；"
+            "默认：自动加速。遇到模型启动失败、显存/统一内存不足或设备兼容问题时"
+            "可切换 CPU，速度会明显降低；所有包含对应插件的处理方式均生效。",
+        )
+        performance_form.addRow(compute_label, self.compute_combo)
+        groups.addWidget(performance_group, 1, 0)
+
+        self.processing_linear_group = QGroupBox("线性处理")
+        linear_form = QFormLayout(self.processing_linear_group)
+        linear_form.setContentsMargins(10, 8, 10, 8)
+        self.denoise_combo = QComboBox()
+        self.denoise_combo.addItem("自动", "auto")
+        self.denoise_combo.addItem("强制开启", "on")
+        self.denoise_combo.addItem("强制关闭", "off")
+        denoise_label = QLabel("线性降噪")
+        self._set_parameter_help(
+            denoise_label,
+            self.denoise_combo,
+            "用途：控制 Stage 5 线性降噪；默认：自动，由图像噪声特征决定。"
+            "强制开启可能抹除极弱结构，强制关闭可能保留较多色噪；"
+            "从线性结果继续时不生效。",
+        )
+        linear_form.addRow(denoise_label, self.denoise_combo)
+
+        self.deconv_combo = QComboBox()
+        self.deconv_combo.addItem(
+            "自动：GraXpert 应用模型 → 用户模型 → Siril RL",
+            "auto",
+        )
+        self.deconv_combo.addItem("仅 Siril RL", "rl")
+        self.deconv_combo.addItem("关闭反卷积", "off")
+        deconv_label = QLabel("反卷积")
+        self._set_parameter_help(
+            deconv_label,
+            self.deconv_combo,
+            "用途：控制 Stage 5 细节恢复；默认：自动。自动模式优先 Seestar App 内或"
+            "本机 GraXpert 应用的 Object Deconvolution 模型，其次用户模型，"
+            "最后回退 Siril RL。关闭可避免反卷积引入星环，但会损失部分细节；"
+            "从线性结果继续时不生效。",
+        )
+        linear_form.addRow(deconv_label, self.deconv_combo)
+
+        model_row = QWidget()
+        model_layout = QVBoxLayout(model_row)
+        model_layout.setContentsMargins(0, 0, 0, 0)
+        model_layout.setSpacing(4)
+        self.graxpert_model_edit = QLineEdit()
+        self.graxpert_model_edit.setPlaceholderText(
+            "可选：model.onnx 或版本/模型家族目录"
+        )
+        self.graxpert_model_edit.setAccessibleName(
+            "用户 GraXpert 对象反卷积模型路径"
+        )
+        model_actions = QHBoxLayout()
+        self.graxpert_model_file_btn = QPushButton("选择文件…")
+        self.graxpert_model_dir_btn = QPushButton("选择目录…")
+        model_actions.addWidget(self.graxpert_model_file_btn)
+        model_actions.addWidget(self.graxpert_model_dir_btn)
+        model_actions.addStretch(1)
+        model_layout.addWidget(self.graxpert_model_edit)
+        model_layout.addLayout(model_actions)
+        model_label = QLabel("用户模型")
+        model_help = (
+            "用途：在 App 与本机 GraXpert 均无对象反卷积模型时提供官方 model.onnx；"
+            "默认：空。可选择 model.onnx、语义版本目录或模型家族目录。"
+            "路径无效不会阻断任务，自动模式会回退 Siril RL；从线性结果继续时不生效。"
+        )
+        self._set_parameter_help(model_label, model_row, model_help)
+        for widget in (
+            self.graxpert_model_edit,
+            self.graxpert_model_file_btn,
+            self.graxpert_model_dir_btn,
+        ):
+            widget.setToolTip(model_help)
+            widget.setAccessibleDescription(model_help)
+        linear_form.addRow(model_label, model_row)
+
+        self.graxpert_model_status = QLabel()
+        self.graxpert_model_status.setWordWrap(True)
+        self.graxpert_model_status.setStyleSheet(
+            "color: rgba(127,127,127,0.95);"
+        )
+        linear_form.addRow("", self.graxpert_model_status)
+        groups.addWidget(self.processing_linear_group, 1, 1)
+
+        self.processing_professional_group = QGroupBox("专业细节")
+        self.processing_professional_group.setAccessibleName("专业图像处理参数")
+        self.processing_professional_group.setMinimumHeight(88)
+        professional_grid = QGridLayout(self.processing_professional_group)
+        professional_grid.setContentsMargins(10, 8, 10, 8)
+        professional_grid.setHorizontalSpacing(8)
+        professional_grid.setVerticalSpacing(6)
+        for column in (1, 3, 5, 7, 9, 11):
+            professional_grid.setColumnStretch(column, 1)
+        self.processing_prelinear_professional_widgets: list[QWidget] = []
+
+        def integer_spin(
+            minimum: int,
+            maximum: int,
+            step: int = 1,
+            suffix: str = "",
+        ) -> QSpinBox:
+            control = QSpinBox()
+            control.setRange(minimum, maximum)
+            control.setSingleStep(step)
+            control.setSuffix(suffix)
+            control.setKeyboardTracking(False)
+            control.setMinimumWidth(62)
+            return control
+
+        def decimal_spin(
+            minimum: float,
+            maximum: float,
+            step: float,
+            suffix: str = "",
+        ) -> QDoubleSpinBox:
+            control = QDoubleSpinBox()
+            control.setRange(minimum, maximum)
+            control.setDecimals(2)
+            control.setSingleStep(step)
+            control.setSuffix(suffix)
+            control.setKeyboardTracking(False)
+            control.setMinimumWidth(62)
+            return control
+
+        def add_professional_parameter(
+            row: int,
+            pair_column: int,
+            label_text: str,
+            control: QWidget,
+            help_text: str,
+            *,
+            prelinear: bool = False,
+        ) -> None:
+            label = QLabel(label_text)
+            if hasattr(label, "setBuddy"):
+                label.setBuddy(control)
+            self._set_parameter_help(label, control, help_text)
+            professional_grid.addWidget(label, row, pair_column * 2)
+            professional_grid.addWidget(control, row, pair_column * 2 + 1)
+            if prelinear:
+                self.processing_prelinear_professional_widgets.extend(
+                    (label, control)
+                )
+
+        self.pcc_timeout_spin = integer_spin(5, 120, 5, " 秒")
+        add_professional_parameter(
+            0,
+            0,
+            "PCC 超时",
+            self.pcc_timeout_spin,
+            "Stage 4 在线 Gaia PCC 的单次等待上限；默认 30 秒，范围 5–120 秒。"
+            "网络较慢可适当增加；超时后不会重试，会继续使用安全回退结果。",
+            prelinear=True,
+        )
+
+        self.local_wb_gain_spin = decimal_spin(1.01, 1.50, 0.01, "×")
+        add_professional_parameter(
+            0,
+            1,
+            "WB 增益",
+            self.local_wb_gain_spin,
+            "Stage 4 局部恒星白平衡的单通道最大增益；默认 1.20×。"
+            "数值越高纠偏越强，但过高可能使星色和局部背景偏色。",
+            prelinear=True,
+        )
+
+        self.builtin_denoise_spin = decimal_spin(0.20, 0.55, 0.05)
+        add_professional_parameter(
+            0,
+            2,
+            "线性降噪",
+            self.builtin_denoise_spin,
+            "Stage 5 Siril 线性降噪 mod；默认 0.50，范围 0.20–0.55。"
+            "数值越高降噪越强，也越可能削弱微弱尘埃和小尺度结构。",
+            prelinear=True,
+        )
+
+        self.graxpert_strength_spin = decimal_spin(0.20, 0.40, 0.01)
+        add_professional_parameter(
+            0,
+            3,
+            "GraXpert 强度",
+            self.graxpert_strength_spin,
+            "Stage 5 GraXpert Object Deconvolution 强度；默认 0.30。"
+            "增大可强化细节，但也会提高星环、锐化噪声和伪影风险。",
+            prelinear=True,
+        )
+
+        self.rl_iterations_spin = integer_spin(1, 40)
+        add_professional_parameter(
+            0,
+            4,
+            "RL 迭代次数",
+            self.rl_iterations_spin,
+            "GraXpert 不可用或选择 Siril RL 时的反卷积迭代次数；默认 8。"
+            "次数越多恢复越强且耗时越长，过高容易放大噪声并产生星环。",
+            prelinear=True,
+        )
+
+        self.rl_maxstars_spin = integer_spin(20, 1000, 20)
+        add_professional_parameter(
+            0,
+            5,
+            "PSF 星数",
+            self.rl_maxstars_spin,
+            "估算 Siril RL 点扩散函数时最多使用的恒星数；默认 200。"
+            "更多样本通常更稳定但更慢；星场稀疏时无需盲目提高。",
+            prelinear=True,
+        )
+
+        self.starless_retry_spin = integer_spin(0, 3)
+        add_professional_parameter(
+            1,
+            0,
+            "去星质量重试",
+            self.starless_retry_spin,
+            "Stage 6 去星质量不达标时追加的同源参数重试次数；默认 2，范围 0–3。"
+            "提高会增加耗时，但不会绕过质量门或启用联网下载。",
+        )
+
+        self.starless_repair_spin = decimal_spin(0.00, 0.85, 0.05)
+        add_professional_parameter(
+            1,
+            1,
+            "残星修复",
+            self.starless_repair_spin,
+            "Stage 7 starless 小尺度残星修复强度；默认 0.68。"
+            "过低可能残留星核，过高可能误伤紧凑目标和细小纹理。",
+        )
+
+        self.starless_halo_spin = decimal_spin(0.00, 0.90, 0.05)
+        add_professional_parameter(
+            1,
+            2,
+            "星晕修复",
+            self.starless_halo_spin,
+            "Stage 7 亮星 halo 平滑修复强度；默认 0.70。"
+            "提高可减轻残余光环，但过高会造成亮星周围背景过度平滑。",
+        )
+
+        self.starless_chroma_spin = decimal_spin(0.00, 0.90, 0.05)
+        add_professional_parameter(
+            1,
+            3,
+            "彩噪修复",
+            self.starless_chroma_spin,
+            "Stage 7 starless 背景彩噪修复强度；默认 0.55。"
+            "过高可能降低暗弱区域的真实色彩差异。",
+        )
+
+        self.starmask_stretch_spin = decimal_spin(1.10, 3.00, 0.10)
+        add_professional_parameter(
+            1,
+            4,
+            "星点拉伸",
+            self.starmask_stretch_spin,
+            "Stage 9 星点蒙版统计不可用时的固定 Asinh 回退强度；默认 2.00。"
+            "提高会提亮弱星，同时增加亮星核饱和和星点膨胀风险。",
+        )
+
+        self.weak_star_recovery_spin = decimal_spin(0.40, 0.95, 0.05)
+        add_professional_parameter(
+            1,
+            5,
+            "弱星门槛",
+            self.weak_star_recovery_spin,
+            "Stage 9 候选相对 Stage 8 必须恢复的弱星比例；默认 0.70。"
+            "数值越高质量门越严格，可能拒绝更多候选并触发保守回退。",
+        )
+
+        groups.addWidget(self.processing_professional_group, 2, 0, 1, 2)
+        layout.addLayout(groups)
+
+        self.processing_sheet_status = QLabel(
+            "修改后自动保存；点击“开始处理”时冻结为本次任务配置。"
+        )
+        self.processing_sheet_status.setAccessibleName("处理参数保存状态")
+        self.processing_sheet_status.setStyleSheet(
+            "color: rgba(127,127,127,0.95); padding: 1px 2px;"
+        )
+        layout.addWidget(self.processing_sheet_status)
+
+        for key, checkbox in self.output_format_checks.items():
+            checkbox.toggled.connect(
+                lambda checked, output_key=key: self._on_output_format_toggled(
+                    output_key,
+                    checked,
+                )
+            )
+        self.review_combo.currentIndexChanged.connect(
+            self._on_processing_controls_changed
+        )
+        self.filter_combo.currentIndexChanged.connect(
+            self._on_processing_controls_changed
+        )
+        self.denoise_combo.currentIndexChanged.connect(
+            self._on_processing_controls_changed
+        )
+        self.compute_combo.currentIndexChanged.connect(
+            self._on_processing_controls_changed
+        )
+        self.color_combo.currentIndexChanged.connect(
+            self._on_processing_selection_changed
+        )
+        self.deconv_combo.currentIndexChanged.connect(
+            self._on_processing_selection_changed
+        )
+        self.graxpert_model_edit.textChanged.connect(
+            lambda _text: self._update_graxpert_model_status()
+        )
+        self.graxpert_model_edit.editingFinished.connect(
+            self._on_processing_controls_changed
+        )
+        self.graxpert_model_file_btn.clicked.connect(
+            self._select_graxpert_model_file
+        )
+        self.graxpert_model_dir_btn.clicked.connect(
+            self._select_graxpert_model_directory
+        )
+        self.processing_defaults_btn.clicked.connect(
+            self._restore_processing_defaults
+        )
+        for control in (
+            self.pcc_timeout_spin,
+            self.local_wb_gain_spin,
+            self.builtin_denoise_spin,
+            self.graxpert_strength_spin,
+            self.rl_iterations_spin,
+            self.rl_maxstars_spin,
+            self.starless_retry_spin,
+            self.starless_repair_spin,
+            self.starless_halo_spin,
+            self.starless_chroma_spin,
+            self.starmask_stretch_spin,
+            self.weak_star_recovery_spin,
+        ):
+            control.valueChanged.connect(self._on_processing_controls_changed)
+        self._sync_processing_controls_from_state()
+        return panel
+
+    def _sync_processing_controls_from_state(self) -> None:
+        if not hasattr(self, "output_format_checks"):
+            return
+        self._processing_controls_updating = True
+        try:
+            for key, checkbox in self.output_format_checks.items():
+                checkbox.setChecked(key in self.output_formats)
+            self.review_combo.setCurrentIndex(
+                max(0, self.review_combo.findData(self.review_only))
+            )
+            for combo, value in (
+                (self.color_combo, self.color_calibration),
+                (self.filter_combo, self.filter_hint),
+                (self.denoise_combo, self.denoise_mode),
+                (self.deconv_combo, self.deconvolution_mode),
+                (self.compute_combo, self.compute_mode),
+            ):
+                combo.setCurrentIndex(max(0, combo.findData(value)))
+            self.graxpert_model_edit.setText(self.graxpert_model_path)
+            for control, value in (
+                (self.pcc_timeout_spin, self.pcc_timeout_sec),
+                (self.local_wb_gain_spin, self.local_wb_gain_limit),
+                (self.builtin_denoise_spin, self.builtin_denoise_strength),
+                (self.graxpert_strength_spin, self.graxpert_deconv_strength),
+                (self.rl_iterations_spin, self.rl_iterations),
+                (self.rl_maxstars_spin, self.rl_maxstars),
+                (self.starless_retry_spin, self.starless_retry_max),
+                (self.starless_repair_spin, self.starless_repair_strength),
+                (self.starless_halo_spin, self.starless_halo_repair_strength),
+                (self.starless_chroma_spin, self.starless_chroma_strength),
+                (self.starmask_stretch_spin, self.starmask_asinh_stretch),
+                (self.weak_star_recovery_spin, self.weak_star_recovery_ratio),
+            ):
+                control.setValue(value)
+        finally:
+            self._processing_controls_updating = False
+        self._update_processing_sheet_availability()
+
+    def _update_processing_sheet_availability(self) -> None:
+        if not hasattr(self, "processing_color_group"):
+            return
+        linear_resume = self._current_input_mode() == INPUT_MODE_LINEAR_RESUME
+        self.processing_color_group.setEnabled(not linear_resume)
+        self.processing_linear_group.setEnabled(not linear_resume)
+        self.filter_combo.setEnabled(not linear_resume)
+        for widget in self.processing_prelinear_professional_widgets:
+            widget.setEnabled(not linear_resume)
+        model_editable = (
+            not linear_resume and str(self.deconv_combo.currentData()) == "auto"
+        )
+        for widget in (
+            self.graxpert_model_edit,
+            self.graxpert_model_file_btn,
+            self.graxpert_model_dir_btn,
+        ):
+            widget.setEnabled(model_editable)
+        if linear_resume:
+            self.processing_sheet_note.setText(
+                "从线性结果继续：色彩校准和线性处理已完成，本次不再执行。"
+            )
+        else:
+            self.processing_sheet_note.setText(
+                "同一任务页内配置；运行开始后保持只读。"
+            )
+        self._update_graxpert_model_status()
+
+    def _update_graxpert_model_status(self) -> None:
+        if not hasattr(self, "graxpert_model_status"):
+            return
+        raw_path = self.graxpert_model_edit.text().strip()
+        if not raw_path:
+            self.graxpert_model_status.setText(
+                "未指定用户模型；自动模式优先检查应用模型，否则回退 Siril RL。"
+            )
+            return
+        path = Path(raw_path).expanduser()
+        if path.exists():
+            self.graxpert_model_status.setText(
+                "用户模型路径存在；运行时还会校验版本目录和模型文件。"
+            )
+        else:
+            self.graxpert_model_status.setText(
+                "⚠ 路径当前不存在；任务仍可启动，自动模式将安全回退。"
+            )
+
+    def _on_output_format_toggled(self, key: str, checked: bool) -> None:
+        if self._processing_controls_updating:
+            return
+        if not checked and not any(
+            checkbox.isChecked()
+            for checkbox in self.output_format_checks.values()
+        ):
+            checkbox = self.output_format_checks[key]
+            checkbox.blockSignals(True)
+            try:
+                checkbox.setChecked(True)
+            finally:
+                checkbox.blockSignals(False)
+            self.processing_sheet_status.setText("至少保留一种输出格式。")
+            return
+        self._on_processing_controls_changed()
+
+    def _on_processing_selection_changed(self, _index: int = -1) -> None:
+        if self._processing_controls_updating:
+            return
+        self._update_processing_sheet_availability()
+        self._on_processing_controls_changed()
+
+    def _on_processing_controls_changed(self, _value: object = None) -> None:
+        if self._processing_controls_updating:
+            return
+        formats = tuple(
+            key
+            for key, checkbox in self.output_format_checks.items()
+            if checkbox.isChecked()
+        )
+        if not formats:
+            return
+        self.output_formats = formats
+        self.review_only = bool(self.review_combo.currentData())
+        self.color_calibration = str(self.color_combo.currentData())
+        self.filter_hint = str(self.filter_combo.currentData())
+        self.denoise_mode = str(self.denoise_combo.currentData())
+        self.deconvolution_mode = str(self.deconv_combo.currentData())
+        self.graxpert_model_path = self.graxpert_model_edit.text().strip()
+        self.compute_mode = str(self.compute_combo.currentData())
+        self.pcc_timeout_sec = self.pcc_timeout_spin.value()
+        self.local_wb_gain_limit = self.local_wb_gain_spin.value()
+        self.builtin_denoise_strength = self.builtin_denoise_spin.value()
+        self.graxpert_deconv_strength = self.graxpert_strength_spin.value()
+        self.rl_iterations = self.rl_iterations_spin.value()
+        self.rl_maxstars = self.rl_maxstars_spin.value()
+        self.starless_retry_max = self.starless_retry_spin.value()
+        self.starless_repair_strength = self.starless_repair_spin.value()
+        self.starless_halo_repair_strength = self.starless_halo_spin.value()
+        self.starless_chroma_strength = self.starless_chroma_spin.value()
+        self.starmask_asinh_stretch = self.starmask_stretch_spin.value()
+        self.weak_star_recovery_ratio = self.weak_star_recovery_spin.value()
+        self.processing_sheet_status.setText(
+            "已自动保存；点击“开始处理”时冻结为本次任务配置。"
+        )
+        if not self._restoring_settings:
+            self._save_settings()
+
+    def _select_graxpert_model_file(self) -> None:
+        selected, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "选择 GraXpert 对象反卷积模型",
+            self.graxpert_model_edit.text().strip() or str(Path.home()),
+            "ONNX 模型 (model.onnx *.onnx)",
+        )
+        if selected:
+            self.graxpert_model_edit.setText(selected)
+            self._on_processing_controls_changed()
+
+    def _select_graxpert_model_directory(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "选择 GraXpert 模型目录",
+            self.graxpert_model_edit.text().strip() or str(Path.home()),
+        )
+        if selected:
+            self.graxpert_model_edit.setText(selected)
+            self._on_processing_controls_changed()
+
+    def _restore_processing_defaults(self) -> None:
+        self._restore_processing_settings(DEFAULT_PROCESSING_SETTINGS)
+        self._save_settings()
+        self.processing_sheet_status.setText("已恢复并保存安全默认值。")
+        self._append_event("处理参数已恢复为安全默认值。")
+
+    def _set_processing_parameters_expanded(self, expanded: bool) -> None:
+        self.processing_parameters_expanded = bool(expanded)
+        visible = bool(expanded and self.advanced_toggle_btn.isChecked())
+        self.processing_params_panel.setVisible(visible)
+        self.processing_params_btn.setText(
+            "收起处理参数" if expanded else "处理参数…"
+        )
+        self.processing_params_btn.setAccessibleName(
+            "收起处理参数设置" if expanded else "展开处理参数设置"
+        )
+        if expanded:
+            self._update_processing_sheet_availability()
+        if not self._restoring_settings:
+            self._save_settings()
+
+    def _configure_processing_parameters(self, _checked: bool = False) -> None:
+        self._set_processing_parameters_expanded(
+            not self.processing_parameters_expanded
         )
 
     def _developer_ai_configuration(self) -> dict[str, str]:
@@ -1923,6 +2904,9 @@ class SeestarGui(QMainWindow):
 
     def _on_advanced_toggled(self, expanded: bool) -> None:
         self.advanced_panel.setVisible(expanded)
+        self.processing_params_panel.setVisible(
+            bool(expanded and self.processing_parameters_expanded)
+        )
         self.advanced_toggle_btn.setText(
             "高级设置 ▾" if expanded else "高级设置 ▸"
         )
@@ -1948,9 +2932,9 @@ class SeestarGui(QMainWindow):
             if saved_geometry:
                 self.restoreGeometry(saved_geometry)
 
-            self.ai_stage_enabled = self.settings.value(
-                "advanced/aiPostprocess", False, type=bool
-            )
+            # AI processing is currently unavailable. Keep the dormant code path,
+            # but never restore a stale enabled toggle into the hidden UI.
+            self.ai_stage_enabled = False
             self.debug_mode_enabled = self.settings.value(
                 "advanced/keepIntermediateFiles", False, type=bool
             )
@@ -1972,6 +2956,92 @@ class SeestarGui(QMainWindow):
             self.ai_custom_model = str(
                 self.settings.value("ai/customModel", "") or ""
             ).strip()
+            saved_formats = self.settings.value(
+                "processing/outputFormats",
+                list(DEFAULT_PROCESSING_SETTINGS["output_formats"]),
+            )
+            if isinstance(saved_formats, str):
+                saved_formats = [
+                    value.strip()
+                    for value in saved_formats.split(",")
+                    if value.strip()
+                ]
+            self._restore_processing_settings(
+                {
+                    "output_formats": list(saved_formats or []),
+                    "review_only": self.settings.value(
+                        "processing/reviewOnly", False, type=bool
+                    ),
+                    "color_calibration": self.settings.value(
+                        "processing/colorCalibration", "auto"
+                    ),
+                    "filter_hint": self.settings.value(
+                        "processing/filterHint", "auto"
+                    ),
+                    "denoise_mode": self.settings.value(
+                        "processing/denoiseMode", "auto"
+                    ),
+                    "deconvolution_mode": self.settings.value(
+                        "processing/deconvolutionMode", "auto"
+                    ),
+                    "graxpert_model_path": self.settings.value(
+                        "processing/graxpertModelPath", ""
+                    ),
+                    "compute_mode": self.settings.value(
+                        "processing/computeMode", "auto"
+                    ),
+                    "pcc_timeout_sec": self.settings.value(
+                        "processing/pccTimeoutSec",
+                        DEFAULT_PROCESSING_SETTINGS["pcc_timeout_sec"],
+                    ),
+                    "local_wb_gain_limit": self.settings.value(
+                        "processing/localWbGainLimit",
+                        DEFAULT_PROCESSING_SETTINGS["local_wb_gain_limit"],
+                    ),
+                    "builtin_denoise_strength": self.settings.value(
+                        "processing/builtinDenoiseStrength",
+                        DEFAULT_PROCESSING_SETTINGS["builtin_denoise_strength"],
+                    ),
+                    "graxpert_deconv_strength": self.settings.value(
+                        "processing/graxpertDeconvStrength",
+                        DEFAULT_PROCESSING_SETTINGS["graxpert_deconv_strength"],
+                    ),
+                    "rl_iterations": self.settings.value(
+                        "processing/rlIterations",
+                        DEFAULT_PROCESSING_SETTINGS["rl_iterations"],
+                    ),
+                    "rl_maxstars": self.settings.value(
+                        "processing/rlMaxStars",
+                        DEFAULT_PROCESSING_SETTINGS["rl_maxstars"],
+                    ),
+                    "starless_retry_max": self.settings.value(
+                        "processing/starlessRetryMax",
+                        DEFAULT_PROCESSING_SETTINGS["starless_retry_max"],
+                    ),
+                    "starless_repair_strength": self.settings.value(
+                        "processing/starlessRepairStrength",
+                        DEFAULT_PROCESSING_SETTINGS["starless_repair_strength"],
+                    ),
+                    "starless_halo_repair_strength": self.settings.value(
+                        "processing/starlessHaloRepairStrength",
+                        DEFAULT_PROCESSING_SETTINGS[
+                            "starless_halo_repair_strength"
+                        ],
+                    ),
+                    "starless_chroma_strength": self.settings.value(
+                        "processing/starlessChromaStrength",
+                        DEFAULT_PROCESSING_SETTINGS["starless_chroma_strength"],
+                    ),
+                    "starmask_asinh_stretch": self.settings.value(
+                        "processing/starmaskAsinhStretch",
+                        DEFAULT_PROCESSING_SETTINGS["starmask_asinh_stretch"],
+                    ),
+                    "weak_star_recovery_ratio": self.settings.value(
+                        "processing/weakStarRecoveryRatio",
+                        DEFAULT_PROCESSING_SETTINGS["weak_star_recovery_ratio"],
+                    ),
+                }
+            )
             self._update_ai_button_text()
             self._update_debug_button_text()
             self._update_network_button_text()
@@ -1982,6 +3052,11 @@ class SeestarGui(QMainWindow):
             )
             self.advanced_toggle_btn.setChecked(advanced_expanded)
             self._on_advanced_toggled(advanced_expanded)
+
+            processing_expanded = self.settings.value(
+                "ui/processingParametersExpanded", False, type=bool
+            )
+            self._set_processing_parameters_expanded(processing_expanded)
 
             log_expanded = self.settings.value(
                 "ui/logExpanded", False, type=bool
@@ -2020,7 +3095,7 @@ class SeestarGui(QMainWindow):
     def _save_settings(self) -> None:
         if self._restoring_settings:
             return
-        self.settings.setValue("advanced/aiPostprocess", self.ai_stage_enabled)
+        self.settings.setValue("advanced/aiPostprocess", False)
         self.settings.setValue(
             "advanced/keepIntermediateFiles", self.debug_mode_enabled
         )
@@ -2029,7 +3104,58 @@ class SeestarGui(QMainWindow):
         self.settings.setValue("ai/customEndpoint", self.ai_custom_endpoint)
         self.settings.setValue("ai/customModel", self.ai_custom_model)
         self.settings.setValue(
+            "processing/outputFormats", list(self.output_formats)
+        )
+        self.settings.setValue("processing/reviewOnly", self.review_only)
+        self.settings.setValue(
+            "processing/colorCalibration", self.color_calibration
+        )
+        self.settings.setValue("processing/filterHint", self.filter_hint)
+        self.settings.setValue("processing/denoiseMode", self.denoise_mode)
+        self.settings.setValue(
+            "processing/deconvolutionMode", self.deconvolution_mode
+        )
+        self.settings.setValue(
+            "processing/graxpertModelPath", self.graxpert_model_path
+        )
+        self.settings.setValue("processing/computeMode", self.compute_mode)
+        self.settings.setValue("processing/pccTimeoutSec", self.pcc_timeout_sec)
+        self.settings.setValue(
+            "processing/localWbGainLimit", self.local_wb_gain_limit
+        )
+        self.settings.setValue(
+            "processing/builtinDenoiseStrength", self.builtin_denoise_strength
+        )
+        self.settings.setValue(
+            "processing/graxpertDeconvStrength", self.graxpert_deconv_strength
+        )
+        self.settings.setValue("processing/rlIterations", self.rl_iterations)
+        self.settings.setValue("processing/rlMaxStars", self.rl_maxstars)
+        self.settings.setValue(
+            "processing/starlessRetryMax", self.starless_retry_max
+        )
+        self.settings.setValue(
+            "processing/starlessRepairStrength", self.starless_repair_strength
+        )
+        self.settings.setValue(
+            "processing/starlessHaloRepairStrength",
+            self.starless_halo_repair_strength,
+        )
+        self.settings.setValue(
+            "processing/starlessChromaStrength", self.starless_chroma_strength
+        )
+        self.settings.setValue(
+            "processing/starmaskAsinhStretch", self.starmask_asinh_stretch
+        )
+        self.settings.setValue(
+            "processing/weakStarRecoveryRatio", self.weak_star_recovery_ratio
+        )
+        self.settings.setValue(
             "ui/advancedExpanded", self.advanced_toggle_btn.isChecked()
+        )
+        self.settings.setValue(
+            "ui/processingParametersExpanded",
+            self.processing_parameters_expanded,
         )
         self.settings.setValue("ui/logExpanded", self.log_toggle_btn.isChecked())
         self.settings.setValue("ui/windowGeometry", self.saveGeometry())
@@ -2420,15 +3546,6 @@ class SeestarGui(QMainWindow):
                 seed_growth_bytes += directory_size_bytes(source)
 
         support_growth_bytes = 0
-        try:
-            spcc_ready, _detail = verify_siril_spcc_database_seed(
-                self.siril_spcc_seed_dir,
-                self.runtime_home,
-            )
-        except Exception:
-            spcc_ready = False
-        if not spcc_ready:
-            support_growth_bytes += directory_size_bytes(self.siril_spcc_seed_dir)
 
         scripts_root = resolve_siril_scripts_root(self.siril_plugin_dir)
         runtime_scripts_marker = (
@@ -3174,25 +4291,6 @@ class SeestarGui(QMainWindow):
         xdg_siril_dir = self._runtime_xdg_siril_dir()
         xdg_siril_dir.mkdir(parents=True, exist_ok=True)
 
-        # Siril 1.4 local Gaia DR3 xp_sampled catalog directory. The worker
-        # writes this exact path to core.catalogue_gaia_photo.
-        gaia_photo_dir = xdg_siril_dir / "siril_cat1_healpix8_xpsamp"
-        gaia_photo_dir.mkdir(parents=True, exist_ok=True)
-        valid_spcc_chunks = [
-            path
-            for path in gaia_photo_dir.glob("siril_cat1_healpix8_xpsamp_*.dat")
-            if path.is_file() and safe_file_size(path) >= 1024
-        ]
-        if valid_spcc_chunks:
-            self._append_event(
-                f"本地 SPCC 星表：{gaia_photo_dir} "
-                f"({len(valid_spcc_chunks)} 个有效分块)"
-            )
-        else:
-            self._append_event(
-                "本地 SPCC 星表为空或无有效 .dat 分块；"
-                "Stage 4 将在调用 Siril 前跳过 SPCC。"
-            )
         gaia_astro_path = xdg_siril_dir / "siril_cat_healpix8_astro.dat"
         if gaia_astro_path.is_file() and safe_file_size(gaia_astro_path) >= 1024:
             self._append_event(
@@ -4061,16 +5159,6 @@ class SeestarGui(QMainWindow):
             progress("正在同步 Siril 离线资源…")
             self._check_bootstrap_cancelled()
             try:
-                self._ensure_runtime_spcc_database_seed()
-            except BootstrapCancelled:
-                raise
-            except Exception as exc:
-                self._append_event(
-                    "Siril SPCC 固定数据库准备失败；"
-                    f"本次运行将禁用 SPCC 并改走 PCC：{exc}"
-                )
-            self._check_bootstrap_cancelled()
-            try:
                 self._ensure_runtime_siril_support_dirs()
             except BootstrapCancelled:
                 raise
@@ -4193,9 +5281,23 @@ class SeestarGui(QMainWindow):
             }
             else self._current_input_mode()
         )
+        (
+            self._pending_runtime_overrides,
+            self._pending_runtime_unset_keys,
+        ) = self._processing_runtime_configuration(input_mode)
+        if self.graxpert_model_path:
+            model_path = Path(self.graxpert_model_path).expanduser()
+            if not model_path.exists():
+                self._append_event(
+                    "用户 GraXpert 对象模型路径当前不存在；"
+                    "自动反卷积将尝试应用模型并安全回退 Siril RL："
+                    f"{model_path}"
+                )
         errors = self._preflight_errors(work_dir, input_mode=input_mode)
         if errors:
             self._pending_ai_runtime_overrides.clear()
+            self._pending_runtime_overrides.clear()
+            self._pending_runtime_unset_keys.clear()
             QMessageBox.critical(self, "预检失败", "\n\n".join(errors))
             self._append_event("预检失败：")
             for err in errors:
@@ -4214,6 +5316,7 @@ class SeestarGui(QMainWindow):
             "ai_provider_mode": self.ai_provider_mode,
             "ai_custom_endpoint": self.ai_custom_endpoint,
             "ai_custom_model": self.ai_custom_model,
+            "processing_settings": self._processing_settings_snapshot(),
         }
         stage_count = 11 if self.ai_stage_enabled else 10
         self._progress_timer.stop()
@@ -4286,6 +5389,8 @@ class SeestarGui(QMainWindow):
     def _on_bootstrap_failed(self, title: str, detail: str) -> None:
         self._cleanup_bootstrap_worker()
         self._pending_ai_runtime_overrides.clear()
+        self._pending_runtime_overrides.clear()
+        self._pending_runtime_unset_keys.clear()
         self._run_terminal_status = "Failed"
         self._set_status_text("Failed")
         self.progress_bar.setRange(0, 10)
@@ -4304,6 +5409,8 @@ class SeestarGui(QMainWindow):
     def _on_bootstrap_cancelled(self) -> None:
         self._cleanup_bootstrap_worker()
         self._pending_ai_runtime_overrides.clear()
+        self._pending_runtime_overrides.clear()
+        self._pending_runtime_unset_keys.clear()
         self._run_terminal_status = "Stopped"
         self._set_status_text("Stopped")
         self.progress_bar.setRange(0, 10)
@@ -4355,6 +5462,8 @@ class SeestarGui(QMainWindow):
         self._append_event(
             f"本次运行 input_mode={input_mode}"
         )
+        for line in self._processing_settings_summary_lines(input_mode):
+            self._append_event("本次处理参数：" + line)
         self._append_event(
             f"本次运行 ai_stage11={'ON' if self.ai_stage_enabled else 'OFF'}"
         )
@@ -4387,9 +5496,14 @@ class SeestarGui(QMainWindow):
             network_mode=self.network_mode_enabled,
             ai_stage_enabled=self.ai_stage_enabled,
             ai_runtime_overrides=self._pending_ai_runtime_overrides,
+            runtime_overrides=self._pending_runtime_overrides,
+            runtime_unset_keys=self._pending_runtime_unset_keys,
+            graxpert_application_home=Path.home(),
             parent=self,
         )
         self._pending_ai_runtime_overrides.clear()
+        self._pending_runtime_overrides.clear()
+        self._pending_runtime_unset_keys.clear()
         self.worker.log.connect(self._append_text)
         self.worker.state.connect(self._set_status_text)
         self.worker.progress.connect(self._on_pipeline_progress)
@@ -4577,6 +5691,8 @@ class SeestarGui(QMainWindow):
 
     def _cleanup_after_run(self) -> None:
         self._pending_ai_runtime_overrides.clear()
+        self._pending_runtime_overrides.clear()
+        self._pending_runtime_unset_keys.clear()
         if self.worker:
             self.worker.wait(200)
             self.worker.deleteLater()
