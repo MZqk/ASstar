@@ -51,7 +51,7 @@ try:
         choose_best as choose_best_stretch_candidate,
         score_candidate as score_stretch_candidate,
     )
-    from target_profiler import build_target_profile
+    from target_profiler import build_target_profile, normalize_target_profile
 except (ImportError, RuntimeError):
     analyze_adaptive_image = None
     DEFAULT_POLICY = {
@@ -64,6 +64,7 @@ except (ImportError, RuntimeError):
     choose_best_stretch_candidate = None
     score_stretch_candidate = None
     build_target_profile = None
+    normalize_target_profile = None
 
 ENV_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 ENV_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
@@ -263,10 +264,50 @@ class TargetRuntimeMixin:
 
 
     def _active_target_type(self) -> str:
+        frozen = getattr(self, "_frozen_primary_target", None)
+        if isinstance(frozen, dict) and frozen.get("type"):
+            return str(frozen["type"])
         profile = getattr(self, "target_profile", None)
         if isinstance(profile, dict):
+            primary = profile.get("primary_target")
+            if isinstance(primary, dict) and primary.get("type"):
+                return str(primary["type"])
             return str(profile.get("target_type") or "generic_low_snr_safe")
         return "generic_low_snr_safe"
+
+    def _freeze_primary_target(self) -> Dict[str, Any]:
+        """Freeze the sole routing target before processing transforms start."""
+        if (
+            bool(getattr(self, "_target_primary_frozen", False))
+            and isinstance(getattr(self, "_frozen_primary_target", None), dict)
+        ):
+            return dict(self._frozen_primary_target)
+        profile = dict(getattr(self, "target_profile", {}) or {})
+        if callable(normalize_target_profile):
+            profile = normalize_target_profile(profile)
+        primary = dict(profile.get("primary_target") or {})
+        primary.update(
+            {
+                "type": str(
+                    primary.get("type")
+                    or profile.get("target_type")
+                    or "generic_low_snr_safe"
+                ),
+                "frozen": True,
+                "frozen_at": "processing_plan",
+            }
+        )
+        profile["primary_target"] = primary
+        profile["target_type"] = primary["type"]
+        profile.setdefault("routing_contract", {})["primary_frozen"] = True
+        self.target_profile = profile
+        self._frozen_primary_target = copy.deepcopy(primary)
+        self._target_primary_frozen = True
+        self.log.info(
+            "[TargetProfile] primary frozen "
+            f"type={primary['type']} confidence={float(primary.get('confidence', 0.0)):.2f}"
+        )
+        return dict(primary)
 
 
     def _sync_runtime_policy_from_profile(
@@ -276,6 +317,59 @@ class TargetRuntimeMixin:
         source: str,
         policy_candidate: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        if callable(normalize_target_profile):
+            normalized = normalize_target_profile(profile)
+            profile.clear()
+            profile.update(normalized)
+
+        if bool(getattr(self, "_target_primary_frozen", False)):
+            frozen = dict(getattr(self, "_frozen_primary_target", {}) or {})
+            observed_primary = dict(profile.get("primary_target") or {})
+            current = dict(getattr(self, "target_profile", {}) or {})
+            current_secondary = current.get("secondary_labels", [])
+            observed_secondary = profile.get("secondary_labels", [])
+            merged_secondary = [
+                label
+                for label in (
+                    "bright_core",
+                    "large_nebulosity",
+                    "faint_outer_cloud",
+                    "dense_star_field",
+                    "reflection_blue",
+                    "emission_red",
+                )
+                if label in set(current_secondary or ())
+                or label in set(observed_secondary or ())
+            ]
+            profile["secondary_labels"] = merged_secondary
+            merged_evidence = dict(current.get("secondary_label_evidence") or {})
+            merged_evidence.update(profile.get("secondary_label_evidence") or {})
+            profile["secondary_label_evidence"] = {
+                label: merged_evidence.get(label, {})
+                for label in merged_secondary
+            }
+            profile["target_name_guess"] = frozen.get("name")
+            profile["target_confidence"] = frozen.get("confidence", 0.0)
+            profile["target_type"] = frozen.get(
+                "type", "generic_low_snr_safe"
+            )
+            profile["classification_method"] = frozen.get("method", "unknown")
+            profile["primary_target"] = copy.deepcopy(frozen)
+            profile["pipeline"] = str(
+                current.get("pipeline")
+                or getattr(self, "pipeline_policy", {}).get("policy_name")
+                or "generic_low_snr_safe"
+            )
+            profile.setdefault("routing_contract", {})["primary_frozen"] = True
+            if observed_primary.get("type") != frozen.get("type"):
+                profile["observed_primary_target"] = observed_primary
+                profile.setdefault("diagnostics", []).append(
+                    "primary_target_frozen: "
+                    f"observed={observed_primary.get('type')} "
+                    f"retained={frozen.get('type')}"
+                )
+                policy_candidate = None
+
         desired_name = str(
             profile.get("pipeline")
             or profile.get("default_policy")
@@ -314,6 +408,8 @@ class TargetRuntimeMixin:
             "target_type": "generic_low_snr_safe",
             "pipeline": "generic_low_snr_safe",
             "classification_method": "fallback",
+            "secondary_labels": [],
+            "secondary_label_evidence": {},
             "features": {},
             "risks": {},
             "image_stats": {},
@@ -322,6 +418,8 @@ class TargetRuntimeMixin:
             "color_stats": {},
             "warnings": [reason],
         }
+        if callable(normalize_target_profile):
+            profile = normalize_target_profile(profile)
         policy = (
             policy_for_profile(profile)
             if callable(policy_for_profile)

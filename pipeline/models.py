@@ -38,6 +38,59 @@ class PipelineCheckpoint(str, Enum):
         return self.value
 
 
+class StarSeparationState(str, Enum):
+    """Semantic result of Stage 6; passthrough images are never starless."""
+
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    TARGET_BYPASS = "target_bypass"
+    REJECTED = "rejected"
+    TOOL_FAILED = "tool_failed"
+
+
+class InputState(str, Enum):
+    """Resolved transfer-function state of the current input image."""
+
+    LINEAR = "linear"
+    NONLINEAR = "nonlinear"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class InputProfile:
+    """Evidence-backed input state used to guard destructive linear stages."""
+
+    state: InputState
+    confidence: float
+    source: str
+    input_mode: str
+    evidence: List[Dict[str, Any]] = field(default_factory=list)
+    conflicts: List[str] = field(default_factory=list)
+    pixel_metrics: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def safe_for_linear_steps(self) -> bool:
+        return self.state is InputState.LINEAR and not self.conflicts
+
+    @property
+    def requires_review(self) -> bool:
+        return not self.safe_for_linear_steps
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema": "seestar.input-profile.v1",
+            "state": self.state.value,
+            "confidence": max(0.0, min(1.0, float(self.confidence))),
+            "source": self.source,
+            "input_mode": self.input_mode,
+            "safe_for_linear_steps": self.safe_for_linear_steps,
+            "requires_review": self.requires_review,
+            "evidence": list(self.evidence),
+            "conflicts": list(self.conflicts),
+            "pixel_metrics": dict(self.pixel_metrics),
+        }
+
+
 @dataclass
 class PipelineConfig:
     """处理参数配置 - 所有可调参数集中管理"""
@@ -65,11 +118,23 @@ class PipelineConfig:
     bg_edge_black_rise_max: float = 0.35  # Reject when edge black clipping rises too much
     bg_star_preserve_ratio_min: float = 0.90  # 阶段3背景提取后星点数量保留率下限
     bg_nebula_mean_change_max: float = 0.10  # 阶段3星云/弥散信号均值相对变化上限
+    stage3_conditional_decision_enabled: bool = True  # 阶段3先诊断再决定 apply/skip/review，禁止无证据直接扣背景
+    stage3_deterministic_auto_apply_enabled: bool = True  # 无视觉顾问时仅对高置信梯度使用离线确定性 apply
+    stage3_apply_confidence_min: float = 0.75  # 外部/视觉背景建议获准执行所需最低置信度
+    stage3_gradient_skip_max: float = 0.045  # 低于该内部工程门禁且背景干净时跳过 DBE
+    stage3_dirty_skip_max: float = 0.16  # 与低梯度同时满足时判定无需 DBE
+    stage3_gradient_apply_min: float = 0.08  # 确定性自动 apply 所需最低方向梯度评分
+    stage3_dirty_apply_min: float = 0.18  # 确定性自动 apply 所需最低背景污染评分
+    stage3_diffuse_auto_apply_enabled: bool = False  # 弥散星云/大尺度信号默认禁止自动 DBE，转人工复核
 
     # 阶段 5: 线性整理 / 反卷积 / 降噪
     denoise_enabled: bool = False   # 是否启用线性阶段降噪
     denoise_mod: float = 0.35       # 降噪强度参数（0~1），越大降噪越强
     denoise_safety_max: float = 0.55  # 降噪强度安全上限，防止细节被抹平
+    stage5_multiscale_denoise_enabled: bool = True  # 启用噪声模型驱动的亮度/对立色度多尺度确定性候选
+    stage5_multiscale_denoise_strength: float = 0.72  # 多尺度软阈值与回混强度，受质量门限制
+    stage5_multiscale_detail_retention_min: float = 0.82  # 主体高频细节最低保留比例
+    stage5_multiscale_noise_reduction_min: float = 0.05  # 非低噪输入所需最低背景噪声下降比例
     stage5_builtin_denoise_mod: float = 0.50  # Stage5 Siril 内置线性降噪强度，默认 denoise -mod=0.50 -indep
     stage5_deconvolution_enabled: bool = True  # Stage5 是否在线性降噪前执行 GraXpert/RL 反卷积
     stage5_graxpert_deconvolution_enabled: bool = True  # Stage5 是否优先尝试本地 GraXpert 对象反卷积；关闭后直接使用 RL
@@ -83,10 +148,24 @@ class PipelineConfig:
     optional_color_transform_enabled: bool = False  # 是否启用可选转色（Alchemy/Hubble）
     workflow_plugin_probe_enabled: bool = False  # Probe broad workflow plugin commands only when explicitly enabled; stage8 has a narrow safe SASP probe
     stage4_platesolve_enabled: bool = True  # 阶段4默认执行 platesolve -noflip，解算时保留原始图像方向
-    stage4_pcc_timeout_sec: int = 30  # 在线 Gaia PCC 只尝试一次；独立 Siril 子进程达到该秒数即终止
+    stage4_auto_geometry_enabled: bool = True  # 高置信 FITS/设备几何可用于 platesolve；显式环境覆盖始终优先
+    stage4_auto_geometry_confidence_min: float = 0.85  # 自动使用设备几何所需最低置信度
+    stage4_auto_geometry_scale_residual_max: float = 0.05  # 解算 WCS 像素比例相对预测值最大偏差，超限回滚并禁止 PCC
+    stage4_narrowband_normalization_enabled: bool = True  # 仅对已确认 Ha/OIII 通道映射的双窄带 RGB 启用确定性归一化
+    stage4_nbn_mapping_confidence_min: float = 0.85  # 低于此置信度时保留输入，不猜测窄带通道含义
+    stage4_nbn_strength: float = 0.55  # HOO 通道跨度与背景中和的保守混合强度
+    stage4_nbn_gain_limit: float = 1.08  # 单通道最大归一化增益/衰减范围
+    stage4_nbn_line_ratio_drift_max: float = 0.12  # Ha/OIII 信号比例最大相对漂移
+    stage4_pcc_timeout_sec: int = 180  # 本地优先/在线回退的 Gaia PCC 只尝试一次；独立 Siril 子进程达到该秒数即终止
     stage4_pcc_quality_gate_enabled: bool = True  # PCC 候选必须通过目标感知色彩质量门，否则回到 pre_pcc
     stage4_pcc_channel_gain_ratio_max: float = 1.80  # PCC 三通道相对增益最大跨度，限制异常色偏
+    stage4_pcc_emission_balance_gain_ratio_max: float = 4.0  # 发射星云仅在背景色差显著改善且其他门均安全时允许的大增益跨度
     stage4_pcc_clip_growth_max: float = 0.005  # PCC 相对 pre_pcc 允许新增的高光裁剪比例
+    stage4_pcc_star_temperature_ratio_min: float = 0.45  # 校色后可测恒星综合色温中位数相对输入的最低比例
+    stage4_pcc_star_temperature_ratio_max: float = 2.20  # 校色后可测恒星综合色温中位数相对输入的最高比例
+    stage4_pcc_background_color_delta_max: float = 0.22  # 背景变得更失衡时允许的最大归一化 RGB 色差
+    stage4_pcc_target_color_drift_max: float = 0.28  # 普通主体归一化 RGB 色度允许的最大漂移
+    stage4_pcc_emission_target_color_drift_max: float = 0.45  # 发射星云保留真实线发射主色时允许的更宽主体色度漂移
     stage4_local_star_wb_enabled: bool = True  # PCC 失败/拒绝时，仅在恒星软遮罩内做保守色彩恢复
     stage4_local_star_wb_min_pixels: int = 32  # 本地星点白平衡所需的最小白参考像素数
     stage4_local_star_wb_gain_limit: float = 1.20  # 恒星软遮罩内单通道增益限制，避免替代光度校准
@@ -104,6 +183,8 @@ class PipelineConfig:
     nebula_saturation: float = 0.4  # 去星图饱和度增强幅度
     nebula_bg_factor: int = 1       # 饱和度算法背景抑制系数（Siril `satu` 第二参数）
     stage8_masked_enhancement_enabled: bool = True  # 阶段8默认使用 Starless soft mask 分区增强，保护核心与背景
+    stage8_local_adjustment_engine_enabled: bool = True  # 使用版本化本地曲线/蒙版配方，候选未过门则保留配方前图像
+    stage8_local_curve_opacity: float = 0.30  # 本地微曲线最大混合比例，Stage8 仍受背景与核心质量门限制
     stage8_core_protection_strength: float = 0.92  # 阶段8亮核心回混原图强度，越高越保护核心不过曝
     stage8_background_denoise_strength: float = 0.14  # 阶段8背景区域轻量降噪强度
     stage8_faint_nebula_boost_max: float = 0.08  # 阶段8外围暗云气最大提亮强度
@@ -112,6 +193,9 @@ class PipelineConfig:
     stage8_blue_precontrol_strength: float = 0.55  # 阶段8增强前信号区蓝偏预抑制强度，减少后置 ccm 补救
     stage8_bg_std_growth_max: float = 1.08  # 阶段8背景噪声增长上限
     stage8_texture_artifact_growth_max: float = 1.25  # 阶段8纹理伪影评分增长上限
+    stage8_limited_saturation_max: float = 0.05  # 亮星云 halo 中风险区受限候选的饱和度硬上限
+    stage8_limited_halo_texture_growth_max: float = 1.05  # 受限候选星周环带纹理相对增长上限
+    stage8_limited_halo_texture_delta_max: float = 0.00075  # 环带绝对增长低于此值时豁免比例误报
 
     # 阶段 9: 星点混合
     star_intensity: float = 1.0     # 传统回混时星点层主强度
@@ -120,6 +204,11 @@ class PipelineConfig:
     stage9_starmask_stretch_enabled: bool = True  # 阶段9像素回混前默认把线性 starmask 独立 Asinh 拉伸到非线性域
     stage9_starmask_adaptive_stretch_enabled: bool = True  # 根据星点层有效信号分布反解 Asinh 强度，而不是固定套用单一参数
     stage9_compact_starmask_enabled: bool = True  # Asinh 前仅保留连通紧致星核和窄星翼；覆盖异常时允许重建更严格支持层
+    stage9_star_color_repair_enabled: bool = True  # 用不可变线性含星参考修复星层核心/星翼色度，候选失败即保留原层
+    stage9_star_color_repair_strength: float = 0.72  # 参考色度回混强度；亮星核心自动降低以保留真实星色和通量
+    stage9_star_color_support_ratio_max: float = 0.12  # 星色修复允许影响的最大画面覆盖率
+    stage9_star_color_improvement_min: float = 0.01  # 候选所需最小中位色度误差改善
+    stage9_star_color_post_chroma_error_max: float = 0.22  # 拉伸及回混前最终星层相对参考的中位色度误差上限
     stage9_source_star_detail_percentile: float = 98.0  # 从原始含星图提取独立星核目录的局部细节百分位
     stage9_source_component_density_max: float = 2500.0  # 独立星表紧致组件密度上限；伴随单像素噪点证据时自适应收紧或 fail-closed
     stage9_source_single_pixel_ratio_max: float = 0.20  # 独立星表单像素组件比例上限，单项超限即自适应收紧或 fail-closed
@@ -183,21 +272,22 @@ class PipelineConfig:
     stage10_full_bg_std_min: float = 0.018  # Stage10 色噪伴随亮度背景噪声时改用 full 的 bg_std 门限
     stage10_full_mottling_score_min: float = 0.45  # Stage10 色噪伴随背景斑驳时改用 full 的斑驳门限
     stage10_stage9_local_color_risk_strength: float = 1.0  # 按 Stage9 局部青蓝/核心突变风险比例压低正向最终饱和度
+    stage10_managed_output_enabled: bool = True  # 独立生成带 sRGB/ICC 的 16-bit PNG/TIFF；永不重写 FITS 科学存档
     force_review_only_output: bool = False  # 显式启用时 Stage10 仅写 result_review*，不写正式结果名
 
     # Stage 11: Optional AI postprocess
     review_bundle_enabled: bool = True  # 为关键阶段生成 before/after/diff/metrics 视觉复核包
-    ai_post_enabled: bool = False   # Enable optional AI postprocess stage
-    ai_endpoint: str = ""           # OpenAI-compatible image edit endpoint
+    ai_post_enabled: bool = False   # 可选 AI 顾问/Stage11 副本总开关；联网仍需 SEESTAR_NETWORK_MODE=1
+    ai_endpoint: str = ""           # OpenAI-compatible chat endpoint
     ai_model: str = ""              # User-provided model name
     ai_api_key: str = ""            # User-provided API key
     ai_timeout_sec: int = 90        # API request timeout in seconds
     ai_strength: float = 0.12       # Conservative blend ratio for AI result
     ai_prompt: str = ""             # Custom prompt; empty uses default conservative prompt
-    ai_advisor_mode: str = "text"  # AI 顾问模式：text 或 multimodal；多模态失败时参数建议自动回退文本
-    ai_stage6_enabled: bool = True  # AI 总开关开启且凭据齐全时，允许阶段6使用 AI 拉伸顾问
-    ai_stage7_enabled: bool = True  # AI 总开关开启且凭据齐全时，允许阶段7使用 AI SyQon 参数优化
-    ai_stage8_enabled: bool = True  # AI 总开关开启且凭据齐全时，允许阶段8使用 AI Starless 参数优化
+    ai_advisor_mode: str = "text"  # AI 顾问模式：text 或 multimodal；模型只返回代码候选 ID
+    ai_stage6_enabled: bool = True  # 联网与总开关开启后，允许 AI 从通过硬门控的拉伸候选 ID 中选择
+    ai_stage7_enabled: bool = True  # 联网与总开关开启后，允许 AI 从代码生成的 SyQon 候选 ID 中选择
+    ai_stage8_enabled: bool = True  # 联网与总开关开启后，允许 AI 从代码生成的 Starless 增强候选 ID 中选择
 
     # Stage 11 后：完全隔离的 AI 艺术衍生实验（不属于正式阶段）
     ai_artistic_derivative_enabled: bool = False  # 显式开启后才上传 Stage10 预览并生成独立艺术衍生图
@@ -218,6 +308,7 @@ class PipelineConfig:
     stage6_black_pixel_ratio_max: float = 0.35  # 阶段6验收：近黑像素占比上限
     stage6_highlight_clip_ratio_max: float = 0.010  # 阶段6验收：高亮裁剪占比上限
     stage6_star_growth_ratio_max: float = 1.25  # 阶段6验收：星点中位尺寸增长上限
+    stage7_bright_nebula_star_growth_ratio_max: float = 1.50  # Stage 7 亮核心星云 starless 拉伸的星状结构增长上限
     stage7_preview_calibration_enabled: bool = True  # 阶段7用 linked preview 的 P50/P99 标定正式 Asinh 候选
     stage7_target_aware_stretch_enabled: bool = True  # 阶段7按 target profile/policy 收紧核心保护或增强弱信号，但保持固定双候选
     stage7_preview_cand_a_p50_ratio: float = 0.35  # cand_a 目标背景相对 preview P50 的保守比例
@@ -266,7 +357,7 @@ class PipelineConfig:
     stage7_ultra_conservative_asinh_stretch: float = 1.65  # 旧去星前兼容门禁的诊断候选参数，不进入正式 Stage 6
     stage7_soft_starless_asinh_stretch: float = 1.35  # 旧去星前兼容参数；当前 Stage 6 不使用预拉伸重试
     stage7_conservative_asinh_offset: float = 0.0025  # 旧去星前兼容门禁的 Asinh 偏移
-    stage7_starless_pixel_repair_enabled: bool = True  # 阶段7质量差时对 starless 做残星/halo/背景彩噪局部修复
+    stage7_starless_pixel_repair_enabled: bool = True  # 阶段6质量不合格或亮星云 halo advisory 时，对 starless 做残星/halo/背景彩噪局部修复
     stage7_starless_repair_strength: float = 0.68  # 阶段7残星小尺度修复强度
     stage7_starless_halo_repair_strength: float = 0.70  # 阶段7亮星 halo 平滑修补强度
     stage7_starless_chroma_denoise_strength: float = 0.55  # 阶段7背景 chroma noise reduction 强度
@@ -274,7 +365,7 @@ class PipelineConfig:
     stage7_starless_repair_max_score_growth: float = 0.00  # 阶段7像素修复不得让综合质量评分变差
     stage7_starless_repair_chroma_reduction_min: float = 0.20  # 背景综合色噪至少下降此比例时允许走专用验收路径
     stage7_starless_repair_chroma_delta_min: float = 0.0005  # 背景综合色噪专用验收所需的最小绝对下降量
-    stage8_force_conservative_after_stage7_repair: bool = True  # Stage7 修复/不安全时 Stage8 禁止细节增强
+    stage8_force_conservative_after_stage7_repair: bool = True  # Stage6 修复被接受后强制 Stage8 使用受限候选，不进入完整增强
     stage8_mask_signal_coverage_min: float = 0.002  # Stage8 增强前信号 mask 覆盖下限，小视场 M42 等紧凑目标保守放行
     stage8_blue_excess_max: float = 0.08  # 阶段8验收：蓝色相对红/绿通道的过量上限
     stage8_saturation_growth_ratio_max: float = 1.45  # 阶段8验收：饱和度增长上限
@@ -372,26 +463,22 @@ class StageResult:
     status: str = 'pending'     # ok / degraded / failed / skipped
     duration: float = 0.0
     message: str = ''
+    execution: str = "completed"  # completed / safe_passthrough / skipped
+    fallback_used: bool = False  # 仅表示本阶段实际采用回退路径
+    upstream_passthrough: bool = False  # 上游安全旁路，不等同本阶段回退
+    reason_code: str = ''
+    details: Dict[str, Any] = field(default_factory=dict)
+    components: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     @property
     def display_status(self) -> str:
-        """Return a summary-only status without changing pipeline control flow."""
+        """Return a structured summary status without inspecting human text."""
         if self.status != "ok":
             return self.status
-        message = self.message.lower()
-        fallback_markers = (
-            "fallback:",
-            "fallback_status=success",
-            "fallback_used=true",
-            "fallback used=true",
-            "using fallback",
-            "fallback applied",
-            "explicit fallback",
-            "已回退",
-            "使用回退",
-        )
-        if any(token in message for token in fallback_markers):
+        if self.fallback_used:
             return "ok_with_fallback"
-        if any(token in message for token in ("skipped", "跳过", "disabled")):
+        if self.execution == "safe_passthrough":
+            return "ok_safe_passthrough"
+        if self.execution == "skipped":
             return "ok_skipped_optional"
         return self.status

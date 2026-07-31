@@ -339,7 +339,10 @@ class PluginServiceMixin:
 
 
 class Stage7ServiceMixin:
-    def _normalize_stage7_starless_plan(self, obj: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize_stage7_starless_plan(
+        self,
+        obj: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
         return ai_advisory.normalize_stage7_starless_plan(self, obj)
 
 
@@ -818,7 +821,10 @@ class Stage8ServiceMixin:
         )
 
 
-    def _normalize_stage8_processing_plan(self, obj: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize_stage8_processing_plan(
+        self,
+        obj: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
         return ai_advisory.normalize_stage8_processing_plan(self, obj)
 
 
@@ -882,6 +888,11 @@ class Stage8ServiceMixin:
         target_type = self._active_target_type() if hasattr(self, "_active_target_type") else ""
         if target_type == "bright_emission_reflection_nebula":
             return max(base, float(self.cfg.stage7_bright_nebula_halo_residue_score_max))
+        if target_type in stage7_quality.DIFFUSE_EMISSION_NEBULA_TARGET_TYPES:
+            return max(
+                base,
+                stage7_quality.DIFFUSE_EMISSION_HALO_RESIDUE_SCORE_MAX,
+            )
         return base
 
 
@@ -963,6 +974,10 @@ class AiPostServiceMixin:
         api_key: str,
         timeout_sec: int,
     ) -> Dict[str, Any]:
+        if not ai_advisory.network_mode_enabled():
+            raise RuntimeError(
+                "outbound AI request blocked: SEESTAR_NETWORK_MODE is disabled"
+            )
         return ai_advisory.post_json_with_auth(endpoint, payload, api_key, timeout_sec)
 
 

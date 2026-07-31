@@ -1,6 +1,7 @@
 """Target profiling for adaptive deep-sky processing."""
 from __future__ import annotations
 
+import copy
 import json
 import re
 from pathlib import Path
@@ -68,6 +69,112 @@ TYPE_TO_POLICY = {
     "widefield_milkyway": "generic_low_snr_safe",
     "generic_low_snr_safe": DEFAULT_POLICY_NAME,
 }
+
+SECONDARY_CONTEXT_LABELS = (
+    "bright_core",
+    "large_nebulosity",
+    "faint_outer_cloud",
+    "dense_star_field",
+    "reflection_blue",
+    "emission_red",
+)
+
+_SECONDARY_LABEL_ROLES = {
+    "bright_core": "structure_protection",
+    "large_nebulosity": "background_protection",
+    "faint_outer_cloud": "background_protection",
+    "dense_star_field": "star_protection",
+    "reflection_blue": "color_context",
+    "emission_red": "color_context",
+}
+
+
+def _secondary_context(
+    features: AdaptiveImageFeatures,
+    flags: Dict[str, bool],
+) -> Tuple[List[str], Dict[str, Dict[str, Any]]]:
+    scores = {
+        "bright_core": max(features.bright_core_score, features.core_peak_ratio),
+        "large_nebulosity": features.nebulosity_area_ratio,
+        "faint_outer_cloud": features.faint_structure_score,
+        "dense_star_field": features.dense_star_field_score,
+        "reflection_blue": max(0.0, min(1.0, (features.blue_dominance - 1.0) / 0.25)),
+        "emission_red": max(0.0, min(1.0, (features.red_dominance - 1.0) / 0.25)),
+    }
+    labels = [label for label in SECONDARY_CONTEXT_LABELS if flags.get(label, False)]
+    evidence = {
+        label: {
+            "role": _SECONDARY_LABEL_ROLES[label],
+            "score": round(float(scores[label]), 4),
+            "source": "image_features",
+        }
+        for label in labels
+    }
+    return labels, evidence
+
+
+def normalize_target_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize routing so only one primary target can select the policy."""
+    normalized = copy.deepcopy(profile if isinstance(profile, dict) else {})
+    target_type = str(
+        normalized.get("target_type") or "generic_low_snr_safe"
+    ).strip().lower()
+    if target_type not in TYPE_TO_POLICY:
+        target_type = "generic_low_snr_safe"
+    target_name = normalized.get("target_name_guess")
+    try:
+        confidence = max(
+            0.0,
+            min(1.0, float(normalized.get("target_confidence", 0.0) or 0.0)),
+        )
+    except (TypeError, ValueError):
+        confidence = 0.0
+    method = str(normalized.get("classification_method") or "unknown")
+    pipeline_name = TYPE_TO_POLICY.get(target_type, DEFAULT_POLICY_NAME)
+
+    raw_secondary = normalized.get("secondary_labels", [])
+    if not isinstance(raw_secondary, (list, tuple)):
+        raw_secondary = []
+    secondary_labels = [
+        label
+        for label in SECONDARY_CONTEXT_LABELS
+        if label in {str(item).strip() for item in raw_secondary}
+    ]
+    raw_evidence = normalized.get("secondary_label_evidence", {})
+    evidence = {
+        label: copy.deepcopy(raw_evidence.get(label, {}))
+        for label in secondary_labels
+        if isinstance(raw_evidence, dict)
+    }
+
+    normalized.update(
+        {
+            "target_name_guess": target_name,
+            "target_confidence": round(confidence, 4),
+            "target_type": target_type,
+            "pipeline": pipeline_name,
+            "classification_method": method,
+            "primary_target": {
+                "name": target_name,
+                "type": target_type,
+                "confidence": round(confidence, 4),
+                "method": method,
+                "frozen": bool(
+                    (normalized.get("primary_target") or {}).get("frozen", False)
+                    if isinstance(normalized.get("primary_target"), dict)
+                    else False
+                ),
+            },
+            "secondary_labels": secondary_labels,
+            "secondary_label_evidence": evidence,
+            "routing_contract": {
+                "policy_source": "primary_target.type",
+                "star_separation_source": "primary_target.type",
+                "secondary_labels_can_route": False,
+            },
+        }
+    )
+    return normalized
 
 
 def load_catalog(path: Path = CATALOG_PATH) -> List[Dict[str, Any]]:
@@ -365,12 +472,15 @@ def build_target_profile(
         target_type = visual_type if visual_type != "generic_low_snr_safe" else "generic_low_snr_safe"
 
     policy_name = TYPE_TO_POLICY.get(target_type, DEFAULT_POLICY_NAME)
+    secondary_labels, secondary_evidence = _secondary_context(features, flags)
     profile = {
         "target_name_guess": target_name,
         "target_confidence": round(float(target_confidence), 4),
         "target_type": target_type,
         "pipeline": policy_name,
         "classification_method": method,
+        "secondary_labels": secondary_labels,
+        "secondary_label_evidence": secondary_evidence,
         "features": flags,
         "risks": risk_levels(features),
         "image_stats": {
@@ -409,5 +519,6 @@ def build_target_profile(
         "diagnostics": diagnostics,
         "warnings": warnings,
     }
+    profile = normalize_target_profile(profile)
     profile["policy"] = policy_for_profile(profile)
     return profile
