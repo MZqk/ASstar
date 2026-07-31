@@ -57,10 +57,13 @@ from processor_services import (
 from models import (
     AutoTuneResult,
     ImageFeatures,
+    InputProfile,
+    InputState,
     PipelineCheckpoint,
     PipelineConfig,
     PipelineStage,
     QualityMetrics,
+    StarSeparationState,
     Stage6StretchStrategy,
     StageResult,
     TargetType,
@@ -332,6 +335,9 @@ AUTO_CLAMP_FIELDS = (
     "stage8_blue_precontrol_strength",
     "stage8_bg_std_growth_max",
     "stage8_texture_artifact_growth_max",
+    "stage8_limited_saturation_max",
+    "stage8_limited_halo_texture_growth_max",
+    "stage8_limited_halo_texture_delta_max",
     "star_intensity",
     "star_fallback_intensity",
     "final_saturation",
@@ -346,6 +352,7 @@ AUTO_CLAMP_FIELDS = (
     "stage6_black_pixel_ratio_max",
     "stage6_highlight_clip_ratio_max",
     "stage6_star_growth_ratio_max",
+    "stage7_bright_nebula_star_growth_ratio_max",
     "stage7_stretch_chroma_noise_score_max",
     "stage7_stretch_background_mottling_score_max",
     "stage7_stretch_chroma_load_growth_max",
@@ -453,6 +460,9 @@ CLAMP_RULES: list[tuple[str, type, float, float]] = [
     ("stage8_blue_precontrol_strength", float, 0.0, 1.00),
     ("stage8_bg_std_growth_max", float, 1.00, 1.50),
     ("stage8_texture_artifact_growth_max", float, 1.00, 2.20),
+    ("stage8_limited_saturation_max", float, 0.0, 0.10),
+    ("stage8_limited_halo_texture_growth_max", float, 1.0, 1.50),
+    ("stage8_limited_halo_texture_delta_max", float, 0.00001, 0.01000),
     ("star_intensity", float, 0.8, 1.05),
     ("star_fallback_intensity", float, 0.75, 1.05),
     ("final_saturation", float, 0.05, 0.25),
@@ -467,6 +477,7 @@ CLAMP_RULES: list[tuple[str, type, float, float]] = [
     ("stage6_black_pixel_ratio_max", float, 0.10, 0.70),
     ("stage6_highlight_clip_ratio_max", float, 0.001, 0.050),
     ("stage6_star_growth_ratio_max", float, 1.05, 1.80),
+    ("stage7_bright_nebula_star_growth_ratio_max", float, 1.05, 1.80),
     ("stage7_stretch_chroma_noise_score_max", float, 0.10, 0.80),
     ("stage7_stretch_background_mottling_score_max", float, 0.10, 1.00),
     ("stage7_stretch_chroma_load_growth_max", float, 1.00, 3.00),
@@ -1034,22 +1045,41 @@ class SeestarPostProcessor(
         self._stage8_fallback_used: bool = False
         self._stage8_final_quality: str = "unknown"
         self._stage8_conservative_mode: bool = False
+        self._stage8_handoff: Dict[str, Any] = {}
         self._stage7_selected_quality: Optional[Dict[str, Any]] = None
         self._stage7_residual_star_score: float = 0.0
         self._stage7_starless_skipped: bool = False
+        self._star_separation_state: str = StarSeparationState.PENDING.value
+        self._stage6_passthrough_source: Optional[str] = None
         self._stage9_star_intensity_scale: float = 1.0
         self._stage9_star_intensity_reason: str = ""
         self._stage9_bypassed_bad_starless: bool = False
         self._stage9_stars_required: bool = True
         self._stage9_stars_applied: bool = False
         self._stage9_stars_application_mode: str = "pending"
+        self._stage9_fallback_used: bool = False
+        self._stage9_fallback_reason: Optional[str] = None
         self._stage9_final_source: str = ""
         self._star_preserve_target_bypass: bool = False
+        self.input_profile: Dict[str, Any] = {}
+        self._trusted_input_provenance: Optional[Dict[str, Any]] = None
+        self._input_state_review_route: bool = False
+        self._skip_stage10_color_adjustments: bool = False
+        self._background_review_required: bool = False
+        self._channel_semantics: str = "unknown"
+        self.channel_profile: Dict[str, Any] = {}
+        self._run_id: Optional[str] = None
+        self._processing_plan: Dict[str, Any] = {}
+        self._processing_plan_hash: Optional[str] = None
+        self._pipeline_result_manifest: Dict[str, Any] = {}
+        self._pipeline_result_global_status: Optional[str] = None
         self._stage5_denoise_applied: bool = False
         self._saturation_boost_applied: float = 0.0
         self._debug_quality_metric_index: int = 0
         self.target_profile: Dict[str, Any] = {}
         self.pipeline_policy: Dict[str, Any] = copy.deepcopy(DEFAULT_POLICY)
+        self._target_primary_frozen: bool = False
+        self._frozen_primary_target: Dict[str, Any] = {}
         self.pre_starless_gate_report: Dict[str, Any] = {}
         self.color_calibration_report: Dict[str, Any] = {}
         self.input_mode: str = INPUT_MODE_AUTO
@@ -1241,8 +1271,37 @@ class SeestarPostProcessor(
             if self.process_dir:
                 self.cmd_with_check("cd", f'"{self.process_dir}"')
 
-    def _record_stage(self, name, status, duration=0.0, message=''):
-        result = StageResult(name, status, duration, message)
+    def _record_stage(
+        self,
+        name,
+        status,
+        duration=0.0,
+        message='',
+        *,
+        execution=None,
+        fallback_used=False,
+        upstream_passthrough=False,
+        reason_code='',
+        details=None,
+        components=None,
+    ):
+        normalized_status = str(status).strip().lower()
+        normalized_execution = str(
+            execution
+            or ("skipped" if normalized_status == "skipped" else "completed")
+        ).strip().lower()
+        result = StageResult(
+            name,
+            normalized_status,
+            duration,
+            message,
+            execution=normalized_execution,
+            fallback_used=bool(fallback_used),
+            upstream_passthrough=bool(upstream_passthrough),
+            reason_code=str(reason_code or ""),
+            details=dict(details or {}),
+            components=dict(components or {}),
+        )
         self.results.append(result)
         stage_match = re.match(r"^阶段\s+(\d+)\s*:\s*(.*)$", str(name).strip())
         if stage_match:
@@ -1255,13 +1314,38 @@ class SeestarPostProcessor(
             event_status = {
                 "ok_with_fallback": "degraded",
                 "ok_skipped_optional": "skipped",
-            }.get(result.display_status, str(status).strip().lower())
+                # Legacy GUI versions do not know the neutral passthrough state.
+                "ok_safe_passthrough": "ok",
+            }.get(result.display_status, normalized_status)
             self.log.info(
                 "[PIPELINE_STAGE_RESULT] "
                 f"stage={stage_number} "
                 f"status={event_status} "
                 f"duration={duration_seconds:.1f} "
                 f"title={stage_title}"
+            )
+            stage_detail = {
+                "schema": "seestar.pipeline-stage-detail.v1",
+                "stage": stage_number,
+                "title": stage_title,
+                "status": result.status,
+                "display_status": result.display_status,
+                "execution": result.execution,
+                "fallback_used": result.fallback_used,
+                "upstream_passthrough": result.upstream_passthrough,
+                "reason_code": result.reason_code or None,
+                "duration_seconds": duration_seconds,
+                "details": result.details,
+                "components": result.components,
+            }
+            self.log.info(
+                "[PIPELINE_STAGE_DETAIL] "
+                + json.dumps(
+                    stage_detail,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                )
             )
             try:
                 self._publish_stage_preview(
@@ -1301,9 +1385,13 @@ class SeestarPostProcessor(
             3: ("stage3_bgremoved",),
             4: ("stage4_color", "stage4_colorbalanced", "stage4_psolved"),
             5: ("stage5_linear", "stage5_denoised"),
-            6: ("stage6_starless", "stage7_starless"),
-            7: ("stage7_stretched",),
-            8: ("stage8_enhanced", "starless_enhanced"),
+            6: ("stage6_starless", "stage7_starless", "stage6_passthrough"),
+            7: ("stage7_stretched", "stage7_review_with_stars"),
+            8: (
+                "stage8_enhanced",
+                "starless_enhanced",
+                "stage8_review_with_stars",
+            ),
             9: ("stage9_remixed",),
             10: ("stage10_final",),
         }.get(stage, ())
@@ -1507,6 +1595,67 @@ class SeestarPostProcessor(
                     temp_source.unlink()
                 except OSError as e:
                     self.log.debug(f"Unable to remove temp stage2 input {temp_source.name}: {e}")
+
+    def _activate_input_state_review_route(
+        self,
+        profile: InputProfile,
+    ) -> None:
+        """Keep an unsafe/unknown input intact and prepare Stage 10 review export."""
+        self._input_state_review_route = True
+        self._skip_stage10_color_adjustments = True
+        self.cfg.force_review_only_output = True
+        self._star_separation_state = StarSeparationState.REJECTED.value
+        self._stage7_starless_skipped = True
+        self._stage8_fallback_used = True
+        self._stage8_final_quality = "input_state_passthrough"
+        self._stage9_stars_required = False
+        self._stage9_stars_applied = False
+        self._stage9_stars_application_mode = "not_required_input_state_passthrough"
+        self.starless_file = None
+        self.starmask_file = None
+
+        source_stem = None
+        if self.process_dir:
+            for candidate in (
+                "stage2_corrected",
+                "stage1_prepared",
+                "working",
+            ):
+                if (self.process_dir / f"{candidate}.fit").is_file():
+                    source_stem = candidate
+                    break
+        if source_stem:
+            try:
+                self.cmd_with_check("load", source_stem)
+                if self._save_stage_output("input_state_passthrough"):
+                    source_stem = "input_state_passthrough"
+            except (CommandError, SirilError) as error:
+                self.log.warn(
+                    "输入状态复核 checkpoint 保存失败，沿用当前图像: "
+                    f"{error}"
+                )
+        else:
+            source_stem = "input_state_passthrough"
+
+        self.stretched_name = source_stem
+        self._stage8_final_source = source_stem
+        self._stage9_final_source = source_stem
+        self.log.warn(
+            "[InputProfile] conservative review route active: "
+            f"state={profile.state.value}, source={source_stem}"
+        )
+
+    def _record_input_state_skipped_stages(
+        self,
+        profile: InputProfile,
+        stages: Tuple[PipelineStage, ...],
+    ) -> None:
+        reason = (
+            f"skipped because input state={profile.state.value} "
+            f"confidence={profile.confidence:.2f}; review-only route"
+        )
+        for stage in stages:
+            self._record_skipped_stage(stage.label, reason)
 
     def _apply_forced_runtime_switches(self):
         if self._force_denoise_enabled is not None:
@@ -1853,6 +2002,19 @@ class SeestarPostProcessor(
     # Stage 11: Optional AI postprocess
     # ========================================
     def stage11_ai_postprocess(self):
+        if not self.cfg.ai_post_enabled:
+            stage_label = PipelineStage.AI_POSTPROCESS.label
+            self.log.stage_start(stage_label)
+            self.ai_outputs_generated = False
+            elapsed = self.log.stage_end(stage_label)
+            self._record_stage(
+                stage_label,
+                "skipped",
+                elapsed,
+                "SEESTAR_AI_ENABLED not enabled",
+            )
+            return
+
         if run_stage11_ai_postprocess is None:
             stage_label = PipelineStage.AI_POSTPROCESS.label
             self.log.stage_start(stage_label)
@@ -1979,6 +2141,7 @@ class SeestarPostProcessor(
             'starmask_clean.fit',
             'starmask_external_raw.fit',
             'starmask_stretched.fit',
+            'stage8_limited_candidate.fit',
         }
         if self.stretched_name:
             keep_files.add(f"{self.stretched_name}_starmask.fit")
@@ -2056,6 +2219,8 @@ class SeestarPostProcessor(
             self._stage7_selected_quality = None
             self._stage7_residual_star_score = 0.0
             self._stage7_starless_skipped = False
+            self._star_separation_state = StarSeparationState.PENDING.value
+            self._stage6_passthrough_source = None
             self._stage7_before_stage6 = True
             self._stage7_starless_first_source = ""
             self._stage9_star_intensity_scale = 1.0
@@ -2068,16 +2233,40 @@ class SeestarPostProcessor(
             self._star_preserve_target_bypass = False
             self._stage5_denoise_applied = False
             self._saturation_boost_applied = 0.0
+            self.results = []
+            self.input_profile = {}
+            self._trusted_input_provenance = None
+            self._input_state_review_route = False
+            self._skip_stage10_color_adjustments = False
+            self._background_review_required = False
+            self._channel_semantics = "unknown"
+            self.channel_profile = {}
+            self._run_id = None
+            self._processing_plan = {}
+            self._processing_plan_hash = None
+            self._pipeline_result_manifest = {}
+            self._pipeline_result_global_status = None
+            self._final_export_started_at = None
+            self._final_output_basenames = ()
+            self.target_profile = {}
+            self.pipeline_policy = copy.deepcopy(DEFAULT_POLICY)
+            self._target_primary_frozen = False
+            self._frozen_primary_target = {}
+
+            self._load_trusted_input_provenance_for_resume()
 
             if self.cfg.ai_post_enabled:
                 self.log.info(
-                    "[AI] Enabled for stage6-8 parameter optimization and optional stage11: "
+                    "[AI] Requested for stage6-8 code-owned candidate selection "
+                    "and optional stage11; outbound requests also require "
+                    "SEESTAR_NETWORK_MODE=1: "
                     f"endpoint={self.cfg.ai_endpoint}, model={self.cfg.ai_model}, "
                     f"timeout={self.cfg.ai_timeout_sec}s, strength={self.cfg.ai_strength}"
                 )
             if self.cfg.ai_artistic_derivative_enabled:
                 self.log.info(
-                    "[AI-Artistic] isolated experiment enabled "
+                    "[AI-Artistic] isolated experiment requested; outbound requests "
+                    "also require SEESTAR_NETWORK_MODE=1 "
                     f"model={self.cfg.ai_artistic_model or 'unset'}, "
                     f"timeout={self.cfg.ai_artistic_timeout_sec}s; "
                     "output will not re-enter Siril"
@@ -2085,57 +2274,142 @@ class SeestarPostProcessor(
 
             if self.input_mode == INPUT_MODE_LINEAR_RESUME:
                 self._prepare_linear_resume_input()
+                input_profile = self._resolve_input_profile()
                 self._auto_tune_for_current_input()
+                self._run_target_profile_preflight(
+                    source="Linear resume processing-plan preflight",
+                    metadata_candidates=(LINEAR_RESUME_INPUT_NAME, self.source_file),
+                    preview_name="stage3_target_preview.png",
+                )
+                self._freeze_primary_target()
                 self._record_skipped_stage(
                     PipelineStage.VIEW_CORRECTION.label,
                     "skipped by linear resume mode",
                 )
-                self._run_target_profile_preflight(
-                    source="Linear resume preflight",
-                    metadata_candidates=(LINEAR_RESUME_INPUT_NAME, self.source_file),
-                    preview_name="stage3_target_preview.png",
-                )
-                self._record_skipped_stage(
-                    PipelineStage.BACKGROUND_EXTRACTION.label,
-                    "skipped by linear resume mode",
-                )
-                self._record_skipped_stage(
-                    PipelineStage.COLOR_CALIBRATION.label,
-                    "skipped by linear resume mode",
-                )
-                self._record_skipped_stage(
-                    PipelineStage.LINEAR_DENOISE.label,
-                    "skipped by linear resume mode",
-                )
+                if input_profile.safe_for_linear_steps:
+                    if not self._write_processing_plan(input_profile):
+                        raise RuntimeError("processing-plan.json could not be frozen")
+                    self._record_skipped_stage(
+                        PipelineStage.BACKGROUND_EXTRACTION.label,
+                        "skipped by verified linear resume mode",
+                    )
+                    self._record_skipped_stage(
+                        PipelineStage.COLOR_CALIBRATION.label,
+                        "skipped by verified linear resume mode",
+                    )
+                    self._record_skipped_stage(
+                        PipelineStage.LINEAR_DENOISE.label,
+                        "skipped by verified linear resume mode",
+                    )
+                else:
+                    if not self._write_processing_plan(input_profile):
+                        raise RuntimeError("processing-plan.json could not be frozen")
+                    self._record_input_state_skipped_stages(
+                        input_profile,
+                        (
+                            PipelineStage.BACKGROUND_EXTRACTION,
+                            PipelineStage.COLOR_CALIBRATION,
+                            PipelineStage.LINEAR_DENOISE,
+                        ),
+                    )
             elif self.input_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
                 self._prepare_stage2_corrected_resume_input()
+                input_profile = self._resolve_input_profile()
                 self._auto_tune_for_current_input()
-                self.stage3_background_extraction()
-                self.stage4_color_calibration()
-                self.stage5_linear_denoise()
+                self._run_target_profile_preflight(
+                    source="Stage2 resume processing-plan preflight",
+                    metadata_candidates=("stage2_corrected", self.source_file),
+                    preview_name="stage3_target_preview.png",
+                )
+                self._freeze_primary_target()
+                if not self._write_processing_plan(input_profile):
+                    raise RuntimeError("processing-plan.json could not be frozen")
+                if input_profile.safe_for_linear_steps:
+                    self.stage3_background_extraction()
+                    self.stage4_color_calibration()
+                    self.stage5_linear_denoise()
+                else:
+                    self._record_input_state_skipped_stages(
+                        input_profile,
+                        (
+                            PipelineStage.BACKGROUND_EXTRACTION,
+                            PipelineStage.COLOR_CALIBRATION,
+                            PipelineStage.LINEAR_DENOISE,
+                        ),
+                    )
             else:
                 # 线性阶段 (1-5)
                 self.stage1_preparation()
+                input_profile = self._resolve_input_profile()
                 self._auto_tune_for_current_input()
                 self.stage2_view_correction()
-                self.stage3_background_extraction()
-                self.stage4_color_calibration()
-                self.stage5_linear_denoise()
-            self.stage6_star_separation()
-            self.stage7_stretching()
+                self._run_target_profile_preflight(
+                    source="Processing-plan preflight",
+                    metadata_candidates=("stage2_corrected", self.source_file),
+                    preview_name="stage3_target_preview.png",
+                )
+                self._freeze_primary_target()
+                if not self._write_processing_plan(input_profile):
+                    raise RuntimeError("processing-plan.json could not be frozen")
+                if input_profile.safe_for_linear_steps:
+                    self.stage3_background_extraction()
+                    self.stage4_color_calibration()
+                    self.stage5_linear_denoise()
+                else:
+                    self._record_input_state_skipped_stages(
+                        input_profile,
+                        (
+                            PipelineStage.BACKGROUND_EXTRACTION,
+                            PipelineStage.COLOR_CALIBRATION,
+                            PipelineStage.LINEAR_DENOISE,
+                        ),
+                    )
+
+            if input_profile.safe_for_linear_steps:
+                self.stage6_star_separation()
+                self.stage7_stretching()
+            else:
+                self._activate_input_state_review_route(input_profile)
+                self._record_input_state_skipped_stages(
+                    input_profile,
+                    (
+                        PipelineStage.STAR_SEPARATION,
+                        PipelineStage.STRETCHING,
+                    ),
+                )
             self._record_skipped_stage(
                 PipelineCheckpoint.PRE_STARLESS_COMPATIBILITY_GATE.label,
                 "not a formal stage; starless-first mode completes Stage 6 "
                 "before Stage 7",
             )
-            self.stage8_nebula_enhancement()
-            self.stage9_star_remixing()
+            if input_profile.safe_for_linear_steps:
+                self.stage8_nebula_enhancement()
+                self.stage9_star_remixing()
+            else:
+                self._record_input_state_skipped_stages(
+                    input_profile,
+                    (
+                        PipelineStage.NEBULA_ENHANCEMENT,
+                        PipelineStage.STAR_REMIXING,
+                    ),
+                )
             self.stage10_export()
-            self.stage11_ai_postprocess()
-            if bool(getattr(self.cfg, "ai_artistic_derivative_enabled", False)):
+            if input_profile.safe_for_linear_steps:
+                self.stage11_ai_postprocess()
+            else:
+                self._record_skipped_stage(
+                    PipelineStage.AI_POSTPROCESS.label,
+                    "skipped for input-state review-only route",
+                )
+            if (
+                input_profile.safe_for_linear_steps
+                and bool(getattr(self.cfg, "ai_artistic_derivative_enabled", False))
+            ):
                 self.ai_artistic_derivative_experiment()
 
             self.cleanup()
+            if not self._write_pipeline_result_manifest():
+                raise RuntimeError("pipeline-result.json could not be written")
 
             duration = (time.time() - start_time) / 60
 
@@ -2146,6 +2420,8 @@ class SeestarPostProcessor(
             self.log.info("=" * 60)
             status_icons = {
                 'ok': '✓', 'degraded': '⚠', 'failed': '✗', 'skipped': '—',
+                'ok_with_fallback': '⚠', 'ok_safe_passthrough': '↪',
+                'ok_skipped_optional': '—',
             }
             self.log.info(
                 f"  {'阶段':<28} {'状态':<18} {'耗时':>8}")
@@ -2165,7 +2441,7 @@ class SeestarPostProcessor(
             degraded = [
                 r
                 for r in self.results
-                if r.status == 'degraded' or r.display_status == 'ok_with_fallback'
+                if r.status == 'degraded' or r.fallback_used
             ]
             if failed:
                 self.log.warn(f"{len(failed)} 个阶段失败")
@@ -2189,6 +2465,21 @@ class SeestarPostProcessor(
             self.log.info(f"  - {base_name}.tif  (16-bit Astro-TIFF)")
             self.log.info(f"  - {base_name}.png  (Preview PNG)")
             self.log.info(f"  - {fit_base_name}.fit (FITS archive)")
+            managed_report = getattr(self, "_output_color_manifest", {}) or {}
+            if bool(
+                (managed_report.get("summary") or {}).get(
+                    "managed_export_ready",
+                    False,
+                )
+            ):
+                self.log.info(
+                    f"  - {base_name}_display_srgb.png "
+                    "(16-bit sRGB managed display)"
+                )
+                self.log.info(
+                    f"  - {base_name}_edit_srgb.tif "
+                    "(16-bit ICC managed editable)"
+                )
             fallback_line = "result_processed.tif / result_processed.png / result_final.fit"
             if bool(getattr(self, "_final_output_review_only", False)):
                 fallback_line = (
@@ -2200,7 +2491,7 @@ class SeestarPostProcessor(
                     "result_processed_linear.tif / result_processed_linear.png / "
                     "result_final_linear.fit"
                 )
-            self.log.info(f"  - fallback: {fallback_line}")
+            self.log.info(f"  - 导出失败时回退名: {fallback_line}")
             if self.linear_intermediate_path:
                 self.log.info("  - result_linear.fit (拉伸前线性中间文件)")
             if self.ai_outputs_generated:
@@ -2222,10 +2513,30 @@ class SeestarPostProcessor(
             raise
         except KeyboardInterrupt:
             self.log.warn("用户中断操作")
+            try:
+                self._write_pipeline_result_manifest(failure_reason="user interrupted")
+            except (
+                AttributeError,
+                OSError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as manifest_error:
+                self.log.warn(f"中断结果清单写入失败: {manifest_error}")
             raise
         except Exception as e:
             self.log.error(f"程序中断: {e}")
             self.log.error(traceback.format_exc())
+            try:
+                self._write_pipeline_result_manifest(failure_reason=str(e))
+            except (
+                AttributeError,
+                OSError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as manifest_error:
+                self.log.warn(f"失败结果清单写入失败: {manifest_error}")
             raise
         finally:
             if not self._siril_process_terminated and self._siril_ever_connected:

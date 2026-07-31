@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import tempfile
 import types
@@ -11,6 +12,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -152,6 +154,16 @@ class FakeProcessor:
 
 
 class Stage11RunnerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._network_patch = patch.dict(
+            os.environ,
+            {"SEESTAR_NETWORK_MODE": "1"},
+        )
+        self._network_patch.start()
+
+    def tearDown(self) -> None:
+        self._network_patch.stop()
+
     def _run_with_processor(self, processor: FakeProcessor) -> FakeProcessor:
         def fake_png_writer(path: Path, _rgb: Any) -> None:
             path.write_bytes(b"PNG")
@@ -172,6 +184,18 @@ class Stage11RunnerTests(unittest.TestCase):
             _name, status, _dur, message = processor.results[-1]
             self.assertEqual(status, "skipped")
             self.assertIn("SEESTAR_AI_ENABLED not enabled", message)
+
+    def test_stage11_skipped_when_network_mode_is_disabled(self):
+        with patch.dict(os.environ, {"SEESTAR_NETWORK_MODE": "0"}):
+            with tempfile.TemporaryDirectory() as td:
+                processor = FakeProcessor(Path(td))
+
+                self._run_with_processor(processor)
+
+                _name, status, _dur, message = processor.results[-1]
+                self.assertEqual(status, "skipped")
+                self.assertIn("SEESTAR_NETWORK_MODE", message)
+                self.assertFalse(processor.cmd_calls)
 
     def test_stage11_skips_review_only_stage10_output(self):
         with tempfile.TemporaryDirectory() as td:

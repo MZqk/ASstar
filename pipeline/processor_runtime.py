@@ -10,6 +10,7 @@ import re
 import shutil
 import time
 import traceback
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,6 +26,9 @@ import syqon_starless
 import stage7_quality
 import stage7_repair
 import stage8_pixels
+from channel_semantics import channel_shape_dict, classify_channel_semantics
+from input_profile import infer_input_profile
+import run_manifest
 from image_metrics import (
     _box_blur_gray,
     _clamp_float,
@@ -33,7 +37,15 @@ from image_metrics import (
     measure_image_features,
     measure_quality_metrics,
 )
-from models import ImageFeatures, QualityMetrics, Stage6StretchStrategy, StageResult, TargetType
+from models import (
+    ImageFeatures,
+    InputProfile,
+    PipelineStage,
+    QualityMetrics,
+    Stage6StretchStrategy,
+    StageResult,
+    TargetType,
+)
 from save_utils import save_stage_output, write_ai_raw_response, write_stage_json
 
 try:
@@ -78,6 +90,7 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_DEBUG_MODE",
         "SEESTAR_INPUT_MODE",
         "SEESTAR_OUTPUT_FORMAT",
+        "SEESTAR_NETWORK_MODE",
         "SEESTAR_WORKFLOW_PLUGIN_PROBE",
         "SEESTAR_STAGE4_PLATESOLVE_ENABLE",
         "SEESTAR_STAGE4_PLATESOLVE_FOCAL",
@@ -85,6 +98,15 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_STAGE4_PLATESOLVE_ORDER",
         "SEESTAR_STAGE4_PLATESOLVE_CATALOGS",
         "SEESTAR_STAGE4_PLATESOLVE_HEADER_RADIUS",
+        "SEESTAR_STAGE4_AUTO_GEOMETRY_ENABLE",
+        "SEESTAR_STAGE4_AUTO_GEOMETRY_CONFIDENCE_MIN",
+        "SEESTAR_STAGE4_AUTO_GEOMETRY_SCALE_RESIDUAL_MAX",
+        "SEESTAR_STAGE4_NBN_ENABLE",
+        "SEESTAR_STAGE4_NBN_MAPPING_CONFIDENCE_MIN",
+        "SEESTAR_STAGE4_NBN_STRENGTH",
+        "SEESTAR_STAGE4_NBN_GAIN_LIMIT",
+        "SEESTAR_STAGE4_NBN_LINE_RATIO_DRIFT_MAX",
+        "SEESTAR_GAIA_ASTRO_CATALOG",
         "SEESTAR_STAGE4_FILTER_HINT",
         "SEESTAR_STAGE4_PCC_TIMEOUT_SEC",
         "SEESTAR_STAGE4_LOCAL_STAR_WB_ENABLE",
@@ -97,6 +119,10 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_OPTIONAL_COLOR_TRANSFORM",
         "SEESTAR_DENOISE_ENABLE",
         "SEESTAR_DENOISE_FORCE",
+        "SEESTAR_STAGE5_MULTISCALE_DENOISE_ENABLE",
+        "SEESTAR_STAGE5_MULTISCALE_DENOISE_STRENGTH",
+        "SEESTAR_STAGE5_MULTISCALE_DETAIL_RETENTION_MIN",
+        "SEESTAR_STAGE5_MULTISCALE_NOISE_REDUCTION_MIN",
         "SEESTAR_STAGE5_BUILTIN_DENOISE_MOD",
         "SEESTAR_STAGE5_DECONV_ENABLE",
         "SEESTAR_STAGE5_GRAXPERT_DECONV_ENABLE",
@@ -108,6 +134,7 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_STAGE5_RL_STOP",
         "SEESTAR_STAGE5_GRAXPERT_DECONV_STRENGTH",
         "SEESTAR_GRAXPERT_OBJECT_MODEL_PATH",
+        "SEESTAR_GRAXPERT_GPU",
         "SEESTAR_AI_ENABLED",
         "SEESTAR_AI_ENDPOINT",
         "SEESTAR_AI_MODEL",
@@ -136,9 +163,22 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_STAGE7_PREVIEW_TARGET_P50_MIN_RATIO",
         "SEESTAR_STAGE7_PREVIEW_TARGET_P50_MAX_RATIO",
         "SEESTAR_STAGE7_STARLESS_PIXEL_REPAIR_ENABLE",
+        "SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_REDUCTION_MIN",
+        "SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_DELTA_MIN",
+        "SEESTAR_STAGE7_STARMASK_DIFFUSE_RESIDUAL_RATIO_MAX",
         "SEESTAR_STAGE8_FORCE_CONSERVATIVE_AFTER_STAGE7_REPAIR",
+        "SEESTAR_STAGE8_LOCAL_ADJUSTMENT_ENGINE_ENABLE",
+        "SEESTAR_STAGE8_LOCAL_CURVE_OPACITY",
+        "SEESTAR_STAGE8_LIMITED_SATURATION_MAX",
+        "SEESTAR_STAGE8_LIMITED_HALO_TEXTURE_GROWTH_MAX",
+        "SEESTAR_STAGE8_LIMITED_HALO_TEXTURE_DELTA_MAX",
         "SEESTAR_STAGE9_STARMASK_STRETCH_ENABLE",
         "SEESTAR_STAGE9_STARMASK_ADAPTIVE_STRETCH_ENABLE",
+        "SEESTAR_STAGE9_STAR_COLOR_REPAIR_ENABLE",
+        "SEESTAR_STAGE9_STAR_COLOR_REPAIR_STRENGTH",
+        "SEESTAR_STAGE9_STAR_COLOR_SUPPORT_RATIO_MAX",
+        "SEESTAR_STAGE9_STAR_COLOR_IMPROVEMENT_MIN",
+        "SEESTAR_STAGE9_STAR_COLOR_POST_CHROMA_ERROR_MAX",
         "SEESTAR_STAGE9_SOURCE_STAR_DETAIL_PERCENTILE",
         "SEESTAR_STAGE9_SOURCE_COMPONENT_DENSITY_MAX",
         "SEESTAR_STAGE9_SOURCE_SINGLE_PIXEL_RATIO_MAX",
@@ -185,6 +225,7 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_STAGE9_HOLLOW_STRUCTURE_DELTA_MIN",
         "SEESTAR_STAGE9_NEW_HOLLOW_STRUCTURE_AREA_MAX",
         "SEESTAR_FORCE_REVIEW_ONLY_OUTPUT",
+        "SEESTAR_STAGE10_MANAGED_OUTPUT_ENABLE",
         "SEESTAR_COSMIC_CLASSIC_ENABLE",
         "SEESTAR_COSMIC_CLARITY_EXECUTABLE",
         "SEESTAR_COSMIC_CLASSIC_GPU",
@@ -552,6 +593,42 @@ class ProcessorRuntimeMixin:
                     "keeping current setting"
                 )
 
+        stage4_auto_geometry_raw = os.getenv(
+            "SEESTAR_STAGE4_AUTO_GEOMETRY_ENABLE"
+        )
+        if stage4_auto_geometry_raw is not None:
+            parsed = self._parse_env_bool(
+                stage4_auto_geometry_raw,
+                getattr(self.cfg, "stage4_auto_geometry_enabled", True),
+            )
+            self.cfg.stage4_auto_geometry_enabled = parsed
+            if stage4_auto_geometry_raw.strip().lower() not in (
+                ENV_TRUE_VALUES | ENV_FALSE_VALUES
+            ):
+                self.log.warn(
+                    "SEESTAR_STAGE4_AUTO_GEOMETRY_ENABLE has invalid value; "
+                    "keeping current setting"
+                )
+
+        stage4_nbn_raw = os.getenv("SEESTAR_STAGE4_NBN_ENABLE")
+        if stage4_nbn_raw is not None:
+            parsed = self._parse_env_bool(
+                stage4_nbn_raw,
+                getattr(
+                    self.cfg,
+                    "stage4_narrowband_normalization_enabled",
+                    True,
+                ),
+            )
+            self.cfg.stage4_narrowband_normalization_enabled = parsed
+            if stage4_nbn_raw.strip().lower() not in (
+                ENV_TRUE_VALUES | ENV_FALSE_VALUES
+            ):
+                self.log.warn(
+                    "SEESTAR_STAGE4_NBN_ENABLE has invalid value; "
+                    "keeping current setting"
+                )
+
         local_star_wb_raw = os.getenv("SEESTAR_STAGE4_LOCAL_STAR_WB_ENABLE")
         if local_star_wb_raw is not None:
             parsed = self._parse_env_bool(
@@ -566,6 +643,28 @@ class ProcessorRuntimeMixin:
                 )
 
         for env_key, attr_name, caster in (
+            (
+                "SEESTAR_STAGE4_AUTO_GEOMETRY_CONFIDENCE_MIN",
+                "stage4_auto_geometry_confidence_min",
+                float,
+            ),
+            (
+                "SEESTAR_STAGE4_AUTO_GEOMETRY_SCALE_RESIDUAL_MAX",
+                "stage4_auto_geometry_scale_residual_max",
+                float,
+            ),
+            (
+                "SEESTAR_STAGE4_NBN_MAPPING_CONFIDENCE_MIN",
+                "stage4_nbn_mapping_confidence_min",
+                float,
+            ),
+            ("SEESTAR_STAGE4_NBN_STRENGTH", "stage4_nbn_strength", float),
+            ("SEESTAR_STAGE4_NBN_GAIN_LIMIT", "stage4_nbn_gain_limit", float),
+            (
+                "SEESTAR_STAGE4_NBN_LINE_RATIO_DRIFT_MAX",
+                "stage4_nbn_line_ratio_drift_max",
+                float,
+            ),
             ("SEESTAR_STAGE4_PCC_TIMEOUT_SEC", "stage4_pcc_timeout_sec", int),
             ("SEESTAR_STAGE4_LOCAL_STAR_WB_MIN_PIXELS", "stage4_local_star_wb_min_pixels", int),
             ("SEESTAR_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT", "stage4_local_star_wb_gain_limit", float),
@@ -616,6 +715,23 @@ class ProcessorRuntimeMixin:
                     "SEESTAR_DENOISE_ENABLE has invalid value; keeping current setting"
                 )
 
+        multiscale_denoise_raw = os.getenv(
+            "SEESTAR_STAGE5_MULTISCALE_DENOISE_ENABLE"
+        )
+        if multiscale_denoise_raw is not None:
+            parsed = self._parse_env_bool(
+                multiscale_denoise_raw,
+                getattr(self.cfg, "stage5_multiscale_denoise_enabled", True),
+            )
+            self.cfg.stage5_multiscale_denoise_enabled = parsed
+            if multiscale_denoise_raw.strip().lower() not in (
+                ENV_TRUE_VALUES | ENV_FALSE_VALUES
+            ):
+                self.log.warn(
+                    "SEESTAR_STAGE5_MULTISCALE_DENOISE_ENABLE has invalid value; "
+                    "keeping current setting"
+                )
+
         denoise_force_raw = os.getenv("SEESTAR_DENOISE_FORCE")
         if denoise_force_raw is not None:
             parsed = self._parse_env_bool(
@@ -658,6 +774,21 @@ class ProcessorRuntimeMixin:
                 )
 
         for env_key, attr_name, caster in (
+            (
+                "SEESTAR_STAGE5_MULTISCALE_DENOISE_STRENGTH",
+                "stage5_multiscale_denoise_strength",
+                float,
+            ),
+            (
+                "SEESTAR_STAGE5_MULTISCALE_DETAIL_RETENTION_MIN",
+                "stage5_multiscale_detail_retention_min",
+                float,
+            ),
+            (
+                "SEESTAR_STAGE5_MULTISCALE_NOISE_REDUCTION_MIN",
+                "stage5_multiscale_noise_reduction_min",
+                float,
+            ),
             ("SEESTAR_STAGE5_BUILTIN_DENOISE_MOD", "stage5_builtin_denoise_mod", float),
             ("SEESTAR_STAGE5_RL_MAXSTARS", "stage5_rl_maxstars", int),
             ("SEESTAR_STAGE5_RL_PSF_KS", "stage5_rl_psf_kernel_size", int),
@@ -826,6 +957,10 @@ class ProcessorRuntimeMixin:
             ("SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_REDUCTION_MIN", "stage7_starless_repair_chroma_reduction_min"),
             ("SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_DELTA_MIN", "stage7_starless_repair_chroma_delta_min"),
             ("SEESTAR_STAGE7_STARMASK_DIFFUSE_RESIDUAL_RATIO_MAX", "stage7_starmask_diffuse_residual_ratio_max"),
+            ("SEESTAR_STAGE8_LOCAL_CURVE_OPACITY", "stage8_local_curve_opacity"),
+            ("SEESTAR_STAGE8_LIMITED_SATURATION_MAX", "stage8_limited_saturation_max"),
+            ("SEESTAR_STAGE8_LIMITED_HALO_TEXTURE_GROWTH_MAX", "stage8_limited_halo_texture_growth_max"),
+            ("SEESTAR_STAGE8_LIMITED_HALO_TEXTURE_DELTA_MAX", "stage8_limited_halo_texture_delta_max"),
             ("SEESTAR_STAGE9_STARMASK_ASINH_STRETCH", "stage9_starmask_asinh_stretch"),
             ("SEESTAR_STAGE9_STARMASK_ASINH_OFFSET", "stage9_starmask_asinh_offset"),
             ("SEESTAR_STAGE9_STARMASK_ASINH_STRETCH_MAX", "stage9_starmask_asinh_stretch_max"),
@@ -836,6 +971,10 @@ class ProcessorRuntimeMixin:
             ("SEESTAR_STAGE9_STARMASK_FAINT_CHROMA_MAX", "stage9_starmask_faint_chroma_max"),
             ("SEESTAR_STAGE9_STARMASK_BRIGHT_CHROMA_MAX", "stage9_starmask_bright_chroma_max"),
             ("SEESTAR_STAGE9_STARMASK_PREDICTED_CHANGE_RATIO_MAX", "stage9_starmask_predicted_change_ratio_max"),
+            ("SEESTAR_STAGE9_STAR_COLOR_REPAIR_STRENGTH", "stage9_star_color_repair_strength"),
+            ("SEESTAR_STAGE9_STAR_COLOR_SUPPORT_RATIO_MAX", "stage9_star_color_support_ratio_max"),
+            ("SEESTAR_STAGE9_STAR_COLOR_IMPROVEMENT_MIN", "stage9_star_color_improvement_min"),
+            ("SEESTAR_STAGE9_STAR_COLOR_POST_CHROMA_ERROR_MAX", "stage9_star_color_post_chroma_error_max"),
             ("SEESTAR_STAGE9_STAR_REFERENCE_SIGMA", "stage9_star_reference_sigma"),
             ("SEESTAR_STAGE9_COMPACT_WEAK_STAR_RETENTION_MIN", "stage9_compact_weak_star_retention_min"),
             ("SEESTAR_STAGE9_MIXED_STAR_PEAK_RATIO_MIN", "stage9_mixed_star_peak_ratio_min"),
@@ -907,11 +1046,14 @@ class ProcessorRuntimeMixin:
             ("SEESTAR_STAGE7_STARLESS_PIXEL_REPAIR_ENABLE", "stage7_starless_pixel_repair_enabled"),
             ("SEESTAR_STAGE7_CHROMA_RESCUE_ENABLE", "stage7_chroma_rescue_enabled"),
             ("SEESTAR_STAGE8_FORCE_CONSERVATIVE_AFTER_STAGE7_REPAIR", "stage8_force_conservative_after_stage7_repair"),
+            ("SEESTAR_STAGE8_LOCAL_ADJUSTMENT_ENGINE_ENABLE", "stage8_local_adjustment_engine_enabled"),
             ("SEESTAR_STAGE9_STARMASK_STRETCH_ENABLE", "stage9_starmask_stretch_enabled"),
             ("SEESTAR_STAGE9_STARMASK_ADAPTIVE_STRETCH_ENABLE", "stage9_starmask_adaptive_stretch_enabled"),
             ("SEESTAR_STAGE9_COMPACT_STARMASK_ENABLE", "stage9_compact_starmask_enabled"),
+            ("SEESTAR_STAGE9_STAR_COLOR_REPAIR_ENABLE", "stage9_star_color_repair_enabled"),
             ("SEESTAR_STAGE9_STARMASK_CHROMA_REGULARIZATION_ENABLE", "stage9_starmask_chroma_regularization_enabled"),
             ("SEESTAR_STAGE9_QUALITY_GATE_ENABLE", "stage9_quality_gate_enabled"),
+            ("SEESTAR_STAGE10_MANAGED_OUTPUT_ENABLE", "stage10_managed_output_enabled"),
             ("SEESTAR_FORCE_REVIEW_ONLY_OUTPUT", "force_review_only_output"),
             ("SEESTAR_STAGE7_TARGET_LOCAL_METRICS_ENABLE", "stage7_target_local_metrics_enabled"),
         ):
@@ -1203,6 +1345,520 @@ class ProcessorRuntimeMixin:
             except OSError as e:
                 self.log.debug(f"Unable to read FITS header {path}: {e}")
         return metadata
+
+
+    def _resolve_input_profile(self) -> InputProfile:
+        """Resolve transfer-function state before any linear-only stage runs."""
+        source_candidates = [
+            getattr(self, "source_file", None),
+            getattr(self, "linear_intermediate_path", None),
+        ]
+        if self.process_dir:
+            source_candidates.extend(
+                [
+                    self.process_dir / "stage2_corrected.fit",
+                    self.process_dir / "stage1_prepared.fit",
+                    self.process_dir / "working.fit",
+                ]
+            )
+        source_path = next(
+            (
+                Path(candidate)
+                for candidate in source_candidates
+                if candidate and Path(candidate).is_file()
+            ),
+            None,
+        )
+        metadata = self._read_fits_header_metadata(*source_candidates)
+        image_data = None
+        try:
+            getter = getattr(self.siril, "get_image_pixeldata", None)
+            if callable(getter):
+                image_data = getter(preview=False)
+        except (
+            AttributeError,
+            CommandError,
+            DataError,
+            SirilError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            self.log.warn(f"输入状态像素采样失败，将依赖其他证据: {error}")
+
+        profile = infer_input_profile(
+            input_mode=str(getattr(self, "_stage1_input_mode", "unknown")),
+            source_path=source_path,
+            metadata=metadata,
+            image_data=image_data,
+            trusted_provenance=getattr(
+                self,
+                "_trusted_input_provenance",
+                None,
+            ),
+        )
+        self.input_profile = profile.to_dict()
+        self._write_stage_json("input_profile.json", self.input_profile)
+        self.log.info(
+            "[InputProfile] "
+            f"state={profile.state.value} confidence={profile.confidence:.2f} "
+            f"source={profile.source} "
+            f"linear_safe={str(profile.safe_for_linear_steps).lower()}"
+        )
+        for conflict in profile.conflicts:
+            self.log.warn(f"[InputProfile] conflict: {conflict}")
+        if profile.requires_review:
+            self.log.warn(
+                "[InputProfile] 线性状态不可信；将跳过线性/去星链并仅生成复核输出"
+            )
+        return profile
+
+
+    def _load_trusted_input_provenance_for_resume(self) -> Dict[str, Any]:
+        """Resolve resume trust before the process directory is rebuilt."""
+        result: Dict[str, Any] = {
+            "verified": False,
+            "state": "unknown",
+            "detail": "current input mode is not a resume checkpoint",
+        }
+        if not self.work_dir:
+            self._trusted_input_provenance = result
+            return result
+
+        input_path: Optional[Path] = None
+        checkpoint_name = ""
+        if self.input_mode == INPUT_MODE_LINEAR_RESUME:
+            input_path = self.work_dir / "result_linear.fit"
+            checkpoint_name = "result_linear"
+        elif self.input_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
+            checkpoint_name = "stage2_corrected"
+            candidates = [
+                self.work_dir / "stage2_corrected.fit",
+                self.work_dir / "process" / "stage2_corrected.fit",
+            ]
+            input_path = next((path for path in candidates if path.is_file()), None)
+
+        if input_path is not None and input_path.is_file() and checkpoint_name:
+            result = run_manifest.verify_resume_provenance(
+                work_dir=self.work_dir,
+                input_path=input_path,
+                checkpoint_name=checkpoint_name,
+            )
+        elif checkpoint_name:
+            result = {
+                "verified": False,
+                "state": "unknown",
+                "checkpoint": checkpoint_name,
+                "detail": "resume checkpoint file is missing",
+            }
+
+        self._trusted_input_provenance = result
+        if result.get("verified"):
+            self.log.info(
+                "[InputProfile] verified resume provenance: "
+                f"{result.get('detail')}"
+            )
+        elif checkpoint_name:
+            self.log.warn(
+                "[InputProfile] resume provenance not trusted: "
+                f"{result.get('detail')}"
+            )
+        return result
+
+
+    def _processing_plan_input_path(self) -> Optional[Path]:
+        for candidate in (
+            getattr(self, "source_file", None),
+            getattr(self, "linear_intermediate_path", None),
+            self.process_dir / "working.fit" if self.process_dir else None,
+        ):
+            if candidate and Path(candidate).is_file():
+                return Path(candidate)
+        return None
+
+    def _resolve_channel_profile(self, profile: InputProfile) -> Dict[str, Any]:
+        """Resolve physical channel meaning before the processing plan is frozen."""
+        try:
+            shape = channel_shape_dict(self.siril.get_image_shape())
+        except (
+            AttributeError,
+            CommandError,
+            SirilError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            shape = {}
+        metadata = self._read_fits_header_metadata(
+            "stage2_corrected",
+            "stage1_prepared",
+            "working",
+            getattr(self, "source_file", None),
+        )
+        channel_profile = classify_channel_semantics(
+            channels=int(shape.get("channels", 0) or 0),
+            metadata=metadata,
+            input_state=profile.state.value,
+            explicit_filter_hint=os.getenv("SEESTAR_STAGE4_FILTER_HINT", ""),
+            target_profile=(
+                self.target_profile
+                if isinstance(getattr(self, "target_profile", None), dict)
+                else None
+            ),
+        )
+        channel_profile["shape"] = shape
+        self.channel_profile = channel_profile
+        self._channel_semantics = str(channel_profile["kind"])
+        self.log.info(
+            "[ChannelProfile] "
+            f"kind={self._channel_semantics} "
+            f"confidence={float(channel_profile['confidence']):.2f} "
+            f"action={channel_profile['action']}"
+        )
+        return channel_profile
+
+
+    def _planned_stage_actions(self, profile: InputProfile) -> List[Dict[str, Any]]:
+        safe = profile.safe_for_linear_steps
+        if self.input_mode == INPUT_MODE_LINEAR_RESUME:
+            early_actions = {
+                1: "load_verified_checkpoint" if safe else "load_untrusted_checkpoint",
+                2: "skip_resume",
+                3: "skip_resume" if safe else "skip_input_state_guard",
+                4: "skip_resume" if safe else "skip_input_state_guard",
+                5: "skip_resume" if safe else "skip_input_state_guard",
+            }
+        elif self.input_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
+            early_actions = {
+                1: "skip_resume",
+                2: "load_verified_checkpoint" if safe else "load_untrusted_checkpoint",
+                3: "apply" if safe else "skip_input_state_guard",
+                4: "apply" if safe else "skip_input_state_guard",
+                5: "apply" if safe else "skip_input_state_guard",
+            }
+        else:
+            early_actions = {
+                1: "completed_before_plan",
+                2: "completed_before_plan",
+                3: (
+                    "conditional_background_decision"
+                    if safe
+                    else "skip_input_state_guard"
+                ),
+                4: "apply" if safe else "skip_input_state_guard",
+                5: "apply" if safe else "skip_input_state_guard",
+            }
+        late_actions = {
+            6: "apply" if safe else "skip_input_state_guard",
+            7: "apply" if safe else "skip_input_state_guard",
+            8: "apply" if safe else "skip_input_state_guard",
+            9: "apply" if safe else "skip_input_state_guard",
+            10: "apply" if safe else "review_export_only",
+            11: (
+                "optional"
+                if (
+                    safe
+                    and ai_advisory.network_mode_enabled()
+                    and bool(getattr(self.cfg, "ai_post_enabled", False))
+                )
+                else "skip"
+            ),
+        }
+        actions = {**early_actions, **late_actions}
+        stages_by_number = {
+            index: stage
+            for index, stage in enumerate(PipelineStage, start=1)
+        }
+        return [
+            {
+                "stage": number,
+                "label": stages_by_number[number].label,
+                "action": actions[number],
+            }
+            for number in range(1, 12)
+        ]
+
+
+    def _write_processing_plan(self, profile: InputProfile) -> bool:
+        """Freeze this run's resolved route before post-processing transforms."""
+        if not self.work_dir:
+            return False
+        self._run_id = str(getattr(self, "_run_id", "") or uuid.uuid4())
+        input_path = self._processing_plan_input_path()
+        input_record: Dict[str, Any] = {
+            "path": str(input_path) if input_path else None,
+            "input_mode": self.input_mode,
+            "stage1_input_mode": getattr(self, "_stage1_input_mode", "unknown"),
+            "profile": profile.to_dict(),
+        }
+        if input_path:
+            input_record.update(run_manifest.file_record(input_path))
+        freeze_primary = getattr(self, "_freeze_primary_target", None)
+        if callable(freeze_primary):
+            freeze_primary()
+        channel_profile = self._resolve_channel_profile(profile)
+        target_profile = dict(getattr(self, "target_profile", {}) or {})
+        resolved_policy = dict(getattr(self, "pipeline_policy", {}) or {})
+        stage3_policy = dict(resolved_policy.get("stage3_background") or {})
+        stretch_policy = dict(resolved_policy.get("stage6_stretch") or {})
+        configured_remix_levels = getattr(
+            self.cfg,
+            "stage9_fallback_intensity_levels",
+            (),
+        )
+        if not isinstance(configured_remix_levels, (list, tuple)):
+            configured_remix_levels = ()
+        remix_levels: List[float] = []
+        for raw_level in configured_remix_levels:
+            try:
+                remix_levels.append(float(raw_level))
+            except (TypeError, ValueError):
+                continue
+        plan: Dict[str, Any] = {
+            "schema": "seestar.processing-plan.v1",
+            "run_id": self._run_id,
+            "generated_at": run_manifest.utc_timestamp(),
+            "input": input_record,
+            "channel_semantics": str(
+                getattr(self, "_channel_semantics", "unknown") or "unknown"
+            ),
+            "channel_profile": dict(channel_profile),
+            "target": {
+                "primary": target_profile.get("target_type"),
+                "primary_record": target_profile.get("primary_target", {}),
+                "secondary": target_profile.get("secondary_labels", []),
+                "confidence": target_profile.get("target_confidence"),
+                "policy": resolved_policy.get("policy_name"),
+                "star_separation_basis": "primary_target_only",
+            },
+            "planned_steps": self._planned_stage_actions(profile),
+            "candidate_contracts": {
+                "stage3_background": {
+                    "model_priority": list(stage3_policy.get("model_priority") or []),
+                    "runtime_capability_probe": True,
+                },
+                "stage7_stretch": {
+                    "allowed_modes": list(stretch_policy.get("candidate_mode") or []),
+                    "fallback_candidate": stretch_policy.get("fallback_candidate"),
+                    "model_output_fields": ["selected_candidate_id"],
+                    "parameters_owned_by": "code",
+                    "selection_after_hard_gates": True,
+                },
+                "stage6_star_separation": {
+                    "candidate_ids": [
+                        "syqon_standard",
+                        "syqon_large_context",
+                        "syqon_axiom_standard_if_available",
+                    ],
+                    "model_output_fields": ["selected_candidate_id"],
+                    "parameters_owned_by": "code",
+                },
+                "stage8_enhancement": {
+                    "candidate_ids": [
+                        "preserve",
+                        "conservative",
+                        "balanced",
+                        "detail_preserving",
+                    ],
+                    "model_output_fields": ["selected_candidate_id"],
+                    "parameters_owned_by": "code",
+                },
+                "stage11_optional_derivative": {
+                    "candidate_ids": [
+                        "preserve",
+                        "conservative",
+                        "balanced",
+                        "detail_safe",
+                    ],
+                    "model_output_fields": ["selected_candidate_id"],
+                    "parameters_owned_by": "code",
+                },
+                "stage9_star_remix": {
+                    "primary_id": "primary",
+                    "fallback_intensity_levels": remix_levels,
+                    "ids_generated_after_quality_scaling": True,
+                },
+            },
+            "capabilities": {
+                "offline_first": True,
+                "network_requested": ai_advisory.network_mode_enabled(),
+                "ai_advisory_requested": bool(
+                    getattr(self.cfg, "ai_post_enabled", False)
+                ),
+                "ai_advisory_enabled": bool(
+                    ai_advisory.network_mode_enabled()
+                    and getattr(self.cfg, "ai_post_enabled", False)
+                ),
+            },
+            "config": run_manifest.redact_sensitive(asdict(self.cfg)),
+        }
+        plan["plan_hash"] = run_manifest.canonical_payload_hash(plan)
+        self._processing_plan = plan
+        self._processing_plan_hash = str(plan["plan_hash"])
+
+        destinations = [self.work_dir / "processing-plan.json"]
+        if self.process_dir:
+            destinations.append(self.process_dir / "processing-plan.json")
+        try:
+            for destination in destinations:
+                run_manifest.atomic_write_json(destination, plan)
+            self.log.info(
+                "[ProcessingPlan] frozen "
+                f"run_id={self._run_id} hash={self._processing_plan_hash[:12]}"
+            )
+            return True
+        except (OSError, TypeError, ValueError) as error:
+            self.log.warn(f"processing-plan.json 写入失败: {error}")
+            return False
+
+
+    def _pipeline_result_status(self, failure_reason: Optional[str] = None) -> str:
+        if failure_reason or any(result.status == "failed" for result in self.results):
+            return "failed"
+        review_required = bool(
+            getattr(self, "_input_state_review_route", False)
+            or getattr(self, "_final_output_review_only", False)
+            or getattr(self, "_background_review_required", False)
+            or (
+                bool(getattr(self, "_stage9_stars_required", False))
+                and not bool(getattr(self, "_stage9_stars_applied", False))
+            )
+        )
+        if review_required:
+            return "review_required"
+        if any(
+            result.status == "degraded"
+            or result.fallback_used
+            for result in self.results
+        ):
+            return "partial_success"
+        return "success"
+
+
+    def _result_checkpoint_record(
+        self,
+        path: Path,
+        *,
+        state: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not path.is_file():
+            return None
+        record = run_manifest.file_record(path, base_dir=self.work_dir)
+        record["state"] = state
+        return record
+
+
+    def _write_pipeline_result_manifest(
+        self,
+        *,
+        failure_reason: Optional[str] = None,
+    ) -> bool:
+        """Persist actual steps, output hashes, fallbacks, and global status."""
+        if not self.work_dir:
+            return False
+        input_state = str((getattr(self, "input_profile", {}) or {}).get("state") or "unknown")
+        checkpoint_state = "linear" if input_state == "linear" else "unknown"
+        checkpoints: Dict[str, Any] = {}
+        result_linear = self.work_dir / "result_linear.fit"
+        result_linear_record = self._result_checkpoint_record(
+            result_linear,
+            state=checkpoint_state,
+        )
+        if result_linear_record:
+            checkpoints["result_linear"] = result_linear_record
+
+        stage2_candidates = [
+            self.work_dir / "stage2_corrected.fit",
+            self.process_dir / "stage2_corrected.fit" if self.process_dir else None,
+        ]
+        stage2_path = next(
+            (
+                path
+                for path in stage2_candidates
+                if path is not None and path.is_file()
+            ),
+            None,
+        )
+        if stage2_path is not None:
+            stage2_record = self._result_checkpoint_record(
+                stage2_path,
+                state=checkpoint_state,
+            )
+            if stage2_record:
+                checkpoints["stage2_corrected"] = stage2_record
+
+        outputs = run_manifest.collect_output_records(
+            self.work_dir,
+            output_basenames=getattr(self, "_final_output_basenames", ()),
+            exported_after=getattr(self, "_final_export_started_at", None),
+        )
+
+        status = self._pipeline_result_status(failure_reason)
+        manifest: Dict[str, Any] = {
+            "schema": "seestar.pipeline-result.v1",
+            "run_id": getattr(self, "_run_id", None),
+            "generated_at": run_manifest.utc_timestamp(),
+            "status": status,
+            "failure_reason": failure_reason,
+            "plan_hash": getattr(self, "_processing_plan_hash", None),
+            "input_profile": dict(getattr(self, "input_profile", {}) or {}),
+            "channel_semantics": str(
+                getattr(self, "_channel_semantics", "unknown") or "unknown"
+            ),
+            "target_profile": dict(getattr(self, "target_profile", {}) or {}),
+            "star_separation": {
+                "state": getattr(self, "_star_separation_state", "pending"),
+                "stars_required": bool(
+                    getattr(self, "_stage9_stars_required", False)
+                ),
+                "stars_applied": bool(
+                    getattr(self, "_stage9_stars_applied", False)
+                ),
+                "application_mode": getattr(
+                    self,
+                    "_stage9_stars_application_mode",
+                    "pending",
+                ),
+            },
+            "actual_steps": [
+                {
+                    "name": result.name,
+                    "status": result.status,
+                    "display_status": result.display_status,
+                    "execution": result.execution,
+                    "fallback_used": result.fallback_used,
+                    "upstream_passthrough": result.upstream_passthrough,
+                    "reason_code": result.reason_code or None,
+                    "duration_seconds": float(result.duration),
+                    "message": result.message,
+                    "details": result.details,
+                    "components": result.components,
+                }
+                for result in self.results
+            ],
+            "checkpoints": checkpoints,
+            "outputs": outputs,
+        }
+        manifest["manifest_hash"] = run_manifest.canonical_payload_hash(manifest)
+        self._pipeline_result_manifest = manifest
+        self._pipeline_result_global_status = status
+
+        destinations = [self.work_dir / "pipeline-result.json"]
+        if self.process_dir:
+            destinations.append(self.process_dir / "pipeline-result.json")
+        try:
+            for destination in destinations:
+                run_manifest.atomic_write_json(destination, manifest)
+            self.log.info(
+                "[PIPELINE_RESULT] "
+                f"status={status} manifest={self.work_dir / 'pipeline-result.json'}"
+            )
+            return True
+        except (OSError, TypeError, ValueError) as error:
+            self.log.warn(f"pipeline-result.json 写入失败: {error}")
+            return False
 
 
     def _write_stage_json(self, filename: str, payload: Dict[str, Any]) -> None:

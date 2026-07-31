@@ -348,6 +348,100 @@ class PipelineStageTests(unittest.TestCase):
             cfg.stage9_chromatic_addition_ratio_max,
         )
 
+    def test_stage9_local_cyan_gate_exempts_source_confirmed_star_support(self):
+        cfg = PipelineConfig()
+        base = np.full((3, 96, 96), 0.04, dtype=np.float32)
+        candidate = np.array(base, copy=True)
+        candidate[0, 10:18, 10:20] += 0.01
+        candidate[1, 10:18, 10:20] += 0.08
+        candidate[2, 10:18, 10:20] += 0.10
+        positive_change = np.maximum(candidate - base, 0.0)
+        confirmed_support = np.zeros((96, 96), dtype=bool)
+        confirmed_support[10:18, 10:20] = True
+
+        unmatched = stage9_quality._stage9_local_quality_metrics(
+            base,
+            candidate,
+            positive_change,
+            cfg,
+        )
+        confirmed = stage9_quality._stage9_local_quality_metrics(
+            base,
+            candidate,
+            positive_change,
+            cfg,
+            confirmed_star_support=confirmed_support,
+        )
+
+        self.assertGreater(
+            unmatched["metrics"]["local_cyan_blue_component_max_area"],
+            unmatched["limits"]["local_cyan_blue_component_max_area"],
+        )
+        self.assertEqual(
+            confirmed["metrics"]["local_cyan_blue_component_max_area"],
+            0,
+        )
+        self.assertEqual(
+            confirmed["metrics"]["local_cyan_blue_component_max_area_raw"],
+            80,
+        )
+        self.assertGreater(
+            confirmed["metrics"]["local_cyan_blue_confirmed_star_pixel_ratio"],
+            0.0,
+        )
+
+    def test_stage9_local_shape_gates_exempt_source_confirmed_star_support(self):
+        cfg = PipelineConfig()
+        yy, xx = np.mgrid[:192, :192]
+        base_gray = 0.04 + 0.09 * np.exp(
+            -((xx - 96) ** 2 + (yy - 96) ** 2) / (2.0 * 30.0**2)
+        )
+        base = np.stack([base_gray, base_gray, base_gray]).astype(np.float32)
+        candidate = np.array(base, copy=True)
+        candidate[0, 86:106, 86:106] += 0.12
+        positive_change = np.maximum(candidate - base, 0.0)
+        confirmed_support = np.zeros((192, 192), dtype=bool)
+        confirmed_support[86:106, 86:106] = True
+
+        unmatched = stage9_quality._stage9_local_quality_metrics(
+            base,
+            candidate,
+            positive_change,
+            cfg,
+        )
+        confirmed = stage9_quality._stage9_local_quality_metrics(
+            base,
+            candidate,
+            positive_change,
+            cfg,
+            confirmed_star_support=confirmed_support,
+        )
+
+        self.assertGreater(
+            unmatched["metrics"]["local_connected_component_max_area"],
+            unmatched["limits"]["local_connected_component_max_area"],
+        )
+        self.assertGreater(
+            unmatched["metrics"]["core_color_jump_component_max_area"],
+            unmatched["limits"]["core_color_jump_component_max_area"],
+        )
+        self.assertEqual(
+            confirmed["metrics"]["local_connected_component_max_area"],
+            0,
+        )
+        self.assertEqual(
+            confirmed["metrics"]["core_color_jump_component_max_area"],
+            0,
+        )
+        self.assertEqual(
+            confirmed["metrics"]["local_connected_component_max_area_raw"],
+            400,
+        )
+        self.assertEqual(
+            confirmed["metrics"]["core_color_jump_component_max_area_raw"],
+            400,
+        )
+
     def test_stage9_alpha_screen_keeps_starless_bottom_outside_star_support(self):
         base = np.full((3, 5, 5), 0.20, dtype=np.float32)
         stars = np.full((3, 5, 5), 0.50, dtype=np.float32)
@@ -1104,7 +1198,7 @@ class PipelineStageTests(unittest.TestCase):
         np.testing.assert_allclose(after_ratio, before_ratio, rtol=1e-4, atol=1e-4)
 
     def test_starmask_cleanup_hard_rejects_diffuse_residual_above_limit(self):
-        cfg = PipelineConfig(stage7_starmask_diffuse_residual_ratio_max=0.05)
+        cfg = PipelineConfig(stage7_starmask_diffuse_residual_ratio_max=0.01)
         yy, xx = np.mgrid[-32:32, -32:32]
         diffuse = 0.012 + 0.025 * np.exp(-(xx * xx + yy * yy) / (2.0 * 15.0**2))
         compact = 0.55 * np.exp(
@@ -1129,6 +1223,46 @@ class PipelineStageTests(unittest.TestCase):
         )
         self.assertEqual(quality["status"], "poor")
         self.assertTrue(quality["derived"]["starmask_cleanup_hard_failed"])
+
+    def test_starmask_cleanup_retries_diffuse_only_pixels_before_hard_reject(self):
+        cfg = PipelineConfig(stage7_starmask_nebula_suppression=0.65)
+        yy, xx = np.mgrid[-32:32, -32:32]
+        diffuse = 0.012 + 0.025 * np.exp(
+            -(xx * xx + yy * yy) / (2.0 * 15.0**2)
+        )
+        compact = 0.55 * np.exp(
+            -((xx - 4) ** 2 + (yy + 3) ** 2) / (2.0 * 1.25**2)
+        )
+        faint = 0.09 * np.exp(
+            -((xx + 15) ** 2 + (yy - 10) ** 2) / (2.0 * 1.0**2)
+        )
+        stars = np.stack(
+            [
+                diffuse + compact + faint * 0.80,
+                diffuse + compact * 0.72 + faint * 0.90,
+                diffuse + compact * 0.48 + faint,
+            ]
+        ).astype(np.float32)
+
+        _cleaned, metrics = starmask_cleanup.clean_starmask_pixels(stars, cfg)
+
+        retry = metrics["diffuse_retry"]
+        self.assertTrue(retry["attempted"])
+        self.assertTrue(retry["applied"])
+        self.assertGreater(retry["ratio_before"], cfg.stage7_starmask_diffuse_residual_ratio_max)
+        self.assertLessEqual(
+            retry["ratio_after"],
+            cfg.stage7_starmask_diffuse_residual_ratio_max,
+        )
+        self.assertTrue(metrics["accepted"])
+        self.assertGreaterEqual(
+            metrics["compact_retention"],
+            cfg.stage7_starmask_compact_retention_min,
+        )
+        self.assertGreaterEqual(
+            metrics["faint_compact_retention"],
+            cfg.stage7_starmask_small_star_scale - 0.01,
+        )
 
     def test_starmask_cleanup_rolls_back_before_write_when_compact_stars_are_overcleaned(self):
         yy, xx = np.mgrid[-16:16, -16:16]
@@ -1245,7 +1379,14 @@ class _Pipeline:
         self._last_aberration_api_error = None
         self._last_scunet_fallback_error = None
 
-    def _record_stage(self, name: str, status: str, duration: float, message: str = "") -> None:
+    def _record_stage(
+        self,
+        name: str,
+        status: str,
+        duration: float,
+        message: str = "",
+        **_metadata: object,
+    ) -> None:
         self.results.append((name, status, duration, message))
 
     def cmd_with_check(self, *args, **_kwargs) -> None:

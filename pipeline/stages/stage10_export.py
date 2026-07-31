@@ -1,13 +1,16 @@
 """Stage 10 final denoise and export."""
-from typing import Any, Dict, List, Optional, Tuple
-
 import math
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from sirilpy.exceptions import CommandError, SirilError
 
+from channel_semantics import BROADBAND_RGB_OSC
+from managed_output import export_managed_outputs
 from models import PipelineStage
+from output_color import build_output_color_manifest
 from pipeline_safety import (
     clamp_saturation_boost,
     color_safety_limits,
@@ -437,12 +440,20 @@ def run_stage10_export(pipeline) -> None:
     # 按优先级加载最终图像
     final_file = "stage9_remixed"
     final_loaded = False
-    for candidate in [
+    preferred_final_source = str(
+        getattr(pipeline, "_stage9_final_source", None) or final_file
+    )
+    final_candidates = [
+        preferred_final_source,
         final_file,
+        "input_state_passthrough",
         "starless_enhanced",
         pipeline.stretched_name or "stage7_stretched",
         "stage7_stretched",
-    ]:
+    ]
+    for candidate in dict.fromkeys(
+        str(item) for item in final_candidates if item
+    ):
         candidate_path = pipeline.process_dir / f"{candidate}.fit"
         if not candidate_path.exists():
             messages.append(f"final_candidate_missing={candidate}")
@@ -458,6 +469,9 @@ def run_stage10_export(pipeline) -> None:
     if not final_loaded:
         status = "degraded"
         messages.append("最终候选图加载失败，沿用当前 Siril 图像")
+    input_source_fallback_used = bool(
+        final_loaded and final_file != preferred_final_source
+    )
     pipeline.log.info(f"使用最终图像: {final_file}")
 
     # 色彩微调
@@ -466,7 +480,27 @@ def run_stage10_export(pipeline) -> None:
         getattr(pipeline, "pipeline_policy", {}) or {},
         getattr(pipeline, "color_calibration_report", {}) or {},
     )
-    requested_final_saturation = float(pipeline.cfg.final_saturation)
+    channel_semantics = str(
+        getattr(pipeline, "_channel_semantics", "unknown") or "unknown"
+    )
+    channel_color_adjustments_allowed = channel_semantics == BROADBAND_RGB_OSC
+    requested_final_saturation = (
+        0.0
+        if (
+            bool(getattr(pipeline, "_skip_stage10_color_adjustments", False))
+            or not channel_color_adjustments_allowed
+        )
+        else float(pipeline.cfg.final_saturation)
+    )
+    if bool(getattr(pipeline, "_skip_stage10_color_adjustments", False)):
+        messages.append(
+            "Stage10 color adjustment skipped by input-state review guard"
+        )
+    elif not channel_color_adjustments_allowed:
+        messages.append(
+            "Stage10 global color adjustment skipped by channel semantics "
+            f"({channel_semantics})"
+        )
     color_budget_saturation = clamp_saturation_boost(
         requested_final_saturation,
         already_applied=float(getattr(pipeline, "_saturation_boost_applied", 0.0)),
@@ -549,6 +583,8 @@ def run_stage10_export(pipeline) -> None:
     denoise_primary_status = "skipped"
     denoise_effective = "none"
     denoise_effective_status = "skipped"
+    denoise_fallback_used = False
+    denoise_fallback_reason = ""
     duplicate_denoise_skip = should_skip_final_denoise(
         stage5_denoise_applied=bool(
             getattr(pipeline, "_stage5_denoise_applied", False)
@@ -623,6 +659,8 @@ def run_stage10_export(pipeline) -> None:
                 final_denoise_used = cli_denoise_used
                 denoise_effective = cli_denoise_used
                 denoise_effective_status = "success"
+                denoise_fallback_used = True
+                denoise_fallback_reason = "inprocess_to_cli"
                 messages.append(
                     pipeline._fallback_summary(
                         "CosmicClarity Denoise in-process",
@@ -643,6 +681,8 @@ def run_stage10_export(pipeline) -> None:
                     final_denoise_used = native_denoise_used
                     denoise_effective = native_denoise_used
                     denoise_effective_status = "success"
+                    denoise_fallback_used = True
+                    denoise_fallback_reason = "cli_to_native"
                     messages.append(
                         pipeline._fallback_summary(
                             "CosmicClarity Denoise CLI subprocess",
@@ -664,6 +704,8 @@ def run_stage10_export(pipeline) -> None:
                     if final_scunet_used:
                         denoise_effective = final_scunet_used
                         denoise_effective_status = "success"
+                        denoise_fallback_used = True
+                        denoise_fallback_reason = "native_to_scunet"
                         messages.append(
                             pipeline._fallback_summary(
                                 "CosmicClarity Native Denoise",
@@ -720,6 +762,8 @@ def run_stage10_export(pipeline) -> None:
             if final_scunet_used:
                 denoise_effective = final_scunet_used
                 denoise_effective_status = "success"
+                denoise_fallback_used = True
+                denoise_fallback_reason = "native_to_scunet"
                 messages.append(
                     pipeline._fallback_summary(
                         "CosmicClarity Native Denoise",
@@ -749,6 +793,8 @@ def run_stage10_export(pipeline) -> None:
             final_denoise_used = native_denoise_used
             denoise_effective = native_denoise_used
             denoise_effective_status = "success"
+            denoise_fallback_used = True
+            denoise_fallback_reason = "script_missing_to_native"
             messages.append(
                 pipeline._fallback_summary(
                     "CosmicClarity_Denoise.py",
@@ -770,6 +816,8 @@ def run_stage10_export(pipeline) -> None:
             if final_scunet_used:
                 denoise_effective = final_scunet_used
                 denoise_effective_status = "success"
+                denoise_fallback_used = True
+                denoise_fallback_reason = "script_missing_to_scunet"
                 messages.append(
                     pipeline._fallback_summary(
                         "CosmicClarity Native Denoise",
@@ -828,6 +876,8 @@ def run_stage10_export(pipeline) -> None:
         if aberration_used:
             denoise_effective = aberration_used
             denoise_effective_status = "success"
+            denoise_fallback_used = True
+            denoise_fallback_reason = "denoiser_chain_to_aberration"
             messages.append(
                 pipeline._fallback_summary(
                     "CosmicClarity/SCUNet final denoise",
@@ -863,6 +913,10 @@ def run_stage10_export(pipeline) -> None:
                 messages.append(f"Stage10 chroma-only merge: {chroma_note}")
             else:
                 effective_denoise_mode = "full_fallback"
+                denoise_fallback_used = True
+                denoise_fallback_reason = (
+                    denoise_fallback_reason or "chroma_merge_to_full"
+                )
                 pipeline.log.warn(
                     "Stage10 chroma-only merge unavailable; retaining full denoise: "
                     f"{chroma_note}"
@@ -890,6 +944,8 @@ def run_stage10_export(pipeline) -> None:
             "skipped_by_duplicate_guard": bool(duplicate_denoise_skip),
             "skipped_by_review_only": bool(review_only_denoise_skip),
             "skipped_by_low_noise_guard": bool(low_noise_denoise_skip),
+            "fallback_used": bool(denoise_fallback_used),
+            "fallback_reason": denoise_fallback_reason or None,
         }
     )
     stage_json_writer = getattr(pipeline, "_write_stage_json", None)
@@ -926,6 +982,7 @@ def run_stage10_export(pipeline) -> None:
                     "final_denoise_skipped": skip_final_denoise,
                     "color_policy_limits": color_limits,
                     "effective_final_saturation": effective_final_saturation,
+                    "channel_semantics": channel_semantics,
                     "stage9_local_color_saturation_guard": stage9_color_guard,
                     "denoise_plan": denoise_plan,
                 },
@@ -966,6 +1023,38 @@ def run_stage10_export(pipeline) -> None:
                 messages.append("final_quality_report 写入失败")
                 status = "degraded" if status == "ok" else status
 
+    managed_export_enabled = bool(
+        getattr(pipeline.cfg, "stage10_managed_output_enabled", True)
+    )
+    managed_pixels: Optional[np.ndarray] = None
+    managed_export_report: Optional[Dict[str, Any]] = None
+    if managed_export_enabled:
+        try:
+            if stage_saved:
+                pipeline.cmd_with_check("load", "stage10_final")
+            current_pixels = pipeline.siril.get_image_pixeldata(preview=False)
+            if current_pixels is None:
+                raise RuntimeError("Stage10 managed-export pixels unavailable")
+            managed_pixels = np.array(current_pixels, copy=True)
+        except (
+            AttributeError,
+            CommandError,
+            RuntimeError,
+            SirilError,
+            TypeError,
+            ValueError,
+        ) as error:
+            managed_export_report = {
+                "schema": "seestar.managed-output.v1",
+                "status": "partial",
+                "ready": False,
+                "mode": "independent_managed_derivatives",
+                "issues": [f"source_pixels_unavailable: {error}"],
+            }
+            messages.append(
+                "managed output source unavailable; independent derivatives skipped"
+            )
+
     # 切换回原工作目录导出
     pipeline.cmd_with_check("cd", f'"{pipeline.work_dir}"')
 
@@ -993,15 +1082,29 @@ def run_stage10_export(pipeline) -> None:
             fallback_base = "result_processed_linear"
             fallback_fit_base = "result_final_linear"
 
+    fit_filename = getattr(
+        pipeline,
+        "main_output_fit_basename_template",
+        base_filename + "_final",
+    )
+    export_started_at = time.time()
+    pipeline._final_export_started_at = export_started_at
+    pipeline._final_output_basenames = tuple(
+        dict.fromkeys(
+            (
+                base_filename,
+                fit_filename,
+                fallback_base,
+                fallback_fit_base,
+            )
+        )
+    )
+    export_report: Dict[str, Any] = {}
     status, messages = export_final_outputs(
         pipeline.cmd_with_check,
         pipeline.log,
         base_filename=base_filename,
-        fit_filename=getattr(
-            pipeline,
-            "main_output_fit_basename_template",
-            base_filename + "_final",
-        ),
+        fit_filename=fit_filename,
         fallback_base=fallback_base,
         fallback_fit_base=fallback_fit_base,
         output_format=getattr(pipeline.cfg, "output_format", "all"),
@@ -1010,6 +1113,190 @@ def run_stage10_export(pipeline) -> None:
         ),
         status=status,
         messages=messages,
+        export_report=export_report,
+    )
+    pipeline._write_stage_json("stage10_export_report.json", export_report)
+    if managed_export_enabled and managed_pixels is not None:
+        scientific_names = {
+            str(fit_filename or ""),
+            str(fallback_fit_base or ""),
+        }
+        scientific_paths = [
+            pipeline.work_dir / f"{name}.{extension}"
+            for name in scientific_names
+            if name
+            for extension in ("fit", "fits")
+        ]
+        for extension in ("fit", "fits"):
+            for candidate in pipeline.work_dir.glob(f"*.{extension}"):
+                try:
+                    if candidate.stat().st_mtime >= export_started_at - 1.0:
+                        scientific_paths.append(candidate)
+                except OSError:
+                    continue
+        scientific_paths = list(dict.fromkeys(scientific_paths))
+        try:
+            managed_export_report = export_managed_outputs(
+                managed_pixels,
+                work_dir=pipeline.work_dir,
+                base_filename=base_filename,
+                output_format=getattr(pipeline.cfg, "output_format", "all"),
+                scientific_paths=scientific_paths,
+            )
+            pipeline._write_stage_json(
+                "managed_output_report.json",
+                managed_export_report,
+            )
+            messages.append(
+                "managed_output="
+                f"{managed_export_report.get('status', 'unknown')} "
+                f"artifacts={len(managed_export_report.get('artifacts') or [])} "
+                "scientific_unchanged="
+                f"{str(bool((managed_export_report.get('scientific_archive') or {}).get('unchanged', False))).lower()}"
+            )
+            if not bool(managed_export_report.get("ready", False)):
+                messages.append(
+                    "managed output incomplete; primary Siril/FITS exports remain valid"
+                )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            managed_export_report = {
+                "schema": "seestar.managed-output.v1",
+                "status": "partial",
+                "ready": False,
+                "mode": "independent_managed_derivatives",
+                "issues": [str(error)],
+            }
+            pipeline._write_stage_json(
+                "managed_output_report.json",
+                managed_export_report,
+            )
+            pipeline.log.warn(f"Stage10 managed export unavailable: {error}")
+            messages.append("managed output export failed")
+    elif not managed_export_enabled:
+        messages.append("managed output disabled by configuration")
+
+    try:
+        output_color_manifest = build_output_color_manifest(
+            work_dir=pipeline.work_dir,
+            base_filename=base_filename,
+            fit_filename=fit_filename,
+            fallback_base=fallback_base,
+            fallback_fit_base=fallback_fit_base,
+            output_format=getattr(pipeline.cfg, "output_format", "all"),
+            channel_semantics=channel_semantics,
+            review_only=review_only_output,
+            exported_after=export_started_at,
+            managed_export_report=managed_export_report,
+        )
+        pipeline._output_color_manifest = output_color_manifest
+        pipeline._write_stage_json(
+            "output_color_manifest.json",
+            output_color_manifest,
+        )
+        color_summary = output_color_manifest["summary"]
+        messages.append(
+            "output_color_audit="
+            f"{output_color_manifest.get('mode', 'unknown')} "
+            f"artifacts={int(color_summary['artifact_count'])} "
+            "managed_export_ready="
+            f"{str(bool(color_summary.get('managed_export_ready', False))).lower()}"
+        )
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+        pipeline._output_color_manifest = {
+            "schema": "seestar.output-color-manifest.v1",
+            "mode": "report_only",
+            "rewrote_outputs": False,
+            "status": "unavailable",
+            "error": str(error),
+        }
+        pipeline.log.warn(f"Stage10 output color audit unavailable: {error}")
+        messages.append("output color audit unavailable; exported files unchanged")
+
+    if denoise_effective_status == "success":
+        denoise_component_status = "applied"
+        denoise_reason_code = denoise_fallback_reason or "accepted"
+    elif review_only_denoise_skip:
+        denoise_component_status = "skipped"
+        denoise_reason_code = "review_only_output"
+    elif duplicate_denoise_skip:
+        denoise_component_status = "skipped"
+        denoise_reason_code = "duplicate_denoise_guard"
+    elif low_noise_denoise_skip:
+        denoise_component_status = "skipped"
+        denoise_reason_code = "auto_low_noise"
+    else:
+        denoise_component_status = "failed"
+        denoise_reason_code = "all_final_denoisers_failed"
+    denoise_component = {
+        "status": denoise_component_status,
+        "method": denoise_effective,
+        "primary": denoise_primary,
+        "primary_status": denoise_primary_status,
+        "selected_mode": selected_denoise_mode,
+        "effective_mode": effective_denoise_mode,
+        "reason_code": denoise_reason_code,
+        "fallback_used": bool(denoise_fallback_used),
+        "input": final_file if final_loaded else None,
+        "output": "stage10_final" if stage_saved else None,
+    }
+    input_source_component = {
+        "status": "applied" if final_loaded else "failed",
+        "method": final_file if final_loaded else None,
+        "reason_code": (
+            "final_source_recovery"
+            if input_source_fallback_used
+            else "accepted"
+            if final_loaded
+            else "unavailable"
+        ),
+        "fallback_used": input_source_fallback_used,
+    }
+    export_outputs = export_report.get("outputs") or {}
+    export_failed = any(
+        isinstance(item, dict) and item.get("status") == "failed"
+        for item in export_outputs.values()
+    )
+    export_fallback_used = bool(export_report.get("fallback_used", False))
+    export_component = {
+        "status": (
+            "failed"
+            if export_failed
+            else "applied"
+            if export_outputs
+            else "skipped"
+        ),
+        "method": {
+            key: value.get("selected")
+            for key, value in export_outputs.items()
+            if isinstance(value, dict) and value.get("selected")
+        },
+        "reason_code": (
+            "final_export_failed"
+            if export_failed
+            else "final_export_fallback"
+            if export_fallback_used
+            else "accepted"
+            if export_outputs
+            else "not_requested"
+        ),
+        "fallback_used": export_fallback_used,
+    }
+    stage_denoise_fallback_used = bool(
+        denoise_fallback_used and denoise_effective_status == "success"
+    )
+    stage_fallback_used = bool(
+        input_source_fallback_used
+        or stage_denoise_fallback_used
+        or export_fallback_used
+    )
+    stage_reason_code = (
+        denoise_fallback_reason
+        if stage_denoise_fallback_used
+        else "final_source_recovery"
+        if input_source_fallback_used
+        else "final_export_fallback"
+        if export_fallback_used
+        else ""
     )
 
     elapsed = pipeline.log.stage_end(stage_label)
@@ -1018,4 +1305,15 @@ def run_stage10_export(pipeline) -> None:
         status,
         elapsed,
         "；".join(messages),
+        fallback_used=stage_fallback_used,
+        reason_code=stage_reason_code,
+        details={
+            "review_only_output": bool(review_only_output),
+            "final_source": final_file,
+        },
+        components={
+            "input_source": input_source_component,
+            "denoise": denoise_component,
+            "export": export_component,
+        },
     )

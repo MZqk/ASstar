@@ -8,6 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
 
+import ai_advisory
 from models import PipelineStage
 from pipeline_safety import clamp_ai_color_adjustments, color_safety_limits
 from review_bundle import apply_visual_acceptance, create_image_review_bundle
@@ -38,6 +39,16 @@ def run_stage11_ai_postprocess(
             "skipped",
             elapsed,
             "SEESTAR_AI_ENABLED not enabled",
+        )
+        return
+
+    if not ai_advisory.network_mode_enabled():
+        elapsed = owner.log.stage_end(stage_label)
+        owner._record_stage(
+            stage_label,
+            "skipped",
+            elapsed,
+            "SEESTAR_NETWORK_MODE not enabled; Stage11 remains offline",
         )
         return
 
