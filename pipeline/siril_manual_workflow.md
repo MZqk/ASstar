@@ -181,7 +181,7 @@ save stage4_color
 save stage4_colorbalanced
 ```
 
-自动流程会在独立 Siril CLI 中执行这一条 PCC，超时固定 30 秒且不重试。只有确认线性的宽带 RGB/OSC 输入允许调用；窄带、HOO/SHO、双窄带、单色或非线性输入直接跳过。
+自动流程会在独立 Siril CLI 中执行这一条 PCC，默认超时 180 秒且不重试。只有确认线性的宽带 RGB/OSC 输入允许调用；窄带、HOO/SHO、双窄带、单色或非线性输入直接跳过。
 
 解析失败但 header 有中心坐标时重试：
 

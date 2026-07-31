@@ -1055,6 +1055,18 @@ require_exists "$APP_RESOURCES/SirilPythonSeed/venv/bin/python3.12" "[VERIFY] Em
 require_exists "$APP_RESOURCES/SirilPythonSeed/.python_module/sirilpy" "[VERIFY] Embedded Siril offline module seed"
 require_exists "$APP_FRAMEWORKS/Python.framework/Versions/3.13" "[VERIFY] Embedded Python framework"
 require_executable "$APP_RESOURCES/python/bin/python3.13" "[VERIFY] Embedded Python wrapper"
+GAIA_CATALOG_SCAN_ROOTS=("$APP_PATH")
+if [[ "$BUNDLE_PROFILE" == "core" ]]; then
+  GAIA_CATALOG_SCAN_ROOTS+=("$OFFLINE_RESOURCE_PACK_DIR")
+fi
+if /usr/bin/find "${GAIA_CATALOG_SCAN_ROOTS[@]}" -type f \
+  \( -name "siril_cat*_healpix*_astro*.dat" \
+     -o -name "siril_cat*_healpix*_xpsamp*.dat" \
+     -o -name "gaia_astrometric.dat" \
+     -o -name "gaia_photometric.dat" \) \
+  -print -quit | /usr/bin/grep -q .; then
+  die "[VERIFY] Gaia catalogues must be downloaded to runtime home, never bundled in the app"
+fi
 if [[ "$BUNDLE_PROFILE" == "full" ]]; then
   require_dir "$APP_RESOURCES/siril_plugins/downloads" "[VERIFY] Embedded offline wheels"
   require_file "$APP_RESOURCES/siril_plugins/syqon_starless/zenith.pt" "[VERIFY] Embedded SyQon model"

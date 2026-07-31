@@ -81,6 +81,10 @@ dist/
 resources/ai.env
 resources/siril_plugins/downloads/
 .seestar_ai.env
+siril_cat*_healpix*_astro*.dat
+siril_cat*_healpix*_xpsamp*.dat
+gaia_astrometric.dat
+gaia_photometric.dat
 
 # Local build artifacts
 release/
