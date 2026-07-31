@@ -116,9 +116,26 @@ def _load_gui_module():
 gui_module = _load_gui_module()
 bootstrap_module = sys.modules[gui_module.BootstrapWorker.__module__]
 pipeline_worker_module = sys.modules[gui_module.PipelineWorker.__module__]
+common_module = sys.modules["common"]
+main_window_module = sys.modules[gui_module.SeestarGui.__module__]
 
 
 class GuiRuntimeModesTests(unittest.TestCase):
+    def test_legacy_default_pcc_timeout_migrates_to_180_seconds(self):
+        migrate = main_window_module._migrate_pcc_timeout_setting
+        self.assertEqual(migrate(30, 0), 180)
+        self.assertEqual(migrate(45, 0), 45)
+        self.assertEqual(migrate(30, 2), 30)
+
+    def test_ai_env_allowlist_keeps_runtime_acceleration_and_quality_gates(self):
+        self.assertIn("SEESTAR_GRAXPERT_GPU", common_module.AI_ENV_ALLOWED_KEYS)
+        for key in (
+            "SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_REDUCTION_MIN",
+            "SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_DELTA_MIN",
+            "SEESTAR_STAGE7_STARMASK_DIFFUSE_RESIDUAL_RATIO_MAX",
+        ):
+            self.assertIn(key, common_module.AI_ENV_ALLOWED_KEYS)
+
     def test_processing_parameters_expand_inside_task_sheet(self):
         class _Widget:
             def __init__(self):
@@ -196,6 +213,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             "0",
         )
         self.assertEqual(overrides["SEESTAR_SYQON_GPU"], "0")
+        self.assertEqual(overrides["SEESTAR_GRAXPERT_GPU"], "0")
         self.assertEqual(overrides["SEESTAR_STAGE4_PCC_TIMEOUT_SEC"], "45")
         self.assertEqual(
             overrides["SEESTAR_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT"], "1.18"
@@ -242,6 +260,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
         )
 
         self.assertEqual(overrides["SEESTAR_OUTPUT_FORMAT"], "fit")
+        self.assertEqual(overrides["SEESTAR_GRAXPERT_GPU"], "1")
         self.assertNotIn("SEESTAR_STAGE4_FILTER_HINT", overrides)
         self.assertNotIn("SEESTAR_STAGE4_PCC_TIMEOUT_SEC", overrides)
         self.assertNotIn("SEESTAR_STAGE5_RL_ITERS", overrides)
@@ -274,7 +293,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(proxy.pcc_timeout_sec, 120)
+        self.assertEqual(proxy.pcc_timeout_sec, 180)
         self.assertEqual(proxy.local_wb_gain_limit, 1.50)
         self.assertEqual(proxy.builtin_denoise_strength, 0.20)
         self.assertEqual(proxy.graxpert_deconv_strength, 0.30)
@@ -1010,7 +1029,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             self.assertEqual(env.get("SEESTAR_WATCHDOG_IDLE_TIMEOUT_SEC"), "900")
             self.assertEqual(env.get("SEESTAR_EXPORT_TAIL_TIMEOUT_SEC"), "120")
             self.assertEqual(env.get("SEESTAR_TEMP_CLEANUP_TIMEOUT_SEC"), "30")
-            self.assertEqual(env.get("SEESTAR_NETWORK_MODE"), "1")
+            self.assertEqual(env.get("SEESTAR_NETWORK_MODE"), "0")
             self.assertNotIn("SEESTAR_SPCC_ENABLE", env)
             self.assertNotIn("SEESTAR_GAIA_PHOTO_CATALOG", env)
 
@@ -1025,21 +1044,26 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 "SEESTAR_AI_API_KEY=plaintext-file-key\n",
                 encoding="utf-8",
             )
-            worker = gui_module.PipelineWorker(
-                work_dir=root / "work",
-                config_template=root / "config.ini",
-                pipeline_path=root / "pipeline.py",
-                siril_plugin_dir=root / "plugins",
-                resources=resources,
-                runtime_home=root / "runtime_home",
-                siril_candidates=[],
-                ai_stage_enabled=True,
-                ai_runtime_overrides={
-                    "SEESTAR_AI_ENDPOINT": "https://custom.example/v1",
-                    "SEESTAR_AI_MODEL": "custom-model",
-                    "SEESTAR_AI_API_KEY": "keychain-runtime-key",
-                },
-            )
+            with patch.object(
+                pipeline_worker_module,
+                "AI_STAGE_RELEASE_ENABLED",
+                True,
+            ):
+                worker = gui_module.PipelineWorker(
+                    work_dir=root / "work",
+                    config_template=root / "config.ini",
+                    pipeline_path=root / "pipeline.py",
+                    siril_plugin_dir=root / "plugins",
+                    resources=resources,
+                    runtime_home=root / "runtime_home",
+                    siril_candidates=[],
+                    ai_stage_enabled=True,
+                    ai_runtime_overrides={
+                        "SEESTAR_AI_ENDPOINT": "https://custom.example/v1",
+                        "SEESTAR_AI_MODEL": "custom-model",
+                        "SEESTAR_AI_API_KEY": "keychain-runtime-key",
+                    },
+                )
 
             with patch.dict(
                 os.environ,
@@ -1069,6 +1093,38 @@ class GuiRuntimeModesTests(unittest.TestCase):
             self.assertEqual(worker._temp_cleanup_timeout_sec, 30)
             self.assertEqual(worker._watchdog_idle_timeout_sec, 900)
             self.assertEqual(worker._export_tail_timeout_sec, 120)
+
+    def test_pipeline_worker_first_phase_hard_disables_stage11(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            resources = root / "resources"
+            resources.mkdir()
+            worker = gui_module.PipelineWorker(
+                work_dir=root / "work",
+                config_template=root / "config.ini",
+                pipeline_path=root / "pipeline.py",
+                siril_plugin_dir=root / "plugins",
+                resources=resources,
+                runtime_home=root / "runtime_home",
+                siril_candidates=[],
+                ai_stage_enabled=True,
+                ai_runtime_overrides={
+                    "SEESTAR_AI_ENDPOINT": "https://custom.example/v1",
+                    "SEESTAR_AI_MODEL": "custom-model",
+                    "SEESTAR_AI_API_KEY": "keychain-runtime-key",
+                },
+                runtime_overrides={
+                    "SEESTAR_AI_ARTISTIC_API_KEY": "internal-artistic-key",
+                },
+            )
+
+            env = worker._build_env(Path("/tmp/siril-cli"))
+
+            self.assertFalse(worker.ai_stage_enabled)
+            self.assertEqual(env["SEESTAR_AI_ENABLED"], "0")
+            self.assertNotIn("SEESTAR_AI_API_KEY", env)
+            self.assertNotIn("SEESTAR_AI_ARTISTIC_API_KEY", env)
+            self.assertFalse(worker.ai_runtime_overrides)
 
     def test_pipeline_worker_bootstrap_timeout_uses_env_and_fits_size(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1310,8 +1366,12 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 siril_candidates=[],
             )
             emitted = []
+            detail_events = []
             worker.progress = SimpleNamespace(
                 emit=lambda stage, title, state: emitted.append((stage, title, state))
+            )
+            worker.stage_detail = SimpleNamespace(
+                emit=lambda stage, payload: detail_events.append((stage, payload))
             )
 
             worker._inspect_output_for_errors("[INFO] 阶段 4: 色彩校准")
@@ -1319,6 +1379,12 @@ class GuiRuntimeModesTests(unittest.TestCase):
             worker._inspect_output_for_errors(
                 "[INFO] [PIPELINE_STAGE_RESULT] "
                 "stage=4 status=degraded duration=12.7 title=图像解析 + 色彩校准"
+            )
+            worker._inspect_output_for_errors(
+                '[INFO] [PIPELINE_STAGE_DETAIL] '
+                '{"schema":"seestar.pipeline-stage-detail.v1","stage":4,'
+                '"status":"ok","display_status":"ok_with_fallback",'
+                '"fallback_used":true,"components":{}}'
             )
             worker._inspect_output_for_errors("[INFO] 阶段 4: 色彩校准重试")
             worker._inspect_output_for_errors("[INFO] 阶段 5: 线性降噪")
@@ -1333,6 +1399,76 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(worker._pipeline_stage_durations[4], 12.7)
+            self.assertEqual(detail_events[0][0], 4)
+            self.assertTrue(detail_events[0][1]["fallback_used"])
+            self.assertEqual(
+                detail_events[0][1]["display_status"],
+                "ok_with_fallback",
+            )
+
+    def test_gui_formats_stage5_components_and_stage8_limited_outcome(self):
+        component_summary = gui_module.SeestarGui._format_stage_component_summary(
+            {
+                "components": {
+                    "deconvolution": {
+                        "status": "applied",
+                        "method": "graxpert_object",
+                        "reason_code": "accepted",
+                    },
+                    "denoise": {
+                        "status": "skipped",
+                        "method": "none",
+                        "reason_code": "config_disabled",
+                    },
+                }
+            }
+        )
+        detail_note = gui_module.SeestarGui._format_stage_detail_note(
+            {
+                "details": {
+                    "reason_text": (
+                        "bright_nebula_halo_advisory: "
+                        "0.488 > 0.350, accepted_limit=0.600"
+                    ),
+                    "stage8_handoff": {
+                        "outcome_reason_code": "stage8_limited_candidate_rejected"
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(component_summary, "反卷积 ✓ GraXpert · 降噪 — 配置关闭")
+        self.assertIn(
+            "bright_nebula_halo_advisory: 0.488 > 0.350, accepted_limit=0.600",
+            detail_note,
+        )
+        self.assertIn("受限候选未通过质量门，已安全回滚", detail_note)
+
+        upstream_note = gui_module.SeestarGui._format_stage_detail_note(
+            {
+                "status": "ok",
+                "fallback_used": False,
+                "upstream_passthrough": True,
+                "details": {
+                    "reason_text": "使用 Stage 8 安全旁路源",
+                    "stage9_fallback_used": False,
+                },
+            }
+        )
+        self.assertEqual(upstream_note, "成功（使用 Stage 8 安全旁路源）")
+
+        local_fallback_note = gui_module.SeestarGui._format_stage_detail_note(
+            {
+                "status": "ok",
+                "fallback_used": True,
+                "upstream_passthrough": True,
+                "details": {
+                    "stage9_fallback_reason": "intensity_fallback",
+                },
+            }
+        )
+        self.assertIn("Stage 9 已使用回退：降低星点合成强度", local_fallback_note)
+        self.assertIn("上游为 Stage 8 安全旁路源", local_fallback_note)
 
     def test_pipeline_worker_watchdog_uses_only_current_run_artifacts(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1433,16 +1569,21 @@ class GuiRuntimeModesTests(unittest.TestCase):
     def test_pipeline_worker_stage11_disarms_short_export_tail_watchdog(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            worker = gui_module.PipelineWorker(
-                work_dir=root,
-                config_template=root / "config.ini",
-                pipeline_path=root / "pipeline.py",
-                siril_plugin_dir=root / "plugins",
-                resources=root / "resources",
-                runtime_home=root / "runtime_home",
-                siril_candidates=[],
-                ai_stage_enabled=True,
-            )
+            with patch.object(
+                pipeline_worker_module,
+                "AI_STAGE_RELEASE_ENABLED",
+                True,
+            ):
+                worker = gui_module.PipelineWorker(
+                    work_dir=root,
+                    config_template=root / "config.ini",
+                    pipeline_path=root / "pipeline.py",
+                    siril_plugin_dir=root / "plugins",
+                    resources=root / "resources",
+                    runtime_home=root / "runtime_home",
+                    siril_candidates=[],
+                    ai_stage_enabled=True,
+                )
             worker._inspect_output_for_errors("Saving PNG: result.png")
             worker._inspect_output_for_errors("[INFO] 阶段 11: AI 后期美化")
 
@@ -1628,6 +1769,74 @@ class GuiRuntimeModesTests(unittest.TestCase):
             self.assertEqual(
                 env.get("PIP_FIND_LINKS"),
                 f"{downloads} {runtime_downloads}",
+            )
+
+    def test_pipeline_worker_copies_target_catalog_and_policies_to_runtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            work_dir = root / "work"
+            work_dir.mkdir()
+            config_template = root / "config.ini"
+            config_template.write_text(
+                "[core]\nextension=.fit\n",
+                encoding="utf-8",
+            )
+            pipeline_dir = root / "pipeline"
+            pipeline_dir.mkdir()
+            pipeline_path = pipeline_dir / "seestar_Superimpose.py"
+            pipeline_path.write_text("# mock\n", encoding="utf-8")
+            pipeline_path.with_name("stage11_ai_postprocess.py").write_text(
+                "# mock stage11\n",
+                encoding="utf-8",
+            )
+            policy = (
+                pipeline_dir
+                / "configs"
+                / "policies"
+                / "emission_nebula_widefield.yaml"
+            )
+            policy.parent.mkdir(parents=True)
+            policy.write_text('{"policy_name":"emission_nebula_widefield"}\n')
+            catalog = (
+                pipeline_dir
+                / "configs"
+                / "target_catalog"
+                / "popular_dso.json"
+            )
+            catalog.parent.mkdir(parents=True)
+            catalog.write_text('[{"name":"Lagoon Nebula"}]\n')
+
+            worker = gui_module.PipelineWorker(
+                work_dir=work_dir,
+                config_template=config_template,
+                pipeline_path=pipeline_path,
+                siril_plugin_dir=root / "plugins",
+                resources=root / "resources",
+                runtime_home=root / "runtime_home",
+                siril_candidates=[],
+            )
+            temp_dir = root / "temp"
+            temp_dir.mkdir()
+
+            worker._prepare_runtime_files(temp_dir)
+
+            self.assertEqual(
+                (
+                    temp_dir
+                    / "configs"
+                    / "policies"
+                    / "emission_nebula_widefield.yaml"
+                ).read_text(),
+                policy.read_text(),
+            )
+            self.assertEqual(
+                (
+                    temp_dir
+                    / "configs"
+                    / "target_catalog"
+                    / "popular_dso.json"
+                ).read_text(),
+                catalog.read_text(),
             )
 
     def test_pipeline_worker_uses_lightweight_plugin_overlay_for_large_resources(self):
@@ -2018,6 +2227,46 @@ class GuiRuntimeModesTests(unittest.TestCase):
             )
 
             self.assertEqual(worker._completed_run_status(), "CompletedWithWarning")
+
+    def test_pipeline_worker_marks_review_required_manifest_as_warning(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worker = gui_module.PipelineWorker(
+                work_dir=root / "work",
+                config_template=root / "config.ini",
+                pipeline_path=root / "pipeline.py",
+                siril_plugin_dir=root / "plugins",
+                resources=root / "resources",
+                runtime_home=root / "runtime_home",
+                siril_candidates=[],
+            )
+
+            worker._inspect_output_for_errors(
+                "log: [INFO] [PIPELINE_RESULT] "
+                "status=review_required manifest=/tmp/pipeline-result.json"
+            )
+
+            self.assertEqual(worker._completed_run_status(), "CompletedWithWarning")
+
+    def test_pipeline_worker_marks_failed_manifest_as_failed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worker = gui_module.PipelineWorker(
+                work_dir=root / "work",
+                config_template=root / "config.ini",
+                pipeline_path=root / "pipeline.py",
+                siril_plugin_dir=root / "plugins",
+                resources=root / "resources",
+                runtime_home=root / "runtime_home",
+                siril_candidates=[],
+            )
+
+            worker._inspect_output_for_errors(
+                "log: [INFO] [PIPELINE_RESULT] "
+                "status=failed manifest=/tmp/pipeline-result.json"
+            )
+
+            self.assertEqual(worker._completed_run_status(), "Failed")
 
     @unittest.skip("SPCC runtime and crash-retry path retired")
     def test_pipeline_worker_spcc_crash_diagnostics_include_recent_output(self):

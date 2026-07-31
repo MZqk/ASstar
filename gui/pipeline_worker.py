@@ -68,6 +68,11 @@ _PIPELINE_RUN_SUMMARY_RE = re.compile(
     r"\[PIPELINE_RUN_SUMMARY\]\s+failed=(\d+)\s+degraded=(\d+)",
     re.IGNORECASE,
 )
+_PIPELINE_RESULT_RE = re.compile(
+    r"\[PIPELINE_RESULT\]\s+status="
+    r"(success|partial_success|review_required|failed)\b",
+    re.IGNORECASE,
+)
 _SIRIL_PROGRESS_RE = re.compile(
     r"^\s*(?:log:\s*)?progress:\s*(.*?)(?:,\s*)?"
     r"([0-9]+(?:\.[0-9]+)?)%\s*$",
@@ -161,6 +166,7 @@ class PipelineWorker(QThread):
     log = Signal(str)
     state = Signal(str)
     progress = Signal(int, str, str)
+    stage_detail = Signal(int, object)
     preview = Signal(int, str, str, str)
     done = Signal(str, int, bool, str)
 
@@ -175,7 +181,7 @@ class PipelineWorker(QThread):
         siril_candidates: list[Path],
         input_mode: str = INPUT_MODE_AUTO,
         debug_mode: bool = False,
-        network_mode: bool = True,
+        network_mode: bool = False,
         ai_stage_enabled: bool = False,
         ai_runtime_overrides: dict[str, str] | None = None,
         runtime_overrides: dict[str, str] | None = None,
@@ -202,11 +208,13 @@ class PipelineWorker(QThread):
         )
         self.debug_mode = bool(debug_mode)
         self.network_mode = bool(network_mode)
-        self.ai_stage_enabled = bool(ai_stage_enabled)
+        self.ai_stage_enabled = bool(
+            AI_STAGE_RELEASE_ENABLED and ai_stage_enabled
+        )
         self.ai_runtime_overrides = {
             str(key): str(value)
             for key, value in (ai_runtime_overrides or {}).items()
-            if str(key) in AI_ENV_ALLOWED_KEYS
+            if self.ai_stage_enabled and str(key) in AI_ENV_ALLOWED_KEYS
         }
         self.runtime_overrides = {
             str(key): str(value)
@@ -238,6 +246,7 @@ class PipelineWorker(QThread):
         self._native_termination_command = ""
         self._pipeline_summary_failed = 0
         self._pipeline_summary_degraded = 0
+        self._pipeline_result_status: str | None = None
         self._recent_process_output: deque[str] = deque(maxlen=80)
         self._last_command = ""
         self._saving_png_seen_at: float | None = None
@@ -404,6 +413,22 @@ class PipelineWorker(QThread):
                 self._pipeline_stage_durations.get(stage, 0.0) + duration_seconds
             )
             self.progress.emit(stage, result_match.group(4).strip(), state)
+        stage_detail_marker = "[PIPELINE_STAGE_DETAIL]"
+        stage_detail_index = text.find(stage_detail_marker)
+        if stage_detail_index >= 0:
+            raw_payload = text[
+                stage_detail_index + len(stage_detail_marker):
+            ].strip()
+            try:
+                stage_detail_payload = json.loads(raw_payload)
+                stage_detail_stage = int(stage_detail_payload.get("stage", 0))
+                if stage_detail_stage > 0:
+                    self.stage_detail.emit(
+                        stage_detail_stage,
+                        stage_detail_payload,
+                    )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
         preview_marker = "[PIPELINE_PREVIEW]"
         preview_index = text.find(preview_marker)
         if preview_index >= 0:
@@ -433,6 +458,9 @@ class PipelineWorker(QThread):
         if summary_match:
             self._pipeline_summary_failed = int(summary_match.group(1))
             self._pipeline_summary_degraded = int(summary_match.group(2))
+        result_status_match = _PIPELINE_RESULT_RE.search(text)
+        if result_status_match:
+            self._pipeline_result_status = result_status_match.group(1).lower()
         command_markers = (
             "running command:",
             "running command ",
@@ -750,6 +778,9 @@ class PipelineWorker(QThread):
         stages_dir = pipeline_dir / "stages"
         if stages_dir.exists() and stages_dir.is_dir():
             shutil.copytree(stages_dir, temp_dir / "stages", dirs_exist_ok=True)
+        configs_dir = pipeline_dir / "configs"
+        if configs_dir.exists() and configs_dir.is_dir():
+            shutil.copytree(configs_dir, temp_dir / "configs", dirs_exist_ok=True)
         if not stage11_module_path.exists():
             raise FileNotFoundError(f"未找到 Stage11 模块脚本：{stage11_module_path}")
         if not run_stage11_module.exists():
@@ -997,7 +1028,11 @@ class PipelineWorker(QThread):
         env["SEESTAR_GAIA_ASTRO_CATALOG"] = str(
             local_catalog_root / "siril_cat_healpix8_astro.dat"
         )
-        # GUI toggle is the highest-priority control for optional stage11 execution.
+        # Phase 1 hard boundary: the GUI worker cannot enable dormant Stage11,
+        # even if a stale setting or an internal caller requests it.
+        if not self.ai_stage_enabled:
+            for secret_key in _AI_CREDENTIAL_ENV_KEYS:
+                env.pop(secret_key, None)
         env["SEESTAR_AI_ENABLED"] = "1" if self.ai_stage_enabled else "0"
         return env
 
@@ -1350,10 +1385,14 @@ class PipelineWorker(QThread):
             self._append_event(f"  ... 另有 {len(artifacts) - 40} 个产物")
 
     def _completed_run_status(self) -> str:
+        if self._pipeline_result_status == "failed":
+            return "Failed"
         if (
             self._export_tail_timeout_recovered
             or self._pipeline_summary_failed > 0
             or self._pipeline_summary_degraded > 0
+            or self._pipeline_result_status
+            in {"partial_success", "review_required"}
         ):
             return "CompletedWithWarning"
         return "Completed"
@@ -1369,6 +1408,7 @@ class PipelineWorker(QThread):
         self._native_termination_command = ""
         self._pipeline_summary_failed = 0
         self._pipeline_summary_degraded = 0
+        self._pipeline_result_status = None
         self._recent_process_output.clear()
         self._last_command = ""
         self._saving_png_seen_at = None

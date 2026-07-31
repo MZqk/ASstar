@@ -115,6 +115,7 @@ PIPELINE_PROGRESS_STATE_LABELS = {
     "waiting": "等待",
     "running": "● 运行中",
     "completed": "✓ 已完成",
+    "safe_passthrough": "↪ 安全旁路",
     "degraded": "⚠ 已降级",
     "failed": "✕ 失败",
     "skipped": "— 已跳过",
@@ -126,7 +127,7 @@ PIPELINE_STAGE_SHORT_TITLES = {
     2: "裁切",
     3: "背景",
     4: "校色",
-    5: "线性降噪",
+    5: "线性处理",
     6: "去星",
     7: "拉伸",
     8: "深加工",
@@ -212,6 +213,21 @@ except ImportError:
     from pipeline_worker import PipelineWorker  # type: ignore[no-redef]
 
 try:
+    from .gaia_catalog import (
+        GaiaCatalogCancelled,
+        GaiaCatalogDownloadError,
+        download_gaia_catalog,
+        gaia_catalog_status,
+    )
+except ImportError:
+    from gaia_catalog import (  # type: ignore[no-redef]
+        GaiaCatalogCancelled,
+        GaiaCatalogDownloadError,
+        download_gaia_catalog,
+        gaia_catalog_status,
+    )
+
+try:
     from .preview_widgets import LatestPreviewCanvas
     from .preview_worker import InitialPreviewWorker, preview_cache_path
 except ImportError:
@@ -235,7 +251,7 @@ DEFAULT_PROCESSING_SETTINGS = {
     "deconvolution_mode": "auto",
     "graxpert_model_path": "",
     "compute_mode": "auto",
-    "pcc_timeout_sec": 30,
+    "pcc_timeout_sec": 180,
     "local_wb_gain_limit": 1.20,
     "builtin_denoise_strength": 0.50,
     "graxpert_deconv_strength": 0.30,
@@ -248,6 +264,28 @@ DEFAULT_PROCESSING_SETTINGS = {
     "starmask_asinh_stretch": 2.00,
     "weak_star_recovery_ratio": 0.70,
 }
+PCC_TIMEOUT_SETTINGS_VERSION = 2
+PCC_TIMEOUT_LEGACY_DEFAULT_SEC = 30
+
+
+def _migrate_pcc_timeout_setting(value: object, version: object) -> object:
+    """Raise only the legacy 30-second default; preserve explicit custom values."""
+    try:
+        parsed_version = int(version)
+    except (TypeError, ValueError):
+        parsed_version = 0
+    try:
+        parsed_value = int(value)
+    except (TypeError, ValueError):
+        return value
+    if (
+        parsed_version < PCC_TIMEOUT_SETTINGS_VERSION
+        and parsed_value == PCC_TIMEOUT_LEGACY_DEFAULT_SEC
+    ):
+        return DEFAULT_PROCESSING_SETTINGS["pcc_timeout_sec"]
+    return value
+
+
 VALID_OUTPUT_FORMATS = frozenset({"tif", "png", "fit"})
 VALID_COLOR_CALIBRATION_MODES = frozenset({"pcc"})
 VALID_FILTER_HINT_MODES = frozenset(
@@ -261,7 +299,12 @@ VALID_COMPUTE_MODES = frozenset({"auto", "cpu"})
 class SeestarGui(QMainWindow):
     thread_log = Signal(str)
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        resources_override: Path | None = None,
+        runtime_home_override: Path | None = None,
+    ) -> None:
         super().__init__()
         self.setWindowTitle("Seestar 图像后处理")
         self.setMinimumSize(980, 680)
@@ -284,10 +327,18 @@ class SeestarGui(QMainWindow):
         self._last_run_snapshot: dict[str, object] | None = None
         self._run_input_mode_override: str | None = None
 
-        self.resources = resource_root()
+        self.resources = (
+            Path(resources_override).expanduser().resolve()
+            if resources_override is not None
+            else resource_root()
+        )
         self.pipeline_path = default_pipeline_path(self.resources)
         self.siril_plugin_dir = default_siril_plugin_dir(self.resources)
-        self.runtime_home = default_runtime_home()
+        self.runtime_home = (
+            Path(runtime_home_override).expanduser().resolve()
+            if runtime_home_override is not None
+            else default_runtime_home()
+        )
         self.bundled_siril_cli = (
             self.resources / "Siril.app" / "Contents" / "MacOS" / "siril-cli"
         )
@@ -299,6 +350,7 @@ class SeestarGui(QMainWindow):
 
         self.worker: PipelineWorker | None = None
         self.bootstrap_worker: BootstrapWorker | None = None
+        self.gaia_catalog_worker: BootstrapWorker | None = None
         self._bootstrap_stop_event: threading.Event | None = None
         self.run_log_path: Path | None = None
         self.run_log_file = None
@@ -312,6 +364,7 @@ class SeestarGui(QMainWindow):
         self._stage_elapsed_seconds: dict[int, float] = {}
         self._stage_progress_states: dict[int, str] = {}
         self._stage_progress_titles: dict[int, str] = {}
+        self._stage_progress_details: dict[int, dict[str, object]] = {}
         self._stage_items: dict[int, QLabel] = {}
         self._progress_stage_count = 10
         self.input_mode = INPUT_MODE_AUTO
@@ -1468,6 +1521,7 @@ class SeestarGui(QMainWindow):
             self.review_combo,
             self.color_combo,
             self.filter_combo,
+            self.gaia_catalog_download_btn,
             self.denoise_combo,
             self.deconv_combo,
             self.graxpert_model_edit,
@@ -1519,6 +1573,7 @@ class SeestarGui(QMainWindow):
         self._stage_elapsed_seconds.clear()
         self._stage_progress_states.clear()
         self._stage_progress_titles.clear()
+        self._stage_progress_details.clear()
         self._stage_items.clear()
         while self.stage_stepper_layout.count():
             layout_item = self.stage_stepper_layout.takeAt(0)
@@ -1542,6 +1597,7 @@ class SeestarGui(QMainWindow):
                 self.stage_stepper_layout.addWidget(phase_label)
             title = PIPELINE_STAGE_TITLES.get(stage, f"阶段 {stage}")
             chip = QLabel()
+            chip.setWordWrap(True)
             chip.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
             self.stage_stepper_layout.addWidget(chip)
             self._stage_items[stage] = chip
@@ -1556,6 +1612,107 @@ class SeestarGui(QMainWindow):
         if hasattr(self, "stage_timing_label"):
             self.stage_timing_label.setText("本阶段 — · 总耗时 —")
 
+    @staticmethod
+    def _format_stage_component_summary(payload: dict[str, object]) -> str:
+        components = payload.get("components")
+        if not isinstance(components, dict):
+            return ""
+        labels = {
+            "deconvolution": "反卷积",
+            "denoise": "降噪",
+        }
+        method_labels = {
+            "graxpert_object": "GraXpert",
+            "siril_rl": "Siril RL",
+            "deterministic_multiscale": "多尺度",
+            "siril_builtin": "Siril",
+            "none": "",
+        }
+        reason_labels = {
+            "accepted": "已应用",
+            "auto_low_noise": "低噪声自动跳过",
+            "user_disabled": "用户关闭",
+            "config_disabled": "配置关闭",
+            "background_guard_rollback": "质量门回滚",
+            "all_denoisers_failed": "全部降噪器失败",
+            "deconvolution_unavailable": "不可用",
+        }
+        status_symbols = {
+            "applied": "✓",
+            "skipped": "—",
+            "failed": "✕",
+            "rolled_back": "↩",
+        }
+        parts: list[str] = []
+        for component_id, raw_component in components.items():
+            if not isinstance(raw_component, dict):
+                continue
+            component_status = str(raw_component.get("status") or "").strip()
+            method = str(raw_component.get("method") or "").strip()
+            reason = str(raw_component.get("reason_code") or "").strip()
+            label = labels.get(str(component_id), str(component_id))
+            detail = method_labels.get(method, method)
+            if component_status != "applied" or not detail:
+                detail = reason_labels.get(reason, reason or detail)
+            symbol = status_symbols.get(component_status, "·")
+            part = f"{label} {symbol}"
+            if detail:
+                part += f" {detail}"
+            parts.append(part)
+        return " · ".join(parts)
+
+    @staticmethod
+    def _format_stage_detail_note(payload: dict[str, object]) -> str:
+        details = payload.get("details")
+        details = details if isinstance(details, dict) else {}
+        reason_text = str(details.get("reason_text") or "").strip()
+        stage8_handoff = details.get("stage8_handoff")
+        stage8_handoff = (
+            stage8_handoff if isinstance(stage8_handoff, dict) else {}
+        )
+        outcome_reason = str(
+            stage8_handoff.get("outcome_reason_code") or ""
+        ).strip()
+        if outcome_reason == "stage8_limited_candidate_rejected":
+            suffix = "受限候选未通过质量门，已安全回滚"
+            return f"{reason_text}；{suffix}" if reason_text else suffix
+        if outcome_reason == "stage8_limited_candidate_accepted":
+            suffix = "受限候选已通过质量门"
+            return f"{reason_text}；{suffix}" if reason_text else suffix
+        upstream_passthrough = bool(payload.get("upstream_passthrough", False))
+        stage_fallback_used = bool(payload.get("fallback_used", False))
+        if upstream_passthrough and not stage_fallback_used:
+            return "成功（使用 Stage 8 安全旁路源）"
+        if stage_fallback_used:
+            fallback_reason = str(
+                details.get("stage9_fallback_reason")
+                or payload.get("reason_code")
+                or ""
+            ).strip()
+            fallback_labels = {
+                "intensity_fallback": "降低星点合成强度",
+                "compact_mask_recovery": "紧凑星点蒙版恢复",
+                "unsafe_starless_bypass": "不安全 Starless 回滚",
+                "all_remix_candidates_rejected": "合成候选全部拒绝",
+                "starmask_stretch_failed_keep_upstream": "星点蒙版处理失败并保留上游源",
+                "output_save_failed_keep_upstream": "输出保存失败并保留上游源",
+            }
+            fallback_text = fallback_labels.get(fallback_reason, fallback_reason)
+            if fallback_text:
+                prefix = "Stage 9 已使用回退：" + fallback_text
+                if upstream_passthrough:
+                    prefix += "；上游为 Stage 8 安全旁路源"
+                return prefix
+        if reason_text:
+            return reason_text
+        reason_code = str(payload.get("reason_code") or "").strip()
+        reason_labels = {
+            "bright_nebula_halo_advisory": "亮星云 halo 中风险，采用受限增强与质量门",
+            "stage8_enhancement_quality_rollback": "增强候选未通过质量门，已安全回滚",
+            "star_preserve_target_bypass": "目标要求保留星点，使用安全旁路",
+        }
+        return reason_labels.get(reason_code, "")
+
     def _update_stage_chip(self, stage: int) -> None:
         chip = self._stage_items.get(stage)
         if chip is None:
@@ -1565,6 +1722,7 @@ class SeestarGui(QMainWindow):
             "waiting": "○",
             "running": "●",
             "completed": "✓",
+            "safe_passthrough": "↪",
             "degraded": "⚠",
             "failed": "✕",
             "skipped": "—",
@@ -1573,12 +1731,14 @@ class SeestarGui(QMainWindow):
         border = {
             "running": "#0a84ff",
             "completed": "#34c759",
+            "safe_passthrough": "#4f8fa8",
             "degraded": "#c08a00",
             "failed": "#ff453a",
         }.get(state, "rgba(127, 127, 127, 0.36)")
         background = {
             "running": "rgba(10, 132, 255, 0.16)",
             "completed": "rgba(52, 199, 89, 0.13)",
+            "safe_passthrough": "rgba(79, 143, 168, 0.14)",
             "degraded": "rgba(255, 193, 7, 0.16)",
             "failed": "rgba(255, 69, 58, 0.14)",
         }.get(state, "transparent")
@@ -1587,12 +1747,20 @@ class SeestarGui(QMainWindow):
             "waiting": "等待",
             "running": "运行中",
             "completed": "已完成",
+            "safe_passthrough": "安全旁路",
             "degraded": "已降级",
             "failed": "失败",
             "skipped": "已跳过",
             "stopped": "已停止",
         }.get(state, state)
-        chip.setText(f"{symbol}  Stage {stage} · {short_title}    {state_text}")
+        stage_detail = self._stage_progress_details.get(stage, {})
+        component_summary = self._format_stage_component_summary(stage_detail)
+        detail_note = self._format_stage_detail_note(stage_detail)
+        extra_text = component_summary or detail_note
+        chip_text = f"{symbol}  Stage {stage} · {short_title}    {state_text}"
+        if extra_text:
+            chip_text += f"\n   {extra_text}"
+        chip.setText(chip_text)
         chip.setAccessibleName(f"阶段 {stage}：{short_title}")
         chip.setStyleSheet(
             "padding: 6px 7px;"
@@ -1603,11 +1771,16 @@ class SeestarGui(QMainWindow):
         )
         elapsed = self._stage_elapsed_seconds.get(stage)
         elapsed_text = self._format_elapsed(elapsed) if elapsed is not None else "—"
-        chip.setToolTip(
+        tooltip = (
             f"阶段 {stage}：{self._stage_progress_titles.get(stage, short_title)}\n"
             f"状态：{state_text}\n"
             f"耗时：{elapsed_text}"
         )
+        if component_summary:
+            tooltip += f"\n子状态：{component_summary}"
+        if detail_note:
+            tooltip += f"\n说明：{detail_note}"
+        chip.setToolTip(tooltip)
         chip.setAccessibleDescription(chip.toolTip())
         if state == "running" and hasattr(self, "stage_scroll"):
             self.stage_scroll.ensureWidgetVisible(chip, 0, 8)
@@ -1852,7 +2025,7 @@ class SeestarGui(QMainWindow):
                 value = caster(DEFAULT_PROCESSING_SETTINGS[key])
             return max(caster(lower), min(caster(upper), value))
 
-        self.pcc_timeout_sec = bounded_value("pcc_timeout_sec", 5, 120, int)
+        self.pcc_timeout_sec = bounded_value("pcc_timeout_sec", 5, 180, int)
         self.local_wb_gain_limit = bounded_value(
             "local_wb_gain_limit", 1.01, 1.50, float
         )
@@ -1892,6 +2065,7 @@ class SeestarGui(QMainWindow):
             "SEESTAR_SYQON_GPU": "0" if self.compute_mode == "cpu" else "1",
             "SEESTAR_COSMIC_NATIVE_GPU": "0" if self.compute_mode == "cpu" else "1",
             "SEESTAR_COSMIC_CLASSIC_GPU": "0" if self.compute_mode == "cpu" else "1",
+            "SEESTAR_GRAXPERT_GPU": "0" if self.compute_mode == "cpu" else "1",
             "SEESTAR_STAGE7_QUALITY_RETRY_MAX": str(self.starless_retry_max),
             "SEESTAR_STAGE7_STARLESS_REPAIR_STRENGTH": (
                 f"{self.starless_repair_strength:.2f}"
@@ -1962,7 +2136,7 @@ class SeestarGui(QMainWindow):
 
     def _processing_settings_summary_lines(self, input_mode: str) -> list[str]:
         format_labels = {"tif": "TIFF", "png": "PNG", "fit": "FITS"}
-        color_labels = {"pcc": "单次在线 Gaia PCC（30 秒）"}
+        color_labels = {"pcc": "Gaia PCC（本地优先，180 秒）"}
         filter_labels = {
             "auto": "自动识别",
             "no_filter": "无滤镜",
@@ -2090,13 +2264,14 @@ class SeestarGui(QMainWindow):
         color_form = QFormLayout(self.processing_color_group)
         color_form.setContentsMargins(10, 8, 10, 8)
         self.color_combo = QComboBox()
-        self.color_combo.addItem("单次在线 Gaia PCC（30 秒，自动安全回退）", "pcc")
+        self.color_combo.addItem("Gaia PCC（本地优先，单次安全回退）", "pcc")
         color_label = QLabel("校准方式")
         self._set_parameter_help(
             color_label,
             self.color_combo,
-            "用途：Stage 4 仅对确认线性的宽带 RGB/OSC 执行一次在线 Gaia PCC。"
-            "30 秒超时、失败或目标感知质量门拒绝后会回到 pre_pcc 线性检查点；"
+            "用途：Stage 4 仅对确认线性的宽带 RGB/OSC 执行一次 Gaia PCC。"
+            "本地 Gaia 目录可用时完全离线运行，否则仅在允许联网时使用在线 Gaia。"
+            "超时、失败或色温/背景/主体颜色质量门拒绝后会回到 pre_pcc 线性检查点；"
             "从线性结果继续时不生效。",
         )
         color_form.addRow(color_label, self.color_combo)
@@ -2115,6 +2290,35 @@ class SeestarGui(QMainWindow):
             "从线性结果继续时不生效。",
         )
         color_form.addRow(filter_label, self.filter_combo)
+
+        catalog_row = QWidget()
+        catalog_layout = QVBoxLayout(catalog_row)
+        catalog_layout.setContentsMargins(0, 0, 0, 0)
+        catalog_layout.setSpacing(3)
+        self.gaia_catalog_download_btn = QPushButton(
+            "下载离线 Gaia 星色目录（约 1.1 GB）"
+        )
+        self.gaia_catalog_download_btn.setAccessibleName("下载离线 Gaia 星色目录")
+        self.gaia_catalog_download_btn.setToolTip(
+            "从 Siril 官方 Zenodo 数据集下载并校验；解压后约 1.52 GB，"
+            "只保存到应用 runtime home，不写入项目，也不会打包进应用。"
+        )
+        self.gaia_catalog_status = QLabel()
+        self.gaia_catalog_status.setWordWrap(True)
+        self.gaia_catalog_status.setStyleSheet(
+            "color: rgba(127,127,127,0.95); font-size: 11px;"
+        )
+        catalog_layout.addWidget(self.gaia_catalog_download_btn)
+        catalog_layout.addWidget(self.gaia_catalog_status)
+        catalog_label = QLabel("离线目录")
+        self._set_parameter_help(
+            catalog_label,
+            catalog_row,
+            "用途：安装包含 Gaia DR3 恒星有效温度的 Siril 本地目录，"
+            "同时支持离线图像解析与 pcc -catalog=localgaia。"
+            "目录不会随项目保存或随 App 打包。",
+        )
+        color_form.addRow(catalog_label, catalog_row)
         groups.addWidget(self.processing_color_group, 0, 1)
 
         performance_group = QGroupBox("性能兼容")
@@ -2127,7 +2331,7 @@ class SeestarGui(QMainWindow):
         self._set_parameter_help(
             compute_label,
             self.compute_combo,
-            "用途：控制 SyQon 与 CosmicClarity 是否允许自动使用硬件加速；"
+            "用途：控制 GraXpert、SyQon 与 CosmicClarity 是否允许自动使用硬件加速；"
             "默认：自动加速。遇到模型启动失败、显存/统一内存不足或设备兼容问题时"
             "可切换 CPU，速度会明显降低；所有包含对应插件的处理方式均生效。",
         )
@@ -2272,14 +2476,15 @@ class SeestarGui(QMainWindow):
                     (label, control)
                 )
 
-        self.pcc_timeout_spin = integer_spin(5, 120, 5, " 秒")
+        self.pcc_timeout_spin = integer_spin(5, 180, 5, " 秒")
         add_professional_parameter(
             0,
             0,
             "PCC 超时",
             self.pcc_timeout_spin,
-            "Stage 4 在线 Gaia PCC 的单次等待上限；默认 30 秒，范围 5–120 秒。"
-            "网络较慢可适当增加；超时后不会重试，会继续使用安全回退结果。",
+            "Stage 4 本地或在线 Gaia PCC 的单次等待上限；"
+            "默认 180 秒，范围 5–180 秒。超时后不会重试，"
+            "会回滚并继续使用安全回退结果。",
             prelinear=True,
         )
 
@@ -2450,6 +2655,9 @@ class SeestarGui(QMainWindow):
         self.processing_defaults_btn.clicked.connect(
             self._restore_processing_defaults
         )
+        self.gaia_catalog_download_btn.clicked.connect(
+            self._toggle_gaia_catalog_download
+        )
         for control in (
             self.pcc_timeout_spin,
             self.local_wb_gain_spin,
@@ -2466,6 +2674,7 @@ class SeestarGui(QMainWindow):
         ):
             control.valueChanged.connect(self._on_processing_controls_changed)
         self._sync_processing_controls_from_state()
+        self._refresh_gaia_catalog_status()
         return panel
 
     def _sync_processing_controls_from_state(self) -> None:
@@ -2533,6 +2742,99 @@ class SeestarGui(QMainWindow):
                 "同一任务页内配置；运行开始后保持只读。"
             )
         self._update_graxpert_model_status()
+
+    def _refresh_gaia_catalog_status(self) -> None:
+        status_label = getattr(self, "gaia_catalog_status", None)
+        button = getattr(self, "gaia_catalog_download_btn", None)
+        if status_label is None or button is None:
+            return
+        status = gaia_catalog_status(self.runtime_home)
+        if status["available"]:
+            status_label.setText(
+                "已安装：runtime home/.local/share/siril/"
+                "siril_cat_healpix8_astro.dat（约 1.52 GB）"
+            )
+            button.setText("重新下载并校验离线 Gaia 目录")
+        else:
+            size_bytes = int(status["size_bytes"])
+            suffix = (
+                f"；发现不完整文件 {size_bytes / (1024**2):.1f} MiB"
+                if size_bytes
+                else ""
+            )
+            status_label.setText(
+                "未安装；无目录时保持在线 PCC/本地恒星回退策略"
+                + suffix
+            )
+            button.setText("下载离线 Gaia 星色目录（约 1.1 GB）")
+
+    def _toggle_gaia_catalog_download(self, _checked: bool = False) -> None:
+        worker = self.gaia_catalog_worker
+        if worker and worker.isRunning():
+            self.gaia_catalog_status.setText("正在取消目录下载并清理临时文件…")
+            self.gaia_catalog_download_btn.setEnabled(False)
+            worker.stop()
+            return
+
+        self.gaia_catalog_download_btn.setText("取消下载")
+        self.gaia_catalog_download_btn.setEnabled(True)
+        self.gaia_catalog_status.setText("正在准备离线 Gaia 目录下载…")
+        force_download = bool(
+            gaia_catalog_status(self.runtime_home)["available"]
+        )
+
+        def runner(stop_event, progress):
+            try:
+                return download_gaia_catalog(
+                    self.runtime_home,
+                    stop_event=stop_event,
+                    progress=progress,
+                    force=force_download,
+                )
+            except GaiaCatalogCancelled as error:
+                raise BootstrapCancelled() from error
+            except GaiaCatalogDownloadError as error:
+                raise BootstrapError("离线 Gaia 目录安装失败", str(error)) from error
+            except Exception as error:
+                raise BootstrapError("离线 Gaia 目录安装失败", str(error)) from error
+
+        self.gaia_catalog_worker = BootstrapWorker(runner, parent=self)
+        self.gaia_catalog_worker.progress.connect(
+            lambda message: self.gaia_catalog_status.setText(message)
+        )
+        self.gaia_catalog_worker.succeeded.connect(
+            self._on_gaia_catalog_download_succeeded
+        )
+        self.gaia_catalog_worker.failed.connect(
+            self._on_gaia_catalog_download_failed
+        )
+        self.gaia_catalog_worker.cancelled.connect(
+            self._on_gaia_catalog_download_cancelled
+        )
+        self.gaia_catalog_worker.start()
+
+    def _cleanup_gaia_catalog_worker(self) -> None:
+        if self.gaia_catalog_worker:
+            self.gaia_catalog_worker.wait(200)
+            self.gaia_catalog_worker.deleteLater()
+            self.gaia_catalog_worker = None
+        self.gaia_catalog_download_btn.setEnabled(not self._ui_running)
+
+    def _on_gaia_catalog_download_succeeded(self, result: object) -> None:
+        self._cleanup_gaia_catalog_worker()
+        self._refresh_gaia_catalog_status()
+        self._append_event(f"离线 Gaia 星色目录安装完成：{result}")
+
+    def _on_gaia_catalog_download_failed(self, title: str, detail: str) -> None:
+        self._cleanup_gaia_catalog_worker()
+        self._refresh_gaia_catalog_status()
+        QMessageBox.critical(self, title, detail)
+        self._append_event(f"{title}：{detail}")
+
+    def _on_gaia_catalog_download_cancelled(self) -> None:
+        self._cleanup_gaia_catalog_worker()
+        self._refresh_gaia_catalog_status()
+        self._append_event("已取消离线 Gaia 目录下载，临时文件已清理。")
 
     def _update_graxpert_model_status(self) -> None:
         if not hasattr(self, "graxpert_model_status"):
@@ -2966,6 +3268,18 @@ class SeestarGui(QMainWindow):
                     for value in saved_formats.split(",")
                     if value.strip()
                 ]
+            saved_pcc_timeout = self.settings.value(
+                "processing/pccTimeoutSec",
+                DEFAULT_PROCESSING_SETTINGS["pcc_timeout_sec"],
+            )
+            saved_pcc_timeout = _migrate_pcc_timeout_setting(
+                saved_pcc_timeout,
+                self.settings.value("processing/pccTimeoutSettingsVersion", 0),
+            )
+            self.settings.setValue(
+                "processing/pccTimeoutSettingsVersion",
+                PCC_TIMEOUT_SETTINGS_VERSION,
+            )
             self._restore_processing_settings(
                 {
                     "output_formats": list(saved_formats or []),
@@ -2990,10 +3304,7 @@ class SeestarGui(QMainWindow):
                     "compute_mode": self.settings.value(
                         "processing/computeMode", "auto"
                     ),
-                    "pcc_timeout_sec": self.settings.value(
-                        "processing/pccTimeoutSec",
-                        DEFAULT_PROCESSING_SETTINGS["pcc_timeout_sec"],
-                    ),
+                    "pcc_timeout_sec": saved_pcc_timeout,
                     "local_wb_gain_limit": self.settings.value(
                         "processing/localWbGainLimit",
                         DEFAULT_PROCESSING_SETTINGS["local_wb_gain_limit"],
@@ -5241,6 +5552,14 @@ class SeestarGui(QMainWindow):
         *,
         input_mode_override: str | None = None,
     ) -> None:
+        gaia_worker = getattr(self, "gaia_catalog_worker", None)
+        if gaia_worker and gaia_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "正在安装离线目录",
+                "请等待 Gaia 目录安装完成，或先点击“取消下载”。",
+            )
+            return
         if self.bootstrap_worker and self.bootstrap_worker.isRunning():
             return
         if self.worker and self.worker.isRunning():
@@ -5507,6 +5826,7 @@ class SeestarGui(QMainWindow):
         self.worker.log.connect(self._append_text)
         self.worker.state.connect(self._set_status_text)
         self.worker.progress.connect(self._on_pipeline_progress)
+        self.worker.stage_detail.connect(self._on_pipeline_stage_detail)
         self.worker.preview.connect(self._on_pipeline_preview)
         self.worker.done.connect(self._on_worker_done)
 
@@ -5555,6 +5875,7 @@ class SeestarGui(QMainWindow):
 
         if stage not in self._stage_items:
             chip = QLabel()
+            chip.setWordWrap(True)
             chip.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
             self.stage_stepper_layout.addWidget(chip, 1)
             self._stage_items[stage] = chip
@@ -5599,7 +5920,7 @@ class SeestarGui(QMainWindow):
             self.preview_activity_label.setText(
                 f"正在处理 Stage {stage} · {detail}"
             )
-        elif normalized_state in {"completed", "degraded"}:
+        elif normalized_state in {"completed", "safe_passthrough", "degraded"}:
             self.preview_activity_label.setText(
                 f"Stage {stage} {state_label} · 等待最新预览"
             )
@@ -5609,6 +5930,33 @@ class SeestarGui(QMainWindow):
             )
         self._announce_accessibility(progress_text)
         self._refresh_elapsed_labels()
+
+    def _on_pipeline_stage_detail(
+        self,
+        stage: int,
+        payload: object,
+    ) -> None:
+        if not isinstance(payload, dict):
+            return
+        stage = int(stage)
+        self._stage_progress_details[stage] = dict(payload)
+        raw_status = str(payload.get("status") or "").strip().lower()
+        display_status = str(
+            payload.get("display_status") or raw_status
+        ).strip().lower()
+        execution = str(payload.get("execution") or "completed").strip().lower()
+        if raw_status == "failed":
+            state = "failed"
+        elif raw_status == "degraded" or display_status == "ok_with_fallback":
+            state = "degraded"
+        elif raw_status == "skipped" or execution == "skipped":
+            state = "skipped"
+        elif execution == "safe_passthrough":
+            state = "safe_passthrough"
+        else:
+            state = "completed"
+        title = str(payload.get("title") or "").strip()
+        self._on_pipeline_progress(stage, title, state)
 
     def _on_pipeline_preview(
         self,
@@ -5708,9 +6056,12 @@ class SeestarGui(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         active_worker = None
+        gaia_catalog_worker = getattr(self, "gaia_catalog_worker", None)
         bootstrap_worker = getattr(self, "bootstrap_worker", None)
         pipeline_worker = getattr(self, "worker", None)
-        if bootstrap_worker and bootstrap_worker.isRunning():
+        if gaia_catalog_worker and gaia_catalog_worker.isRunning():
+            active_worker = gaia_catalog_worker
+        elif bootstrap_worker and bootstrap_worker.isRunning():
             active_worker = bootstrap_worker
         elif pipeline_worker and pipeline_worker.isRunning():
             active_worker = pipeline_worker
@@ -5736,7 +6087,10 @@ class SeestarGui(QMainWindow):
                 return
             stopped = False
             try:
-                self._stop_run()
+                if worker is gaia_catalog_worker:
+                    worker.stop()
+                else:
+                    self._stop_run()
             except Exception as e:
                 log_shutdown_error(f"停止 worker 时发生异常：{e}")
             finally:
