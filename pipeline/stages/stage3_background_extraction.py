@@ -579,17 +579,25 @@ def _stage3_diffuse_nebula_context(
         maximum=1.0,
     )
     target_type = str(profile.get("target_type") or "").strip().lower()
+    secondary_labels = {
+        str(label).strip()
+        for label in (profile.get("secondary_labels") or [])
+    }
     features = profile.get("features") if isinstance(profile, dict) else {}
     feature_large = bool(
         isinstance(features, dict)
         and features.get("large_nebulosity")
     )
+    feature_large = bool(
+        feature_large or "large_nebulosity" in secondary_labels
+    )
     object_area_ratio = _stage3_metric(profile, adaptive or {}, "object_area_ratio")
     nebulosity_area_ratio = _stage3_metric(profile, adaptive or {}, "nebulosity_area_ratio")
     faint_structure_score = _stage3_metric(profile, adaptive or {}, "faint_structure_score")
     is_emission = target_type in EMISSION_NEBULA_TARGET_TYPES
+    emission_context = bool(is_emission or "emission_red" in secondary_labels)
     emission_diffuse = bool(
-        is_emission
+        emission_context
         and (
             object_area_ratio >= object_area_min
             or nebulosity_area_ratio >= nebulosity_area_min
@@ -614,6 +622,10 @@ def _stage3_diffuse_nebula_context(
     return diffuse, {
         "target_type": target_type,
         "is_emission_target": is_emission,
+        "secondary_labels": sorted(secondary_labels),
+        "secondary_emission_context": bool(
+            "emission_red" in secondary_labels
+        ),
         "emission_diffuse": emission_diffuse,
         "faint_nebula_protection": faint_nebula_protection,
         "pixel_signal_protection": pixel_signal_protection,
@@ -667,6 +679,222 @@ def _stage3_should_exhaust_builtin_search(
     return bool(diffuse and (policy_requests_protection or pixel_signal_requests_protection)), context
 
 
+def _stage3_background_decision(
+    pipeline,
+    adaptive: Dict[str, Any],
+    *,
+    diffuse_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Resolve apply/skip/review before any destructive background command."""
+    cfg = pipeline.cfg
+    if not bool(getattr(cfg, "stage3_conditional_decision_enabled", True)):
+        return {
+            "decision": "apply",
+            "source": "compatibility_override",
+            "confidence": 1.0,
+            "reason": "conditional background decision disabled by configuration",
+            "threshold_basis": "explicit configuration override",
+        }
+
+    def bounded(name: str, default: float, lower: float, upper: float) -> float:
+        try:
+            value = float(getattr(cfg, name, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(lower, min(upper, value))
+
+    gradient_skip_max = bounded("stage3_gradient_skip_max", 0.045, 0.0, 0.30)
+    dirty_skip_max = bounded("stage3_dirty_skip_max", 0.16, 0.0, 0.60)
+    gradient_apply_min = bounded("stage3_gradient_apply_min", 0.08, 0.01, 0.80)
+    dirty_apply_min = bounded("stage3_dirty_apply_min", 0.18, 0.01, 0.80)
+    confidence_min = bounded("stage3_apply_confidence_min", 0.75, 0.50, 0.99)
+    thresholds = {
+        "gradient_skip_max": gradient_skip_max,
+        "dirty_skip_max": dirty_skip_max,
+        "gradient_apply_min": gradient_apply_min,
+        "dirty_apply_min": dirty_apply_min,
+        "apply_confidence_min": confidence_min,
+    }
+    required_keys = {"gradient_score", "dirty_background_score"}
+    if not isinstance(adaptive, dict) or not required_keys.issubset(adaptive):
+        return {
+            "decision": "review_required",
+            "source": "diagnostics",
+            "confidence": 0.0,
+            "reason": "gradient diagnostics unavailable or incomplete",
+            "metrics": dict(adaptive or {}),
+            "thresholds": thresholds,
+            "threshold_basis": "project internal engineering gate",
+        }
+
+    try:
+        gradient = float(adaptive.get("gradient_score") or 0.0)
+        dirty = float(adaptive.get("dirty_background_score") or 0.0)
+    except (TypeError, ValueError):
+        gradient = 0.0
+        dirty = 0.0
+    metrics = {
+        "gradient_score": gradient,
+        "dirty_background_score": dirty,
+        "chroma_noise_score": float(adaptive.get("chroma_noise_score") or 0.0),
+    }
+    target_profile = getattr(pipeline, "target_profile", {}) or {}
+    advisory: Any = getattr(pipeline, "_stage3_background_advisory", None)
+    if not isinstance(advisory, dict) and isinstance(target_profile, dict):
+        raw_decision = target_profile.get("dbe_decision")
+        if raw_decision:
+            advisory = {
+                "decision": raw_decision,
+                "confidence": target_profile.get("dbe_confidence", 0.0),
+                "reason": target_profile.get("dbe_reason", ""),
+            }
+    if not isinstance(advisory, dict):
+        advisory = {}
+
+    raw_advisory_decision = str(
+        advisory.get("decision") or advisory.get("dbe_decision") or ""
+    ).strip().lower()
+    normalized_advisory = {
+        "review_chromatic": "review_required",
+        "review": "review_required",
+    }.get(raw_advisory_decision, raw_advisory_decision)
+    try:
+        advisory_confidence = max(
+            0.0,
+            min(1.0, float(advisory.get("confidence") or 0.0)),
+        )
+    except (TypeError, ValueError):
+        advisory_confidence = 0.0
+
+    common = {
+        "metrics": metrics,
+        "thresholds": thresholds,
+        "threshold_basis": "project internal engineering gate",
+        "diffuse_context": dict(diffuse_context or {}),
+    }
+    if normalized_advisory == "skip":
+        return {
+            **common,
+            "decision": "skip",
+            "source": "validated_advisory",
+            "confidence": advisory_confidence,
+            "reason": str(advisory.get("reason") or "advisor selected skip"),
+        }
+    if normalized_advisory == "review_required":
+        return {
+            **common,
+            "decision": "review_required",
+            "source": "validated_advisory",
+            "confidence": advisory_confidence,
+            "reason": str(
+                advisory.get("reason")
+                or "advisor requires chromatic/background review"
+            ),
+        }
+
+    diffuse_risk = bool(
+        (diffuse_context or {}).get("diffuse")
+        or (diffuse_context or {}).get("emission_diffuse")
+        or (diffuse_context or {}).get("pixel_signal_protection")
+    )
+    if diffuse_risk and not bool(
+        getattr(cfg, "stage3_diffuse_auto_apply_enabled", False)
+    ):
+        if (
+            dirty <= dirty_skip_max
+            and normalized_advisory != "apply"
+            and bool(
+                (diffuse_context or {}).get("pixel_signal_protection")
+                or (diffuse_context or {}).get("emission_diffuse")
+            )
+        ):
+            return {
+                **common,
+                "decision": "skip",
+                "source": "target_protection_policy",
+                "confidence": 0.85,
+                "reason": (
+                    "dirty-background evidence is low and the measured "
+                    "gradient overlaps protected diffuse target signal"
+                ),
+            }
+        return {
+            **common,
+            "decision": "review_required",
+            "source": (
+                "validated_advisory"
+                if normalized_advisory == "apply"
+                else "diagnostics"
+            ),
+            "confidence": advisory_confidence,
+            "reason": "diffuse or large-scale target signal may contaminate DBE samples",
+        }
+
+    if gradient <= gradient_skip_max and dirty <= dirty_skip_max:
+        return {
+            **common,
+            "decision": "skip",
+            "source": "diagnostics",
+            "confidence": 0.90,
+            "reason": "no material low-frequency gradient detected",
+        }
+
+    eligible = gradient >= gradient_apply_min and dirty >= dirty_apply_min
+    if normalized_advisory == "apply":
+        if advisory_confidence < confidence_min:
+            return {
+                **common,
+                "decision": "review_required",
+                "source": "validated_advisory",
+                "confidence": advisory_confidence,
+                "reason": "apply advisory confidence is below the execution gate",
+            }
+        if not eligible:
+            return {
+                **common,
+                "decision": "review_required",
+                "source": "validated_advisory",
+                "confidence": advisory_confidence,
+                "reason": "apply advisory is not supported by deterministic gradient evidence",
+            }
+        return {
+            **common,
+            "decision": "apply",
+            "source": "validated_advisory",
+            "confidence": advisory_confidence,
+            "reason": str(advisory.get("reason") or "high-confidence apply advisory"),
+        }
+
+    if eligible and bool(
+        getattr(cfg, "stage3_deterministic_auto_apply_enabled", True)
+    ):
+        confidence = min(
+            0.95,
+            0.75
+            + 0.20
+            * min(
+                gradient / max(gradient_apply_min, 1e-6) - 1.0,
+                dirty / max(dirty_apply_min, 1e-6) - 1.0,
+                1.0,
+            ),
+        )
+        return {
+            **common,
+            "decision": "apply",
+            "source": "deterministic_offline_policy",
+            "confidence": max(0.75, confidence),
+            "reason": "directional gradient and dirty-background evidence exceed apply gates",
+        }
+
+    return {
+        **common,
+        "decision": "review_required",
+        "source": "diagnostics",
+        "confidence": 0.50,
+        "reason": "background evidence is ambiguous; preserve the baseline",
+    }
+
+
 def run_stage3_background_extraction(pipeline) -> None:
     """
     阶段 3: 背景提取
@@ -697,11 +925,42 @@ def run_stage3_background_extraction(pipeline) -> None:
 
     baseline_stem = "stage3_bg_input"
     baseline_saved = False
+    rollback_events: List[Dict[str, Any]] = []
     try:
         pipeline.cmd_with_check("save", baseline_stem)
         baseline_saved = True
     except (CommandError, SirilError) as e:
-        pipeline.log.warn(f"stage3 baseline save failed, fallback without rollback: {e}")
+        pipeline.log.warn(
+            "stage3 baseline save failed; skip destructive background candidates: "
+            f"{e}"
+        )
+
+    def restore_baseline(context: str) -> bool:
+        nonlocal baseline_saved
+        if not baseline_saved:
+            rollback_events.append(
+                {
+                    "context": context,
+                    "status": "unavailable",
+                    "reason": "stage3 baseline checkpoint unavailable",
+                }
+            )
+            return False
+        try:
+            pipeline.cmd_with_check("load", baseline_stem, quiet=True)
+            rollback_events.append({"context": context, "status": "restored"})
+            return True
+        except (CommandError, SirilError) as e:
+            baseline_saved = False
+            rollback_events.append(
+                {
+                    "context": context,
+                    "status": "failed",
+                    "reason": str(e),
+                }
+            )
+            pipeline.log.warn(f"failed to restore stage3 baseline ({context}): {e}")
+            return False
 
     before_feat = pipeline._stage3_measure_features("before")
     before_image = None
@@ -727,6 +986,121 @@ def run_stage3_background_extraction(pipeline) -> None:
     builtin_search_mode = "theoretical_effect_order"
     diffuse_context: Dict[str, Any] = {}
 
+    target_profile = getattr(pipeline, "target_profile", {}) or {}
+    profile_fallback_used = bool(
+        isinstance(target_profile, dict)
+        and str(
+            target_profile.get("classification_method") or ""
+        ).strip().lower()
+        == "fallback"
+    )
+    _diffuse, diffuse_context = _stage3_diffuse_nebula_context(
+        target_profile,
+        before_adaptive,
+        stage3_policy=stage3_policy,
+    )
+    diffuse_context["diffuse"] = bool(_diffuse)
+    background_decision = _stage3_background_decision(
+        pipeline,
+        before_adaptive,
+        diffuse_context=diffuse_context,
+    )
+    pipeline._stage3_background_decision = background_decision
+    decision = str(background_decision.get("decision") or "review_required")
+    pipeline.log.info(
+        "[Stage3] Background decision: "
+        f"decision={decision} source={background_decision.get('source')} "
+        f"confidence={float(background_decision.get('confidence') or 0.0):.2f}"
+    )
+    if decision != "apply":
+        restore_baseline(f"decision:{decision}")
+        stage_saved = pipeline._save_stage_output("stage3_bgremoved")
+        after_adaptive = dict(before_adaptive or {})
+        if decision == "review_required":
+            pipeline._background_review_required = True
+        reason = str(
+            background_decision.get("reason")
+            or "background extraction was not authorized"
+        )
+        if hasattr(pipeline, "_write_stage_json"):
+            pipeline._write_stage_json(
+                "background_quality_report.json",
+                {
+                    "stage": "stage3_background",
+                    "policy": policy_name,
+                    "decision": background_decision,
+                    "model_used": None,
+                    "candidate_order": [],
+                    "attempts": [],
+                    "rollback_events": rollback_events,
+                    "diffuse_nebula_context": diffuse_context,
+                    "before": before_adaptive,
+                    "after": after_adaptive,
+                    "quality": (
+                        "unchanged"
+                        if decision == "skip"
+                        else "review_required"
+                    ),
+                    "fallback_used": False,
+                },
+            )
+        message = f"decision={decision}; {reason}"
+        if preflight_message:
+            message = f"{preflight_message}; {message}"
+        if not stage_saved:
+            message += "; stage3 输出保存失败"
+        elapsed = pipeline.log.stage_end(stage_label)
+        pipeline._record_stage(
+            stage_label,
+            (
+                "skipped"
+                if decision == "skip" and stage_saved
+                else "degraded"
+            ),
+            elapsed,
+            message,
+            execution=(
+                "skipped"
+                if decision == "skip" and stage_saved
+                else "safe_passthrough"
+            ),
+            fallback_used=profile_fallback_used,
+            reason_code=(
+                "stage3_output_save_failed"
+                if not stage_saved
+                else "background_not_required"
+                if decision == "skip"
+                else "background_review_required"
+            ),
+            components={
+                "target_profile": {
+                    "status": "applied",
+                    "method": target_profile.get("classification_method"),
+                    "reason_code": (
+                        "target_profiler_fallback"
+                        if profile_fallback_used
+                        else "accepted"
+                    ),
+                    "fallback_used": profile_fallback_used,
+                },
+                "background_extraction": {
+                    "status": (
+                        "skipped" if decision == "skip" else "rolled_back"
+                    ),
+                    "method": None,
+                    "reason_code": (
+                        "background_not_required"
+                        if decision == "skip"
+                        else "background_review_required"
+                    ),
+                    "input": baseline_stem,
+                    "output": "stage3_bgremoved" if stage_saved else None,
+                    "fallback_used": False,
+                },
+            },
+        )
+        return
+
     def evaluate_attempts(
         attempts: List[Tuple[str, Tuple[str, ...], str]],
         *,
@@ -735,13 +1109,18 @@ def run_stage3_background_extraction(pipeline) -> None:
     ) -> bool:
         nonlocal baseline_saved, graxpert_runtime_error
         phase_sufficient = False
+        if not baseline_saved:
+            pipeline.log.warn(
+                f"[Stage3] Skip {phase}: rollback checkpoint is unavailable"
+            )
+            return False
         for label, command, source in attempts:
-            if baseline_saved:
-                try:
-                    pipeline.cmd_with_check("load", baseline_stem, quiet=True)
-                except (CommandError, SirilError) as e:
-                    pipeline.log.warn(f"failed to restore stage3 baseline: {e}")
-                    baseline_saved = False
+            if not restore_baseline(f"before:{label}"):
+                pipeline.log.warn(
+                    f"[Stage3] Stop {phase}: unable to establish clean baseline "
+                    f"before {label}"
+                )
+                break
 
             pipeline.log.info(f"尝试背景提取: {label}")
             command_ok, failure_reason = _stage3_try_background_command(
@@ -792,6 +1171,8 @@ def run_stage3_background_extraction(pipeline) -> None:
                         ),
                     }
                 )
+                if not restore_baseline(f"failed:{label}"):
+                    break
                 continue
 
             after_feat = pipeline._stage3_measure_features(label)
@@ -830,6 +1211,8 @@ def run_stage3_background_extraction(pipeline) -> None:
                 pipeline.log.warn(
                     f"{label} rejected by quality gate, try next candidate: {gate_msg}"
                 )
+                if not restore_baseline(f"rejected:{label}"):
+                    break
                 continue
 
             candidate_stem = _stage3_candidate_stem(label)
@@ -881,6 +1264,8 @@ def run_stage3_background_extraction(pipeline) -> None:
                         "sufficient": sufficient,
                     }
                 )
+            if not restore_baseline(f"evaluated:{label}"):
+                break
             if sufficient and candidate_saved:
                 pipeline.log.info(
                     f"背景提取候选足够干净: {label} score={candidate_score:.3f}"
@@ -902,7 +1287,6 @@ def run_stage3_background_extraction(pipeline) -> None:
         rbf_attempts.append((f"subsky-rbf-{idx}", cmd, "builtin"))
     poly_attempt = [("subsky-poly", ("subsky", "1"), "builtin")]
 
-    target_profile = getattr(pipeline, "target_profile", {}) or {}
     poly_first = _stage3_prefers_poly_first(
         target_profile,
         before_adaptive,
@@ -942,32 +1326,49 @@ def run_stage3_background_extraction(pipeline) -> None:
 
     if accepted_candidates:
         selected = min(accepted_candidates, key=lambda item: float(item.get("score", 999.0)))
+        selected_loaded = False
         try:
             pipeline.cmd_with_check("load", str(selected["stem"]))
+            selected_loaded = True
         except (CommandError, SirilError) as e:
-            pipeline.log.warn(f"failed to load best stage3 candidate, keeping current image: {e}")
-        bg_ok = True
-        selected_source = str(selected.get("source") or "")
-        selected_label = str(selected.get("label") or "")
-        selected_preservation = selected.get("preservation") or {}
-        selected_message = (
-            f"method={selected.get('label')}; {selected.get('quality_message')}; "
-            f"background_score={float(selected.get('score', 0.0)):.3f}"
-        )
-        stage_message = (
-            f"{preflight_message}; {selected_message}"
-            if preflight_message
-            else selected_message
-        )
-        if selected_source == "plugin":
-            pipeline.workflow_command_used["背景提取插件链"] = str(selected.get("label"))
-        elif selected_source == "graxpert":
-            pipeline.workflow_command_used["GraXpert 背景提取"] = str(selected.get("label"))
-        pipeline.log.info(
-            "背景提取最终选择: "
-            f"{selected.get('label')} score={float(selected.get('score', 0.0)):.3f}"
-        )
+            pipeline.log.warn(
+                "failed to load best stage3 candidate; restoring baseline: "
+                f"{e}"
+            )
+            restore_baseline(f"selected_load_failed:{selected.get('label')}")
+            failure_message = (
+                f"selected candidate load failed: {selected.get('label')}"
+            )
+            stage_message = (
+                f"{preflight_message}; {failure_message}"
+                if preflight_message
+                else failure_message
+            )
+        if selected_loaded:
+            bg_ok = True
+            selected_source = str(selected.get("source") or "")
+            selected_label = str(selected.get("label") or "")
+            selected_preservation = selected.get("preservation") or {}
+            selected_message = (
+                f"method={selected.get('label')}; {selected.get('quality_message')}; "
+                f"background_score={float(selected.get('score', 0.0)):.3f}"
+            )
+            stage_message = (
+                f"{preflight_message}; {selected_message}"
+                if preflight_message
+                else selected_message
+            )
+            if selected_source == "plugin":
+                pipeline.workflow_command_used["背景提取插件链"] = str(selected.get("label"))
+            elif selected_source == "graxpert":
+                pipeline.workflow_command_used["GraXpert 背景提取"] = str(selected.get("label"))
+            pipeline.log.info(
+                "背景提取最终选择: "
+                f"{selected.get('label')} score={float(selected.get('score', 0.0)):.3f}"
+            )
     elif not bg_ok:
+        restore_baseline("no_candidate_accepted")
+        pipeline._background_review_required = True
         pipeline.log.error("背景提取完全失败，图像可能有梯度残留")
 
     stage_saved = pipeline._save_stage_output("stage3_bgremoved")
@@ -1000,12 +1401,19 @@ def run_stage3_background_extraction(pipeline) -> None:
             )
             pipeline.log.warn(f"[Stage3] {warning_msg}")
             stage_message = f"{stage_message}; {warning_msg}" if stage_message else warning_msg
+    graxpert_runtime_fallback_used = bool(
+        bg_ok and graxpert_runtime_error and selected_source != "graxpert"
+    )
+    stage_fallback_used = bool(
+        profile_fallback_used or graxpert_runtime_fallback_used
+    )
     if hasattr(pipeline, "_write_stage_json"):
         pipeline._write_stage_json(
             "background_quality_report.json",
             {
                 "stage": "stage3_background",
                 "policy": policy_name,
+                "decision": background_decision,
                 "model_used": selected_label or None,
                 "graxpert_attempted": graxpert_attempted,
                 "graxpert_runtime_error": graxpert_runtime_error,
@@ -1033,9 +1441,17 @@ def run_stage3_background_extraction(pipeline) -> None:
                 "before": before_adaptive,
                 "after": after_adaptive,
                 "attempts": attempt_records,
+                "rollback_events": rollback_events,
                 "selected_preservation": selected_preservation,
                 "quality": "warning" if fallback_warning else ("ok" if bg_ok else "degraded"),
-                "fallback_used": selected_source == "graxpert" or not bg_ok or fallback_warning,
+                "fallback_used": stage_fallback_used,
+                "fallback_reason": (
+                    "graxpert_runtime_fallback"
+                    if graxpert_runtime_fallback_used
+                    else "target_profiler_fallback"
+                    if profile_fallback_used
+                    else None
+                ),
             },
         )
     if not stage_saved:
@@ -1061,9 +1477,50 @@ def run_stage3_background_extraction(pipeline) -> None:
             stage_message = f"{stage_message}; {review_note}" if stage_message else review_note
 
     elapsed = pipeline.log.stage_end(stage_label)
+    components = {
+        "target_profile": {
+            "status": "applied",
+            "method": target_profile.get("classification_method"),
+            "reason_code": (
+                "target_profiler_fallback"
+                if profile_fallback_used
+                else "accepted"
+            ),
+            "fallback_used": profile_fallback_used,
+        },
+        "background_extraction": {
+            "status": "applied" if bg_ok else "rolled_back",
+            "method": selected_label or None,
+            "reason_code": "accepted" if bg_ok else "no_candidate_accepted",
+            "input": baseline_stem,
+            "output": "stage3_bgremoved" if stage_saved else None,
+            "fallback_used": graxpert_runtime_fallback_used,
+        },
+    }
+    reason_code = (
+        "no_background_candidate_accepted"
+        if not bg_ok
+        else "stage3_output_save_failed"
+        if not stage_saved
+        else "graxpert_runtime_fallback"
+        if graxpert_runtime_fallback_used
+        else "target_profiler_fallback"
+        if profile_fallback_used
+        else "background_improvement_limited"
+        if fallback_warning
+        else ""
+    )
     if bg_ok:
         status = "ok" if stage_saved else "degraded"
-        pipeline._record_stage(stage_label, status, elapsed, stage_message)
+        pipeline._record_stage(
+            stage_label,
+            status,
+            elapsed,
+            stage_message,
+            fallback_used=stage_fallback_used,
+            reason_code=reason_code,
+            components=components,
+        )
         if selected_source == "builtin":
             pipeline.log.info("阶段3按策略使用内置 subsky/RBF 背景提取")
     else:
@@ -1075,4 +1532,8 @@ def run_stage3_background_extraction(pipeline) -> None:
             "degraded",
             elapsed,
             degrade_message,
+            execution="safe_passthrough",
+            fallback_used=profile_fallback_used,
+            reason_code=reason_code,
+            components=components,
         )

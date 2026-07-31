@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -161,6 +162,90 @@ class FakeLogger:
         self.events.append(("debug", msg))
 
 
+class Stage3TransactionFake:
+    """Minimal buffer model for Stage 3 rollback regression tests."""
+
+    def __init__(
+        self,
+        *,
+        gate_ok: bool,
+        fail_selected_load: bool = False,
+    ) -> None:
+        self.log = FakeLogger()
+        self.cfg = SimpleNamespace(workflow_plugin_probe_enabled=False)
+        self.pipeline_policy = {
+            "policy_name": "test",
+            "stage3_background": {},
+        }
+        self.target_profile: dict[str, Any] = {}
+        self.current_image = "baseline"
+        self.fail_selected_load = fail_selected_load
+        self.gate_ok = gate_ok
+        self.saved_sources: dict[str, str] = {}
+        self.cmd_calls: list[tuple[Any, ...]] = []
+        self.workflow_command_used: dict[str, str] = {}
+        self.results: list[tuple[str, str, float, str]] = []
+        self.result_metadata: list[dict[str, Any]] = []
+        self.report: dict[str, Any] = {}
+        self.siril = SimpleNamespace(get_image_pixeldata=lambda preview=False: None)
+
+    def cmd_with_check(self, *args: Any, quiet: bool = False) -> bool:
+        _ = quiet
+        self.cmd_calls.append(args)
+        if args[0] == "save":
+            self.saved_sources[str(args[1])] = self.current_image
+            return True
+        if args[0] == "load":
+            stem = str(args[1])
+            if self.fail_selected_load and stem.startswith("stage3_candidate_"):
+                raise pipeline_module.CommandError("mock selected candidate load failure")
+            self.current_image = self.saved_sources[stem]
+            return True
+        self.current_image = f"candidate:{args[0]}"
+        return True
+
+    def _stage3_subsky_rbf_candidates(self):
+        return []
+
+    def _stage3_measure_features(self, _label: str):
+        return None
+
+    def _stage3_signal_preservation_metrics(self, _before: Any, _after: Any):
+        return {"available": False}
+
+    def _stage3_quality_gate(self, _before: Any, _after: Any, _preservation: Any):
+        return self.gate_ok, "accepted" if self.gate_ok else "mock rejection"
+
+    def _adaptive_features_current(self):
+        return {
+            "bg_std": 0.0001,
+            "gradient_score": 0.10,
+            "dirty_background_score": 0.20,
+            "chroma_noise_score": 0.03,
+            "red_dominance": 1.0,
+            "blue_dominance": 1.0,
+            "green_cast": 1.0,
+        }
+
+    def _save_stage_output(self, stem: str) -> bool:
+        self.saved_sources[stem] = self.current_image
+        return True
+
+    def _write_stage_json(self, _name: str, payload: dict[str, Any]) -> None:
+        self.report = payload
+
+    def _record_stage(
+        self,
+        name: str,
+        status: str,
+        elapsed: float,
+        message: str,
+        **metadata: Any,
+    ) -> None:
+        self.results.append((name, status, elapsed, message))
+        self.result_metadata.append(dict(metadata))
+
+
 class FakeProcessor:
     def __init__(self, module: Any, work_dir: Path) -> None:
         self.module = module
@@ -239,6 +324,7 @@ class FakeProcessor:
         self.local_aberration_model: Path | None = None
         self.ccm_fallback_ok = True
         self._stage1_input_mode = "stacked"
+        self._channel_semantics = "broadband_rgb_osc"
         self.ccm_fallback_message = (
             "使用 CCM 回退完成色彩校准 (r_gain=1.010, b_gain=0.990, sample_pixels=2048)"
         )
@@ -251,6 +337,7 @@ class FakeProcessor:
         self.aberration_calls: list[str] = []
         self.checkpoints: list[str] = []
         self.results: list[tuple[str, str, float, str]] = []
+        self.result_metadata: list[dict[str, Any]] = []
         self.workflow_command_used: dict[str, str] = {}
         self.starmask_file: Path | None = None
         self.starless_file: Path | None = None
@@ -508,8 +595,10 @@ class FakeProcessor:
         status: str,
         duration: float = 0.0,
         message: str = "",
+        **metadata: Any,
     ) -> None:
         self.results.append((name, status, duration, message))
+        self.result_metadata.append(dict(metadata))
 
     def _short_text(self, value: Any, max_len: int = 240) -> str:
         text = str(value).strip()
@@ -634,6 +723,27 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertEqual(result["visual_review"]["status"], "not_requested")
         self.assertEqual(result["visual_review"]["advisor_mode"], "not_requested")
 
+    def test_stage11_disabled_skips_before_optional_module_import_failure(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.log = FakeLogger()
+        processor.cfg.ai_post_enabled = False
+
+        with patch.object(
+            pipeline_module,
+            "run_stage11_ai_postprocess",
+            None,
+        ), patch.object(
+            pipeline_module,
+            "STAGE11_IMPORT_ERROR",
+            RuntimeError("mock optional import failure"),
+        ):
+            processor.stage11_ai_postprocess()
+
+        result = processor.results[-1]
+        self.assertEqual(result.status, "skipped")
+        self.assertIn("SEESTAR_AI_ENABLED not enabled", result.message)
+        self.assertFalse(processor.ai_outputs_generated)
+
     def test_stage_preview_publishes_only_accepted_artifact_pixels(self):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
@@ -701,7 +811,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             )
         )
 
-    def test_record_stage_propagates_summary_only_states_to_gui(self):
+    def test_record_stage_emits_gui_state_from_structured_fields_only(self):
         processor = pipeline_module.SeestarPostProcessor()
         processor.results = []
         processor.log = FakeLogger()
@@ -719,14 +829,46 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             0.5,
             "final denoise skipped because input is already low-noise",
         )
+        processor._record_stage(
+            "阶段 6: 去星与 Halo 修复",
+            "ok",
+            0.8,
+            "primary tool failed; alternate accepted",
+            fallback_used=True,
+            reason_code="alternate_star_separation",
+        )
+        processor._record_stage(
+            "阶段 8: Starless 深加工",
+            "ok",
+            0.4,
+            "guard retained the accepted Stage 7 source",
+            execution="safe_passthrough",
+            reason_code="bright_nebula_halo_advisory",
+        )
 
         events = [
             message
             for level, message in processor.log.events
             if level == "info" and "[PIPELINE_STAGE_RESULT]" in message
         ]
-        self.assertIn("stage=9 status=degraded", events[0])
-        self.assertIn("stage=10 status=skipped", events[1])
+        detail_events = [
+            json.loads(message.split("[PIPELINE_STAGE_DETAIL] ", 1)[1])
+            for level, message in processor.log.events
+            if level == "info" and "[PIPELINE_STAGE_DETAIL]" in message
+        ]
+        self.assertIn("stage=9 status=ok", events[0])
+        self.assertIn("stage=10 status=ok", events[1])
+        self.assertIn("stage=6 status=degraded", events[2])
+        self.assertIn("stage=8 status=ok", events[3])
+        self.assertEqual(detail_events[0]["display_status"], "ok")
+        self.assertEqual(detail_events[1]["display_status"], "ok")
+        self.assertTrue(detail_events[2]["fallback_used"])
+        self.assertEqual(detail_events[2]["display_status"], "ok_with_fallback")
+        self.assertEqual(detail_events[3]["execution"], "safe_passthrough")
+        self.assertEqual(
+            detail_events[3]["display_status"],
+            "ok_safe_passthrough",
+        )
         self.assertEqual(processor.results[0].status, "ok")
         self.assertEqual(processor.results[1].status, "ok")
 
@@ -916,6 +1058,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
     def test_stage5_prefers_graxpert_object_deconvolution_when_model_exists(self):
         processor = self._new_processor()
+        processor.cfg.denoise_enabled = False
         processor.available_scripts.add("processing/GraXpert-AI.py")
         model = (
             processor.work_dir
@@ -937,6 +1080,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             },
             clear=False,
         ):
+            os.environ.pop("SEESTAR_GRAXPERT_GPU", None)
             stage5_linear_denoise(processor)
 
         graxpert_call = next(
@@ -946,10 +1090,68 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         )
         self.assertIn("-deconv_obj", graxpert_call)
         self.assertIn("1.0.1", graxpert_call)
+        self.assertIn("-gpu", graxpert_call)
+        self.assertNotIn("-nogpu", graxpert_call)
         self.assertNotIn("rl", [str(call[0]) for call in processor.cmd_calls])
+        self.assertNotIn("denoise", [str(call[0]) for call in processor.cmd_calls])
         report = processor.stage_json_reports["stage5_linear_report.json"]
         self.assertEqual(report["deconvolution"]["method"], "graxpert_object")
         self.assertEqual(report["denoise"]["input"], "stage5_graxpert_deconv")
+        self.assertEqual(report["components"]["deconvolution"]["status"], "applied")
+        self.assertEqual(report["components"]["denoise"]["status"], "skipped")
+        self.assertEqual(
+            report["deconvolution"]["graxpert"]["hardware_acceleration"],
+            "auto",
+        )
+        self.assertEqual(
+            report["components"]["denoise"]["reason_code"],
+            "config_disabled",
+        )
+        self.assertEqual(
+            processor.result_metadata[-1]["components"],
+            report["components"],
+        )
+        self.assertEqual(report["final_linear_source"], "stage5_linear")
+
+    def test_stage5_graxpert_cpu_compatibility_disables_hardware_acceleration(self):
+        processor = self._new_processor()
+        processor.cfg.denoise_enabled = False
+        processor.available_scripts.add("processing/GraXpert-AI.py")
+        model = (
+            processor.work_dir
+            / "Library"
+            / "Application Support"
+            / "GraXpert"
+            / "deconvolution-object-ai-models"
+            / "1.0.1"
+            / "model.onnx"
+        )
+        model.parent.mkdir(parents=True)
+        model.write_bytes(b"mock onnx")
+
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": str(processor.work_dir),
+                "SEESTAR_GRAXPERT_OBJECT_MODEL_PATH": "",
+                "SEESTAR_GRAXPERT_GPU": "0",
+            },
+            clear=False,
+        ):
+            stage5_linear_denoise(processor)
+
+        graxpert_call = next(
+            args
+            for step, _name, args in processor.script_calls
+            if step == "Stage5 GraXpert反卷积"
+        )
+        self.assertIn("-nogpu", graxpert_call)
+        self.assertNotIn("-gpu", graxpert_call)
+        report = processor.stage_json_reports["stage5_linear_report.json"]
+        self.assertEqual(
+            report["deconvolution"]["graxpert"]["hardware_acceleration"],
+            "cpu",
+        )
 
     def test_stage5_graxpert_failure_reloads_baseline_then_falls_back_to_rl(self):
         processor = self._new_processor()
@@ -2296,6 +2498,40 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         self.assertLessEqual(stage6_services.stage6_effective_bg_median_min(0.020), 0.0199)
 
+    def test_stage7_bright_nebula_uses_target_specific_star_growth_gate(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.cfg = pipeline_module.PipelineConfig()
+        processor._active_target_type = lambda: "bright_emission_reflection_nebula"
+        processor._measure_current_quality = lambda: pipeline_module.QualityMetrics(
+            bg_median=0.03,
+            median_star_size=1.414,
+        )
+        baseline = pipeline_module.QualityMetrics(
+            bg_median=0.003,
+            median_star_size=1.0,
+        )
+
+        accepted, issues, _metrics = (
+            pipeline_module.SeestarPostProcessor._validate_stage6_stretch_quality(
+                processor,
+                baseline,
+            )
+        )
+
+        self.assertTrue(accepted)
+        self.assertEqual(issues, [])
+
+        processor._active_target_type = lambda: "large_galaxy"
+        accepted, issues, _metrics = (
+            pipeline_module.SeestarPostProcessor._validate_stage6_stretch_quality(
+                processor,
+                baseline,
+            )
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(issues, ["star_size_growth 1.414>1.250"])
+
     def test_stage7_compact_stretch_adapts_extreme_low_background(self):
         processor = self._new_processor()
         processor._stage7_baseline_background_stats = types.MethodType(
@@ -2574,6 +2810,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
     def test_stage8_applies_blue_guard_when_starless_layer_is_too_blue(self):
         processor = self._new_processor()
+        processor._channel_semantics = "broadband_rgb_osc"
         processor.feature_measurements.append(
             pipeline_module.ImageFeatures(
                 red_dominance=0.946,
@@ -2599,6 +2836,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
     def test_stage8_rolls_back_blue_guard_when_feature_gets_worse(self):
         processor = self._new_processor()
+        processor._channel_semantics = "broadband_rgb_osc"
         processor.feature_measurements.append(
             pipeline_module.ImageFeatures(
                 red_dominance=0.933,
@@ -2618,6 +2856,26 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         _name, status, _dur, message = processor.results[-1]
         self.assertEqual(status, "ok")
         self.assertIn("Starless 蓝色门控回滚", message)
+
+    def test_stage8_narrowband_skips_blue_guard(self):
+        processor = self._new_processor()
+        processor._channel_semantics = "narrowband_composite"
+        processor.feature_measurements.append(
+            pipeline_module.ImageFeatures(
+                red_dominance=0.946,
+                blue_dominance=1.168,
+            )
+        )
+
+        stage8_nebula_enhancement(processor)
+
+        self.assertFalse(any(call[0] == "ccm" for call in processor.cmd_calls))
+        _name, _status, _dur, message = processor.results[-1]
+        self.assertIn(
+            "Stage8 global color transforms skipped by channel semantics "
+            "(narrowband_composite)",
+            message,
+        )
 
     def test_stage8_bg_growth_gate_allows_low_absolute_background_noise(self):
         processor = self._new_processor()
@@ -2669,6 +2927,25 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertIn("fallback_status=success", message)
         self.assertIn("final_denoise_effective=SASP Aberration API", message)
         self.assertIn("effective_status=success", message)
+        self.assertTrue(processor.result_metadata[-1]["fallback_used"])
+        self.assertEqual(
+            processor.result_metadata[-1]["reason_code"],
+            "denoiser_chain_to_aberration",
+        )
+
+    def test_stage10_narrowband_skips_global_saturation(self):
+        processor = self._new_processor()
+        self._stage10_final_input(processor)
+        processor._channel_semantics = "narrowband_composite"
+
+        stage10_export(processor)
+
+        self.assertFalse(any(call[0] == "satu" for call in processor.cmd_calls))
+        self.assertIn(
+            "Stage10 global color adjustment skipped by channel semantics "
+            "(narrowband_composite)",
+            processor.results[-1][3],
+        )
 
     def test_stage10_color_dominant_input_uses_chroma_plan_with_full_model(self):
         processor = self._new_processor()
@@ -2720,6 +2997,11 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertFalse(report["skipped_by_review_only"])
         self.assertFalse(report["skipped_by_duplicate_guard"])
         self.assertIn("Stage10 low-noise guard", processor.results[-1][3])
+        self.assertFalse(processor.result_metadata[-1]["fallback_used"])
+        self.assertEqual(
+            processor.result_metadata[-1]["components"]["denoise"]["reason_code"],
+            "auto_low_noise",
+        )
 
     def test_stage10_script_failure_prefers_scunet_command_fallback(self):
         processor = self._new_processor()
@@ -2737,6 +3019,11 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertIn("fallback_component=Siril-SCUNet Denoise", message)
         self.assertIn("fallback_status=success", message)
         self.assertNotIn("fallback_component=SASP Aberration API", message)
+        self.assertTrue(processor.result_metadata[-1]["fallback_used"])
+        self.assertEqual(
+            processor.result_metadata[-1]["components"]["denoise"]["method"],
+            "Siril-SCUNet Denoise",
+        )
 
     def test_stage10_uses_in_process_cosmic_clarity_by_default(self):
         processor = self._new_processor()
@@ -2749,6 +3036,38 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertIn("final_denoise_primary=CosmicClarity Denoise in-process script", message)
         self.assertIn("final_denoise_effective=CosmicClarity Denoise script", message)
         self.assertNotIn("fallback_component=", message)
+        self.assertFalse(processor.result_metadata[-1]["fallback_used"])
+
+    def test_stage10_export_filename_fallback_is_structured(self):
+        processor = self._new_processor()
+        self._stage10_final_input(processor)
+        processor._stage5_denoise_applied = True
+        processor._stage8_final_quality = "ok"
+        processor._stage8_fallback_used = False
+        processor._result_output_basename = lambda: "primary_result"
+        processor.main_output_fit_basename_template = "primary_final"
+        command_calls: list[tuple[Any, ...]] = []
+
+        def command(*args: Any, quiet: bool = False) -> bool:
+            _ = quiet
+            command_calls.append(args)
+            if args[:2] == ("savetif", "primary_result"):
+                raise pipeline_module.CommandError("mock primary TIFF failure")
+            return True
+
+        processor.cmd_with_check = command
+
+        stage10_export(processor)
+
+        report = processor.stage_json_reports["stage10_export_report.json"]
+        self.assertTrue(report["fallback_used"])
+        self.assertEqual(report["fallback_formats"], ["tif"])
+        self.assertEqual(report["outputs"]["tif"]["status"], "fallback")
+        self.assertIn(("savetif", "result_processed", "-astro"), command_calls)
+        metadata = processor.result_metadata[-1]
+        self.assertTrue(metadata["fallback_used"])
+        self.assertEqual(metadata["reason_code"], "final_export_fallback")
+        self.assertTrue(metadata["components"]["export"]["fallback_used"])
 
     def test_stage10_in_process_path_does_not_depend_on_cli_connection(self):
         processor = self._new_processor()
@@ -2791,6 +3110,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertIn("final_denoise_primary=CosmicClarity Native Denoise cli-subprocess", message)
         self.assertIn("primary_status=success", message)
         self.assertNotIn("fallback_component=CosmicClarity Native Denoise", message)
+        self.assertFalse(processor.result_metadata[-1]["fallback_used"])
 
     def test_cosmic_clarity_native_uses_device_auto_by_default(self):
         processor = self._new_processor()
@@ -2990,6 +3310,59 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             0.857,
         )
 
+    def test_final_quality_accepts_near_limit_compact_halo_after_safe_star_remix(self):
+        probe = SimpleNamespace(
+            _stage8_final_quality="ok",
+            _stage8_fallback_used=False,
+            _stage9_bypassed_bad_starless=False,
+            _stage9_stars_required=True,
+            _stage9_stars_applied=True,
+            _stage9_stars_application_mode="screen",
+            _stage9_starmask_stretch_failed=False,
+            _stage9_selected_remix_quality={
+                "metrics": {
+                    "chromatic_star_addition_ratio": 0.00001,
+                    "local_color_risk_score": 0.66,
+                },
+                "limits": {"chromatic_star_addition_ratio": 0.003},
+            },
+            _stage7_selected_quality={
+                "status": "ok",
+                "derived": {
+                    "halo_residue_score": 0.343,
+                    "global_halo_residue_score": 0.343,
+                    "compact_halo_residue_score": 0.637,
+                    "compact_residual_star_score": 0.001,
+                    "compact_residual_coverage": 0.0001,
+                },
+            },
+            _read_image_by_stem=lambda _stem: object(),
+            _background_quality_metrics=lambda _image: {
+                "chroma_noise_score": 0.01,
+                "background_mottling_score": 0.03,
+                "local_patch_variance": 0.000001,
+                "core_clip_score": 0.0,
+                "starless_artifact_score": 0.06,
+                "bg_dirty_score": 0.04,
+                "bg_std": 0.004,
+            },
+            _stage7_halo_residue_score=lambda: 0.343,
+            _stage7_effective_halo_threshold=lambda: 0.60,
+            _active_policy_name=lambda: "bright_nebula_hdr_conservative",
+            _active_target_type=lambda: "bright_emission_reflection_nebula",
+        )
+
+        report = pipeline_module.stage8_pixels.final_quality_report(probe)
+
+        self.assertFalse(report["strict_gate"])
+        self.assertEqual(report["final_quality"], "ok")
+        self.assertTrue(
+            report["metrics"]["stage7_compact_halo_raw_limit_exceeded"]
+        )
+        self.assertTrue(
+            report["metrics"]["stage7_compact_halo_target_aware_exempted"]
+        )
+
     def test_final_quality_rejects_selected_stage9_chromatic_artifacts(self):
         probe = SimpleNamespace(
             _stage8_final_quality="ok",
@@ -3138,6 +3511,131 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertEqual(report["final_quality"], "conservative_skipped")
         self.assertIn("stage7_quality_status=poor", report["reasons"])
 
+    def test_stage8_input_guard_allows_limited_m42_candidate_with_valid_mask(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        starmask_file = Path(td.name) / "starmask.fit"
+        starmask_file.write_bytes(b"mock")
+        reason_text = (
+            "bright_nebula_halo_advisory: "
+            "0.488 > 0.350, accepted_limit=0.600"
+        )
+        probe = SimpleNamespace(
+            _stage8_handoff={
+                "processing_policy": "limited",
+                "reason_code": "bright_nebula_halo_advisory",
+                "reason_text": reason_text,
+                "reasons": [
+                    {
+                        "code": "bright_nebula_halo_advisory",
+                        "value": 0.488,
+                        "effective_value": 0.493,
+                        "base_limit": 0.35,
+                        "accepted_limit": 0.60,
+                    }
+                ],
+            },
+            _stage7_selected_quality={
+                "status": "ok",
+                "derived": {
+                    "residual_star_score": 0.10,
+                    "halo_residue_score": 0.488,
+                    "compact_halo_residue_score": 0.493,
+                    "starless_noise_gain": 1.0,
+                },
+            },
+            _stage7_starless_skipped=False,
+            starmask_file=starmask_file,
+            cfg=SimpleNamespace(
+                stage8_masked_enhancement_enabled=True,
+                stage7_residual_star_score_max=0.45,
+                stage7_halo_residue_score_max=0.35,
+                stage7_starless_noise_gain_max=1.25,
+                stage8_mask_signal_coverage_min=0.002,
+            ),
+            siril=SimpleNamespace(get_image_pixeldata=lambda preview=False: None),
+            _stage7_halo_residue_score=lambda: 0.488,
+            _stage7_effective_halo_threshold=lambda: 0.60,
+            _active_target_type=lambda: "bright_emission_reflection_nebula",
+            _short_text=lambda value, _limit=120: str(value),
+        )
+
+        report = pipeline_module.stage8_pixels.stage8_input_enhancement_guard(probe)
+
+        self.assertFalse(report["skip_enhancement"])
+        self.assertEqual(report["processing_policy"], "limited")
+        self.assertEqual(report["reason_code"], "bright_nebula_halo_advisory")
+        self.assertEqual(report["advisories"], [reason_text])
+        self.assertAlmostEqual(
+            report["derived"]["compact_halo_residue_score"],
+            0.493,
+        )
+
+    def test_stage8_limited_halo_texture_gate_rejects_new_ring_detail(self):
+        cfg = SimpleNamespace(
+            stage8_limited_halo_texture_growth_max=1.05,
+            stage8_limited_halo_texture_delta_max=0.00075,
+        )
+        probe = SimpleNamespace(cfg=cfg)
+        baseline = np.full((3, 64, 64), 0.12, dtype=np.float32)
+        candidate = baseline.copy()
+        starmask = np.zeros_like(baseline)
+        starmask[:, 29:35, 29:35] = 1.0
+        yy, xx = np.indices((64, 64))
+        radius = np.sqrt((yy - 31.5) ** 2 + (xx - 31.5) ** 2)
+        ring = (radius >= 5.0) & (radius <= 10.0)
+        checker = np.where((xx + yy) % 2 == 0, 0.035, -0.035)
+        candidate[:, ring] = np.clip(
+            candidate[:, ring] + checker[ring],
+            0.0,
+            1.0,
+        )
+
+        report = pipeline_module.stage8_pixels.stage8_limited_halo_texture_report(
+            probe,
+            baseline,
+            candidate,
+            starmask,
+        )
+        unchanged = pipeline_module.stage8_pixels.stage8_limited_halo_texture_report(
+            probe,
+            baseline,
+            baseline.copy(),
+            starmask,
+        )
+
+        self.assertTrue(report["available"])
+        self.assertFalse(report["accepted"])
+        self.assertGreater(report["growth"], 1.05)
+        self.assertGreater(report["absolute_delta"], 0.00075)
+        self.assertTrue(unchanged["accepted"])
+
+    def test_stage8_limited_halo_gate_extracts_compact_support_from_diffuse_starmask(self):
+        cfg = SimpleNamespace(
+            stage8_limited_halo_texture_growth_max=1.05,
+            stage8_limited_halo_texture_delta_max=0.00075,
+        )
+        probe = SimpleNamespace(cfg=cfg)
+        baseline = np.full((3, 128, 128), 0.12, dtype=np.float32)
+        rng = np.random.default_rng(42)
+        diffuse = rng.uniform(0.0, 0.10, size=(128, 128)).astype(np.float32)
+        for y, x in ((20, 20), (32, 96), (64, 64), (96, 28), (105, 105)):
+            diffuse[y, x] = 1.0
+        starmask = np.repeat(diffuse[None, ...], 3, axis=0)
+
+        report = pipeline_module.stage8_pixels.stage8_limited_halo_texture_report(
+            probe,
+            baseline,
+            baseline.copy(),
+            starmask,
+        )
+
+        self.assertTrue(report["available"])
+        self.assertTrue(report["accepted"])
+        self.assertLessEqual(report["ring_coverage"], 0.45)
+        self.assertGreaterEqual(report["support_quantile"], 0.90)
+        self.assertLess(report["core_coverage"], 0.05)
+
     def test_stage8_prefers_accepted_stage7_stretched_input(self):
         processor = self._new_processor()
         processor.stretched_name = "stage7_stretched"
@@ -3215,7 +3713,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertTrue(processor._stage7_stretch_accepted)
         self.assertEqual(processor._stage7_stretch_output, "stage7_stretched")
 
-    def test_stage7_marks_validated_rescue_as_accepted_but_degraded(self):
+    def test_stage7_marks_validated_rescue_as_accepted_and_ok(self):
         processor = self._new_processor()
         processor._stage7_stretch_validated_rescue = True
         processor._run_stage6_ai_stretching = lambda allow_ai=False: (
@@ -3229,7 +3727,12 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         self.assertTrue(processor._stage7_stretch_accepted)
         self.assertEqual(processor._stage7_stretch_output, "stage7_stretched")
-        self.assertEqual(processor.results[-1][1], "degraded")
+        self.assertEqual(processor.results[-1][1], "ok")
+        self.assertTrue(processor.result_metadata[-1]["fallback_used"])
+        self.assertEqual(
+            processor.result_metadata[-1]["reason_code"],
+            "validated_chroma_rescue",
+        )
 
     def test_stage7_marks_review_only_candidate_as_degraded_not_accepted(self):
         processor = self._new_processor()
@@ -3503,6 +4006,51 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             any("background_chroma_noise_score" in issue for issue in gate_b["issues"])
         )
 
+    def test_background_chroma_noise_ignores_smooth_colour_bias(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        smooth_red = np.full((3, 64, 64), 0.04, dtype=np.float32)
+        smooth_red[0] = 0.16
+
+        metrics = processor._background_quality_metrics(smooth_red)
+
+        self.assertLess(metrics["chroma_noise_score"], 0.05)
+        self.assertGreater(metrics["background_chroma_load"], 0.50)
+
+    def test_background_chroma_noise_detects_high_frequency_colour_variation(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        yy, xx = np.mgrid[:64, :64]
+        checker = ((xx + yy) % 2).astype(np.float32)
+        noisy = np.full((3, 64, 64), 0.08, dtype=np.float32)
+        noisy[0] += checker * 0.10
+        noisy[2] += (1.0 - checker) * 0.10
+
+        metrics = processor._background_quality_metrics(noisy)
+
+        self.assertGreater(metrics["chroma_noise_score"], 0.34)
+
+    def test_stage7_background_gate_prefers_direct_chroma_load_metric(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        baseline = {
+            "chroma_noise_score": 0.02,
+            "background_chroma_load": 0.80,
+            "background_mottling_score": 0.01,
+            "bg_std": 0.001,
+            "bg_median": 0.002,
+        }
+        candidate = {
+            "chroma_noise_score": 0.03,
+            "background_chroma_load": 0.60,
+            "background_mottling_score": 0.02,
+            "bg_std": 0.005,
+            "bg_median": 0.05,
+        }
+
+        gate = processor._stage7_stretch_background_gate(baseline, candidate)
+
+        self.assertTrue(gate["accepted"], gate)
+        self.assertAlmostEqual(gate["metrics"]["chroma_load"], 0.60)
+        self.assertAlmostEqual(gate["metrics"]["chroma_load_growth"], 0.75)
+
     def test_stage7_background_gate_checks_mottling_and_accepts_safe_candidate(self):
         processor = pipeline_module.SeestarPostProcessor()
         baseline = {
@@ -3694,6 +4242,124 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertNotIn("曲线/蒙版工具2", processor.command_chain_calls)
         self.assertNotIn("细节/结构增强", processor.command_chain_calls)
 
+    def test_stage8_limited_candidate_uses_masked_builtin_only_and_is_accepted(self):
+        processor = self._new_processor()
+        processor.cfg.stage8_masked_enhancement_enabled = True
+        processor.cfg.stage8_limited_saturation_max = 0.05
+        processor.cfg.optional_color_transform_enabled = True
+        processor._stage8_handoff = {
+            "processing_policy": "limited",
+            "reason_code": "bright_nebula_halo_advisory",
+            "reason_text": (
+                "bright_nebula_halo_advisory: "
+                "0.488 > 0.350, accepted_limit=0.600"
+            ),
+            "reasons": [],
+        }
+        processor.starmask_file = processor.process_dir / "starmask.fit"
+        processor.starmask_file.write_bytes(b"mock")
+        processor._stage8_input_enhancement_guard = lambda: {
+            "skip_enhancement": False,
+            "processing_policy": "limited",
+            "reason_code": "bright_nebula_halo_advisory",
+            "reason_text": processor._stage8_handoff["reason_text"],
+            "reason_details": [],
+            "advisories": [processor._stage8_handoff["reason_text"]],
+        }
+        captured_plans: list[dict[str, Any]] = []
+        processor._apply_stage8_builtin_enhancement = (
+            lambda plan, *, label: (
+                captured_plans.append(dict(plan))
+                or [f"{label} masked limited candidate"]
+            )
+        )
+        processor._stage8_quality_assessment = lambda: {
+            "status": "ok",
+            "issues": [],
+        }
+        saved_stems: list[str] = []
+        processor._save_stage_output = lambda stem: saved_stems.append(stem) or True
+
+        stage8_nebula_enhancement(processor)
+
+        self.assertEqual(processor.results[-1][1], "ok")
+        self.assertEqual(processor._stage8_final_source, "stage8_enhanced")
+        self.assertFalse(processor._stage8_handoff["passthrough"])
+        self.assertTrue(processor._stage8_handoff["restricted_downstream"])
+        self.assertEqual(
+            processor._stage8_handoff["outcome_reason_code"],
+            "stage8_limited_candidate_accepted",
+        )
+        self.assertIn("stage8_limited_candidate", saved_stems)
+        self.assertFalse(processor.sasp_stage8_calls)
+        self.assertNotIn("调色1（可选）", processor.command_chain_calls)
+        self.assertEqual(captured_plans[0]["bg_factor"], 0)
+        self.assertEqual(captured_plans[0]["unsharp_radius"], 0.0)
+        self.assertEqual(captured_plans[0]["unsharp_amount"], 0.0)
+        self.assertLessEqual(captured_plans[0]["saturation"], 0.05)
+        self.assertFalse(processor.result_metadata[-1]["fallback_used"])
+        self.assertEqual(
+            processor.result_metadata[-1]["execution"],
+            "completed",
+        )
+
+    def test_stage8_limited_candidate_rejection_preserves_candidate_and_rolls_back(self):
+        processor = self._new_processor()
+        processor.cfg.stage8_masked_enhancement_enabled = True
+        processor.cfg.stage8_limited_saturation_max = 0.05
+        processor._stage8_handoff = {
+            "processing_policy": "limited",
+            "reason_code": "bright_nebula_halo_advisory",
+            "reason_text": (
+                "bright_nebula_halo_advisory: "
+                "0.488 > 0.350, accepted_limit=0.600"
+            ),
+            "reasons": [],
+        }
+        processor.starmask_file = processor.process_dir / "starmask.fit"
+        processor.starmask_file.write_bytes(b"mock")
+        processor._stage8_input_enhancement_guard = lambda: {
+            "skip_enhancement": False,
+            "processing_policy": "limited",
+            "reason_code": "bright_nebula_halo_advisory",
+            "reason_text": processor._stage8_handoff["reason_text"],
+            "reason_details": [],
+            "advisories": [processor._stage8_handoff["reason_text"]],
+        }
+        processor._apply_stage8_builtin_enhancement = (
+            lambda _plan, *, label: [f"{label} masked limited candidate"]
+        )
+        processor._stage8_quality_assessment = lambda: {
+            "status": "poor",
+            "issues": ["stage8_limited_halo_texture_growth_exceeded"],
+        }
+        rollback_calls: list[str] = []
+        processor._rollback_stage8_to_input = (
+            lambda: rollback_calls.append("stage8_input_starless") or True
+        )
+        saved_stems: list[str] = []
+        processor._save_stage_output = lambda stem: saved_stems.append(stem) or True
+
+        stage8_nebula_enhancement(processor)
+
+        self.assertEqual(rollback_calls, ["stage8_input_starless"])
+        self.assertIn("stage8_limited_candidate", saved_stems)
+        self.assertEqual(processor._stage8_final_source, "stage8_input_starless")
+        self.assertEqual(
+            processor._stage8_final_quality,
+            "limited_candidate_rejected",
+        )
+        self.assertTrue(processor._stage8_handoff["passthrough"])
+        self.assertEqual(
+            processor._stage8_handoff["outcome_reason_code"],
+            "stage8_limited_candidate_rejected",
+        )
+        self.assertEqual(
+            processor.result_metadata[-1]["execution"],
+            "safe_passthrough",
+        )
+        self.assertFalse(processor.result_metadata[-1]["fallback_used"])
+
     def test_pyqt6_headless_stub_includes_sasp_stage8_widget_imports(self):
         saved = {
             name: sys.modules.pop(name)
@@ -3818,8 +4484,14 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         processor.cfg.workflow_plugin_probe_enabled = False
         processor.cfg.star_intensity = 1.05
         processor.cfg.star_fallback_intensity = 1.05
-        processor._stage8_fallback_used = True
         processor._stage8_final_source = "stage8_input_starless"
+        processor._stage8_handoff = {
+            "schema": "seestar.stage8-handoff.v1",
+            "source_stem": "stage8_input_starless",
+            "passthrough": True,
+            "restricted_downstream": True,
+            "reason_code": "bright_nebula_halo_advisory",
+        }
         processor.starmask_file = processor.process_dir / "starmask.fit"
         processor.starmask_file.write_bytes(b"mock")
 
@@ -3831,7 +4503,16 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             processor.previous_stage_remix_calls,
             [("stage8_input_starless", "starmask_stretched", 0.95)],
         )
-        self.assertIn("Stage8 fallback source active", message)
+        self.assertIn("Stage8 restricted source active", message)
+        report = processor.stage_json_reports["stage9_remix_quality.json"]
+        self.assertTrue(report["upstream_passthrough"])
+        self.assertFalse(report["stage9_fallback_used"])
+        self.assertIsNone(report["stage9_fallback_reason"])
+        metadata = processor.result_metadata[-1]
+        self.assertTrue(metadata["upstream_passthrough"])
+        self.assertFalse(metadata["fallback_used"])
+        self.assertEqual(metadata["reason_code"], "upstream_safe_passthrough")
+        self.assertEqual(metadata["details"]["reason_text"], "使用 Stage 8 安全旁路源")
 
     def test_stage9_uses_plugin_stretched_starmask_without_builtin_asinh(self):
         processor = self._new_processor()
@@ -3895,6 +4576,8 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         )
         report = processor.stage_json_reports["stage9_remix_quality.json"]
         self.assertEqual(report["selected"]["attempt"], "screen_fallback_075")
+        self.assertTrue(report["stage9_fallback_used"])
+        self.assertEqual(report["stage9_fallback_reason"], "intensity_fallback")
         self.assertEqual(len(review_calls), 1)
         review_args, review_kwargs = review_calls[0]
         self.assertEqual(
@@ -3908,6 +4591,69 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertEqual(review_kwargs["context"]["mode"], "screen")
         self.assertEqual(len(review_kwargs["candidates"]), 2)
         self.assertEqual(processor.results[-1][1], "ok")
+        self.assertTrue(processor.result_metadata[-1]["fallback_used"])
+        self.assertEqual(
+            processor.result_metadata[-1]["reason_code"],
+            "intensity_fallback",
+        )
+
+    def test_stage9_local_fallback_classifier_excludes_upstream_passthrough(self):
+        stage9_module = sys.modules["stages.stage9_star_remixing"]
+        cases = (
+            ("screen", {"attempt": "primary"}, "screen", False, None),
+            (
+                "screen",
+                {"attempt": "screen_fallback_075"},
+                "screen",
+                True,
+                "intensity_fallback",
+            ),
+            (
+                "screen",
+                {"attempt": "screen_compact_recovery"},
+                "screen",
+                True,
+                "compact_mask_recovery",
+            ),
+            (
+                "unsafe_starless_bypass",
+                None,
+                "unsafe_starless_bypass",
+                True,
+                "unsafe_starless_bypass",
+            ),
+            (
+                "rejected_keep_starless",
+                None,
+                "rejected_keep_starless",
+                True,
+                "all_remix_candidates_rejected",
+            ),
+            (
+                "starmask_stretch_failed",
+                None,
+                "starmask_stretch_failed",
+                True,
+                "starmask_stretch_failed_keep_upstream",
+            ),
+            ("no_starmask", None, "no_starmask", False, None),
+            (
+                "star_preserve_target_bypass",
+                None,
+                "not_required_star_preserve",
+                False,
+                None,
+            ),
+        )
+        for mode, selected, application_mode, expected_used, expected_reason in cases:
+            with self.subTest(mode=mode, selected=selected):
+                used, reason = stage9_module._stage9_local_fallback(
+                    mode,
+                    selected,
+                    application_mode,
+                )
+                self.assertEqual(used, expected_used)
+                self.assertEqual(reason, expected_reason)
 
     def test_stage9_review_bundle_marks_safe_rollback_as_selected(self):
         processor = self._new_processor()
@@ -4018,6 +4764,8 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         )
         report = processor.stage_json_reports["stage9_remix_quality.json"]
         self.assertEqual(report["selected"]["attempt"], "screen_compact_recovery")
+        self.assertTrue(report["stage9_fallback_used"])
+        self.assertEqual(report["stage9_fallback_reason"], "compact_mask_recovery")
         self.assertTrue(report["starmask_calibration"]["recovery_attempted"])
         self.assertTrue(report["starmask_calibration"]["recovery_applied"])
         self.assertEqual(processor.results[-1][1], "ok")
@@ -4740,6 +5488,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             "starmask_clean.fit",
             "starmask_external_raw.fit",
             "starmask_stretched.fit",
+            "stage8_limited_candidate.fit",
         }
         for name in keep | {"temporary.fit"}:
             (processor.process_dir / name).write_bytes(name.encode("utf-8"))
@@ -4748,6 +5497,292 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         self.assertTrue(all((processor.process_dir / name).exists() for name in keep))
         self.assertFalse((processor.process_dir / "temporary.fit").exists())
+
+    def test_review_route_artifacts_are_available_as_stage_previews(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        processor.process_dir = Path(td.name)
+
+        expected = {
+            6: "stage6_passthrough.fit",
+            7: "stage7_review_with_stars.fit",
+            8: "stage8_review_with_stars.fit",
+        }
+        for stage, filename in expected.items():
+            self.assertIn(
+                processor.process_dir / filename,
+                processor._stage_preview_candidates(stage),
+            )
+
+    def test_project_env_allowlist_includes_acceleration_and_quality_gates(self):
+        allowed = sys.modules["processor_runtime"].PROJECT_ENV_ALLOWED_KEYS
+        self.assertIn("SEESTAR_GRAXPERT_GPU", allowed)
+        self.assertIn(
+            "SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_REDUCTION_MIN",
+            allowed,
+        )
+        self.assertIn(
+            "SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_DELTA_MIN",
+            allowed,
+        )
+        self.assertIn(
+            "SEESTAR_STAGE7_STARMASK_DIFFUSE_RESIDUAL_RATIO_MAX",
+            allowed,
+        )
+        self.assertIn("SEESTAR_STAGE8_LIMITED_SATURATION_MAX", allowed)
+        self.assertIn(
+            "SEESTAR_STAGE8_LIMITED_HALO_TEXTURE_GROWTH_MAX",
+            allowed,
+        )
+        self.assertIn(
+            "SEESTAR_STAGE8_LIMITED_HALO_TEXTURE_DELTA_MAX",
+            allowed,
+        )
+
+    def test_stage6_halo_threshold_is_target_aware_for_diffuse_emission(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.cfg.stage7_halo_residue_score_max = 0.35
+        processor.cfg.stage7_bright_nebula_halo_residue_score_max = 0.60
+
+        processor._active_target_type = lambda: "galaxy"
+        self.assertEqual(processor._stage7_effective_halo_threshold(), 0.35)
+        processor._active_target_type = lambda: "emission_nebula_widefield"
+        self.assertEqual(processor._stage7_effective_halo_threshold(), 0.45)
+        processor._active_target_type = lambda: "bright_emission_reflection_nebula"
+        self.assertEqual(processor._stage7_effective_halo_threshold(), 0.60)
+
+    def test_stage6_bright_nebula_advisory_halo_triggers_pixel_repair(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.cfg.stage7_halo_residue_score_max = 0.35
+        processor.cfg.stage7_bright_nebula_halo_residue_score_max = 0.60
+        processor._active_target_type = lambda: "bright_emission_reflection_nebula"
+        quality = {
+            "status": "ok",
+            "derived": {
+                "halo_residue_score": 0.488,
+                "compact_halo_residue_score": 0.493,
+            },
+        }
+
+        trigger = (
+            stage7_star_separation_module._stage7_starless_pixel_repair_trigger(
+                processor,
+                quality,
+            )
+        )
+
+        self.assertTrue(trigger["triggered"])
+        self.assertEqual(trigger["reason"], "bright_nebula_halo_advisory")
+        self.assertTrue(trigger["within_target_limit"])
+        self.assertAlmostEqual(trigger["measured_halo_score"], 0.493)
+
+    def test_stage6_stage8_handoff_uses_three_level_bright_nebula_gate(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.cfg.stage7_halo_residue_score_max = 0.35
+        processor.cfg.stage7_bright_nebula_halo_residue_score_max = 0.60
+        processor._active_target_type = lambda: "bright_emission_reflection_nebula"
+
+        cases = (
+            (0.3500, 0.3400, "full"),
+            (0.4880, 0.4930, "limited"),
+            (0.6000, 0.5900, "limited"),
+            (0.6001, 0.5900, "skip"),
+            (0.3000, 0.6001, "skip"),
+        )
+        for global_halo, compact_halo, expected_policy in cases:
+            with self.subTest(
+                global_halo=global_halo,
+                compact_halo=compact_halo,
+            ):
+                quality = {
+                    "status": "ok",
+                    "derived": {
+                        "halo_residue_score": global_halo,
+                        "compact_halo_residue_score": compact_halo,
+                        "residual_star_score": 0.10,
+                        "starless_noise_gain": 1.0,
+                    },
+                }
+                handoff = stage7_star_separation_module._stage8_handoff_from_stage6(
+                    processor,
+                    quality,
+                    [],
+                    separation_accepted=True,
+                )
+                self.assertEqual(handoff["processing_policy"], expected_policy)
+
+        m42_handoff = stage7_star_separation_module._stage8_handoff_from_stage6(
+            processor,
+            {
+                "status": "ok",
+                "derived": {
+                    "halo_residue_score": 0.488,
+                    "compact_halo_residue_score": 0.493,
+                    "residual_star_score": 0.10,
+                    "starless_noise_gain": 1.0,
+                },
+            },
+            [],
+            separation_accepted=True,
+        )
+        self.assertEqual(
+            m42_handoff["reason_text"],
+            "bright_nebula_halo_advisory: 0.488 > 0.350, accepted_limit=0.600",
+        )
+        self.assertEqual(m42_handoff["reason_code"], "bright_nebula_halo_advisory")
+
+        repaired_handoff = stage7_star_separation_module._stage8_handoff_from_stage6(
+            processor,
+            {
+                "status": "ok",
+                "derived": {
+                    "halo_residue_score": 0.445,
+                    "compact_halo_residue_score": 0.445,
+                    "residual_star_score": 0.056,
+                    "starless_noise_gain": 0.625,
+                },
+            },
+            [
+                {
+                    "accepted": True,
+                    "acceptance_path": "residual_or_halo",
+                    "trigger": {
+                        "reason": "bright_nebula_halo_advisory",
+                        "halo_residue_score": 0.488,
+                        "compact_halo_residue_score": 0.493,
+                    },
+                }
+            ],
+            separation_accepted=True,
+        )
+        self.assertEqual(
+            repaired_handoff["reason_text"],
+            "bright_nebula_halo_advisory: 0.488 > 0.350, accepted_limit=0.600",
+        )
+        self.assertAlmostEqual(
+            repaired_handoff["metrics"]["halo_residue_score"],
+            0.445,
+        )
+        self.assertAlmostEqual(
+            repaired_handoff["metrics"]["trigger_effective_halo_residue_score"],
+            0.493,
+        )
+        self.assertAlmostEqual(
+            m42_handoff["metrics"]["effective_halo_residue_score"],
+            0.493,
+        )
+
+    def test_stage6_safe_bright_nebula_halo_does_not_trigger_pixel_repair(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.cfg.stage7_halo_residue_score_max = 0.35
+        processor.cfg.stage7_bright_nebula_halo_residue_score_max = 0.60
+        processor._active_target_type = lambda: "bright_emission_reflection_nebula"
+        quality = {
+            "status": "ok",
+            "derived": {
+                "halo_residue_score": 0.32,
+                "compact_halo_residue_score": 0.34,
+            },
+        }
+
+        trigger = (
+            stage7_star_separation_module._stage7_starless_pixel_repair_trigger(
+                processor,
+                quality,
+            )
+        )
+
+        self.assertFalse(trigger["triggered"])
+        self.assertEqual(trigger["reason"], "")
+
+    def test_stage6_poor_quality_still_triggers_pixel_repair(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor._active_target_type = lambda: "galaxy"
+        quality = {
+            "status": "poor",
+            "derived": {
+                "halo_residue_score": 0.10,
+                "compact_halo_residue_score": 0.08,
+            },
+        }
+
+        trigger = (
+            stage7_star_separation_module._stage7_starless_pixel_repair_trigger(
+                processor,
+                quality,
+            )
+        )
+
+        self.assertTrue(trigger["triggered"])
+        self.assertEqual(trigger["reason"], "quality_status=poor")
+
+    def test_stage6_compact_halo_triggers_refinement_and_candidate_penalty(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor.cfg.stage7_halo_residue_score_max = 0.35
+        processor.cfg.stage7_bright_nebula_halo_residue_score_max = 0.60
+        processor._active_target_type = lambda: "bright_emission_reflection_nebula"
+
+        safe = {
+            "derived": {
+                "residual_star_score": 0.03,
+                "halo_residue_score": 0.49,
+                "compact_halo_residue_score": 0.58,
+                "black_hole_score": 0.0,
+                "starmask_contamination": 0.0,
+                "starless_noise_gain": 1.0,
+                "starless_dynamic_range_ratio": 1.0,
+                "starless_peak_signal": 1.0,
+                "starmask_coverage_ratio": 1.0,
+                "starmask_width_ratio": 1.0,
+            }
+        }
+        compact_halo = {
+            "derived": {
+                **safe["derived"],
+                "compact_halo_residue_score": 0.89,
+            }
+        }
+
+        self.assertEqual(processor._stage7_repair_triggers(safe), [])
+        self.assertIn(
+            "compact_halo_residue",
+            processor._stage7_repair_triggers(compact_halo),
+        )
+        self.assertGreater(
+            processor._stage7_quality_score(compact_halo),
+            processor._stage7_quality_score(safe),
+        )
+
+    def test_stage6_compact_halo_measurement_stays_local_in_dense_star_field(self):
+        processor = pipeline_module.SeestarPostProcessor()
+        processor._active_target_type = lambda: "galaxy"
+        height = width = 256
+        yy, xx = np.mgrid[:height, :width]
+        background = 0.015 + xx.astype(np.float32) / width * 0.018
+        source_gray = background.copy()
+        starmask_gray = np.zeros_like(background)
+        for cy in range(12, height, 20):
+            for cx in range(12, width, 20):
+                radius2 = (yy - cy) ** 2 + (xx - cx) ** 2
+                star = 0.22 * np.exp(-radius2 / 5.0)
+                source_gray += star
+                starmask_gray += star
+        source = np.repeat(source_gray[None, :, :], 3, axis=0)
+        starless = np.repeat(background[None, :, :], 3, axis=0)
+        starmask = np.repeat(starmask_gray[None, :, :], 3, axis=0)
+
+        scores = pipeline_module.stage7_quality.stage7_starless_artifact_scores(
+            processor,
+            source,
+            starless,
+            starmask,
+            pipeline_module.measure_image_features(source),
+            pipeline_module.measure_image_features(starless),
+        )
+
+        self.assertLess(scores["compact_halo_mask_coverage"], 0.50)
+        self.assertLess(scores["compact_halo_residue_score"], 0.60)
 
     def test_cleanup_archives_lightweight_diagnostics_before_deleting_logs(self):
         import zipfile
@@ -5193,7 +6228,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
 
         self.assertTrue(available)
 
-    def test_run_linear_resume_skips_stages_2_through_5(self):
+    def test_run_linear_resume_without_evidence_uses_review_only_route(self):
         processor = pipeline_module.SeestarPostProcessor()
         processor.log = FakeLogger()
 
@@ -5243,12 +6278,7 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             [
                 "prepare_linear_resume",
                 "auto_tune",
-                "stage6",
-                "stage7",
-                "stage8",
-                "stage9",
                 "stage10",
-                "stage11",
                 "cleanup",
             ],
         )
@@ -5261,20 +6291,36 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             ("阶段 2: 裁切", "skipped", "skipped by linear resume mode"),
             skipped,
         )
-        self.assertIn(
-            ("阶段 3: 背景提取", "skipped", "skipped by linear resume mode"),
-            skipped,
+        skipped_names = {name for name, _status, _message in skipped}
+        self.assertTrue(
+            {
+                pipeline_module.PipelineStage.BACKGROUND_EXTRACTION.label,
+                pipeline_module.PipelineStage.COLOR_CALIBRATION.label,
+                pipeline_module.PipelineStage.LINEAR_DENOISE.label,
+                pipeline_module.PipelineStage.STAR_SEPARATION.label,
+                pipeline_module.PipelineStage.STRETCHING.label,
+                pipeline_module.PipelineStage.NEBULA_ENHANCEMENT.label,
+                pipeline_module.PipelineStage.STAR_REMIXING.label,
+                pipeline_module.PipelineStage.AI_POSTPROCESS.label,
+            }.issubset(skipped_names)
         )
-        self.assertIn(
-            ("阶段 4: 图像解析 + 色彩校准", "skipped", "skipped by linear resume mode"),
-            skipped,
+        self.assertTrue(processor.cfg.force_review_only_output)
+        self.assertEqual(processor.input_profile["state"], "unknown")
+        plan = json.loads(
+            (work_dir / "processing-plan.json").read_text(encoding="utf-8")
         )
-        self.assertIn(
-            ("阶段 5: 线性反卷积 / 轻降噪", "skipped", "skipped by linear resume mode"),
-            skipped,
+        result_manifest = json.loads(
+            (work_dir / "pipeline-result.json").read_text(encoding="utf-8")
         )
+        self.assertEqual(plan["input"]["profile"]["state"], "unknown")
+        self.assertEqual(
+            plan["planned_steps"][9]["action"],
+            "review_export_only",
+        )
+        self.assertEqual(result_manifest["status"], "review_required")
+        self.assertEqual(result_manifest["plan_hash"], plan["plan_hash"])
 
-    def test_run_stage2_corrected_resume_continues_from_stage3(self):
+    def test_run_stage2_resume_without_evidence_uses_review_only_route(self):
         processor = pipeline_module.SeestarPostProcessor()
         processor.log = FakeLogger()
 
@@ -5324,18 +6370,16 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             [
                 "prepare_stage2_corrected_resume",
                 "auto_tune",
-                "stage3",
-                "stage4",
-                "stage5",
-                "stage6",
-                "stage7",
-                "stage8",
-                "stage9",
                 "stage10",
-                "stage11",
                 "cleanup",
             ],
         )
+        self.assertTrue(processor.cfg.force_review_only_output)
+        self.assertEqual(processor.input_profile["state"], "unknown")
+        result_manifest = json.loads(
+            (work_dir / "pipeline-result.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(result_manifest["status"], "review_required")
 
     def test_run_stage4_psolved_resume_skips_stages_1_through_3(self):
         processor = pipeline_module.SeestarPostProcessor()
@@ -5815,41 +6859,53 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertIsNotNone(diff_note)
         self.assertIn("内容有变化", diff_note)
 
-    def test_stage_result_display_status_marks_ok_variants(self):
-        fallback_result = pipeline_module.StageResult(
+    def test_stage_result_display_status_uses_structured_fields_only(self):
+        message_only_result = pipeline_module.StageResult(
             "阶段 X",
             "ok",
             message="fallback: failed_component=A; fallback_component=B; fallback_status=success",
         )
-        skipped_result = pipeline_module.StageResult(
+        skipped_message_result = pipeline_module.StageResult(
             "阶段 Y",
             "ok",
             message="SPCC skipped on Light_ preprocess mode",
         )
+        fallback_result = pipeline_module.StageResult(
+            "阶段 A",
+            "ok",
+            fallback_used=True,
+        )
+        skipped_result = pipeline_module.StageResult(
+            "阶段 B",
+            "ok",
+            execution="skipped",
+        )
+        passthrough_result = pipeline_module.StageResult(
+            "阶段 C",
+            "ok",
+            execution="safe_passthrough",
+        )
         degraded_result = pipeline_module.StageResult("阶段 Z", "degraded")
 
+        self.assertEqual(message_only_result.display_status, "ok")
+        self.assertEqual(skipped_message_result.display_status, "ok")
         self.assertEqual(fallback_result.display_status, "ok_with_fallback")
         self.assertEqual(skipped_result.display_status, "ok_skipped_optional")
+        self.assertEqual(passthrough_result.display_status, "ok_safe_passthrough")
         self.assertEqual(degraded_result.display_status, "degraded")
 
-    def test_ai_plan_text_fallback_extracts_adjustments_without_strict_json(self):
+    def test_ai_plan_text_fallback_extracts_candidate_id_without_numeric_params(self):
         processor = pipeline_module.SeestarPostProcessor()
         raw_text = (
             "Recommendation summary\n"
-            "background_protection: 0.92\n"
-            "global_contrast_delta=-0.02\n"
-            "global_saturation_delta: 0.04\n"
-            "red_balance_delta: -0.01\n"
-            "blue_balance_delta: 0.02\n"
-            "denoise_strength: 0.07\n"
-            "detail_boost=0.05\n"
+            "selected_candidate_id: conservative\n"
+            "global_saturation_delta: 0.99\n"
         )
 
         parsed = processor._extract_first_json_object(raw_text)
 
-        self.assertIn("adjustments", parsed)
-        self.assertAlmostEqual(parsed["adjustments"]["background_protection"], 0.92)
-        self.assertAlmostEqual(parsed["adjustments"]["detail_boost"], 0.05)
+        self.assertEqual(parsed["selected_candidate_id"], "conservative")
+        self.assertNotIn("adjustments", parsed)
 
     def test_stage3_plugin_order_uses_theoretical_effect_chain(self):
         processor = pipeline_module.SeestarPostProcessor()
@@ -6137,7 +7193,14 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             def _write_stage_json(self, _name: str, payload: dict[str, Any]) -> None:
                 self.report = payload
 
-            def _record_stage(self, name: str, status: str, elapsed: float, message: str) -> None:
+            def _record_stage(
+                self,
+                name: str,
+                status: str,
+                elapsed: float,
+                message: str,
+                **_metadata: Any,
+            ) -> None:
                 self.results.append((name, status, elapsed, message))
 
         processor = Stage3Fake()
@@ -6155,7 +7218,60 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertIn(("load", "stage3_candidate_adbe"), processor.cmd_calls)
         self.assertEqual(processor.workflow_command_used["背景提取插件链"], "ADBE")
         self.assertTrue(processor.report["graxpert_attempted"])
+        self.assertFalse(processor.report["fallback_used"])
         self.assertEqual(processor.results[-1][1], "ok")
+
+    def test_stage3_all_candidates_rejected_restores_baseline(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        processor = Stage3TransactionFake(gate_ok=False)
+
+        with patch.object(
+            stage3_module,
+            "_stage3_background_candidate_chain",
+            return_value=(
+                [("rejected", ("subsky", "1"), "builtin")],
+                ["rejected"],
+                "test",
+            ),
+        ):
+            stage3_module.run_stage3_background_extraction(processor)
+
+        self.assertEqual(processor.saved_sources["stage3_bgremoved"], "baseline")
+        self.assertEqual(processor.results[-1][1], "degraded")
+        self.assertEqual(processor.report["attempts"][0]["status"], "rejected")
+        self.assertIn(
+            {"context": "rejected:rejected", "status": "restored"},
+            processor.report["rollback_events"],
+        )
+
+    def test_stage3_selected_candidate_load_failure_restores_baseline(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        processor = Stage3TransactionFake(
+            gate_ok=True,
+            fail_selected_load=True,
+        )
+
+        with patch.object(
+            stage3_module,
+            "_stage3_background_candidate_chain",
+            return_value=(
+                [("accepted", ("subsky", "1"), "builtin")],
+                ["accepted"],
+                "test",
+            ),
+        ):
+            stage3_module.run_stage3_background_extraction(processor)
+
+        self.assertEqual(processor.saved_sources["stage3_bgremoved"], "baseline")
+        self.assertEqual(processor.results[-1][1], "degraded")
+        self.assertIsNone(processor.report["model_used"])
+        self.assertIn(
+            {
+                "context": "selected_load_failed:accepted",
+                "status": "restored",
+            },
+            processor.report["rollback_events"],
+        )
 
     def test_stage3_graxpert_runtime_error_triggers_background_fallback(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
@@ -6232,7 +7348,14 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             def _write_stage_json(self, _name: str, payload: dict[str, Any]) -> None:
                 self.report = payload
 
-            def _record_stage(self, name: str, status: str, elapsed: float, message: str) -> None:
+            def _record_stage(
+                self,
+                name: str,
+                status: str,
+                elapsed: float,
+                message: str,
+                **_metadata: Any,
+            ) -> None:
                 self.results.append((name, status, elapsed, message))
 
         processor = Stage3Fake()
@@ -6247,6 +7370,11 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         self.assertEqual(processor.workflow_command_used["背景提取插件链"], "ADBE")
         self.assertTrue(processor.report["graxpert_runtime_error"])
         self.assertTrue(processor.report["fallback_triggered_by_graxpert_error"])
+        self.assertTrue(processor.report["fallback_used"])
+        self.assertEqual(
+            processor.report["fallback_reason"],
+            "graxpert_runtime_fallback",
+        )
         self.assertEqual(
             [record["status"] for record in processor.report["attempts"][:2]],
             ["graxpert_runtime_error", "graxpert_runtime_error"],
@@ -6473,7 +7601,14 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             def _write_stage_json(self, _name: str, payload: dict[str, Any]) -> None:
                 self.report = payload
 
-            def _record_stage(self, name: str, status: str, elapsed: float, message: str) -> None:
+            def _record_stage(
+                self,
+                name: str,
+                status: str,
+                elapsed: float,
+                message: str,
+                **_metadata: Any,
+            ) -> None:
                 self.results.append((name, status, elapsed, message))
 
         processor = Stage3Fake()
@@ -6494,7 +7629,10 @@ class PipelinePluginFallbackTests(unittest.TestCase):
         class Stage3Fake:
             def __init__(self) -> None:
                 self.log = FakeLogger()
-                self.cfg = SimpleNamespace(workflow_plugin_probe_enabled=False)
+                self.cfg = SimpleNamespace(
+                    workflow_plugin_probe_enabled=False,
+                    stage3_diffuse_auto_apply_enabled=True,
+                )
                 self.target_profile = {
                     "target_type": "emission_nebula_widefield",
                     "object_stats": {"object_area_ratio": 0.46},
@@ -6580,7 +7718,14 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             def _write_stage_json(self, _name: str, payload: dict[str, Any]) -> None:
                 self.report = payload
 
-            def _record_stage(self, name: str, status: str, elapsed: float, message: str) -> None:
+            def _record_stage(
+                self,
+                name: str,
+                status: str,
+                elapsed: float,
+                message: str,
+                **_metadata: Any,
+            ) -> None:
                 self.results.append((name, status, elapsed, message))
 
         processor = Stage3Fake()
@@ -6601,6 +7746,92 @@ class PipelinePluginFallbackTests(unittest.TestCase):
             processor.report["builtin_search_mode"],
             "theoretical_effect_order_with_diffuse_signal_protection",
         )
+
+    def test_stage3_decision_skips_clean_background(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        processor = SimpleNamespace(
+            cfg=pipeline_module.PipelineConfig(),
+            target_profile={},
+        )
+
+        decision = stage3_module._stage3_background_decision(
+            processor,
+            {
+                "gradient_score": 0.02,
+                "dirty_background_score": 0.08,
+                "chroma_noise_score": 0.01,
+            },
+            diffuse_context={"diffuse": False},
+        )
+
+        self.assertEqual(decision["decision"], "skip")
+
+    def test_stage3_decision_requires_review_for_diffuse_signal(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        processor = SimpleNamespace(
+            cfg=pipeline_module.PipelineConfig(),
+            target_profile={"target_type": "emission_nebula_widefield"},
+        )
+
+        decision = stage3_module._stage3_background_decision(
+            processor,
+            {
+                "gradient_score": 0.20,
+                "dirty_background_score": 0.40,
+                "chroma_noise_score": 0.08,
+            },
+            diffuse_context={
+                "diffuse": True,
+                "emission_diffuse": True,
+            },
+        )
+
+        self.assertEqual(decision["decision"], "review_required")
+
+    def test_stage3_decision_skips_low_dirty_gradient_when_diffuse_signal_is_protected(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        processor = SimpleNamespace(
+            cfg=pipeline_module.PipelineConfig(),
+            target_profile={"target_type": "emission_nebula_widefield"},
+        )
+
+        decision = stage3_module._stage3_background_decision(
+            processor,
+            {
+                "gradient_score": 0.13,
+                "dirty_background_score": 0.088,
+                "chroma_noise_score": 0.15,
+            },
+            diffuse_context={
+                "diffuse": True,
+                "emission_diffuse": True,
+                "pixel_signal_protection": True,
+            },
+        )
+
+        self.assertEqual(decision["decision"], "skip")
+        self.assertEqual(decision["source"], "target_protection_policy")
+        self.assertGreaterEqual(decision["confidence"], 0.80)
+
+    def test_stage3_decision_applies_high_confidence_offline_gradient(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        processor = SimpleNamespace(
+            cfg=pipeline_module.PipelineConfig(),
+            target_profile={},
+        )
+
+        decision = stage3_module._stage3_background_decision(
+            processor,
+            {
+                "gradient_score": 0.14,
+                "dirty_background_score": 0.32,
+                "chroma_noise_score": 0.04,
+            },
+            diffuse_context={"diffuse": False},
+        )
+
+        self.assertEqual(decision["decision"], "apply")
+        self.assertEqual(decision["source"], "deterministic_offline_policy")
 
     def test_stage3_dynamic_rbf_candidates_expand_for_noisy_complex_fields(self):
         processor = pipeline_module.SeestarPostProcessor()

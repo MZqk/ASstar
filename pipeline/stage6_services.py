@@ -299,6 +299,8 @@ def stage6_effective_bg_median_min(configured_min: float) -> float:
 
 class Stage6ServiceMixin:
     def _ai_stage_advisory_enabled(self, attr_name: str) -> bool:
+        if not ai_advisory.network_mode_enabled():
+            return False
         if not bool(getattr(self.cfg, "ai_post_enabled", False)):
             return False
         if not bool(getattr(self.cfg, attr_name, True)):
@@ -628,6 +630,28 @@ class Stage6ServiceMixin:
         )
 
 
+    def _normalize_stage7_stretch_selection(
+        self,
+        obj: Dict[str, Any],
+        allowed_candidate_ids: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        return ai_advisory.normalize_stage7_stretch_selection(
+            self,
+            obj,
+            allowed_candidate_ids,
+        )
+
+
+    def _request_stage7_stretch_selection(
+        self,
+        accepted_attempts: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        return ai_advisory.request_stage7_stretch_selection(
+            self,
+            accepted_attempts,
+        )
+
+
     def _stage6_candidate_specs(
         self,
         ai_plan: Optional[Dict[str, Any]],
@@ -842,6 +866,28 @@ class Stage6ServiceMixin:
             return False, self._short_text(e, 180)
 
 
+    def _stage7_effective_star_growth_ratio_max(self) -> float:
+        """Allow bright-nebula starless structure without weakening other targets."""
+        generic_limit = float(self.cfg.stage6_star_growth_ratio_max)
+        target_type = (
+            str(self._active_target_type() or "").strip().lower()
+            if hasattr(self, "_active_target_type")
+            else ""
+        )
+        if target_type != "bright_emission_reflection_nebula":
+            return generic_limit
+        return max(
+            generic_limit,
+            float(
+                getattr(
+                    self.cfg,
+                    "stage7_bright_nebula_star_growth_ratio_max",
+                    generic_limit,
+                )
+            ),
+        )
+
+
     def _validate_stage6_stretch_quality(
         self,
         baseline_quality: Optional[QualityMetrics],
@@ -868,9 +914,10 @@ class Stage6ServiceMixin:
             )
         if baseline_quality and baseline_quality.median_star_size > 0.2 and metrics.median_star_size > 0:
             star_growth = metrics.median_star_size / max(baseline_quality.median_star_size, 1e-4)
-            if star_growth > self.cfg.stage6_star_growth_ratio_max:
+            star_growth_limit = self._stage7_effective_star_growth_ratio_max()
+            if star_growth > star_growth_limit:
                 issues.append(
-                    f"star_size_growth {star_growth:.3f}>{self.cfg.stage6_star_growth_ratio_max:.3f}"
+                    f"star_size_growth {star_growth:.3f}>{star_growth_limit:.3f}"
                 )
         return len(issues) == 0, issues, metrics
 
@@ -878,6 +925,14 @@ class Stage6ServiceMixin:
     @staticmethod
     def _stage7_background_chroma_load(metrics: Dict[str, Any]) -> float:
         """Return background chroma deviation relative to the background level."""
+        direct_load = metrics.get("background_chroma_load")
+        if direct_load is not None:
+            try:
+                value = float(direct_load)
+                if math.isfinite(value):
+                    return max(value, 0.0)
+            except (TypeError, ValueError):
+                pass
         chroma_score = max(float(metrics.get("chroma_noise_score", 0.0) or 0.0), 0.0)
         bg_std = max(float(metrics.get("bg_std", 0.0) or 0.0), 0.0)
         bg_median = max(float(metrics.get("bg_median", 0.0) or 0.0), 1e-4)
@@ -1241,8 +1296,9 @@ class Stage6ServiceMixin:
             score += ((metrics.highlight_clip_ratio - clip_max) / clip_max) * 6.0
         if baseline_quality and baseline_quality.median_star_size > 0.2 and metrics.median_star_size > 0:
             star_growth = metrics.median_star_size / max(baseline_quality.median_star_size, 1e-4)
-            if star_growth > self.cfg.stage6_star_growth_ratio_max:
-                score += (star_growth - self.cfg.stage6_star_growth_ratio_max) * 8.0
+            star_growth_limit = self._stage7_effective_star_growth_ratio_max()
+            if star_growth > star_growth_limit:
+                score += (star_growth - star_growth_limit) * 8.0
         return float(score)
 
 
@@ -1633,7 +1689,9 @@ class Stage6ServiceMixin:
         self._stage7_stretch_validated_rescue = False
         self._stage7_review_source = None
         messages: List[str] = []
-        source_stem = "stage6_starless"
+        source_stem = str(
+            getattr(self, "_stage7_stretch_source", None) or "stage6_starless"
+        )
         try:
             self.cmd_with_check("load", source_stem)
         except (CommandError, SirilError) as e:
@@ -2079,11 +2137,39 @@ class Stage6ServiceMixin:
             for attempt in saved_attempts
             if not bool(attempt.get("allowed_as_final", False))
         ]
-        best_attempt = (
+        deterministic_best_attempt = (
             min(accepted_attempts, key=self._stage7_candidate_selection_key)
             if accepted_attempts
             else None
         )
+        ai_selection: Optional[Dict[str, Any]] = None
+        best_attempt = deterministic_best_attempt
+        if allow_ai and accepted_attempts:
+            ai_selection = self._request_stage7_stretch_selection(
+                accepted_attempts
+            )
+            if ai_selection:
+                selected_candidate_id = str(
+                    ai_selection.get("selected_candidate_id") or ""
+                )
+                selected_attempt = next(
+                    (
+                        attempt
+                        for attempt in accepted_attempts
+                        if str(attempt.get("name") or "")
+                        == selected_candidate_id
+                        and not bool(attempt.get("explicit_fallback"))
+                    ),
+                    None,
+                )
+                if selected_attempt is not None:
+                    best_attempt = selected_attempt
+                else:
+                    self.log.warn(
+                        "[AI] stage7 stretch selection was not revalidated; "
+                        "using deterministic quality rank"
+                    )
+                    ai_selection = None
         best_rejected_attempt = (
             min(rejected_attempts, key=self._stage7_candidate_selection_key)
             if rejected_attempts
@@ -2119,11 +2205,18 @@ class Stage6ServiceMixin:
                 attempt["selection_role"] = "not_selected"
 
         if best_attempt is not None:
-            messages.append(
-                "stage7 quality-ranked candidate selected "
-                f"(name={best_attempt.get('name')}, "
-                f"risk={float(best_attempt.get('risk_score', 0.0) or 0.0):.3f})"
-            )
+            if ai_selection:
+                messages.append(
+                    "stage7 AI selected a hard-gate-passing candidate id "
+                    f"(name={best_attempt.get('name')}, "
+                    f"risk={float(best_attempt.get('risk_score', 0.0) or 0.0):.3f})"
+                )
+            else:
+                messages.append(
+                    "stage7 deterministic quality-ranked candidate selected "
+                    f"(name={best_attempt.get('name')}, "
+                    f"risk={float(best_attempt.get('risk_score', 0.0) or 0.0):.3f})"
+                )
         elif review_attempt is not None:
             self._stage7_review_source = str(review_attempt.get("stem") or "") or None
             messages.append(
@@ -2136,6 +2229,24 @@ class Stage6ServiceMixin:
 
         selection_summary = {
             "strategy": "hard_gate_then_quality_rank_with_safe_p50_review",
+            "selector": (
+                "ai_candidate_id"
+                if ai_selection
+                else "deterministic_quality_rank"
+            ),
+            "model_output_fields": ["selected_candidate_id"],
+            "parameters_owned_by": "code",
+            "allowed_candidate_ids": [
+                str(attempt.get("name"))
+                for attempt in accepted_attempts
+                if not bool(attempt.get("explicit_fallback"))
+            ],
+            "ai_selection": ai_selection,
+            "deterministic_fallback": (
+                str(deterministic_best_attempt.get("name"))
+                if deterministic_best_attempt
+                else None
+            ),
             "saved_candidate_count": len(saved_attempts),
             "accepted_candidate_count": len(accepted_attempts),
             "safe_review_candidate_count": len(safe_review_attempts),

@@ -14,6 +14,7 @@ from urllib import request as urllib_request
 
 import numpy as np
 
+import ai_advisory
 from image_metrics import _to_rgb_float_image
 from sirilpy.exceptions import CommandError, DataError, SirilError
 
@@ -114,6 +115,11 @@ def _extract_image_bytes(
 
     result_url = first.get("url")
     if isinstance(result_url, str) and result_url.startswith(("http://", "https://")):
+        if not ai_advisory.network_mode_enabled():
+            raise RuntimeError(
+                "AI artistic result download blocked: "
+                "SEESTAR_NETWORK_MODE is disabled"
+            )
         try:
             with urllib_request.urlopen(result_url, timeout=timeout_sec) as response:
                 image_bytes = _read_limited(response)
@@ -131,6 +137,10 @@ def request_artistic_derivative(
     image_path: Path,
     timeout_sec: int,
 ) -> Tuple[bytes, Dict[str, Any]]:
+    if not ai_advisory.network_mode_enabled():
+        raise RuntimeError(
+            "AI artistic request blocked: SEESTAR_NETWORK_MODE is disabled"
+        )
     endpoints = build_image_edit_endpoint_candidates(endpoint)
     if not endpoints:
         raise RuntimeError("SEESTAR_AI_ARTISTIC_ENDPOINT is empty")
@@ -211,6 +221,21 @@ def run_ai_artistic_derivative(
     output_dir = Path(owner.work_dir) / "ai_artistic_derivative"
     output_dir.mkdir(parents=True, exist_ok=True)
     report_path = output_dir / "artistic_report.json"
+    if not ai_advisory.network_mode_enabled():
+        report = {
+            "schema_version": 1,
+            "experiment": "ai_artistic_derivative",
+            "status": "skipped",
+            "reason": "SEESTAR_NETWORK_MODE not enabled",
+            "isolated": True,
+            "reimported_into_siril": False,
+            "affects_pipeline_status": False,
+        }
+        _write_report(report_path, report)
+        owner.log.warn(
+            "[AI-Artistic] skipped; SEESTAR_NETWORK_MODE is disabled"
+        )
+        return None
     required = {
         "SEESTAR_AI_ARTISTIC_ENDPOINT": str(
             getattr(owner.cfg, "ai_artistic_endpoint", "") or ""

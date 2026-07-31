@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import types
@@ -10,6 +11,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import numpy as np
 
@@ -102,6 +104,16 @@ def _write_png(path: Path, _image: Any) -> None:
 
 
 class ArtisticDerivativeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._network_patch = patch.dict(
+            os.environ,
+            {"SEESTAR_NETWORK_MODE": "1"},
+        )
+        self._network_patch.start()
+
+    def tearDown(self) -> None:
+        self._network_patch.stop()
+
     def test_endpoint_base_url_expands_to_image_edits(self) -> None:
         self.assertEqual(
             build_image_edit_endpoint_candidates("https://api.example.com"),
@@ -126,6 +138,35 @@ class ArtisticDerivativeTests(unittest.TestCase):
             self.assertFalse((owner.work_dir / "ai_artistic_derivative").exists())
             self.assertEqual(owner.cmd_calls, [])
             self.assertEqual(owner.results, [("stage10", "ok")])
+
+    def test_network_disabled_writes_skipped_report_without_request(self) -> None:
+        calls: list[tuple[Any, ...]] = []
+
+        def fake_request(*args: Any):
+            calls.append(args)
+            return b"", {}
+
+        with patch.dict(os.environ, {"SEESTAR_NETWORK_MODE": "0"}):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                owner = _Owner(Path(tmpdir))
+                result = run_ai_artistic_derivative(
+                    owner,
+                    write_png_rgb16_func=_write_png,
+                    request_func=fake_request,
+                )
+
+                self.assertIsNone(result)
+                self.assertEqual(calls, [])
+                self.assertEqual(owner.cmd_calls, [])
+                report = json.loads(
+                    (
+                        owner.work_dir
+                        / "ai_artistic_derivative"
+                        / "artistic_report.json"
+                    ).read_text(encoding="utf-8")
+                )
+                self.assertEqual(report["status"], "skipped")
+                self.assertIn("NETWORK_MODE", report["reason"])
 
     def test_missing_isolated_credentials_only_writes_skipped_report(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

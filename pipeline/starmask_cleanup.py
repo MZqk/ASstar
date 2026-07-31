@@ -8,6 +8,10 @@ import numpy as np
 from image_metrics import _box_blur_gray, _to_rgb_float_fullres
 
 
+DIFFUSE_RETRY_MAX_STRENGTH = 0.50
+DIFFUSE_RETRY_TARGET_MARGIN = 0.95
+
+
 def _bounded(value: Any, default: float, lower: float, upper: float) -> float:
     try:
         parsed = float(value)
@@ -169,42 +173,11 @@ def clean_starmask_pixels(
     faint_compact_mask = compact_mask & (compact_protection < 0.55)
     diffuse_mask = (compact_protection < 0.05) & (gray > background + noise_sigma)
     before_signal = float(np.sum(stars_norm))
-    after_signal = float(np.sum(cleaned_norm))
     compact_before = float(np.sum(gray[compact_mask])) if np.any(compact_mask) else 0.0
-    cleaned_rgb = _to_rgb_float_fullres(cleaned_norm)
-    cleaned_gray = (
-        0.2126 * cleaned_rgb[0]
-        + 0.7152 * cleaned_rgb[1]
-        + 0.0722 * cleaned_rgb[2]
-    ).astype(np.float32)
-    compact_after = (
-        float(np.sum(cleaned_gray[compact_mask])) if np.any(compact_mask) else 0.0
-    )
     faint_compact_before = (
         float(np.sum(gray[faint_compact_mask])) if np.any(faint_compact_mask) else 0.0
     )
-    faint_compact_after = (
-        float(np.sum(cleaned_gray[faint_compact_mask]))
-        if np.any(faint_compact_mask)
-        else 0.0
-    )
     diffuse_before = float(np.sum(gray[diffuse_mask])) if np.any(diffuse_mask) else 0.0
-    diffuse_after = (
-        float(np.sum(cleaned_gray[diffuse_mask])) if np.any(diffuse_mask) else 0.0
-    )
-
-    signal_ratio = after_signal / max(before_signal, 1e-8)
-    compact_retention = (
-        compact_after / max(compact_before, 1e-8) if compact_before > 0.0 else 1.0
-    )
-    faint_compact_retention = (
-        faint_compact_after / max(faint_compact_before, 1e-8)
-        if faint_compact_before > 0.0
-        else 1.0
-    )
-    diffuse_residual_ratio = (
-        diffuse_after / max(diffuse_before, 1e-8) if diffuse_before > 0.0 else 0.0
-    )
     min_compact_retention = _bounded(
         getattr(cfg, "stage7_starmask_compact_retention_min", 0.82),
         0.82,
@@ -217,6 +190,126 @@ def clean_starmask_pixels(
         0.01,
         0.50,
     )
+
+    cleaned_rgb = _to_rgb_float_fullres(cleaned_norm)
+    cleaned_gray = (
+        0.2126 * cleaned_rgb[0]
+        + 0.7152 * cleaned_rgb[1]
+        + 0.0722 * cleaned_rgb[2]
+    ).astype(np.float32)
+    initial_compact_after = (
+        float(np.sum(cleaned_gray[compact_mask])) if np.any(compact_mask) else 0.0
+    )
+    initial_faint_compact_after = (
+        float(np.sum(cleaned_gray[faint_compact_mask]))
+        if np.any(faint_compact_mask)
+        else 0.0
+    )
+    initial_diffuse_after = (
+        float(np.sum(cleaned_gray[diffuse_mask])) if np.any(diffuse_mask) else 0.0
+    )
+    initial_compact_retention = (
+        initial_compact_after / max(compact_before, 1e-8)
+        if compact_before > 0.0
+        else 1.0
+    )
+    initial_faint_compact_retention = (
+        initial_faint_compact_after / max(faint_compact_before, 1e-8)
+        if faint_compact_before > 0.0
+        else 1.0
+    )
+    initial_diffuse_residual_ratio = (
+        initial_diffuse_after / max(diffuse_before, 1e-8)
+        if diffuse_before > 0.0
+        else 0.0
+    )
+
+    diffuse_retry = {
+        "attempted": False,
+        "applied": False,
+        "strength": 0.0,
+        "max_strength": DIFFUSE_RETRY_MAX_STRENGTH,
+        "target_ratio": max_diffuse_residual_ratio * DIFFUSE_RETRY_TARGET_MARGIN,
+        "ratio_before": initial_diffuse_residual_ratio,
+        "ratio_after": initial_diffuse_residual_ratio,
+    }
+    retention_safe = bool(
+        initial_compact_retention >= min_compact_retention
+        and initial_faint_compact_retention >= compact_floor - 0.01
+    )
+    if (
+        initial_diffuse_residual_ratio > max_diffuse_residual_ratio
+        and diffuse_before > 0.0
+        and retention_safe
+        and np.any(diffuse_mask)
+    ):
+        diffuse_retry["attempted"] = True
+        retry_profile = np.zeros_like(gray, dtype=np.float32)
+        retry_profile[diffuse_mask] = np.sqrt(
+            np.clip(
+                (0.05 - compact_protection[diffuse_mask]) / 0.05,
+                0.0,
+                1.0,
+            )
+        )
+        removable_signal = float(
+            np.sum(cleaned_gray[diffuse_mask] * retry_profile[diffuse_mask])
+        )
+        target_signal = (
+            diffuse_before
+            * max_diffuse_residual_ratio
+            * DIFFUSE_RETRY_TARGET_MARGIN
+        )
+        retry_strength = min(
+            DIFFUSE_RETRY_MAX_STRENGTH,
+            max(
+                0.0,
+                (initial_diffuse_after - target_signal)
+                / max(removable_signal, 1e-12),
+            ),
+        )
+        if retry_strength > 1e-6:
+            retry_weight = np.clip(
+                1.0 - retry_profile * retry_strength,
+                0.0,
+                1.0,
+            )
+            cleaned_norm *= _weight_like(cleaned_norm, retry_weight)
+            cleaned_rgb = _to_rgb_float_fullres(cleaned_norm)
+            cleaned_gray = (
+                0.2126 * cleaned_rgb[0]
+                + 0.7152 * cleaned_rgb[1]
+                + 0.0722 * cleaned_rgb[2]
+            ).astype(np.float32)
+            diffuse_retry["applied"] = True
+            diffuse_retry["strength"] = retry_strength
+
+    after_signal = float(np.sum(cleaned_norm))
+    compact_after = (
+        float(np.sum(cleaned_gray[compact_mask])) if np.any(compact_mask) else 0.0
+    )
+    faint_compact_after = (
+        float(np.sum(cleaned_gray[faint_compact_mask]))
+        if np.any(faint_compact_mask)
+        else 0.0
+    )
+    diffuse_after = (
+        float(np.sum(cleaned_gray[diffuse_mask])) if np.any(diffuse_mask) else 0.0
+    )
+    signal_ratio = after_signal / max(before_signal, 1e-8)
+    compact_retention = (
+        compact_after / max(compact_before, 1e-8) if compact_before > 0.0 else 1.0
+    )
+    faint_compact_retention = (
+        faint_compact_after / max(faint_compact_before, 1e-8)
+        if faint_compact_before > 0.0
+        else 1.0
+    )
+    diffuse_residual_ratio = (
+        diffuse_after / max(diffuse_before, 1e-8) if diffuse_before > 0.0 else 0.0
+    )
+    diffuse_retry["ratio_after"] = diffuse_residual_ratio
+
     issues = []
     if not np.all(np.isfinite(cleaned_norm)):
         issues.append("non-finite cleaned starmask pixels")
@@ -251,6 +344,7 @@ def clean_starmask_pixels(
         "faint_compact_retention": faint_compact_retention,
         "diffuse_pixels": int(np.count_nonzero(diffuse_mask)),
         "diffuse_residual_ratio": diffuse_residual_ratio,
+        "diffuse_retry": diffuse_retry,
         "changed_pixel_ratio": float(np.mean(np.abs(cleaned_gray - gray) > 0.001)),
         "limits": {
             "min_compact_retention": min_compact_retention,

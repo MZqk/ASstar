@@ -31,6 +31,16 @@ except ImportError:  # Tests may import with lightweight fakes.
     SirilError = RuntimeError
 
 
+DIFFUSE_EMISSION_NEBULA_TARGET_TYPES = frozenset(
+    {
+        "emission_nebula",
+        "emission_nebula_widefield",
+        "bright_emission_reflection_nebula",
+    }
+)
+DIFFUSE_EMISSION_HALO_RESIDUE_SCORE_MAX = 0.45
+
+
 def stage7_dynamic_range_assessment(
     cfg,
     *,
@@ -87,6 +97,9 @@ def stage7_starless_artifact_scores(
         "halo_residue_score": 0.0,
         "global_halo_residue_score": 0.0,
         "compact_halo_residue_score": 0.0,
+        "compact_halo_mask_coverage": 0.0,
+        "compact_halo_source_level": 0.0,
+        "compact_halo_starless_level": 0.0,
         "black_hole_score": 0.0,
         "compact_residual_star_score": 0.0,
         "compact_residual_coverage": 0.0,
@@ -103,7 +116,7 @@ def stage7_starless_artifact_scores(
 
     try:
         target_type = pipeline._active_target_type() if hasattr(pipeline, "_active_target_type") else ""
-        is_bright_nebula = target_type == "bright_emission_reflection_nebula"
+        is_protected_nebula = target_type in DIFFUSE_EMISSION_NEBULA_TARGET_TYPES
         source_rgb = _to_rgb_float_image(source_data, max_side=1024)
         starless_rgb = _to_rgb_float_image(starless_data, max_side=1024)
         source_gray = (
@@ -146,9 +159,9 @@ def stage7_starless_artifact_scores(
             float(np.quantile(broad_source, 0.76)),
             source_bg + max(1.8 * source_std, 0.018),
         )
-        bright_nebula_protect = (
+        diffuse_nebula_protect = (
             broad_source > nebula_threshold
-            if is_bright_nebula
+            if is_protected_nebula
             else np.zeros_like(source_gray, dtype=bool)
         )
         scores["starless_noise_gain"] = _clamp_float(
@@ -167,8 +180,8 @@ def stage7_starless_artifact_scores(
             for _ in range(5):
                 halo_weight = _box_blur_gray(halo_weight)
             halo_mask = (halo_weight > 0.004) & (~core_mask)
-            if is_bright_nebula:
-                halo_mask &= ~bright_nebula_protect
+            if is_protected_nebula:
+                halo_mask &= ~diffuse_nebula_protect
             if int(np.count_nonzero(halo_mask)) > 16:
                 source_halo = np.clip(source_gray[halo_mask] - source_bg, 0.0, None)
                 starless_halo = np.clip(starless_gray[halo_mask] - starless_bg, 0.0, None)
@@ -223,8 +236,8 @@ def stage7_starless_artifact_scores(
                     star_weight = _box_blur_gray(star_weight)
                 nebula_mask = diffuse_mask & (star_weight <= 0.003)
                 protected_nebula_mask = (
-                    nebula_mask | bright_nebula_protect
-                    if is_bright_nebula
+                    nebula_mask | diffuse_nebula_protect
+                    if is_protected_nebula
                     else nebula_mask
                 )
                 mask_signal = np.clip(starmask_gray, 0.0, None)
@@ -282,32 +295,44 @@ def stage7_starless_artifact_scores(
                         / max(float(np.sum(compact_weight)), 1e-6)
                     )
                 star_core_weight = compact_weight.copy()
-                halo_weight = star_core_weight.copy()
-                for _ in range(5):
-                    halo_weight = np.maximum(
-                        halo_weight,
-                        np.clip(_box_blur_gray(halo_weight) * 1.9, 0.0, 1.0),
-                    )
+                # Keep the compact-halo diagnostic local. Repeated max-dilation
+                # blankets dense star fields and turns this into a background
+                # brightness ratio instead of a star-halo measurement.
+                halo_weight = _box_blur_gray(
+                    (star_core_weight > 0.08).astype(np.float32)
+                )
                 compact_halo_mask = (
-                    (halo_weight > 0.035)
+                    (halo_weight > 0.02)
                     & (star_core_weight < 0.28)
                     & (~protected_nebula_mask)
                 )
-                if is_bright_nebula:
-                    compact_halo_mask &= ~bright_nebula_protect
+                if is_protected_nebula:
+                    compact_halo_mask &= ~diffuse_nebula_protect
+                scores["compact_halo_mask_coverage"] = float(
+                    np.mean(compact_halo_mask)
+                )
                 if int(np.count_nonzero(compact_halo_mask)) > 16:
+                    source_local = source_gray.copy()
+                    starless_local = starless_gray.copy()
+                    for _ in range(4):
+                        source_local = _box_blur_gray(source_local)
+                        starless_local = _box_blur_gray(starless_local)
                     source_compact_halo = np.clip(
-                        source_gray[compact_halo_mask] - source_bg,
+                        source_gray[compact_halo_mask]
+                        - source_local[compact_halo_mask],
                         0.0,
                         None,
                     )
                     starless_compact_halo = np.clip(
-                        starless_gray[compact_halo_mask] - starless_bg,
+                        starless_gray[compact_halo_mask]
+                        - starless_local[compact_halo_mask],
                         0.0,
                         None,
                     )
                     source_compact_level = float(np.mean(source_compact_halo)) if source_compact_halo.size else 0.0
                     starless_compact_level = float(np.mean(starless_compact_halo)) if starless_compact_halo.size else 0.0
+                    scores["compact_halo_source_level"] = source_compact_level
+                    scores["compact_halo_starless_level"] = starless_compact_level
                     if source_compact_level > 1e-5:
                         scores["compact_halo_residue_score"] = _clamp_float(
                             starless_compact_level / source_compact_level,
@@ -417,6 +442,11 @@ def stage7_quality_assessment(
             "halo_residue "
             f"{halo_residue_score:.3f}>{halo_threshold:.3f}"
         )
+    if compact_halo_residue_score > halo_threshold:
+        issues.append(
+            "compact_halo_residue "
+            f"{compact_halo_residue_score:.3f}>{halo_threshold:.3f}"
+        )
     if black_hole_score > pipeline.cfg.stage7_black_hole_score_max:
         issues.append(
             "black_hole "
@@ -484,6 +514,18 @@ def stage7_quality_assessment(
             "halo_residue_score": halo_residue_score,
             "global_halo_residue_score": global_halo_residue_score,
             "compact_halo_residue_score": compact_halo_residue_score,
+            "compact_halo_mask_coverage": artifact_scores.get(
+                "compact_halo_mask_coverage",
+                0.0,
+            ),
+            "compact_halo_source_level": artifact_scores.get(
+                "compact_halo_source_level",
+                0.0,
+            ),
+            "compact_halo_starless_level": artifact_scores.get(
+                "compact_halo_starless_level",
+                0.0,
+            ),
             "black_hole_score": black_hole_score,
             "starmask_contamination": starmask_contamination,
             "starless_noise_gain": starless_noise_gain,
@@ -538,6 +580,7 @@ def stage7_quality_score(pipeline, quality: Optional[Dict[str, Any]]) -> float:
         return 1_000_000.0
     residual = float(derived.get("residual_star_score", 1_000.0))
     halo = float(derived.get("halo_residue_score", 0.0))
+    compact_halo = float(derived.get("compact_halo_residue_score", 0.0))
     black_hole = float(derived.get("black_hole_score", 0.0))
     contamination = float(derived.get("starmask_contamination", 0.0))
     noise_gain = float(derived.get("starless_noise_gain", 1.0))
@@ -548,6 +591,10 @@ def stage7_quality_score(pipeline, quality: Optional[Dict[str, Any]]) -> float:
     coverage_penalty = max(0.0, pipeline.cfg.stage7_starmask_coverage_min_ratio - coverage_ratio)
     width_penalty = max(0.0, width_ratio - pipeline.cfg.stage7_starmask_width_ratio_max)
     halo_penalty = max(0.0, halo - pipeline._stage7_effective_halo_threshold())
+    compact_halo_penalty = max(
+        0.0,
+        compact_halo - pipeline._stage7_effective_halo_threshold(),
+    )
     black_hole_penalty = max(0.0, black_hole - pipeline.cfg.stage7_black_hole_score_max)
     contamination_penalty = max(
         0.0,
@@ -571,6 +618,7 @@ def stage7_quality_score(pipeline, quality: Optional[Dict[str, Any]]) -> float:
         + coverage_penalty * 2.0
         + width_penalty
         + halo_penalty
+        + compact_halo_penalty
         + black_hole_penalty * 2.0
         + contamination_penalty
         + noise_penalty
@@ -597,6 +645,10 @@ def stage7_repair_triggers(pipeline, quality: Optional[Dict[str, Any]]) -> List[
     except (TypeError, ValueError):
         halo = 0.0
     try:
+        compact_halo = float(derived.get("compact_halo_residue_score", 0.0))
+    except (TypeError, ValueError):
+        compact_halo = 0.0
+    try:
         dynamic_range_ratio = float(derived.get("starless_dynamic_range_ratio", 1.0))
     except (TypeError, ValueError):
         dynamic_range_ratio = 1.0
@@ -608,6 +660,8 @@ def stage7_repair_triggers(pipeline, quality: Optional[Dict[str, Any]]) -> List[
         triggers.append("residual_stars")
     if halo > float(pipeline._stage7_effective_halo_threshold()):
         triggers.append("halo_residue")
+    if compact_halo > float(pipeline._stage7_effective_halo_threshold()):
+        triggers.append("compact_halo_residue")
     if black_hole > float(pipeline.cfg.stage7_black_hole_score_max):
         triggers.append("black_hole")
     collapse = derived.get("dynamic_range_collapse")

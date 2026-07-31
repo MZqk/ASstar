@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 from dataclasses import asdict
 from pathlib import Path
@@ -34,6 +35,39 @@ VISUAL_ACCEPTANCE_STAGE_KEYS = frozenset(
 )
 
 
+def network_mode_enabled() -> bool:
+    """Return whether this run explicitly opted in to outbound network access."""
+    return (
+        os.getenv("SEESTAR_NETWORK_MODE", "0").strip().lower()
+        in ENV_TRUE_VALUES
+    )
+
+
+def _selection_payload(
+    obj: Dict[str, Any],
+    *envelope_keys: str,
+) -> Dict[str, Any]:
+    if not isinstance(obj, dict):
+        return {}
+    for key in envelope_keys:
+        value = obj.get(key)
+        if isinstance(value, dict):
+            return value
+    return obj
+
+
+def _selection_rationale(pipeline: object, payload: Dict[str, Any]) -> str:
+    return pipeline._short_text(
+        str(
+            payload.get(
+                "rationale",
+                payload.get("summary", payload.get("reason", "")),
+            )
+        ),
+        180,
+    )
+
+
 def _clamp_float(value: object, min_value: float, max_value: float) -> float:
     try:
         fvalue = float(value)  # type: ignore[arg-type]
@@ -56,6 +90,10 @@ def post_json_with_auth(
     api_key: str,
     timeout_sec: int,
 ) -> Dict[str, Any]:
+    if not network_mode_enabled():
+        raise RuntimeError(
+            "outbound AI request blocked: SEESTAR_NETWORK_MODE is disabled"
+        )
     if not endpoint.lower().startswith(("http://", "https://")):
         raise ValueError("SEESTAR_AI_ENDPOINT must be an absolute http(s) URL")
 
@@ -201,40 +239,25 @@ def extract_chat_content(pipeline: object, response_obj: Dict[str, Any]) -> str:
 
 
 def extract_adjustments_from_text(pipeline: object, text: str) -> Optional[Dict[str, Any]]:
-    keys = (
-        "background_protection",
-        "global_contrast_delta",
-        "global_saturation_delta",
-        "red_balance_delta",
-        "blue_balance_delta",
-        "denoise_strength",
-        "detail_boost",
+    """Compatibility parser that accepts only a candidate identifier.
+
+    Numeric parameters in free-form model text are intentionally ignored.
+    """
+    match = re.search(
+        r"[\"']?selected_candidate_id[\"']?\s*[:=：]\s*[\"']?([a-z0-9_-]+)",
+        text or "",
+        flags=re.IGNORECASE,
     )
-
-    adjustments: Dict[str, float] = {}
-    for key in keys:
-        pattern = (
-            rf"[\"']?{re.escape(key)}[\"']?"
-            r"\s*[:=：]\s*(-?\d+(?:\.\d+)?)"
-        )
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if not match:
-            continue
-        try:
-            adjustments[key] = float(match.group(1))
-        except (TypeError, ValueError):
-            continue
-
-    if not adjustments:
+    if not match:
         return None
 
-    summary = "fallback: parsed non-json ai plan text"
+    summary = "fallback: parsed candidate id from non-json AI response"
     first_line = text.splitlines()[0].strip() if text else ""
     if first_line:
         summary = pipeline._short_text(first_line, max_len=96)
     return {
         "summary": summary,
-        "adjustments": adjustments,
+        "selected_candidate_id": match.group(1).strip().lower(),
     }
 
 
@@ -296,7 +319,7 @@ def extract_first_json_object(pipeline: object, text: str) -> Dict[str, Any]:
     parsed_from_text = extract_adjustments_from_text(pipeline, text)
     if parsed_from_text is not None:
         pipeline.log.warn(
-            "[AI] Plan is not strict JSON; extracted adjustments from plain text fallback"
+            "[AI] Plan is not strict JSON; extracted candidate id from plain text fallback"
         )
         return parsed_from_text
 
@@ -324,98 +347,51 @@ def extract_stage_advisory_from_text(
             return cleaned
         return first_line or "parsed from non-json ai text"
 
-    def pick_float_any(names: Tuple[str, ...]) -> Optional[float]:
-        for name in names:
-            patterns = [
-                rf"{re.escape(name)}\s*[:=：]\s*(-?\d+(?:\.\d+)?)",
-                rf"{re.escape(name.replace('_', ' '))}\s*[:=：]\s*(-?\d+(?:\.\d+)?)",
-            ]
-            for pattern in patterns:
-                match = re.search(pattern, text, flags=re.IGNORECASE)
-                if match:
-                    try:
-                        return float(match.group(1))
-                    except (TypeError, ValueError):
-                        return None
-        return None
-
     if stage_name == "stage6_stretch_plan":
-        method = ""
+        candidate_id = ""
         if (
             "autostretch" in lowered
             or "auto stretch" in lowered
             or "automatic stretch" in lowered
             or "自动拉伸" in raw_text
         ):
-            method = "autostretch"
+            candidate_id = "autostretch"
+        elif "asinh_ghs" in lowered or "asinh+ghs" in lowered:
+            candidate_id = "asinh_ghs"
         elif "ghs" in lowered or "autoghs" in lowered or "generalized hyperbolic" in lowered:
-            method = "ghs"
+            candidate_id = "ghs"
         elif "asinh" in lowered or "arcsinh" in lowered or "反双曲" in raw_text:
-            method = "asinh"
-        if not method:
+            candidate_id = "asinh"
+        if not candidate_id:
             return None
-
-        def pick(name: str) -> Optional[float]:
-            return pick_float_any((name,))
-
-        params = {
-            "asinh_stretch": pick("asinh_stretch") or pipeline.cfg.asinh_stretch,
-            "asinh_offset": pick("asinh_offset") or pipeline.cfg.asinh_offset,
-            "ghs_shadowsclip": pick("ghs_shadowsclip") or pipeline.cfg.ghs_shadowsclip,
-            "ghs_stretchamount": pick("ghs_stretchamount") or pipeline.cfg.ghs_stretchamount,
-        }
         return {
-            "stage6_stretch_plan": {
-                "summary": pipeline._short_text(first_useful_line(), 140),
-                "method": method,
-                "params": params,
+            "stage6_stretch_selection": {
+                "rationale": pipeline._short_text(first_useful_line(), 140),
+                "selected_candidate_id": candidate_id,
             }
         }
     if stage_name == "stage7_starless_plan":
-        def pick_int(name: str, default: int) -> int:
-            match = re.search(
-                rf"{re.escape(name)}\s*[:=：]\s*(\d+)",
-                text,
-                flags=re.IGNORECASE,
-            )
-            if not match:
-                match = re.search(
-                    rf"{re.escape(name.replace('_', ' '))}\s*[:=：]\s*(\d+)",
-                    text,
-                    flags=re.IGNORECASE,
-                )
-            if match:
-                try:
-                    return int(match.group(1))
-                except (TypeError, ValueError):
-                    pass
-            return default
-
-        tile_size = pick_int("tile_size", 512)
-        overlap = pick_int("overlap", 64)
-        pair_match = re.search(
-            r"(?:tile|tile_size)?\s*(512|1024)\s*[/,x×]\s*(?:overlap)?\s*(64|96|128)",
-            text,
-            flags=re.IGNORECASE,
-        )
-        if pair_match:
-            tile_size = int(pair_match.group(1))
-            overlap = int(pair_match.group(2))
-        elif "tile_size" not in lowered and "tile size" not in lowered and "overlap" not in lowered:
-            if "larger overlap" in lowered or "increase overlap" in lowered or "more overlap" in lowered:
-                tile_size, overlap = 512, 96
-            elif "larger tile" in lowered or "increase tile" in lowered or "1024" in lowered:
-                tile_size, overlap = 1024, 64
-            elif "residual" in lowered or "残星" in raw_text:
-                tile_size, overlap = 512, 96
-            else:
-                return None
+        if "syqon_axiom_standard" in lowered or "axiom" in lowered:
+            candidate_id = "syqon_axiom_standard"
+        elif (
+            "syqon_large_context" in lowered
+            or "large context" in lowered
+            or "larger tile" in lowered
+            or "1024" in lowered
+        ):
+            candidate_id = "syqon_large_context"
+        elif (
+            "syqon_standard" in lowered
+            or "standard" in lowered
+            or "512" in lowered
+        ):
+            candidate_id = "syqon_standard"
+        else:
+            return None
         return {
-            "stage7_starless_plan": {
-                "summary": pipeline._short_text(first_useful_line(), 140),
-                "tile_size": tile_size,
-                "overlap": overlap,
-                "use_axiom": "axiom" in lowered,
+            "stage7_starless_selection": {
+                "rationale": pipeline._short_text(first_useful_line(), 140),
+                "selected_candidate_id": candidate_id,
             }
         }
     if stage_name == "stage7_quality":
@@ -442,22 +418,18 @@ def extract_stage_advisory_from_text(
             action = "fallback_sasp"
         if "degrade" in lowered:
             action = "degrade"
-        ai_scale = pick_float_any(
-            (
-                "stage9_star_intensity_scale",
-                "star_intensity_scale",
-                "intensity_scale",
-                "scale",
-            )
-        )
-        suppression = pick_float_any(
-            (
-                "residual_suppression_strength",
-                "suppression_strength",
-                "residual suppression",
-                "suppression",
-            )
-        )
+        if "conservative" in lowered:
+            star_remix_candidate_id = "conservative"
+        elif "reduced" in lowered:
+            star_remix_candidate_id = "reduced"
+        else:
+            star_remix_candidate_id = "full" if verdict == "ok" else "reduced"
+        if "guarded" in lowered:
+            residual_candidate_id = "guarded"
+        elif residual or "light" in lowered:
+            residual_candidate_id = "light"
+        else:
+            residual_candidate_id = "off"
         quality: Dict[str, Any] = {
             "verdict": verdict,
             "summary": pipeline._short_text(first_useful_line(), 160),
@@ -465,55 +437,25 @@ def extract_stage_advisory_from_text(
             "starmask_missing": missing,
             "starmask_too_wide": too_wide,
             "recommended_action": action,
+            "star_remix_candidate_id": star_remix_candidate_id,
+            "residual_suppression_candidate_id": residual_candidate_id,
         }
-        if ai_scale is not None:
-            quality["stage9_star_intensity_scale"] = ai_scale
-        if suppression is not None:
-            quality["residual_suppression_strength"] = suppression
-        elif residual:
-            quality["residual_suppression_strength"] = 0.12
         return {"stage7_quality": quality}
     if stage_name == "stage8_processing_plan":
-        def pick_float(name: str, default: float) -> float:
-            match = re.search(
-                rf"{re.escape(name)}\s*[:=：]\s*(-?\d+(?:\.\d+)?)",
-                text,
-                flags=re.IGNORECASE,
-            )
-            if not match:
-                match = re.search(
-                    rf"{re.escape(name.replace('_', ' '))}\s*[:=：]\s*(-?\d+(?:\.\d+)?)",
-                    text,
-                    flags=re.IGNORECASE,
-                )
-            if match:
-                try:
-                    return float(match.group(1))
-                except (TypeError, ValueError):
-                    pass
-            return default
-
-        if not any(
-            token in lowered
-            for token in ("saturation", "unsharp", "bg_factor", "bg factor")
-        ):
+        if "detail_preserving" in lowered or "detail preserving" in lowered:
+            candidate_id = "detail_preserving"
+        elif "conservative" in lowered:
+            candidate_id = "conservative"
+        elif "preserve" in lowered or "no enhancement" in lowered:
+            candidate_id = "preserve"
+        elif "balanced" in lowered:
+            candidate_id = "balanced"
+        else:
             return None
         return {
-            "stage8_processing_plan": {
-                "summary": pipeline._short_text(text.splitlines()[0] if text else "parsed from text", 140),
-                "saturation": pick_float("saturation", pipeline.cfg.nebula_saturation),
-                "bg_factor": int(round(pick_float("bg_factor", float(pipeline.cfg.nebula_bg_factor)))),
-                "unsharp_radius": pick_float("unsharp_radius", 0.8),
-                "unsharp_amount": pick_float("unsharp_amount", 0.35),
-                "apply_after_plugins": not any(
-                    token in lowered
-                    for token in (
-                        "keep plugin",
-                        "no after plugin",
-                        "apply_after_plugins=false",
-                        "apply after plugins false",
-                    )
-                ),
+            "stage8_processing_selection": {
+                "rationale": pipeline._short_text(first_useful_line(), 140),
+                "selected_candidate_id": candidate_id,
             }
         }
     return None
@@ -618,7 +560,12 @@ def request_stage_ai_advisory(
                         )
                         try:
                             plan_obj = pipeline._extract_first_json_object(content)
-                        except (TypeError, ValueError, json.JSONDecodeError):
+                        except (
+                            RuntimeError,
+                            TypeError,
+                            ValueError,
+                            json.JSONDecodeError,
+                        ):
                             parse_failures.append(
                                 f"endpoint={endpoint_url},mode={request_mode},"
                                 f"temperature={temperature},json_mode={json_mode}"
@@ -798,44 +745,54 @@ def request_visual_acceptance(
     }
 
 
-def normalize_stage6_ai_plan(pipeline: object, obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    plan = obj.get("stage6_stretch_plan") if isinstance(obj, dict) else None
-    if not isinstance(plan, dict):
-        plan = obj if isinstance(obj, dict) else {}
-    method = str(plan.get("method", "")).strip().lower().replace("-", "_")
-    aliases = {
-        "auto": "autostretch",
-        "auto_stretch": "autostretch",
-        "auto stretch": "autostretch",
-        "asinh_stretch": "asinh",
-        "autoghs": "ghs",
-        "asinh+ghs": "asinh_ghs",
-        "asinh ghs": "asinh_ghs",
-        "asinh_then_ghs": "asinh_ghs",
+def _stage6_stretch_candidate_presets(
+    pipeline: object,
+) -> Dict[str, Dict[str, Any]]:
+    """Build the code-owned compatibility stretch candidate set."""
+    params = {
+        "asinh_stretch": _clamp_float(
+            pipeline.cfg.asinh_stretch, 1.6, 3.6
+        ),
+        "asinh_offset": _clamp_float(
+            pipeline.cfg.asinh_offset, 0.0005, 0.006
+        ),
+        "ghs_shadowsclip": _clamp_float(
+            pipeline.cfg.ghs_shadowsclip, -3.6, -1.8
+        ),
+        "ghs_stretchamount": _clamp_float(
+            pipeline.cfg.ghs_stretchamount, 1.0, 2.8
+        ),
     }
-    method = aliases.get(method, method)
-    if method not in {"asinh", "asinh_ghs", "ghs", "autostretch"}:
-        return None
-
-    params_obj = plan.get("params")
-    params = params_obj if isinstance(params_obj, dict) else plan
     return {
-        "method": method,
-        "summary": str(plan.get("summary", plan.get("reason", ""))).strip(),
-        "params": {
-            "asinh_stretch": _clamp_float(
-                params.get("asinh_stretch", pipeline.cfg.asinh_stretch), 1.6, 3.6
-            ),
-            "asinh_offset": _clamp_float(
-                params.get("asinh_offset", pipeline.cfg.asinh_offset), 0.0005, 0.006
-            ),
-            "ghs_shadowsclip": _clamp_float(
-                params.get("ghs_shadowsclip", pipeline.cfg.ghs_shadowsclip), -3.6, -1.8
-            ),
-            "ghs_stretchamount": _clamp_float(
-                params.get("ghs_stretchamount", pipeline.cfg.ghs_stretchamount), 1.0, 2.8
-            ),
-        },
+        candidate_id: {
+            "candidate_id": candidate_id,
+            "method": candidate_id,
+            "params": dict(params),
+        }
+        for candidate_id in ("asinh", "asinh_ghs", "ghs", "autostretch")
+    }
+
+
+def normalize_stage6_ai_plan(
+    pipeline: object,
+    obj: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Resolve an AI response to one code-owned stretch candidate."""
+    plan = _selection_payload(
+        obj,
+        "stage6_stretch_selection",
+        "stage6_stretch_plan",
+    )
+    candidate_id = str(plan.get("selected_candidate_id", "")).strip().lower()
+    candidate = _stage6_stretch_candidate_presets(pipeline).get(candidate_id)
+    if candidate is None:
+        return None
+    return {
+        **candidate,
+        "selected_candidate_id": candidate_id,
+        "summary": _selection_rationale(pipeline, plan),
+        "confidence": _clamp_float(plan.get("confidence", 0.0), 0.0, 1.0),
+        "selection_contract": "candidate_id_only",
     }
 
 
@@ -844,36 +801,28 @@ def request_stage6_stretch_plan(
     baseline_features: Optional[object],
     baseline_quality: Optional[object],
 ) -> Optional[Dict[str, Any]]:
+    candidates = _stage6_stretch_candidate_presets(pipeline)
     observations = {
         "target_type": (
             getattr(getattr(pipeline, "auto_tune_result", None), "target_type", TargetType.UNKNOWN).name
         ),
         "features": asdict(baseline_features) if baseline_features else None,
         "quality_metrics": asdict(baseline_quality) if baseline_quality else None,
-        "current_params": {
-            "asinh_stretch": pipeline.cfg.asinh_stretch,
-            "asinh_offset": pipeline.cfg.asinh_offset,
-            "ghs_shadowsclip": pipeline.cfg.ghs_shadowsclip,
-            "ghs_stretchamount": pipeline.cfg.ghs_stretchamount,
-        },
+        "allowed_candidates": list(candidates.values()),
         "constraints": {
             "bg_median_min": pipeline.cfg.stage6_bg_median_min,
             "black_pixel_ratio_max": pipeline.cfg.stage6_black_pixel_ratio_max,
             "highlight_clip_ratio_max": pipeline.cfg.stage6_highlight_clip_ratio_max,
             "star_growth_ratio_max": pipeline.cfg.stage6_star_growth_ratio_max,
+            "model_output": "selected_candidate_id only; parameters are code-owned",
         },
     }
     schema = (
         "{\n"
-        '  "stage6_stretch_plan": {\n'
-        '    "summary": "short reason",\n'
-        '    "method": "asinh|asinh_ghs|ghs|autostretch",\n'
-        '    "params": {\n'
-        '      "asinh_stretch": 1.6,\n'
-        '      "asinh_offset": 0.0005,\n'
-        '      "ghs_shadowsclip": -3.6,\n'
-        '      "ghs_stretchamount": 1.0\n'
-        "    }\n"
+        '  "stage6_stretch_selection": {\n'
+        '    "selected_candidate_id": "asinh|asinh_ghs|ghs|autostretch",\n'
+        '    "confidence": 0.0,\n'
+        '    "rationale": "short reason"\n'
         "  }\n"
         "}"
     )
@@ -883,32 +832,165 @@ def request_stage6_stretch_plan(
         )
         plan = pipeline._normalize_stage6_ai_plan(raw_plan)
         if plan is None:
-            raise RuntimeError("stage6 AI plan has invalid method")
+            raise RuntimeError("stage6 AI selection has unknown candidate id")
         return plan
     except (OSError, RuntimeError, TypeError, ValueError) as e:
         pipeline.log.warn(f"[AI] stage6 stretch advisory unavailable: {e}")
         return None
 
 
-def normalize_stage7_starless_plan(pipeline: object, obj: Dict[str, Any]) -> Dict[str, Any]:
-    plan = obj.get("stage7_starless_plan") if isinstance(obj, dict) else None
-    if not isinstance(plan, dict):
-        plan = obj if isinstance(obj, dict) else {}
-
-    tile_size = _clamp_int(plan.get("tile_size", 512), 512, 1024)
-    overlap = _clamp_int(plan.get("overlap", 64), 64, 128)
-    if overlap >= tile_size:
-        overlap = max(64, min(128, tile_size // 4))
-
-    use_axiom = bool(plan.get("use_axiom", False))
-    if use_axiom and not pipeline._syqon_axiom_model_available():
-        use_axiom = False
-
+def normalize_stage7_stretch_selection(
+    pipeline: object,
+    obj: Dict[str, Any],
+    allowed_candidate_ids: List[str],
+) -> Optional[Dict[str, Any]]:
+    """Validate a model selection against the post-gate candidate allow-list."""
+    selection = _selection_payload(obj, "stage7_stretch_selection")
+    candidate_id = str(
+        selection.get("selected_candidate_id", "")
+    ).strip().lower()
+    allowed = {
+        str(item).strip().lower()
+        for item in allowed_candidate_ids
+        if str(item).strip()
+    }
+    if not candidate_id or candidate_id not in allowed:
+        return None
     return {
-        "summary": pipeline._short_text(str(plan.get("summary", "")), 180),
-        "tile_size": tile_size,
-        "overlap": overlap,
-        "use_axiom": use_axiom,
+        "selected_candidate_id": candidate_id,
+        "confidence": _clamp_float(
+            selection.get("confidence", 0.0), 0.0, 1.0
+        ),
+        "rationale": _selection_rationale(pipeline, selection),
+        "allowed_candidate_ids": sorted(allowed),
+        "selection_contract": "candidate_id_only_after_hard_gates",
+    }
+
+
+def request_stage7_stretch_selection(
+    pipeline: object,
+    accepted_attempts: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Ask AI to choose only among locally generated, hard-gate-passing IDs."""
+    if not pipeline._ai_stage_advisory_enabled("ai_stage6_enabled"):
+        return None
+    selectable = [
+        attempt
+        for attempt in accepted_attempts
+        if not bool(attempt.get("explicit_fallback"))
+        and str(attempt.get("name") or "").strip()
+    ]
+    allowed_ids = [str(attempt["name"]).strip() for attempt in selectable]
+    if not allowed_ids:
+        return None
+
+    observations = {
+        "target_type": (
+            pipeline._active_target_type()
+            if hasattr(pipeline, "_active_target_type")
+            else "unknown"
+        ),
+        "allowed_candidates": [
+            {
+                "candidate_id": str(attempt["name"]),
+                "method": str(attempt.get("method") or ""),
+                "risk_score": float(attempt.get("risk_score", 0.0) or 0.0),
+                "quality_metrics": attempt.get("metrics"),
+                "pixel_stats": attempt.get("pixel_stats"),
+                "preview_target_attainment": attempt.get(
+                    "preview_target_attainment"
+                ),
+                "target_local_quality": attempt.get("target_local_quality"),
+                "background_quality_gate": attempt.get(
+                    "background_quality_gate"
+                ),
+            }
+            for attempt in selectable
+        ],
+        "constraints": {
+            "allowed_candidate_ids": allowed_ids,
+            "all_candidates_passed_hard_gates": True,
+            "model_must_not_return_parameters": True,
+        },
+    }
+    schema = (
+        "{\n"
+        '  "stage7_stretch_selection": {\n'
+        f'    "selected_candidate_id": "one of: {"|".join(allowed_ids)}",\n'
+        '    "confidence": 0.0,\n'
+        '    "rationale": "short reason"\n'
+        "  }\n"
+        "}"
+    )
+    try:
+        raw = pipeline._request_stage_ai_advisory(
+            "stage7_stretch_selection",
+            schema,
+            observations,
+        )
+        selection = normalize_stage7_stretch_selection(
+            pipeline,
+            raw,
+            allowed_ids,
+        )
+        if selection is None:
+            raise RuntimeError(
+                "stage7 AI selection is not in the allowed candidate ids"
+            )
+        return selection
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        pipeline.log.warn(
+            f"[AI] stage7 stretch selection unavailable: {error}"
+        )
+        return None
+
+
+def stage7_starless_candidate_presets(
+    pipeline: object,
+) -> Dict[str, Dict[str, Any]]:
+    candidates = {
+        "syqon_standard": {
+            "candidate_id": "syqon_standard",
+            "tile_size": 512,
+            "overlap": 64,
+            "use_axiom": False,
+        },
+        "syqon_large_context": {
+            "candidate_id": "syqon_large_context",
+            "tile_size": 1024,
+            "overlap": 128,
+            "use_axiom": False,
+        },
+    }
+    if pipeline._syqon_axiom_model_available():
+        candidates["syqon_axiom_standard"] = {
+            "candidate_id": "syqon_axiom_standard",
+            "tile_size": 512,
+            "overlap": 64,
+            "use_axiom": True,
+        }
+    return candidates
+
+
+def normalize_stage7_starless_plan(
+    pipeline: object,
+    obj: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    plan = _selection_payload(
+        obj,
+        "stage7_starless_selection",
+        "stage7_starless_plan",
+    )
+    candidate_id = str(plan.get("selected_candidate_id", "")).strip().lower()
+    candidate = stage7_starless_candidate_presets(pipeline).get(candidate_id)
+    if candidate is None:
+        return None
+    return {
+        **candidate,
+        "selected_candidate_id": candidate_id,
+        "summary": _selection_rationale(pipeline, plan),
+        "confidence": _clamp_float(plan.get("confidence", 0.0), 0.0, 1.0),
+        "selection_contract": "candidate_id_only",
     }
 
 
@@ -917,28 +999,22 @@ def request_stage7_starless_plan(pipeline: object) -> Optional[Dict[str, Any]]:
         return None
     features = pipeline._measure_current_features()
     quality = pipeline._measure_current_quality()
+    candidates = stage7_starless_candidate_presets(pipeline)
     observations = {
         "features": asdict(features) if features else None,
         "quality_metrics": asdict(quality) if quality else None,
-        "current_syqon_defaults": {
-            "tile_size": 512,
-            "overlap": 64,
-            "use_axiom": False,
-            "axiom_available": pipeline._syqon_axiom_model_available(),
-        },
+        "allowed_candidates": list(candidates.values()),
         "constraints": {
-            "tile_size": "512..1024; do not use 256 as an optimization path",
-            "overlap": "64..128 and lower than tile_size; do not use 32 as an optimization path",
-            "use_axiom": "only true when axiom_available is true",
+            "allowed_candidate_ids": list(candidates),
+            "model_must_not_return_parameters": True,
         },
     }
     schema = (
         "{\n"
-        '  "stage7_starless_plan": {\n'
-        '    "summary": "short reason",\n'
-        '    "tile_size": 512,\n'
-        '    "overlap": 64,\n'
-        '    "use_axiom": false\n'
+        '  "stage7_starless_selection": {\n'
+        f'    "selected_candidate_id": "one of: {"|".join(candidates)}",\n'
+        '    "confidence": 0.0,\n'
+        '    "rationale": "short reason"\n'
         "  }\n"
         "}"
     )
@@ -946,7 +1022,12 @@ def request_stage7_starless_plan(pipeline: object) -> Optional[Dict[str, Any]]:
         raw = pipeline._request_stage_ai_advisory(
             "stage7_starless_plan", schema, observations
         )
-        return pipeline._normalize_stage7_starless_plan(raw)
+        plan = pipeline._normalize_stage7_starless_plan(raw)
+        if plan is None:
+            raise RuntimeError(
+                "stage7 starless AI selection has unknown candidate id"
+            )
+        return plan
     except (OSError, RuntimeError, TypeError, ValueError) as e:
         pipeline.log.warn(f"[AI] stage7 starless plan unavailable: {e}")
         return None
@@ -973,13 +1054,37 @@ def normalize_stage7_ai_quality(pipeline: object, obj: Dict[str, Any]) -> Dict[s
     if action not in {"accept", "retry_syqon", "fallback_sasp", "degrade"}:
         action = "accept" if verdict == "ok" else "retry_syqon"
 
-    def opt_float(name: str, lo: float, hi: float) -> Optional[float]:
-        if name not in quality:
-            return None
-        try:
-            return _clamp_float(quality.get(name), lo, hi)
-        except (TypeError, ValueError):
-            return None
+    star_remix_candidates = {
+        "full": 1.0,
+        "reduced": 0.75,
+        "conservative": 0.50,
+    }
+    residual_suppression_candidates = {
+        "off": 0.0,
+        "light": 0.08,
+        "guarded": 0.16,
+    }
+    default_star_remix_id = (
+        "full"
+        if verdict == "ok"
+        and not as_bool("starmask_missing")
+        and not as_bool("starmask_too_wide")
+        else "reduced"
+    )
+    default_residual_id = "light" if as_bool("residual_stars") else "off"
+    star_remix_id = str(
+        quality.get("star_remix_candidate_id", default_star_remix_id)
+    ).strip().lower()
+    residual_id = str(
+        quality.get(
+            "residual_suppression_candidate_id",
+            default_residual_id,
+        )
+    ).strip().lower()
+    if star_remix_id not in star_remix_candidates:
+        star_remix_id = default_star_remix_id
+    if residual_id not in residual_suppression_candidates:
+        residual_id = default_residual_id
 
     return {
         "verdict": verdict,
@@ -987,13 +1092,16 @@ def normalize_stage7_ai_quality(pipeline: object, obj: Dict[str, Any]) -> Dict[s
         "starmask_missing": as_bool("starmask_missing"),
         "starmask_too_wide": as_bool("starmask_too_wide"),
         "recommended_action": action,
-        "stage9_star_intensity_scale": opt_float(
-            "stage9_star_intensity_scale", 0.35, 1.0
-        ),
-        "residual_suppression_strength": opt_float(
-            "residual_suppression_strength", 0.0, 0.25
-        ),
+        "star_remix_candidate_id": star_remix_id,
+        "stage9_star_intensity_scale": star_remix_candidates[
+            star_remix_id
+        ],
+        "residual_suppression_candidate_id": residual_id,
+        "residual_suppression_strength": residual_suppression_candidates[
+            residual_id
+        ],
         "summary": pipeline._short_text(str(quality.get("summary", "")), 180),
+        "selection_contract": "candidate_id_only",
     }
 
 
@@ -1011,8 +1119,8 @@ def request_stage7_quality_ai(
         '    "residual_stars": false,\n'
         '    "starmask_missing": false,\n'
         '    "starmask_too_wide": false,\n'
-        '    "stage9_star_intensity_scale": 0.75,\n'
-        '    "residual_suppression_strength": 0.08,\n'
+        '    "star_remix_candidate_id": "full|reduced|conservative",\n'
+        '    "residual_suppression_candidate_id": "off|light|guarded",\n'
         '    "recommended_action": "accept|retry_syqon|fallback_sasp|degrade"\n'
         "  }\n"
         "}"
@@ -1045,26 +1153,68 @@ def request_stage7_quality_ai(
         return None
 
 
-def normalize_stage8_processing_plan(pipeline: object, obj: Dict[str, Any]) -> Dict[str, Any]:
-    plan = obj.get("stage8_processing_plan") if isinstance(obj, dict) else None
-    if not isinstance(plan, dict):
-        plan = obj if isinstance(obj, dict) else {}
-
+def stage8_processing_candidate_presets(
+    pipeline: object,
+) -> Dict[str, Dict[str, Any]]:
+    saturation = _clamp_float(
+        pipeline.cfg.nebula_saturation, 0.0, 0.65
+    )
+    bg_factor = _clamp_int(pipeline.cfg.nebula_bg_factor, 0, 3)
     return {
-        "summary": pipeline._short_text(str(plan.get("summary", "")), 180),
-        "saturation": _clamp_float(
-            plan.get("saturation", pipeline.cfg.nebula_saturation), 0.0, 0.65
-        ),
-        "bg_factor": _clamp_int(
-            plan.get("bg_factor", pipeline.cfg.nebula_bg_factor), 0, 3
-        ),
-        "unsharp_radius": _clamp_float(
-            plan.get("unsharp_radius", 0.8), 0.0, 1.2
-        ),
-        "unsharp_amount": _clamp_float(
-            plan.get("unsharp_amount", 0.35), 0.0, 0.60
-        ),
-        "apply_after_plugins": bool(plan.get("apply_after_plugins", True)),
+        "preserve": {
+            "candidate_id": "preserve",
+            "saturation": 0.0,
+            "bg_factor": 0,
+            "unsharp_radius": 0.0,
+            "unsharp_amount": 0.0,
+            "apply_after_plugins": False,
+        },
+        "conservative": {
+            "candidate_id": "conservative",
+            "saturation": min(saturation, 0.08),
+            "bg_factor": min(bg_factor, 1),
+            "unsharp_radius": 0.55,
+            "unsharp_amount": 0.18,
+            "apply_after_plugins": True,
+        },
+        "balanced": {
+            "candidate_id": "balanced",
+            "saturation": saturation,
+            "bg_factor": bg_factor,
+            "unsharp_radius": 0.8,
+            "unsharp_amount": 0.35,
+            "apply_after_plugins": True,
+        },
+        "detail_preserving": {
+            "candidate_id": "detail_preserving",
+            "saturation": min(saturation, 0.12),
+            "bg_factor": min(bg_factor, 1),
+            "unsharp_radius": 0.65,
+            "unsharp_amount": 0.25,
+            "apply_after_plugins": True,
+        },
+    }
+
+
+def normalize_stage8_processing_plan(
+    pipeline: object,
+    obj: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    plan = _selection_payload(
+        obj,
+        "stage8_processing_selection",
+        "stage8_processing_plan",
+    )
+    candidate_id = str(plan.get("selected_candidate_id", "")).strip().lower()
+    candidate = stage8_processing_candidate_presets(pipeline).get(candidate_id)
+    if candidate is None:
+        return None
+    return {
+        **candidate,
+        "selected_candidate_id": candidate_id,
+        "summary": _selection_rationale(pipeline, plan),
+        "confidence": _clamp_float(plan.get("confidence", 0.0), 0.0, 1.0),
+        "selection_contract": "candidate_id_only",
     }
 
 
@@ -1073,32 +1223,22 @@ def request_stage8_processing_plan(pipeline: object) -> Optional[Dict[str, Any]]
         return None
     features = pipeline._measure_current_features()
     quality = pipeline._measure_current_quality()
+    candidates = stage8_processing_candidate_presets(pipeline)
     observations = {
         "features": asdict(features) if features else None,
         "quality_metrics": asdict(quality) if quality else None,
-        "current_params": {
-            "saturation": pipeline.cfg.nebula_saturation,
-            "bg_factor": pipeline.cfg.nebula_bg_factor,
-            "unsharp_radius": 0.8,
-            "unsharp_amount": 0.35,
-        },
+        "allowed_candidates": list(candidates.values()),
         "constraints": {
-            "saturation": "0.0..0.65",
-            "bg_factor": "0..3 integer",
-            "unsharp_radius": "0.0..1.2, 0 disables unsharp",
-            "unsharp_amount": "0.0..0.60, 0 disables unsharp",
-            "apply_after_plugins": "true by default; use false only when plugin output should be kept untouched",
+            "allowed_candidate_ids": list(candidates),
+            "model_must_not_return_parameters": True,
         },
     }
     schema = (
         "{\n"
-        '  "stage8_processing_plan": {\n'
-        '    "summary": "short reason",\n'
-        '    "saturation": 0.20,\n'
-        '    "bg_factor": 1,\n'
-        '    "unsharp_radius": 0.8,\n'
-        '    "unsharp_amount": 0.35,\n'
-        '    "apply_after_plugins": true\n'
+        '  "stage8_processing_selection": {\n'
+        f'    "selected_candidate_id": "one of: {"|".join(candidates)}",\n'
+        '    "confidence": 0.0,\n'
+        '    "rationale": "short reason"\n'
         "  }\n"
         "}"
     )
@@ -1106,7 +1246,12 @@ def request_stage8_processing_plan(pipeline: object) -> Optional[Dict[str, Any]]
         raw = pipeline._request_stage_ai_advisory(
             "stage8_processing_plan", schema, observations
         )
-        return pipeline._normalize_stage8_processing_plan(raw)
+        plan = pipeline._normalize_stage8_processing_plan(raw)
+        if plan is None:
+            raise RuntimeError(
+                "stage8 AI selection has unknown candidate id"
+            )
+        return plan
     except (OSError, RuntimeError, TypeError, ValueError) as e:
         pipeline.log.warn(f"[AI] stage8 processing plan unavailable: {e}")
         return None
@@ -1131,20 +1276,32 @@ def normalize_stage8_ai_quality(pipeline: object, obj: Dict[str, Any]) -> Dict[s
     action = str(quality.get("recommended_action", "accept")).strip().lower()
     if action not in {"accept", "blue_guard", "conservative_rerun", "rollback"}:
         action = "accept" if verdict == "ok" else "conservative_rerun"
-    target_blue_excess = quality.get("target_blue_excess", None)
-    if target_blue_excess is not None:
-        try:
-            target_blue_excess = _clamp_float(target_blue_excess, 0.05, 0.16)
-        except (TypeError, ValueError):
-            target_blue_excess = None
+    blue_guard_candidates = {
+        "strict": 0.07,
+        "balanced": 0.10,
+        "permissive": 0.14,
+    }
+    default_blue_guard_id = (
+        "strict" if as_bool("blue_bias") else "balanced"
+    )
+    blue_guard_id = str(
+        quality.get(
+            "blue_guard_candidate_id",
+            default_blue_guard_id,
+        )
+    ).strip().lower()
+    if blue_guard_id not in blue_guard_candidates:
+        blue_guard_id = default_blue_guard_id
     return {
         "verdict": verdict,
         "oversaturated": as_bool("oversaturated"),
         "blue_bias": as_bool("blue_bias"),
         "microcontrast_overdone": as_bool("microcontrast_overdone"),
         "recommended_action": action,
-        "target_blue_excess": target_blue_excess,
+        "blue_guard_candidate_id": blue_guard_id,
+        "target_blue_excess": blue_guard_candidates[blue_guard_id],
         "summary": pipeline._short_text(str(quality.get("summary", "")), 180),
+        "selection_contract": "candidate_id_only",
     }
 
 
@@ -1162,7 +1319,7 @@ def request_stage8_quality_ai(
         '    "oversaturated": false,\n'
         '    "blue_bias": false,\n'
         '    "microcontrast_overdone": false,\n'
-        '    "target_blue_excess": 0.10,\n'
+        '    "blue_guard_candidate_id": "strict|balanced|permissive",\n'
         '    "recommended_action": "accept|blue_guard|conservative_rerun|rollback"\n'
         "  }\n"
         "}"
@@ -1195,11 +1352,10 @@ def request_stage8_quality_ai(
         return None
 
 
-def normalize_ai_adjustments(pipeline: object, obj: Dict[str, Any]) -> Dict[str, float]:
-    adjustments = obj.get("adjustments")
-    if not isinstance(adjustments, dict):
-        adjustments = {}
-
+def _normalize_adjustment_values(
+    pipeline: object,
+    adjustments: Dict[str, Any],
+) -> Dict[str, float]:
     def pick(name: str, default: float) -> float:
         value = adjustments.get(name, default)
         try:
@@ -1233,6 +1389,77 @@ def normalize_ai_adjustments(pipeline: object, obj: Dict[str, Any]) -> Dict[str,
             pick("blend_strength", pipeline.cfg.ai_strength), 0.05, 0.20
         ),
     }
+
+
+def stage11_adjustment_candidate_presets(
+    pipeline: object,
+) -> Dict[str, Dict[str, float]]:
+    configured_blend = _clamp_float(
+        pipeline.cfg.ai_strength, 0.05, 0.20
+    )
+    return {
+        "preserve": {
+            "background_protection": 0.95,
+            "global_contrast_delta": 0.0,
+            "global_saturation_delta": 0.0,
+            "red_balance_delta": 0.0,
+            "blue_balance_delta": 0.0,
+            "denoise_strength": 0.0,
+            "detail_boost": 0.0,
+            "blend_strength": 0.05,
+        },
+        "conservative": {
+            "background_protection": 0.92,
+            "global_contrast_delta": 0.025,
+            "global_saturation_delta": 0.015,
+            "red_balance_delta": 0.0,
+            "blue_balance_delta": 0.0,
+            "denoise_strength": 0.04,
+            "detail_boost": 0.015,
+            "blend_strength": min(configured_blend, 0.10),
+        },
+        "balanced": {
+            "background_protection": 0.88,
+            "global_contrast_delta": 0.04,
+            "global_saturation_delta": 0.03,
+            "red_balance_delta": 0.0,
+            "blue_balance_delta": 0.0,
+            "denoise_strength": 0.06,
+            "detail_boost": 0.03,
+            "blend_strength": configured_blend,
+        },
+        "detail_safe": {
+            "background_protection": 0.92,
+            "global_contrast_delta": 0.03,
+            "global_saturation_delta": 0.015,
+            "red_balance_delta": 0.0,
+            "blue_balance_delta": 0.0,
+            "denoise_strength": 0.035,
+            "detail_boost": 0.04,
+            "blend_strength": min(configured_blend, 0.10),
+        },
+    }
+
+
+def normalize_ai_adjustments(
+    pipeline: object,
+    obj: Dict[str, Any],
+) -> Dict[str, float]:
+    """Map an AI-selected preset ID to immutable, code-owned adjustments."""
+    selection = _selection_payload(
+        obj,
+        "stage11_adjustment_selection",
+    )
+    candidate_id = str(
+        selection.get("selected_candidate_id", "")
+    ).strip().lower()
+    candidate = stage11_adjustment_candidate_presets(pipeline).get(
+        candidate_id
+    )
+    if candidate is None:
+        raise ValueError("Stage11 AI response has unknown candidate id")
+    pipeline._ai_selected_candidate_id = candidate_id
+    return _normalize_adjustment_values(pipeline, candidate)
 
 
 def stage11_feature_based_fallback_adjustments(
@@ -1307,7 +1534,8 @@ def stage11_feature_based_fallback_adjustments(
         adjustments["red_balance_delta"] = 0.008
         notes.append("warm nebula signal preserved")
 
-    normalized = pipeline._normalize_ai_adjustments({"adjustments": adjustments})
+    normalized = _normalize_adjustment_values(pipeline, adjustments)
+    pipeline._ai_selected_candidate_id = "feature_based_fallback"
     reason = "; ".join(notes) if notes else "balanced conservative fallback"
     return normalized, f"fallback: feature-based conservative adjustments ({reason})"
 
@@ -1330,25 +1558,23 @@ def request_ai_adjustments(
 
     system_prompt = (
         "You are an expert astronomical image post-processing advisor. "
-        "Return strict JSON only. Keep edits conservative and scientifically realistic. "
-        "Do not hallucinate objects. Keep star colors natural and avoid over-saturation."
+        "Return strict JSON only. Select exactly one supplied candidate id. "
+        "Never return or modify numeric parameters. Keep edits conservative and "
+        "scientifically realistic. Do not hallucinate objects."
     )
+    candidates = stage11_adjustment_candidate_presets(pipeline)
     user_prompt = (
-        "Generate local postprocess suggestions for deep-sky image.\n"
+        "Select one code-owned local postprocess candidate for this deep-sky image.\n"
         f"Model prompt context: {prompt}\n"
         f"Image features: {format_feature_summary(source_features)}\n"
+        "Allowed candidates (read-only):\n"
+        f"{json.dumps(candidates, ensure_ascii=False, sort_keys=True)}\n"
         "Output JSON schema:\n"
         "{\n"
-        '  "summary": "short rationale",\n'
-        '  "adjustments": {\n'
-        '    "background_protection": 0.60..0.98,\n'
-        '    "global_contrast_delta": -0.10..0.12,\n'
-        '    "global_saturation_delta": -0.10..0.12,\n'
-        '    "red_balance_delta": -0.08..0.08,\n'
-        '    "blue_balance_delta": -0.08..0.08,\n'
-        '    "denoise_strength": 0.00..0.20,\n'
-        '    "detail_boost": 0.00..0.12,\n'
-        '    "blend_strength": 0.05..0.20\n'
+        '  "stage11_adjustment_selection": {\n'
+        f'    "selected_candidate_id": "one of: {"|".join(candidates)}",\n'
+        '    "confidence": 0.0,\n'
+        '    "rationale": "short reason"\n'
         "  }\n"
         "}\n"
         "JSON only, no markdown."
@@ -1403,7 +1629,19 @@ def request_ai_adjustments(
                         )
                         plan_obj = pipeline._extract_first_json_object(content)
                         adjustments = pipeline._normalize_ai_adjustments(plan_obj)
-                        summary = str(plan_obj.get("summary", "")).strip()
+                        selection = _selection_payload(
+                            plan_obj,
+                            "stage11_adjustment_selection",
+                        )
+                        summary = _selection_rationale(pipeline, selection)
+                        selected_id = str(
+                            selection.get("selected_candidate_id", "")
+                        ).strip()
+                        if selected_id:
+                            summary = (
+                                f"candidate={selected_id}"
+                                + (f"; {summary}" if summary else "")
+                            )
                         pipeline._ai_plan_parse_fallback = False
                         pipeline._ai_plan_parse_fallback_reason = None
                         if temperature != 0.1:

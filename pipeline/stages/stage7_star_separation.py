@@ -1,7 +1,7 @@
 """Star separation and star-mask preparation."""
 from typing import Any, Dict, List, Optional, Tuple
 
-from models import PipelineStage
+from models import PipelineStage, StarSeparationState
 from pipeline_safety import should_bypass_star_separation
 from sirilpy.exceptions import CommandError, SirilError
 
@@ -41,6 +41,266 @@ def _stage7_chroma_repair_acceptance(
         "minimum_reduction_ratio": min_reduction,
         "residual_not_worse": residual_not_worse,
         "halo_not_worse": halo_not_worse,
+    }
+
+
+def _stage7_starless_pixel_repair_trigger(
+    pipeline,
+    quality: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Decide whether the accepted Stage 6 starless still needs pixel repair."""
+    if not isinstance(quality, dict):
+        return {
+            "triggered": False,
+            "reason": "quality_unavailable",
+        }
+
+    status = str(quality.get("status", "") or "").strip().lower()
+    derived = quality.get("derived") or {}
+    if not isinstance(derived, dict):
+        derived = {}
+
+    def _metric(name: str) -> float:
+        try:
+            return max(float(derived.get(name, 0.0) or 0.0), 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    halo_score = _metric("halo_residue_score")
+    compact_halo_score = _metric("compact_halo_residue_score")
+    measured_halo = max(halo_score, compact_halo_score)
+    base_limit = float(pipeline.cfg.stage7_halo_residue_score_max)
+    target_limit = float(pipeline._stage7_effective_halo_threshold())
+    target_type = str(pipeline._active_target_type() or "")
+
+    reason = ""
+    if status != "ok":
+        reason = f"quality_status={status or 'unknown'}"
+    elif (
+        target_type == "bright_emission_reflection_nebula"
+        and measured_halo > base_limit
+    ):
+        # Bright nebulae have a relaxed acceptance limit so real nebulosity is
+        # not rejected as halo. The same relaxed limit previously prevented the
+        # transactional halo repair from running, even though Stage 8 treated
+        # the base-limit exceedance as an enhancement advisory.
+        reason = "bright_nebula_halo_advisory"
+
+    return {
+        "triggered": bool(reason),
+        "reason": reason,
+        "quality_status": status or "unknown",
+        "target_type": target_type,
+        "halo_residue_score": halo_score,
+        "compact_halo_residue_score": compact_halo_score,
+        "measured_halo_score": measured_halo,
+        "base_halo_limit": base_limit,
+        "target_halo_limit": target_limit,
+        "within_target_limit": measured_halo <= target_limit,
+    }
+
+
+def _stage8_handoff_from_stage6(
+    pipeline,
+    quality: Optional[Dict[str, Any]],
+    pixel_repairs: List[Dict[str, Any]],
+    *,
+    separation_accepted: bool,
+) -> Dict[str, Any]:
+    """Build the typed Stage 6 -> Stage 8 processing decision."""
+    quality = quality if isinstance(quality, dict) else {}
+    derived = quality.get("derived") or {}
+    derived = derived if isinstance(derived, dict) else {}
+
+    def metric(name: str) -> float:
+        try:
+            return max(float(derived.get(name, 0.0) or 0.0), 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    global_halo = metric("halo_residue_score")
+    compact_halo = metric("compact_halo_residue_score")
+    effective_halo = max(global_halo, compact_halo)
+    residual_score = metric("residual_star_score")
+    noise_gain = metric("starless_noise_gain")
+    base_limit = float(pipeline.cfg.stage7_halo_residue_score_max)
+    accepted_limit = float(pipeline._stage7_effective_halo_threshold())
+    target_type = str(pipeline._active_target_type() or "")
+    quality_status = str(quality.get("status") or "unknown").strip().lower()
+    accepted_repair = next(
+        (
+            item
+            for item in reversed(pixel_repairs)
+            if isinstance(item, dict) and bool(item.get("accepted"))
+        ),
+        None,
+    )
+    repair_trigger = (
+        accepted_repair.get("trigger") or {}
+        if isinstance(accepted_repair, dict)
+        else {}
+    )
+    repair_trigger = repair_trigger if isinstance(repair_trigger, dict) else {}
+
+    def trigger_metric(name: str) -> float:
+        try:
+            return max(float(repair_trigger.get(name, 0.0) or 0.0), 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    trigger_global_halo = trigger_metric("halo_residue_score")
+    trigger_compact_halo = trigger_metric("compact_halo_residue_score")
+    trigger_effective_halo = max(trigger_global_halo, trigger_compact_halo)
+    bright_advisory_triggered = (
+        str(repair_trigger.get("reason") or "")
+        == "bright_nebula_halo_advisory"
+        and trigger_effective_halo > base_limit
+    )
+    reasons: List[Dict[str, Any]] = []
+    policy = "full"
+
+    def add_reason(code: str, **values: Any) -> None:
+        reasons.append({"code": code, "source_stage": 6, **values})
+
+    if not separation_accepted:
+        policy = "skip"
+        add_reason(
+            "star_separation_unavailable",
+            quality_status=quality_status,
+        )
+    elif quality_status != "ok":
+        policy = "skip"
+        add_reason(
+            "stage6_starless_quality_not_ok",
+            quality_status=quality_status,
+        )
+    elif residual_score > float(pipeline.cfg.stage7_residual_star_score_max):
+        policy = "skip"
+        add_reason(
+            "stage6_residual_star_score_exceeded",
+            value=residual_score,
+            accepted_limit=float(pipeline.cfg.stage7_residual_star_score_max),
+        )
+    elif noise_gain > float(pipeline.cfg.stage7_starless_noise_gain_max):
+        policy = "skip"
+        add_reason(
+            "stage6_starless_noise_gain_exceeded",
+            value=noise_gain,
+            accepted_limit=float(pipeline.cfg.stage7_starless_noise_gain_max),
+        )
+    elif effective_halo > accepted_limit:
+        policy = "skip"
+        add_reason(
+            "stage6_halo_residue_hard_limit_exceeded",
+            value=effective_halo,
+            global_value=global_halo,
+            compact_value=compact_halo,
+            base_limit=base_limit,
+            accepted_limit=accepted_limit,
+        )
+    elif (
+        target_type == "bright_emission_reflection_nebula"
+        and (effective_halo > base_limit or bright_advisory_triggered)
+    ):
+        policy = "limited"
+        advisory_global = (
+            trigger_global_halo if bright_advisory_triggered else global_halo
+        )
+        advisory_compact = (
+            trigger_compact_halo if bright_advisory_triggered else compact_halo
+        )
+        advisory_effective = max(advisory_global, advisory_compact)
+        advisory_value = (
+            advisory_global
+            if advisory_global > base_limit
+            else advisory_compact
+        )
+        add_reason(
+            "bright_nebula_halo_advisory",
+            metric=(
+                "halo_residue_score"
+                if advisory_global > base_limit
+                else "compact_halo_residue_score"
+            ),
+            value=advisory_value,
+            effective_value=advisory_effective,
+            global_value=advisory_global,
+            compact_value=advisory_compact,
+            post_repair_global_value=global_halo,
+            post_repair_compact_value=compact_halo,
+            base_limit=base_limit,
+            accepted_limit=accepted_limit,
+            within_accepted_limit=advisory_effective <= accepted_limit,
+        )
+    elif accepted_repair is not None and bool(
+        getattr(
+            pipeline.cfg,
+            "stage8_force_conservative_after_stage7_repair",
+            True,
+        )
+    ):
+        policy = "limited"
+        add_reason(
+            "stage6_starless_pixel_repair_accepted",
+            acceptance_path=accepted_repair.get("acceptance_path"),
+            global_value=global_halo,
+            compact_value=compact_halo,
+            base_limit=base_limit,
+            accepted_limit=accepted_limit,
+        )
+
+    primary_reason = reasons[0] if reasons else {}
+    reason_code = str(primary_reason.get("code") or "")
+    reason_text = ""
+    if reason_code == "bright_nebula_halo_advisory":
+        reason_text = (
+            "bright_nebula_halo_advisory: "
+            f"{float(primary_reason['value']):.3f} > {base_limit:.3f}, "
+            f"accepted_limit={accepted_limit:.3f}"
+        )
+    elif reason_code:
+        reason_text = reason_code
+
+    handoff_metrics: Dict[str, Any] = {
+        "halo_residue_score": global_halo,
+        "compact_halo_residue_score": compact_halo,
+        "effective_halo_residue_score": effective_halo,
+        "base_halo_limit": base_limit,
+        "accepted_halo_limit": accepted_limit,
+        "residual_star_score": residual_score,
+        "starless_noise_gain": noise_gain,
+    }
+    if bright_advisory_triggered:
+        handoff_metrics.update(
+            {
+                "trigger_halo_residue_score": trigger_global_halo,
+                "trigger_compact_halo_residue_score": trigger_compact_halo,
+                "trigger_effective_halo_residue_score": trigger_effective_halo,
+            }
+        )
+
+    return {
+        "schema": "seestar.stage8-handoff.v1",
+        "requested_policy": policy,
+        "processing_policy": policy,
+        "source_stage": 6,
+        "source_stem": None,
+        "passthrough": False,
+        "restricted_downstream": policy != "full",
+        "reason_code": reason_code,
+        "reason_text": reason_text,
+        "reasons": reasons,
+        "quality_status": quality_status,
+        "metrics": handoff_metrics,
+        "repair": {
+            "attempted": bool(pixel_repairs),
+            "accepted": accepted_repair is not None,
+            "acceptance_path": (
+                accepted_repair.get("acceptance_path")
+                if accepted_repair is not None
+                else None
+            ),
+        },
     }
 
 
@@ -183,6 +443,23 @@ def run_stage6_star_separation(pipeline) -> None:
     pipeline.log.stage_start(stage_label)
     pipeline._stage7_starless_skipped = False
     pipeline._stage8_conservative_mode = False
+    pipeline._stage8_handoff = {
+        "schema": "seestar.stage8-handoff.v1",
+        "requested_policy": "full",
+        "processing_policy": "full",
+        "source_stage": 6,
+        "source_stem": None,
+        "passthrough": False,
+        "restricted_downstream": False,
+        "reason_code": "",
+        "reason_text": "",
+        "reasons": [],
+        "quality_status": "pending",
+        "metrics": {},
+        "repair": {"attempted": False, "accepted": False},
+    }
+    pipeline._star_separation_state = StarSeparationState.PENDING.value
+    pipeline._stage6_passthrough_source = None
     selected_source_stem, star_separation_mode, mode_input_records = (
         _prepare_star_separation_source(pipeline)
     )
@@ -190,6 +467,11 @@ def run_stage6_star_separation(pipeline) -> None:
         pipeline._active_target_type()
         if hasattr(pipeline, "_active_target_type")
         else "generic_low_snr_safe"
+    )
+    secondary_labels = list(
+        (getattr(pipeline, "target_profile", {}) or {}).get(
+            "secondary_labels", []
+        )
     )
     if should_bypass_star_separation(
         target_type,
@@ -203,11 +485,30 @@ def run_stage6_star_separation(pipeline) -> None:
         ]
         try:
             pipeline.cmd_with_check("load", selected_source_stem)
-            pipeline.cmd_with_check("save", "starless")
-            pipeline.starless_file = pipeline.process_dir / "starless.fit"
+            stage_saved = pipeline._save_stage_output("stage6_passthrough")
+            pipeline._stage6_passthrough_source = "stage6_passthrough"
+            pipeline.starless_file = None
             pipeline.starmask_file = None
             pipeline._stage7_starless_skipped = True
             pipeline._star_preserve_target_bypass = True
+            pipeline._star_separation_state = StarSeparationState.TARGET_BYPASS.value
+            pipeline._stage8_handoff.update(
+                {
+                    "requested_policy": "skip",
+                    "processing_policy": "skip",
+                    "restricted_downstream": False,
+                    "reason_code": "star_preserve_target_bypass",
+                    "reason_text": "star_preserve_target_bypass",
+                    "reasons": [
+                        {
+                            "code": "star_preserve_target_bypass",
+                            "source_stage": 6,
+                            "target_type": target_type,
+                        }
+                    ],
+                    "quality_status": "skipped",
+                }
+            )
             quality_record = {
                 "attempt": "star_preserve_target_bypass",
                 "tool_label": "none",
@@ -225,7 +526,10 @@ def run_stage6_star_separation(pipeline) -> None:
                     "attempts": [quality_record],
                     "selected": quality_record,
                     "mode": "star_preserve_target_bypass",
+                    "star_separation_state": pipeline._star_separation_state,
                     "target_type": target_type,
+                    "secondary_labels": secondary_labels,
+                    "routing_basis": "primary_target_only",
                     "star_separation_mode": star_separation_mode,
                     "input_domain": "linear",
                     "selected_source_stem": selected_source_stem,
@@ -234,15 +538,15 @@ def run_stage6_star_separation(pipeline) -> None:
                         "scale": 1.0,
                         "reason": "no remix required for star-preserve target",
                     },
+                    "stage8_handoff": pipeline._stage8_handoff,
                     "retry_max": 0,
                 },
             )
-            stage_saved = pipeline._save_stage_output("stage7_starless")
             if stage_saved and hasattr(pipeline, "_create_stage_review_bundle"):
                 review = pipeline._create_stage_review_bundle(
                     "stage6_star_separation",
                     "stage6_input",
-                    "stage7_starless",
+                    "stage6_passthrough",
                     context={"mode": "star_preserve_target_bypass"},
                     candidates=[quality_record],
                     selected_candidate=str(quality_record.get("attempt")),
@@ -293,10 +597,30 @@ def run_stage6_star_separation(pipeline) -> None:
             message_parts.append("reason=" + ", ".join(reasons[:3]))
         try:
             pipeline.cmd_with_check("load", source_stem)
-            pipeline.cmd_with_check("save", "starless")
-            pipeline.starless_file = pipeline.process_dir / "starless.fit"
+            stage_saved = pipeline._save_stage_output("stage6_passthrough")
+            pipeline._stage6_passthrough_source = "stage6_passthrough"
+            pipeline.starless_file = None
             pipeline.starmask_file = None
             pipeline._stage7_starless_skipped = True
+            pipeline._stage8_conservative_mode = True
+            pipeline._star_separation_state = StarSeparationState.REJECTED.value
+            pipeline._stage8_handoff.update(
+                {
+                    "requested_policy": "skip",
+                    "processing_policy": "skip",
+                    "restricted_downstream": True,
+                    "reason_code": "pre_starless_gate_rejected",
+                    "reason_text": "pre_starless_gate_rejected",
+                    "reasons": [
+                        {
+                            "code": "pre_starless_gate_rejected",
+                            "source_stage": 6,
+                            "issues": reasons,
+                        }
+                    ],
+                    "quality_status": "skipped",
+                }
+            )
             quality_record = {
                 "attempt": "skipped_by_pre_starless_gate",
                 "tool_label": "none",
@@ -315,22 +639,23 @@ def run_stage6_star_separation(pipeline) -> None:
                     "attempts": [quality_record],
                     "selected": quality_record,
                     "mode": "skipped_by_pre_starless_gate",
+                    "star_separation_state": pipeline._star_separation_state,
                     "star_separation_mode": star_separation_mode,
                     "input_domain": "linear",
                     "selected_source_stem": source_stem,
                     "conservative_inputs": mode_input_records,
                     "pre_starless_gate": gate_report,
                     "stage9_star_remix": stage9_record,
+                    "stage8_handoff": pipeline._stage8_handoff,
                     "retry_max": 0,
                 },
             )
             pipeline._export_sasp_exchange_files()
-            stage_saved = pipeline._save_stage_output("stage7_starless")
             if stage_saved and hasattr(pipeline, "_create_stage_review_bundle"):
                 review = pipeline._create_stage_review_bundle(
                     "stage6_star_separation",
                     "stage6_input",
-                    "stage7_starless",
+                    "stage6_passthrough",
                     context={"mode": "skipped_by_pre_starless_gate"},
                     candidates=[quality_record],
                     selected_candidate=str(quality_record.get("attempt")),
@@ -396,8 +721,9 @@ def run_stage6_star_separation(pipeline) -> None:
                 plan_overlap = int(stage7_plan["overlap"])
                 plan_axiom = bool(stage7_plan["use_axiom"])
                 plan_note = (
-                    "AI stage7 SyQon params applied "
-                    f"(tile={plan_tile_size}, overlap={plan_overlap}, "
+                    "AI selected code-owned SyQon candidate "
+                    f"(id={stage7_plan['selected_candidate_id']}, "
+                    f"tile={plan_tile_size}, overlap={plan_overlap}, "
                     f"axiom={plan_axiom})"
                 )
                 if stage7_plan.get("summary"):
@@ -653,11 +979,23 @@ def run_stage6_star_separation(pipeline) -> None:
                 else "local_quality"
             )
 
+        pixel_repair_trigger = _stage7_starless_pixel_repair_trigger(
+            pipeline,
+            selected_quality,
+        )
         if (
             selected_quality
-            and selected_quality.get("status") != "ok"
+            and pixel_repair_trigger.get("triggered")
             and bool(getattr(pipeline.cfg, "stage7_starless_pixel_repair_enabled", True))
         ):
+            stage_messages.append(
+                "Stage6 starless pixel repair triggered "
+                f"({pixel_repair_trigger['reason']}, "
+                f"halo={pixel_repair_trigger['halo_residue_score']:.3f}, "
+                f"compact_halo={pixel_repair_trigger['compact_halo_residue_score']:.3f}, "
+                f"base_limit={pixel_repair_trigger['base_halo_limit']:.3f}, "
+                f"target_limit={pixel_repair_trigger['target_halo_limit']:.3f})"
+            )
             before_repair_quality = selected_quality
             before_repair_score = pipeline._stage7_quality_score(before_repair_quality)
             repair_snapshot = pipeline._stage7_snapshot_current_outputs("before_pixel_repair")
@@ -665,6 +1003,7 @@ def run_stage6_star_separation(pipeline) -> None:
                 source_stem=selected_source_stem,
                 label="selected_starless_pixel_repair",
             )
+            pixel_repair["trigger"] = pixel_repair_trigger
             starless_pixel_repair_records.append(pixel_repair)
             if pixel_repair.get("status") == "applied":
                 repaired_quality = pipeline._stage7_quality_assessment(
@@ -686,10 +1025,22 @@ def run_stage6_star_separation(pipeline) -> None:
                 after_residual = float(repaired_derived.get("residual_star_score", 0.0) or 0.0)
                 before_halo = float(before_derived.get("halo_residue_score", 0.0) or 0.0)
                 after_halo = float(repaired_derived.get("halo_residue_score", 0.0) or 0.0)
+                before_compact_halo = float(
+                    before_derived.get("compact_halo_residue_score", 0.0) or 0.0
+                )
+                after_compact_halo = float(
+                    repaired_derived.get("compact_halo_residue_score", 0.0) or 0.0
+                )
                 residual_improved = after_residual < before_residual - 0.005
-                halo_improved = after_halo < before_halo - 0.005
+                halo_improved = (
+                    after_halo < before_halo - 0.005
+                    or after_compact_halo < before_compact_halo - 0.005
+                )
                 residual_not_worse = after_residual <= before_residual + 0.002
-                halo_not_worse = after_halo <= before_halo + 0.002
+                halo_not_worse = (
+                    after_halo <= before_halo + 0.002
+                    and after_compact_halo <= before_compact_halo + 0.002
+                )
                 legacy_accepted = (
                     repaired_score <= before_repair_score + max_growth
                     and residual_not_worse
@@ -723,6 +1074,8 @@ def run_stage6_star_separation(pipeline) -> None:
                         "residual_after": after_residual,
                         "halo_before": before_halo,
                         "halo_after": after_halo,
+                        "compact_halo_before": before_compact_halo,
+                        "compact_halo_after": after_compact_halo,
                         "quality_after": repaired_quality,
                     }
                 )
@@ -769,29 +1122,47 @@ def run_stage6_star_separation(pipeline) -> None:
                 "for this candidate"
             )
 
-        if selected_quality and selected_quality.get("status") != "ok":
-            pipeline._stage8_conservative_mode = bool(
-                pipeline.cfg.stage8_force_conservative_after_stage7_repair
-            )
-        elif selected_quality:
-            derived = selected_quality.get("derived") if isinstance(selected_quality, dict) else {}
-            halo_for_base_guard = (
-                float(derived.get("halo_residue_score", 0.0) or 0.0)
-                if isinstance(derived, dict)
-                else 0.0
-            )
-            if (
-                pipeline._active_target_type() == "bright_emission_reflection_nebula"
-                and halo_for_base_guard > float(pipeline.cfg.stage7_halo_residue_score_max)
-            ):
-                pipeline._stage8_conservative_mode = bool(
-                    pipeline.cfg.stage8_force_conservative_after_stage7_repair
-                )
-                stage_messages.append(
-                    "stage8 conservative mode requested for bright-nebula halo advisory "
-                    f"({halo_for_base_guard:.3f}>{pipeline.cfg.stage7_halo_residue_score_max:.3f})"
-                )
         stage9_remix_quality = selected_quality
+
+        separation_accepted = bool(
+            selected_quality
+            and selected_quality.get("status") == "ok"
+            and pipeline.starless_file
+            and not cleanup_hard_failed
+        )
+        pipeline._star_separation_state = (
+            StarSeparationState.ACCEPTED.value
+            if separation_accepted
+            else StarSeparationState.REJECTED.value
+        )
+        if not separation_accepted:
+            pipeline._stage7_starless_skipped = True
+            pipeline.starmask_file = None
+            pipeline._stage7_update_star_remix_from_quality(None)
+            stage9_remix_quality = None
+            stage_messages.append(
+                "star separation candidate rejected; downstream uses with-stars "
+                "review passthrough"
+            )
+
+        pipeline._stage8_handoff = _stage8_handoff_from_stage6(
+            pipeline,
+            selected_quality,
+            starless_pixel_repair_records,
+            separation_accepted=separation_accepted,
+        )
+        pipeline._stage8_conservative_mode = (
+            pipeline._stage8_handoff["processing_policy"] != "full"
+        )
+        handoff_reason_text = str(
+            pipeline._stage8_handoff.get("reason_text") or ""
+        )
+        if handoff_reason_text:
+            stage_messages.append(
+                "stage8_processing_policy="
+                f"{pipeline._stage8_handoff['processing_policy']}; "
+                f"{handoff_reason_text}"
+            )
 
         pipeline._write_stage_json(
             "stage7_quality.json",
@@ -799,6 +1170,7 @@ def run_stage6_star_separation(pipeline) -> None:
                 "attempts": quality_records,
                 "selected": selected_quality,
                 "mode": quality_mode,
+                "star_separation_state": pipeline._star_separation_state,
                 "star_separation_mode": star_separation_mode,
                 "input_domain": "linear",
                 "selected_source_stem": selected_source_stem,
@@ -809,6 +1181,7 @@ def run_stage6_star_separation(pipeline) -> None:
                 "conservative_inputs": conservative_input_records,
                 "processing_plan": stage7_plan,
                 "stage8_conservative_mode": pipeline._stage8_conservative_mode,
+                "stage8_handoff": pipeline._stage8_handoff,
                 "stage9_star_remix": pipeline._stage7_update_star_remix_from_quality(
                     stage9_remix_quality
                 ),
@@ -823,14 +1196,26 @@ def run_stage6_star_separation(pipeline) -> None:
             )
 
         pipeline._export_sasp_exchange_files()
-        pipeline.cmd_with_check("load", pipeline.starless_file.stem)
-        stage_saved = pipeline._save_stage_output("stage7_starless")
+        if separation_accepted:
+            pipeline.cmd_with_check("load", pipeline.starless_file.stem)
+            stage_output_stem = "stage7_starless"
+            review_before_stem = "stage6_input"
+        else:
+            pipeline.cmd_with_check("load", selected_source_stem)
+            stage_output_stem = "stage6_passthrough"
+            review_before_stem = "stage6_input"
+            pipeline._stage6_passthrough_source = stage_output_stem
+            pipeline.starless_file = None
+        stage_saved = pipeline._save_stage_output(stage_output_stem)
         if stage_saved and hasattr(pipeline, "_create_stage_review_bundle"):
             review = pipeline._create_stage_review_bundle(
                 "stage6_star_separation",
-                "stage6_input",
-                "stage7_starless",
-                context={"mode": quality_mode},
+                review_before_stem,
+                stage_output_stem,
+                context={
+                    "mode": quality_mode,
+                    "star_separation_state": pipeline._star_separation_state,
+                },
                 candidates=quality_records,
                 selected_candidate=str((selected_quality or {}).get("attempt") or ""),
             )
@@ -841,8 +1226,29 @@ def run_stage6_star_separation(pipeline) -> None:
         elapsed = pipeline.log.stage_end(stage_label)
         if stage_saved:
             selected_status = str((selected_quality or {}).get("status", "ok")).lower()
-            stage_status = "ok" if selected_status == "ok" else "degraded"
-            pipeline._record_stage(stage_label, stage_status, elapsed, stage_message_text)
+            stage_status = (
+                "ok"
+                if separation_accepted and selected_status == "ok"
+                else "degraded"
+            )
+            stage6_fallback_used = bool(
+                separation_accepted
+                and syqon_failure_reason
+                and starless_used
+            )
+            pipeline._record_stage(
+                stage_label,
+                stage_status,
+                elapsed,
+                stage_message_text,
+                fallback_used=stage6_fallback_used,
+                reason_code=(
+                    "syqon_to_alternate_starless"
+                    if stage6_fallback_used
+                    else ""
+                ),
+                details={"stage8_handoff": pipeline._stage8_handoff},
+            )
         else:
             if stage_message_text:
                 stage_message_text = f"{stage_message_text}；stage7 输出保存失败"
@@ -857,44 +1263,60 @@ def run_stage6_star_separation(pipeline) -> None:
         pipeline.log.error("请检查 SyQon-Starless.py / SASP Dark Star 环境与模型配置")
         pipeline.starless_file = None
         pipeline.starmask_file = None
+        pipeline._stage7_starless_skipped = True
+        pipeline._stage8_conservative_mode = True
+        pipeline._star_separation_state = StarSeparationState.TOOL_FAILED.value
+        pipeline._stage8_handoff.update(
+            {
+                "requested_policy": "skip",
+                "processing_policy": "skip",
+                "restricted_downstream": True,
+                "reason_code": "star_separation_tool_failed",
+                "reason_text": "star_separation_tool_failed",
+                "reasons": [
+                    {
+                        "code": "star_separation_tool_failed",
+                        "source_stage": 6,
+                        "error": pipeline._short_text(e, 180),
+                    }
+                ],
+                "quality_status": "failed",
+            }
+        )
         pipeline._stage7_update_star_remix_from_quality(None)
-        # 使用固定的线性 Stage 6 输入作为 starless 继续。
+        # 保留固定的含星线性 Stage 6 输入，仅供后续复核路径使用。
         pipeline.cmd_with_check("load", pipeline.stretched_name)
-        pipeline.cmd_with_check("save", "starless")
-        pipeline.starless_file = pipeline.process_dir / "starless.fit"
-        if pipeline._ai_stage_advisory_enabled("ai_stage7_enabled"):
-            pipeline._write_stage_json(
-                "stage7_quality.json",
-                {
-                    "attempts": [
-                        {
-                            "attempt": "degraded_stage7_stretched",
-                            "tool_label": "none",
-                            "status": "degraded",
-                            "issues": [pipeline._short_text(e, 180)],
-                        }
-                    ],
-                    "selected": {
-                        "attempt": "degraded_stage7_stretched",
+        stage_saved = pipeline._save_stage_output("stage6_passthrough")
+        pipeline._stage6_passthrough_source = "stage6_passthrough"
+        pipeline._write_stage_json(
+            "stage7_quality.json",
+            {
+                "attempts": [
+                    {
+                        "attempt": "tool_failed_with_stars_passthrough",
+                        "tool_label": "none",
                         "status": "degraded",
-                    },
-                    "mode": "degraded_fallback",
-                    "input_domain": "linear",
-                    "selected_source_stem": pipeline.stretched_name,
-                    "preflight": locals().get("stage7_preflight"),
-                    "starmask_cleanup": locals().get("starmask_cleanup_records", []),
-                    "repairs": locals().get("repair_records", []),
-                    "starless_pixel_repairs": locals().get("starless_pixel_repair_records", []),
-                    "conservative_inputs": locals().get("conservative_input_records", []),
-                    "retry_max": pipeline.cfg.stage7_quality_retry_max,
-                },
-            )
+                        "issues": [pipeline._short_text(e, 180)],
+                    }
+                ],
+                "selected": None,
+                "mode": "with_stars_review_passthrough",
+                "star_separation_state": pipeline._star_separation_state,
+                "input_domain": "linear",
+                "selected_source_stem": pipeline.stretched_name,
+                "preflight": locals().get("stage7_preflight"),
+                "starmask_cleanup": locals().get("starmask_cleanup_records", []),
+                "repairs": locals().get("repair_records", []),
+                "starless_pixel_repairs": locals().get("starless_pixel_repair_records", []),
+                "conservative_inputs": locals().get("conservative_input_records", []),
+                "stage8_handoff": pipeline._stage8_handoff,
+                "retry_max": pipeline.cfg.stage7_quality_retry_max,
+            },
+        )
         pipeline._export_sasp_exchange_files()
-        pipeline.cmd_with_check("load", "starless")
-        stage_saved = pipeline._save_stage_output("stage7_starless")
 
         elapsed = pipeline.log.stage_end(stage_label)
-        message = "无可用去星工具，已退化为直接使用线性 Stage 6 输入继续"
+        message = "无可用去星工具，已切换为含星复核路径"
         if not stage_saved:
             message += "；stage7 输出保存失败"
         pipeline._record_stage(

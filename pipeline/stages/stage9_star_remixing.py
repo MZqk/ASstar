@@ -3,13 +3,63 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from models import PipelineStage
+from models import PipelineStage, StarSeparationState
 import stage9_quality
+from star_color_repair import (
+    assess_repaired_star_layer,
+    public_star_color_report,
+    repair_star_layer_colors,
+)
 from sirilpy.exceptions import CommandError, SirilError
 
 
 def _clamp_float(value: float, lower: float, upper: float) -> float:
     return float(max(lower, min(upper, float(value))))
+
+
+def _stage9_upstream_handoff(pipeline, source_stem: str) -> Dict[str, Any]:
+    handoff = dict(getattr(pipeline, "_stage8_handoff", {}) or {})
+    if not handoff:
+        passthrough_sources = {
+            "stage8_input_starless",
+            "stage8_review_with_stars",
+            "stage7_review_with_stars",
+            "stage6_passthrough",
+        }
+        handoff = {
+            "schema": "seestar.stage8-handoff.legacy",
+            "source_stem": source_stem,
+            "passthrough": source_stem in passthrough_sources,
+            "restricted_downstream": bool(
+                getattr(pipeline, "_stage8_fallback_used", False)
+            ),
+            "reason_code": "stage8_handoff_legacy",
+        }
+    return handoff
+
+
+def _stage9_local_fallback(
+    mode: str,
+    selected: Optional[Dict[str, Any]],
+    application_mode: str,
+) -> tuple[bool, Optional[str]]:
+    attempt = str((selected or {}).get("attempt") or "").strip().lower()
+    normalized_mode = str(mode or "").strip().lower()
+    normalized_application = str(application_mode or "").strip().lower()
+    if attempt.startswith("screen_fallback_"):
+        return True, "intensity_fallback"
+    if attempt == "screen_compact_recovery":
+        return True, "compact_mask_recovery"
+    mode_reasons = {
+        "unsafe_starless_bypass": "unsafe_starless_bypass",
+        "rejected_keep_starless": "all_remix_candidates_rejected",
+        "starmask_stretch_failed": "starmask_stretch_failed_keep_upstream",
+    }
+    if normalized_mode in mode_reasons:
+        return True, mode_reasons[normalized_mode]
+    if normalized_application in {"screen_save_failed", "starcomposer_save_failed"}:
+        return True, "output_save_failed_keep_upstream"
+    return False, None
 
 
 def _stage9_remix_intensity_candidates(
@@ -65,11 +115,47 @@ def _assess_stage9_candidate(
             "issues": ["quality assessor unavailable"],
             "metrics": {},
         }
-    return assessor(
+    report = assessor(
         source_stem,
         attempt=attempt,
         formula=formula,
     )
+    reference_samples = getattr(
+        pipeline,
+        "_stage9_star_color_reference_samples",
+        None,
+    )
+    star_layer = getattr(pipeline, "_stage9_last_star_layer", None)
+    if (
+        bool(report.get("accepted", False))
+        and isinstance(reference_samples, dict)
+        and star_layer is not None
+    ):
+        validation = assess_repaired_star_layer(
+            star_layer,
+            reference_samples,
+            support_mask=getattr(
+                pipeline,
+                "_stage9_last_star_overlay_mask",
+                None,
+            ),
+            chroma_error_max=float(
+                getattr(
+                    pipeline.cfg,
+                    "stage9_star_color_post_chroma_error_max",
+                    0.22,
+                )
+            ),
+        )
+        report["star_color_validation"] = validation
+        pipeline._stage9_star_color_post_validation = validation
+        if not bool(validation.get("accepted", False)):
+            report["accepted"] = False
+            report["status"] = "rejected"
+            report.setdefault("issues", []).extend(
+                validation.get("issues") or ["star_color_validation_failed"]
+            )
+    return report
 
 
 def _stage9_needs_compact_mask_recovery(quality: Dict[str, Any]) -> bool:
@@ -216,6 +302,161 @@ def _prepare_stage9_star_reference(
     return catalog
 
 
+def _prepare_stage9_star_color_repair(
+    pipeline,
+    starmask_name: str,
+    messages: List[str],
+) -> str:
+    """Create and validate a reversible reference-driven star-color candidate."""
+    report: Dict[str, Any] = {
+        "schema": "seestar.star-color-repair.v1",
+        "status": "not_run",
+        "accepted": False,
+    }
+    pipeline._stage9_star_color_reference_samples = None
+    if not bool(
+        getattr(pipeline.cfg, "stage9_star_color_repair_enabled", False)
+    ):
+        report.update(status="disabled", issues=["disabled_by_configuration"])
+        pipeline._stage9_star_color_repair_report = report
+        pipeline._write_stage_json("stage9_star_color_repair.json", report)
+        messages.append("Stage9 deterministic star-color repair disabled")
+        return starmask_name
+    try:
+        pipeline.cmd_with_check("load", starmask_name)
+        if not pipeline._save_stage_output("starmask_pre_color_repair"):
+            raise RuntimeError("immutable star-color baseline save failed")
+        get_pixels = getattr(pipeline.siril, "get_image_pixeldata", None)
+        if not callable(get_pixels):
+            raise RuntimeError("star-layer pixel reader unavailable")
+        star_data = get_pixels(preview=False)
+        if star_data is None:
+            raise RuntimeError("star-layer pixels unavailable")
+        star_pixels = np.array(star_data, copy=True)
+
+        reference_pixels = None
+        reference_source = ""
+        process_dir = getattr(pipeline, "process_dir", None)
+        for source_stem in ("stage5_linear", "stage6_input", "working"):
+            source_path = (
+                process_dir / f"{source_stem}.fit"
+                if process_dir is not None
+                else None
+            )
+            if source_path is None or not source_path.exists():
+                continue
+            pipeline.cmd_with_check("load", source_stem)
+            source_data = get_pixels(preview=False)
+            if source_data is not None:
+                reference_pixels = np.array(source_data, copy=True)
+                reference_source = source_stem
+                break
+        if reference_pixels is None:
+            raise RuntimeError("immutable linear with-stars reference unavailable")
+
+        candidate, report = repair_star_layer_colors(
+            star_pixels,
+            reference_pixels,
+            strength=float(
+                getattr(pipeline.cfg, "stage9_star_color_repair_strength", 0.72)
+            ),
+            support_coverage_max=float(
+                getattr(
+                    pipeline.cfg,
+                    "stage9_star_color_support_ratio_max",
+                    0.12,
+                )
+            ),
+            chroma_improvement_min=float(
+                getattr(
+                    pipeline.cfg,
+                    "stage9_star_color_improvement_min",
+                    0.01,
+                )
+            ),
+        )
+        report["reference_source"] = reference_source
+        report["transaction"]["baseline_saved"] = True
+        reference_samples = report.get("_reference_samples")
+        public_report = public_star_color_report(report)
+        if not bool(report.get("accepted", False)):
+            pipeline.cmd_with_check("load", starmask_name)
+            public_report["transaction"]["rollback_performed"] = False
+            pipeline._stage9_star_color_repair_report = public_report
+            pipeline._write_stage_json(
+                "stage9_star_color_repair.json",
+                public_report,
+            )
+            messages.append(
+                "Stage9 deterministic star-color candidate rejected: "
+                + ",".join(report.get("issues") or [])
+            )
+            return starmask_name
+
+        pipeline.cmd_with_check("load", starmask_name)
+        writer = getattr(pipeline, "_set_current_image_pixeldata", None)
+        if callable(writer):
+            writer(candidate, label="Stage9 deterministic star-color repair")
+        else:
+            set_pixels = getattr(pipeline.siril, "set_image_pixeldata", None)
+            if not callable(set_pixels):
+                raise RuntimeError("star-layer pixel writer unavailable")
+            lock_factory = getattr(pipeline.siril, "image_lock", None)
+            if callable(lock_factory):
+                with lock_factory():
+                    set_pixels(candidate)
+            else:
+                set_pixels(candidate)
+        if not pipeline._save_stage_output("starmask_color_repaired"):
+            raise RuntimeError("star-color candidate save failed")
+        public_report["transaction"].update(
+            candidate_saved=True,
+            rollback_performed=False,
+        )
+        pipeline._stage9_star_color_reference_samples = reference_samples
+        pipeline._stage9_star_color_repair_report = public_report
+        pipeline._write_stage_json(
+            "stage9_star_color_repair.json",
+            public_report,
+        )
+        metrics = public_report.get("metrics") or {}
+        messages.append(
+            "Stage9 deterministic star-color repair accepted "
+            f"(samples={int(metrics.get('reference_sample_count', 0))}, "
+            f"chroma_improvement={float(metrics.get('star_chroma_improvement', 0.0)):.3f}, "
+            f"flux_drift={float(metrics.get('star_flux_drift', 0.0)):.4f})"
+        )
+        return "starmask_color_repaired"
+    except (
+        AttributeError,
+        CommandError,
+        OSError,
+        RuntimeError,
+        SirilError,
+        TypeError,
+        ValueError,
+    ) as error:
+        report = public_star_color_report(report)
+        report.update(status="failed", accepted=False, error=str(error))
+        try:
+            pipeline.cmd_with_check("load", "starmask_pre_color_repair")
+            report.setdefault("transaction", {}).update(
+                rollback_performed=True,
+            )
+        except (CommandError, SirilError) as rollback_error:
+            report.setdefault("transaction", {}).update(
+                rollback_performed=False,
+                rollback_error=str(rollback_error),
+            )
+        pipeline._stage9_star_color_repair_report = report
+        pipeline._write_stage_json("stage9_star_color_repair.json", report)
+        messages.append(
+            "Stage9 deterministic star-color repair unavailable; "
+            f"baseline retained: {error}"
+        )
+        return starmask_name
+
+
 def _write_stage9_quality_report(
     pipeline,
     attempts: List[Dict[str, Any]],
@@ -224,14 +465,22 @@ def _write_stage9_quality_report(
     source_stem: str,
     mode: str,
 ) -> None:
-    writer = getattr(pipeline, "_write_stage_json", None)
-    if not callable(writer):
-        return
     stars_required = bool(getattr(pipeline, "_stage9_stars_required", True))
     stars_applied = bool(getattr(pipeline, "_stage9_stars_applied", False))
     stars_application_mode = str(
         getattr(pipeline, "_stage9_stars_application_mode", mode) or mode
     )
+    upstream_handoff = _stage9_upstream_handoff(pipeline, source_stem)
+    stage9_fallback_used, stage9_fallback_reason = _stage9_local_fallback(
+        mode,
+        selected,
+        stars_application_mode,
+    )
+    pipeline._stage9_fallback_used = stage9_fallback_used
+    pipeline._stage9_fallback_reason = stage9_fallback_reason
+    writer = getattr(pipeline, "_write_stage_json", None)
+    if not callable(writer):
+        return
     pipeline.log.info(
         "[Stage9] star application contract "
         f"required={str(stars_required).lower()}, "
@@ -248,6 +497,15 @@ def _write_stage9_quality_report(
             "mode": mode,
             "formula": report_formula,
             "source_stem": source_stem,
+            "upstream_handoff": upstream_handoff,
+            "upstream_passthrough": bool(
+                upstream_handoff.get("passthrough", False)
+            ),
+            "upstream_restricted": bool(
+                upstream_handoff.get("restricted_downstream", False)
+            ),
+            "stage9_fallback_used": stage9_fallback_used,
+            "stage9_fallback_reason": stage9_fallback_reason,
             "stars_required": stars_required,
             "stars_applied": stars_applied,
             "stars_application_mode": stars_application_mode,
@@ -263,6 +521,20 @@ def _write_stage9_quality_report(
             ),
             "starmask_stretch_failed": bool(
                 getattr(pipeline, "_stage9_starmask_stretch_failed", False)
+            ),
+            "star_color_repair": getattr(
+                pipeline,
+                "_stage9_star_color_repair_report",
+                {
+                    "schema": "seestar.star-color-repair.v1",
+                    "status": "not_run",
+                    "accepted": False,
+                },
+            ),
+            "star_color_post_validation": getattr(
+                pipeline,
+                "_stage9_star_color_post_validation",
+                None,
             ),
             "attempts": attempts,
             "selected": selected,
@@ -601,12 +873,111 @@ def run_stage9_star_remixing(pipeline) -> None:
     pipeline._stage9_star_reference_summary = stage9_quality.star_reference_summary(
         pipeline._stage9_star_reference_catalog
     )
+    pipeline._stage9_star_color_reference_samples = None
+    pipeline._stage9_star_color_repair_report = {
+        "schema": "seestar.star-color-repair.v1",
+        "status": "not_run",
+        "accepted": False,
+    }
+    pipeline._stage9_star_color_post_validation = None
+    pipeline._stage9_fallback_used = False
+    pipeline._stage9_fallback_reason = None
     source_stem = getattr(pipeline, "_stage8_final_source", "starless_enhanced") or "starless_enhanced"
-    fallback_used = bool(getattr(pipeline, "_stage8_fallback_used", False))
+    upstream_handoff = _stage9_upstream_handoff(pipeline, source_stem)
+    upstream_passthrough = bool(upstream_handoff.get("passthrough", False))
+    upstream_restricted = bool(
+        upstream_handoff.get("restricted_downstream", False)
+    )
     messages.append(
         "stage9_starless_source="
-        f"{source_stem}; stage8_fallback_used={str(fallback_used).lower()}"
+        f"{source_stem}; "
+        f"upstream_passthrough={str(upstream_passthrough).lower()}; "
+        f"upstream_restricted={str(upstream_restricted).lower()}"
     )
+
+    def result_metadata() -> Dict[str, Any]:
+        stage9_fallback_used = bool(
+            getattr(pipeline, "_stage9_fallback_used", False)
+        )
+        stage9_fallback_reason = str(
+            getattr(pipeline, "_stage9_fallback_reason", None) or ""
+        )
+        return {
+            "fallback_used": stage9_fallback_used,
+            "upstream_passthrough": upstream_passthrough,
+            "reason_code": (
+                stage9_fallback_reason
+                or ("upstream_safe_passthrough" if upstream_passthrough else "")
+            ),
+            "details": {
+                "reason_text": (
+                    "使用 Stage 8 安全旁路源"
+                    if upstream_passthrough
+                    else ""
+                ),
+                "upstream_handoff": upstream_handoff,
+                "stage9_fallback_used": stage9_fallback_used,
+                "stage9_fallback_reason": stage9_fallback_reason or None,
+            },
+        }
+    separation_state = str(
+        getattr(
+            pipeline,
+            "_star_separation_state",
+            StarSeparationState.ACCEPTED.value,
+        )
+    )
+    if separation_state in {
+        StarSeparationState.REJECTED.value,
+        StarSeparationState.TOOL_FAILED.value,
+    }:
+        stage_saved = False
+        try:
+            pipeline.cmd_with_check("load", source_stem)
+            stage_saved = pipeline._save_stage_output("stage9_remixed")
+        except (CommandError, SirilError) as error:
+            messages.append(
+                "with-stars Stage9 passthrough failed: "
+                f"{pipeline._short_text(error, 160)}"
+            )
+        pipeline._stage9_stars_required = True
+        pipeline._stage9_stars_applied = False
+        pipeline._stage9_stars_application_mode = (
+            "not_applied_star_separation_unavailable"
+        )
+        pipeline._stage9_final_source = (
+            "stage9_remixed" if stage_saved else source_stem
+        )
+        _write_stage9_quality_report(
+            pipeline,
+            [],
+            None,
+            source_stem=source_stem,
+            mode="with_stars_review_passthrough",
+        )
+        _append_stage9_review_bundle(
+            pipeline,
+            messages,
+            [],
+            None,
+            source_stem=source_stem,
+            mode="with_stars_review_passthrough",
+            stage_saved=stage_saved,
+        )
+        messages.append(
+            "star remix skipped; input already contains stars and normal delivery "
+            f"is disabled (star_separation_state={separation_state})"
+        )
+        elapsed = pipeline.log.stage_end(stage_label)
+        pipeline._record_stage(
+            stage_label,
+            "degraded" if stage_saved else "failed",
+            elapsed,
+            "；".join(messages),
+            **result_metadata(),
+        )
+        return
+
     if bool(getattr(pipeline, "_star_preserve_target_bypass", False)):
         try:
             pipeline.cmd_with_check("load", source_stem)
@@ -639,6 +1010,7 @@ def run_stage9_star_remixing(pipeline) -> None:
                 "skipped" if stage_saved else "degraded",
                 elapsed,
                 "；".join(messages),
+                **result_metadata(),
             )
             return
         except (CommandError, SirilError) as error:
@@ -709,6 +1081,7 @@ def run_stage9_star_remixing(pipeline) -> None:
                 "degraded",
                 elapsed,
                 "；".join(messages),
+                **result_metadata(),
             )
             return
         except (CommandError, SirilError) as e:
@@ -740,6 +1113,19 @@ def run_stage9_star_remixing(pipeline) -> None:
             pipeline.starmask_file.stem,
             messages,
         )
+        repaired_starmask_name = _prepare_stage9_star_color_repair(
+            pipeline,
+            pipeline.starmask_file.stem,
+            messages,
+        )
+        repaired_path = (
+            pipeline.process_dir / f"{repaired_starmask_name}.fit"
+        )
+        if (
+            repaired_starmask_name == "starmask_color_repaired"
+            and repaired_path.exists()
+        ):
+            pipeline.starmask_file = repaired_path
         try:
             pipeline.cmd_with_check("load", pipeline.starmask_file.stem)
             star_stretch_label = pipeline._run_first_available_command(
@@ -774,8 +1160,11 @@ def run_stage9_star_remixing(pipeline) -> None:
             pipeline.log.warn(f"星点处理插件链失败，使用原始 starmask: {e}")
 
     # 按工作流先在 Siril 侧做 Starless 二次细化，再进行星点合成
-    if fallback_used:
-        messages.append("Stage9 skipped starless secondary enhancement because Stage8 used fallback")
+    if upstream_restricted:
+        messages.append(
+            "Stage9 skipped starless secondary enhancement because the Stage8 "
+            "handoff is restricted"
+        )
     else:
         try:
             pipeline.cmd_with_check("load", source_stem)
@@ -810,10 +1199,10 @@ def run_stage9_star_remixing(pipeline) -> None:
         0.45,
         1.0,
     )
-    if fallback_used:
-        messages.append("Stage8 fallback source active; using controlled pixel remix")
+    if upstream_restricted:
+        messages.append("Stage8 restricted source active; using controlled pixel remix")
         remix_scale = min(remix_scale, 0.95 / max(float(pipeline.cfg.star_intensity), 1e-6))
-        messages.append("Stage8 fallback star remix intensity capped at 0.950")
+        messages.append("Stage8 restricted-source star remix intensity capped at 0.950")
     messages.append(
         "Stage9 bypassed StarComposer; formal remix uses explicit "
         "starmask-top/starless-bottom Alpha+Screen composition"
@@ -880,6 +1269,7 @@ def run_stage9_star_remixing(pipeline) -> None:
                 'ok',
                 elapsed,
                 "；".join(messages),
+                **result_metadata(),
             )
         else:
             messages.append("stage9 输出保存失败")
@@ -888,6 +1278,7 @@ def run_stage9_star_remixing(pipeline) -> None:
                 'degraded',
                 elapsed,
                 "；".join(messages),
+                **result_metadata(),
             )
         return
 
@@ -919,6 +1310,7 @@ def run_stage9_star_remixing(pipeline) -> None:
                 "degraded",
                 elapsed,
                 "；".join(messages + ["StarComposer rejected; kept Stage8 starless source"]),
+                **result_metadata(),
             )
             return
         elapsed = pipeline.log.stage_end(stage_label)
@@ -931,14 +1323,23 @@ def run_stage9_star_remixing(pipeline) -> None:
             mode="no_starmask",
         )
         pipeline._record_stage(
-            stage_label, 'skipped', elapsed, "无星点蒙版")
+            stage_label,
+            'skipped',
+            elapsed,
+            "无星点蒙版",
+            **result_metadata(),
+        )
         return
 
     intensity = _clamp_float(pipeline.cfg.star_intensity * remix_scale, 0.10, 1.05)
     if remix_scale < 0.999:
         reason = getattr(pipeline, "_stage9_star_intensity_reason", "")
         if not reason:
-            reason = "stage8 fallback star intensity cap" if fallback_used else "stage7 residual stars"
+            reason = (
+                "stage8 restricted-source star intensity cap"
+                if upstream_restricted
+                else "stage7 residual stars"
+            )
         messages.append(
             "Stage9 star remix intensity reduced from safety diagnostics "
             f"(base={pipeline.cfg.star_intensity:.3f}, effective={intensity:.3f}, "
@@ -982,7 +1383,13 @@ def run_stage9_star_remixing(pipeline) -> None:
         if not stage_saved:
             messages.append("stage9 输出保存失败")
         elapsed = pipeline.log.stage_end(stage_label)
-        pipeline._record_stage(stage_label, "degraded", elapsed, "；".join(messages))
+        pipeline._record_stage(
+            stage_label,
+            "degraded",
+            elapsed,
+            "；".join(messages),
+            **result_metadata(),
+        )
         return
     candidates = _stage9_remix_intensity_candidates(
         pipeline,
@@ -1197,7 +1604,13 @@ def run_stage9_star_remixing(pipeline) -> None:
         messages.append("Stage9 gate rejected all remix candidates; kept Stage8 starless source")
         if not stage_saved:
             messages.append("stage9 输出保存失败")
-        pipeline._record_stage(stage_label, "degraded", elapsed, "；".join(messages))
+        pipeline._record_stage(
+            stage_label,
+            "degraded",
+            elapsed,
+            "；".join(messages),
+            **result_metadata(),
+        )
         return
 
     stage_saved = pipeline._save_stage_output("stage9_remixed")
@@ -1236,6 +1649,7 @@ def run_stage9_star_remixing(pipeline) -> None:
             'ok',
             elapsed,
             "；".join(messages),
+            **result_metadata(),
         )
     else:
         messages.append("stage9 输出保存失败")
@@ -1244,4 +1658,5 @@ def run_stage9_star_remixing(pipeline) -> None:
             'degraded',
             elapsed,
             "；".join(messages),
+            **result_metadata(),
         )

@@ -21,7 +21,19 @@ from image_metrics import (
     measure_image_features,
     measure_quality_metrics,
 )
+from local_adjustments import (
+    LOCAL_ADJUSTMENT_SCHEMA,
+    apply_local_adjustment_recipe,
+    dilate_mask,
+    feather_mask,
+)
 from models import ImageFeatures, QualityMetrics
+
+_FINAL_COMPACT_HALO_NEAR_LIMIT_FACTOR = 1.10
+_FINAL_GLOBAL_HALO_SAFE_FACTOR = 0.75
+_FINAL_COMPACT_RESIDUAL_SCORE_SAFE_MAX = 0.02
+_FINAL_COMPACT_RESIDUAL_COVERAGE_SAFE_MAX = 0.005
+_FINAL_STARLESS_ARTIFACT_SAFE_MAX = 0.20
 
 def _clamp_int(value: int, lower: int, upper: int) -> int:
     return max(lower, min(upper, int(value)))
@@ -245,7 +257,19 @@ def background_quality_metrics(
             total = max(float(np.sum(bg_weight)), 1e-6)
             return float(np.sqrt(np.sum(((values - mean) ** 2) * bg_weight) / total))
 
-        chroma = np.std(np.stack([rgb[0] - gray, rgb[1] - gray, rgb[2] - gray], axis=0), axis=0)
+        # Channel spread is colour magnitude, not noise.  Measure chroma noise
+        # from only the high-frequency part of the two opponent-colour planes,
+        # otherwise smooth H-alpha nebulosity is misclassified as background
+        # noise after a nonlinear stretch.
+        chroma_bias = np.std(rgb, axis=0)
+        red_green = rgb[0] - rgb[1]
+        blue_green = rgb[2] - rgb[1]
+        red_green_noise = red_green - _box_blur_gray(red_green)
+        blue_green_noise = blue_green - _box_blur_gray(blue_green)
+        chroma_noise = np.sqrt(
+            (red_green_noise * red_green_noise + blue_green_noise * blue_green_noise)
+            * 0.5
+        )
         blur1 = _box_blur_gray(gray)
         blur3 = gray.copy()
         for _ in range(3):
@@ -264,12 +288,16 @@ def background_quality_metrics(
         red = weighted_mean(rgb[0])
         green = weighted_mean(rgb[1])
         blue = weighted_mean(rgb[2])
+        background_level = weighted_mean(gray)
+        chroma_bias_mean = weighted_mean(chroma_bias)
         blue_excess = max(0.0, blue / max(green, 1e-6) - max(1.08, red / max(green, 1e-6) + 0.12))
         return {
-            "bg_median": weighted_mean(gray),
+            "bg_median": background_level,
             "bg_std": weighted_std(gray),
-            "bg_dirty_score": _clamp_float(weighted_std(gray) / max(weighted_mean(gray), 0.015), 0.0, 2.0),
-            "chroma_noise_score": _clamp_float(weighted_mean(chroma) / max(weighted_std(gray) * 2.0, 0.01), 0.0, 2.0),
+            "bg_dirty_score": _clamp_float(weighted_std(gray) / max(background_level, 0.015), 0.0, 2.0),
+            "chroma_noise_score": _clamp_float(weighted_mean(chroma_noise) / max(weighted_std(gray) * 2.0, 0.01), 0.0, 2.0),
+            "background_chroma_bias_score": _clamp_float(chroma_bias_mean / max(background_level, 0.015), 0.0, 2.0),
+            "background_chroma_load": chroma_bias_mean / max(background_level, 1e-4),
             "blue_excess_score": _clamp_float(blue_excess, 0.0, 2.0),
             "background_mottling_score": _clamp_float(weighted_mean(mottling) / max(weighted_std(gray) * 2.0, 0.006), 0.0, 2.0),
             "local_patch_variance": patch_variance,
@@ -393,7 +421,7 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
             stage7_halo_limit = float(pipeline._stage7_effective_halo_threshold())
         except (TypeError, ValueError):
             stage7_halo_limit = 0.70
-    compact_halo_limit_exceeded = bool(
+    compact_halo_raw_limit_exceeded = bool(
         compact_halo_residue > stage7_halo_limit
     )
     bypassed_bad_starless = bool(getattr(pipeline, "_stage9_bypassed_bad_starless", False))
@@ -462,6 +490,73 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
         stage9_chromatic_addition_limit = 0.003
     conservative_stage8_skip = (
         str(getattr(pipeline, "_stage8_final_quality", "")) == "conservative_skipped"
+    )
+    active_target_type = (
+        pipeline._active_target_type()
+        if hasattr(pipeline, "_active_target_type")
+        else ""
+    )
+    try:
+        effective_stage7_halo = float(
+            stage7_quality_derived.get("halo_residue_score", halo_residue)
+            or 0.0
+        )
+    except (TypeError, ValueError):
+        effective_stage7_halo = halo_residue
+    try:
+        compact_residual_star_score = float(
+            stage7_quality_derived.get("compact_residual_star_score", 1.0)
+            or 0.0
+        )
+    except (TypeError, ValueError):
+        compact_residual_star_score = 1.0
+    try:
+        compact_residual_coverage = float(
+            stage7_quality_derived.get("compact_residual_coverage", 1.0)
+            or 0.0
+        )
+    except (TypeError, ValueError):
+        compact_residual_coverage = 1.0
+    try:
+        final_starless_artifact = float(
+            metrics.get("starless_artifact_score", 1.0) if metrics else 1.0
+        )
+    except (TypeError, ValueError):
+        final_starless_artifact = 1.0
+    stage7_status = (
+        str(selected_stage7_quality.get("status", ""))
+        if isinstance(selected_stage7_quality, dict)
+        else ""
+    )
+    # A compact-halo score just over the threshold can be contaminated by real
+    # bright-nebula structure. Exempt only the narrow case already accepted by
+    # Stage 6/7 and independently confirmed by safe Stage 8 plus an applied,
+    # quality-gated star remix. Larger/unsupported compact halos still fail.
+    compact_halo_target_aware_exempted = bool(
+        compact_halo_raw_limit_exceeded
+        and active_target_type == "bright_emission_reflection_nebula"
+        and compact_halo_residue
+        <= stage7_halo_limit * _FINAL_COMPACT_HALO_NEAR_LIMIT_FACTOR
+        and global_halo_residue
+        <= stage7_halo_limit * _FINAL_GLOBAL_HALO_SAFE_FACTOR
+        and effective_stage7_halo <= stage7_halo_limit
+        and compact_residual_star_score
+        <= _FINAL_COMPACT_RESIDUAL_SCORE_SAFE_MAX
+        and compact_residual_coverage
+        <= _FINAL_COMPACT_RESIDUAL_COVERAGE_SAFE_MAX
+        and stage7_status == "ok"
+        and str(getattr(pipeline, "_stage8_final_quality", "")) == "ok"
+        and not bool(getattr(pipeline, "_stage8_fallback_used", False))
+        and not bypassed_bad_starless
+        and stage9_contract_known
+        and stage9_stars_required
+        and stage9_stars_applied
+        and not stage9_starmask_stretch_failed
+        and final_starless_artifact <= _FINAL_STARLESS_ARTIFACT_SAFE_MAX
+    )
+    compact_halo_limit_exceeded = bool(
+        compact_halo_raw_limit_exceeded
+        and not compact_halo_target_aware_exempted
     )
     strict_gate = (
         (
@@ -532,6 +627,8 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
         )
     normalized_metrics = {
         "background_chroma_noise_score": metrics.get("chroma_noise_score") if metrics else None,
+        "background_chroma_bias_score": metrics.get("background_chroma_bias_score") if metrics else None,
+        "background_chroma_load": metrics.get("background_chroma_load") if metrics else None,
         "background_mottling_score": metrics.get("background_mottling_score") if metrics else None,
         "local_patch_variance": metrics.get("local_patch_variance") if metrics else None,
         "local_patch_variance_score": metrics.get("local_patch_variance") if metrics else None,
@@ -540,7 +637,22 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
         "halo_artifact_score": halo_residue,
         "stage7_global_halo_residue_score": global_halo_residue,
         "stage7_compact_halo_residue_score": compact_halo_residue,
+        "stage7_compact_halo_mask_coverage": stage7_quality_derived.get(
+            "compact_halo_mask_coverage"
+        ),
+        "stage7_compact_halo_source_level": stage7_quality_derived.get(
+            "compact_halo_source_level"
+        ),
+        "stage7_compact_halo_starless_level": stage7_quality_derived.get(
+            "compact_halo_starless_level"
+        ),
         "stage7_halo_residue_score_max": stage7_halo_limit,
+        "stage7_compact_halo_raw_limit_exceeded": (
+            compact_halo_raw_limit_exceeded
+        ),
+        "stage7_compact_halo_target_aware_exempted": (
+            compact_halo_target_aware_exempted
+        ),
         "bg_dirty_score": metrics.get("bg_dirty_score") if metrics else None,
         "bg_std": metrics.get("bg_std") if metrics else None,
         "stage9_bypassed_bad_starless": bypassed_bad_starless,
@@ -564,6 +676,16 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
         "stage9_local_cyan_blue_component_max_area": stage9_quality_metrics.get(
             "local_cyan_blue_component_max_area"
         ),
+        "stage9_local_cyan_blue_component_max_area_raw": (
+            stage9_quality_metrics.get(
+                "local_cyan_blue_component_max_area_raw"
+            )
+        ),
+        "stage9_local_cyan_blue_confirmed_star_pixel_ratio": (
+            stage9_quality_metrics.get(
+                "local_cyan_blue_confirmed_star_pixel_ratio"
+            )
+        ),
         "stage9_core_color_jump_component_max_area": stage9_quality_metrics.get(
             "core_color_jump_component_max_area"
         ),
@@ -586,7 +708,7 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
         "stage": "stage10_final_quality",
         "file": f"{stem}.fit",
         "policy": pipeline._active_policy_name() if hasattr(pipeline, "_active_policy_name") else "",
-        "target_type": pipeline._active_target_type() if hasattr(pipeline, "_active_target_type") else "",
+        "target_type": active_target_type,
         "status": "needs_conservative_rerun" if issues else "ok",
         "final_quality": "poor" if issues else "ok",
         "needs_conservative_rerun": bool(issues),
@@ -597,10 +719,49 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
 
 def stage8_input_enhancement_guard(pipeline) -> Dict[str, Any]:
     reasons: List[str] = []
+    handoff = getattr(pipeline, "_stage8_handoff", {}) or {}
+    handoff = handoff if isinstance(handoff, dict) else {}
+    requested_policy = str(
+        handoff.get("processing_policy")
+        or handoff.get("requested_policy")
+        or ""
+    ).strip().lower()
+    handoff_reason_text = str(handoff.get("reason_text") or "").strip()
+    handoff_reason_details = list(handoff.get("reasons") or [])
+    guard_reason_code = str(handoff.get("reason_code") or "")
+    guard_reason_text = handoff_reason_text
+    advisories: List[str] = []
+    if requested_policy == "skip":
+        reasons.append(
+            handoff_reason_text
+            or str(handoff.get("reason_code") or "stage8_handoff_requested_skip")
+        )
+    elif requested_policy == "limited":
+        if handoff_reason_text:
+            advisories.append(handoff_reason_text)
+    elif not requested_policy and bool(
+        getattr(pipeline, "_stage8_conservative_mode", False)
+    ):
+        # Old checkpoints only carried a boolean. Keep them fail-closed without
+        # inventing a repair reason that is not present in the evidence.
+        requested_policy = "skip"
+        reasons.append("stage8_conservative_mode_legacy")
+    elif not requested_policy:
+        requested_policy = "full"
+    if requested_policy == "limited":
+        if not bool(
+            getattr(pipeline.cfg, "stage8_masked_enhancement_enabled", False)
+        ):
+            reasons.append("stage8_limited_masked_enhancement_disabled")
+        starmask_file = getattr(pipeline, "starmask_file", None)
+        if not (
+            starmask_file is not None
+            and callable(getattr(starmask_file, "exists", None))
+            and starmask_file.exists()
+        ):
+            reasons.append("stage8_limited_starmask_unavailable")
     quality = getattr(pipeline, "_stage7_selected_quality", None)
     derived = quality.get("derived") if isinstance(quality, dict) else {}
-    if bool(getattr(pipeline, "_stage8_conservative_mode", False)):
-        reasons.append("stage8_conservative_mode_after_stage7_starless_repair")
     if bool(getattr(pipeline, "_stage7_starless_skipped", False)):
         reasons.append("stage7_starless_skipped_by_pre_starless_gate")
     status = str(quality.get("status", "")) if isinstance(quality, dict) else ""
@@ -609,6 +770,7 @@ def stage8_input_enhancement_guard(pipeline) -> Dict[str, Any]:
 
     residual = 0.0
     halo = pipeline._stage7_halo_residue_score()
+    compact_halo = 0.0
     noise_gain = 0.0
     if isinstance(derived, dict):
         try:
@@ -620,6 +782,14 @@ def stage8_input_enhancement_guard(pipeline) -> Dict[str, Any]:
         except (TypeError, ValueError):
             pass
         try:
+            compact_halo = max(
+                compact_halo,
+                float(derived.get("compact_halo_residue_score", 0.0) or 0.0),
+            )
+            halo = max(halo, compact_halo)
+        except (TypeError, ValueError):
+            pass
+        try:
             noise_gain = float(derived.get("starless_noise_gain", 0.0) or 0.0)
         except (TypeError, ValueError):
             noise_gain = 0.0
@@ -628,6 +798,48 @@ def stage8_input_enhancement_guard(pipeline) -> Dict[str, Any]:
             f"stage7_residual_star_score {residual:.3f}>{pipeline.cfg.stage7_residual_star_score_max:.3f}"
         )
     halo_threshold = pipeline._stage7_effective_halo_threshold()
+    base_halo_limit = float(
+        getattr(pipeline.cfg, "stage7_halo_residue_score_max", 0.35)
+    )
+    target_type = (
+        str(pipeline._active_target_type() or "")
+        if hasattr(pipeline, "_active_target_type")
+        else ""
+    )
+    if (
+        requested_policy == "full"
+        and target_type == "bright_emission_reflection_nebula"
+        and halo > base_halo_limit
+        and halo <= halo_threshold
+    ):
+        requested_policy = "limited"
+        guard_reason_code = "bright_nebula_halo_advisory"
+        guard_reason_text = (
+            "bright_nebula_halo_advisory: "
+            f"{halo:.3f} > {base_halo_limit:.3f}, "
+            f"accepted_limit={halo_threshold:.3f}"
+        )
+        advisories.append(guard_reason_text)
+        handoff_reason_details.append(
+            {
+                "code": guard_reason_code,
+                "source_stage": 8,
+                "value": halo,
+                "base_limit": base_halo_limit,
+                "accepted_limit": halo_threshold,
+            }
+        )
+        if not bool(
+            getattr(pipeline.cfg, "stage8_masked_enhancement_enabled", False)
+        ):
+            reasons.append("stage8_limited_masked_enhancement_disabled")
+        starmask_file = getattr(pipeline, "starmask_file", None)
+        if not (
+            starmask_file is not None
+            and callable(getattr(starmask_file, "exists", None))
+            and starmask_file.exists()
+        ):
+            reasons.append("stage8_limited_starmask_unavailable")
     if halo > halo_threshold:
         reasons.append(
             f"stage7_halo_residue_score {halo:.3f}>{halo_threshold:.3f}"
@@ -657,13 +869,14 @@ def stage8_input_enhancement_guard(pipeline) -> Dict[str, Any]:
     except (CommandError, SirilError, OSError, RuntimeError, TypeError, ValueError) as e:
         reasons.append(f"stage8_mask_guard_unavailable={pipeline._short_text(e, 120)}")
 
-    conservative_skip = bool(
-        reasons
-        and (
-            bool(getattr(pipeline, "_stage8_conservative_mode", False))
-            or "stage8_conservative_mode_after_stage7_starless_repair" in reasons
-        )
+    processing_policy = (
+        "skip"
+        if reasons
+        else "limited"
+        if requested_policy == "limited"
+        else "full"
     )
+    conservative_skip = bool(reasons and requested_policy in {"limited", "skip"})
     skip_status = (
         "conservative_skipped"
         if conservative_skip
@@ -673,15 +886,22 @@ def stage8_input_enhancement_guard(pipeline) -> Dict[str, Any]:
     )
     return {
         "skip_enhancement": bool(reasons),
-        "conservative_mode": bool(getattr(pipeline, "_stage8_conservative_mode", False)),
+        "processing_policy": processing_policy,
+        "requested_policy": requested_policy,
+        "conservative_mode": processing_policy in {"limited", "skip"},
         "status": skip_status,
         "final_quality": skip_status,
         "reasons": reasons,
+        "advisories": advisories,
+        "reason_details": handoff_reason_details,
+        "reason_code": guard_reason_code,
+        "reason_text": guard_reason_text,
         "mask_coverage": coverage,
         "mask_signal_coverage": mask_signal_coverage,
         "derived": {
             "residual_star_score": residual,
             "halo_residue_score": halo,
+            "compact_halo_residue_score": compact_halo,
             "starless_noise_gain": noise_gain,
         },
     }
@@ -853,11 +1073,98 @@ def apply_stage8_masked_pixel_enhancement(
     core_restore = np.clip(core_protection * core, 0.0, 1.0)
     result = result * (1.0 - core_restore[None, :, :]) + base * core_restore[None, :, :]
 
+    local_adjustment_report: Dict[str, Any] = {
+        "schema": LOCAL_ADJUSTMENT_SCHEMA,
+        "status": "disabled",
+        "accepted": False,
+    }
+    if bool(
+        getattr(
+            pipeline.cfg,
+            "stage8_local_adjustment_engine_enabled",
+            True,
+        )
+    ):
+        local_operations: List[Dict[str, Any]] = []
+        if faint_boost > 1e-6:
+            local_operations.append(
+                {
+                    "type": "curve",
+                    "mask": "faint_nebula",
+                    "points": (
+                        (0.0, 0.0),
+                        (0.18, 0.19),
+                        (0.50, 0.51),
+                        (1.0, 1.0),
+                    ),
+                    "opacity": min(
+                        0.60,
+                        float(
+                            getattr(
+                                pipeline.cfg,
+                                "stage8_local_curve_opacity",
+                                0.30,
+                            )
+                        )
+                        * mask_quality_scale,
+                    ),
+                }
+            )
+        if saturation > 1e-6:
+            local_operations.append(
+                {
+                    "type": "saturation",
+                    "mask": "nebula",
+                    "amount": min(0.05, saturation * 0.12),
+                    "opacity": 0.50 * mask_quality_scale,
+                }
+            )
+        if contrast_strength > 1e-6:
+            local_operations.append(
+                {
+                    "type": "local_contrast",
+                    "mask": "nebula",
+                    "amount": min(0.03, contrast_strength * 0.25),
+                    "radius": 2,
+                    "opacity": 0.50 * mask_quality_scale,
+                }
+            )
+        local_candidate, local_adjustment_report = (
+            apply_local_adjustment_recipe(
+                result,
+                {
+                    "schema": LOCAL_ADJUSTMENT_SCHEMA,
+                    "id": "stage8_nebula_local_v1",
+                    "operations": local_operations,
+                },
+                masks={
+                    "background": background,
+                    "core": core,
+                    "nebula": nebula,
+                    "faint_nebula": faint,
+                },
+            )
+        )
+        if bool(local_adjustment_report.get("accepted", False)):
+            result = np.asarray(local_candidate, dtype=np.float32)
+            messages.append(
+                f"{label} local curves/masks recipe accepted "
+                f"(operations={len(local_operations)}, "
+                "changed="
+                f"{float((local_adjustment_report.get('metrics') or {}).get('changed_pixel_ratio', 0.0)):.3f})"
+            )
+        else:
+            messages.append(
+                f"{label} local curves/masks recipe rejected; "
+                "kept pre-recipe candidate"
+            )
+
     restored = pipeline._stage8_restore_rgb_like(image_data, np.clip(result, 0.0, 1.0))
     diagnostics = {
         "mask_coverage": masks["coverage"],
         "masked_metrics": pipeline._stage8_masked_metrics(restored, masks),
         "protection_actions": messages,
+        "local_adjustment_engine": local_adjustment_report,
     }
     messages.append(
         f"{label} masked Starless enhancement "
@@ -965,12 +1272,185 @@ def stage8_target_blue_excess(pipeline, quality_record: Optional[Dict[str, Any]]
                 pass
     return float(pipeline.cfg.stage8_blue_excess_max)
 
+
+def stage8_limited_halo_texture_report(
+    pipeline,
+    baseline_data: Optional[np.ndarray],
+    candidate_data: Optional[np.ndarray],
+    starmask_data: Optional[np.ndarray],
+) -> Dict[str, Any]:
+    """Compare local texture in a starmask-derived star-halo annulus."""
+    growth_limit = float(
+        getattr(pipeline.cfg, "stage8_limited_halo_texture_growth_max", 1.05)
+    )
+    delta_limit = float(
+        getattr(pipeline.cfg, "stage8_limited_halo_texture_delta_max", 0.00075)
+    )
+    report: Dict[str, Any] = {
+        "available": False,
+        "accepted": False,
+        "growth_limit": growth_limit,
+        "absolute_delta_limit": delta_limit,
+        "reason": "required image data unavailable",
+    }
+    if baseline_data is None or candidate_data is None or starmask_data is None:
+        return report
+    try:
+        baseline_rgb = _to_rgb_float_image(baseline_data, max_side=1024)
+        candidate_rgb = _to_rgb_float_image(candidate_data, max_side=1024)
+        starmask_rgb = _to_rgb_float_image(starmask_data, max_side=1024)
+        if not (
+            baseline_rgb.shape == candidate_rgb.shape == starmask_rgb.shape
+        ):
+            report["reason"] = "baseline/candidate/starmask shape mismatch"
+            return report
+
+        baseline_gray = (
+            0.2126 * baseline_rgb[0]
+            + 0.7152 * baseline_rgb[1]
+            + 0.0722 * baseline_rgb[2]
+        ).astype(np.float32)
+        candidate_gray = (
+            0.2126 * candidate_rgb[0]
+            + 0.7152 * candidate_rgb[1]
+            + 0.0722 * candidate_rgb[2]
+        ).astype(np.float32)
+        starmask_gray = (
+            0.2126 * starmask_rgb[0]
+            + 0.7152 * starmask_rgb[1]
+            + 0.0722 * starmask_rgb[2]
+        ).astype(np.float32)
+        mask_floor = float(np.quantile(starmask_gray, 0.55))
+        mask_signal = np.clip(starmask_gray - mask_floor, 0.0, None)
+        positive = mask_signal[mask_signal > 0.0]
+        if positive.size < 16:
+            report["reason"] = "starmask compact support unavailable"
+            return report
+        mask_scale = max(float(np.quantile(positive, 0.995)), 1e-7)
+        normalized = np.clip(mask_signal / mask_scale, 0.0, 1.0)
+        # A cleaned starmask can still contain a low-amplitude diffuse pedestal.
+        # A fixed threshold then turns almost half the frame into "star cores" and
+        # makes the annulus unusable.  Select the strongest compact support first,
+        # relaxing only when there are too few core pixels for a stable sample.
+        support_attempts: List[Dict[str, Any]] = []
+        ring_weight: Optional[np.ndarray] = None
+        ring_coverage = 0.0
+        weight_total = 0.0
+        selected_threshold = 0.0
+        selected_quantile = 0.0
+        selected_core_coverage = 0.0
+        normalized_positive = normalized[normalized > 0.0]
+        for support_quantile in (0.995, 0.99, 0.98, 0.95, 0.90):
+            core_threshold = max(
+                0.12,
+                float(np.quantile(normalized_positive, support_quantile)),
+            )
+            star_core = (normalized >= core_threshold).astype(np.float32)
+            core_pixels = int(np.count_nonzero(star_core))
+            core_coverage = float(np.mean(star_core > 0.0))
+            attempt: Dict[str, Any] = {
+                "support_quantile": support_quantile,
+                "core_threshold": core_threshold,
+                "core_pixels": core_pixels,
+                "core_coverage": core_coverage,
+            }
+            if core_pixels < 8:
+                attempt["reason"] = "core support too small"
+                support_attempts.append(attempt)
+                continue
+
+            inner = dilate_mask(star_core, iterations=1)
+            outer = dilate_mask(star_core, iterations=5)
+            candidate_ring = np.clip(
+                feather_mask(outer, radius=1) - feather_mask(inner, radius=1),
+                0.0,
+                1.0,
+            )
+            candidate_coverage = float(np.mean(candidate_ring > 0.05))
+            candidate_weight = float(np.sum(candidate_ring))
+            attempt.update(
+                ring_coverage=candidate_coverage,
+                ring_weight_total=candidate_weight,
+            )
+            support_attempts.append(attempt)
+            if candidate_weight < 16.0 or candidate_coverage > 0.45:
+                continue
+            ring_weight = candidate_ring
+            ring_coverage = candidate_coverage
+            weight_total = candidate_weight
+            selected_threshold = core_threshold
+            selected_quantile = support_quantile
+            selected_core_coverage = core_coverage
+            break
+
+        if ring_weight is None:
+            report.update(
+                reason="starmask compact halo annulus unavailable",
+                support_attempts=support_attempts,
+            )
+            return report
+
+        def local_texture(gray: np.ndarray) -> np.ndarray:
+            smooth = gray
+            for _ in range(3):
+                smooth = _box_blur_gray(smooth)
+            return np.abs(gray - smooth)
+
+        baseline_texture = local_texture(baseline_gray)
+        candidate_texture = local_texture(candidate_gray)
+        baseline_level = float(
+            np.sum(baseline_texture * ring_weight) / weight_total
+        )
+        candidate_level = float(
+            np.sum(candidate_texture * ring_weight) / weight_total
+        )
+        growth = candidate_level / max(baseline_level, 1e-7)
+        absolute_delta = max(0.0, candidate_level - baseline_level)
+        accepted = growth <= growth_limit or absolute_delta <= delta_limit
+        report.update(
+            {
+                "available": True,
+                "accepted": accepted,
+                "reason": "" if accepted else "halo annulus texture growth exceeded",
+                "ring_coverage": ring_coverage,
+                "core_coverage": selected_core_coverage,
+                "core_threshold": selected_threshold,
+                "support_quantile": selected_quantile,
+                "support_attempts": support_attempts,
+                "baseline_level": baseline_level,
+                "candidate_level": candidate_level,
+                "growth": growth,
+                "absolute_delta": absolute_delta,
+                "low_absolute_growth_exempted": (
+                    growth > growth_limit and absolute_delta <= delta_limit
+                ),
+            }
+        )
+        return report
+    except (IndexError, TypeError, ValueError, FloatingPointError) as error:
+        report["reason"] = str(error)
+        return report
+
 def stage8_quality_assessment(
     pipeline,
     *,
     baseline_stem: str = "stage8_input_starless",
     candidate_stem: str = "stage8_enhanced",
 ) -> Dict[str, Any]:
+    handoff = getattr(pipeline, "_stage8_handoff", {}) or {}
+    limited_mode = bool(
+        isinstance(handoff, dict)
+        and str(handoff.get("processing_policy") or "").strip().lower()
+        == "limited"
+    )
+    starmask_data = None
+    if limited_mode:
+        starmask_file = getattr(pipeline, "starmask_file", None)
+        starmask_stem = getattr(starmask_file, "stem", "")
+        if starmask_stem:
+            loaded_starmask = pipeline._read_image_by_stem(starmask_stem)
+            if loaded_starmask is not None:
+                starmask_data = np.array(loaded_starmask, copy=True)
     baseline_data = pipeline._read_image_by_stem(baseline_stem)
     candidate_data = pipeline._read_image_by_stem(candidate_stem)
     baseline_metrics = (
@@ -1014,6 +1494,32 @@ def stage8_quality_assessment(
         / max(baseline_masked_metrics.get("texture_artifact_score", 0.0), 1e-5)
     )
     issues: List[str] = []
+    halo_texture_report: Dict[str, Any] = {
+        "available": False,
+        "accepted": True,
+        "reason": "not_required",
+    }
+    if limited_mode:
+        halo_texture_report = stage8_limited_halo_texture_report(
+            pipeline,
+            baseline_data,
+            candidate_data,
+            starmask_data,
+        )
+        if not bool(halo_texture_report.get("available")):
+            issues.append(
+                "limited_halo_texture_gate_unavailable="
+                + str(halo_texture_report.get("reason") or "unknown")
+            )
+        elif not bool(halo_texture_report.get("accepted")):
+            issues.append(
+                "limited_halo_texture_growth "
+                f"{float(halo_texture_report.get('growth', 0.0)):.3f}>"
+                f"{float(halo_texture_report.get('growth_limit', 1.05)):.3f}, "
+                "delta "
+                f"{float(halo_texture_report.get('absolute_delta', 0.0)):.6f}>"
+                f"{float(halo_texture_report.get('absolute_delta_limit', 0.0)):.6f}"
+            )
     blue_issue_threshold = pipeline.cfg.stage8_blue_excess_max + 0.012
     if candidate_metrics.blue_excess > blue_issue_threshold:
         issues.append(
@@ -1083,6 +1589,7 @@ def stage8_quality_assessment(
             "diffuse_gain": diffuse_gain,
             "texture_artifact_growth": texture_artifact_growth,
         },
+        "limited_halo_texture": halo_texture_report,
         "local_issues": issues,
     }
     ai_assessment = pipeline._request_stage8_quality_ai(observations)
@@ -1110,6 +1617,7 @@ def stage8_quality_assessment(
             "candidate": candidate_masked_metrics,
         },
         "mask_coverage": observations["mask_coverage"],
+        "limited_halo_texture": halo_texture_report,
         "protection_actions": getattr(
             pipeline,
             "_last_stage8_masked_diagnostics",

@@ -4,13 +4,17 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from models import PipelineStage
+from noise_model import build_noise_model_report, multiscale_denoise_candidate
 from sirilpy.exceptions import CommandError, SirilError
 
 
 GRAXPERT_OBJECT_MODEL_ENV = "SEESTAR_GRAXPERT_OBJECT_MODEL_PATH"
+GRAXPERT_GPU_ENV = "SEESTAR_GRAXPERT_GPU"
+_ENV_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_ENV_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 _GRAXPERT_MODEL_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 
 
@@ -71,6 +75,35 @@ def _stage5_denoise_strength(stage5_policy: dict) -> str:
     return "0.25"
 
 
+def _stage5_disabled_denoise_reason(pipeline) -> str:
+    """Explain why the optional denoise component did not run."""
+    if getattr(pipeline, "_force_denoise_enabled", None) is False:
+        return "user_disabled"
+    if bool(getattr(pipeline.cfg, "auto_tune_enabled", False)) and getattr(
+        pipeline,
+        "auto_tune_result",
+        None,
+    ) is not None:
+        return "auto_low_noise"
+    return "config_disabled"
+
+
+def _stage5_graxpert_hardware_acceleration_enabled(pipeline) -> bool:
+    """Allow ONNX provider auto-selection unless CPU compatibility is requested."""
+    raw_value = os.getenv(GRAXPERT_GPU_ENV)
+    if raw_value is None:
+        return True
+    normalized = raw_value.strip().lower()
+    if normalized in _ENV_TRUE_VALUES:
+        return True
+    if normalized in _ENV_FALSE_VALUES:
+        return False
+    pipeline.log.warn(
+        f"{GRAXPERT_GPU_ENV} has invalid value; defaulting to automatic hardware acceleration"
+    )
+    return True
+
+
 def _run_builtin_linear_denoise(pipeline, messages: List[str]) -> bool:
     denoise_mod = max(0.20, min(0.55, float(getattr(pipeline.cfg, "stage5_builtin_denoise_mod", 0.50))))
     try:
@@ -82,6 +115,127 @@ def _run_builtin_linear_denoise(pipeline, messages: List[str]) -> bool:
         pipeline.log.warn(f"[Stage5] Siril linear denoise failed: {e}")
         messages.append(f"Siril linear denoise failed: {pipeline._short_text(e, 160)}")
         return False
+
+
+def _run_multiscale_linear_denoise(
+    pipeline,
+    messages: List[str],
+) -> tuple[bool, Dict[str, Any]]:
+    report: Dict[str, Any] = {
+        "schema": "seestar.multiscale-denoise-candidate.v1",
+        "status": "unavailable",
+        "accepted": False,
+    }
+    baseline_saved = pipeline._save_stage_output("stage5_pre_multiscale")
+    if not baseline_saved:
+        report.update(
+            status="prohibited",
+            issues=["immutable_baseline_save_failed"],
+        )
+        messages.append(
+            "Stage5 multiscale denoise prohibited: immutable baseline save failed"
+        )
+        return False, report
+    try:
+        image_data = pipeline.siril.get_image_pixeldata(preview=False)
+        candidate, report = multiscale_denoise_candidate(
+            image_data,
+            strength=max(
+                0.10,
+                min(
+                    1.0,
+                    float(
+                        getattr(
+                            pipeline.cfg,
+                            "stage5_multiscale_denoise_strength",
+                            0.72,
+                        )
+                    ),
+                ),
+            ),
+            detail_retention_min=float(
+                getattr(
+                    pipeline.cfg,
+                    "stage5_multiscale_detail_retention_min",
+                    0.82,
+                )
+            ),
+            noise_reduction_min=float(
+                getattr(
+                    pipeline.cfg,
+                    "stage5_multiscale_noise_reduction_min",
+                    0.05,
+                )
+            ),
+        )
+        report["transaction"]["baseline_saved"] = True
+        if not bool(report.get("accepted")):
+            messages.append(
+                "Stage5 multiscale candidate not applied: "
+                f"status={report.get('status')}, "
+                f"issues={','.join(report.get('issues') or []) or 'none'}"
+            )
+            return False, report
+
+        safe_writer = getattr(pipeline, "_set_current_image_pixeldata", None)
+        if callable(safe_writer):
+            safe_writer(candidate, label="Stage5 multiscale linear denoise")
+        else:
+            set_pixels = getattr(pipeline.siril, "set_image_pixeldata", None)
+            if not callable(set_pixels):
+                raise RuntimeError("Siril pixel writer unavailable")
+            lock_factory = getattr(pipeline.siril, "image_lock", None)
+            if callable(lock_factory):
+                with lock_factory():
+                    set_pixels(candidate)
+            else:
+                pipeline.log.warn(
+                    "Stage5 multiscale denoise: image_lock unavailable"
+                )
+                set_pixels(candidate)
+
+        if not pipeline._save_stage_output("stage5_multiscale_candidate"):
+            raise RuntimeError("candidate checkpoint save failed")
+        report["transaction"].update(
+            candidate_saved=True,
+            rollback_performed=False,
+        )
+        metrics = report.get("metrics") or {}
+        messages.append(
+            "Stage5 deterministic multiscale denoise accepted "
+            f"(noise_reduction={float(metrics.get('background_noise_reduction', 0.0)):.3f}, "
+            f"detail_retention={float(metrics.get('signal_detail_retention', 0.0)):.3f})"
+        )
+        return True, report
+    except (
+        AttributeError,
+        CommandError,
+        OSError,
+        RuntimeError,
+        SirilError,
+        TypeError,
+        ValueError,
+    ) as error:
+        report.update(
+            status="failed",
+            accepted=False,
+            error=str(error),
+        )
+        try:
+            pipeline.cmd_with_check("load", "stage5_pre_multiscale")
+            report.setdefault("transaction", {}).update(
+                rollback_performed=True,
+            )
+        except (CommandError, SirilError) as rollback_error:
+            report.setdefault("transaction", {}).update(
+                rollback_performed=False,
+                rollback_error=str(rollback_error),
+            )
+        messages.append(
+            "Stage5 multiscale denoise failed; restored baseline: "
+            f"{pipeline._short_text(error, 160)}"
+        )
+        return False, report
 
 
 def _run_cosmic_clarity_linear_denoise(
@@ -411,23 +565,29 @@ def _run_stage5_graxpert_deconvolution(
             messages.append("Stage5 GraXpert object deconvolution unavailable: local model missing")
         return False, details
 
+    hardware_acceleration = _stage5_graxpert_hardware_acceleration_enabled(pipeline)
     details.update({
         "attempted": True,
         "available": True,
         "model": model.parent.name,
         "resolved_model_path": str(model),
+        "hardware_acceleration": "auto" if hardware_acceleration else "cpu",
     })
+    script_args = [
+        "-deconv_obj",
+        "-strength", f"{details['strength']:.2f}",
+        "-psfsize", f"{details['psf_size']:.1f}",
+        "-model", model.parent.name,
+    ]
+    if hardware_acceleration:
+        script_args.append("-gpu")
+    else:
+        script_args.append("-nogpu")
     used = pipeline._run_plugin_script_by_path(
         "Stage5 GraXpert反卷积",
         "GraXpert AI Object Deconvolution",
         script,
-        args=(
-            "-deconv_obj",
-            "-strength", f"{details['strength']:.2f}",
-            "-psfsize", f"{details['psf_size']:.1f}",
-            "-model", model.parent.name,
-            "-nogpu",
-        ),
+        args=tuple(script_args),
     )
     if not used:
         details["reason"] = (
@@ -449,7 +609,8 @@ def _run_stage5_graxpert_deconvolution(
     pipeline._save_stage_output("stage5_graxpert_deconv")
     messages.append(
         "Stage5 GraXpert object deconvolution applied "
-        f"(model={model.parent.name}, strength={details['strength']:.2f}, psf=5.0)"
+        f"(model={model.parent.name}, strength={details['strength']:.2f}, psf=5.0, "
+        f"hardware={'auto' if hardware_acceleration else 'cpu'})"
     )
     return True, details
 
@@ -476,10 +637,17 @@ def run_stage5_linear_denoise(pipeline) -> None:
     guard_triggered = False
     guard_reason = ""
     denoise_used = "none"
+    denoise_reason_code = ""
+    denoise_fallback_used = False
     deconv_applied = False
     deconv_method = "none"
     deconv_attempted_method = "none"
+    deconv_fallback_used = False
     graxpert_details = {}
+    multiscale_report: Dict[str, Any] = {
+        "status": "not_requested",
+        "accepted": False,
+    }
     denoise_input = "stage5_input_linear"
     final_stem = "stage5_linear"
 
@@ -501,6 +669,44 @@ def run_stage5_linear_denoise(pipeline) -> None:
         if hasattr(pipeline, "_adaptive_features_current")
         else {}
     )
+    try:
+        noise_pixels = pipeline.siril.get_image_pixeldata(preview=False)
+        noise_model_report = build_noise_model_report(
+            noise_pixels,
+            source_checkpoint="stage5_input_linear.fit",
+            channel_semantics=str(
+                getattr(pipeline, "_channel_semantics", "unknown") or "unknown"
+            ),
+        )
+        pipeline._stage5_noise_model_report = noise_model_report
+        pipeline._write_stage_json(
+            "stage5_noise_model.json",
+            noise_model_report,
+        )
+        messages.append(
+            "stage5_noise_model=report_only "
+            f"scales={len(noise_model_report['scales'])} "
+            f"background_samples={int(noise_model_report['background']['sample_count'])}"
+        )
+    except (
+        AttributeError,
+        CommandError,
+        OSError,
+        RuntimeError,
+        SirilError,
+        TypeError,
+        ValueError,
+    ) as error:
+        noise_model_report = {
+            "schema": "seestar.multiscale-noise-model.v1",
+            "mode": "report_only",
+            "applied_to_pixels": False,
+            "status": "unavailable",
+            "error": str(error),
+        }
+        pipeline._stage5_noise_model_report = noise_model_report
+        pipeline.log.warn(f"Stage5 noise model report unavailable: {error}")
+        messages.append("stage5 noise model unavailable; existing denoise policy unchanged")
     background_risk = _stage5_background_risk(before_adaptive, stage5_policy)
 
     deconv_applied, graxpert_details = _run_stage5_graxpert_deconvolution(
@@ -521,6 +727,18 @@ def run_stage5_linear_denoise(pipeline) -> None:
         )
         if deconv_applied:
             deconv_method = "siril_rl"
+            deconv_fallback_used = bool(
+                getattr(
+                    pipeline.cfg,
+                    "stage5_graxpert_deconvolution_enabled",
+                    True,
+                )
+                and graxpert_details.get("reason")
+                not in {
+                    "deconvolution_disabled",
+                    "graxpert_deconvolution_disabled",
+                }
+            )
     if deconv_applied:
         if deconv_method == "siril_rl":
             denoise_input = "stage5_deconv"
@@ -545,6 +763,7 @@ def run_stage5_linear_denoise(pipeline) -> None:
                 denoise_input = "stage5_input_linear"
                 deconv_applied = False
                 deconv_method = "none"
+                deconv_fallback_used = False
             except (CommandError, SirilError) as e:
                 status = "degraded"
                 messages.append(f"Stage5 background guard reload failed: {pipeline._short_text(e, 160)}")
@@ -557,9 +776,57 @@ def run_stage5_linear_denoise(pipeline) -> None:
             pipeline.log.warn(f"[Stage5] stale deconvolution output cleanup failed: {e}")
 
     if not bool(getattr(pipeline.cfg, "denoise_enabled", False)):
-        messages.append("linear denoise skipped by configuration")
+        denoise_reason_code = _stage5_disabled_denoise_reason(pipeline)
+        denoise_reason_text = {
+            "user_disabled": "linear denoise disabled by user",
+            "auto_low_noise": "linear denoise skipped by automatic low-noise policy",
+            "config_disabled": "linear denoise skipped by configuration",
+        }[denoise_reason_code]
+        messages.append(denoise_reason_text)
+    elif bool(
+        getattr(pipeline.cfg, "stage5_multiscale_denoise_enabled", True)
+    ):
+        multiscale_applied, multiscale_report = (
+            _run_multiscale_linear_denoise(pipeline, messages)
+        )
+        pipeline._write_stage_json(
+            "stage5_multiscale_denoise.json",
+            multiscale_report,
+        )
+        if multiscale_applied:
+            denoise_used = "deterministic_multiscale"
+            denoise_reason_code = "accepted"
+        elif multiscale_report.get("status") == "skipped_low_noise":
+            denoise_used = "none"
+            denoise_reason_code = "auto_low_noise"
+            messages.append(
+                "Stage5 low-noise guard skipped fallback denoisers"
+            )
+        elif _run_builtin_linear_denoise(pipeline, messages):
+            denoise_used = "siril_builtin"
+            denoise_reason_code = "primary_failed"
+            denoise_fallback_used = True
+        else:
+            plugin_used = _run_cosmic_clarity_linear_denoise(
+                pipeline,
+                denoise_mode=denoise_mode,
+                denoise_strength=denoise_strength,
+                messages=messages,
+            )
+            if plugin_used:
+                denoise_used = plugin_used
+                denoise_reason_code = "primary_failed"
+                denoise_fallback_used = True
+            else:
+                status = "degraded"
+                denoise_reason_code = "all_denoisers_failed"
+                messages.append(
+                    "linear denoise unavailable; stage5_linear keeps current "
+                    f"{'deconvolved' if deconv_applied else 'linear'} image"
+                )
     elif _run_builtin_linear_denoise(pipeline, messages):
         denoise_used = "siril_builtin"
+        denoise_reason_code = "accepted"
     else:
         plugin_used = _run_cosmic_clarity_linear_denoise(
             pipeline,
@@ -569,8 +836,11 @@ def run_stage5_linear_denoise(pipeline) -> None:
         )
         if plugin_used:
             denoise_used = plugin_used
+            denoise_reason_code = "primary_failed"
+            denoise_fallback_used = True
         else:
             status = "degraded"
+            denoise_reason_code = "all_denoisers_failed"
             messages.append(
                 "linear denoise unavailable; stage5_linear keeps current "
                 f"{'deconvolved' if deconv_applied else 'linear'} image"
@@ -614,6 +884,57 @@ def run_stage5_linear_denoise(pipeline) -> None:
         status = "degraded"
         messages.append("stage5_denoised compatibility save failed")
 
+    if deconv_applied:
+        deconv_component_status = "applied"
+        deconv_reason_code = "accepted"
+    elif guard_triggered:
+        deconv_component_status = "rolled_back"
+        deconv_reason_code = "background_guard_rollback"
+    elif not bool(getattr(pipeline.cfg, "stage5_deconvolution_enabled", True)):
+        deconv_component_status = "skipped"
+        deconv_reason_code = (
+            "user_disabled"
+            if str(os.getenv("SEESTAR_STAGE5_DECONV_ENABLE") or "").strip().lower()
+            in {"0", "false", "no", "off"}
+            else "config_disabled"
+        )
+    else:
+        deconv_component_status = "failed"
+        deconv_reason_code = "deconvolution_unavailable"
+
+    if denoise_used != "none":
+        denoise_component_status = "applied"
+        denoise_reason_code = denoise_reason_code or "accepted"
+    elif denoise_reason_code in {
+        "auto_low_noise",
+        "user_disabled",
+        "config_disabled",
+    }:
+        denoise_component_status = "skipped"
+    else:
+        denoise_component_status = "failed"
+        denoise_reason_code = denoise_reason_code or "all_denoisers_failed"
+
+    components = {
+        "deconvolution": {
+            "status": deconv_component_status,
+            "method": deconv_method,
+            "reason_code": deconv_reason_code,
+            "input": "stage5_input_linear",
+            "output": denoise_input if deconv_applied else None,
+            "fallback_used": deconv_fallback_used,
+        },
+        "denoise": {
+            "status": denoise_component_status,
+            "method": denoise_used,
+            "reason_code": denoise_reason_code,
+            "input": denoise_input,
+            "output": "stage5_linear" if linear_saved else None,
+            "fallback_used": denoise_fallback_used,
+        },
+    }
+    stage_fallback_used = deconv_fallback_used or denoise_fallback_used
+
     pipeline._write_stage_json(
         "stage5_linear_report.json",
         {
@@ -640,9 +961,14 @@ def run_stage5_linear_denoise(pipeline) -> None:
                 else "generic_low_snr_safe"
             ),
             "denoise": {
+                "status": denoise_component_status,
+                "reason_code": denoise_reason_code,
+                "fallback_used": denoise_fallback_used,
                 "method": denoise_used,
                 "input": denoise_input,
                 "output": "stage5_linear",
+                "noise_model_report": noise_model_report,
+                "multiscale_candidate": multiscale_report,
                 "siril_builtin_mod": max(
                     0.20,
                     min(0.55, float(getattr(pipeline.cfg, "stage5_builtin_denoise_mod", 0.50))),
@@ -652,6 +978,9 @@ def run_stage5_linear_denoise(pipeline) -> None:
                 "cosmic_clarity_fallback_strength": denoise_strength,
             },
             "deconvolution": {
+                "status": deconv_component_status,
+                "reason_code": deconv_reason_code,
+                "fallback_used": deconv_fallback_used,
                 "enabled": bool(getattr(pipeline.cfg, "stage5_deconvolution_enabled", True)),
                 "method": deconv_method,
                 "attempted_method": deconv_attempted_method,
@@ -673,10 +1002,19 @@ def run_stage5_linear_denoise(pipeline) -> None:
                 "after_linear": after_linear_adaptive,
                 "after_final": after_linear_adaptive,
             },
+            "components": components,
             "status": status,
             "messages": messages,
         },
     )
 
     elapsed = pipeline.log.stage_end(stage_name)
-    pipeline._record_stage(stage_name, status, elapsed, "；".join(messages))
+    pipeline._record_stage(
+        stage_name,
+        status,
+        elapsed,
+        "；".join(messages),
+        fallback_used=stage_fallback_used,
+        reason_code=("component_fallback_used" if stage_fallback_used else ""),
+        components=components,
+    )

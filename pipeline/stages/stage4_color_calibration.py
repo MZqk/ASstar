@@ -11,7 +11,21 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from channel_semantics import (
+    channel_shape_dict,
+    classify_channel_semantics,
+    filter_hint_suggests_narrowband,
+)
+from device_geometry import (
+    activate_device_geometry_report,
+    build_device_geometry_report,
+    validate_active_geometry,
+)
 from models import PipelineStage
+from narrowband_normalization import (
+    classify_dual_narrowband_mapping,
+    normalize_dual_narrowband_candidate,
+)
 from sirilpy.exceptions import CommandError, SirilError
 
 
@@ -21,6 +35,10 @@ DEFAULT_STAGE4_PIXEL_SIZE_UM = 2.9
 DEFAULT_STAGE4_INSTRUMENT = "Seestar S30 Pro"
 DEFAULT_OSC_SENSOR = "Sony IMX585"
 PCC_CATALOG = "gaia"
+PCC_LOCAL_CATALOG = "localgaia"
+PCC_TIMEOUT_DEFAULT_SEC = 180
+PCC_TIMEOUT_MIN_SEC = 5
+PCC_TIMEOUT_MAX_SEC = 180
 PCC_CHECKPOINT_STEM = "stage4_pre_pcc"
 PCC_CANDIDATE_STEM = "stage4_pcc_candidate"
 LOCAL_ASTROMETRIC_FILENAME = "siril_cat_healpix8_astro.dat"
@@ -66,7 +84,7 @@ DUAL_NARROWBAND_KEYWORDS = frozenset(
 
 def _stage4_network_enabled() -> bool:
     return (
-        os.getenv("SEESTAR_NETWORK_MODE", "1").strip().lower()
+        os.getenv("SEESTAR_NETWORK_MODE", "0").strip().lower()
         in ENV_TRUE_VALUES
     )
 
@@ -108,24 +126,42 @@ def _stage4_local_astrometric_catalog_status(pipeline) -> Dict[str, Any]:
     }
 
 
+def _stage4_pcc_catalog_status(pipeline) -> Dict[str, Any]:
+    """The Siril Gaia astrometric extract also carries Teff for offline PCC."""
+    status = _stage4_local_astrometric_catalog_status(pipeline)
+    return {
+        **status,
+        "catalog": PCC_LOCAL_CATALOG,
+        "photometric_field": "Gaia DR3 Teff",
+        "supports_offline_pcc": bool(status["available"]),
+    }
+
+
+def _stage4_preferred_pcc_catalog(pipeline) -> Optional[str]:
+    if _stage4_pcc_catalog_status(pipeline)["supports_offline_pcc"]:
+        return PCC_LOCAL_CATALOG
+    if _stage4_network_enabled():
+        return PCC_CATALOG
+    return None
+
+
 def _stage4_active_target_type(pipeline) -> str:
+    if hasattr(pipeline, "_active_target_type"):
+        target_type = str(
+            pipeline._active_target_type() or ""
+        ).strip().lower()
+        if target_type:
+            return target_type
     profile = getattr(pipeline, "target_profile", None)
     if isinstance(profile, dict):
         target_type = str(profile.get("target_type") or "").strip().lower()
         if target_type:
             return target_type
-    if hasattr(pipeline, "_active_target_type"):
-        return str(pipeline._active_target_type() or "").strip().lower()
     return ""
 
 
 def _stage4_filter_hint_suggests_narrowband(filter_hint: str) -> bool:
-    if not filter_hint:
-        return False
-    return any(
-        keyword in filter_hint
-        for keyword in DUAL_NARROWBAND_KEYWORDS
-    )
+    return filter_hint_suggests_narrowband(filter_hint)
 
 
 def _stage4_focal_length() -> float:
@@ -140,15 +176,28 @@ def _stage4_platesolve_order() -> str:
     return str(os.getenv("SEESTAR_STAGE4_PLATESOLVE_ORDER", "3") or "").strip()
 
 
-def _stage4_platesolve_geometry_args() -> Tuple[str, ...]:
-    focal = str(os.getenv("SEESTAR_STAGE4_PLATESOLVE_FOCAL", "160") or "160").strip()
-    pixelsize = str(os.getenv("SEESTAR_STAGE4_PLATESOLVE_PIXELSIZE", "2.90") or "2.90").strip()
+def _stage4_platesolve_geometry_args(pipeline=None) -> Tuple[str, ...]:
+    active = (
+        getattr(pipeline, "_stage4_active_geometry", None)
+        if pipeline is not None
+        else None
+    )
+    if isinstance(active, dict):
+        focal = f"{float(active.get('focal_length_mm', 160.0)):.8g}"
+        pixelsize = f"{float(active.get('pixel_size_um', 2.90)):.8g}"
+    else:
+        focal = str(
+            os.getenv("SEESTAR_STAGE4_PLATESOLVE_FOCAL", "160") or "160"
+        ).strip()
+        pixelsize = str(
+            os.getenv("SEESTAR_STAGE4_PLATESOLVE_PIXELSIZE", "2.90") or "2.90"
+        ).strip()
     # Plate solving adds WCS metadata; it must not rewrite the user's image orientation.
     return ("-noflip", f"-focal={focal}", f"-pixelsize={pixelsize}")
 
 
-def _stage4_platesolve_args() -> Tuple[str, ...]:
-    args = _stage4_platesolve_geometry_args()
+def _stage4_platesolve_args(pipeline=None) -> Tuple[str, ...]:
+    args = _stage4_platesolve_geometry_args(pipeline)
     order = _stage4_platesolve_order()
     if order:
         args += (f"-order={order}",)
@@ -214,11 +263,14 @@ def _stage4_header_center_coordinates(metadata: Dict[str, Any]) -> Optional[str]
     return None
 
 
-def _stage4_header_platesolve_args(metadata: Dict[str, Any]) -> Tuple[str, ...]:
+def _stage4_header_platesolve_args(
+    metadata: Dict[str, Any],
+    pipeline=None,
+) -> Tuple[str, ...]:
     center = _stage4_header_center_coordinates(metadata)
     if not center:
         return ()
-    args = (center,) + _stage4_platesolve_geometry_args()
+    args = (center,) + _stage4_platesolve_geometry_args(pipeline)
     radius = str(os.getenv("SEESTAR_STAGE4_PLATESOLVE_HEADER_RADIUS", "") or "").strip()
     if radius:
         args += (f"-radius={radius}",)
@@ -229,13 +281,13 @@ def _stage4_platesolve_variants(
     pipeline,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> List[Tuple[str, Tuple[str, ...]]]:
-    base = _stage4_platesolve_geometry_args()
+    base = _stage4_platesolve_geometry_args(pipeline)
     order = _stage4_platesolve_order()
     order_args = (f"-order={order}",) if order else ()
     variants: List[Tuple[str, Tuple[str, ...]]] = []
     for catalog in _stage4_platesolve_catalogs(pipeline):
         variants.append((f"catalog:{catalog}", base + (f"-catalog={catalog}",) + order_args))
-    header_base = _stage4_header_platesolve_args(metadata or {})
+    header_base = _stage4_header_platesolve_args(metadata or {}, pipeline)
     if header_base:
         for catalog in _stage4_platesolve_catalogs(pipeline):
             variants.append((f"header:catalog:{catalog}", header_base + (f"-catalog={catalog}",) + order_args))
@@ -349,13 +401,22 @@ def _stage4_run_pcc(
     pipeline,
     *,
     phase: str,
+    catalog: str = PCC_CATALOG,
 ) -> Tuple[bool, str, List[Dict[str, Any]]]:
-    """Run exactly one online Gaia PCC behind a killable process boundary."""
-    timeout_sec = int(getattr(pipeline.cfg, "stage4_pcc_timeout_sec", 30) or 30)
-    timeout_sec = max(5, min(timeout_sec, 120))
-    command = f"pcc -catalog={PCC_CATALOG}"
+    """Run exactly one local or online Gaia PCC behind a killable boundary."""
+    timeout_sec = int(
+        getattr(pipeline.cfg, "stage4_pcc_timeout_sec", PCC_TIMEOUT_DEFAULT_SEC)
+        or PCC_TIMEOUT_DEFAULT_SEC
+    )
+    timeout_sec = max(PCC_TIMEOUT_MIN_SEC, min(timeout_sec, PCC_TIMEOUT_MAX_SEC))
+    catalog = (
+        PCC_LOCAL_CATALOG
+        if str(catalog).strip().lower() == PCC_LOCAL_CATALOG
+        else PCC_CATALOG
+    )
+    command = f"pcc -catalog={catalog}"
     attempt: Dict[str, Any] = {
-        "label": f"catalog:{PCC_CATALOG}",
+        "label": f"catalog:{catalog}",
         "phase": phase,
         "command": command,
         "status": "failed",
@@ -364,14 +425,23 @@ def _stage4_run_pcc(
         "max_attempts": 1,
     }
 
-    if not _stage4_network_enabled():
+    if catalog == PCC_LOCAL_CATALOG:
+        catalog_status = _stage4_pcc_catalog_status(pipeline)
+        attempt["catalog_status"] = catalog_status
+        attempt["offline"] = True
+        if not catalog_status["supports_offline_pcc"]:
+            attempt.update(status="skipped", error="local Gaia catalogue unavailable")
+            return False, "PCC skipped: local Gaia catalogue unavailable", [attempt]
+    elif not _stage4_network_enabled():
         attempt.update(status="skipped", error="network mode disabled")
         return False, "PCC skipped: network mode disabled", [attempt]
+    else:
+        attempt["offline"] = False
 
     test_runner = getattr(pipeline, "_run_stage4_pcc_once", None)
     if callable(test_runner):
         try:
-            ok, detail = test_runner(timeout_sec=timeout_sec, catalog=PCC_CATALOG)
+            ok, detail = test_runner(timeout_sec=timeout_sec, catalog=catalog)
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             ok, detail = False, str(error)
         attempt["status"] = "ok" if ok else "failed"
@@ -421,7 +491,9 @@ def _stage4_run_pcc(
     attempt["runner"] = "independent_siril_cli"
     attempt["cli"] = str(cli)
     pipeline.log.info(
-        f"PCC 单次在线 Gaia 校色开始（timeout={timeout_sec}s）"
+        "PCC 单次 "
+        + ("离线" if catalog == PCC_LOCAL_CATALOG else "在线")
+        + f" Gaia 校色开始（timeout={timeout_sec}s）"
     )
     try:
         completed = subprocess.run(
@@ -513,42 +585,26 @@ def _stage4_channel_policy(
         shape = _stage4_shape_dict(pipeline.siril.get_image_shape())
     except (CommandError, SirilError, OSError, RuntimeError, TypeError, ValueError):
         shape = {}
-    channels = int(shape.get("channels", 0) or 0)
-    linearity = _stage4_linearity(metadata, checkpoint_loaded=checkpoint_loaded)
-    filter_text = _stage4_filter_semantics_text(pipeline, metadata)
-    narrowband = _stage4_filter_hint_suggests_narrowband(filter_text)
-
-    if channels == 1:
-        kind = "mono"
-        confidence = 1.0
-        action = "skip_color_calibration"
-    elif linearity["status"] == "nonlinear":
-        kind = "nonlinear_color"
-        confidence = float(linearity["confidence"])
-        action = "preserve_input"
-    elif channels < 3 or linearity["status"] != "linear":
-        kind = "unknown"
-        confidence = 0.0
-        action = "preserve_input_review"
-    elif narrowband:
-        kind = "narrowband_composite"
-        confidence = 0.95
-        action = "skip_pcc_local_star_only"
-    else:
-        kind = "broadband_rgb_osc"
-        confidence = 0.90
-        action = "single_pcc"
-
-    return {
-        "kind": kind,
-        "confidence": confidence,
-        "action": action,
-        "channels": channels,
-        "shape": shape,
-        "linearity": linearity,
-        "filter_hint": filter_text or None,
-        "narrowband_detected": bool(narrowband),
-    }
+    input_profile = getattr(pipeline, "input_profile", {}) or {}
+    input_state = (
+        str(input_profile.get("state") or "unknown")
+        if isinstance(input_profile, dict)
+        else "unknown"
+    )
+    policy = classify_channel_semantics(
+        channels=int(shape.get("channels", 0) or 0),
+        metadata=metadata,
+        input_state=input_state,
+        checkpoint_linear=checkpoint_loaded,
+        explicit_filter_hint=os.getenv("SEESTAR_STAGE4_FILTER_HINT", ""),
+        target_profile=(
+            pipeline.target_profile
+            if isinstance(getattr(pipeline, "target_profile", None), dict)
+            else None
+        ),
+    )
+    policy["shape"] = shape
+    return policy
 
 
 def _stage4_color_statistics(chw: np.ndarray) -> Dict[str, Any]:
@@ -580,6 +636,228 @@ def _stage4_color_statistics(chw: np.ndarray) -> Dict[str, Any]:
     }
 
 
+def _stage4_rgb_chromaticity(values: np.ndarray) -> Optional[List[float]]:
+    rgb = np.asarray(values, dtype=np.float64)
+    if rgb.size != 3 or not np.all(np.isfinite(rgb)):
+        return None
+    total = float(np.sum(np.clip(rgb, 0.0, None)))
+    if total <= 1e-8:
+        return None
+    return [float(value) for value in np.clip(rgb, 0.0, None) / total]
+
+
+def _stage4_star_temperature_distribution(chw: np.ndarray) -> Dict[str, Any]:
+    """Estimate a CCT distribution proxy from unsaturated bright star pixels."""
+    rgb = np.clip(np.asarray(chw[:3], dtype=np.float64), 0.0, None)
+    if rgb.shape[0] < 3 or rgb.size < 192:
+        return {"valid": False, "reason": "insufficient_rgb_pixels", "sample_count": 0}
+    lum = _stage4_luminance(rgb.astype(np.float32))
+    finite = np.isfinite(lum) & np.all(np.isfinite(rgb), axis=0)
+    if int(np.count_nonzero(finite)) < 64:
+        return {"valid": False, "reason": "insufficient_finite_pixels", "sample_count": 0}
+    valid_lum = lum[finite]
+    low = float(np.quantile(valid_lum, 0.97))
+    high = float(np.quantile(valid_lum, 0.9995))
+    if high <= low:
+        return {"valid": False, "reason": "no_star_dynamic_range", "sample_count": 0}
+    channel_max = np.max(rgb, axis=0)
+    channel_min = np.min(rgb, axis=0)
+    chroma = (channel_max - channel_min) / np.maximum(channel_max, 1e-8)
+    mask = finite & (lum >= low) & (lum <= high) & (chroma <= 0.85)
+    sample_count = int(np.count_nonzero(mask))
+    if sample_count < 24:
+        return {
+            "valid": False,
+            "reason": "insufficient_unsaturated_star_samples",
+            "sample_count": sample_count,
+        }
+
+    samples = rgb[:, mask]
+    scale = np.maximum(np.max(samples, axis=0), 1e-8)
+    r, g, b = samples / scale
+    x_xyz = 0.4124564 * r + 0.3575761 * g + 0.1804375 * b
+    y_xyz = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b
+    z_xyz = 0.0193339 * r + 0.1191920 * g + 0.9503041 * b
+    xyz_sum = x_xyz + y_xyz + z_xyz
+    valid_xyz = xyz_sum > 1e-8
+    x = x_xyz[valid_xyz] / xyz_sum[valid_xyz]
+    y = y_xyz[valid_xyz] / xyz_sum[valid_xyz]
+    denominator = 0.1858 - y
+    valid_xy = np.abs(denominator) > 1e-5
+    n = (x[valid_xy] - 0.3320) / denominator[valid_xy]
+    cct = -449.0 * n**3 + 3525.0 * n**2 - 6823.3 * n + 5520.33
+    cct = cct[np.isfinite(cct) & (cct >= 1500.0) & (cct <= 30000.0)]
+    if cct.size < 16:
+        return {
+            "valid": False,
+            "reason": "temperature_proxy_unavailable",
+            "sample_count": sample_count,
+            "temperature_samples": int(cct.size),
+        }
+    return {
+        "valid": True,
+        "method": "linear_rgb_mccamy_cct_proxy",
+        "sample_count": sample_count,
+        "temperature_samples": int(cct.size),
+        "median_kelvin": float(np.median(cct)),
+        "p10_kelvin": float(np.quantile(cct, 0.10)),
+        "p90_kelvin": float(np.quantile(cct, 0.90)),
+        "warm_fraction": float(np.mean(cct < 4000.0)),
+        "cool_fraction": float(np.mean(cct > 7500.0)),
+    }
+
+
+def _stage4_target_chromaticity(
+    chw: np.ndarray,
+    reference_luminance: np.ndarray,
+) -> Optional[List[float]]:
+    finite_lum = reference_luminance[np.isfinite(reference_luminance)]
+    if finite_lum.size < 64:
+        return None
+    low = float(np.quantile(finite_lum, 0.60))
+    high = float(np.quantile(finite_lum, 0.96))
+    mask = (
+        np.isfinite(reference_luminance)
+        & (reference_luminance >= low)
+        & (reference_luminance <= high)
+    )
+    if int(np.count_nonzero(mask)) < 32:
+        mask = np.isfinite(reference_luminance)
+    medians = np.array(
+        [float(np.median(np.asarray(channel)[mask])) for channel in chw[:3]],
+        dtype=np.float64,
+    )
+    return _stage4_rgb_chromaticity(medians)
+
+
+def _stage4_post_calibration_color_checks(
+    before: np.ndarray,
+    after: np.ndarray,
+    *,
+    before_stats: Dict[str, Any],
+    after_stats: Dict[str, Any],
+    emission_target: bool,
+    pipeline,
+) -> Tuple[List[str], Dict[str, Any]]:
+    before_star = _stage4_star_temperature_distribution(before)
+    after_star = _stage4_star_temperature_distribution(after)
+    star_ratio_min = float(
+        getattr(pipeline.cfg, "stage4_pcc_star_temperature_ratio_min", 0.45)
+        or 0.45
+    )
+    star_ratio_max = float(
+        getattr(pipeline.cfg, "stage4_pcc_star_temperature_ratio_max", 2.20)
+        or 2.20
+    )
+    star_ratio_min = max(0.20, min(star_ratio_min, 0.95))
+    star_ratio_max = max(1.05, min(star_ratio_max, 5.0))
+    star_ratio: Optional[float] = None
+    reasons: List[str] = []
+    if before_star.get("valid") and after_star.get("valid"):
+        star_ratio = float(after_star["median_kelvin"]) / max(
+            float(before_star["median_kelvin"]),
+            1e-8,
+        )
+        if not star_ratio_min <= star_ratio <= star_ratio_max:
+            reasons.append("star_temperature_distribution_shift_exceeded")
+
+    before_bg = _stage4_rgb_chromaticity(
+        np.asarray(before_stats.get("background_medians", []), dtype=np.float64)
+    )
+    after_bg = _stage4_rgb_chromaticity(
+        np.asarray(after_stats.get("background_medians", []), dtype=np.float64)
+    )
+    background_delta: Optional[float] = None
+    background_delta_max = float(
+        getattr(pipeline.cfg, "stage4_pcc_background_color_delta_max", 0.22)
+        or 0.22
+    )
+    background_delta_max = max(0.05, min(background_delta_max, 0.60))
+    before_spread = float(before_stats.get("background_channel_spread", float("inf")))
+    after_spread = float(after_stats.get("background_channel_spread", float("inf")))
+    if before_bg is not None and after_bg is not None:
+        background_delta = float(
+            np.linalg.norm(np.asarray(after_bg) - np.asarray(before_bg))
+        )
+        if (
+            background_delta > background_delta_max
+            and after_spread > before_spread * 1.05
+        ):
+            reasons.append("background_color_difference_exceeded")
+
+    before_lum = _stage4_luminance(np.asarray(before[:3], dtype=np.float32))
+    before_target = _stage4_target_chromaticity(before, before_lum)
+    after_target = _stage4_target_chromaticity(after, before_lum)
+    target_drift: Optional[float] = None
+    target_drift_max = float(
+        getattr(
+            pipeline.cfg,
+            (
+                "stage4_pcc_emission_target_color_drift_max"
+                if emission_target
+                else "stage4_pcc_target_color_drift_max"
+            ),
+            0.45 if emission_target else 0.28,
+        )
+        or (0.45 if emission_target else 0.28)
+    )
+    target_drift_max = max(0.05, min(target_drift_max, 0.75))
+    if before_target is not None and after_target is not None:
+        target_drift = float(
+            np.linalg.norm(np.asarray(after_target) - np.asarray(before_target))
+        )
+        if target_drift > target_drift_max:
+            reasons.append("target_color_drift_exceeded")
+
+    return reasons, {
+        "star_color_temperature_distribution": {
+            "before": before_star,
+            "after": after_star,
+            "median_temperature_ratio": star_ratio,
+            "accepted_range": [star_ratio_min, star_ratio_max],
+            "status": (
+                "passed"
+                if star_ratio is not None
+                and star_ratio_min <= star_ratio <= star_ratio_max
+                else ("not_measurable" if star_ratio is None else "rejected")
+            ),
+        },
+        "background_color_difference": {
+            "before_chromaticity": before_bg,
+            "after_chromaticity": after_bg,
+            "chromaticity_delta": background_delta,
+            "maximum_worsening_delta": background_delta_max,
+            "before_channel_spread": before_spread,
+            "after_channel_spread": after_spread,
+            "status": (
+                "not_measurable"
+                if background_delta is None
+                else (
+                    "rejected"
+                    if "background_color_difference_exceeded" in reasons
+                    else "passed"
+                )
+            ),
+        },
+        "target_color_drift": {
+            "before_chromaticity": before_target,
+            "after_chromaticity": after_target,
+            "chromaticity_delta": target_drift,
+            "maximum_delta": target_drift_max,
+            "emission_target_profile": bool(emission_target),
+            "status": (
+                "not_measurable"
+                if target_drift is None
+                else (
+                    "rejected"
+                    if "target_color_drift_exceeded" in reasons
+                    else "passed"
+                )
+            ),
+        },
+    }
+
+
 def _stage4_pcc_quality_gate(
     before: np.ndarray,
     after: np.ndarray,
@@ -599,6 +877,18 @@ def _stage4_pcc_quality_gate(
         getattr(pipeline.cfg, "stage4_pcc_channel_gain_ratio_max", 1.80) or 1.80
     )
     gain_ratio_max = max(1.10, min(gain_ratio_max, 3.0))
+    emission_balance_gain_ratio_max = float(
+        getattr(
+            pipeline.cfg,
+            "stage4_pcc_emission_balance_gain_ratio_max",
+            4.0,
+        )
+        or 4.0
+    )
+    emission_balance_gain_ratio_max = max(
+        gain_ratio_max,
+        min(emission_balance_gain_ratio_max, 5.0),
+    )
     clip_growth_max = float(
         getattr(pipeline.cfg, "stage4_pcc_clip_growth_max", 0.005) or 0.005
     )
@@ -629,6 +919,14 @@ def _stage4_pcc_quality_gate(
     bg_spread = float(after_stats.get("background_channel_spread", float("inf")))
     if bg_spread > bg_spread_max:
         reasons.append("background_chroma_exceeded")
+    before_bg_spread = float(
+        before_stats.get("background_channel_spread", float("inf"))
+    )
+    bg_spread_improvement_ratio = (
+        bg_spread / max(before_bg_spread, 1e-8)
+        if np.isfinite(before_bg_spread)
+        else float("inf")
+    )
     clip_growth = float(after_stats.get("highlight_clip_ratio", 0.0)) - float(
         before_stats.get("highlight_clip_ratio", 0.0)
     )
@@ -639,6 +937,42 @@ def _stage4_pcc_quality_gate(
     dynamic_ratio = after_dynamic / max(before_dynamic, 1e-8)
     if before_dynamic > 1e-6 and (dynamic_ratio < 0.50 or dynamic_ratio > 2.50):
         reasons.append("dynamic_range_shift_exceeded")
+
+    color_check_reasons, post_calibration_checks = (
+        _stage4_post_calibration_color_checks(
+            before,
+            after,
+            before_stats=before_stats,
+            after_stats=after_stats,
+            emission_target=emission_target,
+            pipeline=pipeline,
+        )
+    )
+    reasons.extend(color_check_reasons)
+
+    target_aware_exemptions: List[str] = []
+    emission_balance_verified = bool(
+        emission_target
+        and "channel_gain_ratio_exceeded" in reasons
+        and gain_ratio <= emission_balance_gain_ratio_max
+        and before_bg_spread >= 0.60
+        and bg_spread <= min(bg_spread_max, 0.12)
+        and bg_spread_improvement_ratio <= 0.25
+        and clip_growth <= clip_growth_max
+        and (
+            before_dynamic <= 1e-6
+            or 0.50 <= dynamic_ratio <= 2.50
+        )
+        and before.shape == after.shape
+        and bool(before_stats.get("valid"))
+        and bool(after_stats.get("valid"))
+        and float(after_stats.get("finite_ratio", 0.0)) >= 0.999999
+    )
+    if emission_balance_verified:
+        reasons.remove("channel_gain_ratio_exceeded")
+        target_aware_exemptions.append(
+            "large_gain_accepted_after_verified_background_balance"
+        )
 
     enabled = bool(getattr(pipeline.cfg, "stage4_pcc_quality_gate_enabled", True))
     accepted = (not enabled) or not reasons
@@ -655,15 +989,22 @@ def _stage4_pcc_quality_gate(
         "thresholds": {
             "background_channel_spread_max": bg_spread_max,
             "channel_gain_ratio_max": gain_ratio_max,
+            "emission_balance_gain_ratio_max": emission_balance_gain_ratio_max,
             "highlight_clip_growth_max": clip_growth_max,
         },
         "measurements": {
             "channel_gains": gains,
             "channel_gain_ratio": gain_ratio,
+            "background_channel_spread_before": before_bg_spread,
             "background_channel_spread": bg_spread,
+            "background_channel_spread_improvement_ratio": (
+                bg_spread_improvement_ratio
+            ),
             "highlight_clip_growth": clip_growth,
             "dynamic_range_ratio": dynamic_ratio,
         },
+        "post_calibration_checks": post_calibration_checks,
+        "target_aware_exemptions": target_aware_exemptions,
         "before": before_stats,
         "after": after_stats,
         "rejection_reasons": reasons,
@@ -672,10 +1013,7 @@ def _stage4_pcc_quality_gate(
 
 
 def _stage4_shape_dict(shape) -> Dict[str, int]:
-    if not shape:
-        return {}
-    channels, height, width = shape
-    return {"channels": int(channels), "height": int(height), "width": int(width)}
+    return channel_shape_dict(shape)
 
 
 def _stage4_pixel_scale_arcsec_per_px() -> float:
@@ -981,6 +1319,129 @@ def _stage4_write_image_pixels(pipeline, pixels: np.ndarray) -> None:
     pipeline.siril.set_image_pixeldata(pixels)
 
 
+def _stage4_run_narrowband_normalization(
+    pipeline,
+    metadata: Dict[str, Any],
+) -> tuple[bool, Dict[str, Any], str]:
+    report: Dict[str, Any] = {
+        "schema": "seestar.narrowband-normalization.v1",
+        "status": "not_run",
+        "accepted": False,
+    }
+    if not bool(
+        getattr(pipeline.cfg, "stage4_narrowband_normalization_enabled", True)
+    ):
+        report.update(status="disabled", issues=["disabled_by_configuration"])
+        return False, report, "narrowband normalization disabled"
+    filter_hint = _stage4_filter_semantics_text(pipeline, metadata)
+    mapping_confidence_min = float(
+        getattr(
+            pipeline.cfg,
+            "stage4_nbn_mapping_confidence_min",
+            0.85,
+        )
+    )
+    mapping = classify_dual_narrowband_mapping(
+        metadata,
+        filter_hint=filter_hint,
+    )
+    if float(mapping.get("confidence", 0.0)) < mapping_confidence_min:
+        report.update(
+            status="skipped_unconfirmed_mapping",
+            mapping=mapping,
+            issues=["channel_mapping_unconfirmed"],
+        )
+        return (
+            False,
+            report,
+            "narrowband normalization skipped: Ha/OIII mapping unconfirmed",
+        )
+    baseline_saved = pipeline._save_stage_output("stage4_pre_nbn")
+    if not baseline_saved:
+        report.update(
+            status="prohibited",
+            issues=["immutable_baseline_save_failed"],
+        )
+        return (
+            False,
+            report,
+            "narrowband normalization prohibited: immutable baseline save failed",
+        )
+    try:
+        image_data = pipeline.siril.get_image_pixeldata(preview=False)
+        candidate, report = normalize_dual_narrowband_candidate(
+            image_data,
+            metadata=metadata,
+            filter_hint=filter_hint,
+            mapping_confidence_min=mapping_confidence_min,
+            strength=float(
+                getattr(pipeline.cfg, "stage4_nbn_strength", 0.55)
+            ),
+            gain_limit=float(
+                getattr(pipeline.cfg, "stage4_nbn_gain_limit", 1.08)
+            ),
+            line_ratio_drift_max=float(
+                getattr(
+                    pipeline.cfg,
+                    "stage4_nbn_line_ratio_drift_max",
+                    0.12,
+                )
+            ),
+        )
+        report["transaction"]["baseline_saved"] = True
+        if not bool(report.get("accepted")):
+            return (
+                False,
+                report,
+                "narrowband normalization candidate rejected: "
+                + ",".join(report.get("issues") or []),
+            )
+        _stage4_write_image_pixels(pipeline, candidate)
+        if not pipeline._save_stage_output("stage4_nbn_candidate"):
+            raise RuntimeError("stage4_nbn_candidate save failed")
+        report["transaction"].update(
+            candidate_saved=True,
+            rollback_performed=False,
+        )
+        metrics = report.get("metrics") or {}
+        return (
+            True,
+            report,
+            "narrowband normalization accepted "
+            f"(background_improvement={float(metrics.get('background_color_improvement', 0.0)):.4f}, "
+            f"line_ratio_drift={float(metrics.get('ha_oiii_ratio_drift', 0.0)):.3f})",
+        )
+    except (
+        AttributeError,
+        CommandError,
+        OSError,
+        RuntimeError,
+        SirilError,
+        TypeError,
+        ValueError,
+    ) as error:
+        report.update(
+            status="failed",
+            accepted=False,
+            error=str(error),
+        )
+        try:
+            pipeline.cmd_with_check("load", "stage4_pre_nbn")
+            report.setdefault("transaction", {}).update(
+                rollback_performed=True,
+            )
+        except (CommandError, SirilError) as rollback_error:
+            report.setdefault("transaction", {}).update(
+                rollback_performed=False,
+                rollback_error=str(rollback_error),
+            )
+        return (
+            False,
+            report,
+            f"narrowband normalization unavailable; baseline restored: {error}",
+        )
+
+
 def _stage4_local_color_fallback(
     pipeline,
     *,
@@ -1024,6 +1485,11 @@ def run_stage4_color_calibration(pipeline) -> None:
     color_confidence = 0.0
     messages: List[str] = []
     local_fallback_report: Optional[Dict[str, Any]] = None
+    narrowband_normalization_report: Dict[str, Any] = {
+        "schema": "seestar.narrowband-normalization.v1",
+        "status": "not_applicable",
+        "accepted": False,
+    }
     pcc_attempts: List[Dict[str, Any]] = []
     pcc_quality_report: Dict[str, Any] = {"enabled": True, "accepted": False, "status": "not_run"}
     rollback_report: Dict[str, Any] = {"required": False, "restored": False}
@@ -1046,6 +1512,55 @@ def run_stage4_color_calibration(pipeline) -> None:
     stage4_metadata = _stage4_header_metadata(pipeline)
     setattr(pipeline, "_stage4_header_metadata", stage4_metadata)
     stage4_geometry = _stage4_image_geometry(pipeline)
+    device_geometry_report: Dict[str, Any]
+    try:
+        device_geometry_report = activate_device_geometry_report(
+            build_device_geometry_report(
+                stage4_metadata,
+                image_shape=stage4_geometry.get("current_shape") or {},
+                crop_report=stage4_geometry.get("stage2_crop") or {},
+            ),
+            enabled=bool(
+                getattr(pipeline.cfg, "stage4_auto_geometry_enabled", True)
+            ),
+            confidence_min=float(
+                getattr(
+                    pipeline.cfg,
+                    "stage4_auto_geometry_confidence_min",
+                    0.85,
+                )
+            ),
+        )
+        pipeline._stage4_active_geometry = dict(
+            device_geometry_report["activation"]["runtime_geometry"]
+        )
+        pipeline._device_geometry_report = device_geometry_report
+        pipeline._write_stage_json(
+            "device_geometry_report.json",
+            device_geometry_report,
+        )
+        geometry_activation = device_geometry_report["activation"]
+        messages.append(
+            "device_geometry=active_guarded "
+            f"confidence={float(geometry_activation['confidence']):.2f} "
+            f"applied={str(bool(geometry_activation['applied'])).lower()} "
+            f"source={geometry_activation['source']}"
+        )
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+        device_geometry_report = {
+            "schema": "seestar.device-geometry.v1",
+            "mode": "report_only",
+            "applied": False,
+            "status": "unavailable",
+            "error": str(error),
+        }
+        pipeline._device_geometry_report = device_geometry_report
+        pipeline._stage4_active_geometry = {
+            "focal_length_mm": _stage4_focal_length(),
+            "pixel_size_um": _stage4_pixel_size(),
+        }
+        pipeline.log.warn(f"Stage4 device geometry report unavailable: {error}")
+        messages.append("device_geometry report unavailable; runtime geometry unchanged")
     crop_total = (stage4_geometry.get("stage2_crop") or {}).get("total_crop") or {}
     if crop_total:
         messages.append(
@@ -1053,17 +1568,20 @@ def run_stage4_color_calibration(pipeline) -> None:
             f"L/T/R/B={crop_total.get('left')}/{crop_total.get('top')}/"
             f"{crop_total.get('right')}/{crop_total.get('bottom')}"
         )
+    active_geometry = getattr(pipeline, "_stage4_active_geometry", {}) or {}
     pipeline.log.info(
         "Stage4 instrument geometry: "
         f"{DEFAULT_STAGE4_INSTRUMENT} tele sensor={DEFAULT_OSC_SENSOR}, "
-        f"focal={_stage4_focal_length():g}mm, "
-        f"pixelsize={_stage4_pixel_size():g}um, "
+        f"focal={float(active_geometry.get('focal_length_mm', _stage4_focal_length())):g}mm, "
+        f"pixelsize={float(active_geometry.get('pixel_size_um', _stage4_pixel_size())):g}um, "
         f"shape={stage4_geometry.get('current_shape')}"
     )
 
     pipeline.platesolve_ok = False
     platesolve_attempted = True
-    platesolve_command = "platesolve " + " ".join(_stage4_platesolve_args())
+    platesolve_command = "platesolve " + " ".join(
+        _stage4_platesolve_args(pipeline)
+    )
     platesolve_attempts: List[Dict[str, str]] = []
     if bool(getattr(pipeline.cfg, "stage4_platesolve_enabled", True)):
         pipeline.platesolve_ok, platesolve_result, platesolve_attempts = _stage4_run_platesolve(
@@ -1088,6 +1606,55 @@ def run_stage4_color_calibration(pipeline) -> None:
         status = "degraded"
         hard_degraded = True
         messages.append("stage4_psolved 保存失败")
+    elif pipeline.platesolve_ok:
+        solved_metadata = _stage4_header_metadata(
+            pipeline,
+            "stage4_psolved",
+        )
+        device_geometry_report = validate_active_geometry(
+            device_geometry_report,
+            solved_metadata,
+            residual_max=float(
+                getattr(
+                    pipeline.cfg,
+                    "stage4_auto_geometry_scale_residual_max",
+                    0.05,
+                )
+            ),
+        )
+        pipeline._device_geometry_report = device_geometry_report
+        pipeline._write_stage_json(
+            "device_geometry_report.json",
+            device_geometry_report,
+        )
+        geometry_validation = (
+            device_geometry_report.get("activation", {}).get("validation", {})
+        )
+        messages.append(
+            "device_geometry_validation="
+            f"{geometry_validation.get('status', 'unavailable')}"
+        )
+        if geometry_validation.get("accepted") is False:
+            pipeline.log.warn(
+                "Stage4 自动几何与解算 WCS 比例冲突，回滚到未解析输入并禁止 PCC"
+            )
+            try:
+                pipeline.cmd_with_check("load", stage4_input_stem)
+                ps_saved = pipeline._save_stage_output("stage4_psolved")
+                pipeline.platesolve_ok = False
+                status = "degraded"
+                requires_review = True
+                messages.append(
+                    "auto geometry WCS validation rejected; restored stage3 input"
+                )
+            except (CommandError, SirilError) as error:
+                pipeline.platesolve_ok = False
+                status = "degraded"
+                hard_degraded = True
+                requires_review = True
+                messages.append(
+                    f"auto geometry validation rollback failed: {error}"
+                )
 
     if hasattr(pipeline, "_run_target_profile_preflight"):
         profile_msg = pipeline._run_target_profile_preflight(
@@ -1098,6 +1665,14 @@ def run_stage4_color_calibration(pipeline) -> None:
             messages.append(profile_msg)
             policy = getattr(pipeline, "pipeline_policy", {}) or {}
             stage4_policy = policy.get("stage4_color", {}) if isinstance(policy, dict) else {}
+    target_profile = getattr(pipeline, "target_profile", {}) or {}
+    profile_fallback_used = bool(
+        isinstance(target_profile, dict)
+        and str(
+            target_profile.get("classification_method") or ""
+        ).strip().lower()
+        == "fallback"
+    )
     refreshed_metadata = _stage4_header_metadata(
         pipeline,
         "stage4_psolved",
@@ -1112,6 +1687,29 @@ def run_stage4_color_calibration(pipeline) -> None:
         pipeline,
         stage4_metadata,
         checkpoint_loaded=checkpoint_loaded,
+    )
+    pipeline.channel_profile = dict(channel_policy)
+    pipeline._channel_semantics = str(channel_policy["kind"])
+    input_classification = {
+        "kind": pipeline._channel_semantics,
+        "label": {
+            "broadband_rgb_osc": "宽带 RGB/OSC",
+            "narrowband_composite": "双窄带/窄带合成",
+            "mono": "单色",
+            "nonlinear_color": "非线性色彩图",
+            "unknown": "未知",
+        }.get(pipeline._channel_semantics, pipeline._channel_semantics),
+        "calibration_route": {
+            "broadband_rgb_osc": "gaia_pcc_local_preferred",
+            "narrowband_composite": "skip_pcc_star_mask_only",
+            "mono": "skip_all_color_calibration",
+            "nonlinear_color": "preserve_input",
+            "unknown": "preserve_input_review",
+        }.get(pipeline._channel_semantics, "preserve_input_review"),
+    }
+    messages.append(
+        "channel_semantics="
+        f"{pipeline._channel_semantics} confidence={float(channel_policy['confidence']):.2f}"
     )
     target_aware_color = _stage4_active_target_type(pipeline) in EMISSION_NEBULA_TARGET_TYPES
     pre_pcc_saved = pipeline._save_stage_output(PCC_CHECKPOINT_STEM)
@@ -1132,12 +1730,14 @@ def run_stage4_color_calibration(pipeline) -> None:
         messages.append(f"pre_pcc pixels unavailable: {error}")
 
     policy_status = "not_applicable"
+    local_pcc_catalog = _stage4_pcc_catalog_status(pipeline)
+    selected_pcc_catalog = _stage4_preferred_pcc_catalog(pipeline)
     pcc_allowed = bool(
         channel_policy["action"] == "single_pcc"
         and pipeline.platesolve_ok
         and pre_pcc_saved
         and before_chw is not None
-        and _stage4_network_enabled()
+        and selected_pcc_catalog is not None
     )
 
     if channel_policy["kind"] == "mono":
@@ -1161,6 +1761,22 @@ def run_stage4_color_calibration(pipeline) -> None:
     elif channel_policy["kind"] == "narrowband_composite":
         policy_status = "skipped_by_policy"
         messages.append("high-confidence narrowband composite: PCC and global white balance skipped")
+        (
+            narrowband_normalized,
+            narrowband_normalization_report,
+            narrowband_message,
+        ) = _stage4_run_narrowband_normalization(
+            pipeline,
+            stage4_metadata,
+        )
+        pipeline._stage4_narrowband_normalization_report = (
+            narrowband_normalization_report
+        )
+        pipeline._write_stage_json(
+            "stage4_narrowband_normalization.json",
+            narrowband_normalization_report,
+        )
+        messages.append(narrowband_message)
         try:
             (
                 local_applied,
@@ -1171,7 +1787,14 @@ def run_stage4_color_calibration(pipeline) -> None:
                 fallback_message,
             ) = _stage4_local_color_fallback(pipeline, narrowband=True)
             messages.append(fallback_message)
-            if not local_applied:
+            if narrowband_normalized and local_applied:
+                color_method = "NBN_LOCAL_STAR_COLOR_RESTORE"
+                color_confidence = max(color_confidence, 0.88)
+            elif narrowband_normalized:
+                color_method = "NARROWBAND_NORMALIZED"
+                color_warning = ""
+                color_confidence = 0.86
+            elif not local_applied:
                 color_method = "PRESERVE_INPUT"
                 color_warning = "narrowband_preserved_no_star_samples"
                 color_confidence = 0.80
@@ -1185,13 +1808,18 @@ def run_stage4_color_calibration(pipeline) -> None:
             reason = (
                 "plate solve unavailable"
                 if not pipeline.platesolve_ok
-                else ("network mode disabled" if not _stage4_network_enabled() else "pre_pcc unavailable")
+                else (
+                    "local Gaia catalogue unavailable and network mode disabled"
+                    if selected_pcc_catalog is None
+                    else "pre_pcc unavailable"
+                )
             )
             messages.append(f"PCC skipped: {reason}")
         else:
             pcc_ok, pcc_result, pcc_attempts = _stage4_run_pcc(
                 pipeline,
                 phase="linear_broadband",
+                catalog=str(selected_pcc_catalog),
             )
             if pcc_ok:
                 try:
@@ -1204,8 +1832,16 @@ def run_stage4_color_calibration(pipeline) -> None:
                         pipeline,
                     )
                     if accepted:
-                        color_method = "PCC"
-                        color_confidence = 0.78
+                        color_method = (
+                            "PCC_LOCAL_GAIA"
+                            if selected_pcc_catalog == PCC_LOCAL_CATALOG
+                            else "PCC"
+                        )
+                        color_confidence = (
+                            0.82
+                            if selected_pcc_catalog == PCC_LOCAL_CATALOG
+                            else 0.78
+                        )
                         policy_status = "accepted"
                         messages.append(f"{pcc_result} accepted by target-aware quality gate")
                         pipeline.log.info("PCC 单次 Gaia 校色通过目标感知质量门")
@@ -1228,7 +1864,7 @@ def run_stage4_color_calibration(pipeline) -> None:
                 color_warning = "pcc_single_attempt_failed"
                 messages.append(pcc_result)
 
-        if color_method != "PCC":
+        if color_method not in {"PCC", "PCC_LOCAL_GAIA"}:
             rollback_report["required"] = bool(pcc_attempts)
             try:
                 pipeline.cmd_with_check("load", PCC_CHECKPOINT_STEM)
@@ -1291,6 +1927,84 @@ def run_stage4_color_calibration(pipeline) -> None:
         if review.get("report_path"):
             messages.append(f"review_bundle={review['report_path']}")
 
+    local_star_applied = bool(
+        isinstance(local_fallback_report, dict)
+        and bool(
+            (
+                local_fallback_report.get("star_white_balance") or {}
+            ).get("applied")
+        )
+    )
+    broadband_local_fallback_used = bool(
+        channel_policy.get("kind") == "broadband_rgb_osc"
+        and policy_status == "fallback_review_required"
+        and color_method == "LOCAL_STAR_COLOR_RESTORE"
+        and local_star_applied
+    )
+    stage_fallback_used = bool(
+        profile_fallback_used or broadband_local_fallback_used
+    )
+    platesolve_diagnostics = _stage4_platesolve_diagnostics(
+        platesolve_attempts,
+        stage4_metadata,
+    )
+    color_applied_methods = {
+        "PCC",
+        "PCC_LOCAL_GAIA",
+        "LOCAL_STAR_COLOR_RESTORE",
+        "NARROWBAND_NORMALIZED",
+        "NBN_LOCAL_STAR_COLOR_RESTORE",
+    }
+    intentional_color_skip = channel_policy.get("kind") in {
+        "mono",
+        "nonlinear_color",
+    }
+    components = {
+        "target_profile": {
+            "status": "applied",
+            "method": target_profile.get("classification_method"),
+            "reason_code": (
+                "target_profiler_fallback"
+                if profile_fallback_used
+                else "accepted"
+            ),
+            "fallback_used": profile_fallback_used,
+        },
+        "platesolve": {
+            "status": (
+                "applied"
+                if pipeline.platesolve_ok
+                else "skipped"
+                if not platesolve_attempted
+                else "failed"
+            ),
+            "method": platesolve_command if pipeline.platesolve_ok else None,
+            "reason_code": (
+                "accepted"
+                if pipeline.platesolve_ok
+                else "user_disabled"
+                if not platesolve_attempted
+                else str(platesolve_diagnostics.get("failure_kind") or "failed")
+            ),
+            "fallback_used": False,
+        },
+        "color_calibration": {
+            "status": (
+                "applied"
+                if color_method in color_applied_methods
+                else "skipped"
+                if intentional_color_skip
+                else "failed"
+                if requires_review
+                else "skipped"
+            ),
+            "method": color_method,
+            "reason_code": color_warning or policy_status,
+            "input": stage4_input_stem,
+            "output": "stage4_color" if color_saved else None,
+            "fallback_used": broadband_local_fallback_used,
+        },
+    }
     pipeline.color_calibration_report = {
         "stage": "stage4_color",
         "input": stage4_input_stem,
@@ -1299,21 +2013,29 @@ def run_stage4_color_calibration(pipeline) -> None:
             "ok": bool(pipeline.platesolve_ok),
             "command": platesolve_command,
             "attempts": platesolve_attempts,
-            "diagnostics": _stage4_platesolve_diagnostics(platesolve_attempts, stage4_metadata),
+            "diagnostics": platesolve_diagnostics,
             "output": "stage4_psolved.fit",
             "instrument_geometry": stage4_geometry,
+            "device_geometry_report": device_geometry_report,
             "input_metadata": stage4_metadata,
         },
         "method": color_method,
         "target_aware_color_mapping": bool(target_aware_color),
         "channel_policy": channel_policy,
+        "input_classification": input_classification,
         "photometric_calibration_allowed": bool(pcc_allowed),
         "requires_review": bool(requires_review),
         "global_white_balance": {"applied": False, "prohibited": True},
         "pcc": {
-            "catalog": PCC_CATALOG,
+            "catalog": selected_pcc_catalog,
+            "catalog_policy": "local_gaia_preferred_then_online_gaia",
+            "local_catalog": local_pcc_catalog,
             "max_attempts": 1,
-            "timeout_sec": int(getattr(pipeline.cfg, "stage4_pcc_timeout_sec", 30) or 30),
+            "timeout_sec": (
+                int(pcc_attempts[0].get("timeout_sec", PCC_TIMEOUT_DEFAULT_SEC))
+                if pcc_attempts
+                else PCC_TIMEOUT_DEFAULT_SEC
+            ),
             "policy_status": policy_status,
             "attempts": pcc_attempts,
             "network_enabled": _stage4_network_enabled(),
@@ -1321,6 +2043,7 @@ def run_stage4_color_calibration(pipeline) -> None:
             "rollback": rollback_report,
         },
         "local_fallback": local_fallback_report,
+        "narrowband_normalization": narrowband_normalization_report,
         "status": (
             "review_required"
             if requires_review
@@ -1349,8 +2072,37 @@ def run_stage4_color_calibration(pipeline) -> None:
             "compat_color": "stage4_colorbalanced.fit",
         },
         "messages": messages,
+        "fallback_used": stage_fallback_used,
+        "components": components,
     }
     pipeline._write_stage_json("color_calibration_report.json", pipeline.color_calibration_report)
 
     elapsed = pipeline.log.stage_end(stage_label)
-    pipeline._record_stage(stage_label, status, elapsed, "；".join(messages))
+    reason_code = (
+        "stage4_input_checkpoint_unavailable"
+        if not checkpoint_loaded
+        else "stage4_output_save_failed"
+        if not color_saved
+        else "stage4_hard_degraded"
+        if hard_degraded
+        else "color_calibration_review_required"
+        if requires_review
+        else "target_profiler_fallback"
+        if profile_fallback_used
+        else "broadband_local_star_fallback"
+        if broadband_local_fallback_used
+        else "color_not_applicable_mono"
+        if color_method == "SKIPPED_MONO"
+        else "color_preserved_by_policy"
+        if color_method == "PRESERVE_INPUT"
+        else ""
+    )
+    pipeline._record_stage(
+        stage_label,
+        status,
+        elapsed,
+        "；".join(messages),
+        fallback_used=stage_fallback_used,
+        reason_code=reason_code,
+        components=components,
+    )

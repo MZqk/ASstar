@@ -7,6 +7,7 @@ import importlib
 import os
 import sys
 import types
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -47,9 +48,10 @@ target_profiler = importlib.import_module("target_profiler")
 
 def _pipeline(shape=(3, 64, 64)):
     cfg = SimpleNamespace(
-        stage4_pcc_timeout_sec=30,
+        stage4_pcc_timeout_sec=180,
         stage4_pcc_quality_gate_enabled=True,
         stage4_pcc_channel_gain_ratio_max=1.80,
+        stage4_pcc_emission_balance_gain_ratio_max=4.0,
         stage4_pcc_clip_growth_max=0.005,
         stage4_local_star_wb_enabled=True,
         stage4_local_star_wb_min_pixels=16,
@@ -74,6 +76,19 @@ class Stage4PccPolicyTests(unittest.TestCase):
         self.assertIsNotNone(matched)
         item, confidence = matched
         self.assertEqual(item["name"], "M42")
+        self.assertEqual(item["type"], "bright_emission_reflection_nebula")
+        self.assertGreaterEqual(confidence, 0.90)
+
+    def test_object_header_m8_uses_packaged_lagoon_catalog_entry(self):
+        text = target_profiler._metadata_text({"OBJECT": "M 8"}, "")
+        matched = target_profiler._catalog_name_match(
+            target_profiler.load_catalog(),
+            text,
+        )
+
+        self.assertIsNotNone(matched)
+        item, confidence = matched
+        self.assertEqual(item["name"], "Lagoon Nebula")
         self.assertEqual(item["type"], "bright_emission_reflection_nebula")
         self.assertGreaterEqual(confidence, 0.90)
 
@@ -126,9 +141,57 @@ class Stage4PccPolicyTests(unittest.TestCase):
                 phase="linear_broadband",
             )
         self.assertFalse(ok)
-        self.assertEqual(calls, [(30, "gaia")])
+        self.assertEqual(calls, [(180, "gaia")])
         self.assertEqual(len(attempts), 1)
         self.assertEqual(attempts[0]["max_attempts"], 1)
+
+    def test_pcc_runner_clamps_timeout_to_180_seconds(self):
+        pipeline = _pipeline()
+        pipeline.cfg.stage4_pcc_timeout_sec = 999
+        calls = []
+        pipeline._run_stage4_pcc_once = lambda **kwargs: (
+            calls.append(kwargs) or False,
+            "timeout",
+        )
+        pipeline.log = SimpleNamespace(warn=lambda *_args: None, info=lambda *_args: None)
+
+        with patch.dict(os.environ, {"SEESTAR_NETWORK_MODE": "1"}, clear=False):
+            stage4._stage4_run_pcc(pipeline, phase="linear_broadband")
+
+        self.assertEqual(calls[0]["timeout_sec"], 180)
+
+    def test_local_gaia_catalog_drives_pcc_with_network_disabled(self):
+        pipeline = _pipeline()
+        calls = []
+        pipeline._run_stage4_pcc_once = lambda **kwargs: (
+            calls.append(kwargs) or True,
+            "ok",
+        )
+        pipeline.log = SimpleNamespace(warn=lambda *_args: None, info=lambda *_args: None)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            catalog = Path(temp_dir) / stage4.LOCAL_ASTROMETRIC_FILENAME
+            catalog.write_bytes(b"x" * stage4.MIN_LOCAL_CATALOG_FILE_BYTES)
+            with patch.dict(
+                os.environ,
+                {
+                    "SEESTAR_NETWORK_MODE": "0",
+                    "SEESTAR_GAIA_ASTRO_CATALOG": str(catalog),
+                },
+                clear=False,
+            ):
+                self.assertEqual(
+                    stage4._stage4_preferred_pcc_catalog(pipeline),
+                    "localgaia",
+                )
+                ok, _detail, attempts = stage4._stage4_run_pcc(
+                    pipeline,
+                    phase="linear_broadband",
+                    catalog="localgaia",
+                )
+
+        self.assertTrue(ok)
+        self.assertEqual(calls, [{"timeout_sec": 180, "catalog": "localgaia"}])
+        self.assertTrue(attempts[0]["offline"])
 
     def test_local_star_restore_does_not_apply_global_white_balance(self):
         pipeline = _pipeline(shape=(3, 96, 96))
@@ -162,6 +225,67 @@ class Stage4PccPolicyTests(unittest.TestCase):
             report["target_aware_profile"],
             "emission_nebula_red_dominance_allowed",
         )
+        self.assertEqual(
+            set(report["post_calibration_checks"]),
+            {
+                "star_color_temperature_distribution",
+                "background_color_difference",
+                "target_color_drift",
+            },
+        )
+
+    def test_emission_pcc_accepts_large_gain_only_after_verified_background_balance(self):
+        pipeline = _pipeline()
+        pipeline.target_profile = {
+            "target_name_guess": "Lagoon Nebula",
+            "target_type": "bright_emission_reflection_nebula",
+        }
+        before = np.empty((3, 64, 64), dtype=np.float32)
+        before[0] = 0.060
+        before[1] = 0.020
+        before[2] = 0.018
+        after = np.full((3, 64, 64), 0.030, dtype=np.float32)
+
+        accepted, report = stage4._stage4_pcc_quality_gate(
+            before,
+            after,
+            pipeline,
+        )
+
+        self.assertTrue(accepted, report)
+        self.assertGreater(
+            report["measurements"]["channel_gain_ratio"],
+            pipeline.cfg.stage4_pcc_channel_gain_ratio_max,
+        )
+        self.assertIn(
+            "large_gain_accepted_after_verified_background_balance",
+            report["target_aware_exemptions"],
+        )
+
+    def test_emission_pcc_large_gain_is_rejected_when_background_remains_unbalanced(self):
+        pipeline = _pipeline()
+        pipeline.target_profile = {
+            "target_name_guess": "Lagoon Nebula",
+            "target_type": "bright_emission_reflection_nebula",
+        }
+        before = np.empty((3, 64, 64), dtype=np.float32)
+        before[0] = 0.060
+        before[1] = 0.020
+        before[2] = 0.018
+        after = np.empty((3, 64, 64), dtype=np.float32)
+        after[0] = 0.030
+        after[1] = 0.030
+        after[2] = 0.010
+
+        accepted, report = stage4._stage4_pcc_quality_gate(
+            before,
+            after,
+            pipeline,
+        )
+
+        self.assertFalse(accepted)
+        self.assertIn("channel_gain_ratio_exceeded", report["rejection_reasons"])
+        self.assertIn("background_chroma_exceeded", report["rejection_reasons"])
 
     def test_failed_pcc_restores_pre_pcc_and_marks_review_required(self):
         image = np.full((3, 64, 64), 0.04, dtype=np.float32)
@@ -226,7 +350,7 @@ class Stage4PccPolicyTests(unittest.TestCase):
         pipeline._run_target_profile_preflight = lambda **_kwargs: ""
         pipeline._run_stage4_pcc_once = lambda **_kwargs: (False, "timeout")
         pipeline._write_stage_json = lambda *_args: None
-        pipeline._record_stage = lambda *args: results.append(args)
+        pipeline._record_stage = lambda *args, **_metadata: results.append(args)
         pipeline._active_policy_name = lambda: "bright_nebula_hdr_conservative"
 
         with patch.dict(os.environ, {"SEESTAR_NETWORK_MODE": "1"}, clear=False):

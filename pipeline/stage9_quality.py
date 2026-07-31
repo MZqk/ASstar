@@ -180,6 +180,8 @@ def _stage9_local_quality_metrics(
     candidate_norm: np.ndarray,
     positive_change: np.ndarray,
     cfg: Any,
+    *,
+    confirmed_star_support: np.ndarray | None = None,
 ) -> Dict[str, Any]:
     """Measure local Stage 9 artifacts that whole-frame ratios can dilute."""
     component_peak_min = _bounded(
@@ -299,7 +301,22 @@ def _stage9_local_quality_metrics(
         out=np.zeros_like(positive_peak),
         where=positive_peak > 0.0,
     )
-    component_mask = positive_peak > component_peak_min
+    supported_star_mask = np.zeros_like(positive_peak, dtype=bool)
+    if confirmed_star_support is not None:
+        supplied_support = np.asarray(confirmed_star_support, dtype=bool)
+        if supplied_support.shape == positive_peak.shape:
+            supported_star_mask = supplied_support
+    raw_component_mask = positive_peak > component_peak_min
+    # Source-matched star support is expected to contain compact positive
+    # additions. Keep the raw measurement for diagnostics, but gate only
+    # additions outside confirmed stars.
+    component_mask = raw_component_mask & ~supported_star_mask
+    _, raw_component_count, raw_component_areas = _component_areas(
+        raw_component_mask
+    )
+    raw_component_max_area = (
+        int(np.max(raw_component_areas)) if raw_component_areas.size else 0
+    )
     labels, component_count, component_areas = _component_areas(component_mask)
     component_max_area = int(np.max(component_areas)) if component_areas.size else 0
     single_pixel_ratio = (
@@ -324,11 +341,18 @@ def _stage9_local_quality_metrics(
 
     positive_rgb = _rgb_channels(positive_change)
     red, green, blue = positive_rgb
-    cyan_blue_mask = (
+    raw_cyan_blue_mask = (
         (positive_peak > cyan_peak_min)
         & (positive_saturation > cyan_saturation_min)
         & (blue > red * 1.20)
         & (((green + blue) * 0.5) > red * 1.25)
+    )
+    # Blue/cyan additions are expected for real blue stars. Only unmatched
+    # additions are an artifact gate; retain raw measurements for diagnostics.
+    cyan_blue_mask = raw_cyan_blue_mask & ~supported_star_mask
+    _, raw_cyan_count, raw_cyan_areas = _component_areas(raw_cyan_blue_mask)
+    raw_cyan_max_area = (
+        int(np.max(raw_cyan_areas)) if raw_cyan_areas.size else 0
     )
     _, cyan_count, cyan_areas = _component_areas(cyan_blue_mask)
     cyan_max_area = int(np.max(cyan_areas)) if cyan_areas.size else 0
@@ -358,10 +382,19 @@ def _stage9_local_quality_metrics(
         where=candidate_sum[np.newaxis, ...] > 1e-6,
     )
     color_jump = np.max(np.abs(candidate_ratio - base_ratio), axis=0)
-    core_jump_mask = (
+    raw_core_jump_mask = (
         core_mask
         & (positive_peak > component_peak_min)
         & (color_jump > core_color_jump_min)
+    )
+    # A verified star layer is allowed to restore stellar colour inside its
+    # own support. Unmatched core colour jumps remain a hard artifact gate.
+    core_jump_mask = raw_core_jump_mask & ~supported_star_mask
+    _, raw_core_jump_count, raw_core_jump_areas = _component_areas(
+        raw_core_jump_mask
+    )
+    raw_core_jump_max_area = (
+        int(np.max(raw_core_jump_areas)) if raw_core_jump_areas.size else 0
     )
     _, core_jump_count, core_jump_areas = _component_areas(core_jump_mask)
     core_jump_max_area = (
@@ -379,6 +412,11 @@ def _stage9_local_quality_metrics(
         "local_component_peak_min": component_peak_min,
         "local_connected_component_count": component_count,
         "local_connected_component_max_area": component_max_area,
+        "local_connected_component_count_raw": raw_component_count,
+        "local_connected_component_max_area_raw": raw_component_max_area,
+        "local_confirmed_star_support_ratio": float(
+            np.mean(supported_star_mask)
+        ),
         "local_nonstellar_shape_component_count": len(nonstellar_shape_areas),
         "local_nonstellar_shape_component_max_area": (
             max(nonstellar_shape_areas) if nonstellar_shape_areas else 0
@@ -387,6 +425,12 @@ def _stage9_local_quality_metrics(
         "local_cyan_blue_component_count": cyan_count,
         "local_cyan_blue_component_max_area": cyan_max_area,
         "local_cyan_blue_pixel_ratio": float(np.mean(cyan_blue_mask)),
+        "local_cyan_blue_component_count_raw": raw_cyan_count,
+        "local_cyan_blue_component_max_area_raw": raw_cyan_max_area,
+        "local_cyan_blue_pixel_ratio_raw": float(np.mean(raw_cyan_blue_mask)),
+        "local_cyan_blue_confirmed_star_pixel_ratio": float(
+            np.mean(raw_cyan_blue_mask & supported_star_mask)
+        ),
         "local_cyan_blue_peak_min": cyan_peak_min,
         "local_cyan_blue_saturation_min": cyan_saturation_min,
         "core_signal_percentile": core_percentile,
@@ -394,6 +438,8 @@ def _stage9_local_quality_metrics(
         "core_color_jump_min": core_color_jump_min,
         "core_color_jump_component_count": core_jump_count,
         "core_color_jump_component_max_area": core_jump_max_area,
+        "core_color_jump_component_count_raw": raw_core_jump_count,
+        "core_color_jump_component_max_area_raw": raw_core_jump_max_area,
         "core_color_jump_pixel_ratio": core_jump_ratio,
         "local_color_risk_score": min(1.0, float(local_color_risk_score)),
     }
@@ -2138,11 +2184,22 @@ def assess_remix(
             & (positive_change_saturation > chromatic_addition_saturation_min)
         )
     )
+    confirmed_star_support = None
+    if (
+        isinstance(star_reference, dict)
+        and star_reference.get("status") == "ok"
+        and bool(star_reference.get("source_matched", False))
+        and star_overlay_mask is not None
+    ):
+        supplied_support = np.asarray(star_overlay_mask, dtype=bool)
+        if supplied_support.shape == positive_change_peak.shape:
+            confirmed_star_support = supplied_support
     local_quality = _stage9_local_quality_metrics(
         base_norm,
         candidate_norm,
         positive_change,
         cfg,
+        confirmed_star_support=confirmed_star_support,
     )
 
     hollow_delta_min = _bounded(

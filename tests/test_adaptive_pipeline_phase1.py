@@ -60,6 +60,29 @@ class AdaptivePipelinePhase1Tests(unittest.TestCase):
         self.assertEqual(profile["target_type"], "bright_emission_reflection_nebula")
         self.assertEqual(profile["pipeline"], "bright_nebula_hdr_conservative")
         self.assertGreaterEqual(profile["target_confidence"], 0.55)
+        self.assertEqual(
+            profile["primary_target"]["type"],
+            "bright_emission_reflection_nebula",
+        )
+        self.assertIn("large_nebulosity", profile["secondary_labels"])
+
+    def test_cluster_primary_is_not_promoted_by_nebula_secondary_label(self) -> None:
+        features = AdaptiveImageFeatures(
+            bright_core_score=0.44,
+            compactness_score=0.32,
+            nebulosity_area_ratio=0.19,
+            faint_structure_score=0.48,
+            dense_star_field_score=0.82,
+            red_dominance=1.18,
+        )
+
+        profile = build_target_profile(features)
+
+        self.assertEqual(profile["target_type"], "globular_cluster")
+        self.assertEqual(profile["pipeline"], "globular_cluster_star_preserve")
+        self.assertIn("large_nebulosity", profile["secondary_labels"])
+        self.assertIn("emission_red", profile["secondary_labels"])
+        self.assertFalse(profile["routing_contract"]["secondary_labels_can_route"])
 
     def test_policy_missing_falls_back_to_generic(self) -> None:
         policy = load_policy("does_not_exist")

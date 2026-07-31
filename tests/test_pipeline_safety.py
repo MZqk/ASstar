@@ -36,6 +36,8 @@ from pipeline_safety import (  # noqa: E402
     should_bypass_star_separation,
     should_skip_final_denoise,
 )
+from models import StarSeparationState  # noqa: E402
+from stages.stage6_stretching import run_stage7_stretching  # noqa: E402
 from stages.stage7_star_separation import run_stage6_star_separation  # noqa: E402
 from stages.stage8_nebula_enhancement import run_stage8_nebula_enhancement  # noqa: E402
 from stages.stage9_star_remixing import run_stage9_star_remixing  # noqa: E402
@@ -52,6 +54,9 @@ class _Log:
         return None
 
     def warn(self, _message: str) -> None:
+        return None
+
+    def error(self, _message: str) -> None:
         return None
 
 
@@ -98,8 +103,44 @@ class _StarPreservePipeline:
     def _write_stage_json(self, name: str, payload: object) -> None:
         self.reports[name] = payload
 
-    def _record_stage(self, name: str, status: str, elapsed: float, message: str) -> None:
+    def _record_stage(
+        self,
+        name: str,
+        status: str,
+        elapsed: float,
+        message: str,
+        **_metadata: object,
+    ) -> None:
         self.records.append((name, status, elapsed, message))
+
+
+class _StarFailurePipeline(_StarPreservePipeline):
+    def __init__(self, process_dir: Path) -> None:
+        super().__init__(process_dir)
+        self.cfg = SimpleNamespace(
+            stage6_star_preserve_target_bypass_enabled=True,
+            stage7_quality_retry_max=0,
+        )
+
+    def _active_target_type(self) -> str:
+        return "large_galaxy"
+
+    def _find_plugin_script(self, _candidates: object):
+        return None
+
+    def _run_first_available_command(self, *_args: object, **_kwargs: object):
+        return None
+
+    def _stage7_update_star_remix_from_quality(self, _quality: object):
+        self._stage9_star_intensity_scale = 1.0
+        self._stage9_star_intensity_reason = "star separation unavailable"
+        return {"scale": 1.0, "reason": self._stage9_star_intensity_reason}
+
+    def _export_sasp_exchange_files(self) -> None:
+        return None
+
+    def _short_text(self, value: object, limit: int) -> str:
+        return str(value)[:limit]
 
 
 class PipelineSafetyTests(unittest.TestCase):
@@ -189,6 +230,12 @@ class PipelineSafetyTests(unittest.TestCase):
 
             self.assertTrue(pipeline._star_preserve_target_bypass)
             self.assertTrue(pipeline._stage7_starless_skipped)
+            self.assertEqual(
+                pipeline._star_separation_state,
+                StarSeparationState.TARGET_BYPASS.value,
+            )
+            self.assertTrue((pipeline.process_dir / "stage6_passthrough.fit").exists())
+            self.assertFalse((pipeline.process_dir / "starless.fit").exists())
             quality_report = pipeline.reports["stage7_quality.json"]
             self.assertEqual(quality_report["mode"], "star_preserve_target_bypass")
             self.assertFalse(any(command[0] == "script" for command in pipeline.commands))
@@ -208,6 +255,50 @@ class PipelineSafetyTests(unittest.TestCase):
 
             self.assertEqual(pipeline.records[-1][1], "skipped")
             self.assertEqual(pipeline._stage9_final_source, "stage8_enhanced")
+            self.assertTrue((pipeline.process_dir / "stage9_remixed.fit").exists())
+
+    def test_star_tool_failure_uses_with_stars_review_path_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline = _StarFailurePipeline(Path(tmpdir))
+
+            run_stage6_star_separation(pipeline)
+
+            self.assertEqual(
+                pipeline._star_separation_state,
+                StarSeparationState.TOOL_FAILED.value,
+            )
+            self.assertIsNone(pipeline.starless_file)
+            self.assertIsNone(pipeline.starmask_file)
+            self.assertTrue((pipeline.process_dir / "stage6_passthrough.fit").exists())
+            self.assertFalse((pipeline.process_dir / "starless.fit").exists())
+            self.assertFalse((pipeline.process_dir / "stage6_starless.fit").exists())
+
+            run_stage7_stretching(pipeline)
+            self.assertFalse(pipeline._stage7_stretch_accepted)
+            self.assertEqual(
+                pipeline._stage7_review_source,
+                "stage7_review_with_stars",
+            )
+
+            run_stage8_nebula_enhancement(pipeline)
+            stage8_report = pipeline.reports["stage8_enhancement_report.json"]
+            self.assertEqual(
+                stage8_report["mode"],
+                "with_stars_review_passthrough",
+            )
+            self.assertFalse(stage8_report["starless_enhancement_applied"])
+            self.assertEqual(
+                pipeline._stage8_final_source,
+                "stage8_review_with_stars",
+            )
+
+            run_stage9_star_remixing(pipeline)
+            self.assertTrue(pipeline._stage9_stars_required)
+            self.assertFalse(pipeline._stage9_stars_applied)
+            self.assertEqual(
+                pipeline._stage9_stars_application_mode,
+                "not_applied_star_separation_unavailable",
+            )
             self.assertTrue((pipeline.process_dir / "stage9_remixed.fit").exists())
 
 
