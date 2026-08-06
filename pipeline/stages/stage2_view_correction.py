@@ -1,4 +1,5 @@
 """Stage 2 view correction and crop."""
+import math
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -23,6 +24,14 @@ def _line_edge_scores(gray: np.ndarray, rgb: np.ndarray, *, axis: int, black_thr
     red_excess = np.maximum(r - np.maximum(g, b), 0.0)
     color_cast = np.median(chroma + 0.65 * np.maximum(blue_excess, red_excess), axis=0)
     return black_ratio.astype(np.float32), median_level.astype(np.float32), color_cast.astype(np.float32)
+
+
+def _combine_edge_evidence(hard_black: np.ndarray, *soft_evidence: np.ndarray) -> np.ndarray:
+    """Require two soft signals unless a line has direct near-black coverage."""
+    votes = np.zeros(np.asarray(hard_black).shape, dtype=np.uint8)
+    for evidence in soft_evidence:
+        votes += np.asarray(evidence, dtype=np.uint8)
+    return np.asarray(hard_black, dtype=bool) | (votes >= 2)
 
 
 def _first_stable_good_index(bad: np.ndarray, max_scan: int, stable_run: int) -> int:
@@ -94,11 +103,16 @@ def _detect_auto_edge_crop(pipeline, is_adaptive: bool = False) -> Tuple[Optiona
     max_scan_y = max(4, int(height * 0.25))
     stable_run = max(6, int(min(width, height) * 0.006))
 
+    # Score each side through the orthogonal center band. A top/bottom black
+    # strip otherwise raises the black ratio of every column (and vice versa),
+    # making a modest rectangular border look like a 25% crop on all sides.
+    center_y = slice(int(height * 0.25), max(int(height * 0.75), int(height * 0.25) + 1))
+    center_x = slice(int(width * 0.25), max(int(width * 0.75), int(width * 0.25) + 1))
     col_black, col_median, col_cast = _line_edge_scores(
-        gray, rgb, axis=0, black_threshold=black_threshold
+        gray[center_y, :], rgb[:, center_y, :], axis=0, black_threshold=black_threshold
     )
     row_black, row_median, row_cast = _line_edge_scores(
-        gray, rgb, axis=1, black_threshold=black_threshold
+        gray[:, center_x], rgb[:, :, center_x], axis=1, black_threshold=black_threshold
     )
     level_window = int(getattr(pipeline.cfg, "stage2_level_artifact_window", 81))
     row_level = _rolling_median_1d(row_median, level_window)
@@ -107,18 +121,18 @@ def _detect_auto_edge_crop(pipeline, is_adaptive: bool = False) -> Tuple[Optiona
     col_high_limit = bg_median + max(bg_std * 2.30, 0.00008)
     col_low_limit = center_median - max(bg_std * 0.62, 0.000035)
 
-    bad_cols = (
-        (col_black > black_line_limit)
-        | ((col_median <= dark_level_limit) & (col_black > 0.004))
-        | (col_cast > cast_limit)
-        | (col_level > col_high_limit)
-        | (col_level < col_low_limit)
+    bad_cols = _combine_edge_evidence(
+        col_black > black_line_limit,
+        (col_median <= dark_level_limit) & (col_black > 0.004),
+        col_cast > cast_limit,
+        col_level > col_high_limit,
+        col_level < col_low_limit,
     )
-    bad_rows = (
-        (row_black > black_line_limit)
-        | ((row_median <= dark_level_limit) & (row_black > 0.004))
-        | (row_cast > cast_limit)
-        | (row_level > row_high_limit)
+    bad_rows = _combine_edge_evidence(
+        row_black > black_line_limit,
+        (row_median <= dark_level_limit) & (row_black > 0.004),
+        row_cast > cast_limit,
+        row_level > row_high_limit,
     )
 
     left = _first_stable_good_index(bad_cols, max_scan_x, stable_run)
@@ -205,6 +219,140 @@ def _stage2_shape_dict(shape) -> dict:
     return {"channels": int(channels), "height": int(height), "width": int(width)}
 
 
+def _stage2_center_protection(shape: dict, area_ratio: float) -> dict:
+    width = int((shape or {}).get("width", 0) or 0)
+    height = int((shape or {}).get("height", 0) or 0)
+    if width <= 0 or height <= 0:
+        return {}
+    requested_ratio = max(0.50, min(0.95, float(area_ratio)))
+    linear_ratio = math.sqrt(requested_ratio)
+    protected_width = min(width, max(1, int(math.ceil(width * linear_ratio))))
+    protected_height = min(height, max(1, int(math.ceil(height * linear_ratio))))
+    if protected_width < width and protected_width % 2:
+        protected_width += 1
+    if protected_height < height and protected_height % 2:
+        protected_height += 1
+    left = (width - protected_width) // 2
+    top = (height - protected_height) // 2
+    if left > 0 and left % 2:
+        left -= 1
+    if top > 0 and top % 2:
+        top -= 1
+    right = left + protected_width
+    bottom = top + protected_height
+    return {
+        "requested_area_ratio": requested_ratio,
+        "actual_area_ratio": (protected_width * protected_height) / float(width * height),
+        "left": left,
+        "top": top,
+        "right": right,
+        "bottom": bottom,
+        "width": protected_width,
+        "height": protected_height,
+    }
+
+
+def _stage2_constrain_crop_to_center(
+    pipeline,
+    crop_report: dict,
+    x: int,
+    y: int,
+    crop_w: int,
+    crop_h: int,
+    *,
+    reason: str,
+) -> Tuple[Optional[Tuple[int, int, int, int]], str]:
+    before = crop_report.get("current_shape") or _stage2_shape_dict(pipeline.siril.get_image_shape())
+    current_width = int((before or {}).get("width", 0) or 0)
+    current_height = int((before or {}).get("height", 0) or 0)
+    if current_width <= 0 or current_height <= 0:
+        return None, "center-area protection blocked crop: current shape unavailable"
+
+    original = crop_report.get("original_shape") or before
+    if not crop_report.get("original_shape"):
+        crop_report["original_shape"] = original
+    original_width = int((original or {}).get("width", 0) or 0)
+    original_height = int((original or {}).get("height", 0) or 0)
+    if original_width <= 0 or original_height <= 0:
+        return None, "center-area protection blocked crop: original shape unavailable"
+
+    current_left = int(crop_report.get("total_left", 0) or 0)
+    current_top = int(crop_report.get("total_top", 0) or 0)
+    current_right = current_left + current_width
+    current_bottom = current_top + current_height
+
+    requested_left = current_left + max(0, int(x))
+    requested_top = current_top + max(0, int(y))
+    requested_right = min(current_right, current_left + int(x) + int(crop_w))
+    requested_bottom = min(current_bottom, current_top + int(y) + int(crop_h))
+    if requested_right <= requested_left or requested_bottom <= requested_top:
+        return None, "center-area protection blocked crop: invalid requested rectangle"
+
+    protection = crop_report.get("center_protection") or _stage2_center_protection(
+        original,
+        float(getattr(pipeline.cfg, "stage2_center_protect_area_ratio", 0.70)),
+    )
+    crop_report["center_protection"] = protection
+    if not protection:
+        return None, "center-area protection blocked crop: protection rectangle unavailable"
+    if (
+        current_left > int(protection["left"])
+        or current_top > int(protection["top"])
+        or current_right < int(protection["right"])
+        or current_bottom < int(protection["bottom"])
+    ):
+        return None, "center-area protection blocked crop: current image already violates protection"
+
+    applied_left = max(current_left, min(requested_left, int(protection["left"])))
+    applied_top = max(current_top, min(requested_top, int(protection["top"])))
+    applied_right = min(current_right, max(requested_right, int(protection["right"])))
+    applied_bottom = min(current_bottom, max(requested_bottom, int(protection["bottom"])))
+    applied_w = applied_right - applied_left
+    applied_h = applied_bottom - applied_top
+    if applied_w <= 0 or applied_h <= 0:
+        return None, "center-area protection blocked crop: no valid protected rectangle"
+
+    applied_rect = (
+        applied_left - current_left,
+        applied_top - current_top,
+        applied_w,
+        applied_h,
+    )
+    requested_rect = (int(x), int(y), int(crop_w), int(crop_h))
+    if applied_rect == (0, 0, current_width, current_height):
+        note = (
+            "center-area protection blocked crop "
+            f"(reason={reason}, requested={requested_rect}, "
+            f"protected_area={float(protection['actual_area_ratio']):.3f})"
+        )
+        crop_report.setdefault("crop_limit_hits", []).append(
+            {
+                "reason": reason,
+                "requested": requested_rect,
+                "applied": None,
+                "message": note,
+            }
+        )
+        return None, note
+
+    if applied_rect != requested_rect:
+        note = (
+            "center-area protection constrained crop "
+            f"(reason={reason}, requested={requested_rect}, applied={applied_rect}, "
+            f"protected_area={float(protection['actual_area_ratio']):.3f})"
+        )
+        crop_report.setdefault("crop_limit_hits", []).append(
+            {
+                "reason": reason,
+                "requested": requested_rect,
+                "applied": applied_rect,
+                "message": note,
+            }
+        )
+        return applied_rect, note
+    return applied_rect, ""
+
+
 def _stage2_crop_totals(crop_report: dict) -> dict:
     original = crop_report.get("original_shape") or {}
     current = crop_report.get("current_shape") or original
@@ -231,10 +379,28 @@ def _stage2_apply_crop(
     crop_h: int,
     *,
     reason: str,
-) -> None:
+) -> Tuple[Optional[Tuple[int, int, int, int]], str]:
     before = crop_report.get("current_shape") or _stage2_shape_dict(pipeline.siril.get_image_shape())
     before_width = int(before.get("width", 0) or 0)
     before_height = int(before.get("height", 0) or 0)
+    requested_crop = {
+        "x": int(x),
+        "y": int(y),
+        "width": int(crop_w),
+        "height": int(crop_h),
+    }
+    applied_rect, protection_note = _stage2_constrain_crop_to_center(
+        pipeline,
+        crop_report,
+        x,
+        y,
+        crop_w,
+        crop_h,
+        reason=reason,
+    )
+    if applied_rect is None:
+        return None, protection_note
+    x, y, crop_w, crop_h = applied_rect
     pipeline.cmd_with_check("crop", str(x), str(y), str(crop_w), str(crop_h))
     crop_report["total_left"] = int(crop_report.get("total_left", 0) or 0) + int(x)
     crop_report["total_top"] = int(crop_report.get("total_top", 0) or 0) + int(y)
@@ -246,6 +412,8 @@ def _stage2_apply_crop(
     crop_report.setdefault("crops", []).append(
         {
             "reason": reason,
+            "requested_crop": requested_crop,
+            "center_protection_limited": bool(protection_note),
             "x": int(x),
             "y": int(y),
             "width": int(crop_w),
@@ -259,6 +427,7 @@ def _stage2_apply_crop(
         }
     )
     crop_report["total_crop"] = _stage2_crop_totals(crop_report)
+    return applied_rect, protection_note
 
 
 def _edge_color_artifact_crop(pipeline, crop_report: Optional[dict] = None) -> str:
@@ -300,7 +469,7 @@ def _edge_color_artifact_crop(pipeline, crop_report: Optional[dict] = None) -> s
     if crop_w <= width * 0.90 or crop_h <= height * 0.90:
         return ""
     if crop_report is not None:
-        _stage2_apply_crop(
+        applied_rect, protection_note = _stage2_apply_crop(
             pipeline,
             crop_report,
             crop_left,
@@ -309,6 +478,11 @@ def _edge_color_artifact_crop(pipeline, crop_report: Optional[dict] = None) -> s
             crop_h,
             reason="adaptive_color_edge",
         )
+        if applied_rect is None:
+            return f"adaptive color-edge crop blocked; {protection_note}"
+        crop_left, crop_top, crop_w, crop_h = applied_rect
+        crop_right = width - crop_left - crop_w
+        crop_bottom = height - crop_top - crop_h
     else:
         pipeline.cmd_with_check("crop", str(crop_left), str(crop_top), str(crop_w), str(crop_h))
     side_text = ",".join(sorted(bad_sides))
@@ -353,7 +527,12 @@ def run_stage2_view_correction(pipeline) -> None:
         "total_top": 0,
         "total_crop": {"left": 0, "top": 0, "right": 0, "bottom": 0},
         "crops": [],
+        "crop_limit_hits": [],
         "target_edge_black_ratio": float(getattr(pipeline.cfg, "stage2_edge_black_target", 0.03)),
+        "center_protection": _stage2_center_protection(
+            initial_shape,
+            float(getattr(pipeline.cfg, "stage2_center_protect_area_ratio", 0.70)),
+        ),
     }
     pipeline.stage2_crop_report = crop_report
 
@@ -364,8 +543,26 @@ def run_stage2_view_correction(pipeline) -> None:
         messages.append(crop_note)
         if crop_rect:
             x, y, crop_w, crop_h = crop_rect
-            _stage2_apply_crop(pipeline, crop_report, x, y, crop_w, crop_h, reason="initial_auto_edge")
-            pipeline.log.info(f"已自动裁切 (x={x}, y={y}, w={crop_w}, h={crop_h})")
+            applied_rect, protection_note = _stage2_apply_crop(
+                pipeline,
+                crop_report,
+                x,
+                y,
+                crop_w,
+                crop_h,
+                reason="initial_auto_edge",
+            )
+            if protection_note:
+                messages.append(protection_note)
+            if applied_rect is None:
+                pipeline.log.warn("中心面积保护已阻止本次边界裁切")
+                status = "degraded"
+            else:
+                applied_x, applied_y, applied_w, applied_h = applied_rect
+                pipeline.log.info(
+                    f"已自动裁切 (x={applied_x}, y={applied_y}, "
+                    f"w={applied_w}, h={applied_h})"
+                )
         else:
             pipeline.log.info(crop_note)
     except (CommandError, SirilError) as e:
@@ -392,7 +589,7 @@ def run_stage2_view_correction(pipeline) -> None:
                 crop_rect, adaptive_note = _detect_auto_edge_crop(pipeline, is_adaptive=True)
                 if crop_rect:
                     x, y, crop_w, crop_h = crop_rect
-                    _stage2_apply_crop(
+                    applied_rect, protection_note = _stage2_apply_crop(
                         pipeline,
                         crop_report,
                         x,
@@ -401,6 +598,14 @@ def run_stage2_view_correction(pipeline) -> None:
                         crop_h,
                         reason=f"adaptive_edge_pass_{pass_index + 1}",
                     )
+                    if protection_note:
+                        messages.append(protection_note)
+                    if applied_rect is None:
+                        status = "degraded"
+                        messages.append(
+                            "adaptive edge crop stopped: center-area protection limit reached"
+                        )
+                        break
                 after_feat = pipeline._measure_current_features()
                 if after_feat is not None:
                     messages.append(
@@ -452,6 +657,8 @@ def run_stage2_view_correction(pipeline) -> None:
             color_edge_note = _edge_color_artifact_crop(pipeline, crop_report)
             if color_edge_note:
                 messages.append(color_edge_note)
+                if color_edge_note.startswith("adaptive color-edge crop blocked"):
+                    status = "degraded"
         except (CommandError, SirilError) as e:
             pipeline.log.warn(f"彩色边缘裁切失败: {e}")
             status = "degraded"

@@ -63,7 +63,9 @@ def run_stage7_stretching(pipeline) -> None:
     阶段 7: 主体拉伸
     - 输入固定为 stage6_starless.fit
     - 固定生成 stage7_cand_a / stage7_cand_b 和一个 stage7_preview_ref
-    - 两个候选仅因背景色度门控失败时，可追加受控色度救援候选
+    - 亮核心星云 cand_a 使用扩张的星点/halo 掩膜保护并保留 1.50x 尺寸门
+    - 完整变换后实测 P50；偏离时从线性源校准参数并重跑一次
+    - 候选仅因背景色度门控失败时，可追加受控色度救援候选
     - 输出 stage7_stretched.fit
     """
     stage_label = PipelineStage.STRETCHING.label
@@ -114,6 +116,11 @@ def run_stage7_stretching(pipeline) -> None:
     validated_rescue = bool(
         getattr(pipeline, "_stage7_stretch_validated_rescue", False)
     )
+    fallback_reason = str(
+        getattr(pipeline, "_stage7_stretch_fallback_reason", "") or ""
+    )
+    if validated_rescue and not fallback_reason:
+        fallback_reason = "validated_stretch_fallback"
     pipeline._stage7_stretch_accepted = bool(
         stretched and stage_saved and (not stage_degraded or validated_rescue)
     )
@@ -156,7 +163,7 @@ def run_stage7_stretching(pipeline) -> None:
             elapsed,
             message_text,
             fallback_used=validated_rescue,
-            reason_code=("validated_chroma_rescue" if validated_rescue else ""),
+            reason_code=(fallback_reason if validated_rescue else ""),
             components={
                 "stretch": {
                     "status": "accepted",
@@ -164,7 +171,7 @@ def run_stage7_stretching(pipeline) -> None:
                     "source": compare_stem,
                     "output": pipeline.stretched_name,
                     "reason_code": (
-                        "validated_chroma_rescue"
+                        fallback_reason
                         if validated_rescue
                         else "accepted"
                     ),

@@ -36,7 +36,7 @@ DEFAULT_POLICY: Dict[str, Any] = {
         "fallback_to_safe_model": True,
     },
     "stage4_color": {
-        "calibration_policy": "single_gaia_pcc",
+        "calibration_policy": "spcc_first_then_pcc",
         "reduce_saturation_if_solution_imprecise": True,
         "blue_gain_limit": 0.90,
         "red_gain_limit": 1.08,
@@ -89,7 +89,7 @@ BUILTIN_POLICY_OVERLAYS: Dict[str, Dict[str, Any]] = {
             "fallback_to_safe_model": True,
         },
         "stage4_color": {
-            "calibration_policy": "single_gaia_pcc",
+            "calibration_policy": "spcc_first_then_pcc",
             "allow_pcc_warning": False,
             "reduce_saturation_if_solution_imprecise": True,
             "blue_gain_limit": 0.85,
@@ -157,7 +157,7 @@ BUILTIN_POLICY_OVERLAYS.update(
                 "fallback_to_safe_model": True,
             },
             "stage4_color": {
-                "calibration_policy": "single_gaia_pcc",
+                "calibration_policy": "spcc_first_then_pcc",
                 "reduce_saturation_if_solution_imprecise": True,
                 "blue_gain_limit": 0.92,
                 "red_gain_limit": 1.08,
@@ -207,7 +207,7 @@ BUILTIN_POLICY_OVERLAYS.update(
                 "fallback_to_safe_model": True,
             },
             "stage4_color": {
-                "calibration_policy": "single_gaia_pcc",
+                "calibration_policy": "spcc_first_then_pcc",
                 "reduce_saturation_if_solution_imprecise": True,
                 "blue_gain_limit": 0.90,
                 "red_gain_limit": 1.08,

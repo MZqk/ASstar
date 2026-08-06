@@ -10,12 +10,12 @@ from typing import Iterable
 from PySide6.QtCore import QThread, Signal
 
 try:
-    from pipeline.ui_preview import write_raw_fits_preview
+    from pipeline.ui_preview import write_display_fits_preview
 except ImportError:  # Support direct execution from the gui directory.
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from pipeline.ui_preview import write_raw_fits_preview  # type: ignore[no-redef]
+    from pipeline.ui_preview import write_display_fits_preview  # type: ignore[no-redef]
 
 
 def preview_cache_path(work_dir: Path) -> Path:
@@ -45,7 +45,11 @@ class InitialPreviewWorker(QThread):
 
     def run(self) -> None:
         try:
-            source = write_raw_fits_preview(self.candidates, self.output_path)
+            source = write_display_fits_preview(
+                self.candidates,
+                self.output_path,
+                apply_stretch=True,
+            )
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             self.failed.emit(self.request_id, str(exc))
         else:

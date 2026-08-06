@@ -416,12 +416,19 @@ def run_stage10_export(pipeline) -> None:
     stage9_starmask_stretch_failed = bool(
         getattr(pipeline, "_stage9_starmask_stretch_failed", False)
     )
+    stage4_color_review_required = bool(
+        getattr(pipeline, "_stage4_color_review_required", False)
+    )
     forced_review_only = bool(
         getattr(pipeline.cfg, "force_review_only_output", False)
     )
     review_only_output = forced_review_only or bool(
         getattr(pipeline, "_stage9_bypassed_bad_starless", False)
-    ) or stage9_missing_required_stars or stage9_starmask_stretch_failed
+    ) or (
+        stage4_color_review_required
+        or stage9_missing_required_stars
+        or stage9_starmask_stretch_failed
+    )
     pipeline._final_output_review_only = False
     if stage9_missing_required_stars:
         messages.append(
@@ -431,6 +438,10 @@ def run_stage10_export(pipeline) -> None:
     if stage9_starmask_stretch_failed:
         messages.append(
             "stage9_starmask_stretch_failed=true; normal delivery is not allowed"
+        )
+    if stage4_color_review_required:
+        messages.append(
+            "stage4_color_review_required=true; normal delivery is not allowed"
         )
     if forced_review_only:
         messages.append(
@@ -1290,7 +1301,9 @@ def run_stage10_export(pipeline) -> None:
         or export_fallback_used
     )
     stage_reason_code = (
-        denoise_fallback_reason
+        "stage4_color_review_required"
+        if stage4_color_review_required
+        else denoise_fallback_reason
         if stage_denoise_fallback_used
         else "final_source_recovery"
         if input_source_fallback_used
@@ -1309,6 +1322,7 @@ def run_stage10_export(pipeline) -> None:
         reason_code=stage_reason_code,
         details={
             "review_only_output": bool(review_only_output),
+            "stage4_color_review_required": stage4_color_review_required,
             "final_source": final_file,
         },
         components={

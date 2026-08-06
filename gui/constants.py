@@ -1,6 +1,6 @@
 """Shared constants for the Seestar GUI."""
 
-FITS_SUFFIXES = (".fit", ".fits")
+FITS_SUFFIXES = (".fit", ".fits", ".fts")
 LIGHT_FRAME_EXPANSION_FACTOR = 3.0
 LIGHT_PREPROCESS_SEQUENCE_COPIES = 2.0
 # Peak FITS/output copies, calibrated against the current stage artifact contract.

@@ -236,7 +236,7 @@ class PipelineSafetyTests(unittest.TestCase):
             )
             self.assertTrue((pipeline.process_dir / "stage6_passthrough.fit").exists())
             self.assertFalse((pipeline.process_dir / "starless.fit").exists())
-            quality_report = pipeline.reports["stage7_quality.json"]
+            quality_report = pipeline.reports["stage6_starless_quality.json"]
             self.assertEqual(quality_report["mode"], "star_preserve_target_bypass")
             self.assertFalse(any(command[0] == "script" for command in pipeline.commands))
 

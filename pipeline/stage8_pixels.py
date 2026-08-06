@@ -109,6 +109,7 @@ def stage8_low_signal_thresholds(
 def stage8_generate_starless_masks(pipeline, image_data: np.ndarray) -> Dict[str, Any]:
     rgb = _to_rgb_float_fullres(image_data)
     gray = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]).astype(np.float32)
+    channel_peak = np.max(rgb, axis=0)
     bg_threshold = float(np.quantile(gray, 0.22))
     bg_mask = gray <= bg_threshold
     if int(np.count_nonzero(bg_mask)) < 64:
@@ -132,10 +133,43 @@ def stage8_generate_starless_masks(pipeline, image_data: np.ndarray) -> Dict[str
     core_threshold = max(
         float(np.quantile(gray, 0.992)),
         bg_median + max(5.5 * bg_std, 0.07),
-        0.82,
     )
-    core_ramp = (gray - core_threshold) / max(1.0 - core_threshold, 1e-3)
-    core_mask = pipeline._stage8_soften_mask(np.clip(core_ramp, 0.0, 1.0), passes=4)
+    # Stage 7 output is already transformed: a genuinely bright/colorful core
+    # can have luminance well below an absolute 0.82 floor while one channel is
+    # close to clipping.  Keep an explicit hard seed so the core does not vanish
+    # when the top quantile is a flat plateau, then add a feathered boundary.
+    core_seed_mask = (
+        (gray >= core_threshold)
+        | (channel_peak >= 0.985)
+    ).astype(np.float32)
+    core_hard_mask = dilate_mask(core_seed_mask, iterations=2)
+    core_feather = feather_mask(
+        dilate_mask(core_hard_mask, iterations=2),
+        radius=3,
+    )
+    core_mask = np.maximum(core_hard_mask, core_feather).astype(np.float32)
+
+    limited_core_expand = _clamp_int(
+        getattr(
+            getattr(pipeline, "cfg", None),
+            "stage8_limited_core_exclusion_expand",
+            8,
+        ),
+        2,
+        16,
+    )
+    limited_core_hard_mask = dilate_mask(
+        core_hard_mask,
+        iterations=limited_core_expand,
+    )
+    limited_core_feather = feather_mask(
+        dilate_mask(limited_core_hard_mask, iterations=2),
+        radius=2,
+    )
+    limited_core_exclusion_mask = np.maximum(
+        limited_core_hard_mask,
+        limited_core_feather,
+    ).astype(np.float32)
 
     nebula_threshold = max(
         float(np.quantile(gray, 0.68)),
@@ -167,6 +201,12 @@ def stage8_generate_starless_masks(pipeline, image_data: np.ndarray) -> Dict[str
 
     coverage = {
         "core": float(np.mean(core_mask > 0.12)),
+        "limited_core_exclusion": float(
+            np.mean(limited_core_exclusion_mask > 0.12)
+        ),
+        "limited_core_exclusion_hard": float(
+            np.mean(limited_core_hard_mask > 0.50)
+        ),
         "nebula": float(np.mean(nebula_mask > 0.12)),
         "faint_nebula": float(np.mean(faint_nebula_mask > 0.12)),
         "background": float(np.mean(background_mask > 0.50)),
@@ -176,7 +216,14 @@ def stage8_generate_starless_masks(pipeline, image_data: np.ndarray) -> Dict[str
         "gray": gray,
         "bg_median": bg_median,
         "bg_std": bg_std,
+        "core_threshold": core_threshold,
+        "core_channel_peak_threshold": 0.985,
+        "core_seed_mask": core_seed_mask,
+        "core_hard_mask": core_hard_mask,
         "core_mask": core_mask,
+        "limited_core_exclusion_expand": limited_core_expand,
+        "limited_core_exclusion_hard_mask": limited_core_hard_mask,
+        "limited_core_exclusion_mask": limited_core_exclusion_mask,
         "nebula_mask": nebula_mask,
         "faint_nebula_mask": faint_nebula_mask,
         "background_mask": background_mask,
@@ -212,7 +259,7 @@ def stage8_masked_metrics(
             mean = float(np.sum(values * weight) / total)
             return float(np.sqrt(np.sum(((values - mean) ** 2) * weight) / total))
 
-        background_weight = np.clip(background, 0.0, 1.0)
+        background_weight = _stage8_exclusive_background_weight(masks, background)
         core_weight = np.clip(core, 0.0, 1.0)
         diffuse_weight = np.clip(nebula + 0.65 * faint, 0.0, 1.0)
         texture_weight = np.clip(background + 0.35 * faint, 0.0, 1.0)
@@ -242,7 +289,8 @@ def background_quality_metrics(
         rgb = _to_rgb_float_fullres(image_data)
         gray = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]).astype(np.float32)
         if masks and "background_mask" in masks:
-            bg_weight = np.clip(np.asarray(masks["background_mask"], dtype=np.float32), 0.0, 1.0)
+            background = np.asarray(masks["background_mask"], dtype=np.float32)
+            bg_weight = _stage8_exclusive_background_weight(masks, background)
         else:
             bg_weight = (gray <= float(np.quantile(gray, 0.35))).astype(np.float32)
         if float(np.sum(bg_weight)) <= 1e-6:
@@ -307,6 +355,40 @@ def background_quality_metrics(
     except (TypeError, ValueError, IndexError, FloatingPointError) as e:
         pipeline.log.warn(f"background quality metrics unavailable: {e}")
         return {}
+
+
+def _stage8_exclusive_background_weight(
+    masks: Dict[str, Any],
+    background: np.ndarray,
+) -> np.ndarray:
+    """Keep Stage 8 quality sampling outside every protected signal mask.
+
+    The generated masks are deliberately feathered, so the background mask can
+    remain strong where a nebula/faint-signal mask is also active.  Enhancement
+    in that overlap must not be reported as new *background* noise.
+    """
+    bg_weight = np.clip(np.asarray(background, dtype=np.float32), 0.0, 1.0)
+    signal_keys = ("core_mask", "nebula_mask", "faint_nebula_mask")
+    if not all(key in masks for key in signal_keys):
+        return bg_weight
+    try:
+        signal = np.maximum.reduce(
+            [
+                np.clip(np.asarray(masks[key], dtype=np.float32), 0.0, 1.0)
+                for key in signal_keys
+            ]
+        )
+        if signal.shape != bg_weight.shape:
+            return bg_weight
+        # 0.12 is the same support threshold used by mask coverage reporting.
+        # Retain a short feather below it instead of introducing a hard edge.
+        signal_exclusion = np.clip(signal / 0.12, 0.0, 1.0)
+        exclusive = bg_weight * (1.0 - signal_exclusion)
+        if float(np.sum(exclusive)) >= 32.0:
+            return exclusive.astype(np.float32, copy=False)
+    except (TypeError, ValueError, FloatingPointError):
+        pass
+    return bg_weight
 
 def stage8_enhancement_quality_report(pipeline) -> Dict[str, Any]:
     before_data = pipeline._read_image_by_stem("stage8_input_starless")
@@ -921,7 +1003,36 @@ def apply_stage8_masked_pixel_enhancement(
     nebula = masks["nebula_mask"]
     faint = masks["faint_nebula_mask"]
     background = masks["background_mask"]
-    coverage = masks.get("coverage", {})
+    coverage = dict(masks.get("coverage", {}))
+    handoff = getattr(pipeline, "_stage8_handoff", {}) or {}
+    limited_mode = bool(
+        isinstance(handoff, dict)
+        and str(handoff.get("processing_policy") or "").strip().lower()
+        == "limited"
+    )
+    limited_core_exclusion = np.asarray(
+        masks.get("limited_core_exclusion_mask", core),
+        dtype=np.float32,
+    )
+    limited_core_hard = np.asarray(
+        masks.get("limited_core_exclusion_hard_mask", core > 0.50),
+        dtype=np.float32,
+    )
+    effective_core = limited_core_exclusion if limited_mode else core
+    core_guard = np.clip(1.0 - effective_core, 0.0, 1.0)
+
+    # The restricted candidate is deliberately weak-signal-only.  Removing the
+    # soft-mask tail below 0.05 keeps the recipe from touching most of the frame,
+    # while the additional nebula suppression avoids lifting the bright subject.
+    weak_signal = np.clip(faint * (1.0 - nebula) * core_guard, 0.0, 1.0)
+    weak_signal = np.clip((weak_signal - 0.05) / 0.95, 0.0, 1.0)
+    if limited_mode:
+        nebula_effect = weak_signal
+        faint_effect = weak_signal
+    else:
+        nebula_effect = np.clip(nebula * core_guard, 0.0, 1.0)
+        faint_effect = np.clip(faint * core_guard, 0.0, 1.0)
+    coverage["limited_weak_signal"] = float(np.mean(weak_signal > 0.05))
     target_type = pipeline._active_target_type() if hasattr(pipeline, "_active_target_type") else ""
     high_halo_risk = pipeline._stage7_halo_residue_score() > pipeline._stage7_effective_halo_threshold()
     object_mask_only = target_type == "bright_emission_reflection_nebula" or high_halo_risk
@@ -957,17 +1068,37 @@ def apply_stage8_masked_pixel_enhancement(
                 f"(coverage={mask_signal_coverage:.4f})"
             )
 
+    if limited_mode:
+        saturation = min(
+            saturation,
+            float(getattr(pipeline.cfg, "stage8_limited_saturation_max", 0.05)),
+        )
+        unsharp_amount = 0.0
+        messages.append(
+            f"{label} stage8 limited weak-signal-only mode "
+            "(core curves/saturation/faint boost disabled, "
+            f"core_expand={int(masks.get('limited_core_exclusion_expand', 8))})"
+        )
+
     core_clip = float(np.mean(gray >= 0.985))
     if core_clip > pipeline.cfg.stage8_highlight_clip_ratio_max:
         unsharp_amount = 0.0
         saturation *= 0.65
         messages.append(f"{label} stage8 highlight guard disabled masked unsharp")
 
-    denoise_strength = float(pipeline.cfg.stage8_background_denoise_strength)
+    denoise_strength = (
+        0.0
+        if limited_mode
+        else float(pipeline.cfg.stage8_background_denoise_strength)
+    )
     faint_boost = min(float(pipeline.cfg.stage8_faint_nebula_boost_max), 0.20 * saturation) * mask_quality_scale
     contrast_strength = min(float(pipeline.cfg.stage8_nebula_contrast_max), 0.28 * saturation) * mask_quality_scale
-    signal_weight = np.clip(nebula + 0.60 * faint, 0.0, 1.0)
-    color_sample_weight = np.clip(signal_weight * (1.0 - core) * (1.0 - 0.85 * background), 0.0, 1.0)
+    signal_weight = np.clip(nebula_effect + 0.60 * faint_effect, 0.0, 1.0)
+    color_sample_weight = np.clip(
+        signal_weight * core_guard * (1.0 - 0.85 * background),
+        0.0,
+        1.0,
+    )
     color_weight_total = float(np.sum(color_sample_weight))
     blue_pre_gain = 1.0
     if color_weight_total > 1e-6:
@@ -1003,36 +1134,52 @@ def apply_stage8_masked_pixel_enhancement(
         denoise_strength * (1.35 * background + 0.30 * faint + 0.10),
         0.0,
         0.42,
-    )
+    ) * core_guard
     result = result * (1.0 - denoise_weight[None, :, :]) + blurred * denoise_weight[None, :, :]
     denoised_base = result.copy()
 
     if blue_pre_gain < 0.999:
-        blue_weight = np.clip((nebula + 0.45 * faint) * (1.0 - core) * (1.0 - background), 0.0, 1.0)
-        result[2] = result[2] * (1.0 - blue_weight + blue_weight * blue_pre_gain)
+        blue_weight = np.clip(
+            (nebula_effect + 0.45 * faint_effect)
+            * core_guard
+            * (1.0 - background),
+            0.0,
+            1.0,
+        )
+        result[2] = result[2] + result[2] * (blue_pre_gain - 1.0) * blue_weight
 
     if faint_boost > 1e-6:
         background_guard = 1.0 - (0.98 if object_mask_only else 0.80) * background
-        lift = faint_boost * faint * background_guard * np.clip(1.0 - gray, 0.0, 1.0)
+        lift = (
+            faint_boost
+            * faint_effect
+            * background_guard
+            * core_guard
+            * np.clip(1.0 - gray, 0.0, 1.0)
+        )
         result = result + lift[None, :, :]
 
     if contrast_strength > 1e-6:
         background_guard = 1.0 - (1.0 if object_mask_only else 0.90) * background
-        signal_weight = np.clip((nebula + 0.30 * faint) * background_guard, 0.0, 1.0)
+        signal_weight = np.clip(
+            (nebula_effect + 0.30 * faint_effect) * background_guard,
+            0.0,
+            1.0,
+        )
         total = float(np.sum(signal_weight))
         center = (
             float(np.sum(gray * signal_weight) / total)
             if total > 1e-6
             else float(np.median(gray))
         )
-        contrast_weight = contrast_strength * nebula * (1.0 - core)
-        result = center + (result - center) * (1.0 + contrast_weight[None, :, :])
+        contrast_weight = contrast_strength * nebula_effect * core_guard
+        result = result + (result - center) * contrast_weight[None, :, :]
 
     if unsharp_amount > 1e-6:
         blurred = pipeline._box_blur_rgb(result)
         background_guard = 1.0 - (1.0 if object_mask_only else 0.98) * background
         detail_weight = np.clip(
-            unsharp_amount * nebula * (1.0 - core) * background_guard,
+            unsharp_amount * nebula_effect * core_guard * background_guard,
             0.0,
             float(pipeline.cfg.stage8_masked_unsharp_amount_max),
         )
@@ -1044,34 +1191,55 @@ def apply_stage8_masked_pixel_enhancement(
         ).astype(np.float32)
         background_guard = 1.0 - (1.0 if object_mask_only else 0.98) * background
         sat_weight = np.clip(
-            saturation * (0.78 * nebula + 0.18 * faint) * (1.0 - core) * background_guard,
+            saturation
+            * (0.78 * nebula_effect + 0.18 * faint_effect)
+            * core_guard
+            * background_guard,
             0.0,
             0.35,
         )
-        result = gray_after[None, :, :] + (result - gray_after[None, :, :]) * (
-            1.0 + sat_weight[None, :, :]
-        )
+        result = result + (
+            result - gray_after[None, :, :]
+        ) * sat_weight[None, :, :]
 
     if plugin_candidate is not None:
         plugin_rgb = _to_rgb_float_fullres(plugin_candidate)
         if blue_pre_gain < 0.999:
-            blue_weight = np.clip((nebula + 0.45 * faint) * (1.0 - core) * (1.0 - background), 0.0, 1.0)
-            plugin_rgb[2] = plugin_rgb[2] * (1.0 - blue_weight + blue_weight * blue_pre_gain)
+            blue_weight = np.clip(
+                (nebula_effect + 0.45 * faint_effect)
+                * core_guard
+                * (1.0 - background),
+                0.0,
+                1.0,
+            )
+            plugin_rgb[2] = (
+                plugin_rgb[2]
+                + plugin_rgb[2] * (blue_pre_gain - 1.0) * blue_weight
+            )
         background_guard = 1.0 - (1.0 if object_mask_only else 0.98) * background
         plugin_weight = np.clip(
-            (0.34 * nebula + 0.16 * faint) * (1.0 - core) * background_guard,
+            (0.34 * nebula_effect + 0.16 * faint_effect)
+            * core_guard
+            * background_guard,
             0.0,
             0.24 if object_mask_only else 0.38,
         )
-        result = result * (1.0 - plugin_weight[None, :, :]) + plugin_rgb * plugin_weight[None, :, :]
+        result = result + (plugin_rgb - result) * plugin_weight[None, :, :]
         messages.append(f"{label} SASP output blended through Starless masks")
 
     core_protection = float(pipeline.cfg.stage8_core_protection_strength)
-    background_restore_strength = 1.0 if object_mask_only else 0.985
-    background_restore = np.clip(background_restore_strength * background, 0.0, 1.0)
-    result = result * (1.0 - background_restore[None, :, :]) + denoised_base * background_restore[None, :, :]
-    core_restore = np.clip(core_protection * core, 0.0, 1.0)
-    result = result * (1.0 - core_restore[None, :, :]) + base * core_restore[None, :, :]
+    if not limited_mode:
+        background_restore_strength = 1.0 if object_mask_only else 0.985
+        background_restore = np.clip(background_restore_strength * background, 0.0, 1.0)
+        result = (
+            result * (1.0 - background_restore[None, :, :])
+            + denoised_base * background_restore[None, :, :]
+        )
+        core_restore = np.clip(core_protection * core, 0.0, 1.0)
+        result = (
+            result * (1.0 - core_restore[None, :, :])
+            + base * core_restore[None, :, :]
+        )
 
     local_adjustment_report: Dict[str, Any] = {
         "schema": LOCAL_ADJUSTMENT_SCHEMA,
@@ -1086,11 +1254,17 @@ def apply_stage8_masked_pixel_enhancement(
         )
     ):
         local_operations: List[Dict[str, Any]] = []
+        curve_mask_name = (
+            "limited_weak_signal" if limited_mode else "faint_nebula"
+        )
+        subject_mask_name = (
+            "limited_weak_signal" if limited_mode else "nebula"
+        )
         if faint_boost > 1e-6:
             local_operations.append(
                 {
                     "type": "curve",
-                    "mask": "faint_nebula",
+                    "mask": curve_mask_name,
                     "points": (
                         (0.0, 0.0),
                         (0.18, 0.19),
@@ -1114,7 +1288,7 @@ def apply_stage8_masked_pixel_enhancement(
             local_operations.append(
                 {
                     "type": "saturation",
-                    "mask": "nebula",
+                    "mask": subject_mask_name,
                     "amount": min(0.05, saturation * 0.12),
                     "opacity": 0.50 * mask_quality_scale,
                 }
@@ -1123,7 +1297,7 @@ def apply_stage8_masked_pixel_enhancement(
             local_operations.append(
                 {
                     "type": "local_contrast",
-                    "mask": "nebula",
+                    "mask": subject_mask_name,
                     "amount": min(0.03, contrast_strength * 0.25),
                     "radius": 2,
                     "opacity": 0.50 * mask_quality_scale,
@@ -1139,9 +1313,10 @@ def apply_stage8_masked_pixel_enhancement(
                 },
                 masks={
                     "background": background,
-                    "core": core,
-                    "nebula": nebula,
-                    "faint_nebula": faint,
+                    "core": effective_core,
+                    "nebula": nebula_effect,
+                    "faint_nebula": faint_effect,
+                    "limited_weak_signal": weak_signal,
                 },
             )
         )
@@ -1159,12 +1334,60 @@ def apply_stage8_masked_pixel_enhancement(
                 "kept pre-recipe candidate"
             )
 
-    restored = pipeline._stage8_restore_rgb_like(image_data, np.clip(result, 0.0, 1.0))
+    if limited_mode:
+        # Enforce the scope after all operations, including the local recipe.
+        # This is an invariant, not merely a quality-gate expectation: pixels
+        # outside the weak-signal mask and the expanded hard core stay bitwise at
+        # the Stage 8 input value.
+        result[:, weak_signal <= 0.0] = base[:, weak_signal <= 0.0]
+        soft_core_edge = limited_core_exclusion * (1.0 - limited_core_hard)
+        result = result + (base - result) * soft_core_edge[None, :, :]
+        result[:, limited_core_hard > 0.50] = base[:, limited_core_hard > 0.50]
+
+    result = np.clip(result, 0.0, 1.0)
+    scope_delta = np.max(np.abs(result - base), axis=0)
+    processing_scope = {
+        "mode": (
+            "limited_weak_signal_only" if limited_mode else "masked_full"
+        ),
+        "core_exclusion_expand": int(
+            masks.get("limited_core_exclusion_expand", 8)
+        ),
+        "core_threshold": float(masks.get("core_threshold", 0.0)),
+        "core_channel_peak_threshold": float(
+            masks.get("core_channel_peak_threshold", 0.985)
+        ),
+    }
+    if limited_mode:
+        hard_core_pixels = limited_core_hard > 0.50
+        outside_weak_pixels = weak_signal <= 0.0
+        processing_scope.update(
+            {
+                "core_operation_weight_max": (
+                    float(np.max(weak_signal[hard_core_pixels]))
+                    if np.any(hard_core_pixels)
+                    else 0.0
+                ),
+                "core_max_abs_change": (
+                    float(np.max(scope_delta[hard_core_pixels]))
+                    if np.any(hard_core_pixels)
+                    else 0.0
+                ),
+                "outside_weak_signal_max_abs_change": (
+                    float(np.max(scope_delta[outside_weak_pixels]))
+                    if np.any(outside_weak_pixels)
+                    else 0.0
+                ),
+            }
+        )
+
+    restored = pipeline._stage8_restore_rgb_like(image_data, result)
     diagnostics = {
-        "mask_coverage": masks["coverage"],
+        "mask_coverage": coverage,
         "masked_metrics": pipeline._stage8_masked_metrics(restored, masks),
         "protection_actions": messages,
         "local_adjustment_engine": local_adjustment_report,
+        "processing_scope": processing_scope,
     }
     messages.append(
         f"{label} masked Starless enhancement "

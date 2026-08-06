@@ -12,7 +12,12 @@ from pathlib import Path
 import numpy as np
 from astropy.io import fits
 
-from pipeline.ui_preview import _rgb_raw_float, write_raw_fits_preview, write_raw_preview
+from pipeline.ui_preview import (
+    _rgb_raw_float,
+    write_display_preview,
+    write_raw_fits_preview,
+    write_raw_preview,
+)
 
 
 def _read_png16_rgb(path: Path) -> np.ndarray:
@@ -96,6 +101,19 @@ class RawPreviewTests(unittest.TestCase):
             self.assertEqual(selected, valid)
             self.assertTrue(target.is_file())
             self.assertEqual(_read_png16_rgb(target).shape, (2, 2, 3))
+
+    def test_display_stretch_lifts_linear_preview_without_mutating_input(self):
+        source = np.linspace(0.001, 0.05, 64 * 64, dtype=np.float32).reshape(64, 64)
+        original = source.copy()
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "display.png"
+
+            write_display_preview(source, target, apply_stretch=True)
+
+            decoded = _read_png16_rgb(target).astype(np.float32) / 65535.0
+        np.testing.assert_array_equal(source, original)
+        self.assertGreater(float(np.median(decoded[:, :, 0])), 0.12)
+        self.assertFalse(target.with_name("display.png.tmp").exists())
 
 
 if __name__ == "__main__":

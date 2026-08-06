@@ -144,6 +144,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             from main_window import QApplication, SeestarGui  # type: ignore[no-redef]
 
         app = QApplication([sys.argv[0]])
+        try:
+            from .ui_theme import install_application_theme
+        except ImportError:
+            from ui_theme import install_application_theme  # type: ignore[no-redef]
+        install_application_theme(app)
         window = SeestarGui(
             resources_override=overlay,
             runtime_home_override=args.runtime_home,

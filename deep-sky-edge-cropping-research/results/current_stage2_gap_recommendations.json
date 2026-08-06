@@ -1,0 +1,234 @@
+{
+  "name": "当前项目 Stage 2 差距与实施建议",
+  "scope_and_question": [
+    "逐项审计当前 Stage 2 的中心背景估计、四边近黑/亮度/色偏扫描、场旋黑角处理、edge_black_ratio 迭代、固定保护带、彩边裁切、裁切报告和 stage2_corrected_resume 契约。",
+    "把实现与 footprint、DQ/mask、coverage/weight、ROI、WCS 和辅助平面传播等调研结论比较，给出不改变 Stage 1-10 顺序前提下的分层改造方案。",
+    "本项只给出实施建议，不直接修改 pipeline 算法、阶段顺序或用户文档；所有建议需在真实 Seestar 数据回归集上标定后才能成为默认值。"
+  ],
+  "pixel_state_taxonomy": [
+    "当前实现把 NaN、正负无穷在图像转换时归零，因此随后会与黑填充、截黑像素一起进入近黑检测，丢失 non-finite 独立状态。",
+    "near-black：由中心背景推导阈值或 image_metrics._dark_clip_threshold 判定，可能代表配准画幅外填充，也可能是真实暗背景。",
+    "暗/亮台阶：按整行或整列中位数及 81 像素滚动中位数识别，可能代表叠加边界，也可能是真实大尺度天体/渐晕。",
+    "彩色伪影：按 RGB 相对灰度的中位色偏及红/蓝单通道 excess 判断，但没有区分通道 footprint 不一致、色差、真实发射/反射结构。",
+    "低覆盖、被拒绝、插值、内部孔洞、坏列和真实暗结构目前没有独立标签；最终只有裁切后的 RGB 图和 ok/degraded 状态。"
+  ],
+  "defect_causes": [
+    "Stage 1 的 register -2pass 与 seqapplyreg 会施加几何变换；当前没有显式 -framing 参数，输出边缘可能由参考画幅、平移、旋转和插值填充产生。",
+    "输入也可能是用户提供的已叠加母版，此时黑边来源、叠加模式、通道覆盖和 WCS 质量未知。",
+    "四边亮度台阶、红蓝边缘可能来自场旋低覆盖、插值 ringing 或通道错位，也可能来自渐晕、星云、暗云、光害梯度和真实颜色。",
+    "fixed 3px guard 每次对已检出边继续追加；多轮自适应会重复消耗边缘，但其宽度并未由实际插值核或后续算子支持域推导。"
+  ],
+  "validity_evidence_source": [
+    "当前唯一直接证据是 stage1_prepared/working 的最终 RGB 像素；初检使用近黑比例、整行/列中位亮度、色偏和平滑亮度台阶，复检使用 edge_black_ratio。",
+    "Stage 1 仅记录总帧数、注册成功数、失败数和失败率，没有逐像素 footprint、coverage、weight、DQ、context 或 rejection 辅助平面。",
+    "现有证据应被定义为 radiometric fallback，而不是 science-validity 主证据；未来优先级应为 footprint/DQ → coverage/weight/rejection → 像素统计。",
+    "显式母版输入无法重建原始多帧 coverage，[不确定]只能读取已有 FITS 扩展/旁车；都没有时维持 degraded-confidence 的像素 fallback。"
+  ],
+  "required_inputs": [
+    "现状：Siril 当前全分辨率像素、图像 shape、PipelineConfig 和图像特征测量结果。",
+    "P0 增补：原图尺寸/WCS、Stage 1 framing、总裁切预算、目标位置或保守中心保护区、每次候选前后指标。",
+    "P1 增补：每帧配准变换或 footprint、coverage_count/weight、DQ/rejection、目标/弱信号 ROI、参考星和背景可用区。",
+    "续跑契约：stage2_corrected.fit 与 crop report、mask/coverage、WCS 和配置指纹的同一检查点清单。"
+  ],
+  "metrics_and_thresholds": [
+    "初检中心区为图像宽高的 25% 到 75%；背景样本取该区低于或等于 45%分位的像素，black_threshold=clamp(bg_median×0.5, 0.0015, 0.018)。",
+    "黑行/列门限为 clamp(stage2_edge_black_target×0.35, 0.015, 0.08)；默认 target=0.03 时约为 0.015。暗边还要求 line median 低于 max(black_threshold×1.25, bg_median-max(2σ,0.004)) 且近黑比例大于 0.004。",
+    "色偏门为 max(0.010, center_cast×2.8)；亮度台阶使用默认 81 像素滚动中位数、中心背景与 σ 的硬编码组合。列有高/低台阶门，行只有高台阶门，判定天然不对称。",
+    "四边初次各最多扫描当前宽高 25%，稳定正常段为 max(6, min(width,height)×0.006)；场旋角再用 5×5 patch 逐像素同时推进相邻两边。",
+    "复检 edge_black_ratio 统计四周约最短边 5%条带中低于 _dark_clip_threshold 的比例；该阈值上限 0.002，旨在识别截黑而非一般暗天空。",
+    "默认目标 edge_black_ratio≤0.03，最多 3 轮；每轮各边最多裁当前尺寸 3.5%，改善不足 0.003 时停止并 degraded。",
+    "彩边使用每边 max(8px,2.5%) 的固定窄条；边缘色偏超过 max(0.010,center×2.6) 就裁整条；若任一维裁后不大于当前尺寸 90%则跳过。",
+    "[不确定]上述绝对/相对阈值和 0.003 改善量没有跨设备、曝光、目标或归一化方式的行业证据；尤其像素转换对最大值大于 2 的图像按本图最大值归一化，使绝对门随极亮像素变化。"
+  ],
+  "algorithm_steps": [
+    "现状一：读取全分辨率像素并转换为 3 通道 float；单通道复制为 RGB，非有限值归零，大于 2 的数据按全图最大值归一化。",
+    "现状二：以中心 50%估计背景和色偏，计算整行/列近黑比例、中位亮度、色偏与滚动亮度台阶，得到 bad_rows/bad_cols。",
+    "现状三：从四边扫描至连续稳定正常段，随后用四个 5×5 黑角循环对左右/上下同时增量，再为每个非零边加固定 guard。",
+    "现状四：执行 Siril crop 并累计 crop_report；若 edge_black_ratio 超标，则在已裁图上重新检测，按单轮 3.5%上限继续裁，最多三轮。",
+    "现状五：每轮裁后复测；改善不足 0.003 时标 degraded 并停止，但不会撤销刚执行的候选裁切。最终仍超目标也 degraded。",
+    "现状六：仅在状态仍为 ok 时检查彩边并最多再裁每侧约 2.5%；保存 stage2_corrected.fit 和 stage2_crop_report.json。",
+    "建议一：从原始 Stage 1 网格一次性构造所有证据和候选，候选先模拟评分、通过硬门后再执行；不在已裁图上不可逆试错。",
+    "建议二：coverage/weight 主证据定义 reliable mask，像素统计只诊断插值/通道伪影；腐蚀支持域后求 ROI 约束的可靠矩形。",
+    "建议三：提交裁切事务时同步 SCI/WCS/辅助平面，复测失败自动回退到上一已接受候选，再决定 degraded/manual-review。"
+  ],
+  "geometric_mask_vs_reliable_mask": [
+    "当前没有显式 geometric mask；场旋黑角只通过 5×5 patch 中是否存在黑像素近似追踪。",
+    "当前 bad_rows/bad_cols 是亮度、色偏和台阶的混合判定，既不是纯 footprint，也不是带贡献数、噪声和算子支持的 reliable mask。",
+    "建议 Stage 1 输出 geometric_coverage（至少一帧覆盖）和 coverage_count/weight；Stage 2 再叠加 DQ/rejection、插值支持和下游 halo 得到 reliable/processing-safe mask。"
+  ],
+  "internal_hole_policy": [
+    "当前只从四条外边和四角向内扫描，无法识别或表达画面内部的 drizzle holes、坏列、芯片缝、被拒绝岛和断开区域。",
+    "P1 应保存内部 hard-invalid/low-coverage mask；只有与外边连通且矩形损失可接受的区域由裁切消除。",
+    "ROI 内存在较大孔洞时回退 Stage 1 调整 framing、帧筛选、核或叠加策略；少量坏点继续 mask，展示修补另标 display-only。"
+  ],
+  "interpolation_and_support_radius": [
+    "Stage 1 调用 seqapplyreg 时未显式指定插值核，实际行为依 Siril 版本/默认；Stage 2 固定 3px guard 因而无法对应真实核支持。",
+    "每次 adaptive pass 都会在当前边缘再次附加 guard，累计宽度与 pass 数相关，而不是与一次组合变换的支持域相关。",
+    "Stage 5 反卷积/降噪和 Stage 6 去星等操作还会需要工作 halo；Stage 2 当前不从这些算子收集最大支持域。",
+    "[不确定]第三方去星/AI 模型的真实 halo 未公开时需用 overlap-tile 一致性实验标定；标定前保守保留处理工作边界并在最终导出时再裁。"
+  ],
+  "recommended_pipeline_stage": [
+    "保留 Stage 2 位于 Stage 1 叠加之后、Stage 3 背景处理之前的顺序；这能在最早阶段隔离黑边对背景、校色和去星的污染。",
+    "Stage 1 应同时产出 framing/coverage 证据，Stage 2 使用它做首个可靠裁切；无需改变 Stage 1-10 的用户可见顺序。",
+    "由于完整 primary target 在 Stage 3/4 preflight 才冻结，P0 可在 Stage 2 只执行明确硬无效的保守裁切；可能触及弱信号的候选延后到目标复核或标 manual-review。",
+    "Stage 5/6 前只做边界 QA 和工作 halo检查，不再对正式 SCI 进行未记录的二次物理裁切；最终展示可单独生成 display crop。"
+  ],
+  "crop_geometry_and_framing_mode": [
+    "现状只支持四边独立的轴对齐矩形；初检可非对称，能处理一般平移边和部分场旋黑角。",
+    "它不是严格最大内接矩形：四角循环同时推进相邻边，且四个角依次修改同一 left/right/top/bottom，结果依扫描顺序并可能过裁。",
+    "没有显式 common/reference/union 模式，也不能为马赛克保留不规则 footprint+mask。",
+    "建议 P0 保留现有矩形输出但声明 framing=fallback_auto_rect；P1 增加 common可靠矩形、reference+mask、union+mask，旋转构图只在收益显著且允许额外重采样时启用。"
+  ],
+  "guard_band_rule": [
+    "现状 stage2_guard_band_pixels 默认 3，范围验证为 0 到 8；只有某边已检出异常才追加，且每次 adaptive pass 重复追加。",
+    "建议 guard=ceil(配准残差上界+重采样核半径+下一阶段最大局部支持+坐标取整余量)，并作用于原始 reliable mask 一次。",
+    "guard 的构成和最终像素值写入报告；如果某下游模型 halo 未知，转 processing-safe 或 manual-review，不用任意常数冒充 science-safe。",
+    "未去马赛克输入额外按 Bayer 2×2 或 X-Trans 6×6 对齐；[不确定]当前显式母版路径是否可能进入 CFA 数据需要输入状态检测。"
+  ],
+  "science_roi_constraint": [
+    "当前 Stage 2 没有目标 ROI、弱信号外延、参考星、测光 aperture/sky annulus 或背景采样区约束。",
+    "中心 50%被当作背景基准会默认中心具有代表性；中心为亮星云时可能把正常暗边裁掉，目标贴边或暗星云时更危险。",
+    "P0 可从 FITS OBJECT、粗 WCS、文件名目标或用户构图生成保守目标保护区；证据不足且总裁切大时停止自动迭代。",
+    "P1 在 Stage 3/4 的目标画像冻结后复核候选；若候选与扩展目标/参考星冲突，应从 stage1_prepared 基线重算，不在已裁图上继续。",
+    "[不确定]低表面亮度结构的真实边界通常无法完全自动确定；多尺度弱拉伸、通道交叉和人工标注冲突时转 manual-review。"
+  ],
+  "information_loss_and_stop_conditions": [
+    "现状初次每边最多扫描 25%，只检查裁后宽高大于零，没有总宽高、面积、角视场或目标保留硬门。",
+    "三轮 adaptive 各边最多裁当前尺寸 3.5%，可在初裁之外继续累计约 10%；固定 guard 也逐轮累加，实际总损失没有统一预算。",
+    "彩边只检查相对当前图像任一维剩余大于 90%，未与前面累计裁切合并；stage2_color_artifact_max_crop=0.15 配置未被读取。",
+    "改善不足 0.003 的停止发生在候选已裁之后，当前不回滚；正确流程应先在内存候选或临时副本上评估，失败恢复上一已接受图。",
+    "P0 立即报告并硬门：相对原图的每边、宽高、面积和角视场损失；候选触及 ROI、剩余尺寸不足、WCS/辅助平面不同步即拒绝。",
+    "[不确定]可先将单边 5%提示、任一维 10%或面积 20%转人工复核设为实验值，但它们不是行业标准，必须用真实回归集校准。",
+    "达到损失预算仍有 edge_black 时保留 mask并 degraded/manual-review，或回到 Stage 1 修复 framing/覆盖，不能继续无界蚕食。"
+  ],
+  "acceptance_and_fallback": [
+    "现状仅 ok/degraded；no-improvement、最终 edge_black 超标、裁切命令失败和保存失败都可能归为 degraded，但原因语义不同。",
+    "现状即使 degraded 也尽量保存 stage2_corrected.fit，便于流水线继续；但产物没有 science-safe/processing-safe/display-only 能力声明。",
+    "建议 science-safe 只允许高优先覆盖证据、ROI/辅助平面/WCS 完整；processing-safe 允许后期但不支持定量科学；display-only 允许视觉修补或更紧构图。",
+    "仅像素 fallback、改善不足或残余坏边归 degraded；ROI冲突、累计损失超预算、证据互相矛盾归 manual-review。",
+    "回退优先级：撤销未改善候选 → 采用上一个已接受矩形+mask → 回 Stage 1 变更 framing/叠加 → 跳过高风险下游或只导出 review。"
+  ],
+  "false_positive_and_failure_modes": [
+    "真实暗星云、渐晕、宽场背景梯度和负背景会触发近黑/暗边；中心亮星云会放大这种偏差。",
+    "真实红色发射星云或蓝色反射星云贴边会提高 color_cast，被当作红蓝叠加伪影。",
+    "整行/列统计会被明亮恒星、衍射结构、卫星轨迹或马赛克面板接缝改变；rolling median 也不能证明异常是无覆盖。",
+    "全图最大值归一化使阈值受极亮星、饱和核和数据位深影响；不同输入标度下同一绝对阈值不可直接比较。",
+    "NaN/Inf 被归零后无法区分数据错误与预期无覆盖；内部孔洞不在四边扫描范围。",
+    "四角 5×5逐步算法可能因单个黑点同时推进两边，且各角共享累积边界，未求全局最优矩形。",
+    "裁后才判断无改善且不回滚会永久丢失数据；多轮在当前图上重新估计中心和百分比使阈值、坐标与总预算漂移。",
+    "黑边阶段 degraded 时跳过彩边检查，可能留下影响后续的色边；反过来，彩边固定 2.5%也可能过裁真实彩色弱信号。",
+    "stage2 resume 直接信任已有 FITS并从 Stage 3继续，不重跑检测；若旁车、WCS或配置来源缺失，无法证明其满足当前契约。"
+  ],
+  "cfa_and_channel_constraints": [
+    "Stage 1 原始 Light 路径在校准时已 -debayer，正常 Stage 2 处理 RGB；Siril crop 会对整幅多通道图使用同一矩形。",
+    "显式母版和 stage2 resume 输入可来自外部，当前 Stage 2/续跑未显式验证是否仍为 CFA、通道是否共用覆盖、各通道 WCS/shape 是否一致。",
+    "P0 增加输入状态和通道一致性检查；CFA 必须先 debayer/Bayer drizzle 或按采样周期取整，不能由普通 3px guard 保证。",
+    "P1 分通道建立可靠掩膜并取必需通道交集；通道错位应重新注册，不靠分别裁切到同尺寸伪装对齐。"
+  ],
+  "wcs_and_auxiliary_propagation": [
+    "当前 _stage2_apply_crop 只调用 Siril crop 并在 JSON 累计像素矩形，没有在代码层显式检查 CRPIX、CD/PC/SIP 或 pixel→world→pixel 往返。",
+    "Stage 4 会在裁后图像上执行 platesolve，并在 geometry 报告中记录当前 shape、估算视场和 Stage 2 total_crop，这能重建新的天体坐标，但不替代 Stage 2 传播验证。",
+    "当前没有 mask、uncertainty、weight、coverage、context、rejection 辅助平面，因此也没有同步裁切或 shape 校验。",
+    "stage2_corrected_resume 复制并加载 FITS，但不读取 stage2_crop_report.json 回填 pipeline.stage2_crop_report；Stage 4 的裁切来源说明会缺失，形成 provenance 断点。",
+    "P0 保存裁前/裁后 WCS摘要、CRPIX 变化和目标角点往返；P1 将 SCI 与全部辅助平面置于原子裁切事务，resume manifest 验证它们的 shape、hash 和同源配置。",
+    "[不确定]不同 Siril 运行版本对所有畸变关键字和裁切历史的保留细节应通过产物级回归验证。"
+  ],
+  "downstream_impact": [
+    "正面：Stage 2 在背景提取前移除明显黑边和彩边，可降低 Stage 3 背景样点、Stage 4校色、Stage 6去星和拉伸被边缘污染的概率。",
+    "过裁风险：弱信号、背景样区和参考星丢失，Stage 4 platesolve/校色可用星数下降，后续构图不可恢复。",
+    "漏裁风险：edge_black 或色边会扭曲背景中位数/RMS、被去星或神经网络放大，并在非线性拉伸后更加明显。",
+    "固定 3px 过紧时，反卷积/去星会重新生成边界伪影；过宽时又造成无证据的信息损失。",
+    "resume 丢失裁切 provenance 会使 Stage 4 报告、质量回溯和同配置复现不完整。",
+    "没有 mask/weight 时，下游只能把裁后矩形内所有像素当同等可靠，内部孔洞和低覆盖区域无法降权。"
+  ],
+  "qa_and_validation": [
+    "P0 单元测试：中心亮/暗、单边黑条、四种旋转黑角、真实红蓝星云贴边、NaN/Inf、整数/浮点不同标度、80px 边界尺寸。",
+    "P0 性质测试：候选坐标始终相对原图可重建；累计裁切不超预算；每次已接受候选嵌套；未改善候选必须回滚。",
+    "P0 报告测试：每轮记录裁前/裁后 edge_black、全局暗比例、各边证据、阈值、总损失、停止原因和状态分类；stage2 resume 可重建同一报告摘要。",
+    "P0 WCS测试：裁前后目标、角点和随机星点 pixel→world→pixel 往返，shape/CRPIX 与累计 left/top 一致；Stage 4重新 platesolve 前后也比较。",
+    "P1 覆盖测试：把已知平移/旋转 footprint 合成 coverage map，验证 common/reference/union、最大可靠矩形、内部孔洞和 guard 腐蚀。",
+    "P1 下游回归：比较裁前后 Stage 3背景、Stage 4解析/校色星数、Stage 5卷积边缘、Stage 6去星、Stage 7拉伸 edge_black 与最终构图。",
+    "真实数据回归集至少包含暗星云、满幅发射星云、目标贴边、少帧 dither、强场旋、通道错位、马赛克和已叠加外部母版。"
+  ],
+  "crop_provenance": [
+    "现有优点：报告记录 original/current/final shape、每次 reason、相对当时图像的 x/y/width/height、removed 四边及相对原图累计 total_crop。",
+    "缺口：未结构化记录每边判定指标和阈值、候选未采用原因、guard 构成、裁前后完整指标、面积/角视场损失、证据置信度、WCS 摘要和软件版本。",
+    "缺口：报告与 checkpoint 没有强绑定的 schema/version/hash；resume 不主动加载旁车，无法持续传播 provenance。",
+    "建议新增 schema、algorithm_version、source_framing、evidence_planes、candidate_rects、accepted_rect、acceptance_class、remaining_risks、WCS/辅助平面校验和及人工覆盖。"
+  ],
+  "software_and_literature_practice": [
+    "Siril 官方已提供 seqapplyreg 的 current/min/max/cog framing；当前项目未显式选择模式，因而把本可在注册几何阶段表达的问题推迟到 RGB亮度扫描。",
+    "Astropy/reproject 返回 footprint，DrizzlePac 输出 SCI/WHT/CTX 并使用 DQ，Montage 输出 area/count；这些实践均证明 coverage/weight 应是主证据。",
+    "DSS 的 Normal/Mosaic/Intersection/Custom Rectangle、APP 的 Full/Reference/Crop、PixInsight 的注册 union/mask/ROI 都把构图策略显式化；当前项目只有一个自动矩形策略。",
+    "Astropy CCDData 切片同步 data、mask 和 WCS，可作为项目未来 crop transaction 的最小数据模型参考。",
+    "推断：最小风险演进不是立刻重写为复杂最大矩形算法，而是先修复总预算、回滚、配置漂移、WCS/provenance 与输入状态，再逐步把 coverage 引入主判据。"
+  ],
+  "evidence_sources": [
+    "项目《pipeline/stages/stage2_view_correction.py》，本地源码，访问日期 2026-08-04，/Users/mz/dev/aiseestart/pipeline/stages/stage2_view_correction.py",
+    "项目《pipeline/image_metrics.py》，本地源码，访问日期 2026-08-04，/Users/mz/dev/aiseestart/pipeline/image_metrics.py",
+    "项目《pipeline/models.py》，本地源码，访问日期 2026-08-04，/Users/mz/dev/aiseestart/pipeline/models.py",
+    "项目《pipeline/stage_support.py》，Stage 1 注册叠加与遗留边裁函数，本地源码，访问日期 2026-08-04，/Users/mz/dev/aiseestart/pipeline/stage_support.py",
+    "项目《pipeline/stages/stage1_preparation.py》，注册统计，本地源码，访问日期 2026-08-04，/Users/mz/dev/aiseestart/pipeline/stages/stage1_preparation.py",
+    "项目《pipeline/stages/stage4_color_calibration.py》，裁后几何与 platesolve，本地源码，访问日期 2026-08-04，/Users/mz/dev/aiseestart/pipeline/stages/stage4_color_calibration.py",
+    "项目《pipeline/seestar_Superimpose.py》，Stage 2续跑与配置边界，本地源码，访问日期 2026-08-04，/Users/mz/dev/aiseestart/pipeline/seestar_Superimpose.py",
+    "项目《seestar_Superimpose_workflow.md》，Stage 2工作流文档，本地文档，访问日期 2026-08-04，/Users/mz/dev/aiseestart/pipeline/seestar_Superimpose_workflow.md",
+    "Siril《Drizzle 与 seqapplyreg framing》，官方文档，访问日期 2026-08-04，https://siril.readthedocs.io/en/latest/preprocessing/drizzle.html",
+    "Siril《主界面：CFA 裁切约束》，官方文档，访问日期 2026-08-04，https://siril.readthedocs.io/en/latest/GUI/main-interface.html",
+    "Astropy/reproject《Footprint arrays》，官方文档，更新于 2026-06-25，https://reproject.readthedocs.io/en/stable/footprints.html",
+    "Astropy/reproject《Combining images into mosaics》，官方文档，访问日期 2026-08-04，https://reproject.readthedocs.io/en/stable/mosaicking.html",
+    "Astropy《CCDData Class》，官方文档，访问日期 2026-08-04，https://docs.astropy.org/en/stable/nddata/ccddata.html",
+    "STScI《DrizzlePac Handbook 3.0》，官方手册，2025-01，https://hst-docs.stsci.edu/drizzpac",
+    "DrizzlePac《Single-visit Mosaic Processing》，官方文档，访问日期 2026-08-04，https://drizzlepac.readthedocs.io/en/latest/mast_data_products/svm_processing.html",
+    "Montage《Toolkit Components》，IPAC 官方文档，访问日期 2026-08-04，https://irsa.ipac.caltech.edu/Montage/docs/components.html",
+    "DeepSkyStacker《ResultParameters.cpp》，官方开源实现，访问日期 2026-08-04，https://github.com/deepskystacker/DSS/blob/master/DeepSkyStacker/ResultParameters.cpp",
+    "Astro Pixel Processor《RGB combination and same-size requirements》，第一方管理员答复，2017-08-10 至 2019-10-10，https://www.astropixelprocessor.com/community/faq/rgb-combination-and-same-size-requirements/",
+    "PixInsight《Building large mosaics with StarAlignment》，第一方论坛示例，2010 年，https://pixinsight.com/forum/index.php?threads/building-large-mosaics-with-staralignment.1953/"
+  ],
+  "evidence_strength_and_conflicts": [
+    "强证据：当前行为、默认值、异常分支、报告和续跑均来自仓库源码；Siril framing、reproject footprint、DrizzlePac WHT/CTX、Montage area 和 Astropy WCS切片来自官方文档。",
+    "中等证据：ROI 分级、总损失实验门、多目标评分和分阶段迁移是根据这些事实形成的工程建议，不是现有项目或单一软件的原生标准。",
+    "[不确定]stage2_level_artifact_window 代码默认 81，但 PipelineConfig 和环境变量校验未定义；运行时外部是否可能动态注入同名属性需结合实际启动路径验证。",
+    "配置冲突：stage2_color_artifact_max_crop 已在模型和环境配置范围中定义，但 _edge_color_artifact_crop 未读取它，实际使用硬编码 2.5%条带与 90%剩余尺寸门。",
+    "语义冲突：crop_margin 仍被自动调参与遗留 _apply_adaptive_edge_crop 引用，但当前 Stage 2 明确不使用固定预裁；遗留函数未见调用，应清理或明确废弃。",
+    "[不确定]Siril 不同发行版在未指定 seqapplyreg -framing/-interp 时的实际默认值，以及 crop 对全部畸变 WCS关键字的传播，需要锁定打包版本做黑盒回归。"
+  ],
+  "current_project_fit": [
+    "优势：Stage 2 位于正确的线性早期；四边可非对称裁切；对严格截黑、暗/亮台阶、红蓝色偏和旋转黑角有多种像素线索；有迭代目标、最大轮数和最小改善门。",
+    "优势：stage2_corrected.fit 是正式跨运行断点；crop_report 能累计相对原图的 left/top/right/bottom，为进一步 provenance 奠定基础；Stage 4 以裁后尺寸重新解析和计算视场。",
+    "核心缺口：没有 footprint/DQ/coverage/weight/rejection，像素统计既承担几何有效性又承担视觉伪影判定，无法区分真实暗信号与无数据。",
+    "安全缺口：没有目标/弱信号 ROI、参考星和背景采样保护；初检 25%扫描、三轮 3.5%补裁和 guard 没有统一总预算。",
+    "事务缺口：裁后才检查改善，失败不回滚；所有轮次在已裁图重估阈值并改变坐标基准，虽能累计 totals，但不能比较未裁基线上的候选。",
+    "配置缺口：彩边最大裁切配置未接线，level window 未正式配置，crop_margin 残留但不驱动 Stage 2，实际行为与可调参数不完全一致。",
+    "几何缺口：角点启发式不是最大可靠矩形，四角顺序会共同改变边界；内部孔洞和不规则马赛克只能漏检。",
+    "数据契约缺口：只同步裁 SCI，没有 mask/weight/uncertainty；WCS不在 Stage 2验收；resume 不重建 crop_report 和辅助证据。",
+    "状态缺口：只有 ok/degraded，无法表达 science-safe、processing-safe、display-only 和 manual-review；degraded 原因也未结构化。"
+  ],
+  "implementation_recommendations": [
+    "P0 最小改动一：引入相对 original_shape 的统一总裁切预算，覆盖 initial/adaptive/color/guard；报告每边、任一维、面积和估算角视场损失，超限停止并 manual-review/degraded。",
+    "P0 最小改动二：候选先在像素数组或临时 Siril 副本上评估，edge_black 改善不足时不提交或自动回滚；停止原因记录 candidate_rejected_no_improvement。",
+    "P0 最小改动三：让 stage2_color_artifact_max_crop 真正控制彩边预算；把 stage2_level_artifact_window 加入 PipelineConfig、环境映射与范围验证；明确 crop_margin 在 Stage 2废弃，移除或隔离未调用遗留函数。",
+    "P0 最小改动四：报告每边 black_ratio、median、cast、level、使用阈值、guard、候选前后指标和 confidence；将 pixel_only 标为 radiometric_fallback。",
+    "P0 最小改动五：检查原图和裁后图的 finite 比例、数据标度和 WCS；避免把 NaN/Inf 静默归零后丢失类型，按 nonfinite_mask 单独记录。",
+    "P0 最小改动六：为没有目标画像的自动接受加保守门，例如候选总损失大、边缘存在连通弱结构或色偏与结构一致时转 manual-review；实验损失阈值必须可配置并标注非行业标准。",
+    "P0 续跑修复：把 crop report 作为 formal Stage 2 checkpoint 旁车写入 manifest 并带 schema/hash；stage2_corrected_resume 加载它，缺失时明确 provenance_unknown 而不是伪装零裁切。",
+    "P1 中期一：Stage 1 显式设置并记录 seqapplyreg framing/interpolation；原始 Light 路径输出 registered footprint 的 coverage_count/weight，外部母版优先读取已有 mask/weight 扩展。",
+    "P1 中期二：以 coverage/DQ 为主构造 reliable mask，像素近黑/亮度/色偏降级为伪影诊断；从 original grid 一次求 ROI约束最大可靠轴对齐矩形。",
+    "P1 中期三：建立 crop transaction，同步 SCI、mask、coverage/weight、WCS、ROI 和 rejection；任何 shape、CRPIX 或往返校验失败都不提交。",
+    "P1 中期四：在 Stage 3/4目标画像冻结后复核边界候选；冲突时从 stage1_prepared 重算，不在 stage2_corrected 上继续蚕食。",
+    "P1 中期五：guard 由配准残差、插值核、坐标取整和后续最大支持域计算；未知模型 halo 通过 overlap-tile 回归标定。",
+    "P2 长期一：支持 common/reference/union+mask 三种 framing，以及 science-safe、processing-safe、display-only、degraded、manual-review 五级产品。",
+    "P2 长期二：保留内部 holes/坏列/低覆盖 mask，提供同坐标 QA overlay；建立暗星云、满幅星云、场旋、多通道、马赛克和外部母版的金标回归集。",
+    "P2 长期三：版本化阈值和模型，以离线可回归、可打包、可续跑为硬约束；覆盖证据不可用时始终保留当前轻量 fallback。"
+  ],
+  "uncertain": [
+    "validity_evidence_source",
+    "metrics_and_thresholds",
+    "interpolation_and_support_radius",
+    "guard_band_rule",
+    "science_roi_constraint",
+    "information_loss_and_stop_conditions",
+    "cfa_and_channel_constraints",
+    "wcs_and_auxiliary_propagation",
+    "evidence_strength_and_conflicts"
+  ]
+}

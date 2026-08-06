@@ -7,7 +7,7 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional
 
 
 _SENSITIVE_KEY_TOKENS = ("api_key", "token", "secret", "password", "credential")
@@ -17,14 +17,25 @@ def utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def sha256_file(path: Path) -> Optional[str]:
+def sha256_file(
+    path: Path,
+    *,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> Optional[str]:
     if not path.is_file():
         return None
     digest = hashlib.sha256()
     try:
         with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            while True:
+                if cancel_check is not None and cancel_check():
+                    raise InterruptedError("SHA-256 calculation cancelled")
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
                 digest.update(chunk)
+    except InterruptedError:
+        raise
     except OSError:
         return None
     return digest.hexdigest()

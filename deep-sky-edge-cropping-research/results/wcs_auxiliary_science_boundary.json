@@ -1,0 +1,249 @@
+{
+  "name": "WCS 与辅助数据传播及科学测量边界",
+  "scope_and_question": "研究矩形裁切后怎样原子更新图像尺寸、FITS WCS/CRPIX、mask、DQ、uncertainty、weight、coverage、context、rejection、目录和 PSF 适用域，并规定背景、源检测、孔径测光和 PSF 建模相对不可靠边缘的排除规则。本项限于纯整数切片；若同时旋转、缩放或重投影，还必须执行相应的通量、相关噪声和 WCS 变换，不能套用纯裁切结论。",
+  "pixel_state_taxonomy": [
+    "SCI 有限且可靠：有足够观测贡献、DQ 可接受、权重与不确定度满足任务门禁。",
+    "SCI 有数值但无覆盖：输出填充值可能为 0 或其他常数，weight/coverage/context 表明没有观测。",
+    "低覆盖或低权重：部分曝光贡献，值可能无明显黑边但误差更大。",
+    "被拒绝：有几何机会贡献，但有效样本因 DQ、宇宙线或异常值拒绝而不足；需要 rejection 或 context 才能区分。",
+    "插值或卷积边界：中心像素有效，但其计算支持域接触无效区，适合显示却不一定适合 PSF、反卷积或测量。",
+    "被 mask 的观测像素：有原始测量但因坏点、饱和、宇宙线或任务规则排除，与 no-data 语义不同。",
+    "内部有效但 WCS 不一致：像素值可靠，元数据却仍引用裁前网格，会产生错误天球坐标和目录匹配。",
+    "科学测量安全像素：除自身可靠外，完整测量孔径、背景环、检测滤波器或 PSF 拟合窗口也落在允许区域内。"
+  ],
+  "defect_causes": [
+    "裁切只改 SCI 数组却未同步 WCS 参考像素和 NAXIS，会把每个源映射到错误天球位置。",
+    "SCI、mask、ERR、WHT、CTX 或 rejection 采用不同切片、坐标顺序或闭区间约定，形成一到数像素错位。",
+    "FITS 一基像素坐标、NumPy 零基索引、GUI 左上或左下原点混用，导致 CRPIX、目录坐标或上/下裁量符号错误。",
+    "只保留填零 SCI 而丢弃 coverage 或 DQ，会让下游背景建模和源检测把 no-data 解释为极暗天空。",
+    "裁切后的畸变 WCS、SIP 或查找表未由支持该模型的工具更新；简单改 CRPIX 可能遗漏辅助畸变表的关联。",
+    "空间变化 PSF、曝光图、分割图和源目录仍使用裁前坐标域；靠近新边界的星又缺少完整拟合窗口。",
+    "新边界虽然每个像素有数据，但后续卷积、PSF 拟合、孔径和背景环跨出可靠区，产生边缘偏差。"
+  ],
+  "validity_evidence_source": {
+    "优先级": [
+      "与 SCI 同源的 DQ/mask、coverage、weight、context、rejection 和 uncertainty",
+      "输入 footprint 与纯裁切切片几何，以及每个下游算子的支持域",
+      "裁前 WCS 与裁后 WCS 的同一天空位置对应测试和源目录残差",
+      "裁后边缘噪声、背景、PSF 和测光诊断",
+      "最终像素近零或亮度台阶"
+    ],
+    "说明": "AstroDrizzle 的 WHT 是相对权重或有效曝光时间图，CTX 记录哪些输入贡献到各输出像素；JWST 科学产品同时提供 SCI、ERR 和 DQ。此类辅助平面比单一成片值更接近数据生成过程。"
+  },
+  "required_inputs": [
+    "裁前 SCI、完整 FITS 头和全部 WCS 表示，包括备用 WCS、SIP 或畸变查找表。",
+    "与 SCI 共网格的 mask、DQ、uncertainty/ERR/variance、weight/WHT、coverage、context/CTX/CON、rejection、有效曝光和分割图。",
+    "裁切半开区间 x0:x1、y0:y1、原点和轴顺序约定，以及裁切是否伴随翻转、旋转或重投影。",
+    "源目录、孔径、背景环、PSF/ePSF 模型与空间坐标模型、科学 ROI 及下游最大支持域。"
+  ],
+  "metrics_and_thresholds": {
+    "数据一致性": [
+      "所有像素平面的 shape、切片原点和 WCS 标识一致；SCI 内部值在纯裁切时与原数组对应区逐像素相同。",
+      "裁后零权重率、DQ 位计数、context 贡献位数、coverage 分位数、非有限率和 rejection 统计。",
+      "mask 边界到测量位置的距离，以及孔径、背景环、检测核、PSF fit_shape 和 ePSF cutout 的有效像素覆盖率。"
+    ],
+    "WCS 指标": [
+      "裁前 (x+x0,y+y0) 与裁后 (x,y) 的世界坐标差、世界到像素再返回的残差、共同源天球残差。",
+      "裁前后角点/边界天球多边形、像素尺度、方向和局部畸变的一致性；NAXIS 与实际数组尺寸相等。"
+    ],
+    "阈值原则": "纯切片应以数值精度内的 WCS 一致和像素平面零错位为硬条件，而不是经验容差。测光、检测和 PSF 所需的最低 coverage、允许 DQ 位、权重和有效窗口比例随仪器与科学目标而变。[不确定] 没有通用的边缘排除像素数或最小权重比例，应由具体孔径、PSF、滤波器与误差预算确定。"
+  },
+  "algorithm_steps": [
+    "冻结裁切定义为同一半开整数切片 [y0:y1, x0:x1]，明确数组轴、GUI 坐标和 FITS 坐标转换；禁止各扩展自行重新检测边界。",
+    "以一个原子产品容器枚举 SCI 及所有共网格辅助平面，检查裁前 shape、单位、mask 语义和 uncertainty 类型，再用完全相同切片裁切。",
+    "更新输出尺寸 NAXIS1=x1-x0、NAXIS2=y1-y0。对无翻转的普通二维 WCS，参考像素位置随切片起点平移，即新 CRPIX 等于旧 CRPIX 减相应轴的整数起点；优先调用支持切片的 WCS 库或 Siril 几何操作，而不是手改头。",
+    "保留 CRVAL、CD/PC/CDELT 和投影语义所代表的天球映射；若有 SIP、畸变查找表、备用 WCS 或轴相关性，由支持该完整模型的库切片并逐项验证。Astropy Cutout2D 明确不支持某些 FITS 畸变查找表。",
+    "纯裁切不重新估计 SCI、uncertainty、weight 或 coverage，只切片；保持 uncertainty 是标准差、方差还是逆方差的类型和单位。context 位图与 DQ 位域必须原样保留位语义。",
+    "源目录像素坐标减去裁切起点，天球坐标不变；同步裁切或平移分割图、对象包围盒、背景网格索引和人工 ROI。裁外对象标记为移除，不静默保留旧像素位置。",
+    "为空间不变且确实适用于全图的 PSF 保留模型本体；空间变化 PSF 的坐标归一化、有效域和节点改到新网格，或重新拟合。ePSF 星样本要求完整 cutout 位于 processing-safe mask 内。",
+    "根据测量类型建立安全 mask：源检测按滤波核腐蚀，孔径测光要求目标孔径与背景环满足 mask/coverage，PSF 拟合按 fit_shape 或模型支持腐蚀，背景建模单独传 coverage_mask。",
+    "裁后执行像素平面一致性、WCS 同点、目录匹配、mask 距离和科学测量复检；写入 HISTORY、裁切 provenance，并重新生成需要的校验和。"
+  ],
+  "geometric_mask_vs_reliable_mask": "裁切矩形只定义新数组边界；几何 mask 只说明输入 footprint 是否覆盖。科学可靠 mask 还要合并 DQ、coverage、weight、rejection、uncertainty 有限性和任务允许位。测量安全 mask 再按测量支持域腐蚀：同一个中心像素可对显示有效、对点源检测有效，却因背景环或 PSF cutout 跨边界而不适合测光或 PSF 建模。",
+  "internal_hole_policy": [
+    "内部 no-data、坏列、饱和和被拒绝区继续保留在 mask/DQ 中；矩形裁切不能消除它们的语义。",
+    "源检测与 PSF 拟合使用 mask 排除洞及其支持域；孔径测光报告有效面积、被 mask 比例和质量位，必要时拒绝该源。",
+    "背景建模把 no-coverage 作为 coverage_mask，把源、坏点等作为普通 mask，不能混为一个填零图。",
+    "展示副本可插值小洞，但科学母版仍保留原值、原 mask 与插值标记。"
+  ],
+  "interpolation_and_support_radius": "纯整数裁切本身不产生新插值，但新边界会截断后续算子的邻域。源检测的卷积核、PSF fit_shape、ePSF cutout、孔径与背景环、PSF 匹配核、反卷积和去星模型都定义各自支持半径；processing-safe mask 应按即将使用的最大必要支持域从不可靠区向内腐蚀。若裁切与旋转或重投影合并，还要加入重采样核支持并传播相关噪声。[不确定] 当前项目各后续工具的最大实际感受野和边界填充方式未统一公开，不能用固定 3px 代表全部处理安全域。",
+  "recommended_pipeline_stage": "在注册/叠加阶段生成 WCS 与辅助平面，在线性图像上完成最终几何裁切，并早于全图背景建模、源检测目录、测光校色、PSF 建模、反卷积、降噪、去星和拉伸。若产品已有可信 WCS，裁切必须当场传播；若像当前项目一样在裁后才 plate solve，也应保留裁前元数据状态并让新解算针对裁后尺寸。科学目录和 PSF 模型应在最终裁切后建立，或明确进行坐标传播和边缘重新筛选。",
+  "crop_geometry_and_framing_mode": {
+    "整数矩形切片": "对现有全图后期管线最稳妥，不新增重采样；所有平面共享同一 x0、y0、x1、y1。",
+    "最大可靠矩形": "矩形内部通过可靠 mask，便于背景、卷积和源检测；还要按各测量支持域生成更小的安全中心集合。",
+    "union加mask": "保留最大科学视场和不规则覆盖，适合支持 mask 的测量与马赛克；WCS 描述完整输出网格，辅助平面表明哪里可用。",
+    "旋转或重投影画幅": "不再是纯裁切，应重新计算输出 WCS、footprint、coverage、weight 和相关误差；最好在注册输出网格阶段一次完成。",
+    "目录级边缘排除": "无需为少数测量问题继续裁整图，可在源目录中按 aperture、annulus、fit_shape 和 mask 距离筛选。"
+  },
+  "guard_band_rule": [
+    "区分图像裁切保护带与科学测量保护带：前者保证矩形像素可靠，后者按每种算子支持域筛选中心。",
+    "源检测安全距离至少覆盖检测卷积核有效支持；PSF/ePSF 至少覆盖完整 fit_shape 或 cutout；孔径测光同时覆盖源孔径和背景环。",
+    "存在低覆盖而非硬无效边时，从 coverage/weight 门禁生成 mask 后再做距离变换，不能只量到数组边缘。",
+    "半开切片向内取整；坐标平移使用实际切片起点，不使用累计比例反算。"
+  ],
+  "science_roi_constraint": "目标本体、扩展低表面亮度结构、测光源及比较星、完整孔径、背景环、用于配准或 WCS 校验的参考星、PSF 建模星和背景采样格应作为不同层级 ROI。图像矩形必须保留硬目标 ROI；测量目录再要求每个源的完整支持域处于相应安全 mask。若目标孔径或关键参考星跨越低覆盖边缘，应保留 union+mask 并标记该测量无效，或重新叠加，不能用裁切或填补制造完整观测。",
+  "information_loss_and_stop_conditions": [
+    "报告像素和角面积、每侧损失、目标及参考星保留、coverage/weight 分布、各 DQ 位数量、可用于检测/测光/PSF 的安全面积与源数。",
+    "当裁切矩形内部达到所选可靠等级、WCS 与所有辅助平面同步、硬 ROI 保留时停止图像级裁切；测量支持不足应优先在目录级排除。",
+    "若 WCS 不能由当前工具可靠切片、辅助扩展 shape 不一致或关键 ROI 无可靠支持，停止自动发布 science-safe 产品并进入人工复核或重处理。",
+    "若裁切只为改善显示且会显著减少科学面积，保留未裁科学母版并另导出显示副本。",
+    "[不确定] 面积损失、可用星数和边缘距离的统一上限不存在，应由科学需求、PSF 尺寸和测光误差预算定义。"
+  ],
+  "acceptance_and_fallback": {
+    "科学安全": "SCI、WCS 和全部辅助平面原子同步，可靠 mask 有直接数据来源，测量按各自支持域筛选，provenance 完整且 WCS 同点测试通过。",
+    "处理安全": "矩形及必要邻域足以供指定背景、卷积或模型使用；可能没有精密测量所需的完整 DQ/uncertainty，但限制被明确记录。",
+    "仅展示": "允许丢弃辅助平面、填零/修补边缘或再次旋转；输出不得覆盖科学母版或用于测光。",
+    "退化": "WCS 缺失或仅裁后重解、coverage/weight/rejection 未保存、只能由亮度推断 mask，或 PSF 空间域无法传播；下游按限制降级。",
+    "人工复核": "畸变查找表不受切片工具支持、备用 WCS 冲突、辅助平面错位、关键 ROI 触边、测光孔径覆盖不足或裁后天球残差超限。"
+  },
+  "false_positive_and_failure_modes": [
+    "把 NAXIS 更新视为 WCS 已更新；实际 CRPIX 或畸变辅助表仍指向裁前像素网格。",
+    "直接套用 CRPIX 平移公式却混淆 FITS 一基坐标、NumPy 零基索引、y 轴方向或已经发生的翻转。",
+    "Astropy Cutout2D 能更新普通 WCS，但官方明确警告不处理某些 FITS 畸变查找表；无条件依赖会产生看似有效的错误 WCS。",
+    "只裁 SCI，WHT/ERR/DQ/CTX 保持原尺寸；程序若广播、截断或按旧坐标读取，会产生隐蔽科学错误。",
+    "把 WHT 当作统一物理量；它可能表示曝光权重、误差权重或逆方差，裁切不改变类型，但门禁必须知道定义。",
+    "把 CTX/CON 当 coverage 数值直接相加；它通常是贡献图像位图，需要按位解释，且输入多于位宽时可能有额外平面。",
+    "mask 后仍使用未校正的孔径面积或背景环，造成通量和背景偏差；简单忽略坏像素不等于完成缺失面积校正。",
+    "空间变化 PSF 在新坐标网格沿用旧归一化坐标，或选择 fit_shape 跨越低覆盖区，会造成位置相关系统误差。",
+    "重新 plate solve 可以得到裁后 WCS，但不能恢复丢失的 DQ、weight、uncertainty 或输入贡献 provenance。",
+    "为保证 PSF 窗口完整而大幅裁整图会无谓删除科学区域；通常应保留图像并在目录级排除边缘源。"
+  ],
+  "cfa_and_channel_constraints": "若 SCI 仍是 CFA，SCI 与 DQ、mask、weight 必须在同一传感器像素格切片，并保持 Bayer 2×2 或 X-Trans 6×6 相位以及 ROWORDER/XBAYROFF/YBAYROFF；去马赛克或 CFA drizzle 后的 RGB 各通道、weight 与 mask 使用同一输出 WCS。多滤镜产品的 WCS 同步只是必要条件，科学测量还必须使用各滤镜自己的可靠 mask 与 uncertainty；共同目录坐标可共享天球坐标，但像素有效域按通道判断。",
+  "wcs_and_auxiliary_propagation": {
+    "WCS与尺寸": "更新实际数组尺寸、NAXIS、CRPIX 与像素边界；纯裁切保持同一天空映射和尺度/方向。同步处理主 WCS、备用 WCS、SIP 和畸变信息，遇到不支持的查找表则重解或用专门工具。",
+    "像素平面": "SCI、mask、DQ、uncertainty/ERR、variance/inverse-variance、WHT、coverage、CTX/CON、rejection、有效曝光、分割图和空间图使用同一切片；纯裁切不改单位与数值定义。",
+    "目录与区域": "像素坐标、包围盒、分割标签、孔径和 ROI 减裁切起点；天球坐标保持不变。裁外对象明确移除，部分裁切对象设置质量位。",
+    "PSF": "固定 PSF 图样本体未必需要裁切，但其适用域和坐标元数据必须更新；空间变化 PSF、PSF 网格与曝光相关模型需变换坐标或重新拟合，边缘星必须有完整可靠 cutout。",
+    "元数据与来源": "更新 HISTORY、裁切矩形、软件版本、输入产品关联和校验和；保留 weight 与 context 的语义、DQ 位定义和 uncertainty 类型。"
+  },
+  "downstream_impact": "正确传播后，背景建模可用 coverage_mask 排除马赛克空白，源检测可用 mask 避免在填充值台阶上产生伪源，孔径和 PSF 测光能用 error 与 DQ 计算或筛选结果，目录天球位置保持一致。若传播失败，背景面会向零边缘弯曲，检测卷积会在边界制造结构，测光孔径与背景环会缺面积，PSF/ePSF 会被截断或采用错误空间坐标，光度校色与跨滤镜匹配随之偏移。反卷积和去星还会把边界错误扩散到内部。过度图像级裁切则减少参考星和弱信号；保留 union+mask 并在目录级排除通常更保真。",
+  "qa_and_validation": [
+    "断言每个共网格扩展与 SCI shape 完全相等，输出 NAXIS 匹配数组；纯裁切时逐像素比较输出与输入 [y0:y1,x0:x1]。",
+    "在裁后四角、中心、ROI、随机点和共同恒星上比较裁前 (x+x0,y+y0) 与裁后 (x,y) 的世界坐标，并做世界到像素往返；同时检查像素尺度、方向和边界天球多边形。",
+    "逐位统计裁前候选区与裁后 DQ、context 和 rejection，比较 WHT、coverage、ERR 分位数；确认 mask 语义和 uncertainty 类型没有变化。",
+    "将 SCI、WHT/coverage、DQ/mask、context 贡献数、processing-safe mask、源孔径、背景环与 PSF cutout 叠图检查。",
+    "对源检测比较边缘伪源率；对裁前同一区域与裁后目录比较源数、质心、孔径通量、误差、PSF/FWHM 和质量位。",
+    "构造平移裁切、四个边界、奇偶尺寸、SIP、畸变查找表、多个备用 WCS、多扩展 shape 错位、内部洞和部分孔径的回归数据。",
+    "重新打开最终 FITS，验证所有扩展、WCS、单位、HISTORY 和校验和，避免仅在内存对象正确。"
+  ],
+  "crop_provenance": "记录输入文件及校验标识、原始和最终尺寸、精确半开切片与坐标约定、累计四边裁量、裁前后主/备用 WCS 摘要、畸变类型、全部辅助扩展及其语义、DQ 允许位、weight/uncertainty 类型、coverage 门禁、各科学算子支持域、目录移除或质量位统计、WCS/测光 QA 结果、软件与库版本、是否额外重采样、人工覆盖和产品安全等级。",
+  "software_and_literature_practice": [
+    "FITS 官方标准与 WCS 论文把 CRPIX 定义为参考像素位置、CRVAL 为其世界坐标；子图必须保持像素到世界的映射而不是只复制旧头。",
+    "Astropy NDData/CCDData 把 data、mask、uncertainty、flags 和 WCS 作为关联对象；官方文档说明切片会相应切片 mask 和 WCS，CCDData 可将 MASK、UNCERT、flags 与 PSF 写入 FITS 扩展。",
+    "Astropy Cutout2D 可返回更新后的 WCS 并提供原图与子图像素坐标转换，但明确警告当前不处理 FITS WCS distortion paper 的查找表。",
+    "AstroDrizzle 最终产品包含 SCI、WHT 和 CTX；官方定义 WHT 为相对权重或有效曝光时间图，CTX 记录哪些输入图像贡献到各像素。",
+    "JWST 科学数据通常同时提供 SCI、ERR 与 DQ，部分重采样产品还提供 WHT/CON 或 WMAP，证明科学图像应与质量和误差平面一同传播。",
+    "Photutils Background2D 明确区分 no-coverage 的 coverage_mask 与源/坏像素 mask；源检测和 PSF 测光接受 mask，非有限值会被排除。",
+    "Photutils extract_stars 不提取 cutout 部分或全部越出输入图像的星，直接支持 ePSF 星必须远离边界至少半个 cutout 的规则；孔径工具支持 mask、误差和边界重叠。",
+    "Siril 自 1.0 起官方声明 rotate、mirror 和 crop 会更新 WCS；这支持当前项目调用 Siril crop，但仍需版本锁定与裁后验证。",
+    "按各科学算子构造不同安全 mask、在目录级排除边缘源以及五级产品验收是本调研的工程综合。"
+  ],
+  "evidence_sources": [
+    {
+      "标题": "FITS 官方标准与 WCS 规范索引",
+      "网址": "https://fits.gsfc.nasa.gov/fits_wcs.html",
+      "来源类型": "美国航天局 FITS 官方标准入口",
+      "日期": "访问于 2026-08-04"
+    },
+    {
+      "标题": "Astropy CCDData：data、mask、uncertainty、flags、WCS 与 PSF",
+      "网址": "https://docs.astropy.org/en/stable/api/astropy.nddata.CCDData.html",
+      "来源类型": "官方软件 API 文档",
+      "日期": "稳定版文档；访问于 2026-08-04"
+    },
+    {
+      "标题": "Astropy NDData：关联平面切片与不确定度传播",
+      "网址": "https://docs.astropy.org/en/stable/nddata/index.html",
+      "来源类型": "官方软件文档",
+      "日期": "稳定版文档；访问于 2026-08-04"
+    },
+    {
+      "标题": "Astropy Cutout2D：WCS 更新与畸变查找表限制",
+      "网址": "https://docs.astropy.org/en/stable/api/astropy.nddata.utils.Cutout2D.html",
+      "来源类型": "官方软件 API 文档",
+      "日期": "稳定版文档；访问于 2026-08-04"
+    },
+    {
+      "标题": "HST AstroDrizzle 管线产品：SCI、WHT 与 CTX",
+      "网址": "https://hst-docs.stsci.edu/drizzpac/chapter-5-drizzlepac-software-package/5-3-astrodrizzle-in-the-pipeline",
+      "来源类型": "空间望远镜科学研究所官方文档",
+      "日期": "访问于 2026-08-04"
+    },
+    {
+      "标题": "JWST 科学数据概览：SCI、ERR、DQ、WHT 与 context",
+      "网址": "https://jwst-docs.stsci.edu/accessing-jwst-data/jwst-science-data-overview",
+      "来源类型": "空间望远镜科学研究所官方文档",
+      "日期": "访问于 2026-08-04"
+    },
+    {
+      "标题": "Photutils Background2D：coverage_mask 与普通 mask",
+      "网址": "https://photutils.readthedocs.io/en/stable/api/photutils.background.Background2D.html",
+      "来源类型": "官方软件 API 文档",
+      "日期": "版本 3.0.0；访问于 2026-08-04"
+    },
+    {
+      "标题": "Photutils 源检测：mask 像素不参与检测",
+      "网址": "https://photutils.readthedocs.io/en/stable/api/photutils.segmentation.detect_sources.html",
+      "来源类型": "官方软件 API 文档",
+      "日期": "稳定版文档；访问于 2026-08-04"
+    },
+    {
+      "标题": "Photutils PSF 测光：data、error、mask 与非有限值",
+      "网址": "https://photutils.readthedocs.io/en/stable/user_guide/psf.html",
+      "来源类型": "官方软件文档",
+      "日期": "版本 3.0.0；访问于 2026-08-04"
+    },
+    {
+      "标题": "Photutils extract_stars：边界不完整 cutout 的排除",
+      "网址": "https://photutils.readthedocs.io/en/latest/api/photutils.psf.extract_stars.html",
+      "来源类型": "官方软件 API 文档",
+      "日期": "开发版文档；访问于 2026-08-04"
+    },
+    {
+      "标题": "Photutils 孔径测光：mask、误差与孔径边界",
+      "网址": "https://photutils.readthedocs.io/en/stable/user_guide/aperture.html",
+      "来源类型": "官方软件文档",
+      "日期": "版本 3.0.0；访问于 2026-08-04"
+    },
+    {
+      "标题": "Siril 1.0：裁切、旋转和镜像后的 WCS 更新",
+      "网址": "https://siril.org/download/2021-11-20-siril-1.0.0-rc1/",
+      "来源类型": "官方版本说明",
+      "日期": "2021-11-20；访问于 2026-08-04"
+    }
+  ],
+  "evidence_strength_and_conflicts": "FITS/WCS 标准、Astropy、STScI/JWST 与 Photutils 官方文档对 WCS 映射、关联数据平面、权重/context、mask 和科学测量边界提供强而互补的证据；Siril 官方版本说明直接支持其 crop 更新 WCS 的行为。主要限制不是冲突而是支持范围：Astropy Cutout2D 对普通 WCS 可用，却明确不支持某些畸变查找表；WHT 定义也会随产品是曝光权重、误差权重或逆方差而变化，不能统一阈值。[不确定] Siril 当前捆绑版本对全部 SIP/畸变与备用 WCS 的裁切传播细节、商业工具的内部处理，以及适用于本项目每个后续模型的安全半径仍需版本源码和回归测试。",
+  "current_project_fit": [
+    "当前 Stage 2 通过 Siril crop 对当前图像做整数矩形裁切，并在 stage2_crop_report.json 记录每次 x、y、width、height、移除四边和累计裁量；这些信息足以成为 WCS 与目录平移 provenance 的基础。",
+    "项目只把 stage2_corrected.fit 作为统一输出，没有生成或同步 mask、DQ、uncertainty、weight、coverage、context、rejection、分割图或 PSF 辅助产品，因此当前只能达到单 SCI 的处理路径。",
+    "Stage 2 主要依赖 RGB 像素统计与 edge_black_ratio，无法区分填零 no-data、低权重、被拒绝样本和真实暗背景，也无法为测光或 PSF 建模产生可靠 mask。",
+    "当前 stage2_guard_band_pixels=3 是边缘检测保护像素，不代表背景网格、卷积、去星、反卷积或 PSF fit_shape 的科学支持域。",
+    "Stage 4 才执行 platesolve，因此常规路径的新 WCS 针对裁后 stage2_corrected 图建立，规避了新解算 WCS 的裁切传播；但若用户输入的叠加图已有 WCS，项目没有显式保存裁前后同点 QA。",
+    "Siril 官方自 1.0 起声明 crop 会更新 WCS，说明当前命令有合理底层支持；项目仍应锁定实际 Siril 版本并验证保存后的 FITS 头，尤其是 SIP 或其他畸变。",
+    "后续阶段主要读取单一图像而非数据、mask、不确定度组合，边界若仍不可靠只能通过整图裁切或 degraded 状态控制，不能在源目录或算法级精确排除。",
+    "从 stage2_corrected.fit 续跑时不会重做裁切；报告和 FITS 内必须自包含裁切与 WCS provenance，否则无法可靠恢复辅助坐标关系。"
+  ],
+  "implementation_recommendations": {
+    "最高优先级最小改动": [
+      "扩展 stage2_crop_report.json：记录明确的半开切片、坐标原点/轴方向、裁前后 FITS 尺寸、WCS 是否存在、CRPIX 摘要、Siril 版本及裁后 WCS 同点检查结果。",
+      "保存 stage2_corrected.fit 后重新读取头和 shape；若裁前有 WCS，在中心、四角和随机点验证裁前偏移坐标与裁后坐标的天空位置一致，失败则标记 manual-review/degraded。",
+      "把固定 3px 明确命名为 edge-detection guard，不宣称 science-safe；后续背景、卷积和模型分别使用自己的安全 mask 或边缘排除宽度。"
+    ],
+    "中期增强": [
+      "引入最小多扩展或并行 FITS 产品：SCI、VALIDMASK、COVERAGE/WEIGHT 和可选 REJECTION/UNCERTAINTY；Stage 2 原子切片并验证全部 shape。",
+      "在后续背景模块传入 coverage_mask，在源检测、测光和 PSF 模块按 fit_shape、孔径及背景环距离筛选；用目录质量位代替继续裁整图。",
+      "记录并传播目录像素坐标、ROI、分割图和空间 PSF 坐标域；为普通 WCS、SIP 和不支持的查找表建立不同处理/回退路径。"
+    ],
+    "长期架构": [
+      "将图像改为包含 SCI、WCS、mask、uncertainty、weight、coverage、context/rejection 和 provenance 的原子数据产品，任何几何操作由单一切片接口完成。",
+      "让 Stage 1 从注册/叠加直接产出 footprint 与覆盖辅助平面；Stage 2 输出 science-union+mask 和 processing-safe 矩形，而展示副本单独生成。",
+      "建立合成与真实回归矩阵，覆盖坐标基准、四边裁切、多扩展错位、SIP/查找表、孔径触边、PSF cutout、内部洞、WCS 往返和光度不变量。"
+    ]
+  },
+  "uncertain": [
+    "metrics_and_thresholds",
+    "interpolation_and_support_radius",
+    "information_loss_and_stop_conditions",
+    "evidence_strength_and_conflicts"
+  ]
+}

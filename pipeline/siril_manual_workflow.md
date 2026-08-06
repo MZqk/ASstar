@@ -178,7 +178,6 @@ save stage4_pre_pcc
 pcc -catalog=gaia
 save stage4_pcc_candidate
 save stage4_color
-save stage4_colorbalanced
 ```
 
 自动流程会在独立 Siril CLI 中执行这一条 PCC，默认超时 180 秒且不重试。只有确认线性的宽带 RGB/OSC 输入允许调用；窄带、HOO/SHO、双窄带、单色或非线性输入直接跳过。
@@ -194,7 +193,6 @@ PCC 失败、超时或目标感知质量门拒绝时：
 ```text
 load stage4_pre_pcc
 save stage4_color
-save stage4_colorbalanced
 ```
 
 自动流程随后只允许通过星点软掩膜做局部颜色恢复；星点不足时原样保留。禁止对整幅图像做背景中性化或全图白平衡。
@@ -223,7 +221,6 @@ rl -loadpsf=stage5_psf.fit -iters=8 -alpha=3000 -tv -gdstep=0.0005 -stop=0.001
 save stage5_deconv
 denoise -mod=0.50 -indep
 save stage5_linear
-save stage5_denoised
 cd "<work_dir>"
 save result_linear
 cd "<work_dir>/process"
@@ -247,7 +244,6 @@ cd "<work_dir>/process"
 load stage5_input_linear
 denoise -mod=0.50 -indep
 save stage5_linear
-save stage5_denoised
 ```
 
 - RL 后背景变脏或星环明显时，也回到 `stage5_input_linear`。
@@ -256,7 +252,6 @@ save stage5_denoised
 ```text
 load stage5_deconv
 save stage5_linear
-save stage5_denoised
 ```
 
 ## 7. 线性去星与星点层准备
@@ -273,7 +268,6 @@ save stage6_input
 ```text
 load starless
 save stage6_starless
-save stage7_starless
 load starmask
 save starmask_raw
 ```
@@ -299,12 +293,10 @@ save starmask_raw
 
 ```text
 load stage5_linear
-save starless
-save stage6_starless
-save stage7_starless
+save stage6_passthrough
 ```
 
-- `starmask.fit` 缺失时，后续 Stage 9 跳过回星。
+- 此路径不得生成任何 Starless 命名产物；`starmask.fit` 缺失时，后续 Stage 9 跳过回星并只允许复核输出。
 
 ## 8. 主体拉伸
 

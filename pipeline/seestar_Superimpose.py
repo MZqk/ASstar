@@ -83,14 +83,7 @@ from save_utils import (
     write_png_rgb16,
     write_stage_json,
 )
-from ui_preview import write_raw_preview
-
-try:
-    from stage11_ai_postprocess import run_stage11_ai_postprocess
-    STAGE11_IMPORT_ERROR = None
-except (ImportError, RuntimeError) as stage11_import_exc:
-    run_stage11_ai_postprocess = None
-    STAGE11_IMPORT_ERROR = stage11_import_exc
+from ui_preview import write_display_preview
 
 try:
     from ai_artistic_derivative import run_ai_artistic_derivative
@@ -138,6 +131,7 @@ from stages.stage7_star_separation import (
 from stages.stage8_nebula_enhancement import run_stage8_nebula_enhancement
 from stages.stage9_star_remixing import run_stage9_star_remixing
 from stages.stage10_export import run_stage10_export
+import task_workspace
 
 try:
     from image_feature_analyzer import (
@@ -182,8 +176,10 @@ ENV_COSMIC_NATIVE_GPU_KEY = "SEESTAR_COSMIC_NATIVE_GPU"
 ENV_COSMIC_CLASSIC_GPU_KEY = "SEESTAR_COSMIC_CLASSIC_GPU"
 ENV_COSMIC_CLASSIC_ENABLE_KEY = "SEESTAR_COSMIC_CLASSIC_ENABLE"
 INPUT_MODE_AUTO = "auto"
+INPUT_MODE_STAGE1_PREPARED_RESUME = "stage1_prepared_resume"
 INPUT_MODE_LINEAR_RESUME = "result_linear_resume"
 INPUT_MODE_STAGE2_CORRECTED_RESUME = "stage2_corrected_resume"
+STAGE1_PREPARED_INPUT_NAME = "stage1_prepared.fit"
 LINEAR_RESUME_INPUT_NAME = "result_linear.fit"
 STAGE2_CORRECTED_INPUT_NAME = "stage2_corrected.fit"
 DEFAULT_AI_PROMPT = (
@@ -304,6 +300,7 @@ AUTO_CLAMP_FIELDS = (
     "stage2_adaptive_edge_crop_max_extra",
     "stage2_guard_band_pixels",
     "stage2_color_artifact_max_crop",
+    "stage2_center_protect_area_ratio",
     "bg_samples",
     "bg_tolerance",
     "bg_smooth",
@@ -313,6 +310,15 @@ AUTO_CLAMP_FIELDS = (
     "bg_edge_black_rise_max",
     "bg_star_preserve_ratio_min",
     "bg_nebula_mean_change_max",
+    "stage3_compound_min_sample_count",
+    "stage3_compound_fit_min_count",
+    "stage3_compound_validation_min_count",
+    "stage3_compound_validation_ratio",
+    "stage3_compound_score_abs_improvement_min",
+    "stage3_compound_score_rel_improvement_min",
+    "stage3_compound_validation_improvement_min",
+    "stage3_compound_zero_point_abs_max",
+    "stage3_compound_zero_point_rel_max",
     "denoise_mod",
     "stage5_builtin_denoise_mod",
     "stage5_rl_maxstars",
@@ -336,6 +342,7 @@ AUTO_CLAMP_FIELDS = (
     "stage8_bg_std_growth_max",
     "stage8_texture_artifact_growth_max",
     "stage8_limited_saturation_max",
+    "stage8_limited_core_exclusion_expand",
     "stage8_limited_halo_texture_growth_max",
     "stage8_limited_halo_texture_delta_max",
     "star_intensity",
@@ -353,10 +360,18 @@ AUTO_CLAMP_FIELDS = (
     "stage6_highlight_clip_ratio_max",
     "stage6_star_growth_ratio_max",
     "stage7_bright_nebula_star_growth_ratio_max",
+    "stage7_bright_nebula_star_mask_expand",
+    "stage7_bright_nebula_star_faint_suppression",
+    "stage7_bright_nebula_star_detail_suppression",
+    "stage7_stretch_feedback_retry_max",
+    "stage7_starless_masked_rank_drift_p95_max",
+    "stage7_starless_halo_detail_growth_ratio_max",
+    "stage7_starless_halo_detail_delta_min",
     "stage7_stretch_chroma_noise_score_max",
     "stage7_stretch_background_mottling_score_max",
     "stage7_stretch_chroma_load_growth_max",
     "stage7_stretch_chroma_load_low_absolute_max",
+    "stage7_stretch_chroma_load_low_absolute_tolerance",
     "stage7_quality_retry_max",
     "stage7_edge_black_warn",
     "stage7_edge_black_high",
@@ -430,6 +445,7 @@ CLAMP_RULES: list[tuple[str, type, float, float]] = [
     ("stage2_adaptive_edge_crop_max_extra", float, 0.005, 0.060),
     ("stage2_guard_band_pixels", int, 0, 8),
     ("stage2_color_artifact_max_crop", float, 0.05, 0.25),
+    ("stage2_center_protect_area_ratio", float, 0.50, 0.95),
     ("bg_samples", int, 12, 32),
     ("bg_tolerance", float, 0.6, 1.8),
     ("bg_smooth", float, 0.2, 1.2),
@@ -439,6 +455,15 @@ CLAMP_RULES: list[tuple[str, type, float, float]] = [
     ("bg_edge_black_rise_max", float, 0.10, 0.60),
     ("bg_star_preserve_ratio_min", float, 0.50, 1.00),
     ("bg_nebula_mean_change_max", float, 0.02, 0.35),
+    ("stage3_compound_min_sample_count", int, 32, 64),
+    ("stage3_compound_fit_min_count", int, 24, 56),
+    ("stage3_compound_validation_min_count", int, 8, 20),
+    ("stage3_compound_validation_ratio", float, 0.15, 0.35),
+    ("stage3_compound_score_abs_improvement_min", float, 0.03, 0.15),
+    ("stage3_compound_score_rel_improvement_min", float, 0.10, 0.40),
+    ("stage3_compound_validation_improvement_min", float, 0.10, 0.40),
+    ("stage3_compound_zero_point_abs_max", float, 0.002, 0.010),
+    ("stage3_compound_zero_point_rel_max", float, 0.05, 0.15),
     ("stage5_builtin_denoise_mod", float, 0.20, 0.55),
     ("stage5_rl_maxstars", int, 20, 1000),
     ("stage5_rl_psf_kernel_size", int, 9, 99),
@@ -461,6 +486,7 @@ CLAMP_RULES: list[tuple[str, type, float, float]] = [
     ("stage8_bg_std_growth_max", float, 1.00, 1.50),
     ("stage8_texture_artifact_growth_max", float, 1.00, 2.20),
     ("stage8_limited_saturation_max", float, 0.0, 0.10),
+    ("stage8_limited_core_exclusion_expand", int, 2, 16),
     ("stage8_limited_halo_texture_growth_max", float, 1.0, 1.50),
     ("stage8_limited_halo_texture_delta_max", float, 0.00001, 0.01000),
     ("star_intensity", float, 0.8, 1.05),
@@ -478,10 +504,18 @@ CLAMP_RULES: list[tuple[str, type, float, float]] = [
     ("stage6_highlight_clip_ratio_max", float, 0.001, 0.050),
     ("stage6_star_growth_ratio_max", float, 1.05, 1.80),
     ("stage7_bright_nebula_star_growth_ratio_max", float, 1.05, 1.80),
+    ("stage7_bright_nebula_star_mask_expand", int, 1, 8),
+    ("stage7_bright_nebula_star_faint_suppression", float, 0.0, 1.0),
+    ("stage7_bright_nebula_star_detail_suppression", float, 0.0, 0.60),
+    ("stage7_stretch_feedback_retry_max", int, 0, 1),
+    ("stage7_starless_masked_rank_drift_p95_max", float, 0.02, 0.50),
+    ("stage7_starless_halo_detail_growth_ratio_max", float, 1.05, 4.00),
+    ("stage7_starless_halo_detail_delta_min", float, 0.001, 0.10),
     ("stage7_stretch_chroma_noise_score_max", float, 0.10, 0.80),
     ("stage7_stretch_background_mottling_score_max", float, 0.10, 1.00),
     ("stage7_stretch_chroma_load_growth_max", float, 1.00, 3.00),
     ("stage7_stretch_chroma_load_low_absolute_max", float, 0.01, 0.15),
+    ("stage7_stretch_chroma_load_low_absolute_tolerance", float, 0.0, 0.01),
     ("stage7_quality_retry_max", int, 0, 3),
     ("stage7_edge_black_warn", float, 0.04, 0.30),
     ("stage7_bg_median_high", float, 0.08, 0.35),
@@ -930,13 +964,14 @@ def auto_tune_config(
 
 def format_config_summary(cfg: PipelineConfig) -> str:
     return (
-        "crop_margin={:.3f}, bg_samples={}, bg_tol={:.2f}, bg_smooth={:.2f}, "
+        "crop_margin={:.3f}, stage2_center_protect={:.2f}, "
+        "bg_samples={}, bg_tol={:.2f}, bg_smooth={:.2f}, "
         "denoise={}({:.2f}), asinh=({:.2f},{:.4f}), ghs=({:.2f},{:.2f}), "
         "nebula_sat={:.2f}, star_input_domain=linear, external_prestretch=false, "
-        "star_intensity={:.2f}, final_sat={:.2f}, "
-        "ai_enabled={}, ai_strength={:.2f}"
+        "star_intensity={:.2f}, final_sat={:.2f}"
     ).format(
         cfg.crop_margin,
+        cfg.stage2_center_protect_area_ratio,
         cfg.bg_samples,
         cfg.bg_tolerance,
         cfg.bg_smooth,
@@ -949,8 +984,6 @@ def format_config_summary(cfg: PipelineConfig) -> str:
         cfg.nebula_saturation,
         cfg.star_intensity,
         cfg.final_saturation,
-        cfg.ai_post_enabled,
-        cfg.ai_strength,
     )
 
 
@@ -1066,6 +1099,7 @@ class SeestarPostProcessor(
         self._input_state_review_route: bool = False
         self._skip_stage10_color_adjustments: bool = False
         self._background_review_required: bool = False
+        self._stage4_color_review_required: bool = False
         self._channel_semantics: str = "unknown"
         self.channel_profile: Dict[str, Any] = {}
         self._run_id: Optional[str] = None
@@ -1370,13 +1404,40 @@ class SeestarPostProcessor(
                     )
                 except Exception:
                     pass
+            if (
+                stage_number in (2, 5)
+                and normalized_status in {"ok", "degraded"}
+                and str((getattr(self, "input_profile", {}) or {}).get("state") or "")
+                == "linear"
+            ):
+                self._publish_task_formal_checkpoint(stage_number)
+
+    def _publish_task_formal_checkpoint(self, stage_number: int) -> None:
+        """Promote accepted Stage 1/2/5 data before normal process cleanup."""
+
+        manifest_value = str(os.getenv("SEESTAR_TASK_RUN_MANIFEST", "") or "").strip()
+        if not manifest_value or not self.process_dir:
+            return
+        try:
+            contract = task_workspace.stage_contract(stage_number)
+            artifact = self.process_dir / contract.primary_artifact
+            record = task_workspace.publish_formal_checkpoint(
+                run_manifest_path=Path(manifest_value),
+                stage_number=stage_number,
+                artifact_path=artifact,
+            )
+            self.log.info(
+                "[TaskCheckpoint] published "
+                f"stage={stage_number} sha256={str(record.get('sha256') or '')[:12]}"
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self.log.warn(
+                f"[TaskCheckpoint] Stage {stage_number} 发布失败；"
+                f"本阶段不能跨运行续跑：{error}"
+            )
 
     def _stage_preview_candidates(self, stage: int) -> List[Path]:
         """Return accepted stage artifacts in strict preference order."""
-        if stage == 11:
-            if not bool(getattr(self, "ai_outputs_generated", False)):
-                return []
-            return [self.work_dir / "result_final_ai.fit"] if self.work_dir else []
         if not self.process_dir:
             return []
         stems = {
@@ -1437,7 +1498,11 @@ class SeestarPostProcessor(
             if image_data is None:
                 raise RuntimeError("accepted stage image buffer is empty")
             preview_path = self.process_dir / "ui_preview" / "latest.png"
-            write_raw_preview(image_data, preview_path)
+            write_display_preview(
+                image_data,
+                preview_path,
+                apply_stretch=stage <= 6,
+            )
             self._emit_preview_event(stage, title, "ready", str(preview_path))
         except (
             CommandError,
@@ -1489,7 +1554,12 @@ class SeestarPostProcessor(
         self.log.stage_start(stage_label)
         self._prepare_process_dir()
 
-        linear_path = self.work_dir / LINEAR_RESUME_INPUT_NAME
+        trusted_path = getattr(self, "_task_resume_checkpoint_path", None)
+        linear_path = (
+            Path(trusted_path)
+            if trusted_path and Path(trusted_path).is_file()
+            else self.work_dir / LINEAR_RESUME_INPUT_NAME
+        )
         if not linear_path.is_file():
             raise SirilError(
                 f"未找到线性续跑输入文件，请检查工作目录: {linear_path}"
@@ -1510,7 +1580,7 @@ class SeestarPostProcessor(
 
         stage_saved = self._save_stage_output("stage1_prepared")
         stage_status = "ok" if stage_saved else "degraded"
-        message = f"loaded existing {LINEAR_RESUME_INPUT_NAME}"
+        message = f"loaded verified Stage 5 checkpoint {linear_path.name}"
         if not stage_saved:
             message += "；stage1 输出保存失败"
 
@@ -1518,7 +1588,9 @@ class SeestarPostProcessor(
         self._record_stage(stage_label, stage_status, elapsed, message)
 
     def _stage2_corrected_resume_candidates(self) -> List[Path]:
+        trusted_path = getattr(self, "_task_resume_checkpoint_path", None)
         candidates = [
+            *([Path(trusted_path)] if trusted_path else []),
             self.work_dir / STAGE2_CORRECTED_INPUT_NAME,
             self.work_dir / "process" / STAGE2_CORRECTED_INPUT_NAME,
         ]
@@ -1531,6 +1603,38 @@ class SeestarPostProcessor(
             seen.add(resolved)
             unique.append(path)
         return unique
+
+    def _prepare_stage1_prepared_resume_input(self) -> None:
+        stage_label = PipelineStage.PREPARATION.label
+        self.log.stage_start(stage_label)
+        trusted_path = getattr(self, "_task_resume_checkpoint_path", None)
+        candidates = [
+            *([Path(trusted_path)] if trusted_path else []),
+            self.work_dir / STAGE1_PREPARED_INPUT_NAME,
+            self.work_dir / "process" / STAGE1_PREPARED_INPUT_NAME,
+        ]
+        source_path = next((path for path in candidates if path.is_file()), None)
+        if source_path is None:
+            raise SirilError("未找到已验证的 Stage 1 准备断点")
+
+        self._prepare_process_dir()
+        prepared_file = self.process_dir / STAGE1_PREPARED_INPUT_NAME
+        working_file = self.process_dir / "working.fit"
+        shutil.copy2(source_path, prepared_file)
+        shutil.copy2(source_path, working_file)
+        self.source_file = source_path
+        self.linear_intermediate_path = None
+        self._stage1_input_mode = "stage1_prepared_resume"
+        self._stage1_registration_stats = None
+        self.cmd_with_check("cd", f'"{self.process_dir}"')
+        self.cmd_with_check("load", "working")
+        elapsed = self.log.stage_end(stage_label)
+        self._record_stage(
+            stage_label,
+            "ok",
+            elapsed,
+            f"loaded verified Stage 1 checkpoint {source_path.name}",
+        )
 
     def _prepare_stage2_corrected_resume_input(self) -> None:
         self._record_skipped_stage(
@@ -1998,37 +2102,9 @@ class SeestarPostProcessor(
     def stage10_export(self):
         run_stage10_export(self)
 
-    # ========================================
-    # Stage 11: Optional AI postprocess
-    # ========================================
     def stage11_ai_postprocess(self):
-        if not self.cfg.ai_post_enabled:
-            stage_label = PipelineStage.AI_POSTPROCESS.label
-            self.log.stage_start(stage_label)
-            self.ai_outputs_generated = False
-            elapsed = self.log.stage_end(stage_label)
-            self._record_stage(
-                stage_label,
-                "skipped",
-                elapsed,
-                "SEESTAR_AI_ENABLED not enabled",
-            )
-            return
-
-        if run_stage11_ai_postprocess is None:
-            stage_label = PipelineStage.AI_POSTPROCESS.label
-            self.log.stage_start(stage_label)
-            status = "degraded"
-            message = f"stage11 module import failed: {STAGE11_IMPORT_ERROR}"
-            self.log.warn(message)
-            elapsed = self.log.stage_end(stage_label)
-            self._record_stage(stage_label, status, elapsed, message)
-            return
-
-        run_stage11_ai_postprocess(
-            self,
-            write_png_rgb16_func=write_png_rgb16,
-        )
+        """Compatibility no-op; the product pipeline ends after Stage 10."""
+        self.ai_outputs_generated = False
 
     def ai_artistic_derivative_experiment(self):
         """Run the non-stage artistic branch without changing Stage 1-11 results."""
@@ -2236,9 +2312,11 @@ class SeestarPostProcessor(
             self.results = []
             self.input_profile = {}
             self._trusted_input_provenance = None
+            self._task_resume_checkpoint_path = None
             self._input_state_review_route = False
             self._skip_stage10_color_adjustments = False
             self._background_review_required = False
+            self._stage4_color_review_required = False
             self._channel_semantics = "unknown"
             self.channel_profile = {}
             self._run_id = None
@@ -2255,14 +2333,6 @@ class SeestarPostProcessor(
 
             self._load_trusted_input_provenance_for_resume()
 
-            if self.cfg.ai_post_enabled:
-                self.log.info(
-                    "[AI] Requested for stage6-8 code-owned candidate selection "
-                    "and optional stage11; outbound requests also require "
-                    "SEESTAR_NETWORK_MODE=1: "
-                    f"endpoint={self.cfg.ai_endpoint}, model={self.cfg.ai_model}, "
-                    f"timeout={self.cfg.ai_timeout_sec}s, strength={self.cfg.ai_strength}"
-                )
             if self.cfg.ai_artistic_derivative_enabled:
                 self.log.info(
                     "[AI-Artistic] isolated experiment requested; outbound requests "
@@ -2272,7 +2342,35 @@ class SeestarPostProcessor(
                     "output will not re-enter Siril"
                 )
 
-            if self.input_mode == INPUT_MODE_LINEAR_RESUME:
+            if self.input_mode == INPUT_MODE_STAGE1_PREPARED_RESUME:
+                self._prepare_stage1_prepared_resume_input()
+                input_profile = self._resolve_input_profile()
+                if input_profile.safe_for_linear_steps:
+                    self._publish_task_formal_checkpoint(1)
+                self._auto_tune_for_current_input()
+                self.stage2_view_correction()
+                self._run_target_profile_preflight(
+                    source="Stage1 resume processing-plan preflight",
+                    metadata_candidates=("stage2_corrected", self.source_file),
+                    preview_name="stage3_target_preview.png",
+                )
+                self._freeze_primary_target()
+                if not self._write_processing_plan(input_profile):
+                    raise RuntimeError("processing-plan.json could not be frozen")
+                if input_profile.safe_for_linear_steps:
+                    self.stage3_background_extraction()
+                    self.stage4_color_calibration()
+                    self.stage5_linear_denoise()
+                else:
+                    self._record_input_state_skipped_stages(
+                        input_profile,
+                        (
+                            PipelineStage.BACKGROUND_EXTRACTION,
+                            PipelineStage.COLOR_CALIBRATION,
+                            PipelineStage.LINEAR_DENOISE,
+                        ),
+                    )
+            elif self.input_mode == INPUT_MODE_LINEAR_RESUME:
                 self._prepare_linear_resume_input()
                 input_profile = self._resolve_input_profile()
                 self._auto_tune_for_current_input()
@@ -2341,6 +2439,8 @@ class SeestarPostProcessor(
                 # 线性阶段 (1-5)
                 self.stage1_preparation()
                 input_profile = self._resolve_input_profile()
+                if input_profile.safe_for_linear_steps:
+                    self._publish_task_formal_checkpoint(1)
                 self._auto_tune_for_current_input()
                 self.stage2_view_correction()
                 self._run_target_profile_preflight(
@@ -2394,13 +2494,6 @@ class SeestarPostProcessor(
                     ),
                 )
             self.stage10_export()
-            if input_profile.safe_for_linear_steps:
-                self.stage11_ai_postprocess()
-            else:
-                self._record_skipped_stage(
-                    PipelineStage.AI_POSTPROCESS.label,
-                    "skipped for input-state review-only route",
-                )
             if (
                 input_profile.safe_for_linear_steps
                 and bool(getattr(self.cfg, "ai_artistic_derivative_enabled", False))
@@ -2494,10 +2587,6 @@ class SeestarPostProcessor(
             self.log.info(f"  - 导出失败时回退名: {fallback_line}")
             if self.linear_intermediate_path:
                 self.log.info("  - result_linear.fit (拉伸前线性中间文件)")
-            if self.ai_outputs_generated:
-                self.log.info("  - result_processed_ai.tif (16-bit Astro-TIFF, AI)")
-                self.log.info("  - result_processed_ai.png (Preview PNG, AI)")
-                self.log.info("  - result_final_ai.fit (AI 后期 FITS 存档)")
             if self.ai_artistic_output_generated and self.ai_artistic_output_path:
                 self.log.info(
                     "  - "

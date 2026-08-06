@@ -1576,68 +1576,42 @@ class StageSupportMixin:
         after: Optional[ImageFeatures],
         preservation: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str]:
+        """Collect source-fidelity diagnostics for the process-based Stage 3 gate.
+
+        Background/RMS acceptance is enforced on source-masked held-out sky
+        patches in ``stage3_background_extraction``.  The former fixed ratios
+        mixed sky-pedestal changes with source loss and are intentionally no
+        longer used to authorize or reject a candidate here.
+        """
         if not self.cfg.bg_quality_gate_enabled:
             return True, "quality gate disabled"
         if before is None or after is None:
             return True, "quality gate skipped: feature sampling unavailable"
-
-        reasons: List[str] = []
-
-        bg_std_ratio = after.bg_std / max(before.bg_std, 1e-6)
-        if bg_std_ratio > self.cfg.bg_std_worsen_ratio_max:
-            reasons.append(
-                f"bg_std ratio {bg_std_ratio:.2f}>{self.cfg.bg_std_worsen_ratio_max:.2f}"
-            )
-
-        if before.bg_median > 0.03:
-            bg_median_ratio = after.bg_median / max(before.bg_median, 1e-6)
-            if bg_median_ratio < self.cfg.bg_median_drop_ratio_min:
-                reasons.append(
-                    "bg_median drop ratio "
-                    f"{bg_median_ratio:.2f}<{self.cfg.bg_median_drop_ratio_min:.2f}"
-                )
-
-        if before.object_area_ratio > 0.08:
-            object_ratio = after.object_area_ratio / max(before.object_area_ratio, 1e-6)
-            if object_ratio < self.cfg.bg_object_preserve_ratio_min:
-                reasons.append(
-                    "object coverage ratio "
-                    f"{object_ratio:.2f}<{self.cfg.bg_object_preserve_ratio_min:.2f}"
-                )
-
-        edge_black_rise = after.edge_black_ratio - before.edge_black_ratio
-        if edge_black_rise > self.cfg.bg_edge_black_rise_max:
-            reasons.append(
-                f"edge_black rise {edge_black_rise:.2f}>{self.cfg.bg_edge_black_rise_max:.2f}"
-            )
 
         preservation_notes: List[str] = []
         if preservation and preservation.get("available"):
             star_retention = preservation.get("star_retention_ratio")
             if star_retention is not None:
                 preservation_notes.append(f"star_retention={float(star_retention):.3f}")
-                if float(star_retention) < self.cfg.bg_star_preserve_ratio_min:
-                    reasons.append(
-                        "star retention ratio "
-                        f"{float(star_retention):.2f}<"
-                        f"{self.cfg.bg_star_preserve_ratio_min:.2f}"
-                    )
-            nebula_change = preservation.get("nebula_mean_change_ratio")
-            if nebula_change is not None:
+            target_flux = preservation.get("target_flux_retention_ratio")
+            if target_flux is not None:
                 preservation_notes.append(
-                    f"nebula_mean_change={float(nebula_change):.3f}"
+                    f"target_flux_retention={float(target_flux):.3f}"
                 )
-                if float(nebula_change) > self.cfg.bg_nebula_mean_change_max:
-                    reasons.append(
-                        "nebula mean change "
-                        f"{float(nebula_change):.2f}>"
-                        f"{self.cfg.bg_nebula_mean_change_max:.2f}"
-                    )
+            morphology = preservation.get("target_morphology_correlation")
+            if morphology is not None:
+                preservation_notes.append(
+                    f"target_morphology_correlation={float(morphology):.5f}"
+                )
+            centroid_shift = preservation.get("target_centroid_shift_fraction")
+            if centroid_shift is not None:
+                preservation_notes.append(
+                    f"target_centroid_shift_fraction={float(centroid_shift):.6f}"
+                )
 
-        if reasons:
-            return False, "; ".join(reasons)
         message = (
-            f"bg_std {before.bg_std:.4f}->{after.bg_std:.4f}, "
+            "source-fidelity diagnostics recorded; held-out sky validation owns "
+            f"acceptance, bg_std {before.bg_std:.4f}->{after.bg_std:.4f}, "
             f"bg_median {before.bg_median:.4f}->{after.bg_median:.4f}"
         )
         if preservation_notes:
@@ -1652,7 +1626,23 @@ class StageSupportMixin:
     ) -> Dict[str, Any]:
         if before_image is None or after_image is None:
             return {"available": False, "notes": ["image sampling unavailable"]}
-        return measure_stage3_signal_preservation(before_image, after_image)
+        safe_report = getattr(self, "_stage3_safe_sample_report", {}) or {}
+        split_report = (
+            safe_report.get("fit_validation_split")
+            or safe_report.get("compound_split")
+            or {}
+        )
+        sky_points = split_report.get("validation_points") or []
+        return measure_stage3_signal_preservation(
+            before_image,
+            after_image,
+            sky_points=[
+                (float(point[0]), float(point[1]))
+                for point in sky_points
+                if isinstance(point, (list, tuple)) and len(point) >= 2
+            ],
+            sky_patch_radius=int(safe_report.get("patch_radius", 12) or 12),
+        )
 
 
     def _stage3_plugin_candidates(
@@ -1773,10 +1763,11 @@ class StageSupportMixin:
                     f"-samples={s_count}",
                     f"-tolerance={tol:.3f}",
                     f"-smooth={sm:.3f}",
+                    "-existing",
                 )
             )
         self.log.info(
-            "[Stage3] Dynamic RBF candidates: "
+            "[Stage3] Dynamic RBF candidates with custom -existing samples: "
             f"count={len(commands)}, bg_std={bg_std:.4f}, "
             f"star_density={star_density:.5f}, object_area={object_area:.3f}"
         )

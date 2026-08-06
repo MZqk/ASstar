@@ -1,0 +1,64 @@
+topic: 深空天文后期 Pipeline Stage 1-10 三维度审计调研
+created: 2026-08-05
+repo: /Users/mz/dev/aiseestart
+
+scope:
+  dimensions:
+    - D1_逻辑专业合理性: 阶段目标、处理顺序、色彩/信号域假设、降级路径是否符合天文后期专业逻辑
+    - D2_门禁来源与归档: 每个 gate 的阈值/判据出处（硬编码/PipelineConfig/env/AI/运行时推导）+ 是否落盘到 processing-plan.json / pipeline-result.json / run-manifest / checkpoint-manifest，能否事后复现
+    - D3_算法行业标准符合度: 与 PixInsight / Siril / APP / 学术文献的主流实现对标，联网取证
+
+code_map_note: |
+  历史命名错位（务必注意）：
+  - Stage 6（线性去星）实现在 pipeline/stages/stage7_star_separation.py::run_stage6_star_separation
+  - Stage 7（主体拉伸）实现在 pipeline/stages/stage6_stretching.py::run_stage7_stretching
+  主类薄封装在 pipeline/seestar_Superimpose.py 约 1882-2130 行。
+
+items:
+  - id: stage1
+    name: Stage 1 前期准备（输入统一 / debayer / register / stack）
+    code: [pipeline/stages/stage1_preparation.py, pipeline/input_discovery.py, pipeline/input_profile.py, pipeline/task_plan.py, pipeline/run_manifest.py]
+    doc_section: "5.1 阶段 1：前期准备（workflow.md L267-300）"
+  - id: stage2
+    name: Stage 2 裁切 / 视场修正
+    code: [pipeline/stages/stage2_view_correction.py, pipeline/device_geometry.py]
+    doc_section: "5.2 阶段 2：裁切（L300-360）"
+  - id: stage3
+    name: Stage 3 背景提取（梯度去除）
+    code: [pipeline/stages/stage3_background_extraction.py, pipeline/background_sampling.py]
+    doc_section: "5.3 阶段 3：背景提取（L360-391）"
+  - id: stage4
+    name: Stage 4 图像解析 + 色彩校准（SPCC/PCC）
+    code: [pipeline/stages/stage4_color_calibration.py, pipeline/channel_semantics.py, pipeline/narrowband_normalization.py]
+    doc_section: "5.4 阶段 4（L391-443）"
+  - id: stage5
+    name: Stage 5 线性反卷积 / 轻降噪
+    code: [pipeline/stages/stage5_linear_denoise.py, pipeline/noise_model.py, pipeline/scunet_denoise.py, pipeline/cosmic_clarity.py]
+    doc_section: "5.5 阶段 5（L443-471）"
+  - id: stage6
+    name: Stage 6 线性去星与星点层准备
+    code: [pipeline/stages/stage7_star_separation.py, pipeline/syqon_starless.py, pipeline/starmask_cleanup.py, pipeline/stage6_services.py]
+    doc_section: "5.6 阶段 6（L471-534）"
+  - id: stage7
+    name: Stage 7 主体拉伸（Starless stretch）
+    code: [pipeline/stages/stage6_stretching.py, pipeline/stage7_quality.py, pipeline/stage7_stretch_metrics.py, pipeline/stage7_repair.py, pipeline/stretch_candidate_evaluator.py]
+    doc_section: "5.7 + 5.7.1（L534-601）"
+  - id: stage8
+    name: Stage 8 Starless 深加工（星云增强）
+    code: [pipeline/stages/stage8_nebula_enhancement.py, pipeline/stage8_pixels.py, pipeline/local_adjustments.py]
+    doc_section: "5.8 阶段 8（L601-655）"
+  - id: stage9
+    name: Stage 9 星点处理与合成（回星）
+    code: [pipeline/stages/stage9_star_remixing.py, pipeline/stage9_quality.py, pipeline/star_color_repair.py]
+    doc_section: "5.9 阶段 9（L655-758）"
+  - id: stage10
+    name: Stage 10 最终降噪与导出
+    code: [pipeline/stages/stage10_export.py, pipeline/output_color.py, pipeline/save_utils.py, pipeline/managed_output.py, pipeline/review_bundle.py]
+    doc_section: "5.10 阶段 10（L758-835）"
+
+execution:
+  batch_size: 10
+  items_per_agent: 1
+  agent_covers: 3 dimensions per stage
+  output_dir: ./results
+  evidence_rule: 每条结论必须带 file:line 或 URL 证据；无证据的判断标记为“推断”

@@ -1450,6 +1450,110 @@ class PipelineStageSmokeTests(unittest.TestCase):
         self.assertEqual(self.pipeline.results[-1][1], "ok")
         self.assertTrue((self.process_dir / "stage2_corrected.fit").exists())
 
+    def test_stage2_center_area_protection_constrains_aggressive_crop(self) -> None:
+        shape = {"channels": 3, "height": 100, "width": 100}
+        crop_report = {
+            "original_shape": shape,
+            "current_shape": shape,
+            "total_left": 0,
+            "total_top": 0,
+            "crops": [],
+            "crop_limit_hits": [],
+            "center_protection": stage2_view_correction._stage2_center_protection(
+                shape,
+                self.pipeline.cfg.stage2_center_protect_area_ratio,
+            ),
+        }
+
+        applied_rect, note = stage2_view_correction._stage2_apply_crop(
+            self.pipeline,
+            crop_report,
+            20,
+            20,
+            60,
+            60,
+            reason="test_aggressive_crop",
+        )
+
+        self.assertEqual(applied_rect, (8, 8, 84, 84))
+        self.assertIn("center-area protection constrained crop", note)
+        self.assertGreaterEqual((84 * 84) / float(100 * 100), 0.70)
+        self.assertEqual(self.pipeline.commands[-1], ("crop", "8", "8", "84", "84"))
+        self.assertTrue(crop_report["crops"][-1]["center_protection_limited"])
+        self.assertEqual(len(crop_report["crop_limit_hits"]), 1)
+
+    def test_stage2_center_area_protection_keeps_safe_crop_unchanged(self) -> None:
+        shape = {"channels": 3, "height": 100, "width": 100}
+        crop_report = {
+            "original_shape": shape,
+            "current_shape": shape,
+            "total_left": 0,
+            "total_top": 0,
+            "crops": [],
+            "crop_limit_hits": [],
+            "center_protection": stage2_view_correction._stage2_center_protection(
+                shape,
+                self.pipeline.cfg.stage2_center_protect_area_ratio,
+            ),
+        }
+
+        applied_rect, note = stage2_view_correction._stage2_apply_crop(
+            self.pipeline,
+            crop_report,
+            2,
+            3,
+            95,
+            94,
+            reason="test_safe_crop",
+        )
+
+        self.assertEqual(applied_rect, (2, 3, 95, 94))
+        self.assertEqual(note, "")
+        self.assertEqual(crop_report["crop_limit_hits"], [])
+
+    def test_stage2_center_area_protection_is_cfa_alignment_safe(self) -> None:
+        shape = {"channels": 3, "height": 3753, "width": 2111}
+
+        protection = stage2_view_correction._stage2_center_protection(shape, 0.70)
+
+        self.assertGreaterEqual(protection["actual_area_ratio"], 0.70)
+        self.assertEqual(protection["left"] % 2, 0)
+        self.assertEqual(protection["top"] % 2, 0)
+        self.assertEqual(protection["width"] % 2, 0)
+        self.assertEqual(protection["height"] % 2, 0)
+
+    def test_stage2_soft_edge_evidence_requires_two_independent_signals(self) -> None:
+        hard_black = np.array([False, False, True])
+        dark_step = np.array([True, True, False])
+        color_cast = np.array([False, True, False])
+
+        combined = stage2_view_correction._combine_edge_evidence(
+            hard_black,
+            dark_step,
+            color_cast,
+        )
+
+        np.testing.assert_array_equal(combined, np.array([False, True, True]))
+
+    def test_stage2_rectangular_black_border_does_not_cross_contaminate_axes(self) -> None:
+        height, width = 400, 240
+        pixels = np.full((3, height, width), 0.02, dtype=np.float32)
+        pixels[:, :20, :] = 0.0
+        pixels[:, -20:, :] = 0.0
+        pixels[:, :, :12] = 0.0
+        pixels[:, :, -12:] = 0.0
+        self.pipeline.siril = SimpleNamespace(
+            get_image_shape=lambda: pixels.shape,
+            get_image_pixeldata=lambda preview=False: pixels,
+        )
+
+        crop_rect, _note = stage2_view_correction._detect_auto_edge_crop(
+            self.pipeline,
+            is_adaptive=False,
+        )
+
+        self.assertEqual(crop_rect, (15, 23, 210, 354))
+
     @property
     def process_dir(self) -> Path:
         return self.pipeline.process_dir

@@ -14,7 +14,10 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PIPELINE_MODULE_PATH = REPO_ROOT / "pipeline" / "seestar_Superimpose.py"
+PIPELINE_DIR = REPO_ROOT / "pipeline"
+PIPELINE_MODULE_PATH = PIPELINE_DIR / "seestar_Superimpose.py"
+if str(PIPELINE_DIR) not in sys.path:
+    sys.path.insert(0, str(PIPELINE_DIR))
 
 
 def _ensure_fake_sirilpy() -> None:
@@ -373,7 +376,7 @@ class PipelineStage1InputFilteringTests(unittest.TestCase):
             name, status, message = probe.stage_records[0]
             self.assertEqual(name, "阶段 1: 前期准备")
             self.assertEqual(status, "ok")
-            self.assertIn("loaded existing result_linear.fit", message)
+            self.assertIn("loaded verified Stage 5 checkpoint result_linear.fit", message)
 
     def test_prepare_stage2_corrected_resume_uses_existing_process_artifact(self):
         with tempfile.TemporaryDirectory() as td:

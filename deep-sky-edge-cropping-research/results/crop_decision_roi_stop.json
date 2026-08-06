@@ -1,0 +1,209 @@
+{
+  "name": "裁切决策、目标保护与停止条件",
+  "scope_and_question": [
+    "研究何时应自动裁切、保留掩膜、降级或请求人工复核，重点覆盖 coverage/weight 门、最大视场损失、科学目标 ROI、参考星与天空背景环、迭代收敛和置信度。",
+    "适用于配准叠加后的线性深空图像，以及为背景提取、校色、反卷积、去星、拉伸、测光或展示生成的不同交付物。",
+    "不假设存在适用于所有相机、帧数、dither、目标类型和科学任务的固定裁切比例；数值策略必须区分来源事实、项目默认建议和数据集标定值。"
+  ],
+  "pixel_state_taxonomy": [
+    "硬无效：非有限、weight=0、coverage=0、无 context 贡献或明确 DQ 禁用。",
+    "低覆盖：有像素值但贡献帧数、有效曝光或逆方差权重明显低于主体区。",
+    "被拒绝/坏像素：由 DQ、rejection 或坏点图标明，可能在其他帧有良好替代，也可能最终形成孔洞。",
+    "插值/填充值：数值存在但依赖图外常数、镜像、修补或生成模型，不等于观测。",
+    "真实暗背景或暗星云：覆盖和噪声正常但亮度低，是裁切误判的主要风险。",
+    "任务关键像素：目标及弱信号外延、比较/检验星、测光 aperture、天空 annulus、背景模型采样区和 PSF/校色参考星。"
+  ],
+  "defect_causes": [
+    "场旋、dither、平移、尺度和畸变校正使矩形输出边缘的参与帧数下降或完全无覆盖。",
+    "过小 pixfrac、过细输出 scale、DQ/rejection 过严或输入帧过少会形成 Drizzle holes；坏列、芯片缝可形成内部无效区。",
+    "最终图像的填充值、插值、Lanczos 波纹、通道错位或卷积边界会制造看似有值但不适合后续处理的边缘。",
+    "自动算法若只比较中心与边缘亮度，会把真实渐晕、暗星云、扩展星云或非均匀马赛克误判为坏边。"
+  ],
+  "validity_evidence_source": [
+    "最高优先：WCS/配准 footprint、DQ/mask、coverage/参与帧数、有效曝光、inverse-variance weight、context 和 rejection map。",
+    "其次：多帧贡献一致性、局部噪声与 PSF 稳定度；这些可以识别有覆盖但质量不足的边缘。",
+    "最后：最终 RGB/FITS 的 NaN、近黑比例、亮度台阶、梯度和色偏；只能在辅助数据缺失时作为降级证据，并须与真实暗结构保护联合。",
+    "决策时应把证据来源写入置信度，不能让低优先像素统计覆盖高优先 coverage/DQ 事实。"
+  ],
+  "required_inputs": [
+    "叠加科学图、有效掩膜、coverage/weight/context/DQ/rejection、原始和当前 WCS/尺寸。",
+    "目标 ROI 或 WCS 坐标、扩展弱信号保护区、参考星清单、测光 aperture 与天空 annulus、背景采样需求。",
+    "候选矩形集合、每边和面积损失、角视场、后续最大算子支持/工作 halo。",
+    "裁切前后 QA 指标、数据来源置信度、软件与参数版本、人工锁定/覆盖信息。"
+  ],
+  "metrics_and_thresholds": [
+    "硬门：候选 science-safe ROI 内不得有 coverage=0、weight=0、非有限或禁用 DQ 像素；若存在则回退重叠加、掩膜或人工复核。",
+    "覆盖门同时保留绝对参与帧数和相对主体覆盖率/权重，避免中心中位数归一化掩盖少帧数据。[不确定]最小参与帧数与相对覆盖比例没有跨数据集统一值。",
+    "DrizzlePac 官方质检给出目标 ROI 内 weight 标准差小于中位数约 20% 的经验规则，并要求检查 holes；该数值是 Drizzle 特定经验，不是通用自动裁边阈值。",
+    "Photutils Background2D 默认只允许背景网格约 10% 像素被 mask，且建议尽可能低；这可转化为‘候选裁切后背景网格必须有足够未遮罩像素’的下游门，而非裁边比例。",
+    "收敛门不应只看近黑比例：应同时比较 hard-invalid 数、低覆盖面积、可靠掩膜占比、ROI 完整率、参考星数量、背景可用面积和新产生的边缘差异。",
+    "[不确定]项目可先采用可配置警戒值而非事实标准，例如单边损失超过 5%提示、任一维损失超过 10%或面积损失超过 20%转人工复核；这些数值必须用真实数据集标定，不能称为天文行业标准。"
+  ],
+  "algorithm_steps": [
+    "一、从 footprint/DQ/coverage/weight 构造 geometric_mask 与 reliable_mask；缺失时才调用像素统计 fallback，并降低置信度。",
+    "二、把所有计划下游算子的支持域作用到 reliable_mask，得到 processing-safe mask；硬无效、低覆盖和内部孔洞继续单独标记。",
+    "三、定义任务约束：主目标和弱信号 ROI、比较/检验星、测光 aperture/天空 annulus、背景网格、PSF 与校色星，并按处理支持扩张。",
+    "四、从原始未裁网格一次性生成候选矩形：四边扫描、最大内接矩形、共同覆盖区或保留 union+mask；不要在累积裁图上反复丢失坐标。",
+    "五、为候选计算多目标评分：减少硬无效和低覆盖、提高 coverage/weight 均匀度，同时惩罚面积/角视场损失、ROI 相交、参考星减少和背景网格不足。硬约束优先于分数。",
+    "六、按置信度与产品用途分类接受：science-safe、processing-safe、display-only、degraded 或 manual-review。",
+    "七、对已接受候选复算全部指标和 WCS，确保裁切后没有新的核边界风险；若改善不足、ROI 受损或辅助平面不同步则停止并回退。",
+    "八、保存裁切报告和可视化叠加；人工覆盖必须记录原候选、覆盖值和理由。"
+  ],
+  "geometric_mask_vs_reliable_mask": [
+    "几何掩膜表示至少有一个输入 footprint 覆盖，不保证贡献数、噪声、PSF 或插值支持足够。",
+    "可靠掩膜在几何掩膜上叠加 DQ、coverage/weight、rejection 与算子支持；processing-safe mask 还应为未来卷积、反卷积或模型保留 halo。",
+    "裁切只能选择一个矩形表达；不规则可靠区和内部孔洞仍需 mask，因此‘已裁切’不等于‘全像素可靠’。"
+  ],
+  "internal_hole_policy": [
+    "ROI 内部 weight=0/coverage=0 时禁止标 science-safe，优先回到叠加阶段调整 DQ bits、pixfrac、scale、拒绝策略或补充帧。",
+    "少量孤立坏点继续以 mask 传播；展示副本可修补但标 display-only。",
+    "只有与外边连通且矩形裁切损失可接受的孔洞才由裁切消除；芯片缝和马赛克缺口通常保留非矩形 mask。"
+  ],
+  "interpolation_and_support_radius": [
+    "ROI 和候选矩形应再向内避让配准误差、重采样核、PSF/卷积核及模型 halo；连续局部算子在统一网格上按组合支持传播。",
+    "星点检测本身也需要边界支持：Photutils DAOStarFinder 可排除距边界半个卷积核以内的源。",
+    "[不确定]闭源去星/神经网络的真实 halo 若未公开，应通过整图与 overlap-tile 一致性实验标定；标定前不能把边缘输出评为 science-safe。"
+  ],
+  "recommended_pipeline_stage": [
+    "第一版边界决策在配准叠加完成后、背景提取前执行，避免黑边/低覆盖污染背景统计；Siril 官方教程也是先裁边，再背景提取、光度校色和反卷积。",
+    "目标 ROI 和产品用途必须在最终自动接受裁切前已知；若目标画像只能在后续确定，则 Stage 2 应保存可逆候选/掩膜并在 Stage 3/4 preflight 后复核，而不是不可逆地假设中心一定不含扩展信号。",
+    "反卷积、去星或神经网络可能扩大边界污染，处理时保留工作 halo，并在这些步骤后做最终交付复检；拉伸后只允许生成独立 display 裁切。",
+    "科学测量应尽量在保留 mask/weight 的线性产品上进行，避免用纯展示裁切替代数据质量信息。"
+  ],
+  "crop_geometry_and_framing_mode": [
+    "common/science framing：在所有必需帧或通道达到可靠覆盖的交集内求矩形，适合定量背景、校色和测光。",
+    "reference framing：保持参考帧矩形，边缘通过 mask/weight 表示，适合需要固定坐标或最大视场的处理。",
+    "union/mosaic framing：保留所有覆盖区域和非矩形 footprint，必须携带 coverage/weight；不可把空角填黑后当完整矩形。",
+    "四边独立裁切适合外连通条带；最大内接轴对齐矩形适合场旋黑角；旋转矩形会引入一次额外重采样，只有角视场收益明显且支持重新传播时采用。"
+  ],
+  "guard_band_rule": [
+    "候选矩形必须位于 processing-safe mask 内：基础可靠边界再加配准残差、插值核、下游最大局部支持和至少 1 像素取整余量。",
+    "测光/参考星约束使用 aperture 或 PSF fit_shape 与完整 sky annulus 的外边界作为保护区，而不是只保护星心。",
+    "CFA 图像按 Bayer 2×2 或 X-Trans 6×6 相位对裁切坐标/尺寸取整；多通道取公共可靠支持。",
+    "[不确定]固定 3 像素保护带没有通用证据；保护带应由实际算子链和网格尺度计算。"
+  ],
+  "science_roi_constraint": [
+    "主目标 ROI 是硬约束：候选不得切穿目标本体、用户标注的弱信号外延、暗云或潮汐结构；ROI 应由 WCS/目录、弱拉伸预览、窄带辅助和人工标注联合定义。",
+    "定量测光必须保留目标、比较星和检验星。AAVSO 指南强调使用比较/检验星，并给出天空 annulus 的经验尺寸：内圈直径约 5×平均 FWHM、外圈直径约 9×平均 FWHM、天空像素约为测量 aperture 的 10 倍；实际配置的完整 aperture/annulus 才是最终硬约束。",
+    "Photutils 也明确 aperture photometry 假设背景已扣除，并常用邻近 annulus 做局部背景；裁切或 mask 造成的部分 overlap 必须进入有效面积和误差计算。",
+    "背景提取应保留足够且空间分布均匀的低信号样区，不能为了干净矩形把所有真实天空裁掉。",
+    "[不确定]弥散目标真实外延常无硬边界；自动分割与低覆盖边相交、不同通道给出冲突 ROI 或参考星不足时强制 manual-review。"
+  ],
+  "information_loss_and_stop_conditions": [
+    "每个候选报告单边像素/百分比、宽高与面积保留率、角视场、ROI 像素和天区保留率、参考/检验星数量、背景可用面积以及 mask/coverage 改善。",
+    "立即停止并拒绝：候选切穿硬 ROI、使测光 aperture/sky annulus 不完整、关键参考星降到任务最小数量以下、WCS/辅助平面无法同步或剩余尺寸不足以下游算子运行。",
+    "收敛停止：相邻候选的主要可靠性指标改善小于测量噪声/预设最小增益，或者扩大裁切只减少真实覆盖正常的暗像素而不减少 hard-invalid/low-coverage。",
+    "循环上限只是故障保险，不是正确性证据；优先一次性从原始网格求解。若使用迭代，应保持候选嵌套、指标单调、坐标相对原图并设置最大轮数。",
+    "[不确定]行业没有通用的 5%、10%、20% 最大损失线；建议项目把‘提示/人工复核/禁止’阈值配置化，先以单边 5% 提示、任一维 10%或面积 20%人工复核作为保守试运行值，并用回归集校准。",
+    "如果达到损失门仍有坏边，保留较大视场加 mask、输出 degraded/processing-safe，或回到叠加修复，不继续自动蚕食 ROI。"
+  ],
+  "acceptance_and_fallback": [
+    "science-safe：高优先证据齐全；ROI/参考星/背景环完整；硬无效为零；coverage/weight 和算子支持达标；WCS 与辅助平面同步。",
+    "processing-safe：边缘足以支持背景、校色或图像处理，但覆盖均匀度、修补像素或误差模型不足以支持定量科学；必须保留 mask/weight。",
+    "display-only：接受 union 空角、镜像/修补/生成填充或视觉裁切；与科学 FITS 分开命名和记录。",
+    "degraded：仅有像素统计、改善不充分或超出自动损失预算；可继续低风险流程但排除高风险边缘，报告残留。",
+    "manual-review：ROI 冲突、暗星云/大尺度弱信号、马赛克不规则 footprint、通道覆盖冲突、参考星不足、候选分数接近或证据互相矛盾。",
+    "回退优先级：重叠加/修正 DQ-pixfrac-scale → 保留 mask 的更大 framing → 跳过依赖边缘的下游步骤 → 独立 display-only 输出。"
+  ],
+  "false_positive_and_failure_modes": [
+    "暗星云、弥散星云外延、真实负背景和渐晕被近黑/暗边阈值误裁；必须用 coverage/weight 与多尺度 ROI 反证。",
+    "中心本身含亮星云时，以中心统计归一化会把正常外部天空判为暗边；马赛克中心也未必代表主体权重。",
+    "只看平均 coverage 会掩盖局部 holes；只看 weight 非零会接受极低权重；只看单边条带会漏掉旋转三角和内部孔洞。",
+    "每轮在已裁图重新按百分比裁切会导致总损失超预算且坐标难追溯；必须相对原图累计。",
+    "最大面积矩形可能裁掉科学关键但面积很小的目标或参考星，因此 ROI 是硬约束，面积仅是次级目标。",
+    "把人工修补或镜像 padding 当作覆盖改善，或把像素统计变好误报为信息增加。"
+  ],
+  "cfa_and_channel_constraints": [
+    "未去马赛克 Bayer/X-Trans 必须按采样周期保持相位；Siril 当前文档分别约束到 2×2 和 6×6 边界。",
+    "RGB、LRGB、窄带科学输出的 ROI、参考星和 sky annulus 必须在全部必需通道的可靠掩膜交集中；通道 union 只可用于带逐通道 mask 的展示或特定分析。",
+    "通道错位和不同 PSF 会使各通道保护带不同，应分别传播后再求共同矩形。"
+  ],
+  "wcs_and_auxiliary_propagation": [
+    "矩形裁切后 NAXIS 与像素原点改变，WCS 至少要更新 CRPIX；旋转/重采样还需更新线性变换和畸变项。Astropy Cutout2D 可返回裁切后更新的 WCS。",
+    "science、mask、uncertainty、weight、coverage、context、rejection、PSF 有效区和 ROI 坐标使用同一窗口；Astropy NDData 的切片示例会同步 data、mask、uncertainty 与 WCS，可作为数据契约参考。",
+    "保存前后做 pixel→world→pixel 往返，并确认目标、参考星和候选角点的天区位置不变；人工 ROI 应同时保存原图像素坐标与天空坐标。",
+    "Siril 现代版本声明 crop 会更新 WCS，但 pipeline 仍需验证实际保存产物和辅助平面，而不是把软件行为当作完整传播契约。"
+  ],
+  "downstream_impact": [
+    "背景建模：低覆盖/黑边会拉低背景与 RMS，过裁则减少天空样区并可能让扩展星云主导剩余画面。",
+    "校色与 PSF：参考星数量和空间分布受裁切影响，边缘卷积不完整会偏移通量、FWHM、圆度和颜色。",
+    "反卷积/去星/降噪：过紧裁切不给算法上下文，会重新制造 ringing、接缝或纹理；应保留工作 halo。",
+    "拉伸：低覆盖和插值噪声会被显著放大；display-only 可以更积极裁切，但不能替换科学主产品。",
+    "测光：不完整 aperture 或 sky annulus、修补像素和相关噪声会使通量及误差失真；必须使用 science-safe mask 与有效 overlap 面积。",
+    "源检测：边缘卷积核不完整会产生漏检/假检；应按检测核排除边界源或标志。"
+  ],
+  "qa_and_validation": [
+    "生成原图、coverage/weight、hard-invalid、reliable-mask、ROI/参考星/天空环和候选矩形的同坐标叠加图。",
+    "裁切前后对比：零覆盖面积、低覆盖面积、weight 标准差/中位数、最大孔洞、edge_black_ratio、背景 RMS、星点数量/分布、ROI 保留率、角视场和每边损失。",
+    "对 Drizzle 产品在目标 ROI 单独检查 weight holes 与离散度；对 Background2D 类下游检查每个背景 box 的未遮罩比例，而非只看整图平均。",
+    "对受边界影响的星做 aperture/PSF 通量、FWHM 和残差对比；对扩展目标在弱拉伸和多通道图中人工核对外延。",
+    "WCS 抽样往返误差、各辅助平面 shape/origin 一致性、候选相对原图的坐标重建必须通过。",
+    "回归集至少包含场旋黑角、暗星云、大星云铺满画面、低帧数 Drizzle holes、宽边渐晕、通道错位、马赛克和目标贴边。"
+  ],
+  "crop_provenance": [
+    "原始/最终尺寸和 WCS、候选矩形、相对原图累计四边损失、角视场与面积保留率。",
+    "证据源、coverage/weight/DQ 阈值、支持域/保护带、ROI 和参考星版本、候选评分、置信度与接受等级。",
+    "每轮指标、停止原因、回退路径、软件/配置版本、人工覆盖人/时间/理由及 display/science 产品关联。"
+  ],
+  "software_and_literature_practice": [
+    "事实：AstroDrizzle 输出 science、weight 和 context；weight 近似有效曝光，context 记录哪些输入图像贡献到像素，官方 QA 要检查目标附近权重与 holes。",
+    "事实：DrizzlePac 指出 pixfrac/scale 没有适合所有观测和科学目标的唯一设置；较小 pixfrac 可提高分辨率并降低相关噪声，但降低低表面亮度结构的可见性。",
+    "事实：Photutils Background2D 明确区分无覆盖 coverage_mask 与源/坏点 mask，并按背景 box 的遮罩比例排除不可靠网格。",
+    "事实：Photutils aperture 工具支持 mask 和部分 overlap 的有效面积；AAVSO 指南要求目标、比较/检验星和足够天空 annulus。",
+    "事实：Astropy Cutout2D 在输入 WCS 时返回更新后的裁切 WCS；NDData 将 data、mask、uncertainty、WCS 作为同一数据对象的关联属性。",
+    "事实：Siril 官方教程把裁边列为背景提取之前的第一项后处理，并说明黑带会扭曲后续统计；同时提示宽场星云可能使背景提取难以判断。",
+    "推断：将上述来源组合成带 ROI 硬约束的多目标裁切评分、分级接受和停止门，是工程整合方案；官方资料没有给出跨软件统一的最大视场损失阈值。"
+  ],
+  "evidence_sources": [
+    "STScI《AstroDrizzle 在管线中的产品结构》，官方文档，访问日期 2026-08-04，https://hst-docs.stsci.edu/drizzpac/chapter-5-drizzlepac-software-package/5-3-astrodrizzle-in-the-pipeline",
+    "STScI《检查重处理后的 Drizzle 产品》，官方文档，访问日期 2026-08-04，https://hst-docs.stsci.edu/drizzpac/chapter-7-data-quality-checks-and-trouble-shooting-problems/7-3-inspecting-drizzled-products-after-user-reprocessing",
+    "STScI《运行 AstroDrizzle》，官方文档，访问日期 2026-08-04，https://hst-docs.stsci.edu/drizzpac/chapter-6-reprocessing-with-the-drizzlepac-package/6-3-running-astrodrizzle",
+    "Photutils《二维背景估计》，官方 API 文档，访问日期 2026-08-04，https://photutils.readthedocs.io/en/stable/api/photutils.background.Background2D.html",
+    "Photutils《孔径测光》，官方用户指南，访问日期 2026-08-04，https://photutils.readthedocs.io/en/stable/user_guide/aperture.html",
+    "Photutils《像素孔径有效重叠面积》，官方 API 文档，访问日期 2026-08-04，https://photutils.readthedocs.io/en/stable/api/photutils.aperture.PixelAperture.html",
+    "Photutils《DAOStarFinder》，官方 API 文档，访问日期 2026-08-04，https://photutils.readthedocs.io/en/stable/api/photutils.detection.DAOStarFinder.html",
+    "AAVSO《单色 CCD/CMOS 测光指南》，专业协会指南，2022 年版，https://www.aavso.org/sites/default/files/publications_files/ccd_photometry_guide/CCDPhotometryGuide.pdf",
+    "Astropy《Cutout2D》，官方 API 文档，访问日期 2026-08-04，https://docs.astropy.org/en/stable/api/astropy.nddata.utils.Cutout2D.html",
+    "Astropy《N 维数据及关联 mask、uncertainty、WCS》，官方文档，访问日期 2026-08-04，https://docs.astropy.org/en/stable/nddata/index.html",
+    "Siril《完整图像处理教程》，官方教程，访问日期 2026-08-04，https://siril.org/tutorials/tuto-scripts/",
+    "Siril《主界面：CFA 裁切约束》，官方文档，访问日期 2026-08-04，https://siril.readthedocs.io/en/latest/GUI/main-interface.html",
+    "Siril《1.0 发布说明：几何操作更新 WCS》，官方发布说明，2021-11-20，https://siril.org/download/2021-11-20-siril-1.0.0-rc1/"
+  ],
+  "evidence_strength_and_conflicts": [
+    "强证据：Drizzle 的 weight/context/DQ 与 holes、Photutils 的 mask/背景 box/孔径有效面积、Astropy 的 WCS 裁切传播、AAVSO 的测光 ROI 要求均来自官方机构或项目文档。",
+    "中等证据：science-safe/processing-safe/display-only 分级、多目标候选评分和 ROI 硬门是依据上述约束形成的工程方案，不是某一软件的原生统一标准。",
+    "[不确定]绝对 coverage 比例、最小帧数、最大单边/面积损失和最小改善量随帧数、dither、目标和产品用途改变，公开资料不存在通用固定值。",
+    "DrizzlePac 不同章节抓取文本对 weight 离散度措辞有不一致；专门 QA 章节明确写目标 ROI 内标准差小于中位数约 20%，本项以此作为仅适用于 Drizzle 的经验检查，并要求版本化复核。",
+    "商业软件未公开的自动裁边阈值没有纳入事实结论。"
+  ],
+  "current_project_fit": [
+    "当前 Stage 2 在叠加后、背景提取前执行，位置符合官方实践；先扫描四边亮度/近黑/色偏，再按 edge_black_ratio 迭代并输出 crop_report。",
+    "已有门控：edge_black 目标 0.03、最多三轮、单轮额外裁切上限 3.5%、改善不足 0.003 停止并 degraded；彩边步骤一次最多取每侧约 2.5%，若任一维剩余不超过 90%则放弃。",
+    "缺口：没有 coverage/weight/context/DQ/rejection、没有 target ROI/暗星云保护、没有参考星/aperture/sky annulus、没有角视场和总面积损失硬门，也没有 acceptance class。",
+    "初次检测允许从每边扫描至 25%，但没有全局最大损失与 ROI 约束；后续每轮 3.5%和三轮叠加也可能使总损失超过单轮直觉。",
+    "固定中心 50%用于背景阈值；当中心是亮星云、边缘是真实暗天空或目标贴边时存在系统性误判风险。",
+    "stage2_color_artifact_max_crop 配置目前未被彩边函数读取，实际由 2.5%条带和剩余 90%代码门控制；配置与行为不一致。",
+    "Stage 3/4 才冻结目标画像，因此 Stage 2 自动裁切发生时尚未利用完整目标策略；[不确定]仅靠当前中心统计无法保证扩展弱信号 ROI 不被裁掉。",
+    "crop_report 已记录相对原图累计四边像素，是扩展 provenance 和候选重算的良好基础。"
+  ],
+  "implementation_recommendations": [
+    "P0 最小改动：增加总损失计算和硬停止，至少报告每边、任一维与面积损失；先把 5%提示、10%维度或20%面积人工复核作为标注为实验性的可配置值，不直接静默接受。",
+    "P0：在 Stage 2 前读取可用的 FITS/WCS 目标位置和保守目标半径；若 target profile 尚未冻结、检测到大尺度弥散结构或候选接近保护区，输出 manual-review/degraded 并停止进一步自适应裁切。",
+    "P0：把 stage2_color_artifact_max_crop 真正接入实现，并让所有初次/自适应/彩边裁切共享相对原图的总预算；停止条件同时检查 ROI、星点和背景可用面积。",
+    "P1：Stage 1 输出 coverage_count/weight/common-footprint mask；Stage 2 用它作为主证据，像素统计改为 fallback。报告 evidence_source、confidence、acceptance_class 和 remaining_risk。",
+    "P1：在 Stage 3/4 preflight 冻结目标后复核 Stage 2 候选。若需改变，应从 stage1_prepared 基线重算一次裁切，避免在已裁图继续叠加；或者 Stage 2 先只产出 mask/候选，确认后再物理裁切。",
+    "P1：构造 science_roi.json，包含主目标/弱信号多边形、参考/检验星、测光 aperture/annulus 与背景安全区；矩形求解把这些设为硬约束。",
+    "P1：把停止判据升级为多指标：hard-invalid 减少、coverage/weight 均匀度改善、ROI 完整、参考星与背景网格充足、边缘卷积差异降低；不再只依赖 edge_black_ratio 0.003。",
+    "P2：支持 common/reference/union 三种 framing 和 science-safe/processing-safe/display-only 三类产物；内部 holes 由 mask 表示，不能靠展示修补升级。",
+    "P2：建立包含暗星云、满幅星云、目标贴边、低帧数 Drizzle、马赛克和通道错位的标注回归集，分别标定 coverage、损失与收敛阈值。"
+  ],
+  "uncertain": [
+    "metrics_and_thresholds",
+    "interpolation_and_support_radius",
+    "guard_band_rule",
+    "science_roi_constraint",
+    "information_loss_and_stop_conditions",
+    "evidence_strength_and_conflicts",
+    "current_project_fit"
+  ]
+}

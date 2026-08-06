@@ -1,0 +1,133 @@
+topic: "深空天文后期处理中场旋、黑边与不可靠边缘像素的裁切逻辑"
+categories:
+  - category: "研究对象"
+    fields:
+      - name: "name"
+        description: "调研项名称。"
+        detail_level: "极简"
+        required: true
+      - name: "scope_and_question"
+        description: "本项解决的具体问题、适用范围及不处理的边界。"
+        detail_level: "详细"
+        required: true
+      - name: "pixel_state_taxonomy"
+        description: "相关像素状态及其物理或计算含义，包括no-data、低覆盖、拒绝、插值、真实暗背景等。"
+        detail_level: "详细"
+        required: false
+      - name: "defect_causes"
+        description: "边缘缺陷的形成原因及可区分证据。"
+        detail_level: "详细"
+        required: true
+
+  - category: "检测与算法"
+    fields:
+      - name: "validity_evidence_source"
+        description: "footprint、DQ/mask、weight、coverage、rejection或像素统计等证据来源及优先级。"
+        detail_level: "详细"
+        required: true
+      - name: "required_inputs"
+        description: "算法所需图像、变换、元数据和辅助平面。"
+        detail_level: "简要"
+        required: true
+      - name: "metrics_and_thresholds"
+        description: "指标定义、阈值形式、归一化基准及阈值证据；没有统一数值时需明确说明。"
+        detail_level: "详细"
+        required: true
+      - name: "algorithm_steps"
+        description: "可复现的检测、区域求解、裁切和复检步骤。"
+        detail_level: "详细"
+        required: true
+      - name: "geometric_mask_vs_reliable_mask"
+        description: "几何有效区与数值可靠区的差别及构造方式。"
+        detail_level: "详细"
+        required: false
+      - name: "internal_hole_policy"
+        description: "内部无效岛、坏列、芯片间隙和drizzle holes的处理方式。"
+        detail_level: "简要"
+        required: false
+      - name: "interpolation_and_support_radius"
+        description: "插值核、PSF、卷积核或模型感受野造成的附加不可靠宽度。"
+        detail_level: "详细"
+        required: false
+
+  - category: "决策与保护"
+    fields:
+      - name: "recommended_pipeline_stage"
+        description: "推荐执行阶段及其相对于配准、叠加、背景、校色、反卷积、去星和拉伸的位置。"
+        detail_level: "详细"
+        required: true
+      - name: "crop_geometry_and_framing_mode"
+        description: "四边裁切、最大内接矩形、共同区、union、旋转或mask等几何策略。"
+        detail_level: "详细"
+        required: true
+      - name: "guard_band_rule"
+        description: "mask腐蚀、额外保护带、坐标取整和核支持域规则。"
+        detail_level: "详细"
+        required: false
+      - name: "science_roi_constraint"
+        description: "目标、扩展弱信号、参考星及背景采样区的保护约束。"
+        detail_level: "详细"
+        required: true
+      - name: "information_loss_and_stop_conditions"
+        description: "面积、角视场、四边损失、最大裁切、迭代改善量和停止条件。"
+        detail_level: "详细"
+        required: true
+      - name: "acceptance_and_fallback"
+        description: "science-safe、processing-safe、display-only、degraded、manual-review分类及回退路径。"
+        detail_level: "详细"
+        required: true
+      - name: "false_positive_and_failure_modes"
+        description: "暗星云、低表面亮度结构、渐晕、马赛克和其他常见误判或失败场景。"
+        detail_level: "详细"
+        required: true
+
+  - category: "数据完整性与影响"
+    fields:
+      - name: "cfa_and_channel_constraints"
+        description: "Bayer/X-Trans相位、多通道共同覆盖和通道对齐约束。"
+        detail_level: "简要"
+        required: false
+      - name: "wcs_and_auxiliary_propagation"
+        description: "WCS/CRPIX、mask、uncertainty、weight、context、rejection等同步更新要求。"
+        detail_level: "详细"
+        required: true
+      - name: "downstream_impact"
+        description: "对背景建模、校色、反卷积、降噪、去星、拉伸、测光和源检测的影响。"
+        detail_level: "详细"
+        required: true
+      - name: "qa_and_validation"
+        description: "裁切前后指标、诊断图交叉检查、WCS往返误差和视觉/自动验收。"
+        detail_level: "详细"
+        required: true
+      - name: "crop_provenance"
+        description: "应记录的原始尺寸、候选矩形、阈值、置信度、版本和人工覆盖信息。"
+        detail_level: "简要"
+        required: false
+
+  - category: "证据与项目映射"
+    fields:
+      - name: "software_and_literature_practice"
+        description: "软件官方行为、论文方法或可验证开源实现；明确事实与推断。"
+        detail_level: "详细"
+        required: true
+      - name: "evidence_sources"
+        description: "直接来源列表，包含标题、URL、来源类型、发布日期或访问日期。"
+        detail_level: "详细"
+        required: true
+      - name: "evidence_strength_and_conflicts"
+        description: "证据强弱、来源冲突、版本差异和仍待核验事项。"
+        detail_level: "详细"
+        required: true
+      - name: "current_project_fit"
+        description: "与当前项目Stage2逻辑的对应关系、缺口和适用限制。"
+        detail_level: "详细"
+        required: true
+      - name: "implementation_recommendations"
+        description: "按优先级给出最小改动、中期增强及长期架构建议。"
+        detail_level: "详细"
+        required: true
+
+uncertain:
+  - "软件未公开的内部自动裁边算法与默认阈值"
+  - "不同传感器和目标类型可通用的固定像素阈值"
+  - "商业软件当前版本中未写入官方文档的具体行为"

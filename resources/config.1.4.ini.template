@@ -1,5 +1,5 @@
 [core]
-wd=/tmp/siril_config_check.uof4zj
+wd=/Users/mz/SeeStar/test/SeestarSuperimpose/ngc7000-ab5d90c56734/runs/20260804T113126Z-3840e693/process
 extension=.fit
 force_16bit=false
 fits_save_icc=true
@@ -159,6 +159,7 @@ use_spcc_repository=false
 auto_update_scripts=false
 auto_update_spcc=false
 selected_scripts=
+startup_scripts=
 warn_scripts_run=true
 show_thumbnails=true
 thumbnail_size=256

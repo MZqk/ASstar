@@ -15,8 +15,9 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Mapping
 
-from PySide6.QtCore import QSettings, QTimer, QUrl, Signal, Qt
+from PySide6.QtCore import QFile, QSettings, QTimer, QUrl, Signal, Qt
 from PySide6.QtGui import QAction, QDesktopServices, QTextCursor
 
 try:
@@ -68,14 +69,13 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
-    QDialog,
-    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -90,26 +90,38 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QStackedWidget,
     QToolBar,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    from PySide6.QtWidgets import QStyle
+except ImportError:  # Lightweight Qt stubs used by non-visual unit tests.
+    QStyle = None  # type: ignore[assignment,misc]
+
+try:
+    from pipeline.stage_contracts import product_stage_contracts
+except ImportError:  # Support direct execution from the gui directory.
+    import sys
+
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from pipeline.stage_contracts import product_stage_contracts  # type: ignore[no-redef]
 
 SIRIL_PLUGIN_PYTHON_ABI = "cp312"
 UI_MODE_RECOMMENDED = "recommended"
 
 PIPELINE_STAGE_TITLES = {
-    1: "前期准备",
-    2: "裁切",
-    3: "背景提取",
-    4: "图像解析 + 色彩校准",
-    5: "线性反卷积 / 轻降噪",
-    6: "去星与星点层准备",
-    7: "主体拉伸",
-    8: "Starless 深加工",
-    9: "星点处理与合成",
-    10: "最终降噪与导出",
-    11: "AI 后期美化",
+    contract.number: contract.title for contract in product_stage_contracts()
 }
+_DISABLED_STAGE_DISPLAY_RE = re.compile(
+    r"(?:阶段\s*11\b|stage\s*11\b|stage11\b|AI\s*后期|"
+    r"ai_stage11|AI\s*(?:阶段|配置|环境)|SEESTAR_AI_|AI-Artistic)",
+    re.IGNORECASE,
+)
 
 PIPELINE_PROGRESS_STATE_LABELS = {
     "waiting": "等待",
@@ -123,17 +135,16 @@ PIPELINE_PROGRESS_STATE_LABELS = {
 }
 
 PIPELINE_STAGE_SHORT_TITLES = {
-    1: "准备",
-    2: "裁切",
-    3: "背景",
-    4: "校色",
-    5: "线性处理",
-    6: "去星",
-    7: "拉伸",
-    8: "深加工",
-    9: "合成",
-    10: "导出",
-    11: "AI 后期",
+    1: "输入准备",
+    2: "边界校正",
+    3: "背景处理",
+    4: "色彩校准",
+    5: "线性清理",
+    6: "线性去星",
+    7: "主体拉伸",
+    8: "Starless 增强",
+    9: "星点合成",
+    10: "降噪与导出",
 }
 
 
@@ -166,31 +177,6 @@ try:
     from .common import *
 except ImportError:
     from common import *  # type: ignore[no-redef]
-
-try:
-    from .ai_credentials import (
-        AI_PROVIDER_CUSTOM,
-        AI_PROVIDER_DEVELOPER,
-        AI_PROVIDER_MODES,
-        AI_SECRET_ENV_KEYS,
-        AiCredentialError,
-        delete_custom_api_key,
-        ensure_developer_credentials,
-        get_custom_api_key,
-        set_custom_api_key,
-    )
-except ImportError:
-    from ai_credentials import (  # type: ignore[no-redef]
-        AI_PROVIDER_CUSTOM,
-        AI_PROVIDER_DEVELOPER,
-        AI_PROVIDER_MODES,
-        AI_SECRET_ENV_KEYS,
-        AiCredentialError,
-        delete_custom_api_key,
-        ensure_developer_credentials,
-        get_custom_api_key,
-        set_custom_api_key,
-    )
 
 try:
     from .bootstrap_worker import (
@@ -237,10 +223,124 @@ except ImportError:
         preview_cache_path,
     )
 
+try:
+    from .ui_platform import (
+        configure_main_window,
+        current_platform_profile,
+        standard_shortcuts,
+    )
+    from .ui_theme import install_application_theme, set_style_property
+except ImportError:
+    from ui_platform import (  # type: ignore[no-redef]
+        configure_main_window,
+        current_platform_profile,
+        standard_shortcuts,
+    )
+    try:
+        from ui_theme import (  # type: ignore[no-redef]
+            install_application_theme,
+            set_style_property,
+        )
+    except ImportError:  # Lightweight Qt stubs used by non-visual unit tests.
+        def install_application_theme(app, profile=None):
+            return None
+
+        def set_style_property(widget, name: str, value: object) -> None:
+            setter = getattr(widget, "setProperty", None)
+            if callable(setter):
+                setter(name, value)
+
+try:
+    from pipeline.input_discovery import (
+        MASTER_SUFFIXES,
+        REVIEW_SUFFIXES,
+        InputDiscovery,
+        InputKind,
+        discover_input,
+    )
+    from pipeline.task_workspace import (
+        apply_task_retention,
+        latest_result_directory,
+        latest_result_files,
+        publish_latest_result_index,
+    )
+    from .task_intake import (
+        PreparedTask,
+        PreparedTaskQueue,
+        describe_input_plan,
+        discover_input_for_processing_settings,
+        prepare_task_queue,
+    )
+    from .history_store import (
+        STATUS_FAILED,
+        STATUS_INTERRUPTED,
+        STATUS_LABELS,
+        STATUS_PARTIAL_SUCCESS,
+        STATUS_PREPARING,
+        STATUS_REVIEW_REQUIRED,
+        STATUS_RUNNING,
+        STATUS_STOPPED,
+        STATUS_SUCCESS,
+        HistoryStore,
+        HistoryStoreError,
+        UnsafeTaskDeletionError,
+        history_task_key,
+        load_verified_pipeline_result,
+        validate_deletable_task_root,
+        verified_result_files,
+        verify_history_run,
+    )
+except ImportError:  # Support direct execution from the gui directory.
+    import sys
+
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from pipeline.input_discovery import (  # type: ignore[no-redef]
+        MASTER_SUFFIXES,
+        REVIEW_SUFFIXES,
+        InputDiscovery,
+        InputKind,
+        discover_input,
+    )
+    from pipeline.task_workspace import (  # type: ignore[no-redef]
+        apply_task_retention,
+        latest_result_directory,
+        latest_result_files,
+        publish_latest_result_index,
+    )
+    from task_intake import (  # type: ignore[no-redef]
+        PreparedTask,
+        PreparedTaskQueue,
+        describe_input_plan,
+        discover_input_for_processing_settings,
+        prepare_task_queue,
+    )
+    from history_store import (  # type: ignore[no-redef]
+        STATUS_FAILED,
+        STATUS_INTERRUPTED,
+        STATUS_LABELS,
+        STATUS_PARTIAL_SUCCESS,
+        STATUS_PREPARING,
+        STATUS_REVIEW_REQUIRED,
+        STATUS_RUNNING,
+        STATUS_STOPPED,
+        STATUS_SUCCESS,
+        HistoryStore,
+        HistoryStoreError,
+        UnsafeTaskDeletionError,
+        history_task_key,
+        load_verified_pipeline_result,
+        validate_deletable_task_root,
+        verified_result_files,
+        verify_history_run,
+    )
+
 
 WORKSPACE_EMPTY = "empty"
 WORKSPACE_TASK = "task"
 WORKSPACE_RUN = "run"
+WORKSPACE_HISTORY = "history"
 
 DEFAULT_PROCESSING_SETTINGS = {
     "output_formats": ("tif", "png", "fit"),
@@ -304,14 +404,26 @@ class SeestarGui(QMainWindow):
         *,
         resources_override: Path | None = None,
         runtime_home_override: Path | None = None,
+        settings_override: QSettings | None = None,
+        history_path_override: Path | None = None,
     ) -> None:
         super().__init__()
         self.setWindowTitle("Seestar 图像后处理")
         self.setMinimumSize(980, 680)
         self.resize(1280, 800)
         self.setAcceptDrops(True)
+        self.platform_profile = current_platform_profile()
+        app = QApplication.instance()
+        if isinstance(app, QApplication):
+            self.theme_controller = install_application_theme(
+                app,
+                self.platform_profile,
+            )
         self._ui_thread_ident = threading.get_ident()
-        self.settings = QSettings("Seestar", "SeestarSuperimpose")
+        self.settings = settings_override or QSettings(
+            "Seestar",
+            "SeestarSuperimpose",
+        )
         self._restoring_settings = False
         self._recent_directories: list[str] = []
         self._recommended_input_mode = INPUT_MODE_AUTO
@@ -326,6 +438,19 @@ class SeestarGui(QMainWindow):
         self._run_terminal_status: str | None = None
         self._last_run_snapshot: dict[str, object] | None = None
         self._run_input_mode_override: str | None = None
+        self._input_discovery: InputDiscovery | None = None
+        self._prepared_tasks: tuple[PreparedTask, ...] = ()
+        self._prepared_task_index = 0
+        self._active_prepared_task: PreparedTask | None = None
+        self._last_task_root: Path | None = None
+        self.history_store = HistoryStore(history_path_override)
+        self._history_return_state = WORKSPACE_EMPTY
+        self._history_task_records: dict[str, dict[str, object]] = {}
+        self._active_history_task_key: str | None = None
+        self._active_history_run_id: str | None = None
+        self._history_detail_mode = False
+        self._historical_run_root: Path | None = None
+        self._historical_result_files: tuple[Path, ...] = ()
 
         self.resources = (
             Path(resources_override).expanduser().resolve()
@@ -349,6 +474,7 @@ class SeestarGui(QMainWindow):
         self.config_template = resolve_existing_path(config_candidates)
 
         self.worker: PipelineWorker | None = None
+        self.intake_worker: BootstrapWorker | None = None
         self.bootstrap_worker: BootstrapWorker | None = None
         self.gaia_catalog_worker: BootstrapWorker | None = None
         self._bootstrap_stop_event: threading.Event | None = None
@@ -370,11 +496,6 @@ class SeestarGui(QMainWindow):
         self.input_mode = INPUT_MODE_AUTO
         self.debug_mode_enabled = False
         self.network_mode_enabled = False
-        self.ai_stage_enabled = False
-        self.ai_provider_mode = AI_PROVIDER_DEVELOPER
-        self.ai_custom_endpoint = ""
-        self.ai_custom_model = ""
-        self._pending_ai_runtime_overrides: dict[str, str] = {}
         self._pending_runtime_overrides: dict[str, str] = {}
         self._pending_runtime_unset_keys: set[str] = set()
         self.processing_parameters_expanded = False
@@ -430,8 +551,17 @@ class SeestarGui(QMainWindow):
         self._progress_timer.timeout.connect(self._refresh_elapsed_labels)
         self.thread_log.connect(self._append_text)
         self._load_settings()
+        try:
+            recovered_runs = self.history_store.mark_incomplete_runs_interrupted()
+        except HistoryStoreError as error:
+            recovered_runs = 0
+            self._append_event(f"历史索引不可用：{error}")
+        if recovered_runs:
+            self._append_event(
+                f"已将 {recovered_runs} 条未正常结束的历史运行标记为异常中断。"
+            )
         self._set_running(False)
-        self._append_event("已就绪。请选择或拖入工作目录。")
+        self._append_event("已就绪。请选择或拖入图像文件、Light 目录或产品任务。")
 
     def _section_block(self, title: str, body_lines: list[str]) -> list[str]:
         divider = "=" * 16
@@ -469,6 +599,18 @@ class SeestarGui(QMainWindow):
         changed = self.status_label.text() != status_text
         self.status_label.setText(status_text)
         self.status_label.setAccessibleDescription(status_text)
+        lowered = message.lower()
+        if "失败" in message or "failed" in lowered:
+            state = "error"
+        elif "降级" in message or "复核" in message:
+            state = "warning"
+        elif "完成" in message or "completed" in lowered:
+            state = "success"
+        elif any(value in message for value in ("运行", "准备", "停止中")):
+            state = "running"
+        else:
+            state = "idle"
+        set_style_property(self.status_label, "state", state)
         if changed:
             self._announce_accessibility(status_text)
 
@@ -491,15 +633,15 @@ class SeestarGui(QMainWindow):
             candidate_names = "<无>"
         lines: list[str] = []
         lines.extend(self._section_block("使用说明", [
-            "  1. 拖入或选择包含 Seestar 图像的工作目录。",
-            "  2. 使用自动推荐，或手动选择完整处理/断点继续。",
+            "  1. 拖入或选择一个 FITS/XISF 母版、Light 目录或产品任务。",
+            "  2. 应用会识别输入并显示唯一安全处理计划，无需选择起始阶段。",
             "  3. 点击“开始处理”；需要中断时点击“停止处理”。",
             "  处理完成后，可直接预览结果或打开结果目录。",
             "  运行细节位于主界面的“详细日志”区域。",
         ]))
         lines.extend(self._section_block("应用能力", [
-            "  - 支持已叠加 FITS 与 Seestar 子帧输入，必要时自动执行预处理。",
-            "  - 能识别已有阶段产物，并推荐从合适的断点继续。",
+            "  - 明确母版始终从 Stage 1 导入；递归 Light 目录按目标、滤镜、相机和几何分组后串行处理。",
+            "  - 只有清单、契约、配置指纹和 SHA-256 均通过校验的产品任务，才会从 Stage 1、2 或 5 后继续。",
             "  - 串联 Siril 1.4+ 与 SyQon/SASP/CosmicClarity 插件链路，执行离线后处理，不依赖系统 Python。",
             "  - 处理过程包含预检、重试、降级回退和阶段状态记录。",
             "  - 输出高质量 TIFF、预览 PNG、拉伸前线性 FITS 和最终 FITS 归档。",
@@ -508,8 +650,8 @@ class SeestarGui(QMainWindow):
             f"  - 允许联网: {'开启' if self.network_mode_enabled else '关闭'}。",
         ]))
         lines.extend(self._section_block("处理阶段总览", [
-            "  线性阶段: 1.前期准备 -> 2.裁切 -> 3.背景提取 -> 4.图像解析+色彩校准 -> 5.线性降噪/反卷积",
-            "  非线性阶段: 6.去星与星点层准备 -> 7.主体拉伸 -> 8.Starless 深加工 -> 9.星点处理与合成 -> 10.最终降噪与导出",
+            "  线性阶段: 1.输入准备 -> 2.边界校正 -> 3.背景处理 -> 4.图像解析与色彩校准 -> 5.线性反卷积与降噪 -> 6.线性去星",
+            "  非线性阶段: 7.主体拉伸 -> 8.Starless 深加工 -> 9.星点处理与合成 -> 10.最终降噪与导出",
         ]))
         lines.extend(self._section_block("阶段文件命名", [
             "  - 阶段 6 去星: stage6_starless.fit / stage6_starless_quality.json。",
@@ -536,10 +678,10 @@ class SeestarGui(QMainWindow):
         dialog.setWindowTitle("使用说明")
         dialog.setIcon(QMessageBox.Icon.Information)
         dialog.setText(
-            "三步完成处理：选择工作目录、确认处理方式、开始处理。"
+            "三步完成处理：选择输入、确认自动计划、开始处理。"
         )
         dialog.setInformativeText(
-            "目录可直接拖入窗口；应用会自动推荐完整处理或断点继续。"
+            "可拖入母版文件、Light 目录或产品任务；应用只采用经验证的安全起点。"
         )
         dialog.setDetailedText(
             self._initial_panel_text(self._resolve_siril_candidates())
@@ -655,39 +797,30 @@ class SeestarGui(QMainWindow):
 
     def _init_ui(self) -> None:
         central = QWidget()
+        central.setObjectName("appRoot")
         self.setCentralWidget(central)
-        central.setStyleSheet(
-            "QFrame#contentCard {"
-            "border: 1px solid rgba(127, 127, 127, 0.32);"
-            "border-radius: 10px;"
-            "}"
-            "QFrame#dropCard {"
-            "border: 1px dashed rgba(127, 127, 127, 0.58);"
-            "border-radius: 14px;"
-            "}"
-            "QLabel#sectionTitle {"
-            "font-size: 16px;"
-            "font-weight: 600;"
-            "}"
-        )
 
         outer = QVBoxLayout(central)
-        outer.setContentsMargins(14, 12, 14, 10)
-        outer.setSpacing(10)
+        margin = self.platform_profile.window_margin
+        outer.setContentsMargins(margin, 12, margin, 10)
+        outer.setSpacing(self.platform_profile.panel_spacing)
 
         self._init_toolbar()
         self.workspace_stack = QStackedWidget()
         self.empty_page = self._build_empty_page()
         self.task_page = self._build_task_page()
         self.run_page = self._build_run_page()
+        self.history_page = self._build_history_page()
         self.workspace_stack.addWidget(self.empty_page)
         self.workspace_stack.addWidget(self.task_page)
         self.workspace_stack.addWidget(self.run_page)
+        self.workspace_stack.addWidget(self.history_page)
         outer.addWidget(self.workspace_stack, 1)
 
         self._build_log_drawer(outer)
         self._init_status_bar()
         self._init_menus()
+        configure_main_window(self, self.platform_profile)
         self._configure_focus_order()
         self._update_result_actions(None)
         self._show_workspace(WORKSPACE_EMPTY)
@@ -700,15 +833,39 @@ class SeestarGui(QMainWindow):
         self.addToolBar(toolbar)
         self.main_toolbar = toolbar
 
-        self.toolbar_directory_btn = QPushButton("选择目录")
-        self.toolbar_directory_btn.setAccessibleName("选择工作目录")
-        self.toolbar_directory_btn.clicked.connect(self._choose_workdir)
+        toolbar_title = QLabel("Seestar Superimpose")
+        toolbar_title.setObjectName("toolbarTitle")
+        toolbar.addWidget(toolbar_title)
+        toolbar.addSeparator()
+
+        self.toolbar_directory_btn = QPushButton("选择文件")
+        self.toolbar_directory_btn.setAccessibleName("选择图像文件")
+        if QStyle is not None:
+            self.toolbar_directory_btn.setIcon(
+                self.style().standardIcon(
+                    QStyle.StandardPixmap.SP_DirOpenIcon
+                )
+            )
+        self.toolbar_directory_btn.clicked.connect(self._choose_input_file)
         self.toolbar_directory_item = toolbar.addWidget(self.toolbar_directory_btn)
 
         self.toolbar_settings_btn = QPushButton("设置")
         self.toolbar_settings_btn.setAccessibleName("展开任务高级设置")
+        self.toolbar_settings_btn.setProperty("variant", "quiet")
         self.toolbar_settings_btn.clicked.connect(self._show_advanced_settings)
         self.toolbar_settings_item = toolbar.addWidget(self.toolbar_settings_btn)
+
+        self.history_btn = QPushButton("历史记录")
+        self.history_btn.setAccessibleName("查看历史处理记录")
+        self.history_btn.setProperty("variant", "quiet")
+        if QStyle is not None:
+            self.history_btn.setIcon(
+                self.style().standardIcon(
+                    QStyle.StandardPixmap.SP_FileDialogDetailedView
+                )
+            )
+        self.history_btn.clicked.connect(self._show_history)
+        self.history_item = toolbar.addWidget(self.history_btn)
 
         spacer = QWidget()
         spacer.setSizePolicy(
@@ -718,10 +875,22 @@ class SeestarGui(QMainWindow):
         toolbar.addWidget(spacer)
 
         self.return_task_btn = QPushButton("返回任务设置")
+        if QStyle is not None:
+            self.return_task_btn.setIcon(
+                self.style().standardIcon(
+                    QStyle.StandardPixmap.SP_ArrowBack
+                )
+            )
         self.return_task_btn.clicked.connect(self._return_to_task_setup)
         self.return_task_item = toolbar.addWidget(self.return_task_btn)
 
         self.rerun_btn = QPushButton("重新运行")
+        if QStyle is not None:
+            self.rerun_btn.setIcon(
+                self.style().standardIcon(
+                    QStyle.StandardPixmap.SP_BrowserReload
+                )
+            )
         self.rerun_btn.clicked.connect(self._rerun_last_task)
         self.rerun_item = toolbar.addWidget(self.rerun_btn)
 
@@ -729,45 +898,92 @@ class SeestarGui(QMainWindow):
         self.start_btn.setAccessibleName("开始图像处理")
         self.start_btn.setMinimumWidth(120)
         self.start_btn.setDefault(True)
+        self.start_btn.setProperty("variant", "primary")
+        if QStyle is not None:
+            self.start_btn.setIcon(
+                self.style().standardIcon(
+                    QStyle.StandardPixmap.SP_MediaPlay
+                )
+            )
         self.start_btn.clicked.connect(self._start_run)
         self.start_item = toolbar.addWidget(self.start_btn)
 
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setAccessibleName("停止图像处理")
         self.stop_btn.setMinimumWidth(96)
+        self.stop_btn.setProperty("variant", "destructive")
+        if QStyle is not None:
+            self.stop_btn.setIcon(
+                self.style().standardIcon(
+                    QStyle.StandardPixmap.SP_MediaStop
+                )
+            )
         self.stop_btn.clicked.connect(self._request_stop_run)
         self.stop_item = toolbar.addWidget(self.stop_btn)
 
     def _build_empty_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(44, 34, 44, 30)
+        layout.setContentsMargins(56, 38, 56, 34)
         layout.addStretch(1)
 
+        heading = QLabel("专业天文图像后处理")
+        heading.setObjectName("pageTitle")
+        heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(heading)
+        description = QLabel("拖入一个母版文件、Light 目录或产品任务；应用会给出唯一安全处理计划。")
+        description.setObjectName("pageDescription")
+        description.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        layout.addSpacing(18)
+
         card = QFrame()
-        card.setObjectName("dropCard")
-        card.setMinimumHeight(330)
+        card.setObjectName("dropZone")
+        card.setProperty("dragActive", False)
+        self.drop_zone = card
+        card.setMinimumHeight(300)
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(40, 38, 40, 38)
+        card_layout.setContentsMargins(40, 34, 40, 34)
         card_layout.addStretch(1)
 
-        title = QLabel("拖入 Seestar 工作目录")
+        icon_label = QLabel()
+        icon_label.setObjectName("dropIcon")
+        if QStyle is not None:
+            icon_label.setPixmap(
+                self.style()
+                .standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon)
+                .pixmap(44, 44)
+            )
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_layout.addWidget(icon_label)
+        card_layout.addSpacing(10)
+
+        title = QLabel("将图像文件或目录拖到这里")
         title.setObjectName("sectionTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         card_layout.addWidget(title)
 
-        subtitle = QLabel("支持 FIT / FITS 图像")
+        subtitle = QLabel("支持 FITS / XISF 母版、递归 Light 目录和已有产品任务。")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle.setStyleSheet("color: rgba(127, 127, 127, 0.92); padding: 8px;")
+        subtitle.setProperty("tone", "muted")
+        subtitle.setWordWrap(True)
         card_layout.addWidget(subtitle)
+        card_layout.addSpacing(16)
 
-        self.empty_choose_btn = QPushButton("选择目录")
-        self.empty_choose_btn.setAccessibleName("选择 Seestar 工作目录")
+        self.empty_choose_btn = QPushButton("选择文件")
+        self.empty_choose_btn.setAccessibleName("选择 FITS 或 XISF 图像")
         self.empty_choose_btn.setMinimumSize(150, 36)
-        self.empty_choose_btn.clicked.connect(self._choose_workdir)
+        self.empty_choose_btn.setProperty("variant", "primary")
+        self.empty_choose_btn.clicked.connect(self._choose_input_file)
+        self.empty_choose_dir_btn = QPushButton("选择目录")
+        self.empty_choose_dir_btn.setAccessibleName("选择 Light 或产品任务目录")
+        self.empty_choose_dir_btn.setMinimumSize(150, 36)
+        self.empty_choose_dir_btn.clicked.connect(self._choose_workdir)
         choose_row = QHBoxLayout()
         choose_row.addStretch(1)
         choose_row.addWidget(self.empty_choose_btn)
+        choose_row.addWidget(self.empty_choose_dir_btn)
         choose_row.addStretch(1)
         card_layout.addLayout(choose_row)
         card_layout.addStretch(1)
@@ -776,83 +992,197 @@ class SeestarGui(QMainWindow):
         reassurance = QLabel("默认离线处理 · 原图不会被覆盖")
         reassurance.setAlignment(Qt.AlignmentFlag.AlignCenter)
         reassurance.setAccessibleName("处理安全说明")
-        reassurance.setStyleSheet("padding: 14px; color: rgba(127, 127, 127, 0.95);")
+        reassurance.setProperty("tone", "muted")
+        reassurance.setContentsMargins(0, 14, 0, 0)
         layout.addWidget(reassurance)
         layout.addStretch(1)
+        return page
+
+    def _build_history_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        heading_row = QHBoxLayout()
+        heading_text = QVBoxLayout()
+        heading_text.setSpacing(2)
+        title = QLabel("历史处理记录")
+        title.setObjectName("pageTitle")
+        description = QLabel("按任务查看新版中实际开始的处理记录。")
+        description.setObjectName("pageDescription")
+        heading_text.addWidget(title)
+        heading_text.addWidget(description)
+        heading_row.addLayout(heading_text)
+        heading_row.addStretch(1)
+        self.history_back_btn = QPushButton("返回")
+        self.history_back_btn.setAccessibleName("返回之前的页面")
+        if QStyle is not None:
+            self.history_back_btn.setIcon(
+                self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowBack)
+            )
+        self.history_back_btn.clicked.connect(self._leave_history)
+        heading_row.addWidget(self.history_back_btn)
+        layout.addLayout(heading_row)
+
+        filter_row = QHBoxLayout()
+        self.history_search_edit = QLineEdit()
+        self.history_search_edit.setPlaceholderText("搜索目标或输入名称")
+        self.history_search_edit.setClearButtonEnabled(True)
+        self.history_search_edit.setAccessibleName("搜索历史任务")
+        self.history_search_edit.textChanged.connect(self._refresh_history_view)
+        filter_row.addWidget(self.history_search_edit, 1)
+
+        self.history_status_combo = QComboBox()
+        self.history_status_combo.setAccessibleName("筛选历史状态")
+        self.history_status_combo.addItem("全部状态", "all")
+        self.history_status_combo.addItem("成功", "success")
+        self.history_status_combo.addItem("需复核", "review")
+        self.history_status_combo.addItem("失败或中止", "failure")
+        self.history_status_combo.currentIndexChanged.connect(
+            self._refresh_history_view
+        )
+        filter_row.addWidget(self.history_status_combo)
+
+        self.history_delete_btn = QPushButton("移到废纸篓")
+        self.history_delete_btn.setAccessibleName("删除选中的历史任务")
+        self.history_delete_btn.setProperty("variant", "destructive")
+        self.history_delete_btn.setEnabled(False)
+        self.history_delete_btn.clicked.connect(self._delete_selected_history_task)
+        filter_row.addWidget(self.history_delete_btn)
+        layout.addLayout(filter_row)
+
+        self.history_tree = QTreeWidget()
+        self.history_tree.setObjectName("historyTree")
+        self.history_tree.setAccessibleName("历史任务和运行记录")
+        self.history_tree.setColumnCount(3)
+        self.history_tree.setHeaderLabels(
+            ["目标 / 输入", "最近处理时间", "状态"]
+        )
+        self.history_tree.setRootIsDecorated(True)
+        self.history_tree.setAlternatingRowColors(True)
+        self.history_tree.setUniformRowHeights(True)
+        history_header = self.history_tree.header()
+        history_header.setStretchLastSection(False)
+        history_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        history_header.setSectionResizeMode(
+            1,
+            QHeaderView.ResizeMode.ResizeToContents,
+        )
+        history_header.setSectionResizeMode(
+            2,
+            QHeaderView.ResizeMode.ResizeToContents,
+        )
+        self.history_tree.itemDoubleClicked.connect(
+            self._on_history_item_activated
+        )
+        self.history_tree.itemSelectionChanged.connect(
+            self._update_history_selection_actions
+        )
+        layout.addWidget(self.history_tree, 1)
+
+        self.history_empty_label = QLabel("还没有历史处理记录")
+        self.history_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.history_empty_label.setProperty("tone", "muted")
+        self.history_empty_label.hide()
+        layout.addWidget(self.history_empty_label)
         return page
 
     def _build_task_page(self) -> QWidget:
         page = QWidget()
         page_layout = QVBoxLayout(page)
-        page_layout.setContentsMargins(2, 2, 2, 2)
-        page_layout.setSpacing(10)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(12)
 
-        guide_label = QLabel("1  选择目录    →    2  确认处理方式    →    3  开始处理")
+        heading_row = QHBoxLayout()
+        heading_text = QVBoxLayout()
+        heading_text.setSpacing(2)
+        page_title = QLabel("任务设置")
+        page_title.setObjectName("pageTitle")
+        page_description = QLabel("确认自动识别的唯一处理计划；高级参数会在任务启动时冻结。")
+        page_description.setObjectName("pageDescription")
+        heading_text.addWidget(page_title)
+        heading_text.addWidget(page_description)
+        heading_row.addLayout(heading_text)
+        heading_row.addStretch(1)
+
+        guide_label = QLabel("选择输入  ·  确认计划  ·  开始处理")
         guide_label.setAccessibleName("使用步骤")
         guide_label.setAccessibleDescription(
-            "第一步选择目录，第二步确认处理方式，第三步开始处理"
+            "第一步选择输入，第二步确认自动计划，第三步开始处理"
         )
-        guide_label.setStyleSheet("font-weight: 600; padding: 4px;")
-        page_layout.addWidget(guide_label)
+        guide_label.setProperty("tone", "muted")
+        heading_row.addWidget(guide_label)
+        page_layout.addLayout(heading_row)
 
-        task_splitter = QSplitter(Qt.Orientation.Horizontal)
-        task_splitter.setChildrenCollapsible(False)
+        self.task_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.task_splitter.setChildrenCollapsible(False)
         self.source_card = self._build_source_card()
-        task_splitter.addWidget(self.source_card)
-        task_splitter.addWidget(self._build_task_preview_card())
-        task_splitter.setStretchFactor(0, 3)
-        task_splitter.setStretchFactor(1, 2)
-        page_layout.addWidget(task_splitter, 1)
+        self.task_splitter.addWidget(self.source_card)
+        self.task_splitter.addWidget(self._build_task_preview_card())
+        self.task_splitter.setStretchFactor(0, 3)
+        self.task_splitter.setStretchFactor(1, 2)
+        page_layout.addWidget(self.task_splitter, 1)
 
         phase_card = QFrame()
-        phase_card.setObjectName("contentCard")
+        phase_card.setObjectName("phaseBar")
+        self.task_phase_bar = phase_card
         phase_layout = QVBoxLayout(phase_card)
         phase_layout.setContentsMargins(14, 11, 14, 11)
-        phase_layout.addWidget(self._section_title("处理阶段"))
         phase_row = QHBoxLayout()
         self.linear_phase_label = QLabel("○ 线性处理 · Stage 1–6")
         self.nonlinear_phase_label = QLabel("○ 非线性处理 · Stage 7–10")
-        self.ai_phase_label = QLabel("可选 · Stage 11 AI 后期")
         for label in (
             self.linear_phase_label,
             self.nonlinear_phase_label,
         ):
-            label.setStyleSheet(
-                "padding: 9px 12px; border: 1px solid rgba(127,127,127,0.28);"
-                " border-radius: 8px;"
-            )
+            label.setProperty("role", "phase")
+            label.setProperty("active", False)
             phase_row.addWidget(label, 1)
-        self.ai_phase_label.hide()
         phase_layout.addLayout(phase_row)
         page_layout.addWidget(phase_card)
+
+        self.processing_params_panel = self._build_processing_parameters_panel()
+        self.processing_params_scroll = QScrollArea()
+        self.processing_params_scroll.setObjectName("processingParametersScroll")
+        self.processing_params_scroll.setWidgetResizable(True)
+        self.processing_params_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.processing_params_scroll.setWidget(self.processing_params_panel)
+        self.processing_params_scroll.hide()
+        page_layout.addWidget(self.processing_params_scroll, 1)
         return page
 
     def _build_source_card(self) -> QFrame:
         source_card = QFrame()
-        source_card.setObjectName("contentCard")
+        source_card.setObjectName("contentPanel")
         source_layout = QVBoxLayout(source_card)
         source_layout.setContentsMargins(16, 14, 16, 14)
         source_layout.setSpacing(10)
-        source_layout.addWidget(self._section_title("任务设置"))
+        section_title = self._section_title("输入与处理计划")
+        source_layout.addWidget(section_title)
 
         directory_row = QHBoxLayout()
         directory_row.setSpacing(8)
-        dir_label = QLabel("工作目录")
+        dir_label = QLabel("输入")
         self.dir_edit = QLineEdit()
-        self.dir_edit.setPlaceholderText("拖入目录，或点击右侧选择")
-        self.dir_edit.setAccessibleName("工作目录")
+        self.dir_edit.setPlaceholderText("拖入 FITS/XISF 文件、Light 目录或产品任务")
+        self.dir_edit.setAccessibleName("任务输入")
         self.dir_edit.setAccessibleDescription(
-            "包含 Seestar FIT 或 FITS 图像的工作目录"
+            "明确的母版文件、递归 Light 目录或产品任务目录"
         )
         self.dir_edit.setAcceptDrops(False)
         self.dir_edit.editingFinished.connect(self._on_directory_edited)
-        self.browse_btn = QPushButton("选择目录")
-        self.browse_btn.setAccessibleName("选择工作目录")
-        self.browse_btn.clicked.connect(self._choose_workdir)
+        self.browse_btn = QPushButton("选择文件")
+        self.browse_btn.setAccessibleName("选择图像文件")
+        self.browse_btn.clicked.connect(self._choose_input_file)
+        self.browse_dir_btn = QPushButton("选择目录")
+        self.browse_dir_btn.setAccessibleName("选择 Light 或产品任务目录")
+        self.browse_dir_btn.clicked.connect(self._choose_workdir)
         dir_label.setBuddy(self.dir_edit)
         directory_row.addWidget(dir_label)
         directory_row.addWidget(self.dir_edit, 1)
         directory_row.addWidget(self.browse_btn)
+        directory_row.addWidget(self.browse_dir_btn)
         source_layout.addLayout(directory_row)
 
         recent_row = QHBoxLayout()
@@ -867,8 +1197,8 @@ class SeestarGui(QMainWindow):
         self.recent_combo.hide()
         source_layout.addLayout(recent_row)
 
-        self.directory_summary_label = QLabel("尚未选择目录")
-        self.directory_summary_label.setAccessibleName("工作目录检测结果")
+        self.directory_summary_label = QLabel("尚未选择输入")
+        self.directory_summary_label.setAccessibleName("自动处理计划")
         self.directory_summary_label.setWordWrap(True)
         source_layout.addWidget(self.directory_summary_label)
 
@@ -881,18 +1211,17 @@ class SeestarGui(QMainWindow):
         )
         self.mode_combo.setToolTip(
             "用途：选择流水线起点；默认：自动推荐。完整处理执行 Stage 1–10；"
-            "从裁切后继续会跳过 Stage 1–2；从线性处理后继续会跳过 Stage 1–5，"
+            "从边界校正后继续会跳过 Stage 1–2；从线性反卷积与降噪后继续会跳过 Stage 1–5，"
             "因此色彩校准、降噪和反卷积设置不再生效。"
         )
         self.mode_combo.addItem("自动推荐（完整处理）", UI_MODE_RECOMMENDED)
         self.mode_combo.addItem("完整处理", INPUT_MODE_AUTO)
-        self.mode_combo.addItem("从裁切后继续", INPUT_MODE_STAGE2_CORRECTED_RESUME)
-        self.mode_combo.addItem("从线性处理后继续", INPUT_MODE_LINEAR_RESUME)
+        self.mode_combo.addItem("从边界校正后继续", INPUT_MODE_STAGE2_CORRECTED_RESUME)
+        self.mode_combo.addItem("从线性反卷积与降噪后继续", INPUT_MODE_LINEAR_RESUME)
         self.mode_combo.currentIndexChanged.connect(self._on_input_mode_changed)
         mode_label.setBuddy(self.mode_combo)
-        mode_row.addWidget(mode_label)
-        mode_row.addWidget(self.mode_combo, 1)
-        source_layout.addLayout(mode_row)
+        self.mode_combo.hide()
+        mode_label.hide()
 
         self.advanced_toggle_btn = QPushButton("高级设置 ▸")
         self.advanced_toggle_btn.setAccessibleName("展开高级设置")
@@ -900,6 +1229,7 @@ class SeestarGui(QMainWindow):
             "显示或隐藏处理参数、保留中间文件和联网设置"
         )
         self.advanced_toggle_btn.setCheckable(True)
+        self.advanced_toggle_btn.setProperty("variant", "quiet")
         self.advanced_toggle_btn.toggled.connect(self._on_advanced_toggled)
         source_layout.addWidget(self.advanced_toggle_btn)
 
@@ -907,19 +1237,6 @@ class SeestarGui(QMainWindow):
         self.advanced_panel.setAccessibleName("高级设置")
         advanced_layout = QHBoxLayout(self.advanced_panel)
         advanced_layout.setContentsMargins(8, 2, 8, 2)
-        self.ai_btn = QCheckBox("AI 后期")
-        self.ai_btn.setAccessibleName("AI 后期")
-        self.ai_btn.setAccessibleDescription("启用可选的 AI 后期处理阶段")
-        self.ai_btn.setChecked(self.ai_stage_enabled)
-        self.ai_btn.toggled.connect(self._on_ai_toggled)
-        self.ai_config_btn = QPushButton("模型配置…")
-        self.ai_config_btn.setAccessibleName("配置 AI 模型")
-        self.ai_config_btn.setAccessibleDescription(
-            "选择开发者试用模型，或配置自己的接口、模型和 API Key"
-        )
-        self.ai_config_btn.clicked.connect(self._configure_ai_model)
-        self.ai_provider_status_label = QLabel("开发者试用")
-        self.ai_provider_status_label.setAccessibleName("当前 AI 模型配置")
         self.processing_params_btn = QPushButton("处理参数…")
         self.processing_params_btn.setAccessibleName("配置本次图像处理参数")
         self.processing_params_btn.setAccessibleDescription(
@@ -929,6 +1246,7 @@ class SeestarGui(QMainWindow):
             "在下方展开处理参数。所有非敏感参数会保存为下次默认值，"
             "任务开始后将冻结为本次运行配置。"
         )
+        self.processing_params_btn.setProperty("variant", "compact")
         self.processing_params_btn.clicked.connect(self._configure_processing_parameters)
         self.debug_btn = QCheckBox("保留中间文件")
         self.debug_btn.setAccessibleName("保留中间文件")
@@ -952,26 +1270,17 @@ class SeestarGui(QMainWindow):
         self.network_btn.setChecked(self.network_mode_enabled)
         self.network_btn.toggled.connect(self._on_network_toggled)
         advanced_layout.addWidget(self.processing_params_btn)
-        advanced_layout.addWidget(self.ai_btn)
-        advanced_layout.addWidget(self.ai_config_btn)
-        advanced_layout.addWidget(self.ai_provider_status_label)
         advanced_layout.addWidget(self.debug_btn)
         advanced_layout.addWidget(self.network_btn)
         advanced_layout.addStretch(1)
-        self.ai_btn.hide()
-        self.ai_config_btn.hide()
-        self.ai_provider_status_label.hide()
         self.advanced_panel.hide()
         source_layout.addWidget(self.advanced_panel)
-        self.processing_params_panel = self._build_processing_parameters_panel()
-        self.processing_params_panel.hide()
-        source_layout.addWidget(self.processing_params_panel)
         source_layout.addStretch(1)
         return source_card
 
     def _build_task_preview_card(self) -> QFrame:
         card = QFrame()
-        card.setObjectName("contentCard")
+        card.setObjectName("previewPanel")
         layout = QVBoxLayout(card)
         layout.setContentsMargins(14, 12, 14, 12)
         header = QHBoxLayout()
@@ -983,8 +1292,8 @@ class SeestarGui(QMainWindow):
         self.task_preview_canvas = LatestPreviewCanvas()
         self.task_preview_canvas.setMinimumHeight(220)
         layout.addWidget(self.task_preview_canvas, 1)
-        note = QLabel("Stage 0 原始预览 · 无显示拉伸")
-        note.setStyleSheet("color: rgba(127, 127, 127, 0.95);")
+        note = QLabel("Stage 0 屏幕拉伸预览 · 仅影响显示，不修改源数据")
+        note.setProperty("tone", "muted")
         layout.addWidget(note)
         return card
 
@@ -995,30 +1304,32 @@ class SeestarGui(QMainWindow):
         layout.setSpacing(8)
 
         self.warning_card = QFrame()
-        self.warning_card.setObjectName("completionWarningCard")
+        self.warning_card.setObjectName("stateBanner")
+        self.warning_card.setProperty("tone", "warning")
         self.warning_card.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Maximum,
-        )
-        self.warning_card.setStyleSheet(
-            "#completionWarningCard {"
-            "background-color: rgba(255, 193, 7, 0.18);"
-            "border: 1px solid #c08a00;"
-            "border-radius: 8px;"
-            "}"
         )
         warning_layout = QHBoxLayout(self.warning_card)
         warning_layout.setContentsMargins(10, 8, 10, 8)
         self.warning_label = QLabel(
             "⚠ 处理已完成，但存在降级或失败阶段，请复核最终质量。"
         )
+        self.warning_label.setWordWrap(True)
         self.warning_label.setAccessibleName("处理完成警告")
         self.quality_report_btn = QPushButton("查看质量报告")
         self.quality_report_btn.setAccessibleName("查看最终质量报告")
         self.quality_report_btn.clicked.connect(self._open_quality_report)
+        self.banner_log_btn = QPushButton("查看详细日志")
+        self.banner_log_btn.setAccessibleName("展开详细日志")
+        self.banner_log_btn.clicked.connect(
+            lambda: self.log_toggle_btn.setChecked(True)
+        )
         warning_layout.addWidget(self.warning_label)
         warning_layout.addStretch(1)
         warning_layout.addWidget(self.quality_report_btn)
+        warning_layout.addWidget(self.banner_log_btn)
+        self.banner_log_btn.hide()
         self.warning_card.hide()
         layout.addWidget(self.warning_card)
 
@@ -1037,7 +1348,7 @@ class SeestarGui(QMainWindow):
 
     def _build_run_sidebar(self) -> QFrame:
         card = QFrame()
-        card.setObjectName("contentCard")
+        card.setObjectName("sidebarPanel")
         card.setMinimumWidth(220)
         card.setMaximumWidth(320)
         layout = QVBoxLayout(card)
@@ -1055,10 +1366,7 @@ class SeestarGui(QMainWindow):
             self.run_mode_label,
             self.run_options_label,
         ):
-            widget.setStyleSheet(
-                "padding: 8px; border: 1px solid rgba(127,127,127,0.24);"
-                " border-radius: 7px;"
-            )
+            widget.setProperty("role", "summary")
             layout.addWidget(widget)
         layout.addStretch(1)
 
@@ -1075,7 +1383,7 @@ class SeestarGui(QMainWindow):
 
     def _build_run_preview_card(self) -> QFrame:
         card = QFrame()
-        card.setObjectName("contentCard")
+        card.setObjectName("previewPanel")
         layout = QVBoxLayout(card)
         layout.setContentsMargins(10, 9, 10, 9)
         layout.setSpacing(7)
@@ -1118,19 +1426,20 @@ class SeestarGui(QMainWindow):
             self.actual_preview_btn,
             self.zoom_in_btn,
         ):
+            button.setProperty("variant", "compact")
             controls.addWidget(button)
         controls.addStretch(1)
         layout.addLayout(controls)
 
-        self.preview_notice_label = QLabel("原始预览 · 无显示拉伸")
+        self.preview_notice_label = QLabel("屏幕预览 · 显示变换不写入处理数据")
         self.preview_notice_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_notice_label.setStyleSheet("color: rgba(127,127,127,0.95);")
+        self.preview_notice_label.setProperty("tone", "muted")
         layout.addWidget(self.preview_notice_label)
         return card
 
     def _build_stage_inspector(self) -> QFrame:
         card = QFrame()
-        card.setObjectName("contentCard")
+        card.setObjectName("inspectorPanel")
         card.setMinimumWidth(250)
         card.setMaximumWidth(340)
         layout = QVBoxLayout(card)
@@ -1139,7 +1448,7 @@ class SeestarGui(QMainWindow):
         layout.addWidget(self._section_title("阶段与质量"))
 
         self.run_phase_label = QLabel("线性处理 · Stage 1–6")
-        self.run_phase_label.setStyleSheet("font-weight: 600; padding: 4px 0;")
+        self.run_phase_label.setProperty("tone", "muted")
         layout.addWidget(self.run_phase_label)
 
         self.progress_summary_label = QLabel("当前进度：等待开始")
@@ -1168,11 +1477,13 @@ class SeestarGui(QMainWindow):
         self.log_toggle_btn.toggled.connect(self._on_log_toggled)
 
         self.log_container = QFrame()
-        self.log_container.setObjectName("contentCard")
-        self.log_container.setMaximumHeight(270)
+        self.log_container.setObjectName("logPanel")
+        self.log_container.setMaximumHeight(250)
         log_layout = QVBoxLayout(self.log_container)
         log_layout.setContentsMargins(10, 8, 10, 8)
         log_actions = QHBoxLayout()
+        log_title = self._section_title("运行日志")
+        log_actions.addWidget(log_title)
         log_actions.addStretch(1)
         self.open_log_btn = QPushButton("打开日志文件")
         self.open_log_btn.setAccessibleName("打开完整日志文件")
@@ -1184,6 +1495,7 @@ class SeestarGui(QMainWindow):
         log_actions.addWidget(self.clear_view_btn)
         log_layout.addLayout(log_actions)
         self.log_view = QPlainTextEdit()
+        self.log_view.setObjectName("logView")
         self.log_view.setAccessibleName("详细运行日志")
         self.log_view.setAccessibleDescription("只读的完整处理日志")
         self.log_view.setReadOnly(True)
@@ -1198,8 +1510,10 @@ class SeestarGui(QMainWindow):
         status_bar = self.statusBar()
         status_bar.setSizeGripEnabled(True)
         self.status_label = QLabel("状态：空闲")
+        self.status_label.setObjectName("statusLabel")
+        self.status_label.setProperty("state", "idle")
         self.status_label.setAccessibleName("处理状态")
-        self.status_label.setStyleSheet("font-weight: 600; padding-right: 10px;")
+        self.status_label.setContentsMargins(0, 0, 10, 0)
         self.stage_timing_label = QLabel("本阶段 — · 总耗时 —")
         self.stage_timing_label.setAccessibleName("处理耗时")
         self.preview_status_label = QLabel("预览：等待输入")
@@ -1210,13 +1524,40 @@ class SeestarGui(QMainWindow):
         status_bar.addPermanentWidget(self.log_toggle_btn)
 
     def _init_menus(self) -> None:
+        shortcuts = standard_shortcuts(self.platform_profile)
+
+        file_menu = self.menuBar().addMenu("文件")
+        self.choose_directory_action = QAction("选择目录…", self)
+        self.choose_directory_action.setShortcut(shortcuts["open"])
+        self.choose_directory_action.triggered.connect(self._choose_workdir)
+        file_menu.addAction(self.choose_directory_action)
+
+        self.open_result_action = QAction("打开结果目录", self)
+        self.open_result_action.triggered.connect(self._open_result_dir)
+        file_menu.addAction(self.open_result_action)
+        file_menu.addSeparator()
+
+        self.preferences_action = QAction("任务设置…", self)
+        self.preferences_action.setShortcut(shortcuts["preferences"])
+        self.preferences_action.setMenuRole(QAction.MenuRole.PreferencesRole)
+        self.preferences_action.triggered.connect(self._show_advanced_settings)
+        file_menu.addAction(self.preferences_action)
+
+        self.quit_action = QAction("退出 Seestar Superimpose", self)
+        self.quit_action.setShortcut(shortcuts["quit"])
+        self.quit_action.setMenuRole(QAction.MenuRole.QuitRole)
+        self.quit_action.triggered.connect(self.close)
+        file_menu.addAction(self.quit_action)
+
         process_menu = self.menuBar().addMenu("处理")
 
         self.start_action = QAction("开始处理", self)
+        self.start_action.setShortcut(shortcuts["start"])
         self.start_action.triggered.connect(self._start_run)
         process_menu.addAction(self.start_action)
 
         self.stop_action = QAction("停止", self)
+        self.stop_action.setShortcut(shortcuts["stop"])
         self.stop_action.triggered.connect(self._request_stop_run)
         process_menu.addAction(self.stop_action)
 
@@ -1225,13 +1566,16 @@ class SeestarGui(QMainWindow):
         process_menu.addAction(self.return_task_action)
 
         self.rerun_action = QAction("重新运行", self)
+        self.rerun_action.setShortcut(shortcuts["rerun"])
         self.rerun_action.triggered.connect(self._rerun_last_task)
         process_menu.addAction(self.rerun_action)
 
         process_menu.addSeparator()
 
-        self.open_result_action = QAction("打开结果目录", self)
-        self.open_result_action.triggered.connect(self._open_result_dir)
+        self.history_action = QAction("历史记录", self)
+        self.history_action.triggered.connect(self._show_history)
+        process_menu.addAction(self.history_action)
+
         process_menu.addAction(self.open_result_action)
 
         help_menu = self.menuBar().addMenu("帮助")
@@ -1255,42 +1599,787 @@ class SeestarGui(QMainWindow):
             WORKSPACE_EMPTY,
             WORKSPACE_TASK,
             WORKSPACE_RUN,
+            WORKSPACE_HISTORY,
         } else WORKSPACE_EMPTY
         self._workspace_state = normalized
         page = {
             WORKSPACE_EMPTY: self.empty_page,
             WORKSPACE_TASK: self.task_page,
             WORKSPACE_RUN: self.run_page,
+            WORKSPACE_HISTORY: self.history_page,
         }[normalized]
         self.workspace_stack.setCurrentWidget(page)
         self._update_toolbar_state()
         self._update_responsive_layout()
 
+    @staticmethod
+    def _format_history_time(value: object) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return "—"
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone()
+            return parsed.strftime("%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            return text
+
+    @staticmethod
+    def _history_status_text(status: object, *, available: bool = True) -> str:
+        normalized = str(status or STATUS_INTERRUPTED)
+        symbol = {
+            STATUS_PREPARING: "●",
+            STATUS_RUNNING: "●",
+            STATUS_SUCCESS: "✓",
+            STATUS_PARTIAL_SUCCESS: "⚠",
+            STATUS_REVIEW_REQUIRED: "⚠",
+            STATUS_FAILED: "✕",
+            STATUS_STOPPED: "■",
+            STATUS_INTERRUPTED: "!",
+        }.get(normalized, "·")
+        label = STATUS_LABELS.get(normalized, normalized or "未知")
+        if not available:
+            label += " · 位置不可用"
+        return f"{symbol} {label}"
+
+    @staticmethod
+    def _history_status_matches(status: str, selected_filter: str) -> bool:
+        if selected_filter == "success":
+            return status in {STATUS_SUCCESS, STATUS_PARTIAL_SUCCESS}
+        if selected_filter == "review":
+            return status == STATUS_REVIEW_REQUIRED
+        if selected_filter == "failure":
+            return status in {STATUS_FAILED, STATUS_STOPPED, STATUS_INTERRUPTED}
+        return True
+
+    def _show_history(self) -> None:
+        if self._ui_running or (
+            self.intake_worker and self.intake_worker.isRunning()
+        ) or (
+            self.bootstrap_worker and self.bootstrap_worker.isRunning()
+        ) or (
+            self.worker and self.worker.isRunning()
+        ):
+            return
+        if self._workspace_state != WORKSPACE_HISTORY:
+            if not self._history_detail_mode:
+                self._history_return_state = self._workspace_state
+            self._history_detail_mode = False
+            self._active_history_task_key = None
+            self._active_history_run_id = None
+        self._refresh_history_view()
+        self._show_workspace(WORKSPACE_HISTORY)
+        self._set_status_message("历史记录")
+
+    def _leave_history(self) -> None:
+        target = self._history_return_state
+        if target not in {WORKSPACE_EMPTY, WORKSPACE_TASK, WORKSPACE_RUN}:
+            target = WORKSPACE_EMPTY
+        if target == WORKSPACE_RUN and not self._run_terminal_status:
+            target = WORKSPACE_TASK if self.dir_edit.text().strip() else WORKSPACE_EMPTY
+        self._show_workspace(target)
+        if target == WORKSPACE_EMPTY:
+            self._set_status_text("Idle")
+
+    def _set_history_status_badge(
+        self,
+        item: QTreeWidgetItem,
+        status: str,
+        *,
+        available: bool,
+    ) -> None:
+        badge = QLabel(self._history_status_text(status, available=available))
+        badge.setObjectName("historyStatusBadge")
+        badge.setProperty("historyStatus", status)
+        badge.setProperty("available", available)
+        badge.setContentsMargins(8, 2, 8, 2)
+        self.history_tree.setItemWidget(item, 2, badge)
+
+    def _refresh_history_view(self, _value: object = None) -> None:
+        if not hasattr(self, "history_tree"):
+            return
+        query = self.history_search_edit.text().strip().casefold()
+        selected_filter = str(self.history_status_combo.currentData() or "all")
+        try:
+            tasks = self.history_store.tasks()
+        except HistoryStoreError as error:
+            tasks = []
+            self.history_empty_label.setText(f"历史索引不可用：{error}")
+        else:
+            self.history_empty_label.setText("还没有符合条件的历史处理记录")
+
+        self._history_task_records = {
+            str(task.get("task_key") or ""): task
+            for task in tasks
+            if str(task.get("task_key") or "")
+        }
+        self.history_tree.clear()
+        user_role = int(Qt.ItemDataRole.UserRole)
+        visible_count = 0
+        for task in tasks:
+            task_key = str(task.get("task_key") or "")
+            display_name = str(task.get("display_name") or "未命名任务")
+            status = str(task.get("latest_status") or STATUS_INTERRUPTED)
+            if query and query not in display_name.casefold():
+                continue
+            if not self._history_status_matches(status, selected_filter):
+                continue
+            available = bool(task.get("available", False))
+            item = QTreeWidgetItem(
+                [
+                    display_name,
+                    self._format_history_time(task.get("latest_activity_at")),
+                    "",
+                ]
+            )
+            item.setData(0, user_role, task_key)
+            item.setData(0, user_role + 1, "task")
+            item.setToolTip(
+                0,
+                str(task.get("task_directory") or "")
+                + ("" if available else "\n位置不可用"),
+            )
+            self.history_tree.addTopLevelItem(item)
+            self._set_history_status_badge(
+                item,
+                status,
+                available=available,
+            )
+            for run in task.get("runs", []):
+                if not isinstance(run, dict):
+                    continue
+                run_id = str(run.get("run_id") or "")
+                run_status = str(run.get("status") or STATUS_INTERRUPTED)
+                child = QTreeWidgetItem(
+                    [
+                        f"运行 {run_id}",
+                        self._format_history_time(
+                            run.get("completed_at") or run.get("started_at")
+                        ),
+                        "",
+                    ]
+                )
+                child.setData(0, user_role, task_key)
+                child.setData(0, user_role + 1, "run")
+                child.setData(0, user_role + 2, run_id)
+                item.addChild(child)
+                self._set_history_status_badge(
+                    child,
+                    run_status,
+                    available=available,
+                )
+            visible_count += 1
+
+        self.history_tree.setVisible(visible_count > 0)
+        self.history_empty_label.setVisible(visible_count == 0)
+        self._update_history_selection_actions()
+
+    def _selected_history_task(self) -> dict[str, object] | None:
+        if not hasattr(self, "history_tree"):
+            return None
+        item = self.history_tree.currentItem()
+        if item is None:
+            return None
+        user_role = int(Qt.ItemDataRole.UserRole)
+        task_key = str(item.data(0, user_role) or "")
+        return self._history_task_records.get(task_key)
+
+    def _update_history_selection_actions(self) -> None:
+        if not hasattr(self, "history_delete_btn"):
+            return
+        task = self._selected_history_task()
+        running = bool(
+            self._ui_running
+            or (self.intake_worker and self.intake_worker.isRunning())
+            or (self.bootstrap_worker and self.bootstrap_worker.isRunning())
+            or (self.worker and self.worker.isRunning())
+        )
+        available = bool(task and task.get("available", False))
+        self.history_delete_btn.setText(
+            "移到废纸篓"
+            if task is None or available
+            else "从历史中移除"
+        )
+        self.history_delete_btn.setEnabled(bool(task) and not running)
+
+    def _clear_deleted_task_state(self, task_root: Path) -> bool:
+        deleted = task_root.expanduser().resolve()
+        current_task = self._last_task_root
+        selected_text = self.dir_edit.text().strip()
+        selected = Path(selected_text).expanduser() if selected_text else None
+        matches_current = bool(
+            current_task is not None and current_task.expanduser().resolve() == deleted
+        )
+        if selected is not None:
+            try:
+                matches_current = matches_current or selected.resolve() == deleted
+            except OSError:
+                pass
+        if not matches_current:
+            return False
+        self._last_task_root = None
+        self._last_run_snapshot = None
+        self._input_discovery = None
+        self._result_preview_path = None
+        self._historical_run_root = None
+        self._historical_result_files = ()
+        self._history_detail_mode = False
+        self._active_history_task_key = None
+        self._active_history_run_id = None
+        self._run_terminal_status = None
+        self.run_log_path = None
+        self.dir_edit.clear()
+        self.task_preview_canvas.clear_image()
+        self.preview_canvas.clear_image()
+        deleted_text = str(deleted)
+        self._recent_directories = [
+            value
+            for value in self._recent_directories
+            if str(Path(value).expanduser()) != deleted_text
+        ]
+        self._refresh_recent_directories()
+        self._save_settings()
+        return True
+
+    def _remove_unavailable_history_task(self, task: Mapping[str, object]) -> None:
+        task_key = str(task.get("task_key") or "")
+        display_name = str(task.get("display_name") or "未命名任务")
+        answer = QMessageBox.question(
+            self,
+            "从历史中移除",
+            f"“{display_name}”的任务目录当前不可用。\n\n"
+            "此操作只移除历史索引，不会访问或删除任何文件。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            removed = self.history_store.remove_task(task_key)
+        except (HistoryStoreError, OSError) as error:
+            QMessageBox.warning(self, "无法移除历史", str(error))
+            return
+        if removed:
+            task_root = Path(str(task.get("task_directory") or "")).expanduser()
+            if self._clear_deleted_task_state(task_root):
+                self._show_workspace(WORKSPACE_EMPTY)
+                self._set_status_text("Idle")
+            else:
+                self._refresh_history_view()
+
+    def _delete_selected_history_task(self) -> None:
+        if self._ui_running or (
+            self.intake_worker and self.intake_worker.isRunning()
+        ) or (
+            self.bootstrap_worker and self.bootstrap_worker.isRunning()
+        ) or (
+            self.worker and self.worker.isRunning()
+        ):
+            QMessageBox.information(
+                self,
+                "处理正在运行",
+                "请等待当前任务结束后再删除历史任务。",
+            )
+            return
+        task = self._selected_history_task()
+        if task is None:
+            return
+        if not bool(task.get("available", False)):
+            self._remove_unavailable_history_task(task)
+            return
+
+        task_root = Path(str(task.get("task_directory") or "")).expanduser()
+        try:
+            workspace = validate_deletable_task_root(task_root)
+        except UnsafeTaskDeletionError as error:
+            QMessageBox.warning(
+                self,
+                "拒绝删除任务",
+                f"删除目标未通过安全校验：\n{error}",
+            )
+            return
+        try:
+            run_count = len(
+                [
+                    path
+                    for path in workspace.runs_dir.iterdir()
+                    if path.is_dir() and not path.is_symlink()
+                ]
+            )
+        except OSError:
+            run_count = len(
+                [item for item in task.get("runs", []) if isinstance(item, dict)]
+            )
+        task_size = directory_size_bytes(workspace.root)
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("将任务移到废纸篓")
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setText(
+            f"确定将任务“{task.get('display_name') or workspace.task_id}”移到废纸篓吗？"
+        )
+        dialog.setInformativeText(
+            "将移动整个任务目录，其中的运行结果、断点和日志都会一并移除。\n\n"
+            f"任务目录：{workspace.root}\n"
+            f"运行记录：{run_count} 次\n"
+            f"目录大小：{format_bytes(task_size)}"
+        )
+        move_button = dialog.addButton(
+            "移到废纸篓",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        dialog.exec()
+        if dialog.clickedButton() is not move_button:
+            return
+
+        try:
+            workspace = validate_deletable_task_root(workspace.root)
+        except UnsafeTaskDeletionError as error:
+            QMessageBox.warning(
+                self,
+                "删除目标已变化",
+                f"确认后目标不再满足安全条件，未执行删除：\n{error}",
+            )
+            return
+        try:
+            trash_result = QFile.moveToTrash(str(workspace.root))
+        except (OSError, RuntimeError, TypeError) as error:
+            QMessageBox.warning(
+                self,
+                "无法移到废纸篓",
+                str(error),
+            )
+            return
+        if isinstance(trash_result, tuple):
+            moved = bool(trash_result[0])
+        else:
+            moved = bool(trash_result)
+        if not moved:
+            QMessageBox.warning(
+                self,
+                "无法移到废纸篓",
+                "系统未能移动该任务目录。任务文件和历史索引均未更改。",
+            )
+            return
+
+        task_key = str(task.get("task_key") or history_task_key(workspace.root))
+        index_update_failed = False
+        try:
+            removed = self.history_store.remove_task(task_key)
+        except (HistoryStoreError, OSError) as error:
+            removed = False
+            index_update_failed = True
+            QMessageBox.warning(
+                self,
+                "任务已移到废纸篓",
+                "任务目录已成功移动，但历史索引更新失败；"
+                f"该记录会显示为位置不可用。\n\n{error}",
+            )
+        if not removed and not index_update_failed:
+            QMessageBox.warning(
+                self,
+                "任务已移到废纸篓",
+                "任务目录已成功移动，但历史索引中未找到对应记录；"
+                "请重新打开历史页面检查。",
+            )
+        was_current = self._clear_deleted_task_state(workspace.root)
+        if was_current:
+            self._show_workspace(WORKSPACE_EMPTY)
+            self._set_status_text("Idle")
+        else:
+            self._refresh_history_view()
+        if removed:
+            self.statusBar().showMessage(
+                "任务目录已移到废纸篓，可从废纸篓恢复。",
+                8000,
+            )
+
+    def _on_history_item_activated(
+        self,
+        item: QTreeWidgetItem,
+        _column: int,
+    ) -> None:
+        user_role = int(Qt.ItemDataRole.UserRole)
+        if str(item.data(0, user_role + 1) or "") != "run":
+            item.setExpanded(not item.isExpanded())
+            return
+        task_key = str(item.data(0, user_role) or "")
+        run_id = str(item.data(0, user_role + 2) or "")
+        self._open_history_run(task_key, run_id)
+
+    @staticmethod
+    def _history_ui_terminal_status(status: str) -> str:
+        if status == STATUS_SUCCESS:
+            return "Completed"
+        if status in {STATUS_PARTIAL_SUCCESS, STATUS_REVIEW_REQUIRED}:
+            return "CompletedWithWarning"
+        if status == STATUS_STOPPED:
+            return "Stopped"
+        return "Failed"
+
+    @staticmethod
+    def _history_log_text(path: Path, *, max_bytes: int = 2 * 1024 * 1024) -> str:
+        try:
+            size = path.stat().st_size
+            with path.open("rb") as handle:
+                if size > max_bytes:
+                    handle.seek(-max_bytes, os.SEEK_END)
+                    data = handle.read()
+                    prefix = "[历史日志较大，界面仅显示末尾 2 MiB]\n"
+                else:
+                    data = handle.read()
+                    prefix = ""
+            decoded = data.decode("utf-8", errors="replace")
+            visible_lines = (
+                line
+                for line in decoded.splitlines(keepends=True)
+                if not _DISABLED_STAGE_DISPLAY_RE.search(line)
+            )
+            return prefix + "".join(visible_lines)
+        except OSError as error:
+            return f"无法读取历史日志：{error}\n"
+
+    def _history_run_log_path(
+        self,
+        run_root: Path,
+        run_record: Mapping[str, object],
+    ) -> Path | None:
+        indexed = str(run_record.get("log_path") or "").strip()
+        candidates: list[Path] = []
+        if indexed:
+            candidates.append(Path(indexed).expanduser())
+        candidates.extend(
+            sorted(
+                run_root.glob("seestar_gui_run_*.log"),
+                key=safe_mtime,
+                reverse=True,
+            )
+        )
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+                resolved.relative_to(run_root.resolve())
+            except (OSError, ValueError):
+                continue
+            if resolved.is_file():
+                return resolved
+        return None
+
+    def _open_history_run(self, task_key: str, run_id: str) -> None:
+        task = self.history_store.find_task(task_key)
+        if task is None:
+            QMessageBox.warning(self, "历史记录不可用", "所选任务已不在历史索引中。")
+            self._refresh_history_view()
+            return
+        task_root = Path(str(task.get("task_directory") or "")).expanduser()
+        if not task_root.is_dir() or task_root.is_symlink():
+            QMessageBox.warning(
+                self,
+                "任务位置不可用",
+                "任务目录不存在或当前磁盘未挂载。",
+            )
+            return
+        run_record = next(
+            (
+                item
+                for item in task.get("runs", [])
+                if isinstance(item, dict)
+                and str(item.get("run_id") or "") == str(run_id)
+            ),
+            None,
+        )
+        if run_record is None:
+            QMessageBox.warning(self, "历史记录不可用", "所选运行记录不存在。")
+            return
+        try:
+            workspace, _run_manifest, run_root = verify_history_run(
+                task_root,
+                run_id,
+            )
+        except (HistoryStoreError, OSError, TypeError, ValueError) as error:
+            QMessageBox.warning(
+                self,
+                "历史运行无法验证",
+                str(error),
+            )
+            return
+
+        result_error = ""
+        try:
+            result = load_verified_pipeline_result(run_root)
+        except HistoryStoreError as error:
+            result = None
+            result_error = str(error)
+        status = str(run_record.get("status") or STATUS_INTERRUPTED)
+        self._history_detail_mode = True
+        self._active_history_task_key = task_key
+        self._active_history_run_id = run_id
+        self._historical_run_root = run_root
+        self._last_task_root = workspace.root
+        self._run_terminal_status = self._history_ui_terminal_status(status)
+        self._last_run_snapshot = None
+
+        self._progress_timer.stop()
+        self._pipeline_started_monotonic = None
+        actual_steps = (
+            result.get("actual_steps")
+            if isinstance(result, dict)
+            and isinstance(result.get("actual_steps"), list)
+            else []
+        )
+        stage_count = 10
+        self._reset_stage_progress(stage_count)
+        for stage, raw_step in enumerate(actual_steps[:stage_count], start=1):
+            if not isinstance(raw_step, dict):
+                continue
+            payload = dict(raw_step)
+            payload["title"] = str(
+                payload.get("title") or payload.get("name") or ""
+            )
+            self._on_pipeline_stage_detail(stage, payload)
+            try:
+                duration = max(0.0, float(payload.get("duration_seconds") or 0.0))
+            except (TypeError, ValueError):
+                duration = 0.0
+            self._stage_elapsed_seconds[stage] = duration
+            self._update_stage_chip(stage)
+
+        status_text = self._history_status_text(status)
+        self.progress_summary_label.setText(f"历史运行：{status_text}")
+        self.progress_summary_label.setAccessibleDescription(
+            f"历史运行状态：{status_text}"
+        )
+        self.stage_timing_label.setText("历史运行 · 阶段耗时见右侧")
+        self.run_phase_label.setText(f"历史记录 · {STATUS_LABELS.get(status, status)}")
+        self.run_directory_label.setText(
+            "历史运行目录\n" + self._display_path(run_root)
+        )
+        self.run_mode_label.setText(
+            "处理方式\n"
+            + self._input_mode_label(str(run_record.get("input_mode") or INPUT_MODE_AUTO))
+        )
+        plan_path = run_root / "processing-plan.json"
+        option_lines = ["只读历史记录"]
+        if plan_path.is_file():
+            option_lines.append("参数快照：processing-plan.json")
+        if run_record.get("failure_reason"):
+            option_lines.append("说明：" + str(run_record["failure_reason"]))
+        if result_error:
+            option_lines.append("结果清单：验证失败")
+        self.run_options_label.setText("运行信息\n" + "\n".join(option_lines))
+
+        self.preview_canvas.clear_image()
+        result_files = (
+            verified_result_files(run_root, result)
+            if isinstance(result, dict)
+            else ()
+        )
+        result_files = tuple(
+            path
+            for path in result_files
+            if not (
+                path.name.lower().startswith("result_processed_ai.")
+                or path.name.lower().startswith("result_final_ai.")
+                or "ai_artistic_derivative" in path.parts
+            )
+        )
+        self._historical_result_files = result_files
+        png_files = [path for path in result_files if path.suffix.lower() == ".png"]
+        preview_path = max(png_files, key=safe_mtime) if png_files else None
+        if preview_path is None:
+            persisted_preview = run_root / "process" / "ui_preview" / "latest.png"
+            if persisted_preview.is_file():
+                preview_path = persisted_preview
+        self._result_preview_path = preview_path
+        if preview_path is not None and self._display_latest_preview(
+            preview_path,
+            stage=min(10, len(actual_steps) or 10),
+            title="历史运行",
+        ):
+            self.preview_activity_label.setText("历史运行预览")
+            self.preview_notice_label.setText("历史预览 · 只读显示")
+        else:
+            self.preview_activity_label.setText("历史预览不可用")
+            self.preview_stage_label.setText("预览：不可用")
+            self.preview_status_label.setText("预览：历史结果不可用")
+
+        self.run_log_path = self._history_run_log_path(run_root, run_record)
+        self.log_view.clear()
+        if self.run_log_path is not None:
+            self.log_view.setPlainText(self._history_log_text(self.run_log_path))
+            self.log_view.moveCursor(QTextCursor.MoveOperation.End)
+        else:
+            detail = str(run_record.get("failure_reason") or "没有保存运行日志。")
+            self.log_view.setPlainText(detail)
+
+        has_results = bool(result_files)
+        self.open_result_btn.setEnabled(has_results)
+        self.open_result_action.setEnabled(has_results)
+        self.result_preview_btn.setEnabled(
+            self._result_preview_path is not None
+            and self._result_preview_path.is_file()
+        )
+        if status in {STATUS_PARTIAL_SUCCESS, STATUS_REVIEW_REQUIRED}:
+            self._show_run_banner(
+                "warning",
+                "这是只读历史运行；处理结果需要复核。",
+                show_log=True,
+            )
+        elif status == STATUS_SUCCESS:
+            self._show_run_banner("success", "这是只读历史运行。")
+        elif status == STATUS_STOPPED:
+            self._show_run_banner(
+                "info",
+                "这是已中止的只读历史运行。",
+                show_log=True,
+            )
+        else:
+            self._show_run_banner(
+                "error",
+                "这是失败或异常中断的只读历史运行。",
+                show_log=True,
+            )
+        self.return_task_btn.setText("返回历史记录")
+        self.rerun_btn.setText("重新处理")
+        self._show_workspace(WORKSPACE_RUN)
+        self._set_status_message(
+            f"历史记录 · {STATUS_LABELS.get(status, status or '未知')}"
+        )
+
+    def _register_history_run(self, task: PreparedTask) -> None:
+        self._history_detail_mode = False
+        try:
+            record = self.history_store.register_run(
+                task_id=task.workspace.task_id,
+                task_directory=task.workspace.root,
+                source_fingerprint=task.workspace.source_fingerprint,
+                source_record=task.source_record,
+                run_id=task.run.run_id,
+                run_directory=task.run.root,
+                input_mode=task.input_mode,
+            )
+        except (HistoryStoreError, OSError, TypeError, ValueError) as error:
+            self._active_history_task_key = None
+            self._active_history_run_id = None
+            self._append_event(f"无法登记历史运行：{error}")
+            return
+        self._active_history_task_key = str(record.get("task_key") or "") or None
+        self._active_history_run_id = task.run.run_id
+
+    def _update_active_history_run(
+        self,
+        status: str,
+        *,
+        failure_reason: str | None = None,
+        exit_code: int | None = None,
+    ) -> None:
+        task_key = self._active_history_task_key
+        run_id = self._active_history_run_id
+        if not task_key or not run_id:
+            return
+        try:
+            self.history_store.update_run(
+                task_key=task_key,
+                run_id=run_id,
+                status=status,
+                failure_reason=failure_reason,
+                exit_code=exit_code,
+                log_path=(
+                    self.run_log_path
+                    if self.run_log_path is not None and self.run_log_path.exists()
+                    else None
+                ),
+            )
+        except (HistoryStoreError, OSError, TypeError, ValueError) as error:
+            self._append_event(f"无法更新历史运行：{error}")
+
+    def _terminal_history_status(self, ui_status: str, work_dir: Path | None) -> str:
+        if ui_status == "Stopped":
+            return STATUS_STOPPED
+        if work_dir is not None:
+            try:
+                result = load_verified_pipeline_result(work_dir)
+            except HistoryStoreError as error:
+                self._append_event(f"历史状态未采用无效结果清单：{error}")
+            else:
+                if result is not None:
+                    manifest_status = str(result.get("status") or "")
+                    if manifest_status in {
+                        STATUS_SUCCESS,
+                        STATUS_PARTIAL_SUCCESS,
+                        STATUS_REVIEW_REQUIRED,
+                        STATUS_FAILED,
+                    }:
+                        return manifest_status
+        if ui_status == "Completed":
+            return STATUS_SUCCESS
+        if ui_status == "CompletedWithWarning":
+            return STATUS_PARTIAL_SUCCESS
+        return STATUS_FAILED
+
     def _update_toolbar_state(self) -> None:
+        intake_running = bool(
+            self.intake_worker and self.intake_worker.isRunning()
+        )
         bootstrap_running = bool(
             self.bootstrap_worker and self.bootstrap_worker.isRunning()
         )
         pipeline_running = bool(self.worker and self.worker.isRunning())
-        running = self._ui_running or bootstrap_running or pipeline_running
+        running = (
+            self._ui_running
+            or intake_running
+            or bootstrap_running
+            or pipeline_running
+        )
         task_state = self._workspace_state == WORKSPACE_TASK
         run_state = self._workspace_state == WORKSPACE_RUN
+        history_state = self._workspace_state == WORKSPACE_HISTORY
         terminal = bool(run_state and self._run_terminal_status)
+        historical_terminal = bool(terminal and self._history_detail_mode)
+        can_rerun = bool(
+            terminal
+            and not running
+            and (
+                self._last_run_snapshot is not None
+                or (
+                    historical_terminal
+                    and self._active_history_task_key
+                    and self._active_history_run_id
+                )
+            )
+        )
 
         self.toolbar_directory_item.setVisible(self._workspace_state != WORKSPACE_RUN)
         self.toolbar_settings_item.setVisible(task_state)
         self.start_item.setVisible(task_state and not running)
-        self.stop_item.setVisible(run_state and running)
-        self.return_task_item.setVisible(terminal and not running)
-        self.rerun_item.setVisible(
-            terminal and not running and self._last_run_snapshot is not None
+        self.stop_item.setVisible(
+            (run_state and running) or (task_state and intake_running)
         )
+        self.return_task_item.setVisible(terminal and not running)
+        self.rerun_item.setVisible(can_rerun)
+        self.return_task_btn.setText(
+            "返回历史记录" if historical_terminal else "返回任务设置"
+        )
+        self.return_task_action.setText(
+            "返回历史记录" if historical_terminal else "返回任务设置"
+        )
+        self.rerun_btn.setText("重新处理" if historical_terminal else "重新运行")
+        self.rerun_action.setText("重新处理" if historical_terminal else "重新运行")
+        self.history_btn.setEnabled(not running and not history_state)
+        self.history_action.setEnabled(not running and not history_state)
+        if hasattr(self, "history_delete_btn"):
+            self._update_history_selection_actions()
 
         self.start_action.setEnabled(task_state and not running)
-        self.stop_action.setEnabled(run_state and running)
-        self.return_task_action.setEnabled(terminal and not running)
-        self.rerun_action.setEnabled(
-            terminal and not running and self._last_run_snapshot is not None
+        self.stop_action.setEnabled(
+            (run_state and running) or (task_state and intake_running)
         )
+        self.return_task_action.setEnabled(terminal and not running)
+        self.rerun_action.setEnabled(can_rerun)
+        self.choose_directory_action.setEnabled(not running)
+        self.preferences_action.setEnabled(task_state and not running)
 
     def _show_advanced_settings(self) -> None:
         if self._workspace_state != WORKSPACE_TASK:
@@ -1299,14 +2388,22 @@ class SeestarGui(QMainWindow):
         self.advanced_panel.setFocus()
 
     def _return_to_task_setup(self) -> None:
-        if (self.bootstrap_worker and self.bootstrap_worker.isRunning()) or (
+        if (self.intake_worker and self.intake_worker.isRunning()) or (
+            self.bootstrap_worker and self.bootstrap_worker.isRunning()
+        ) or (
             self.worker and self.worker.isRunning()
         ):
+            return
+        if self._history_detail_mode:
+            self._historical_run_root = None
+            self._historical_result_files = ()
+            self.run_log_path = None
+            self._show_history()
             return
         self._run_terminal_status = None
         directory_text = self.dir_edit.text().strip()
         work_dir = Path(directory_text).expanduser() if directory_text else None
-        if work_dir is not None and work_dir.is_dir():
+        if work_dir is not None and work_dir.exists():
             self._show_workspace(WORKSPACE_TASK)
             self._analyze_selected_directory()
         else:
@@ -1316,13 +2413,48 @@ class SeestarGui(QMainWindow):
         self._set_running(False)
 
     def _rerun_last_task(self) -> None:
+        if self._history_detail_mode:
+            task_key = self._active_history_task_key
+            task = self.history_store.find_task(task_key or "")
+            if task is None:
+                QMessageBox.warning(
+                    self,
+                    "无法重新处理",
+                    "历史任务已经不在索引中。",
+                )
+                return
+            task_root = Path(
+                str(task.get("task_directory") or "")
+            ).expanduser()
+            try:
+                validate_deletable_task_root(task_root)
+            except UnsafeTaskDeletionError as error:
+                QMessageBox.warning(
+                    self,
+                    "无法重新处理",
+                    f"任务目录不可用或身份验证失败：\n{error}",
+                )
+                return
+            self._history_detail_mode = False
+            self._historical_run_root = None
+            self._historical_result_files = ()
+            self._active_history_task_key = None
+            self._active_history_run_id = None
+            self._run_terminal_status = None
+            self.run_log_path = None
+            self._apply_input_path(task_root, remember=True)
+            self._show_workspace(WORKSPACE_TASK)
+            self._analyze_selected_directory()
+            self._set_status_text("Idle")
+            return
         snapshot = self._last_run_snapshot
         if not snapshot:
             return
         answer = QMessageBox.question(
             self,
             "重新运行",
-            "将按上一次实际配置重新运行。现有同名结果文件可能被替换，是否继续？",
+            "将按上一次实际配置创建新的独立运行。旧结果会保留到新结果"
+            "通过校验并发布后，再按保留策略清理。是否继续？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -1332,26 +2464,18 @@ class SeestarGui(QMainWindow):
         if not work_dir.is_dir():
             QMessageBox.warning(self, "无法重新运行", "上一次工作目录已不可用。")
             return
-        self.ai_stage_enabled = bool(snapshot.get("ai_stage_enabled", False))
         self.debug_mode_enabled = bool(snapshot.get("debug_mode_enabled", False))
         self.network_mode_enabled = bool(snapshot.get("network_mode_enabled", False))
-        self.ai_provider_mode = str(
-            snapshot.get("ai_provider_mode") or AI_PROVIDER_DEVELOPER
-        )
-        self.ai_custom_endpoint = str(snapshot.get("ai_custom_endpoint") or "")
-        self.ai_custom_model = str(snapshot.get("ai_custom_model") or "")
-        self.ai_stage_enabled = False
         self._restore_processing_settings(snapshot.get("processing_settings"))
-        self._update_ai_button_text()
         self._update_debug_button_text()
         self._update_network_button_text()
-        self._update_ai_provider_status()
         self.dir_edit.setText(str(work_dir))
         self._start_run(input_mode_override=str(snapshot.get("input_mode") or INPUT_MODE_AUTO))
 
     def _request_stop_run(self) -> None:
         if not (
-            (self.bootstrap_worker and self.bootstrap_worker.isRunning())
+            (self.intake_worker and self.intake_worker.isRunning())
+            or (self.bootstrap_worker and self.bootstrap_worker.isRunning())
             or (self.worker and self.worker.isRunning())
         ):
             return
@@ -1383,9 +2507,11 @@ class SeestarGui(QMainWindow):
     def _update_responsive_layout(self) -> None:
         if not hasattr(self, "run_sidebar"):
             return
+        compact = self.width() < 1100
         self.run_sidebar.setVisible(
-            self._workspace_state == WORKSPACE_RUN and self.width() >= 1100
+            self._workspace_state == WORKSPACE_RUN and not compact
         )
+        self.preview_status_label.setVisible(not compact)
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
@@ -1396,6 +2522,37 @@ class SeestarGui(QMainWindow):
         work_dir: Path,
         input_mode: str | None = None,
     ) -> tuple[list[Path], str]:
+        active_task = getattr(self, "_active_prepared_task", None)
+        if active_task is not None:
+            source = active_task.source_record
+            files = source.get("files") if isinstance(source, dict) else None
+            candidates = [
+                Path(str(record.get("path") or ""))
+                for record in (files if isinstance(files, list) else [])
+                if isinstance(record, dict)
+                and Path(str(record.get("path") or "")).suffix.lower()
+                in FITS_SUFFIXES
+            ]
+            if candidates:
+                label = (
+                    f"输入样本 · {len(candidates)} 帧"
+                    if str(source.get("kind") or "") == "light_directory"
+                    else "输入"
+                )
+                return candidates, label
+        discovery = getattr(self, "_input_discovery", None)
+        if discovery is not None and discovery.selected_path == work_dir.resolve():
+            if discovery.kind == InputKind.LIGHT_DIRECTORY and discovery.light_groups:
+                candidates = list(discovery.light_groups[0].files)
+                return candidates, f"输入样本 · {len(candidates)} 帧"
+            if (
+                discovery.master_file is not None
+                and discovery.master_file.suffix.lower() in FITS_SUFFIXES
+            ):
+                return [discovery.master_file], "输入"
+            checkpoint_path = discovery.details.get("checkpoint_path")
+            if checkpoint_path and Path(str(checkpoint_path)).is_file():
+                return [Path(str(checkpoint_path))], "已验证断点"
         input_mode = input_mode or self._current_input_mode()
         if input_mode == INPUT_MODE_LINEAR_RESUME:
             source = self._linear_resume_input_path(work_dir)
@@ -1438,6 +2595,33 @@ class SeestarGui(QMainWindow):
             self.task_preview_canvas.clear_image()
             self.preview_canvas.clear_image()
         if not candidates:
+            discovery = getattr(self, "_input_discovery", None)
+            master_file = (
+                discovery.master_file
+                if discovery is not None
+                and discovery.selected_path == work_dir.resolve()
+                else None
+            )
+            if (
+                master_file is not None
+                and master_file.suffix.lower() in REVIEW_SUFFIXES
+                and self._display_latest_preview(
+                    master_file,
+                    stage=0,
+                    title="复核输入",
+                )
+            ):
+                self.task_preview_status_label.setText(
+                    f"复核输入 · {master_file.name}"
+                )
+                return
+            if master_file is not None and master_file.suffix.lower() == ".xisf":
+                self.task_preview_canvas.clear_image()
+                self.task_preview_status_label.setText(
+                    "XISF 将在 Stage 1 转换后显示预览"
+                )
+                self.preview_status_label.setText("预览：等待 Stage 1 转换 XISF")
+                return
             self.task_preview_canvas.clear_image()
             self.task_preview_status_label.setText("无可用输入预览")
             self.preview_status_label.setText("预览：输入不可用")
@@ -1566,7 +2750,7 @@ class SeestarGui(QMainWindow):
         return f"{minutes:02d}:{secs:02d}"
 
     def _reset_stage_progress(self, stage_count: int) -> None:
-        self._progress_stage_count = max(1, int(stage_count))
+        self._progress_stage_count = 10
         self._active_pipeline_stage = None
         self._display_pipeline_stage = None
         self._stage_started_monotonic.clear()
@@ -1583,22 +2767,22 @@ class SeestarGui(QMainWindow):
                 widget.deleteLater()
 
         for stage in range(1, self._progress_stage_count + 1):
-            if stage in {1, 7, 11}:
+            if stage in {1, 7}:
                 phase_text = {
                     1: "线性处理 · Stage 1–6",
                     7: "非线性处理 · Stage 7–10",
-                    11: "AI 后期 · Stage 11",
                 }[stage]
                 phase_label = QLabel(phase_text)
-                phase_label.setStyleSheet(
-                    "font-size: 11px; font-weight: 600;"
-                    " color: rgba(127,127,127,0.96); padding: 6px 2px 2px 2px;"
-                )
+                phase_label.setProperty("tone", "muted")
+                phase_label.setContentsMargins(2, 6, 2, 2)
                 self.stage_stepper_layout.addWidget(phase_label)
             title = PIPELINE_STAGE_TITLES.get(stage, f"阶段 {stage}")
             chip = QLabel()
             chip.setWordWrap(True)
-            chip.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            chip.setSizePolicy(
+                QSizePolicy.Policy.Preferred,
+                QSizePolicy.Policy.Minimum,
+            )
             self.stage_stepper_layout.addWidget(chip)
             self._stage_items[stage] = chip
             self._stage_progress_states[stage] = "waiting"
@@ -1728,20 +2912,6 @@ class SeestarGui(QMainWindow):
             "skipped": "—",
             "stopped": "■",
         }.get(state, "○")
-        border = {
-            "running": "#0a84ff",
-            "completed": "#34c759",
-            "safe_passthrough": "#4f8fa8",
-            "degraded": "#c08a00",
-            "failed": "#ff453a",
-        }.get(state, "rgba(127, 127, 127, 0.36)")
-        background = {
-            "running": "rgba(10, 132, 255, 0.16)",
-            "completed": "rgba(52, 199, 89, 0.13)",
-            "safe_passthrough": "rgba(79, 143, 168, 0.14)",
-            "degraded": "rgba(255, 193, 7, 0.16)",
-            "failed": "rgba(255, 69, 58, 0.14)",
-        }.get(state, "transparent")
         short_title = PIPELINE_STAGE_SHORT_TITLES.get(stage, str(stage))
         state_text = {
             "waiting": "等待",
@@ -1762,13 +2932,7 @@ class SeestarGui(QMainWindow):
             chip_text += f"\n   {extra_text}"
         chip.setText(chip_text)
         chip.setAccessibleName(f"阶段 {stage}：{short_title}")
-        chip.setStyleSheet(
-            "padding: 6px 7px;"
-            f"border: 1px solid {border};"
-            "border-radius: 6px;"
-            f"background-color: {background};"
-            + ("font-weight: 600;" if state == "running" else "")
-        )
+        set_style_property(chip, "stageState", state)
         elapsed = self._stage_elapsed_seconds.get(stage)
         elapsed_text = self._format_elapsed(elapsed) if elapsed is not None else "—"
         tooltip = (
@@ -1836,30 +3000,47 @@ class SeestarGui(QMainWindow):
         self._refresh_elapsed_labels()
 
     def _choose_workdir(self) -> None:
-        selected = QFileDialog.getExistingDirectory(self, "选择工作目录")
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "选择 Light 目录或产品任务",
+        )
         if selected:
-            self._apply_work_directory(Path(selected), remember=True)
+            self._apply_input_path(Path(selected), remember=True)
+
+    def _choose_input_file(self) -> None:
+        selected, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "选择母版或预览图",
+            "",
+            (
+                "天文图像 (*.fit *.fits *.fts *.xisf);;"
+                "复核图像 (*.tif *.tiff *.png *.jpg *.jpeg);;所有文件 (*)"
+            ),
+        )
+        if selected:
+            self._apply_input_path(Path(selected), remember=True)
 
     def _set_running(self, running: bool) -> None:
         self._ui_running = bool(running)
         self.dir_edit.setEnabled(not running)
         self.browse_btn.setEnabled(not running)
+        self.browse_dir_btn.setEnabled(not running)
         self.recent_combo.setEnabled(not running)
         self.mode_combo.setEnabled(not running)
         self.advanced_toggle_btn.setEnabled(not running)
         self.processing_params_btn.setEnabled(not running)
         self.processing_params_panel.setEnabled(not running)
-        self.ai_btn.setEnabled(not running)
-        self.ai_config_btn.setEnabled(not running)
         self.debug_btn.setEnabled(not running)
         self.network_btn.setEnabled(not running)
         self._update_toolbar_state()
 
     def _input_mode_label(self, mode: str) -> str:
+        if mode == INPUT_MODE_STAGE1_PREPARED_RESUME:
+            return "从输入准备后继续"
         if mode == INPUT_MODE_LINEAR_RESUME:
-            return "从线性处理后继续"
+            return "从线性反卷积与降噪后继续"
         if mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
-            return "从裁切后继续"
+            return "从边界校正后继续"
         return "完整处理"
 
     def _current_input_mode(self) -> str:
@@ -1870,6 +3051,7 @@ class SeestarGui(QMainWindow):
                 return self._recommended_input_mode
             if value in {
                 INPUT_MODE_AUTO,
+                INPUT_MODE_STAGE1_PREPARED_RESUME,
                 INPUT_MODE_LINEAR_RESUME,
                 INPUT_MODE_STAGE2_CORRECTED_RESUME,
             }:
@@ -1877,6 +3059,7 @@ class SeestarGui(QMainWindow):
         value = getattr(self, "input_mode", INPUT_MODE_AUTO)
         if value in {
             INPUT_MODE_AUTO,
+            INPUT_MODE_STAGE1_PREPARED_RESUME,
             INPUT_MODE_LINEAR_RESUME,
             INPUT_MODE_STAGE2_CORRECTED_RESUME,
         }:
@@ -1908,42 +3091,6 @@ class SeestarGui(QMainWindow):
                 and work_dir.is_dir()
             ):
                 self._schedule_initial_preview(work_dir, self.input_mode)
-
-    def _update_ai_button_text(self) -> None:
-        if self.ai_btn.isChecked() != self.ai_stage_enabled:
-            self.ai_btn.blockSignals(True)
-            try:
-                self.ai_btn.setChecked(self.ai_stage_enabled)
-            finally:
-                self.ai_btn.blockSignals(False)
-        if hasattr(self, "ai_phase_label"):
-            self.ai_phase_label.setText(
-                ("○ 已启用 · " if self.ai_stage_enabled else "未启用 · ")
-                + "Stage 11 AI 后期"
-            )
-
-    def _on_ai_toggled(self, checked: bool) -> None:
-        self.ai_stage_enabled = bool(checked)
-        self._update_ai_button_text()
-        if not self._restoring_settings:
-            self._append_event(
-                "AI 后期已" + ("开启" if self.ai_stage_enabled else "关闭")
-            )
-            if not (self.worker or self.bootstrap_worker):
-                self._reset_stage_progress(11 if self.ai_stage_enabled else 10)
-            self._save_settings()
-
-    def _update_ai_provider_status(self) -> None:
-        if self.ai_provider_mode == AI_PROVIDER_CUSTOM:
-            label = "自定义模型"
-            if self.ai_custom_model:
-                label += f" · {self.ai_custom_model}"
-        else:
-            label = "开发者试用"
-        self.ai_provider_status_label.setText(label)
-        self.ai_provider_status_label.setAccessibleDescription(
-            f"当前 AI 配置：{label}"
-        )
 
     @staticmethod
     def _set_parameter_help(label: QLabel, control: QWidget, text: str) -> None:
@@ -2087,6 +3234,7 @@ class SeestarGui(QMainWindow):
         if input_mode != INPUT_MODE_LINEAR_RESUME:
             overrides.update(
                 {
+                    "SEESTAR_STAGE4_SPCC_TIMEOUT_SEC": str(self.pcc_timeout_sec),
                     "SEESTAR_STAGE4_PCC_TIMEOUT_SEC": str(self.pcc_timeout_sec),
                     "SEESTAR_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT": (
                         f"{self.local_wb_gain_limit:.2f}"
@@ -2136,7 +3284,9 @@ class SeestarGui(QMainWindow):
 
     def _processing_settings_summary_lines(self, input_mode: str) -> list[str]:
         format_labels = {"tif": "TIFF", "png": "PNG", "fit": "FITS"}
-        color_labels = {"pcc": "Gaia PCC（本地优先，180 秒）"}
+        color_labels = {
+            "pcc": f"SPCC 优先（PCC 异常回退，{self.pcc_timeout_sec} 秒）"
+        }
         filter_labels = {
             "auto": "自动识别",
             "no_filter": "无滤镜",
@@ -2173,7 +3323,7 @@ class SeestarGui(QMainWindow):
                     "线性降噪：" + denoise_labels[self.denoise_mode],
                     "反卷积：" + deconv_labels[self.deconvolution_mode],
                     (
-                        "专业线性：PCC "
+                        "专业线性：校色 "
                         f"{self.pcc_timeout_sec}s · WB {self.local_wb_gain_limit:.2f}×"
                         f" · 降噪 {self.builtin_denoise_strength:.2f}"
                         f" · GraXpert {self.graxpert_deconv_strength:.2f}"
@@ -2187,24 +3337,19 @@ class SeestarGui(QMainWindow):
         panel = QFrame()
         panel.setObjectName("processingParametersSheet")
         panel.setAccessibleName("处理参数设置面板")
-        panel.setStyleSheet(
-            "QFrame#processingParametersSheet {"
-            " border: 1px solid rgba(127,127,127,0.30);"
-            " border-radius: 9px; }"
-        )
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(12)
 
         header = QHBoxLayout()
         title = QLabel("处理参数")
-        title.setStyleSheet("font-weight: 600;")
+        title.setObjectName("sectionTitle")
         self.processing_sheet_note = QLabel()
         self.processing_sheet_note.setWordWrap(True)
-        self.processing_sheet_note.setStyleSheet(
-            "color: rgba(127,127,127,0.95); padding-left: 8px;"
-        )
+        self.processing_sheet_note.setProperty("tone", "muted")
+        self.processing_sheet_note.setContentsMargins(8, 0, 8, 0)
         self.processing_defaults_btn = QPushButton("恢复安全默认值")
+        self.processing_defaults_btn.setProperty("variant", "quiet")
         self.processing_defaults_btn.setAccessibleName("恢复处理参数安全默认值")
         self.processing_defaults_btn.setToolTip(
             "恢复 TIFF、PNG、FITS、正式输出、自动校色、自动降噪、"
@@ -2213,6 +3358,13 @@ class SeestarGui(QMainWindow):
         header.addWidget(title)
         header.addWidget(self.processing_sheet_note, 1)
         header.addWidget(self.processing_defaults_btn)
+        self.processing_done_btn = QPushButton("完成")
+        self.processing_done_btn.setProperty("variant", "primary")
+        self.processing_done_btn.setAccessibleName("收起处理参数设置")
+        self.processing_done_btn.clicked.connect(
+            self._configure_processing_parameters
+        )
+        header.addWidget(self.processing_done_btn)
         layout.addLayout(header)
 
         groups = QGridLayout()
@@ -2222,8 +3374,8 @@ class SeestarGui(QMainWindow):
         groups.setColumnStretch(0, 2)
         groups.setColumnStretch(1, 3)
 
-        output_group = QGroupBox("输出")
-        output_form = QFormLayout(output_group)
+        self.processing_output_group = QGroupBox("输出")
+        output_form = QFormLayout(self.processing_output_group)
         output_form.setContentsMargins(10, 8, 10, 8)
         output_row = QWidget()
         output_layout = QHBoxLayout(output_row)
@@ -2258,20 +3410,20 @@ class SeestarGui(QMainWindow):
             "适合人工检查且不会覆盖正式结果；所有处理方式均生效。",
         )
         output_form.addRow(review_label, self.review_combo)
-        groups.addWidget(output_group, 0, 0)
+        groups.addWidget(self.processing_output_group, 0, 0)
 
         self.processing_color_group = QGroupBox("色彩校准")
         color_form = QFormLayout(self.processing_color_group)
         color_form.setContentsMargins(10, 8, 10, 8)
         self.color_combo = QComboBox()
-        self.color_combo.addItem("Gaia PCC（本地优先，单次安全回退）", "pcc")
+        self.color_combo.addItem("SPCC 优先（PCC 异常回退）", "pcc")
         color_label = QLabel("校准方式")
         self._set_parameter_help(
             color_label,
             self.color_combo,
-            "用途：Stage 4 仅对确认线性的宽带 RGB/OSC 执行一次 Gaia PCC。"
-            "本地 Gaia 目录可用时完全离线运行，否则仅在允许联网时使用在线 Gaia。"
-            "超时、失败或色温/背景/主体颜色质量门拒绝后会回到 pre_pcc 线性检查点；"
+            "用途：Stage 4 对确认线性的宽带与双窄带优先执行一次 Gaia DR3 SPCC 物理校色。"
+            "宽带 SPCC 异常时才执行一次 PCC；双窄带不会用宽带 PCC 代替物理校色。"
+            "超时、失败或质量门拒绝后会回到不可变的线性检查点；"
             "从线性结果继续时不生效。",
         )
         color_form.addRow(color_label, self.color_combo)
@@ -2286,7 +3438,8 @@ class SeestarGui(QMainWindow):
             filter_label,
             self.filter_combo,
             "用途：补充 FITS FILTER 缺失时的通道语义；默认自动识别。"
-            "双窄带会跳过 PCC 和全图白平衡，只允许恒星软遮罩局部恢复；"
+            "双窄带使用 Ha/OIII 波长与带宽执行 SPCC 物理校色；HOO 艺术映射单独输出，"
+            "不会作为后续主链输入；"
             "从线性结果继续时不生效。",
         )
         color_form.addRow(filter_label, self.filter_combo)
@@ -2296,33 +3449,31 @@ class SeestarGui(QMainWindow):
         catalog_layout.setContentsMargins(0, 0, 0, 0)
         catalog_layout.setSpacing(3)
         self.gaia_catalog_download_btn = QPushButton(
-            "下载离线 Gaia 星色目录（约 1.1 GB）"
+            "下载离线 Gaia 解析/PCC 目录（约 1.1 GB）"
         )
-        self.gaia_catalog_download_btn.setAccessibleName("下载离线 Gaia 星色目录")
+        self.gaia_catalog_download_btn.setAccessibleName("下载离线 Gaia 解析和 PCC 目录")
         self.gaia_catalog_download_btn.setToolTip(
             "从 Siril 官方 Zenodo 数据集下载并校验；解压后约 1.52 GB，"
             "只保存到应用 runtime home，不写入项目，也不会打包进应用。"
         )
         self.gaia_catalog_status = QLabel()
         self.gaia_catalog_status.setWordWrap(True)
-        self.gaia_catalog_status.setStyleSheet(
-            "color: rgba(127,127,127,0.95); font-size: 11px;"
-        )
+        self.gaia_catalog_status.setProperty("tone", "muted")
         catalog_layout.addWidget(self.gaia_catalog_download_btn)
         catalog_layout.addWidget(self.gaia_catalog_status)
         catalog_label = QLabel("离线目录")
         self._set_parameter_help(
             catalog_label,
             catalog_row,
-            "用途：安装包含 Gaia DR3 恒星有效温度的 Siril 本地目录，"
-            "同时支持离线图像解析与 pcc -catalog=localgaia。"
+            "用途：安装包含 Gaia DR3 恒星有效温度的 Siril 小型目录，"
+            "支持离线图像解析与 pcc -catalog=localgaia；它不是约 21 GB 的 SPCC xp_sampled 目录。"
             "目录不会随项目保存或随 App 打包。",
         )
         color_form.addRow(catalog_label, catalog_row)
         groups.addWidget(self.processing_color_group, 0, 1)
 
-        performance_group = QGroupBox("性能兼容")
-        performance_form = QFormLayout(performance_group)
+        self.processing_performance_group = QGroupBox("性能兼容")
+        performance_form = QFormLayout(self.processing_performance_group)
         performance_form.setContentsMargins(10, 8, 10, 8)
         self.compute_combo = QComboBox()
         self.compute_combo.addItem("自动加速", "auto")
@@ -2336,7 +3487,7 @@ class SeestarGui(QMainWindow):
             "可切换 CPU，速度会明显降低；所有包含对应插件的处理方式均生效。",
         )
         performance_form.addRow(compute_label, self.compute_combo)
-        groups.addWidget(performance_group, 1, 0)
+        groups.addWidget(self.processing_performance_group, 1, 0)
 
         self.processing_linear_group = QGroupBox("线性处理")
         linear_form = QFormLayout(self.processing_linear_group)
@@ -2410,20 +3561,18 @@ class SeestarGui(QMainWindow):
 
         self.graxpert_model_status = QLabel()
         self.graxpert_model_status.setWordWrap(True)
-        self.graxpert_model_status.setStyleSheet(
-            "color: rgba(127,127,127,0.95);"
-        )
+        self.graxpert_model_status.setProperty("tone", "muted")
         linear_form.addRow("", self.graxpert_model_status)
         groups.addWidget(self.processing_linear_group, 1, 1)
 
         self.processing_professional_group = QGroupBox("专业细节")
         self.processing_professional_group.setAccessibleName("专业图像处理参数")
-        self.processing_professional_group.setMinimumHeight(88)
+        self.processing_professional_group.setMinimumHeight(150)
         professional_grid = QGridLayout(self.processing_professional_group)
         professional_grid.setContentsMargins(10, 8, 10, 8)
         professional_grid.setHorizontalSpacing(8)
         professional_grid.setVerticalSpacing(6)
-        for column in (1, 3, 5, 7, 9, 11):
+        for column in (1, 3, 5):
             professional_grid.setColumnStretch(column, 1)
         self.processing_prelinear_professional_widgets: list[QWidget] = []
 
@@ -2469,8 +3618,14 @@ class SeestarGui(QMainWindow):
             if hasattr(label, "setBuddy"):
                 label.setBuddy(control)
             self._set_parameter_help(label, control, help_text)
-            professional_grid.addWidget(label, row, pair_column * 2)
-            professional_grid.addWidget(control, row, pair_column * 2 + 1)
+            parameter_index = row * 6 + pair_column
+            display_row, display_pair = divmod(parameter_index, 3)
+            professional_grid.addWidget(label, display_row, display_pair * 2)
+            professional_grid.addWidget(
+                control,
+                display_row,
+                display_pair * 2 + 1,
+            )
             if prelinear:
                 self.processing_prelinear_professional_widgets.extend(
                     (label, control)
@@ -2480,10 +3635,10 @@ class SeestarGui(QMainWindow):
         add_professional_parameter(
             0,
             0,
-            "PCC 超时",
+            "SPCC/PCC 超时",
             self.pcc_timeout_spin,
-            "Stage 4 本地或在线 Gaia PCC 的单次等待上限；"
-            "默认 180 秒，范围 5–180 秒。超时后不会重试，"
+            "Stage 4 本地或在线 Gaia SPCC/PCC 独立进程的单次等待上限；"
+            "默认 180 秒，范围 5–180 秒。每种方法超时后不会重试，"
             "会回滚并继续使用安全回退结果。",
             prelinear=True,
         )
@@ -2610,9 +3765,8 @@ class SeestarGui(QMainWindow):
             "修改后自动保存；点击“开始处理”时冻结为本次任务配置。"
         )
         self.processing_sheet_status.setAccessibleName("处理参数保存状态")
-        self.processing_sheet_status.setStyleSheet(
-            "color: rgba(127,127,127,0.95); padding: 1px 2px;"
-        )
+        self.processing_sheet_status.setProperty("tone", "muted")
+        self.processing_sheet_status.setContentsMargins(2, 1, 2, 1)
         layout.addWidget(self.processing_sheet_status)
 
         for key, checkbox in self.output_format_checks.items():
@@ -2754,7 +3908,7 @@ class SeestarGui(QMainWindow):
                 "已安装：runtime home/.local/share/siril/"
                 "siril_cat_healpix8_astro.dat（约 1.52 GB）"
             )
-            button.setText("重新下载并校验离线 Gaia 目录")
+            button.setText("重新下载并校验离线 Gaia 解析/PCC 目录")
         else:
             size_bytes = int(status["size_bytes"])
             suffix = (
@@ -2763,10 +3917,10 @@ class SeestarGui(QMainWindow):
                 else ""
             )
             status_label.setText(
-                "未安装；无目录时保持在线 PCC/本地恒星回退策略"
+                "未安装；该目录仅影响离线 platesolve/PCC，不替代 SPCC xp_sampled 目录"
                 + suffix
             )
-            button.setText("下载离线 Gaia 星色目录（约 1.1 GB）")
+            button.setText("下载离线 Gaia 解析/PCC 目录（约 1.1 GB）")
 
     def _toggle_gaia_catalog_download(self, _checked: bool = False) -> None:
         worker = self.gaia_catalog_worker
@@ -2944,7 +4098,18 @@ class SeestarGui(QMainWindow):
     def _set_processing_parameters_expanded(self, expanded: bool) -> None:
         self.processing_parameters_expanded = bool(expanded)
         visible = bool(expanded and self.advanced_toggle_btn.isChecked())
+        processing_scroll = getattr(self, "processing_params_scroll", None)
+        if processing_scroll is not None:
+            processing_scroll.setVisible(visible)
         self.processing_params_panel.setVisible(visible)
+        task_phase_bar = getattr(self, "task_phase_bar", None)
+        if task_phase_bar is not None:
+            task_phase_bar.setVisible(not visible)
+        task_splitter = getattr(self, "task_splitter", None)
+        if task_splitter is not None:
+            task_splitter.setMaximumHeight(
+                248 if visible else 16777215
+            )
         self.processing_params_btn.setText(
             "收起处理参数" if expanded else "处理参数…"
         )
@@ -2953,221 +4118,22 @@ class SeestarGui(QMainWindow):
         )
         if expanded:
             self._update_processing_sheet_availability()
+            if visible and processing_scroll is not None:
+                processing_scroll.setFocus()
         if not self._restoring_settings:
             self._save_settings()
+            if (
+                not expanded
+                and self._input_discovery is not None
+                and self._input_discovery.kind == InputKind.PRODUCT_TASK
+                and self._workspace_state == WORKSPACE_TASK
+            ):
+                self._analyze_selected_directory()
 
     def _configure_processing_parameters(self, _checked: bool = False) -> None:
         self._set_processing_parameters_expanded(
             not self.processing_parameters_expanded
         )
-
-    def _developer_ai_configuration(self) -> dict[str, str]:
-        merged: dict[str, str] = {}
-        for path in (
-            self.resources / DEFAULT_ENV_RESOURCE_REL,
-            self.resources / AI_ENV_RESOURCE_REL,
-        ):
-            if not path.is_file():
-                continue
-            parsed, _warnings = parse_ai_env_file(path)
-            merged.update(parsed)
-        return merged
-
-    def _resolve_ai_runtime_overrides(self) -> dict[str, str]:
-        if not self.ai_stage_enabled:
-            return {}
-
-        if self.ai_provider_mode == AI_PROVIDER_CUSTOM:
-            endpoint = self.ai_custom_endpoint.strip()
-            model = self.ai_custom_model.strip()
-            api_key = (get_custom_api_key() or "").strip()
-            if not endpoint.lower().startswith(("http://", "https://")):
-                raise AiCredentialError("自定义 AI 接口必须是完整的 http(s) 地址")
-            if not model:
-                raise AiCredentialError("自定义 AI 模型名称不能为空")
-            if not api_key:
-                raise AiCredentialError("尚未在 macOS Keychain 中保存自定义 API Key")
-            return {
-                "SEESTAR_AI_ENDPOINT": endpoint,
-                "SEESTAR_AI_MODEL": model,
-                "SEESTAR_AI_API_KEY": api_key,
-                "SEESTAR_AI_ARTISTIC_DERIVATIVE_ENABLED": "0",
-            }
-
-        defaults = self._developer_ai_configuration()
-        fallback_secrets = (
-            {key: defaults.get(key, "") for key in AI_SECRET_ENV_KEYS}
-            if not is_frozen()
-            else None
-        )
-        secrets = ensure_developer_credentials(
-            self.resources,
-            fallback_secrets=fallback_secrets,
-        )
-        endpoint = defaults.get("SEESTAR_AI_ENDPOINT", "").strip()
-        model = defaults.get("SEESTAR_AI_MODEL", "").strip()
-        api_key = secrets.get("SEESTAR_AI_API_KEY", "").strip()
-        missing = []
-        if not endpoint:
-            missing.append("默认接口")
-        if not model:
-            missing.append("默认模型")
-        if not api_key:
-            missing.append("开发者试用 Key")
-        if missing:
-            raise AiCredentialError("缺少" + "、".join(missing))
-
-        overrides = {
-            "SEESTAR_AI_ENDPOINT": endpoint,
-            "SEESTAR_AI_MODEL": model,
-            "SEESTAR_AI_API_KEY": api_key,
-        }
-        artistic_key = secrets.get("SEESTAR_AI_ARTISTIC_API_KEY", "").strip()
-        if artistic_key:
-            overrides["SEESTAR_AI_ARTISTIC_API_KEY"] = artistic_key
-        return overrides
-
-    def _configure_ai_model(self) -> None:
-        dialog = QDialog(self)
-        dialog.setWindowTitle("AI 模型配置")
-        dialog.setMinimumWidth(560)
-        layout = QVBoxLayout(dialog)
-        form = QFormLayout()
-
-        provider_combo = QComboBox()
-        provider_combo.setAccessibleName("AI 配置来源")
-        provider_combo.addItem("开发者默认（试用）", AI_PROVIDER_DEVELOPER)
-        provider_combo.addItem("使用自己的模型", AI_PROVIDER_CUSTOM)
-        provider_combo.setCurrentIndex(
-            max(0, provider_combo.findData(self.ai_provider_mode))
-        )
-        form.addRow("配置来源", provider_combo)
-
-        endpoint_edit = QLineEdit(self.ai_custom_endpoint)
-        endpoint_edit.setAccessibleName("自定义 AI 接口地址")
-        endpoint_edit.setPlaceholderText("例如 https://api.example.com/v1/chat/completions")
-        form.addRow("接口地址", endpoint_edit)
-
-        model_edit = QLineEdit(self.ai_custom_model)
-        model_edit.setAccessibleName("自定义 AI 模型名称")
-        model_edit.setPlaceholderText("例如 model-name")
-        form.addRow("模型名称", model_edit)
-
-        key_edit = QLineEdit()
-        key_edit.setAccessibleName("自定义 API Key")
-        key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        key_edit.setPlaceholderText("留空则保留 Keychain 中已有的 Key")
-        form.addRow("API Key", key_edit)
-        layout.addLayout(form)
-
-        key_status = QLabel()
-        key_status.setWordWrap(True)
-        layout.addWidget(key_status)
-        try:
-            custom_key_exists = bool((get_custom_api_key() or "").strip())
-            keychain_error = ""
-        except AiCredentialError as exc:
-            custom_key_exists = False
-            keychain_error = str(exc)
-
-        delete_key_btn = QPushButton("删除自定义 Key")
-        delete_key_btn.setAccessibleName("删除自定义 API Key")
-        layout.addWidget(delete_key_btn)
-
-        note = QLabel(
-            "开发者试用配置由应用提供并可能随时失效；自定义 endpoint 和模型名称"
-            "保存在普通设置中，API Key 只写入当前用户的 macOS Keychain。"
-        )
-        note.setWordWrap(True)
-        layout.addWidget(note)
-
-        def update_controls() -> None:
-            custom = provider_combo.currentData() == AI_PROVIDER_CUSTOM
-            endpoint_edit.setEnabled(custom)
-            model_edit.setEnabled(custom)
-            key_edit.setEnabled(custom and not keychain_error)
-            delete_key_btn.setEnabled(custom and custom_key_exists and not keychain_error)
-            if keychain_error:
-                key_status.setText("Keychain 不可用：" + keychain_error)
-            elif custom_key_exists:
-                key_status.setText("已在 macOS Keychain 中保存自定义 API Key。")
-            else:
-                key_status.setText("尚未保存自定义 API Key。")
-
-        def delete_key() -> None:
-            nonlocal custom_key_exists
-            answer = QMessageBox.question(
-                dialog,
-                "删除自定义 Key",
-                "确定从 macOS Keychain 删除自定义 API Key？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-            try:
-                delete_custom_api_key()
-            except AiCredentialError as exc:
-                QMessageBox.critical(dialog, "删除失败", str(exc))
-                return
-            custom_key_exists = False
-            key_edit.clear()
-            update_controls()
-
-        provider_combo.currentIndexChanged.connect(lambda _index: update_controls())
-        delete_key_btn.clicked.connect(delete_key)
-        update_controls()
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save
-            | QDialogButtonBox.StandardButton.Cancel
-        )
-        layout.addWidget(buttons)
-
-        def save_configuration() -> None:
-            nonlocal custom_key_exists
-            mode = str(provider_combo.currentData())
-            if mode == AI_PROVIDER_CUSTOM:
-                endpoint = endpoint_edit.text().strip()
-                model = model_edit.text().strip()
-                new_key = key_edit.text().strip()
-                if not endpoint.lower().startswith(("http://", "https://")):
-                    QMessageBox.warning(
-                        dialog,
-                        "配置不完整",
-                        "接口地址必须是完整的 http(s) 地址。",
-                    )
-                    return
-                if not model:
-                    QMessageBox.warning(dialog, "配置不完整", "请输入模型名称。")
-                    return
-                if not new_key and not custom_key_exists:
-                    QMessageBox.warning(dialog, "配置不完整", "请输入 API Key。")
-                    return
-                if new_key:
-                    try:
-                        set_custom_api_key(new_key)
-                    except AiCredentialError as exc:
-                        QMessageBox.critical(dialog, "保存失败", str(exc))
-                        return
-                    custom_key_exists = True
-                self.ai_custom_endpoint = endpoint
-                self.ai_custom_model = model
-
-            self.ai_provider_mode = (
-                mode if mode in AI_PROVIDER_MODES else AI_PROVIDER_DEVELOPER
-            )
-            self._update_ai_provider_status()
-            self._save_settings()
-            self._append_event(
-                "AI 模型配置已切换为"
-                + ("自定义模型" if mode == AI_PROVIDER_CUSTOM else "开发者试用")
-            )
-            dialog.accept()
-
-        buttons.accepted.connect(save_configuration)
-        buttons.rejected.connect(dialog.reject)
-        dialog.exec()
 
     def _update_debug_button_text(self) -> None:
         if self.debug_btn.isChecked() != self.debug_mode_enabled:
@@ -3206,9 +4172,21 @@ class SeestarGui(QMainWindow):
 
     def _on_advanced_toggled(self, expanded: bool) -> None:
         self.advanced_panel.setVisible(expanded)
-        self.processing_params_panel.setVisible(
-            bool(expanded and self.processing_parameters_expanded)
+        processing_visible = bool(
+            expanded and self.processing_parameters_expanded
         )
+        processing_scroll = getattr(self, "processing_params_scroll", None)
+        if processing_scroll is not None:
+            processing_scroll.setVisible(processing_visible)
+        self.processing_params_panel.setVisible(processing_visible)
+        task_phase_bar = getattr(self, "task_phase_bar", None)
+        if task_phase_bar is not None:
+            task_phase_bar.setVisible(not processing_visible)
+        task_splitter = getattr(self, "task_splitter", None)
+        if task_splitter is not None:
+            task_splitter.setMaximumHeight(
+                248 if processing_visible else 16777215
+            )
         self.advanced_toggle_btn.setText(
             "高级设置 ▾" if expanded else "高级设置 ▸"
         )
@@ -3234,30 +4212,12 @@ class SeestarGui(QMainWindow):
             if saved_geometry:
                 self.restoreGeometry(saved_geometry)
 
-            # AI processing is currently unavailable. Keep the dormant code path,
-            # but never restore a stale enabled toggle into the hidden UI.
-            self.ai_stage_enabled = False
             self.debug_mode_enabled = self.settings.value(
                 "advanced/keepIntermediateFiles", False, type=bool
             )
             self.network_mode_enabled = self.settings.value(
                 "advanced/allowNetwork", False, type=bool
             )
-            saved_provider_mode = str(
-                self.settings.value("ai/providerMode", AI_PROVIDER_DEVELOPER)
-                or AI_PROVIDER_DEVELOPER
-            )
-            self.ai_provider_mode = (
-                saved_provider_mode
-                if saved_provider_mode in AI_PROVIDER_MODES
-                else AI_PROVIDER_DEVELOPER
-            )
-            self.ai_custom_endpoint = str(
-                self.settings.value("ai/customEndpoint", "") or ""
-            ).strip()
-            self.ai_custom_model = str(
-                self.settings.value("ai/customModel", "") or ""
-            ).strip()
             saved_formats = self.settings.value(
                 "processing/outputFormats",
                 list(DEFAULT_PROCESSING_SETTINGS["output_formats"]),
@@ -3353,10 +4313,8 @@ class SeestarGui(QMainWindow):
                     ),
                 }
             )
-            self._update_ai_button_text()
             self._update_debug_button_text()
             self._update_network_button_text()
-            self._update_ai_provider_status()
 
             advanced_expanded = self.settings.value(
                 "ui/advancedExpanded", False, type=bool
@@ -3381,22 +4339,18 @@ class SeestarGui(QMainWindow):
             else:
                 recent = [str(value) for value in (recent_value or [])]
             self._recent_directories = [
-                value for value in recent if Path(value).expanduser().is_dir()
+                value for value in recent if Path(value).expanduser().exists()
             ][:8]
             self._refresh_recent_directories()
 
             last_directory = str(self.settings.value("lastDirectory", "") or "")
-            if last_directory and Path(last_directory).expanduser().is_dir():
-                self._apply_work_directory(
+            if last_directory and Path(last_directory).expanduser().exists():
+                self._apply_input_path(
                     Path(last_directory).expanduser(),
                     remember=False,
                 )
 
-            saved_mode = str(
-                self.settings.value("modeSelection", UI_MODE_RECOMMENDED)
-                or UI_MODE_RECOMMENDED
-            )
-            mode_index = self.mode_combo.findData(saved_mode)
+            mode_index = self.mode_combo.findData(UI_MODE_RECOMMENDED)
             self.mode_combo.setCurrentIndex(max(0, mode_index))
             self.input_mode = self._current_input_mode()
         finally:
@@ -3406,14 +4360,12 @@ class SeestarGui(QMainWindow):
     def _save_settings(self) -> None:
         if self._restoring_settings:
             return
-        self.settings.setValue("advanced/aiPostprocess", False)
+        self.settings.remove("advanced/aiPostprocess")
+        self.settings.remove("ai")
         self.settings.setValue(
             "advanced/keepIntermediateFiles", self.debug_mode_enabled
         )
         self.settings.setValue("advanced/allowNetwork", self.network_mode_enabled)
-        self.settings.setValue("ai/providerMode", self.ai_provider_mode)
-        self.settings.setValue("ai/customEndpoint", self.ai_custom_endpoint)
-        self.settings.setValue("ai/customModel", self.ai_custom_model)
         self.settings.setValue(
             "processing/outputFormats", list(self.output_formats)
         )
@@ -3470,10 +4422,10 @@ class SeestarGui(QMainWindow):
         )
         self.settings.setValue("ui/logExpanded", self.log_toggle_btn.isChecked())
         self.settings.setValue("ui/windowGeometry", self.saveGeometry())
-        self.settings.setValue("modeSelection", self.mode_combo.currentData())
+        self.settings.setValue("modeSelection", UI_MODE_RECOMMENDED)
         self.settings.setValue("recentDirectories", self._recent_directories)
         directory = self.dir_edit.text().strip()
-        if directory and Path(directory).expanduser().is_dir():
+        if directory and Path(directory).expanduser().exists():
             self.settings.setValue("lastDirectory", str(Path(directory).expanduser()))
         self.settings.sync()
 
@@ -3510,17 +4462,34 @@ class SeestarGui(QMainWindow):
     def dragEnterEvent(self, event) -> None:  # type: ignore[override]
         mime_data = event.mimeData()
         if mime_data.hasUrls() and any(
-            Path(url.toLocalFile()).is_dir() for url in mime_data.urls()
+            (
+                Path(url.toLocalFile()).is_dir()
+                or (
+                    Path(url.toLocalFile()).is_file()
+                    and Path(url.toLocalFile()).suffix.lower()
+                    in (MASTER_SUFFIXES | REVIEW_SUFFIXES)
+                )
+            )
+            for url in mime_data.urls()
         ):
+            set_style_property(self.drop_zone, "dragActive", True)
             event.acceptProposedAction()
             return
         event.ignore()
 
+    def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
+        set_style_property(self.drop_zone, "dragActive", False)
+        super().dragLeaveEvent(event)
+
     def dropEvent(self, event) -> None:  # type: ignore[override]
+        set_style_property(self.drop_zone, "dragActive", False)
         for url in event.mimeData().urls():
             path = Path(url.toLocalFile())
-            if path.is_dir():
-                self._apply_work_directory(path, remember=True)
+            if path.is_dir() or (
+                path.is_file()
+                and path.suffix.lower() in (MASTER_SUFFIXES | REVIEW_SUFFIXES)
+            ):
+                self._apply_input_path(path, remember=True)
                 event.acceptProposedAction()
                 return
         event.ignore()
@@ -3528,12 +4497,16 @@ class SeestarGui(QMainWindow):
     def _on_directory_edited(self) -> None:
         text = self.dir_edit.text().strip()
         path = Path(text).expanduser() if text else None
-        if path is not None and path.is_dir():
-            self._apply_work_directory(path, remember=True)
+        if path is not None and path.exists():
+            self._apply_input_path(path, remember=True)
         else:
             self._analyze_selected_directory()
 
     def _apply_work_directory(self, path: Path, *, remember: bool) -> None:
+        """Compatibility alias for callers and stored directory settings."""
+        self._apply_input_path(path, remember=remember)
+
+    def _apply_input_path(self, path: Path, *, remember: bool) -> None:
         expanded = path.expanduser()
         try:
             normalized = expanded.resolve()
@@ -3543,12 +4516,12 @@ class SeestarGui(QMainWindow):
         if not (self.worker or self.bootstrap_worker):
             self._progress_timer.stop()
             self._pipeline_started_monotonic = None
-            self._reset_stage_progress(11 if self.ai_stage_enabled else 10)
+            self._reset_stage_progress(10)
             self.warning_card.hide()
             self._last_quality_report_path = None
             self._set_status_text("Idle")
         self._analyze_selected_directory()
-        if remember and normalized.is_dir():
+        if remember and normalized.exists():
             self._remember_directory(normalized)
 
     def _remember_directory(self, path: Path) -> None:
@@ -3564,7 +4537,7 @@ class SeestarGui(QMainWindow):
         self.recent_combo.blockSignals(True)
         try:
             self.recent_combo.clear()
-            self.recent_combo.addItem("选择最近使用的目录…", None)
+            self.recent_combo.addItem("选择最近使用的输入…", None)
             for value in self._recent_directories:
                 self.recent_combo.addItem(self._display_path(value), value)
             self.recent_combo.setCurrentIndex(0)
@@ -3577,7 +4550,7 @@ class SeestarGui(QMainWindow):
     def _on_recent_directory_selected(self, index: int) -> None:
         value = self.recent_combo.itemData(index)
         if value:
-            self._apply_work_directory(Path(str(value)), remember=True)
+            self._apply_input_path(Path(str(value)), remember=True)
 
     def _directory_recommendation(self, work_dir: Path) -> tuple[str, str]:
         fits = self._fits_in_work_dir(work_dir)
@@ -3592,9 +4565,9 @@ class SeestarGui(QMainWindow):
         ]
 
         if self._linear_resume_input_path(work_dir).is_file():
-            return INPUT_MODE_LINEAR_RESUME, "可用的线性处理进度"
+            return INPUT_MODE_LINEAR_RESUME, "可用的 Stage 5 线性断点"
         if self._stage2_corrected_resume_input_path(work_dir).is_file():
-            return INPUT_MODE_STAGE2_CORRECTED_RESUME, "可用的裁切后处理进度"
+            return INPUT_MODE_STAGE2_CORRECTED_RESUME, "可用的 Stage 2 边界校正断点"
         if light_files:
             return INPUT_MODE_AUTO, f"{len(light_files)} 个 Light FITS"
         if stacked_files:
@@ -3603,40 +4576,79 @@ class SeestarGui(QMainWindow):
 
     def _analyze_selected_directory(self) -> None:
         text = self.dir_edit.text().strip()
-        work_dir = Path(text).expanduser() if text else None
-        if work_dir is None or not work_dir.is_dir():
+        selected_path = Path(text).expanduser() if text else None
+        if selected_path is None or not selected_path.exists():
+            self._input_discovery = None
             self._recommended_input_mode = INPUT_MODE_AUTO
             if self.mode_combo.currentData() == UI_MODE_RECOMMENDED:
                 self.input_mode = INPUT_MODE_AUTO
             self.mode_combo.setItemText(0, "自动推荐（完整处理）")
             self.directory_summary_label.setText(
-                "尚未选择有效目录，可将目录拖入窗口。"
+                "尚未选择有效输入，可拖入 FITS/XISF 文件、Light 目录或产品任务。"
             )
+            self.linear_phase_label.setText("— 线性处理未计划")
+            self.nonlinear_phase_label.setText("— 非线性处理未计划")
             self._update_result_actions(None)
             if self._workspace_state != WORKSPACE_RUN:
                 self._show_workspace(WORKSPACE_EMPTY)
             self.task_preview_canvas.clear_image()
-            self.task_preview_status_label.setText("等待选择目录")
+            self.task_preview_status_label.setText("等待选择输入")
             self.preview_status_label.setText("预览：等待输入")
             return
 
-        recommended_mode, detected = self._directory_recommendation(work_dir)
+        discovery = discover_input_for_processing_settings(
+            selected_path,
+            processing_settings=self._processing_settings_snapshot(),
+        )
+        self._input_discovery = discovery
+        recommended_mode = {
+            1: INPUT_MODE_STAGE1_PREPARED_RESUME,
+            2: INPUT_MODE_STAGE2_CORRECTED_RESUME,
+            5: INPUT_MODE_LINEAR_RESUME,
+        }.get(discovery.resume_after_stage, INPUT_MODE_AUTO)
         self._recommended_input_mode = recommended_mode
         recommendation = self._input_mode_label(recommended_mode)
         self.mode_combo.setItemText(0, f"自动推荐（{recommendation}）")
-        if self.mode_combo.currentData() == UI_MODE_RECOMMENDED:
-            self.input_mode = recommended_mode
-        self.directory_summary_label.setText(
-            f"已检测：{detected} · 推荐“{recommendation}”"
+        recommended_index = self.mode_combo.findData(UI_MODE_RECOMMENDED)
+        if recommended_index >= 0 and self.mode_combo.currentIndex() != recommended_index:
+            self.mode_combo.blockSignals(True)
+            try:
+                self.mode_combo.setCurrentIndex(recommended_index)
+            finally:
+                self.mode_combo.blockSignals(False)
+        self.input_mode = recommended_mode
+        presentation = describe_input_plan(discovery)
+        details = [
+            discovery.summary,
+            presentation.summary,
+            *discovery.warnings,
+            *discovery.errors,
+        ]
+        self.directory_summary_label.setText("\n".join(details))
+        self.linear_phase_label.setText(presentation.linear_phase)
+        self.nonlinear_phase_label.setText(presentation.nonlinear_phase)
+        result_root = (
+            discovery.task_directory
+            if discovery.kind == InputKind.PRODUCT_TASK
+            else None
         )
-        self._update_result_actions(work_dir)
+        self._update_result_actions(result_root)
         if self._workspace_state != WORKSPACE_RUN:
             self._show_workspace(WORKSPACE_TASK)
         if not self._restoring_settings:
-            self._schedule_initial_preview(work_dir)
+            self._schedule_initial_preview(selected_path)
 
     def _find_result_preview(self, work_dir: Path) -> Path | None:
         preferred_candidates: set[Path] = set()
+        if (work_dir / "task-manifest.json").is_file():
+            preferred_candidates.update(
+                path
+                for path in latest_result_files(
+                    work_dir,
+                    suffixes={".png"},
+                )
+                if path.suffix.lower() == ".png"
+            )
         for pattern in (
             "*_ai.png",
             "result_review*.png",
@@ -3701,6 +4713,65 @@ class SeestarGui(QMainWindow):
         current_work_dir_bytes = directory_size_bytes(work_dir)
         available_bytes = shutil.disk_usage(work_dir).free
         current_mode = input_mode or self._current_input_mode()
+        active_task = getattr(self, "_active_prepared_task", None)
+        if active_task is not None and active_task.run.root == work_dir:
+            source = active_task.source_record
+            records = source.get("files") if isinstance(source, dict) else []
+            file_sizes = [
+                max(0, int(record.get("size") or 0))
+                for record in (records if isinstance(records, list) else [])
+                if isinstance(record, dict)
+            ]
+            source_bytes = sum(file_sizes)
+            if active_task.resume_after_stage == 5:
+                base_growth_bytes = int(
+                    max(file_sizes or [0]) * LINEAR_RESUME_STAGE_ARTIFACT_COPIES
+                )
+                mode = "linear_resume"
+                selected_input_label = "Stage 5 已验证断点"
+            elif active_task.resume_after_stage == 2:
+                base_growth_bytes = int(
+                    max(file_sizes or [0]) * STAGE2_RESUME_STAGE_ARTIFACT_COPIES
+                )
+                mode = "stage2_corrected_resume"
+                selected_input_label = "Stage 2 已验证断点"
+            elif str(source.get("kind") or "") == "light_directory":
+                largest = max(file_sizes or [0])
+                average = source_bytes / max(len(file_sizes), 1)
+                processed_frame_bytes = max(
+                    largest,
+                    int(average * LIGHT_FRAME_EXPANSION_FACTOR),
+                )
+                preprocess_growth_bytes = int(
+                    source_bytes
+                    * LIGHT_FRAME_EXPANSION_FACTOR
+                    * LIGHT_PREPROCESS_SEQUENCE_COPIES
+                )
+                base_growth_bytes = preprocess_growth_bytes + int(
+                    processed_frame_bytes * STACKED_STAGE_ARTIFACT_COPIES
+                )
+                mode = "light"
+                selected_input_label = f"Light x {len(file_sizes)}"
+            else:
+                base_growth_bytes = int(
+                    max(file_sizes or [0]) * STACKED_STAGE_ARTIFACT_COPIES
+                )
+                mode = "stacked"
+                selected_input_label = active_task.display_label
+            headroom_bytes = max(
+                DISK_SPACE_MIN_HEADROOM_BYTES,
+                int(base_growth_bytes * DISK_SPACE_HEADROOM_RATIO),
+            )
+            return DiskSpaceEstimate(
+                mode=mode,
+                current_work_dir_bytes=current_work_dir_bytes,
+                input_count=max(len(file_sizes), 1),
+                input_bytes=source_bytes,
+                estimated_peak_growth_bytes=base_growth_bytes,
+                required_free_bytes=base_growth_bytes + headroom_bytes,
+                available_bytes=available_bytes,
+                selected_input_label=selected_input_label,
+            )
 
         if current_mode == INPUT_MODE_LINEAR_RESUME:
             source = self._linear_resume_input_path(work_dir)
@@ -3784,9 +4855,9 @@ class SeestarGui(QMainWindow):
 
     def _disk_space_mode_label(self, estimate: DiskSpaceEstimate) -> str:
         if estimate.mode == "linear_resume":
-            return "从线性处理后继续"
+            return "从线性反卷积与降噪后继续"
         if estimate.mode == "stage2_corrected_resume":
-            return "从裁切后继续"
+            return "从边界校正后继续"
         if estimate.mode == "light":
             return "Light 子帧完整处理"
         return "叠加图像完整处理"
@@ -3954,8 +5025,6 @@ class SeestarGui(QMainWindow):
             f"  检测到的 FITS 输入: 总计={len(fits)}, Light_={len(light_files)}, 其他={len(other_fits)}",
             f"  主机架构: {machine or '<未知>'}",
             f"  流水线脚本: {self._display_path(self.pipeline_path)}",
-            "  Stage11 模块: "
-            f"{self._display_path(self.pipeline_path.with_name('stage11_ai_postprocess.py'))}",
             f"  Siril 插件目录: {self._display_path(self.siril_plugin_dir)}",
         ]
         if current_mode == INPUT_MODE_LINEAR_RESUME:
@@ -3981,6 +5050,30 @@ class SeestarGui(QMainWindow):
         return lines
 
     def _open_result_dir(self) -> None:
+        if self._history_detail_mode:
+            run_root = self._historical_run_root
+            if run_root is not None and run_root.is_dir() and any(
+                path.is_file() for path in self._historical_result_files
+            ):
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(run_root)))
+                return
+            QMessageBox.information(
+                self,
+                "历史结果不可用",
+                "该次运行的交付文件已清理、缺失或未通过校验。",
+            )
+            return
+        task_root = self._last_task_root
+        if self._active_prepared_task is not None:
+            task_root = self._active_prepared_task.workspace.root
+        if task_root is not None and task_root.is_dir():
+            result_directory = latest_result_directory(task_root)
+            QDesktopServices.openUrl(
+                QUrl.fromLocalFile(
+                    str(result_directory or (task_root / "results"))
+                )
+            )
+            return
         path = self.dir_edit.text().strip()
         expanded = Path(path).expanduser() if path else None
         if expanded is not None and expanded.is_dir():
@@ -4003,6 +5096,31 @@ class SeestarGui(QMainWindow):
 
     def _show_completion_warning(self, work_dir: Path | None) -> None:
         self._last_quality_report_path = self._quality_report_path(work_dir)
+        self._show_run_banner(
+            "warning",
+            "处理已完成，但存在降级或需要复核的阶段。请先检查阶段状态与最终质量报告。",
+            quality_report=True,
+        )
+
+    def _show_run_banner(
+        self,
+        tone: str,
+        message: str,
+        *,
+        quality_report: bool = False,
+        show_log: bool = False,
+    ) -> None:
+        set_style_property(self.warning_card, "tone", tone)
+        symbols = {
+            "success": "✓",
+            "warning": "⚠",
+            "error": "✕",
+            "info": "●",
+        }
+        self.warning_label.setText(f"{symbols.get(tone, '•')}  {message}")
+        self.warning_label.setAccessibleDescription(message)
+        self.quality_report_btn.setVisible(quality_report)
+        self.banner_log_btn.setVisible(show_log)
         self.warning_card.show()
 
     def _open_quality_report(self) -> None:
@@ -4031,7 +5149,6 @@ class SeestarGui(QMainWindow):
         required_files = [
             ("配置模板", self.config_template),
             ("流水线脚本", self.pipeline_path),
-            ("Stage11 模块脚本", self.pipeline_path.with_name("stage11_ai_postprocess.py")),
         ]
         for label, path in required_files:
             if not path.exists():
@@ -4047,7 +5164,43 @@ class SeestarGui(QMainWindow):
             errors.append(f"工作目录不存在：{work_dir}")
 
         current_mode = input_mode or self._current_input_mode()
-        if current_mode == INPUT_MODE_LINEAR_RESUME:
+        task_run_manifest = Path(
+            str(
+                getattr(self, "_pending_runtime_overrides", {}).get(
+                    "SEESTAR_TASK_RUN_MANIFEST",
+                    "",
+                )
+            )
+        ).expanduser()
+        has_task_run_manifest = bool(
+            str(task_run_manifest)
+            and task_run_manifest.is_file()
+            and task_run_manifest.parent.resolve() == work_dir.resolve()
+        )
+        resume_checkpoint = Path(
+            str(
+                getattr(self, "_pending_runtime_overrides", {}).get(
+                    "SEESTAR_RESUME_CHECKPOINT_PATH",
+                    "",
+                )
+            )
+        ).expanduser()
+        if has_task_run_manifest and current_mode in {
+            INPUT_MODE_STAGE1_PREPARED_RESUME,
+            INPUT_MODE_STAGE2_CORRECTED_RESUME,
+            INPUT_MODE_LINEAR_RESUME,
+        }:
+            if not str(resume_checkpoint) or not resume_checkpoint.is_file():
+                errors.append("自动续跑计划缺少已验证的正式断点文件。")
+        elif has_task_run_manifest:
+            pass
+        elif current_mode == INPUT_MODE_STAGE1_PREPARED_RESUME:
+            stage1_path = work_dir / STAGE1_PREPARED_INPUT_NAME
+            if not stage1_path.is_file():
+                errors.append(
+                    f"续跑模式要求存在 {STAGE1_PREPARED_INPUT_NAME}：{stage1_path}"
+                )
+        elif current_mode == INPUT_MODE_LINEAR_RESUME:
             linear_resume_path = self._linear_resume_input_path(work_dir)
             if not linear_resume_path.is_file():
                 errors.append(
@@ -5546,12 +6699,108 @@ class SeestarGui(QMainWindow):
         finally:
             self._bootstrap_stop_event = None
 
+    def _start_task_intake(
+        self,
+        discovery: InputDiscovery,
+        processing_settings: dict[str, object],
+    ) -> None:
+        """Hash sources and materialize task/run manifests off the UI thread."""
+
+        if self.intake_worker and self.intake_worker.isRunning():
+            return
+
+        def prepare(
+            stop_event: threading.Event,
+            progress,
+        ) -> PreparedTaskQueue:
+            progress("正在校验来源并建立独立任务…")
+            if stop_event.is_set():
+                raise BootstrapCancelled()
+            try:
+                queue = prepare_task_queue(
+                    discovery,
+                    processing_settings=processing_settings,
+                    cancel_check=stop_event.is_set,
+                )
+            except InterruptedError as exc:
+                raise BootstrapCancelled() from exc
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                if stop_event.is_set():
+                    raise BootstrapCancelled() from exc
+                raise BootstrapError("无法建立任务", str(exc)) from exc
+            if stop_event.is_set():
+                raise BootstrapCancelled()
+            progress(
+                f"已建立 {len(queue.tasks)} 个任务，正在准备预检…"
+            )
+            return queue
+
+        self.intake_worker = BootstrapWorker(prepare, parent=self)
+        self.intake_worker.progress.connect(self._on_task_intake_progress)
+        self.intake_worker.succeeded.connect(self._on_task_intake_succeeded)
+        self.intake_worker.failed.connect(self._on_task_intake_failed)
+        self.intake_worker.cancelled.connect(self._on_task_intake_cancelled)
+        self._set_running(True)
+        self._set_status_text("Preparing")
+        self._append_event("开始在后台校验来源内容指纹…")
+        self.intake_worker.start()
+        self._update_toolbar_state()
+
+    def _cleanup_task_intake_worker(self) -> None:
+        if self.intake_worker:
+            self.intake_worker.wait(200)
+            self.intake_worker.deleteLater()
+            self.intake_worker = None
+
+    def _on_task_intake_progress(self, message: str) -> None:
+        self._set_status_message(message)
+        self._append_event(message)
+
+    def _on_task_intake_succeeded(self, result: object) -> None:
+        self._cleanup_task_intake_worker()
+        if not isinstance(result, PreparedTaskQueue) or not result.tasks:
+            self._on_task_intake_failed(
+                "无法建立任务",
+                "后台任务准备没有返回可执行任务。",
+            )
+            return
+        self._prepared_tasks = result.tasks
+        self._prepared_task_index = 0
+        first_task = result.tasks[0]
+        self._append_event(
+            f"来源校验完成：{len(result.tasks)} 个独立任务，将串行执行。"
+        )
+        self._set_running(False)
+        self._start_run(prepared_task=first_task)
+
+    def _on_task_intake_failed(self, title: str, detail: str) -> None:
+        self._cleanup_task_intake_worker()
+        self._prepared_tasks = ()
+        self._prepared_task_index = 0
+        self._active_prepared_task = None
+        self._set_status_text("Idle")
+        self._set_running(False)
+        QMessageBox.critical(self, title, detail)
+        self._append_event(f"任务目录创建失败：{detail}")
+
+    def _on_task_intake_cancelled(self) -> None:
+        self._cleanup_task_intake_worker()
+        self._prepared_tasks = ()
+        self._prepared_task_index = 0
+        self._active_prepared_task = None
+        self._set_status_text("Idle")
+        self._set_running(False)
+        self._append_event("已停止来源校验；原始文件未被修改。")
+
     def _start_run(
         self,
         _checked: bool = False,
         *,
         input_mode_override: str | None = None,
+        prepared_task: PreparedTask | None = None,
     ) -> None:
+        if self.intake_worker and self.intake_worker.isRunning():
+            return
         gaia_worker = getattr(self, "gaia_catalog_worker", None)
         if gaia_worker and gaia_worker.isRunning():
             QMessageBox.information(
@@ -5565,45 +6814,53 @@ class SeestarGui(QMainWindow):
         if self.worker and self.worker.isRunning():
             return
 
-        directory_text = self.dir_edit.text().strip()
-        if not directory_text:
-            QMessageBox.information(self, "请选择目录", "请先拖入或选择工作目录。")
+        selected_text = self.dir_edit.text().strip()
+        if not selected_text:
+            QMessageBox.information(self, "请选择输入", "请先拖入或选择图像文件或目录。")
             return
-        work_dir = Path(directory_text).expanduser()
-        if self.ai_stage_enabled and not self.network_mode_enabled:
-            QMessageBox.warning(
-                self,
-                "AI 需要联网",
-                "启用 AI 后期时，请同时在高级设置中开启“允许联网”。",
+        selected_path = Path(selected_text).expanduser()
+        if prepared_task is None:
+            discovery = self._input_discovery
+            if (
+                discovery is None
+                or discovery.selected_path != selected_path.resolve()
+                or discovery.kind == InputKind.PRODUCT_TASK
+            ):
+                discovery = discover_input_for_processing_settings(
+                    selected_path,
+                    processing_settings=self._processing_settings_snapshot(),
+                )
+                self._input_discovery = discovery
+            if not discovery.accepted:
+                detail = "\n".join((*discovery.errors, *discovery.warnings))
+                QMessageBox.critical(
+                    self,
+                    "无法建立任务",
+                    detail or discovery.summary,
+                )
+                return
+            self._start_task_intake(
+                discovery,
+                self._processing_settings_snapshot(),
             )
             return
-        try:
-            self._pending_ai_runtime_overrides = (
-                self._resolve_ai_runtime_overrides()
-                if self.ai_stage_enabled
-                else {}
-            )
-        except AiCredentialError as exc:
-            QMessageBox.warning(
-                self,
-                "AI 模型配置不可用",
-                f"{exc}\n\n请点击“模型配置…”切换到自定义模型，或关闭 AI 后期。",
-            )
-            self._append_event(f"AI 模型配置不可用：{exc}")
-            return
-        input_mode = (
-            input_mode_override
-            if input_mode_override in {
-                INPUT_MODE_AUTO,
-                INPUT_MODE_LINEAR_RESUME,
-                INPUT_MODE_STAGE2_CORRECTED_RESUME,
-            }
-            else self._current_input_mode()
-        )
+        self._active_prepared_task = prepared_task
+        self._last_task_root = prepared_task.workspace.root
+        work_dir = prepared_task.run.root
+        self._register_history_run(prepared_task)
+        input_mode = prepared_task.input_mode
+        if input_mode_override in {
+            INPUT_MODE_AUTO,
+            INPUT_MODE_STAGE1_PREPARED_RESUME,
+            INPUT_MODE_LINEAR_RESUME,
+            INPUT_MODE_STAGE2_CORRECTED_RESUME,
+        } and not prepared_task.runtime_overrides:
+            input_mode = str(input_mode_override)
         (
             self._pending_runtime_overrides,
             self._pending_runtime_unset_keys,
         ) = self._processing_runtime_configuration(input_mode)
+        self._pending_runtime_overrides.update(prepared_task.runtime_overrides)
         if self.graxpert_model_path:
             model_path = Path(self.graxpert_model_path).expanduser()
             if not model_path.exists():
@@ -5614,33 +6871,31 @@ class SeestarGui(QMainWindow):
                 )
         errors = self._preflight_errors(work_dir, input_mode=input_mode)
         if errors:
-            self._pending_ai_runtime_overrides.clear()
             self._pending_runtime_overrides.clear()
             self._pending_runtime_unset_keys.clear()
             QMessageBox.critical(self, "预检失败", "\n\n".join(errors))
             self._append_event("预检失败：")
             for err in errors:
                 self._append_text(f"  - {err}\n")
+            self._update_active_history_run(
+                STATUS_FAILED,
+                failure_reason="；".join(errors),
+            )
             return
 
-        self._remember_directory(work_dir)
+        self._remember_directory(selected_path)
         self._current_work_dir = work_dir
         self._run_input_mode_override = input_mode
         self._last_run_snapshot = {
-            "work_dir": str(work_dir),
+            "work_dir": str(selected_path),
             "input_mode": input_mode,
-            "ai_stage_enabled": self.ai_stage_enabled,
             "debug_mode_enabled": self.debug_mode_enabled,
             "network_mode_enabled": self.network_mode_enabled,
-            "ai_provider_mode": self.ai_provider_mode,
-            "ai_custom_endpoint": self.ai_custom_endpoint,
-            "ai_custom_model": self.ai_custom_model,
             "processing_settings": self._processing_settings_snapshot(),
         }
-        stage_count = 11 if self.ai_stage_enabled else 10
         self._progress_timer.stop()
         self._pipeline_started_monotonic = None
-        self._reset_stage_progress(stage_count)
+        self._reset_stage_progress(10)
         self._last_quality_report_path = None
         self.warning_card.hide()
         self._run_terminal_status = None
@@ -5651,7 +6906,9 @@ class SeestarGui(QMainWindow):
         self.preview_canvas.clear_image()
         self.preview_stage_label.setText("预览：Stage 0 · 输入")
         self.preview_activity_label.setText("正在准备运行环境")
-        self.preview_notice_label.setText("Stage 0 原始预览 · 无显示拉伸")
+        self.preview_notice_label.setText(
+            "Stage 0 屏幕拉伸预览 · 仅影响显示，不修改源数据"
+        )
         self.run_phase_label.setText("准备运行环境")
         self._schedule_initial_preview(work_dir, input_mode)
         self._update_run_summary(work_dir, input_mode)
@@ -5662,6 +6919,11 @@ class SeestarGui(QMainWindow):
         self.progress_bar.setFormat("正在准备运行环境…")
         self.progress_bar.show()
         self._append_event("开始准备运行环境…")
+        if prepared_task.queue_total > 1:
+            self._append_event(
+                f"串行任务 {prepared_task.queue_index}/{prepared_task.queue_total}："
+                f"{prepared_task.display_label}"
+            )
 
         self.bootstrap_worker = BootstrapWorker(
             lambda stop_event, progress: self._bootstrap_runtime(
@@ -5707,7 +6969,6 @@ class SeestarGui(QMainWindow):
 
     def _on_bootstrap_failed(self, title: str, detail: str) -> None:
         self._cleanup_bootstrap_worker()
-        self._pending_ai_runtime_overrides.clear()
         self._pending_runtime_overrides.clear()
         self._pending_runtime_unset_keys.clear()
         self._run_terminal_status = "Failed"
@@ -5719,15 +6980,28 @@ class SeestarGui(QMainWindow):
         self.preview_activity_label.setText("运行环境准备失败")
         self.run_phase_label.setText("准备失败")
         self.log_toggle_btn.setChecked(True)
+        self._show_run_banner(
+            "error",
+            "运行环境准备失败。任务尚未进入图像处理，请查看详细日志后重试。",
+            show_log=True,
+        )
         QMessageBox.critical(self, title, detail)
         self._append_event(f"{title}：{detail}")
+        self._update_active_history_run(
+            STATUS_FAILED,
+            failure_reason=f"{title}：{detail}",
+        )
         self._update_result_actions(self._current_work_dir)
         self._current_work_dir = None
+        self._active_prepared_task = None
+        self._prepared_tasks = ()
+        self._prepared_task_index = 0
+        self._active_history_task_key = None
+        self._active_history_run_id = None
         self._set_running(False)
 
     def _on_bootstrap_cancelled(self) -> None:
         self._cleanup_bootstrap_worker()
-        self._pending_ai_runtime_overrides.clear()
         self._pending_runtime_overrides.clear()
         self._pending_runtime_unset_keys.clear()
         self._run_terminal_status = "Stopped"
@@ -5738,9 +7012,23 @@ class SeestarGui(QMainWindow):
         self.progress_bar.hide()
         self.preview_activity_label.setText("任务已停止 · 保留最新可靠预览")
         self.run_phase_label.setText("已停止")
+        self._show_run_banner(
+            "info",
+            "运行环境准备已停止；尚未开始的阶段不会产生新文件。",
+            show_log=True,
+        )
         self._append_event("运行环境准备已停止。")
+        self._update_active_history_run(
+            STATUS_STOPPED,
+            failure_reason="用户在运行环境准备阶段停止任务",
+        )
         self._update_result_actions(self._current_work_dir)
         self._current_work_dir = None
+        self._active_prepared_task = None
+        self._prepared_tasks = ()
+        self._prepared_task_index = 0
+        self._active_history_task_key = None
+        self._active_history_run_id = None
         self._set_running(False)
 
     def _start_pipeline(
@@ -5757,6 +7045,7 @@ class SeestarGui(QMainWindow):
                 encoding="utf-8",
                 errors="replace",
             )
+        self._update_active_history_run(STATUS_RUNNING)
         self._append_divider(
             "本次任务开始",
             [
@@ -5783,19 +7072,6 @@ class SeestarGui(QMainWindow):
         )
         for line in self._processing_settings_summary_lines(input_mode):
             self._append_event("本次处理参数：" + line)
-        self._append_event(
-            f"本次运行 ai_stage11={'ON' if self.ai_stage_enabled else 'OFF'}"
-        )
-        if self.ai_stage_enabled:
-            self._append_event(
-                "本次 AI 配置："
-                + (
-                    "自定义模型"
-                    if self.ai_provider_mode == AI_PROVIDER_CUSTOM
-                    else "开发者试用"
-                )
-            )
-
         siril_candidates = self._resolve_runtime_candidates()
         self._append_event(
             "运行时顺序: "
@@ -5813,14 +7089,11 @@ class SeestarGui(QMainWindow):
             input_mode=input_mode,
             debug_mode=self.debug_mode_enabled,
             network_mode=self.network_mode_enabled,
-            ai_stage_enabled=self.ai_stage_enabled,
-            ai_runtime_overrides=self._pending_ai_runtime_overrides,
             runtime_overrides=self._pending_runtime_overrides,
             runtime_unset_keys=self._pending_runtime_unset_keys,
             graxpert_application_home=Path.home(),
             parent=self,
         )
-        self._pending_ai_runtime_overrides.clear()
         self._pending_runtime_overrides.clear()
         self._pending_runtime_unset_keys.clear()
         self.worker.log.connect(self._append_text)
@@ -5830,14 +7103,18 @@ class SeestarGui(QMainWindow):
         self.worker.preview.connect(self._on_pipeline_preview)
         self.worker.done.connect(self._on_worker_done)
 
-        stage_count = 11 if self.ai_stage_enabled else 10
-        self._begin_stage_progress(stage_count)
+        self._begin_stage_progress(10)
         self.progress_bar.hide()
         self.preview_activity_label.setText("等待 Stage 1 开始")
         self._set_status_text("Running")
         self.worker.start()
 
     def _stop_run(self) -> None:
+        if self.intake_worker and self.intake_worker.isRunning():
+            self._append_event("已请求停止来源校验…")
+            self._set_status_text("Stopping")
+            self.intake_worker.stop()
+            return
         if self.bootstrap_worker and self.bootstrap_worker.isRunning():
             self._append_event("已请求停止运行环境准备…")
             self._set_status_text("Stopping")
@@ -5855,18 +7132,21 @@ class SeestarGui(QMainWindow):
     def _set_run_phase_for_stage(self, stage: int) -> None:
         if stage <= 6:
             phase_text = "线性处理 · Stage 1–6"
-        elif stage <= 10:
-            phase_text = "非线性处理 · Stage 7–10"
         else:
-            phase_text = "AI 后期 · Stage 11"
+            phase_text = "非线性处理 · Stage 7–10"
         self.run_phase_label.setText(phase_text)
 
     def _on_pipeline_progress(self, stage: int, title: str, state: str) -> None:
         stage = int(stage)
-        stage_count = max(11 if self.ai_stage_enabled else 10, int(stage))
+        if stage < 1 or stage > 10:
+            return
+        stage_count = 10
         self._progress_stage_count = stage_count
 
-        detail = title.strip() or PIPELINE_STAGE_TITLES.get(stage, f"阶段 {stage}")
+        detail = PIPELINE_STAGE_TITLES.get(
+            stage,
+            title.strip() or f"阶段 {stage}",
+        )
         normalized_state = state.strip().lower() or "running"
         if normalized_state not in PIPELINE_PROGRESS_STATE_LABELS:
             normalized_state = "failed"
@@ -5876,7 +7156,10 @@ class SeestarGui(QMainWindow):
         if stage not in self._stage_items:
             chip = QLabel()
             chip.setWordWrap(True)
-            chip.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            chip.setSizePolicy(
+                QSizePolicy.Policy.Preferred,
+                QSizePolicy.Policy.Minimum,
+            )
             self.stage_stepper_layout.addWidget(chip, 1)
             self._stage_items[stage] = chip
         self._stage_progress_titles[stage] = detail
@@ -5939,6 +7222,8 @@ class SeestarGui(QMainWindow):
         if not isinstance(payload, dict):
             return
         stage = int(stage)
+        if stage < 1 or stage > 10:
+            return
         self._stage_progress_details[stage] = dict(payload)
         raw_status = str(payload.get("status") or "").strip().lower()
         display_status = str(
@@ -5966,7 +7251,12 @@ class SeestarGui(QMainWindow):
         payload: str,
     ) -> None:
         stage = int(stage)
-        detail = title.strip() or PIPELINE_STAGE_TITLES.get(stage, f"阶段 {stage}")
+        if stage < 1 or stage > 10:
+            return
+        detail = PIPELINE_STAGE_TITLES.get(
+            stage,
+            title.strip() or f"阶段 {stage}",
+        )
         if status == "ready" and self._display_latest_preview(
             Path(payload),
             stage=stage,
@@ -5977,11 +7267,11 @@ class SeestarGui(QMainWindow):
             )
             if stage <= 6:
                 self.preview_notice_label.setText(
-                    "线性原始预览 · 无显示拉伸（画面可能较暗）"
+                    "线性数据 · 已应用屏幕显示拉伸（不写入处理数据）"
                 )
             else:
                 self.preview_notice_label.setText(
-                    "阶段原始输出预览 · 无额外显示拉伸"
+                    "非线性阶段预览 · 无额外显示拉伸"
                 )
             return
 
@@ -5999,6 +7289,30 @@ class SeestarGui(QMainWindow):
 
     def _on_worker_done(self, status: str, exit_code: int, had_errors: bool, cli_used: str) -> None:
         work_dir = self._current_work_dir
+        history_status = self._terminal_history_status(status, work_dir)
+        history_failure_reason: str | None = None
+        if history_status in {STATUS_FAILED, STATUS_STOPPED}:
+            history_failure_reason = (
+                "用户停止处理"
+                if history_status == STATUS_STOPPED
+                else f"处理失败（GUI 状态：{self._display_status(status)}）"
+            )
+            if work_dir is not None:
+                try:
+                    result = load_verified_pipeline_result(work_dir)
+                except HistoryStoreError:
+                    result = None
+                if result is not None and result.get("failure_reason"):
+                    history_failure_reason = str(result["failure_reason"])
+        self._update_active_history_run(
+            history_status,
+            failure_reason=history_failure_reason,
+            exit_code=exit_code,
+        )
+        has_next_task = bool(
+            status in {"Completed", "CompletedWithWarning"}
+            and self._prepared_task_index + 1 < len(self._prepared_tasks)
+        )
         self._finish_stage_progress(status)
         self.progress_bar.hide()
         self._run_terminal_status = status
@@ -6008,6 +7322,29 @@ class SeestarGui(QMainWindow):
         self._append_event(
             f"处理结束：状态={self._display_status(status)}，退出码={exit_code}，CLI={cli_used}"
         )
+        if (
+            status in {"Completed", "CompletedWithWarning"}
+            and self._active_prepared_task is not None
+        ):
+            try:
+                latest_index = publish_latest_result_index(
+                    run_manifest_path=self._active_prepared_task.run.manifest_path
+                )
+                self._append_event(
+                    "已更新任务最新结果索引："
+                    f"run={latest_index.get('run_id')} status={latest_index.get('status')}"
+                )
+                retention = apply_task_retention(
+                    self._active_prepared_task.workspace.root,
+                    preserve_intermediates=self.debug_mode_enabled,
+                )
+                self._append_event(
+                    "任务保留策略已应用："
+                    f"清理旧交付 {len(retention.get('deleted_files') or [])} 个，"
+                    f"中间目录 {len(retention.get('removed_process_directories') or [])} 个"
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                self._append_event(f"最新结果或保留策略未更新：{exc}")
         if status == "Failed" and had_errors:
             self._append_event("在输出中检测到 Siril/脚本错误。")
         if status == "CompletedWithWarning":
@@ -6015,6 +7352,28 @@ class SeestarGui(QMainWindow):
             self._append_event(
                 "最终产物已生成，但流水线存在失败阶段、降级回退或收尾异常；"
                 "请查看阶段汇总和 final_quality_report.json 后再使用。"
+            )
+        elif status == "Completed" and has_next_task:
+            self._show_run_banner(
+                "info",
+                "当前叠加分组已完成，正在按队列启动下一个独立任务。",
+            )
+        elif status == "Completed":
+            self._show_run_banner(
+                "success",
+                "处理已完成。当前预览是最后一个通过验收的可靠结果。",
+            )
+        elif status == "Stopped":
+            self._show_run_banner(
+                "info",
+                "任务已停止；已完成阶段与最后一张可靠预览仍然保留。",
+                show_log=True,
+            )
+        else:
+            self._show_run_banner(
+                "error",
+                "处理失败。已保留最后一张可靠预览，请查看详细日志定位原因。",
+                show_log=True,
             )
         terminal_activity = {
             "Completed": "处理已完成 · 当前为最终可靠预览",
@@ -6034,11 +7393,25 @@ class SeestarGui(QMainWindow):
         )
 
         self._update_result_actions(work_dir)
+        if has_next_task:
+            self._cleanup_after_run(keep_queue=True)
+            self._prepared_task_index += 1
+            next_task = self._prepared_tasks[self._prepared_task_index]
+            self._active_prepared_task = next_task
+            self._run_terminal_status = None
+            self._append_event(
+                f"启动串行任务 {next_task.queue_index}/{next_task.queue_total}："
+                f"{next_task.display_label}"
+            )
+            QTimer.singleShot(
+                0,
+                lambda task=next_task: self._start_run(prepared_task=task),
+            )
+            return
         self._cleanup_after_run()
         self._set_running(False)
 
-    def _cleanup_after_run(self) -> None:
-        self._pending_ai_runtime_overrides.clear()
+    def _cleanup_after_run(self, *, keep_queue: bool = False) -> None:
         self._pending_runtime_overrides.clear()
         self._pending_runtime_unset_keys.clear()
         if self.worker:
@@ -6053,14 +7426,23 @@ class SeestarGui(QMainWindow):
 
         self._current_work_dir = None
         self._run_input_mode_override = None
+        if not keep_queue:
+            self._active_prepared_task = None
+            self._prepared_tasks = ()
+            self._prepared_task_index = 0
+            self._active_history_task_key = None
+            self._active_history_run_id = None
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         active_worker = None
         gaia_catalog_worker = getattr(self, "gaia_catalog_worker", None)
+        intake_worker = getattr(self, "intake_worker", None)
         bootstrap_worker = getattr(self, "bootstrap_worker", None)
         pipeline_worker = getattr(self, "worker", None)
         if gaia_catalog_worker and gaia_catalog_worker.isRunning():
             active_worker = gaia_catalog_worker
+        elif intake_worker and intake_worker.isRunning():
+            active_worker = intake_worker
         elif bootstrap_worker and bootstrap_worker.isRunning():
             active_worker = bootstrap_worker
         elif pipeline_worker and pipeline_worker.isRunning():

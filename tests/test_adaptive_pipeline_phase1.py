@@ -88,6 +88,10 @@ class AdaptivePipelinePhase1Tests(unittest.TestCase):
         policy = load_policy("does_not_exist")
 
         self.assertEqual(policy["policy_name"], "generic_low_snr_safe")
+        self.assertEqual(
+            policy["stage4_color"]["calibration_policy"],
+            "spcc_first_then_pcc",
+        )
 
     def test_named_policy_uses_builtin_overlay_when_config_files_are_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

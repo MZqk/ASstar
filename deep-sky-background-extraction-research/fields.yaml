@@ -1,0 +1,82 @@
+field_categories:
+  - category: 结论
+    fields:
+      - name: item_name
+        description: 调研对象名称
+        detail_level: 极简
+        required: true
+      - name: executive_conclusion
+        description: 对本调研对象最重要的结论，明确事实与推断
+        detail_level: 详细
+        required: true
+      - name: standard_status
+        description: 是否存在统一行业或科学标准，标准适用范围是什么
+        detail_level: 详细
+        required: true
+      - name: evidence_level
+        description: 证据强度、证据类型及主要局限
+        detail_level: 详细
+        required: true
+  - category: 技术审计
+    fields:
+      - name: metric_definition
+        description: 指标、公式、量纲、版本及输入假设
+        detail_level: 详细
+        required: true
+      - name: threshold_provenance
+        description: 阈值来源、历史、标定数据或缺失证据
+        detail_level: 详细
+        required: true
+      - name: scale_and_state_sensitivity
+        description: 对线性或非线性状态、归一化、裁切、分辨率、曝光和通道的敏感性
+        detail_level: 详细
+        required: true
+      - name: contamination_classification
+        description: 区分加性梯度、乘性暗角或平场误差、条带、walking noise 与真实天体结构
+        detail_level: 详细
+        required: true
+  - category: 判定与安全性
+    fields:
+      - name: need_correction_criteria
+        description: 判断是否需要背景校正的可观测条件和统计依据
+        detail_level: 详细
+        required: true
+      - name: auto_apply_safety_criteria
+        description: 判断是否可安全自动执行背景提取的条件
+        detail_level: 详细
+        required: true
+      - name: sky_coverage_and_sampling
+        description: 天空占比、源掩膜、样本覆盖、样本数与模型复杂度要求
+        detail_level: 详细
+        required: true
+      - name: residual_and_preservation_tests
+        description: 残差结构、留出样本、无操作基线、目标通量和低表面亮度结构保真验证
+        detail_level: 详细
+        required: true
+      - name: high_risk_cases
+        description: 扩展天体、低表面亮度、IFN、窄带、无真实天空、拥挤星场等高风险情形
+        detail_level: 详细
+        required: true
+  - category: 项目落地
+    fields:
+      - name: project_assessment
+        description: 对当前 Stage 3 设计的评价及具体影响
+        detail_level: 详细
+        required: true
+      - name: recommended_gate
+        description: 建议的判定门、复核区间、降级路径与可解释输出
+        detail_level: 详细
+        required: true
+      - name: calibration_protocol
+        description: 标注数据、真值、分层抽样、性能指标、阈值敏感性和版本管理方案
+        detail_level: 详细
+        required: true
+      - name: source_references
+        description: 直接支持结论的官方文档、论文、代码或提交链接，含标题和 URL 或本地绝对路径
+        detail_level: 详细
+        required: true
+      - name: open_questions
+        description: 尚不能从现有证据确认的问题和所需补充数据
+        detail_level: 简要
+        required: true
+uncertain: []

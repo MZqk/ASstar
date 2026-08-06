@@ -455,7 +455,7 @@ def apply_stage7_starless_pixel_repair(
             label="stage7 starless pixel repair",
         )
         pipeline._save_stage_output("starless")
-        pipeline._save_stage_output("stage7_starless_repaired")
+        pipeline._save_stage_output("stage6_starless_repaired")
         pipeline.starless_file = pipeline.process_dir / "starless.fit"
 
         metrics = {

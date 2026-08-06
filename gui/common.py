@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -16,13 +18,13 @@ __all__ = [
     "AI_ENV_ALLOWED_KEYS",
     "AI_ENV_OVERRIDE_NAME",
     "AI_ENV_RESOURCE_REL",
-    "AI_STAGE_RELEASE_ENABLED",
     "APP_RUNTIME_HOME_REL",
     "COSMIC_CLARITY_BUNDLE_REL",
     "COSMIC_CLARITY_REQUIRED_MODEL_FILES",
     "DEFAULT_ENV_RESOURCE_REL",
     "DEFAULT_SIRIL_CONFIG_TEMPLATE",
     "INPUT_MODE_AUTO",
+    "INPUT_MODE_STAGE1_PREPARED_RESUME",
     "INPUT_MODE_LINEAR_RESUME",
     "INPUT_MODE_STAGE2_CORRECTED_RESUME",
     "LINEAR_RESUME_INPUT_NAME",
@@ -32,9 +34,11 @@ __all__ = [
     "PIPELINE_RESOURCE_REL",
     "SIRIL_COSMIC_REQUIRED_WHEEL_LABELS",
     "SIRIL_PLUGIN_RESOURCE_REL",
+    "SIRIL_SPCC_DATABASE_SEED_REL",
     "SIRIL_REQUIRED_SITE_PACKAGES",
     "SIRIL_STARLESS_REQUIRED_WHEEL_LABELS",
     "SIRIL_VENDOR_FALLBACK_PACKAGES",
+    "STAGE1_PREPARED_INPUT_NAME",
     "STAGE2_CORRECTED_INPUT_NAME",
     "SYQON_STARLESS_BUNDLE_REL",
     "apply_siril_runtime_patches",
@@ -43,6 +47,7 @@ __all__ = [
     "default_pipeline_path",
     "default_runtime_home",
     "default_siril_plugin_dir",
+    "default_siril_spcc_database_seed_dir",
     "is_frozen",
     "normalize_siril_config_template",
     "parse_ai_env_file",
@@ -55,13 +60,11 @@ __all__ = [
     "scrub_python_env",
     "shell_quote_path",
     "siril_state_root_from_home",
+    "siril_spcc_database_root_from_home",
+    "sync_siril_spcc_database_seed",
+    "verify_siril_spcc_database_seed",
     "verify_siril_offline_seed_venv",
 ]
-
-
-# Phase 1 release boundary: keep the dormant Stage11 implementation available
-# for direct pipeline development, but never expose or enable it from the GUI.
-AI_STAGE_RELEASE_ENABLED = False
 
 
 def is_frozen() -> bool:
@@ -370,6 +373,9 @@ def normalize_siril_config_template(
 
 PIPELINE_RESOURCE_REL = Path("pipeline") / "seestar_Superimpose.py"
 SIRIL_PLUGIN_RESOURCE_REL = Path("resources") / "siril_plugins"
+SIRIL_SPCC_DATABASE_SEED_REL = Path("SirilSPCCDatabaseSeed")
+SIRIL_SPCC_DATABASE_SEED_SCHEMA = "seestar.siril-spcc-database-seed.v1"
+SIRIL_SPCC_DATABASE_VERSION_MARKER = ".seestar-superimpose-spcc-seed"
 SYQON_STARLESS_BUNDLE_REL = Path("syqon_starless")
 COSMIC_CLARITY_BUNDLE_REL = Path("cosmic_clarity")
 COSMIC_CLARITY_REQUIRED_MODEL_FILES = (
@@ -414,8 +420,20 @@ AI_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_TEMP_CLEANUP_TIMEOUT_SEC",
         "SEESTAR_SIRILPY_TIMEOUT_SEC",
         "SEESTAR_WORKFLOW_PLUGIN_PROBE",
+        "SEESTAR_SPCC_ENABLE",
         "SEESTAR_STAGE4_PLATESOLVE_ENABLE",
         "SEESTAR_STAGE4_PLATESOLVE_CATALOGS",
+        "SEESTAR_STAGE4_SPCC_TIMEOUT_SEC",
+        "SEESTAR_STAGE4_SPCC_OSC_SENSOR",
+        "SEESTAR_STAGE4_SPCC_OSC_FILTER",
+        "SEESTAR_STAGE4_SPCC_WHITE_REF",
+        "SEESTAR_STAGE4_SPCC_LIMITMAG",
+        "SEESTAR_STAGE4_SPCC_NB_R_WAVELENGTH_NM",
+        "SEESTAR_STAGE4_SPCC_NB_R_BANDWIDTH_NM",
+        "SEESTAR_STAGE4_SPCC_NB_G_WAVELENGTH_NM",
+        "SEESTAR_STAGE4_SPCC_NB_G_BANDWIDTH_NM",
+        "SEESTAR_STAGE4_SPCC_NB_B_WAVELENGTH_NM",
+        "SEESTAR_STAGE4_SPCC_NB_B_BANDWIDTH_NM",
         "SEESTAR_GAIA_ASTRO_CATALOG",
         "SEESTAR_STAGE4_FILTER_HINT",
         "SEESTAR_STAGE4_PCC_TIMEOUT_SEC",
@@ -489,6 +507,14 @@ def default_siril_plugin_dir(resources: Path) -> Path:
     return project_root() / SIRIL_PLUGIN_RESOURCE_REL
 
 
+def default_siril_spcc_database_seed_dir(resources: Path) -> Path:
+    candidates = (
+        resources / SIRIL_SPCC_DATABASE_SEED_REL,
+        resources / "siril_spcc_database",
+    )
+    return next((path for path in candidates if path.is_dir()), candidates[0])
+
+
 def resolve_existing_path(candidates: list[Path]) -> Path:
     for path in candidates:
         if path.exists():
@@ -502,6 +528,149 @@ def default_runtime_home() -> Path:
 
 def siril_state_root_from_home(runtime_home: Path) -> Path:
     return runtime_home / "Library/Application Support/org.siril.Siril/siril"
+
+
+def siril_spcc_database_root_from_home(runtime_home: Path) -> Path:
+    return (
+        runtime_home
+        / "Library/Application Support/org.siril.Siril/siril-spcc-database"
+    )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_siril_spcc_database_seed_manifest(
+    seed_root: Path,
+) -> tuple[dict, list[tuple[Path, str]]]:
+    manifest_path = seed_root / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(
+            f"SPCC seed manifest 无法读取：{manifest_path} ({exc})"
+        ) from exc
+
+    if not isinstance(manifest, dict):
+        raise ValueError(f"SPCC seed manifest 格式无效：{manifest_path}")
+    if manifest.get("schema") != SIRIL_SPCC_DATABASE_SEED_SCHEMA:
+        raise ValueError(
+            "SPCC seed manifest schema 不受支持："
+            f"{manifest.get('schema')!r}"
+        )
+
+    source = manifest.get("source")
+    commit = source.get("commit") if isinstance(source, dict) else None
+    if not isinstance(commit, str) or len(commit) != 40:
+        raise ValueError("SPCC seed manifest 缺少固定的 40 位 source commit")
+
+    raw_files = manifest.get("files")
+    if not isinstance(raw_files, list) or not raw_files:
+        raise ValueError("SPCC seed manifest 未列出任何文件")
+
+    entries: list[tuple[Path, str]] = []
+    seen: set[Path] = set()
+    for item in raw_files:
+        if not isinstance(item, dict):
+            raise ValueError("SPCC seed manifest files 条目格式无效")
+        relative = Path(str(item.get("path") or ""))
+        expected_sha256 = str(item.get("sha256") or "").lower()
+        if (
+            not relative.parts
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or relative in seen
+        ):
+            raise ValueError(f"SPCC seed manifest 文件路径无效：{relative}")
+        if len(expected_sha256) != 64 or any(
+            char not in "0123456789abcdef" for char in expected_sha256
+        ):
+            raise ValueError(f"SPCC seed manifest SHA-256 无效：{relative}")
+        seen.add(relative)
+        entries.append((relative, expected_sha256))
+    return manifest, entries
+
+
+def verify_siril_spcc_database_seed(
+    seed_root: Path,
+    runtime_home: Path,
+) -> tuple[bool, str]:
+    try:
+        manifest, entries = _load_siril_spcc_database_seed_manifest(seed_root)
+        target_root = siril_spcc_database_root_from_home(runtime_home)
+        for relative, expected_sha256 in entries:
+            source = seed_root / relative
+            if not source.is_file():
+                return False, f"bundled SPCC seed 文件缺失：{source}"
+            if _file_sha256(source) != expected_sha256:
+                return False, f"bundled SPCC seed 校验失败：{source}"
+            target = target_root / relative
+            if not target.is_file():
+                return False, f"runtime SPCC 数据文件缺失：{target}"
+            if _file_sha256(target) != expected_sha256:
+                return False, f"runtime SPCC 数据校验失败：{target}"
+        commit = manifest["source"]["commit"]
+        return True, f"commit={commit}; files={len(entries)}; path={target_root}"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def sync_siril_spcc_database_seed(
+    seed_root: Path,
+    runtime_home: Path,
+) -> dict[str, object]:
+    manifest, entries = _load_siril_spcc_database_seed_manifest(seed_root)
+    target_root = siril_spcc_database_root_from_home(runtime_home)
+    target_root.mkdir(parents=True, exist_ok=True)
+
+    copied: list[str] = []
+    for relative, expected_sha256 in entries:
+        source = seed_root / relative
+        if not source.is_file():
+            raise FileNotFoundError(f"bundled SPCC seed 文件缺失：{source}")
+        if _file_sha256(source) != expected_sha256:
+            raise ValueError(f"bundled SPCC seed 校验失败：{source}")
+
+        target = target_root / relative
+        if target.is_file() and _file_sha256(target) == expected_sha256:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.seestar-tmp")
+        try:
+            shutil.copy2(source, temporary)
+            if _file_sha256(temporary) != expected_sha256:
+                raise ValueError(f"runtime SPCC 临时文件校验失败：{temporary}")
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        copied.append(str(relative))
+
+    commit = manifest["source"]["commit"]
+    marker = target_root / SIRIL_SPCC_DATABASE_VERSION_MARKER
+    marker_text = (
+        f"schema={SIRIL_SPCC_DATABASE_SEED_SCHEMA}\n"
+        f"source_commit={commit}\n"
+        f"managed_files={len(entries)}\n"
+    )
+    if not marker.is_file() or marker.read_text(
+        encoding="utf-8", errors="replace"
+    ) != marker_text:
+        marker.write_text(marker_text, encoding="utf-8")
+
+    ready, detail = verify_siril_spcc_database_seed(seed_root, runtime_home)
+    if not ready:
+        raise RuntimeError(detail)
+    return {
+        "source_commit": commit,
+        "target_root": target_root,
+        "managed_files": len(entries),
+        "copied_files": copied,
+    }
 
 
 SIRIL_REQUIRED_SITE_PACKAGES = ("sirilpy", "numpy", "packaging", "requests")
@@ -535,8 +704,10 @@ SIRIL_STARLESS_REQUIRED_WHEEL_LABELS = (
     "scipy wheel",
 )
 INPUT_MODE_AUTO = "auto"
+INPUT_MODE_STAGE1_PREPARED_RESUME = "stage1_prepared_resume"
 INPUT_MODE_LINEAR_RESUME = "result_linear_resume"
 INPUT_MODE_STAGE2_CORRECTED_RESUME = "stage2_corrected_resume"
+STAGE1_PREPARED_INPUT_NAME = "stage1_prepared.fit"
 LINEAR_RESUME_INPUT_NAME = "result_linear.fit"
 STAGE2_CORRECTED_INPUT_NAME = "stage2_corrected.fit"
 PIPELINE_EXCLUDE_PREFIXES = (

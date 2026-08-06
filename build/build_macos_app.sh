@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Build Seestar Superimpose macOS app bundle with:
-# - Embedded Siril extracted from packages/siril-1.4.3-arm64.dmg
+# - Embedded Siril extracted from packages/siril-1.4.4-arm64.dmg
 # - Embedded Python 3.13.12 runtime from packages/python-3.13.12-macos11.pkg
 #
 # Usage:
@@ -34,24 +34,32 @@ GUI_ENTRY="$PROJECT_ROOT/gui/seestar_gui_app.py"
 APP_LOGO_PNG="$PROJECT_ROOT/gui/SeestarSuperimpose.png"
 PIPELINE_SRC="$PROJECT_ROOT/pipeline/seestar_Superimpose.py"
 STAGE11_MODULE_SRC="$PROJECT_ROOT/pipeline/stage11_ai_postprocess.py"
+PIPELINE_REQUIRED_MODULES=(
+  stage3_contract.py
+  stage_contracts.py
+  task_plan.py
+  input_discovery.py
+  task_workspace.py
+  ui_preview.py
+)
 LOCAL_TEMPLATE="$PROJECT_ROOT/resources/config.1.4.ini.template"
 CONFIG_TEMPLATE_IN="$LOCAL_TEMPLATE"
 DEFAULT_ENV_SRC="$PROJECT_ROOT/resources/default.env"
 AI_ENV_SRC="$PROJECT_ROOT/resources/ai.env"
 AI_CREDENTIAL_PACKAGER="$PROJECT_ROOT/build/package_ai_credentials.py"
 SIRIL_PLUGIN_DIR_SRC="$PROJECT_ROOT/resources/siril_plugins"
+SIRIL_SPCC_DATABASE_SEED_SRC="$PROJECT_ROOT/resources/siril_spcc_database"
 APP_REQUIREMENTS="$PROJECT_ROOT/requirements.lock"
 SIRIL_PLUGIN_REQUIREMENTS="$SIRIL_PLUGIN_DIR_SRC/requirements.lock"
 SIRIL_PLUGIN_DOWNLOADS_DIR="$SIRIL_PLUGIN_DIR_SRC/downloads"
 USER_CONFIG="$HOME/Library/Application Support/org.siril.Siril/siril/config.1.4.ini"
 
 PYTHON_PKG="$PACKAGES_DIR/python-3.13.12-macos11.pkg"
-SIRIL_DMG="$PACKAGES_DIR/siril-1.4.3-arm64.dmg"
+SIRIL_DMG="$PACKAGES_DIR/siril-1.4.4-arm64.dmg"
 SIRIL_SRC_APP=""
 BUNDLE_PROFILE="full"
 OFFLINE_RESOURCE_PACK_DIR=""
 SIRIL_RUNTIME_STATE="$HOME/Library/Application Support/org.siril.Siril/siril"
-SIRIL_SEED_VENV="$SIRIL_RUNTIME_STATE/venv"
 SIRIL_SEED_MODULE="$SIRIL_RUNTIME_STATE/.python_module"
 
 usage() {
@@ -68,7 +76,7 @@ Usage:
 This script requires the following package files in:
   $PACKAGES_DIR
   - python-3.13.12-macos11.pkg
-  - siril-1.4.3-arm64.dmg
+  - siril-1.4.4-arm64.dmg
 EOF
 }
 
@@ -742,18 +750,45 @@ fix_siril_python_runtime() {
 embed_siril_offline_python_seed() {
   local app_resources="$1"
   local seed_root="$app_resources/SirilPythonSeed"
+  local seed_venv="$BUILD_ROOT/siril_seed_venv"
   local seed_site=""
   local seed_bin=""
+  local seed_python=""
+  local siril_python="$app_resources/Siril.app/Contents/Frameworks/Python.framework/Versions/3.12/bin/python3.12"
   local rel_py="../../../Siril.app/Contents/Frameworks/Python.framework/Versions/3.12/bin/python3.12"
 
-  require_dir "$SIRIL_SEED_VENV" "Siril offline python seed venv"
   require_dir "$SIRIL_SEED_MODULE" "Siril offline python seed module"
-  require_executable "$SIRIL_SEED_VENV/bin/python3.12" "Siril offline python seed interpreter"
+  require_dir "$SIRIL_PLUGIN_DOWNLOADS_DIR" "Siril offline Python wheels"
+  require_executable "$siril_python" "Embedded Siril Python interpreter"
 
-  log "[SIRIL] Embedding offline Python seed from: $SIRIL_RUNTIME_STATE"
+  # The user's Siril runtime venv is mutable and may have been recreated by a
+  # different Python version. Build a clean 3.12 seed with the Python runtime
+  # that is actually bundled in this app instead of copying that user venv.
+  log "[SIRIL] Building clean Python 3.12 offline seed..."
+  rm -rf "$seed_venv"
+  "$siril_python" -m venv "$seed_venv"
+  seed_python="$seed_venv/bin/python3.12"
+  require_executable "$seed_python" "Generated Siril offline seed interpreter"
+  PIP_CONFIG_FILE=/dev/null "$seed_python" -m pip install \
+    --disable-pip-version-check \
+    --no-cache-dir \
+    --no-index \
+    --find-links "$SIRIL_PLUGIN_DOWNLOADS_DIR" \
+    --only-binary=:all: \
+    setuptools wheel numpy packaging requests
+  PIP_CONFIG_FILE=/dev/null "$seed_python" -m pip install \
+    --disable-pip-version-check \
+    --no-cache-dir \
+    --no-index \
+    --find-links "$SIRIL_PLUGIN_DOWNLOADS_DIR" \
+    --no-build-isolation \
+    --no-deps \
+    "$SIRIL_SEED_MODULE"
+
+  log "[SIRIL] Embedding clean offline Python seed from: $seed_venv"
   rm -rf "$seed_root"
   mkdir -p "$seed_root"
-  /usr/bin/ditto "$SIRIL_SEED_VENV" "$seed_root/venv"
+  /usr/bin/ditto "$seed_venv" "$seed_root/venv"
   /usr/bin/ditto "$SIRIL_SEED_MODULE" "$seed_root/.python_module"
 
   # Convert absolute venv interpreter links to in-bundle relative links so
@@ -780,12 +815,39 @@ embed_siril_offline_python_seed() {
   verify_siril_seed_runtime "$seed_root/venv"
 }
 
+embed_siril_spcc_database_seed() {
+  local app_resources="$1"
+  local seed_root="$app_resources/SirilSPCCDatabaseSeed"
+
+  require_dir "$SIRIL_SPCC_DATABASE_SEED_SRC" "Siril SPCC database seed source"
+  require_file "$SIRIL_SPCC_DATABASE_SEED_SRC/manifest.json" "Siril SPCC seed manifest"
+  require_file "$SIRIL_SPCC_DATABASE_SEED_SRC/VERSION.txt" "Siril SPCC seed version list"
+  require_file "$SIRIL_SPCC_DATABASE_SEED_SRC/LICENSE.md" "Siril SPCC seed GPLv3 license"
+  if ! (
+    cd "$SIRIL_SPCC_DATABASE_SEED_SRC"
+    /usr/bin/shasum -a 256 -c SHA256SUMS
+  ); then
+    die "Siril SPCC database seed checksum verification failed"
+  fi
+
+  rm -rf "$seed_root"
+  mkdir -p "$seed_root"
+  cp -R "$SIRIL_SPCC_DATABASE_SEED_SRC/." "$seed_root/"
+  log "[SIRIL] Embedded fixed SPCC database seed: $seed_root"
+}
+
 require_apple_silicon_host
 require_exists "$PROJECT_ROOT" "Project root"
 require_exists "$GUI_ENTRY" "GUI entry"
 require_file "$APP_LOGO_PNG" "App logo PNG"
 require_file "$PIPELINE_SRC" "Pipeline script"
 require_file "$STAGE11_MODULE_SRC" "Stage11 module script"
+for module_name in "${PIPELINE_REQUIRED_MODULES[@]}"; do
+  require_file "$(dirname "$PIPELINE_SRC")/$module_name" "Pipeline runtime module"
+done
+require_dir "$SIRIL_SPCC_DATABASE_SEED_SRC" "Siril SPCC database seed source"
+require_file "$SIRIL_SPCC_DATABASE_SEED_SRC/manifest.json" "Siril SPCC seed manifest"
+require_file "$SIRIL_SPCC_DATABASE_SEED_SRC/SHA256SUMS" "Siril SPCC seed checksums"
 require_dir "$PACKAGES_DIR" "Packages directory"
 require_file "$PYTHON_PKG" "Python package"
 if [[ -n "$SIRIL_SRC_APP" ]]; then
@@ -820,13 +882,17 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 
-BUILD_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/seestar_build.XXXXXX")"
+# Keep the build and final bundle on the same filesystem. The existing release
+# remains untouched until the new bundle has passed every verification step.
+BUILD_ROOT="$(mktemp -d "$OUTPUT_DIR/.seestar_build.XXXXXX")"
 SIRIL_MOUNT_DIR=""
 SPEC_DIR="$BUILD_ROOT/spec"
 WORK_DIR="$BUILD_ROOT/work"
 RES_STAGING="$BUILD_ROOT/resources"
-APP_PATH="$OUTPUT_DIR/${APP_NAME}.app"
-ONEDIR_PATH="$OUTPUT_DIR/$APP_NAME"
+BUILD_DIST_DIR="$BUILD_ROOT/dist"
+APP_PATH="$BUILD_DIST_DIR/${APP_NAME}.app"
+ONEDIR_PATH="$BUILD_DIST_DIR/$APP_NAME"
+FINAL_APP_PATH="$OUTPUT_DIR/${APP_NAME}.app"
 APP_ICON_ICNS="$BUILD_ROOT/${APP_NAME}.icns"
 
 cleanup() {
@@ -847,7 +913,7 @@ log "[BUILD] PyInstaller config dir: $PYINSTALLER_CONFIG_DIR"
 
 download_offline_python_packages
 
-log "[BUILD] Cleaning previous output artifacts..."
+log "[BUILD] Cleaning staging output artifacts..."
 remove_old_build_outputs "$APP_PATH" "$ONEDIR_PATH"
 
 log "[BUILD] Generating app icon from: $APP_LOGO_PNG"
@@ -888,7 +954,7 @@ log "[BUILD] Building base app with PyInstaller..."
   --target-architecture "$REQUIRED_APP_ARCH" \
   --icon "$APP_ICON_ICNS" \
   --name "$APP_NAME" \
-  --distpath "$OUTPUT_DIR" \
+  --distpath "$BUILD_DIST_DIR" \
   --workpath "$WORK_DIR" \
   --specpath "$SPEC_DIR" \
   "$GUI_ENTRY"
@@ -910,16 +976,7 @@ APP_FRAMEWORKS="$APP_PATH/Contents/Frameworks"
 mkdir -p "$APP_RESOURCES/pipeline"
 mkdir -p "$APP_FRAMEWORKS"
 
-log "[SIRIL] Embedding Siril..."
-if [[ -n "$SIRIL_SRC_APP" ]]; then
-  copy_siril_from_app "$SIRIL_SRC_APP" "$APP_RESOURCES/Siril.app"
-else
-  extract_siril_from_dmg "$SIRIL_DMG" "$APP_RESOURCES/Siril.app"
-fi
-fix_siril_python_runtime "$APP_RESOURCES/Siril.app"
-embed_siril_offline_python_seed "$APP_RESOURCES"
-
-log "[BUILD] Embedding pipeline/config resources..."
+log "[BUILD] Embedding core pipeline/config resources..."
 cp "$CONFIG_TEMPLATE" "$APP_RESOURCES/config.1.4.ini.template"
 PIPELINE_SRC_DIR="$(cd "$(dirname "$PIPELINE_SRC")" && pwd)"
 find "$APP_RESOURCES/pipeline" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
@@ -936,6 +993,23 @@ fi
 if [[ ! -f "$APP_RESOURCES/pipeline/stage11_ai_postprocess.py" ]]; then
   cp "$STAGE11_MODULE_SRC" "$APP_RESOURCES/pipeline/stage11_ai_postprocess.py"
 fi
+require_file "$APP_RESOURCES/config.1.4.ini.template" "[VERIFY] Embedded config template"
+require_file "$APP_RESOURCES/pipeline/seestar_Superimpose.py" "[VERIFY] Embedded pipeline script"
+require_file "$APP_RESOURCES/pipeline/stage11_ai_postprocess.py" "[VERIFY] Embedded Stage11 module"
+for module_name in "${PIPELINE_REQUIRED_MODULES[@]}"; do
+  require_file "$APP_RESOURCES/pipeline/$module_name" "[VERIFY] Embedded pipeline runtime module"
+done
+
+log "[SIRIL] Embedding Siril..."
+if [[ -n "$SIRIL_SRC_APP" ]]; then
+  copy_siril_from_app "$SIRIL_SRC_APP" "$APP_RESOURCES/Siril.app"
+else
+  extract_siril_from_dmg "$SIRIL_DMG" "$APP_RESOURCES/Siril.app"
+fi
+fix_siril_python_runtime "$APP_RESOURCES/Siril.app"
+embed_siril_offline_python_seed "$APP_RESOURCES"
+embed_siril_spcc_database_seed "$APP_RESOURCES"
+
 if [[ -f "$DEFAULT_ENV_SRC" ]]; then
   cp "$DEFAULT_ENV_SRC" "$APP_RESOURCES/default.env"
   log "[BUILD] Embedded default env file: $DEFAULT_ENV_SRC"
@@ -1053,6 +1127,7 @@ verify_python_wrapper "$APP_RESOURCES/python/bin/python3.13"
 require_exists "$APP_RESOURCES/Siril.app" "[VERIFY] Embedded Siril"
 require_exists "$APP_RESOURCES/SirilPythonSeed/venv/bin/python3.12" "[VERIFY] Embedded Siril offline venv seed"
 require_exists "$APP_RESOURCES/SirilPythonSeed/.python_module/sirilpy" "[VERIFY] Embedded Siril offline module seed"
+require_file "$APP_RESOURCES/SirilSPCCDatabaseSeed/manifest.json" "[VERIFY] Embedded Siril SPCC database seed"
 require_exists "$APP_FRAMEWORKS/Python.framework/Versions/3.13" "[VERIFY] Embedded Python framework"
 require_executable "$APP_RESOURCES/python/bin/python3.13" "[VERIFY] Embedded Python wrapper"
 GAIA_CATALOG_SCAN_ROOTS=("$APP_PATH")
@@ -1094,6 +1169,32 @@ log "[BUILD] Applying deep signing with identity: $CODESIGN_IDENTITY"
 /usr/bin/xattr -cr "$APP_PATH" >/dev/null 2>&1 || true
 codesign --force --deep --sign "$CODESIGN_IDENTITY" "$APP_PATH"
 codesign --verify --deep --strict "$APP_PATH"
+
+log "[BUILD] Publishing verified app bundle..."
+PREVIOUS_APP_PATH="$OUTPUT_DIR/.${APP_NAME}.previous.$$"
+if [[ -e "$PREVIOUS_APP_PATH" ]]; then
+  die "Refusing to overwrite temporary publish backup: $PREVIOUS_APP_PATH"
+fi
+if [[ -e "$FINAL_APP_PATH" ]]; then
+  /bin/mv "$FINAL_APP_PATH" "$PREVIOUS_APP_PATH"
+fi
+if ! /bin/mv "$APP_PATH" "$FINAL_APP_PATH"; then
+  if [[ -e "$PREVIOUS_APP_PATH" && ! -e "$FINAL_APP_PATH" ]]; then
+    /bin/mv "$PREVIOUS_APP_PATH" "$FINAL_APP_PATH"
+  fi
+  die "Failed to publish verified app bundle: $FINAL_APP_PATH"
+fi
+if ! codesign --verify --deep --strict "$FINAL_APP_PATH"; then
+  rm -rf "$FINAL_APP_PATH"
+  if [[ -e "$PREVIOUS_APP_PATH" ]]; then
+    /bin/mv "$PREVIOUS_APP_PATH" "$FINAL_APP_PATH"
+  fi
+  die "Published app signature verification failed: $FINAL_APP_PATH"
+fi
+if [[ -e "$PREVIOUS_APP_PATH" ]]; then
+  rm -rf "$PREVIOUS_APP_PATH"
+fi
+APP_PATH="$FINAL_APP_PATH"
 
 echo
 log "Build complete."

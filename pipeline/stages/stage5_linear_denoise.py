@@ -879,11 +879,6 @@ def run_stage5_linear_denoise(pipeline) -> None:
         else {}
     )
 
-    compatibility_saved = pipeline._save_stage_output("stage5_denoised")
-    if not compatibility_saved:
-        status = "degraded"
-        messages.append("stage5_denoised compatibility save failed")
-
     if deconv_applied:
         deconv_component_status = "applied"
         deconv_reason_code = "accepted"

@@ -521,7 +521,7 @@ def run_stage6_star_separation(pipeline) -> None:
                 },
             }
             pipeline._write_stage_json(
-                "stage7_quality.json",
+                "stage6_starless_quality.json",
                 {
                     "attempts": [quality_record],
                     "selected": quality_record,
@@ -634,7 +634,7 @@ def run_stage6_star_separation(pipeline) -> None:
             }
             stage9_record = pipeline._stage7_update_star_remix_from_quality(quality_record)
             pipeline._write_stage_json(
-                "stage7_quality.json",
+                "stage6_starless_quality.json",
                 {
                     "attempts": [quality_record],
                     "selected": quality_record,
@@ -1165,7 +1165,7 @@ def run_stage6_star_separation(pipeline) -> None:
             )
 
         pipeline._write_stage_json(
-            "stage7_quality.json",
+            "stage6_starless_quality.json",
             {
                 "attempts": quality_records,
                 "selected": selected_quality,
@@ -1198,7 +1198,7 @@ def run_stage6_star_separation(pipeline) -> None:
         pipeline._export_sasp_exchange_files()
         if separation_accepted:
             pipeline.cmd_with_check("load", pipeline.starless_file.stem)
-            stage_output_stem = "stage7_starless"
+            stage_output_stem = "stage6_starless"
             review_before_stem = "stage6_input"
         else:
             pipeline.cmd_with_check("load", selected_source_stem)
@@ -1289,7 +1289,7 @@ def run_stage6_star_separation(pipeline) -> None:
         stage_saved = pipeline._save_stage_output("stage6_passthrough")
         pipeline._stage6_passthrough_source = "stage6_passthrough"
         pipeline._write_stage_json(
-            "stage7_quality.json",
+            "stage6_starless_quality.json",
             {
                 "attempts": [
                     {

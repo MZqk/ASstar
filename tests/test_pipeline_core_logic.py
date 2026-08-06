@@ -87,6 +87,7 @@ class ClampConfigTests(unittest.TestCase):
     def test_clamps_low_values_and_preserves_input(self) -> None:
         cfg = pipeline.PipelineConfig()
         cfg.crop_margin = -1.0
+        cfg.stage2_center_protect_area_ratio = -1.0
         cfg.bg_samples = -100
         cfg.denoise_mod = -1.0
         cfg.stage5_rl_psf_kernel_size = 2
@@ -100,6 +101,7 @@ class ClampConfigTests(unittest.TestCase):
 
         self.assertEqual(cfg.crop_margin, -1.0)
         self.assertEqual(tuned.crop_margin, 0.0)
+        self.assertEqual(tuned.stage2_center_protect_area_ratio, 0.50)
         self.assertEqual(tuned.bg_samples, 12)
         self.assertEqual(tuned.denoise_mod, 0.2)
         self.assertEqual(tuned.stage5_rl_psf_kernel_size, 9)
@@ -112,6 +114,7 @@ class ClampConfigTests(unittest.TestCase):
     def test_clamps_high_values_and_enforces_related_limits(self) -> None:
         cfg = pipeline.PipelineConfig()
         cfg.crop_margin = 1.0
+        cfg.stage2_center_protect_area_ratio = 1.0
         cfg.bg_samples = 100
         cfg.denoise_safety_max = 0.40
         cfg.denoise_mod = 1.0
@@ -125,6 +128,7 @@ class ClampConfigTests(unittest.TestCase):
         tuned = pipeline.clamp_config(cfg)
 
         self.assertEqual(tuned.crop_margin, 0.06)
+        self.assertEqual(tuned.stage2_center_protect_area_ratio, 0.95)
         self.assertEqual(tuned.bg_samples, 32)
         self.assertEqual(tuned.denoise_mod, 0.40)
         self.assertEqual(tuned.stage5_rl_psf_kernel_size, 99)

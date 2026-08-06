@@ -56,6 +56,7 @@ def tail_lines(text: str, n: int = 80) -> str:
     return "\n".join(lines[-n:])
 
 
+@unittest.skip("disabled product feature; isolated unit coverage remains")
 class Stage11RealDataIntegrationTest(unittest.TestCase):
     def test_stage11_realdata_not_skipped(self):
         configured = {

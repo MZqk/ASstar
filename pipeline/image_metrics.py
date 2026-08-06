@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -276,8 +276,17 @@ def measure_image_features(image: np.ndarray) -> ImageFeatures:
 def measure_stage3_signal_preservation(
     before_image: np.ndarray,
     after_image: np.ndarray,
+    *,
+    sky_points: Optional[List[Tuple[float, float]]] = None,
+    sky_patch_radius: int = 12,
 ) -> Dict[str, Any]:
-    """Measure star and diffuse signal preservation after background extraction."""
+    """Measure source fidelity without treating a sky-level shift as flux loss.
+
+    Stage 3 is expected to change the additive background level.  The legacy
+    raw-mean diagnostic is therefore retained for compatibility, but target
+    flux and morphology are measured relative to the *same sky coordinates*
+    before and after correction.
+    """
     result: Dict[str, Any] = {
         "available": False,
         "star_retention_ratio": None,
@@ -287,6 +296,24 @@ def measure_stage3_signal_preservation(
         "before_nebula_mean": None,
         "after_nebula_mean": None,
         "nebula_pixel_count": 0,
+        "before_sky_median": None,
+        "after_sky_median": None,
+        "before_sky_rms": None,
+        "after_sky_rms": None,
+        "before_target_flux": None,
+        "after_target_flux": None,
+        "target_flux_retention_ratio": None,
+        "target_flux_change_significance": None,
+        "target_morphology_correlation": None,
+        "target_centroid_shift_pixels": None,
+        "target_centroid_shift_fraction": None,
+        "target_change_residual_rms": None,
+        "target_change_residual_significance": None,
+        "target_sky_reference": "fixed_before_sky_coordinates",
+        "heldout_sky_model": None,
+        "fidelity_method": (
+            "fixed_before_sky_coordinates_and_background_referenced_target_mask"
+        ),
         "notes": [],
     }
     try:
@@ -306,14 +333,39 @@ def measure_stage3_signal_preservation(
         ).astype(np.float32)
         image_area = max(1, int(before_gray.size))
 
+        source = np.asarray(before_image)
+        if source.ndim == 2:
+            source_height, source_width = source.shape
+        elif source.ndim == 3 and source.shape[0] in (1, 3, 4) and source.shape[-1] not in (1, 3, 4):
+            source_height, source_width = source.shape[1], source.shape[2]
+        elif source.ndim == 3:
+            source_height, source_width = source.shape[0], source.shape[1]
+        else:
+            source_height, source_width = before_gray.shape
+
         bg_threshold = float(np.quantile(before_gray, 0.22))
         bg_mask = before_gray <= bg_threshold
         if int(np.count_nonzero(bg_mask)) < 64:
             bg_mask = before_gray <= float(np.quantile(before_gray, 0.30))
         bg_values = before_gray[bg_mask] if np.any(bg_mask) else before_gray.reshape(-1)
+        after_bg_values = (
+            after_gray[bg_mask]
+            if np.any(bg_mask)
+            else after_gray.reshape(-1)
+        )
         bg_median = float(np.median(bg_values))
+        after_bg_median = float(np.median(after_bg_values))
         bg_std = float(np.std(bg_values))
         bg_mad = float(np.median(np.abs(bg_values - bg_median)))
+        after_bg_mad = float(
+            np.median(np.abs(after_bg_values - after_bg_median))
+        )
+        before_sky_rms = 1.4826 * bg_mad
+        after_sky_rms = 1.4826 * after_bg_mad
+        result["before_sky_median"] = bg_median
+        result["after_sky_median"] = after_bg_median
+        result["before_sky_rms"] = before_sky_rms
+        result["after_sky_rms"] = after_sky_rms
 
         star_threshold = max(
             float(np.quantile(before_gray, 0.985)),
@@ -321,7 +373,11 @@ def measure_stage3_signal_preservation(
         )
         max_star_area = max(4, int(image_area * 0.0008))
         before_star_mask = before_gray > star_threshold
-        after_star_mask = after_gray > star_threshold
+        # Keep the detection contrast fixed relative to each image's measured
+        # sky pedestal.  A legitimate additive subtraction must not turn into
+        # an apparent loss of stars merely because the absolute level moved.
+        star_contrast = max(star_threshold - bg_median, 0.0)
+        after_star_mask = after_gray > (after_bg_median + star_contrast)
         before_star_areas = _component_areas(
             before_star_mask,
             min_area=1,
@@ -375,12 +431,190 @@ def measure_stage3_signal_preservation(
                 before_mean,
                 1e-6,
             )
+
+            before_signal = before_gray[diffuse_mask].astype(np.float64) - bg_median
+            after_signal = after_gray[diffuse_mask].astype(np.float64) - after_bg_median
+            flux_systematic_rms = float(np.hypot(before_sky_rms, after_sky_rms))
+
+            def fit_heldout_sky_plane(gray: np.ndarray) -> Optional[Dict[str, Any]]:
+                if not sky_points or len(sky_points) < 6:
+                    return None
+                analysis_height, analysis_width = gray.shape
+                radius_scale = min(
+                    analysis_width / max(float(source_width), 1.0),
+                    analysis_height / max(float(source_height), 1.0),
+                )
+                radius = max(2, int(round(float(sky_patch_radius) * radius_scale)))
+                records: List[Tuple[float, float, float, float]] = []
+                for raw_x, raw_y in sky_points:
+                    x = int(round(
+                        float(raw_x)
+                        * max(analysis_width - 1, 1)
+                        / max(source_width - 1, 1)
+                    ))
+                    top_y = max(source_height - 1, 1) - float(raw_y)
+                    y = int(round(
+                        top_y
+                        * max(analysis_height - 1, 1)
+                        / max(source_height - 1, 1)
+                    ))
+                    if (
+                        x - radius < 0
+                        or x + radius >= analysis_width
+                        or y - radius < 0
+                        or y + radius >= analysis_height
+                    ):
+                        continue
+                    patch = gray[
+                        y - radius : y + radius + 1,
+                        x - radius : x + radius + 1,
+                    ].astype(np.float64)
+                    if not np.all(np.isfinite(patch)):
+                        continue
+                    median = float(np.median(patch))
+                    mad = 1.4826 * float(np.median(np.abs(patch - median)))
+                    records.append(
+                        (
+                            x / max(analysis_width - 1, 1),
+                            y / max(analysis_height - 1, 1),
+                            median,
+                            mad,
+                        )
+                    )
+                if len(records) < 6:
+                    return None
+                design = np.asarray(
+                    [[1.0, record[0], record[1]] for record in records],
+                    dtype=np.float64,
+                )
+                values = np.asarray([record[2] for record in records], dtype=np.float64)
+                try:
+                    coefficients, *_ = np.linalg.lstsq(design, values, rcond=None)
+                except np.linalg.LinAlgError:
+                    return None
+                residual = values - design @ coefficients
+                residual_center = float(np.median(residual))
+                residual_rms = 1.4826 * float(
+                    np.median(np.abs(residual - residual_center))
+                )
+                return {
+                    "coefficients": coefficients,
+                    "sample_count": len(records),
+                    "residual_rms": residual_rms,
+                    "patch_rms": float(np.median([record[3] for record in records])),
+                }
+
+            before_plane = fit_heldout_sky_plane(before_gray)
+            after_plane = fit_heldout_sky_plane(after_gray)
+            if before_plane is not None and after_plane is not None:
+                target_y, target_x = np.nonzero(diffuse_mask)
+                target_design = np.column_stack(
+                    (
+                        np.ones(target_x.size, dtype=np.float64),
+                        target_x / max(before_gray.shape[1] - 1, 1),
+                        target_y / max(before_gray.shape[0] - 1, 1),
+                    )
+                )
+                before_signal = (
+                    before_gray[diffuse_mask].astype(np.float64)
+                    - target_design @ before_plane["coefficients"]
+                )
+                after_signal = (
+                    after_gray[diffuse_mask].astype(np.float64)
+                    - target_design @ after_plane["coefficients"]
+                )
+                flux_systematic_rms = float(
+                    np.hypot(
+                        max(
+                            float(before_plane["residual_rms"]),
+                            float(before_plane["patch_rms"]),
+                        ),
+                        max(
+                            float(after_plane["residual_rms"]),
+                            float(after_plane["patch_rms"]),
+                        ),
+                    )
+                )
+                result["target_sky_reference"] = "heldout_sky_plane_degree_1"
+                result["fidelity_method"] = (
+                    "heldout_sky_plane_and_fixed_before_target_mask"
+                )
+                result["heldout_sky_model"] = {
+                    "sample_count": int(before_plane["sample_count"]),
+                    "before_coefficients": [
+                        float(value) for value in before_plane["coefficients"]
+                    ],
+                    "after_coefficients": [
+                        float(value) for value in after_plane["coefficients"]
+                    ],
+                    "before_residual_rms": float(before_plane["residual_rms"]),
+                    "after_residual_rms": float(after_plane["residual_rms"]),
+                    "before_patch_rms": float(before_plane["patch_rms"]),
+                    "after_patch_rms": float(after_plane["patch_rms"]),
+                }
+
+            before_flux = float(np.sum(before_signal))
+            after_flux = float(np.sum(after_signal))
+            result["before_target_flux"] = before_flux
+            result["after_target_flux"] = after_flux
+            if before_flux > 1e-12:
+                result["target_flux_retention_ratio"] = after_flux / before_flux
+
+            # Background-model uncertainty is spatially correlated, so use a
+            # conservative N * RMS uncertainty rather than sqrt(N) pixel noise.
+            flux_uncertainty = float(nebula_count) * flux_systematic_rms
+            if flux_uncertainty > 1e-12:
+                result["target_flux_change_significance"] = (
+                    after_flux - before_flux
+                ) / flux_uncertainty
+
+            before_centered = before_signal - float(np.mean(before_signal))
+            after_centered = after_signal - float(np.mean(after_signal))
+            correlation_denominator = float(
+                np.linalg.norm(before_centered) * np.linalg.norm(after_centered)
+            )
+            if correlation_denominator > 1e-12:
+                result["target_morphology_correlation"] = float(
+                    np.dot(before_centered, after_centered)
+                    / correlation_denominator
+                )
+
+            target_change = after_signal - before_signal
+            target_change_center = float(np.median(target_change))
+            target_change_rms = 1.4826 * float(
+                np.median(np.abs(target_change - target_change_center))
+            )
+            result["target_change_residual_rms"] = target_change_rms
+            if flux_systematic_rms > 1e-12:
+                result["target_change_residual_significance"] = (
+                    target_change_rms / flux_systematic_rms
+                )
+
+            target_y, target_x = np.nonzero(diffuse_mask)
+            before_weights = np.clip(before_signal, 0.0, None)
+            after_weights = np.clip(after_signal, 0.0, None)
+            before_weight_sum = float(np.sum(before_weights))
+            after_weight_sum = float(np.sum(after_weights))
+            if before_weight_sum > 1e-12 and after_weight_sum > 1e-12:
+                before_cx = float(np.dot(target_x, before_weights) / before_weight_sum)
+                before_cy = float(np.dot(target_y, before_weights) / before_weight_sum)
+                after_cx = float(np.dot(target_x, after_weights) / after_weight_sum)
+                after_cy = float(np.dot(target_y, after_weights) / after_weight_sum)
+                centroid_shift = float(
+                    np.hypot(after_cx - before_cx, after_cy - before_cy)
+                )
+                result["target_centroid_shift_pixels"] = centroid_shift
+                result["target_centroid_shift_fraction"] = centroid_shift / max(
+                    float(np.hypot(*before_gray.shape)),
+                    1.0,
+                )
         else:
             result["notes"].append("nebula retention skipped: diffuse mask too small")
 
         result["available"] = (
             result["star_retention_ratio"] is not None
-            or result["nebula_mean_change_ratio"] is not None
+            or result["target_flux_retention_ratio"] is not None
+            or result["target_morphology_correlation"] is not None
         )
     except (TypeError, ValueError, IndexError, FloatingPointError) as exc:
         result["notes"].append(f"preservation metrics failed: {exc}")

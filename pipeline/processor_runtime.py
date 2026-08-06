@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import plistlib
 import re
 import shutil
 import time
@@ -13,7 +14,7 @@ import traceback
 import uuid
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -23,6 +24,8 @@ import plugin_runner
 import sasp_runner
 import scunet_denoise
 import syqon_starless
+import stage_contracts
+import stage3_contract
 import stage7_quality
 import stage7_repair
 import stage8_pixels
@@ -92,6 +95,9 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_OUTPUT_FORMAT",
         "SEESTAR_NETWORK_MODE",
         "SEESTAR_WORKFLOW_PLUGIN_PROBE",
+        "SEESTAR_SPCC_ENABLE",
+        "SEESTAR_GAIA_PHOTO_CATALOG",
+        "SEESTAR_SPCC_DATABASE_DIR",
         "SEESTAR_STAGE4_PLATESOLVE_ENABLE",
         "SEESTAR_STAGE4_PLATESOLVE_FOCAL",
         "SEESTAR_STAGE4_PLATESOLVE_PIXELSIZE",
@@ -101,6 +107,17 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_STAGE4_AUTO_GEOMETRY_ENABLE",
         "SEESTAR_STAGE4_AUTO_GEOMETRY_CONFIDENCE_MIN",
         "SEESTAR_STAGE4_AUTO_GEOMETRY_SCALE_RESIDUAL_MAX",
+        "SEESTAR_STAGE4_SPCC_TIMEOUT_SEC",
+        "SEESTAR_STAGE4_SPCC_OSC_SENSOR",
+        "SEESTAR_STAGE4_SPCC_OSC_FILTER",
+        "SEESTAR_STAGE4_SPCC_WHITE_REF",
+        "SEESTAR_STAGE4_SPCC_LIMITMAG",
+        "SEESTAR_STAGE4_SPCC_NB_R_WAVELENGTH_NM",
+        "SEESTAR_STAGE4_SPCC_NB_R_BANDWIDTH_NM",
+        "SEESTAR_STAGE4_SPCC_NB_G_WAVELENGTH_NM",
+        "SEESTAR_STAGE4_SPCC_NB_G_BANDWIDTH_NM",
+        "SEESTAR_STAGE4_SPCC_NB_B_WAVELENGTH_NM",
+        "SEESTAR_STAGE4_SPCC_NB_B_BANDWIDTH_NM",
         "SEESTAR_STAGE4_NBN_ENABLE",
         "SEESTAR_STAGE4_NBN_MAPPING_CONFIDENCE_MIN",
         "SEESTAR_STAGE4_NBN_STRENGTH",
@@ -160,8 +177,20 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_STAGE7_STARLESS_REPAIR_STRENGTH",
         "SEESTAR_STAGE7_STARLESS_HALO_REPAIR_STRENGTH",
         "SEESTAR_STAGE7_STARLESS_CHROMA_DENOISE_STRENGTH",
+        "SEESTAR_STAGE7_STRETCH_CHROMA_NOISE_SCORE_MAX",
+        "SEESTAR_STAGE7_STRETCH_BACKGROUND_MOTTLING_SCORE_MAX",
+        "SEESTAR_STAGE7_STRETCH_CHROMA_LOAD_GROWTH_MAX",
+        "SEESTAR_STAGE7_STRETCH_CHROMA_LOAD_LOW_ABSOLUTE_MAX",
+        "SEESTAR_STAGE7_STRETCH_CHROMA_LOAD_LOW_ABSOLUTE_TOLERANCE",
+        "SEESTAR_STAGE7_CHROMA_RESCUE_ENABLE",
         "SEESTAR_STAGE7_PREVIEW_TARGET_P50_MIN_RATIO",
         "SEESTAR_STAGE7_PREVIEW_TARGET_P50_MAX_RATIO",
+        "SEESTAR_STAGE7_STRETCH_FEEDBACK_RETRY_MAX",
+        "SEESTAR_STAGE7_STARLESS_STRUCTURE_GATE_ENABLE",
+        "SEESTAR_STAGE7_STARLESS_MASKED_RANK_DRIFT_P95_MAX",
+        "SEESTAR_STAGE7_STARLESS_HALO_DETAIL_GROWTH_RATIO_MAX",
+        "SEESTAR_STAGE7_STARLESS_HALO_DETAIL_DELTA_MIN",
+        "SEESTAR_STAGE7_QUANTILE_FALLBACK_ENABLE",
         "SEESTAR_STAGE7_STARLESS_PIXEL_REPAIR_ENABLE",
         "SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_REDUCTION_MIN",
         "SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_DELTA_MIN",
@@ -170,6 +199,7 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "SEESTAR_STAGE8_LOCAL_ADJUSTMENT_ENGINE_ENABLE",
         "SEESTAR_STAGE8_LOCAL_CURVE_OPACITY",
         "SEESTAR_STAGE8_LIMITED_SATURATION_MAX",
+        "SEESTAR_STAGE8_LIMITED_CORE_EXCLUSION_EXPAND",
         "SEESTAR_STAGE8_LIMITED_HALO_TEXTURE_GROWTH_MAX",
         "SEESTAR_STAGE8_LIMITED_HALO_TEXTURE_DELTA_MAX",
         "SEESTAR_STAGE9_STARMASK_STRETCH_ENABLE",
@@ -239,8 +269,11 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
     }
 )
 INPUT_MODE_AUTO = "auto"
+INPUT_MODE_STAGE1_PREPARED_RESUME = "stage1_prepared_resume"
 INPUT_MODE_LINEAR_RESUME = "result_linear_resume"
 INPUT_MODE_STAGE2_CORRECTED_RESUME = "stage2_corrected_resume"
+ENV_TASK_RUN_MANIFEST_KEY = "SEESTAR_TASK_RUN_MANIFEST"
+ENV_RESUME_CHECKPOINT_PATH_KEY = "SEESTAR_RESUME_CHECKPOINT_PATH"
 RESULT_BASENAME_TEMPLATE = (
     "$OBJECT:%s$_$STACKCNT:%d$x$EXPTIME:%d$sec"
     "_$DATE-OBS:dm12$_processed"
@@ -291,6 +324,76 @@ def _clamp_int(value: int, lower: int, upper: int) -> int:
     return max(lower, min(upper, int(value)))
 
 class ProcessorRuntimeMixin:
+    def _processing_software_identity(self) -> Dict[str, Any]:
+        """Return a packaged/dev build identity with a Stage 3 source hash."""
+        module_path = Path(__file__).resolve()
+        app_version = os.getenv("SEESTAR_APP_VERSION", "").strip() or "dev"
+        app_build: Optional[str] = None
+        app_identity_source = "environment" if app_version != "dev" else "development"
+        info_candidates = [
+            module_path.parents[2] / "Info.plist",
+            module_path.parents[1] / "Info.plist",
+        ]
+        for info_path in info_candidates:
+            if not info_path.is_file():
+                continue
+            try:
+                with info_path.open("rb") as handle:
+                    info = plistlib.load(handle)
+                app_version = str(
+                    info.get("CFBundleShortVersionString") or app_version
+                )
+                app_build = str(info.get("CFBundleVersion") or "") or None
+                app_identity_source = "Info.plist"
+                break
+            except (OSError, TypeError, ValueError):
+                continue
+
+        source_files = (
+            module_path.parent / "stage3_contract.py",
+            module_path.parent / "background_sampling.py",
+            module_path.parent / "stages" / "stage3_background_extraction.py",
+        )
+        source_records: Dict[str, Optional[str]] = {}
+        aggregate = hashlib.sha256()
+        aggregate_count = 0
+        for path in source_files:
+            relative_name = path.relative_to(module_path.parent).as_posix()
+            digest = run_manifest.sha256_file(path)
+            source_records[relative_name] = digest
+            if digest:
+                aggregate.update(relative_name.encode("utf-8"))
+                aggregate.update(b"\0")
+                aggregate.update(digest.encode("ascii"))
+                aggregate.update(b"\0")
+                aggregate_count += 1
+
+        stage3_identity = stage3_contract.stage3_static_contract_manifest()
+        stage3_identity.update(
+            {
+                "source_sha256": (
+                    aggregate.hexdigest() if aggregate_count else None
+                ),
+                "source_files": source_records,
+            }
+        )
+        return {
+            "schema": "seestar.software-identity.v1",
+            "app": {
+                "version": app_version,
+                "build": app_build,
+                "identity_source": app_identity_source,
+            },
+            "pipeline_contract": {
+                "schema": stage_contracts.PIPELINE_CONTRACT_SCHEMA,
+                "version": stage_contracts.PIPELINE_CONTRACT_VERSION,
+            },
+            "stage_algorithms": {
+                "stage3_background": stage3_identity,
+            },
+        }
+
+
     def _project_env_candidates(self) -> List[Path]:
         module_project_root = Path(__file__).resolve().parents[1]
         return [
@@ -527,11 +630,14 @@ class ProcessorRuntimeMixin:
 
 
     def _apply_runtime_env_overrides(self):
+        self.cfg.ai_post_enabled = False
+        self.cfg.ai_artistic_derivative_enabled = False
         input_mode_raw = os.getenv(ENV_INPUT_MODE_KEY)
         if input_mode_raw is not None:
             normalized = input_mode_raw.strip().lower()
             if normalized in {
                 INPUT_MODE_AUTO,
+                INPUT_MODE_STAGE1_PREPARED_RESUME,
                 INPUT_MODE_LINEAR_RESUME,
                 INPUT_MODE_STAGE2_CORRECTED_RESUME,
             }:
@@ -565,6 +671,22 @@ class ProcessorRuntimeMixin:
             else:
                 self.log.warn(
                     f"Invalid SEESTAR_OUTPUT_FORMAT={output_format_raw!r}; using current value"
+                )
+
+        stage2_center_protect_raw = os.getenv(
+            "SEESTAR_STAGE2_CENTER_PROTECT_AREA_RATIO"
+        )
+        if stage2_center_protect_raw is not None:
+            try:
+                self.cfg.stage2_center_protect_area_ratio = _clamp_float(
+                    float(stage2_center_protect_raw.strip()),
+                    0.50,
+                    0.95,
+                )
+            except (TypeError, ValueError):
+                self.log.warn(
+                    "SEESTAR_STAGE2_CENTER_PROTECT_AREA_RATIO has invalid value; "
+                    "keeping current setting"
                 )
 
         plugin_probe_raw = os.getenv("SEESTAR_WORKFLOW_PLUGIN_PROBE")
@@ -629,6 +751,29 @@ class ProcessorRuntimeMixin:
                     "keeping current setting"
                 )
 
+        stage4_spcc_raw = os.getenv("SEESTAR_SPCC_ENABLE")
+        if stage4_spcc_raw is not None:
+            parsed = self._parse_env_bool(
+                stage4_spcc_raw,
+                getattr(self.cfg, "stage4_spcc_enabled", True),
+            )
+            self.cfg.stage4_spcc_enabled = parsed
+            if stage4_spcc_raw.strip().lower() not in (
+                ENV_TRUE_VALUES | ENV_FALSE_VALUES
+            ):
+                self.log.warn(
+                    "SEESTAR_SPCC_ENABLE has invalid value; keeping current setting"
+                )
+
+        for env_key, attr_name in (
+            ("SEESTAR_STAGE4_SPCC_OSC_SENSOR", "stage4_spcc_osc_sensor"),
+            ("SEESTAR_STAGE4_SPCC_OSC_FILTER", "stage4_spcc_osc_filter"),
+            ("SEESTAR_STAGE4_SPCC_WHITE_REF", "stage4_spcc_white_ref"),
+        ):
+            raw_value = os.getenv(env_key)
+            if raw_value is not None:
+                setattr(self.cfg, attr_name, raw_value.strip())
+
         local_star_wb_raw = os.getenv("SEESTAR_STAGE4_LOCAL_STAR_WB_ENABLE")
         if local_star_wb_raw is not None:
             parsed = self._parse_env_bool(
@@ -663,6 +808,38 @@ class ProcessorRuntimeMixin:
             (
                 "SEESTAR_STAGE4_NBN_LINE_RATIO_DRIFT_MAX",
                 "stage4_nbn_line_ratio_drift_max",
+                float,
+            ),
+            ("SEESTAR_STAGE4_SPCC_TIMEOUT_SEC", "stage4_spcc_timeout_sec", int),
+            ("SEESTAR_STAGE4_SPCC_LIMITMAG", "stage4_spcc_limit_magnitude", float),
+            (
+                "SEESTAR_STAGE4_SPCC_NB_R_WAVELENGTH_NM",
+                "stage4_spcc_narrowband_r_wavelength_nm",
+                float,
+            ),
+            (
+                "SEESTAR_STAGE4_SPCC_NB_R_BANDWIDTH_NM",
+                "stage4_spcc_narrowband_r_bandwidth_nm",
+                float,
+            ),
+            (
+                "SEESTAR_STAGE4_SPCC_NB_G_WAVELENGTH_NM",
+                "stage4_spcc_narrowband_g_wavelength_nm",
+                float,
+            ),
+            (
+                "SEESTAR_STAGE4_SPCC_NB_G_BANDWIDTH_NM",
+                "stage4_spcc_narrowband_g_bandwidth_nm",
+                float,
+            ),
+            (
+                "SEESTAR_STAGE4_SPCC_NB_B_WAVELENGTH_NM",
+                "stage4_spcc_narrowband_b_wavelength_nm",
+                float,
+            ),
+            (
+                "SEESTAR_STAGE4_SPCC_NB_B_BANDWIDTH_NM",
+                "stage4_spcc_narrowband_b_bandwidth_nm",
                 float,
             ),
             ("SEESTAR_STAGE4_PCC_TIMEOUT_SEC", "stage4_pcc_timeout_sec", int),
@@ -806,108 +983,6 @@ class ProcessorRuntimeMixin:
             except ValueError:
                 self.log.warn(f"Invalid {env_key}={raw_value!r}; using current value")
 
-        enabled_raw = os.getenv("SEESTAR_AI_ENABLED")
-        if enabled_raw is not None:
-            parsed = self._parse_env_bool(enabled_raw, self.cfg.ai_post_enabled)
-            self.cfg.ai_post_enabled = parsed
-            if enabled_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
-                self.log.warn(
-                    "SEESTAR_AI_ENABLED has invalid value; keeping current setting"
-                )
-
-        for env_key, attr_name in (
-            ("SEESTAR_AI_STAGE6_ENABLE", "ai_stage6_enabled"),
-            ("SEESTAR_AI_STAGE7_ENABLE", "ai_stage7_enabled"),
-            ("SEESTAR_AI_STAGE8_ENABLE", "ai_stage8_enabled"),
-        ):
-            raw_value = os.getenv(env_key)
-            if raw_value is None:
-                continue
-            parsed = self._parse_env_bool(raw_value, getattr(self.cfg, attr_name))
-            setattr(self.cfg, attr_name, parsed)
-            if raw_value.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
-                self.log.warn(f"{env_key} has invalid value; keeping current setting")
-
-        endpoint = os.getenv("SEESTAR_AI_ENDPOINT")
-        if endpoint is not None:
-            self.cfg.ai_endpoint = endpoint.strip()
-
-        model = os.getenv("SEESTAR_AI_MODEL")
-        if model is not None:
-            self.cfg.ai_model = model.strip()
-
-        api_key = os.getenv("SEESTAR_AI_API_KEY")
-        if api_key is not None:
-            self.cfg.ai_api_key = api_key.strip()
-
-        prompt = os.getenv("SEESTAR_AI_PROMPT")
-        if prompt is not None:
-            self.cfg.ai_prompt = prompt.strip()
-
-        advisor_mode = os.getenv("SEESTAR_AI_ADVISOR_MODE")
-        if advisor_mode is not None:
-            normalized_mode = advisor_mode.strip().lower()
-            if normalized_mode in {"text", "multimodal"}:
-                self.cfg.ai_advisor_mode = normalized_mode
-            else:
-                self.log.warn(
-                    "Invalid SEESTAR_AI_ADVISOR_MODE="
-                    f"{advisor_mode!r}; expected text or multimodal"
-                )
-
-        artistic_enabled_raw = os.getenv("SEESTAR_AI_ARTISTIC_DERIVATIVE_ENABLED")
-        if artistic_enabled_raw is not None:
-            parsed = self._parse_env_bool(
-                artistic_enabled_raw,
-                self.cfg.ai_artistic_derivative_enabled,
-            )
-            self.cfg.ai_artistic_derivative_enabled = parsed
-            if artistic_enabled_raw.strip().lower() not in (
-                ENV_TRUE_VALUES | ENV_FALSE_VALUES
-            ):
-                self.log.warn(
-                    "SEESTAR_AI_ARTISTIC_DERIVATIVE_ENABLED has invalid value; "
-                    "keeping current setting"
-                )
-
-        for env_key, attr_name in (
-            ("SEESTAR_AI_ARTISTIC_ENDPOINT", "ai_artistic_endpoint"),
-            ("SEESTAR_AI_ARTISTIC_MODEL", "ai_artistic_model"),
-            ("SEESTAR_AI_ARTISTIC_API_KEY", "ai_artistic_api_key"),
-            ("SEESTAR_AI_ARTISTIC_PROMPT", "ai_artistic_prompt"),
-        ):
-            value = os.getenv(env_key)
-            if value is not None:
-                setattr(self.cfg, attr_name, value.strip())
-
-        artistic_timeout_raw = os.getenv("SEESTAR_AI_ARTISTIC_TIMEOUT_SEC")
-        if artistic_timeout_raw is not None:
-            try:
-                self.cfg.ai_artistic_timeout_sec = int(artistic_timeout_raw.strip())
-            except ValueError:
-                self.log.warn(
-                    "Invalid SEESTAR_AI_ARTISTIC_TIMEOUT_SEC="
-                    f"{artistic_timeout_raw!r}; using current value"
-                )
-
-        timeout_raw = os.getenv("SEESTAR_AI_TIMEOUT_SEC")
-        if timeout_raw is not None:
-            try:
-                self.cfg.ai_timeout_sec = int(timeout_raw.strip())
-            except ValueError:
-                self.log.warn(
-                    f"Invalid SEESTAR_AI_TIMEOUT_SEC={timeout_raw!r}; using current value"
-                )
-
-        strength_raw = os.getenv("SEESTAR_AI_STRENGTH")
-        if strength_raw is not None:
-            try:
-                self.cfg.ai_strength = float(strength_raw.strip())
-            except ValueError:
-                self.log.warn(
-                    f"Invalid SEESTAR_AI_STRENGTH={strength_raw!r}; using current value"
-                )
-
         stage7_retry_raw = os.getenv("SEESTAR_STAGE7_QUALITY_RETRY_MAX")
         if stage7_retry_raw is not None:
             try:
@@ -951,8 +1026,15 @@ class ProcessorRuntimeMixin:
             ("SEESTAR_STAGE7_STRETCH_BACKGROUND_MOTTLING_SCORE_MAX", "stage7_stretch_background_mottling_score_max"),
             ("SEESTAR_STAGE7_STRETCH_CHROMA_LOAD_GROWTH_MAX", "stage7_stretch_chroma_load_growth_max"),
             ("SEESTAR_STAGE7_STRETCH_CHROMA_LOAD_LOW_ABSOLUTE_MAX", "stage7_stretch_chroma_load_low_absolute_max"),
+            ("SEESTAR_STAGE7_STRETCH_CHROMA_LOAD_LOW_ABSOLUTE_TOLERANCE", "stage7_stretch_chroma_load_low_absolute_tolerance"),
             ("SEESTAR_STAGE7_PREVIEW_TARGET_P50_MIN_RATIO", "stage7_preview_target_p50_min_ratio"),
             ("SEESTAR_STAGE7_PREVIEW_TARGET_P50_MAX_RATIO", "stage7_preview_target_p50_max_ratio"),
+            ("SEESTAR_STAGE7_BRIGHT_NEBULA_STAR_MASK_EXPAND", "stage7_bright_nebula_star_mask_expand"),
+            ("SEESTAR_STAGE7_BRIGHT_NEBULA_STAR_FAINT_SUPPRESSION", "stage7_bright_nebula_star_faint_suppression"),
+            ("SEESTAR_STAGE7_BRIGHT_NEBULA_STAR_DETAIL_SUPPRESSION", "stage7_bright_nebula_star_detail_suppression"),
+            ("SEESTAR_STAGE7_STARLESS_MASKED_RANK_DRIFT_P95_MAX", "stage7_starless_masked_rank_drift_p95_max"),
+            ("SEESTAR_STAGE7_STARLESS_HALO_DETAIL_GROWTH_RATIO_MAX", "stage7_starless_halo_detail_growth_ratio_max"),
+            ("SEESTAR_STAGE7_STARLESS_HALO_DETAIL_DELTA_MIN", "stage7_starless_halo_detail_delta_min"),
             ("SEESTAR_STAGE7_STARLESS_PEAK_BACKGROUND_RATIO_MIN", "stage7_starless_peak_background_ratio_min"),
             ("SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_REDUCTION_MIN", "stage7_starless_repair_chroma_reduction_min"),
             ("SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_DELTA_MIN", "stage7_starless_repair_chroma_delta_min"),
@@ -1031,6 +1113,8 @@ class ProcessorRuntimeMixin:
                 self.log.warn(f"Invalid {env_key}={raw_value!r}; using current value")
 
         for env_key, attr_name in (
+            ("SEESTAR_STAGE7_STRETCH_FEEDBACK_RETRY_MAX", "stage7_stretch_feedback_retry_max"),
+            ("SEESTAR_STAGE8_LIMITED_CORE_EXCLUSION_EXPAND", "stage8_limited_core_exclusion_expand"),
             ("SEESTAR_STAGE9_MIXED_STAR_WEAK_COUNT_MIN", "stage9_mixed_star_weak_count_min"),
             ("SEESTAR_STAGE9_MIXED_STAR_BRIGHT_COUNT_MIN", "stage9_mixed_star_bright_count_min"),
         ):
@@ -1045,6 +1129,8 @@ class ProcessorRuntimeMixin:
         for env_key, attr_name in (
             ("SEESTAR_STAGE7_STARLESS_PIXEL_REPAIR_ENABLE", "stage7_starless_pixel_repair_enabled"),
             ("SEESTAR_STAGE7_CHROMA_RESCUE_ENABLE", "stage7_chroma_rescue_enabled"),
+            ("SEESTAR_STAGE7_STARLESS_STRUCTURE_GATE_ENABLE", "stage7_starless_structure_gate_enabled"),
+            ("SEESTAR_STAGE7_QUANTILE_FALLBACK_ENABLE", "stage7_quantile_fallback_enabled"),
             ("SEESTAR_STAGE8_FORCE_CONSERVATIVE_AFTER_STAGE7_REPAIR", "stage8_force_conservative_after_stage7_repair"),
             ("SEESTAR_STAGE8_LOCAL_ADJUSTMENT_ENGINE_ENABLE", "stage8_local_adjustment_engine_enabled"),
             ("SEESTAR_STAGE9_STARMASK_STRETCH_ENABLE", "stage9_starmask_stretch_enabled"),
@@ -1076,9 +1162,28 @@ class ProcessorRuntimeMixin:
         old_stage9_starmask_stretch = self.cfg.stage9_starmask_asinh_stretch
         old_stage9_starmask_offset = self.cfg.stage9_starmask_asinh_offset
         self.cfg.ai_timeout_sec = _clamp_int(self.cfg.ai_timeout_sec, 15, 300)
+        self.cfg.stage4_spcc_timeout_sec = _clamp_int(
+            getattr(self.cfg, "stage4_spcc_timeout_sec", 180),
+            5,
+            180,
+        )
+        self.cfg.stage4_spcc_limit_magnitude = _clamp_float(
+            getattr(self.cfg, "stage4_spcc_limit_magnitude", 10.5),
+            1.0,
+            25.0,
+        )
         self.cfg.ai_strength = _clamp_float(self.cfg.ai_strength, 0.05, 0.25)
         self.cfg.stage7_quality_retry_max = _clamp_int(
             self.cfg.stage7_quality_retry_max, 0, 3
+        )
+        self.cfg.stage7_stretch_feedback_retry_max = _clamp_int(
+            self.cfg.stage7_stretch_feedback_retry_max, 0, 1
+        )
+        self.cfg.stage7_bright_nebula_star_mask_expand = _clamp_int(
+            self.cfg.stage7_bright_nebula_star_mask_expand, 1, 8
+        )
+        self.cfg.stage8_limited_core_exclusion_expand = _clamp_int(
+            self.cfg.stage8_limited_core_exclusion_expand, 2, 16
         )
         self.cfg.stage7_soft_starless_asinh_stretch = _clamp_float(
             self.cfg.stage7_soft_starless_asinh_stretch,
@@ -1120,8 +1225,14 @@ class ProcessorRuntimeMixin:
             ("stage7_stretch_background_mottling_score_max", 0.10, 1.00),
             ("stage7_stretch_chroma_load_growth_max", 1.00, 3.00),
             ("stage7_stretch_chroma_load_low_absolute_max", 0.01, 0.15),
+            ("stage7_stretch_chroma_load_low_absolute_tolerance", 0.0, 0.01),
             ("stage7_preview_target_p50_min_ratio", 0.25, 0.90),
             ("stage7_preview_target_p50_max_ratio", 1.00, 3.00),
+            ("stage7_bright_nebula_star_faint_suppression", 0.0, 1.0),
+            ("stage7_bright_nebula_star_detail_suppression", 0.0, 0.60),
+            ("stage7_starless_masked_rank_drift_p95_max", 0.02, 0.50),
+            ("stage7_starless_halo_detail_growth_ratio_max", 1.05, 4.00),
+            ("stage7_starless_halo_detail_delta_min", 0.001, 0.10),
             ("stage7_starless_peak_background_ratio_min", 1.5, 12.0),
             ("stage7_starless_repair_chroma_reduction_min", 0.05, 0.80),
             ("stage7_starless_repair_chroma_delta_min", 0.00001, 0.05000),
@@ -1426,9 +1537,126 @@ class ProcessorRuntimeMixin:
             self._trusted_input_provenance = result
             return result
 
+        task_manifest_value = str(
+            os.getenv(ENV_TASK_RUN_MANIFEST_KEY, "") or ""
+        ).strip()
+        if task_manifest_value:
+            manifest_path = Path(task_manifest_value).expanduser().resolve()
+            expected_stage = {
+                INPUT_MODE_STAGE1_PREPARED_RESUME: 1,
+                INPUT_MODE_STAGE2_CORRECTED_RESUME: 2,
+                INPUT_MODE_LINEAR_RESUME: 5,
+            }.get(self.input_mode)
+            task_result: Dict[str, Any] = {
+                "verified": False,
+                "state": "unknown",
+                "manifest_path": str(manifest_path),
+                "detail": "task-run resume record is invalid",
+            }
+            payload = run_manifest.load_json(manifest_path)
+            if manifest_path.parent != self.work_dir.resolve():
+                task_result["detail"] = "task-run manifest is outside current run"
+            elif payload is None or str(payload.get("schema") or "") != (
+                "seestar.task-run.v1"
+            ):
+                task_result["detail"] = "task-run manifest is missing or unsupported"
+            else:
+                expected_hash = str(payload.get("manifest_hash") or "")
+                unsigned = dict(payload)
+                unsigned.pop("manifest_hash", None)
+                manifest_valid = bool(
+                    expected_hash
+                    and expected_hash == run_manifest.canonical_payload_hash(unsigned)
+                )
+                contract = payload.get("pipeline_contract")
+                contract_valid = bool(
+                    isinstance(contract, Mapping)
+                    and str(contract.get("schema") or "")
+                    == stage_contracts.PIPELINE_CONTRACT_SCHEMA
+                    and str(contract.get("version") or "")
+                    == stage_contracts.PIPELINE_CONTRACT_VERSION
+                )
+                resume = payload.get("resume")
+                if not manifest_valid:
+                    task_result["detail"] = "task-run manifest hash is invalid"
+                elif not contract_valid:
+                    task_result["detail"] = "task-run pipeline contract is incompatible"
+                elif expected_stage is None or not isinstance(resume, Mapping):
+                    task_result["detail"] = "task-run has no resume record for this mode"
+                else:
+                    try:
+                        resume_stage = int(resume.get("stage"))
+                    except (TypeError, ValueError):
+                        resume_stage = 0
+                    contract_record = (
+                        stage_contracts.stage_contract(resume_stage)
+                        if resume_stage in stage_contracts.FORMAL_RESUME_STAGES
+                        else None
+                    )
+                    checkpoint_path = Path(
+                        str(resume.get("path") or "")
+                    ).expanduser().resolve()
+                    task_root = Path(
+                        str(payload.get("task_directory") or "")
+                    ).expanduser().resolve()
+                    try:
+                        checkpoint_path.relative_to(task_root / "checkpoints")
+                        path_inside_task = True
+                    except ValueError:
+                        path_inside_task = False
+                    actual_sha256 = run_manifest.sha256_file(checkpoint_path)
+                    expected_sha256 = str(resume.get("sha256") or "")
+                    if resume_stage != expected_stage or contract_record is None:
+                        task_result["detail"] = "task-run resume stage does not match mode"
+                    elif str(resume.get("artifact") or "") != (
+                        contract_record.primary_artifact
+                    ) or checkpoint_path.name != contract_record.primary_artifact:
+                        task_result["detail"] = "task-run resume artifact violates contract"
+                    elif not path_inside_task:
+                        task_result["detail"] = "task-run checkpoint is outside task"
+                    elif str(resume.get("state") or "").lower() != "linear":
+                        task_result["detail"] = "task-run checkpoint state is not linear"
+                    elif not actual_sha256 or actual_sha256 != expected_sha256:
+                        task_result["detail"] = "task-run checkpoint SHA-256 mismatch"
+                    else:
+                        task_result.update(
+                            {
+                                "verified": True,
+                                "state": "linear",
+                                "checkpoint": f"stage{resume_stage}",
+                                "input_path": str(checkpoint_path),
+                                "actual_sha256": actual_sha256,
+                                "plan_hash": resume.get("plan_hash"),
+                                "detail": (
+                                    "task-run manifest, stage contract, and "
+                                    "checkpoint SHA-256 match"
+                                ),
+                            }
+                        )
+                        self._task_resume_checkpoint_path = checkpoint_path
+            self._trusted_input_provenance = task_result
+            if task_result.get("verified"):
+                self.log.info(
+                    "[InputProfile] verified task resume provenance: "
+                    f"{task_result.get('detail')}"
+                )
+            else:
+                self.log.warn(
+                    "[InputProfile] task resume provenance not trusted: "
+                    f"{task_result.get('detail')}"
+                )
+            return task_result
+
         input_path: Optional[Path] = None
         checkpoint_name = ""
-        if self.input_mode == INPUT_MODE_LINEAR_RESUME:
+        if self.input_mode == INPUT_MODE_STAGE1_PREPARED_RESUME:
+            checkpoint_name = "stage1_prepared"
+            candidates = [
+                self.work_dir / "stage1_prepared.fit",
+                self.work_dir / "process" / "stage1_prepared.fit",
+            ]
+            input_path = next((path for path in candidates if path.is_file()), None)
+        elif self.input_mode == INPUT_MODE_LINEAR_RESUME:
             input_path = self.work_dir / "result_linear.fit"
             checkpoint_name = "result_linear"
         elif self.input_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
@@ -1522,7 +1750,15 @@ class ProcessorRuntimeMixin:
 
     def _planned_stage_actions(self, profile: InputProfile) -> List[Dict[str, Any]]:
         safe = profile.safe_for_linear_steps
-        if self.input_mode == INPUT_MODE_LINEAR_RESUME:
+        if self.input_mode == INPUT_MODE_STAGE1_PREPARED_RESUME:
+            early_actions = {
+                1: "load_verified_checkpoint" if safe else "load_untrusted_checkpoint",
+                2: "apply",
+                3: "apply" if safe else "skip_input_state_guard",
+                4: "apply" if safe else "skip_input_state_guard",
+                5: "apply" if safe else "skip_input_state_guard",
+            }
+        elif self.input_mode == INPUT_MODE_LINEAR_RESUME:
             early_actions = {
                 1: "load_verified_checkpoint" if safe else "load_untrusted_checkpoint",
                 2: "skip_resume",
@@ -1556,15 +1792,6 @@ class ProcessorRuntimeMixin:
             8: "apply" if safe else "skip_input_state_guard",
             9: "apply" if safe else "skip_input_state_guard",
             10: "apply" if safe else "review_export_only",
-            11: (
-                "optional"
-                if (
-                    safe
-                    and ai_advisory.network_mode_enabled()
-                    and bool(getattr(self.cfg, "ai_post_enabled", False))
-                )
-                else "skip"
-            ),
         }
         actions = {**early_actions, **late_actions}
         stages_by_number = {
@@ -1577,7 +1804,7 @@ class ProcessorRuntimeMixin:
                 "label": stages_by_number[number].label,
                 "action": actions[number],
             }
-            for number in range(1, 12)
+            for number in range(1, 11)
         ]
 
 
@@ -1620,6 +1847,8 @@ class ProcessorRuntimeMixin:
             "schema": "seestar.processing-plan.v1",
             "run_id": self._run_id,
             "generated_at": run_manifest.utc_timestamp(),
+            "software": self._processing_software_identity(),
+            "pipeline_contract": stage_contracts.pipeline_contract_manifest(),
             "input": input_record,
             "channel_semantics": str(
                 getattr(self, "_channel_semantics", "unknown") or "unknown"
@@ -1638,6 +1867,25 @@ class ProcessorRuntimeMixin:
                 "stage3_background": {
                     "model_priority": list(stage3_policy.get("model_priority") or []),
                     "runtime_capability_probe": True,
+                    "sample_source": "custom_safe_points",
+                    "sample_safety_gates": [
+                        "low_signal",
+                        "low_texture",
+                        "star_rejection",
+                        "spatial_coverage",
+                    ],
+                    "subsky_requires_existing_samples": True,
+                    "pattern_noise_routes": [
+                        "low_frequency_gradient",
+                        "pattern_noise_deferred",
+                        "mixed_gradient_and_pattern_noise",
+                    ],
+                    "pattern_noise_branches": [
+                        "banding_review",
+                        "walking_noise_review",
+                        "directional_pattern_review",
+                    ],
+                    "plugins_are_fallbacks": True,
                 },
                 "stage7_stretch": {
                     "allowed_modes": list(stretch_policy.get("candidate_mode") or []),
@@ -1661,16 +1909,6 @@ class ProcessorRuntimeMixin:
                         "conservative",
                         "balanced",
                         "detail_preserving",
-                    ],
-                    "model_output_fields": ["selected_candidate_id"],
-                    "parameters_owned_by": "code",
-                },
-                "stage11_optional_derivative": {
-                    "candidate_ids": [
-                        "preserve",
-                        "conservative",
-                        "balanced",
-                        "detail_safe",
                     ],
                     "model_output_fields": ["selected_candidate_id"],
                     "parameters_owned_by": "code",
@@ -1721,6 +1959,7 @@ class ProcessorRuntimeMixin:
             getattr(self, "_input_state_review_route", False)
             or getattr(self, "_final_output_review_only", False)
             or getattr(self, "_background_review_required", False)
+            or getattr(self, "_stage4_color_review_required", False)
             or (
                 bool(getattr(self, "_stage9_stars_required", False))
                 and not bool(getattr(self, "_stage9_stars_applied", False))
@@ -1808,6 +2047,34 @@ class ProcessorRuntimeMixin:
                 getattr(self, "_channel_semantics", "unknown") or "unknown"
             ),
             "target_profile": dict(getattr(self, "target_profile", {}) or {}),
+            "color_calibration": {
+                "status": str(
+                    (getattr(self, "color_calibration_report", {}) or {}).get(
+                        "status",
+                        "not_run",
+                    )
+                ),
+                "method": (getattr(self, "color_calibration_report", {}) or {}).get(
+                    "method"
+                ),
+                "requires_review": bool(
+                    getattr(self, "_stage4_color_review_required", False)
+                ),
+                "physical_color": dict(
+                    (getattr(self, "color_calibration_report", {}) or {}).get(
+                        "physical_color",
+                        {},
+                    )
+                    or {}
+                ),
+                "artistic_hoo": dict(
+                    (getattr(self, "color_calibration_report", {}) or {}).get(
+                        "artistic_hoo",
+                        {},
+                    )
+                    or {}
+                ),
+            },
             "star_separation": {
                 "state": getattr(self, "_star_separation_state", "pending"),
                 "stars_required": bool(

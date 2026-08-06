@@ -1028,6 +1028,9 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
     pipeline._stage8_handoff = handoff
     enhancement_report_value = locals().get("enhancement_report")
     if isinstance(enhancement_report_value, dict) and enhancement_report_value:
+        enhancement_report_value["final_quality"] = pipeline._stage8_final_quality
+        enhancement_report_value["final_source"] = pipeline._stage8_final_source
+        enhancement_report_value["fallback_used"] = pipeline._stage8_fallback_used
         enhancement_report_value["passthrough"] = stage8_passthrough
         enhancement_report_value["processing_policy"] = (
             "limited" if stage8_limited_mode else "full"

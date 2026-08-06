@@ -185,11 +185,11 @@ def classify_channel_semantics(
     elif narrowband:
         kind = NARROWBAND_COMPOSITE
         confidence = 0.95
-        action = "skip_pcc_local_star_only"
+        action = "spcc_narrowband_with_isolated_hoo"
     else:
         kind = BROADBAND_RGB_OSC
         confidence = 0.90
-        action = "single_pcc"
+        action = "spcc_then_pcc"
 
     evidence = [
         f"channels={channel_count or 'unknown'}",

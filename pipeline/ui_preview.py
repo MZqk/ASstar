@@ -1,4 +1,4 @@
-"""Raw, non-stretched PNG previews shared by the pipeline and macOS GUI."""
+"""Display-only PNG previews shared by the pipeline and macOS GUI."""
 
 from __future__ import annotations
 
@@ -101,6 +101,52 @@ def _write_png_rgb16(path: Path, rgb: np.ndarray) -> None:
     path.write_bytes(png_data)
 
 
+def _linked_display_stretch(rgb: np.ndarray) -> np.ndarray:
+    """Apply one bounded linked screen stretch without changing source data."""
+
+    arr = np.asarray(rgb, dtype=np.float32)
+    if arr.ndim != 3 or arr.shape[0] != 3:
+        raise ValueError(f"expected RGB CHW array, got shape={arr.shape}")
+    luminance = (
+        arr[0] * np.float32(0.2126)
+        + arr[1] * np.float32(0.7152)
+        + arr[2] * np.float32(0.0722)
+    )
+    sample = luminance.ravel()
+    if sample.size > 500_000:
+        step = max(1, sample.size // 500_000)
+        sample = sample[::step]
+    sample = sample[np.isfinite(sample)]
+    if sample.size < 8:
+        return np.clip(arr, 0.0, 1.0)
+
+    black, median, white = np.percentile(sample, (0.2, 50.0, 99.8))
+    span = float(white - black)
+    if not np.isfinite(span) or span <= 1e-7:
+        return np.clip(arr, 0.0, 1.0)
+    normalized = np.clip((arr - float(black)) / span, 0.0, 1.0)
+    normalized_luma = np.clip((luminance - float(black)) / span, 0.0, 1.0)
+    median_normalized = float(np.clip((median - black) / span, 1e-6, 0.999999))
+    gamma = float(
+        np.clip(
+            np.log(0.18) / np.log(median_normalized),
+            0.20,
+            1.00,
+        )
+    )
+    stretched_luma = np.power(normalized_luma, gamma).astype(
+        np.float32,
+        copy=False,
+    )
+    gain = np.divide(
+        stretched_luma,
+        normalized_luma,
+        out=np.zeros_like(stretched_luma),
+        where=normalized_luma > 1e-7,
+    )
+    return np.clip(normalized * gain[np.newaxis, :, :], 0.0, 1.0)
+
+
 def write_raw_preview(
     image: Any,
     path: Path,
@@ -113,6 +159,29 @@ def write_raw_preview(
     temporary = target.with_name(target.name + ".tmp")
     try:
         rgb = _rgb_raw_float(image, max_side=max(64, int(max_side)))
+        _write_png_rgb16(temporary, rgb)
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
+
+
+def write_display_preview(
+    image: Any,
+    path: Path,
+    *,
+    apply_stretch: bool = True,
+    max_side: int = DEFAULT_PREVIEW_MAX_SIDE,
+) -> Path:
+    """Write a display preview; optional stretch is linked and observer-only."""
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    try:
+        rgb = _rgb_raw_float(image, max_side=max(64, int(max_side)))
+        if apply_stretch:
+            rgb = _linked_display_stretch(rgb)
         _write_png_rgb16(temporary, rgb)
         temporary.replace(target)
     finally:
@@ -147,8 +216,44 @@ def write_raw_fits_preview(
     raise RuntimeError(detail)
 
 
+def write_display_fits_preview(
+    candidates: Iterable[Path],
+    path: Path,
+    *,
+    apply_stretch: bool = True,
+    max_side: int = DEFAULT_PREVIEW_MAX_SIDE,
+) -> Path:
+    """Write the first readable FITS as a labeled display-only preview."""
+
+    try:
+        from astropy.io import fits
+    except ImportError as exc:  # pragma: no cover - runtime preflight covers this.
+        raise RuntimeError("astropy is unavailable for FITS preview") from exc
+
+    errors: list[str] = []
+    for candidate in candidates:
+        source = Path(candidate)
+        if not source.is_file():
+            continue
+        try:
+            data = fits.getdata(source, memmap=False)
+            write_display_preview(
+                data,
+                path,
+                apply_stretch=apply_stretch,
+                max_side=max_side,
+            )
+            return source
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            errors.append(f"{source.name}: {exc}")
+    detail = "; ".join(errors[:3]) or "no readable FIT/FITS candidate"
+    raise RuntimeError(detail)
+
+
 __all__ = [
     "DEFAULT_PREVIEW_MAX_SIDE",
+    "write_display_fits_preview",
+    "write_display_preview",
     "write_raw_fits_preview",
     "write_raw_preview",
 ]

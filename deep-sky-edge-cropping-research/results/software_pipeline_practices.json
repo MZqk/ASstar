@@ -1,0 +1,224 @@
+{
+  "name": "主流软件与天文数据管线实践",
+  "scope_and_question": [
+    "核验 Siril、PixInsight、Astro Pixel Processor、DeepSkyStacker、Astropy/reproject、DrizzlePac 与 Montage 在配准、重投影、叠加和裁切时如何定义输出画幅、识别无覆盖或低可靠像素，以及传播 WCS 与质量辅助平面。",
+    "重点回答这些工具是否自动裁除场旋黑角、是否能选择共同区/参考区/并集/自定义区，以及用户应依据最终像素亮度还是 footprint、weight、context、DQ、area 等证据。",
+    "不把商业软件界面中未公开的内部阈值推断成事实；也不把用于美学构图的人工裁切等同于支持测光或定量分析的科学裁切。"
+  ],
+  "pixel_state_taxonomy": [
+    "Siril、APP、DSS 等消费级处理软件常把配准画幅外区域表现为黑边或未共同覆盖区，但黑色数值本身仍可能与真实暗天空混淆。",
+    "reproject 的 footprint=0 表示输出像素不落在原图 footprint 内；精确球面多边形重投影还能给出 0 到 1 的分数覆盖。",
+    "AstroDrizzle 的 WHT 表示输出像素权重，CTX/CON 表示哪些输入曝光贡献；DQ 决定哪些输入像素可参与，这些状态与 SCI 亮度分离。",
+    "Montage 的 area 图记录投影/合成到输出像素的天空面积，可作为权重及输出保真验证依据；mAdd 的 count 模式可生成参与图像计数。",
+    "PixInsight ImageIntegration 的 low/high rejection map 表示被拒绝的样本，不等同于无覆盖；StarAlignment 生成的 mask 可用于检查马赛克注册边界。",
+    "内部孔洞、低权重、插值核边界、真实暗背景和人工填充需要保持为不同状态，不能统一编码成零值后再凭亮度裁切。"
+  ],
+  "defect_causes": [
+    "场旋、dither、平移、不同相机角度、尺度和畸变校正使配准图像的 footprint 不再共享同一个轴对齐矩形，从而形成黑角、斜边或贡献数下降的外圈。",
+    "union/max/mosaic 画幅保留全部输入视场，因此天然包含部分覆盖区；common/min/intersection 画幅牺牲视场换取所有输入共有的区域。",
+    "Drizzle 的 pixfrac、输出 scale、核、输入帧数与 dither 覆盖不足可产生零权重孔洞；过严 DQ 或异常值拒绝也会减少有效贡献。",
+    "Lanczos、双三次等重采样可能在星点和硬边附近产生 ringing；Siril 和 APP 都提供抑制过冲/欠冲或 clamping 的相关选项。",
+    "马赛克各面板的背景、归一化和 PSF 不一致会产生接缝或色边；这类问题需归一化、背景匹配或 blending，不能仅靠裁去最外圈保证解决。"
+  ],
+  "validity_evidence_source": [
+    "科学管线优先级应为：输入 WCS/变换 footprint 与 DQ/mask，其次 coverage/count、有效曝光、WHT/area/context/rejection，再其次局部噪声、PSF 与归一化诊断，最后才是最终图像的零值、近黑、亮度台阶和色偏。",
+    "reproject、DrizzlePac 和 Montage 的官方接口都显式返回或保存 footprint/weight/context/area，说明可靠性证据应与 SCI 数据分离。",
+    "Siril 的 framing、DSS 的 result mode、APP 的 composition mode 和 PixInsight 的注册/ROI工具首先决定输出画幅；它们不是统一的自动坏边置信度模型。",
+    "[不确定]PixInsight、APP 与 DSS 当前商业或桌面版本是否在某些批处理脚本中额外生成未公开的覆盖统计，公开官方资料不足以确认。"
+  ],
+  "required_inputs": [
+    "配准变换或每幅输入的 WCS/shape、输出 WCS/shape、叠加 SCI 图。",
+    "可用时读取 footprint、DQ/mask、WHT/area、CTX/CON、参与帧数和 rejection map。",
+    "用户选择的 framing 模式、科学 ROI/参考帧、通道关系、插值或 drizzle 核及其参数。",
+    "裁切前后的 FITS header、WCS、像素尺度、方向、目标和参考星坐标。"
+  ],
+  "metrics_and_thresholds": [
+    "Siril 的 framing=min 是所有图像共同区域，framing=max 是所有投影图像的包围画幅，framing=cog 保持更接近中心重心的构图；这些是几何模式而不是按像素亮度的阈值。",
+    "reproject 的插值 footprint 通常为 0/1，exact footprint 可为分数；mosaic coadd 返回累计 footprint，并可接受 input_weights。候选可靠区可以对 footprint 或累计权重设任务相关门限。",
+    "AstroDrizzle 不提供跨数据集通用的裁边阈值；WHT、CTX、DQ、pixfrac、scale 和 kernel 应共同解释。官方参数把未定义输出值、最终权重类型和允许 DQ bits 都显式配置化。",
+    "Montage area 值和 count 图可分别衡量几何面积贡献与输入图像数；mAdd 在非 exact-size 模式可收缩到实际数据范围，但这仍不等于保证每个像素达到共同覆盖。",
+    "PixInsight 与 APP 的 rejection、归一化和 blending 参数依数据量、重叠率与目标而变；官方材料没有给出可通用于黑边裁切的固定亮度或色偏阈值。",
+    "[不确定]商业软件内部自动构图或批处理默认参数可能随版本变化，不能把论坛示例值当成软件不变契约。"
+  ],
+  "algorithm_steps": [
+    "一、先选择输出几何：共同区适合稳定全图处理，参考画幅适合固定构图，并集/马赛克适合保留最大天区，自定义 ROI 适合明确科学目标。",
+    "二、把所有输入 footprint 投影到输出 WCS；同时投影 DQ/mask/weight，形成 geometric coverage、有效贡献数和可靠权重。",
+    "三、按照任务定义把零覆盖、低覆盖、被拒绝、插值支持不足与真实暗背景分开；不以 SCI=0 单独决定有效性。",
+    "四、共同区产品可直接在达到所有必需输入/通道门限的掩膜中求矩形；union 产品保留非矩形 footprint 和辅助平面，不强制把所有空角裁掉。",
+    "五、根据后续插值、卷积、反卷积或模型支持域腐蚀可靠掩膜，再应用 ROI、参考星和视场损失约束。",
+    "六、同步裁切 SCI、mask、weight、coverage、context、rejection 和 uncertainty，并更新或重建 WCS。",
+    "七、用 footprint/WHT/area/CTX、拒绝图、WCS 往返和视觉弱拉伸联合验收；生成科学产品与展示产品的不同接受等级。"
+  ],
+  "geometric_mask_vs_reliable_mask": [
+    "Siril min/max、DSS Intersection/Mosaic、APP Reference/Full/Crop、PixInsight Register/Union 与 ROI 主要定义 geometric framing。",
+    "reproject footprint、AstroDrizzle WHT/CTX/DQ、Montage area/count 才能进一步定义数值可靠性；有几何覆盖不代表权重、贡献数或插值支持足够。",
+    "建议软件适配层统一输出 geometric_mask、reliable_mask 和 processing_safe_mask，避免把某一软件的‘已裁切’误认为所有像素均为科学可靠。"
+  ],
+  "internal_hole_policy": [
+    "Drizzle/reproject/Montage 产品应通过 footprint、WHT、CTX 或 area 保留内部孔洞；矩形裁切只能消除与外边连通的无效区。",
+    "Siril 文档指出某些 drizzle 核或输入帧不足会形成零像素斑驳，可改用 square/Gaussian 或增加帧数；这优先于裁掉含孔洞的整个大矩形。",
+    "少量坏点或芯片间隙继续以 mask 传播；展示副本可修补，但不得把修补后的像素升级为科学观测。"
+  ],
+  "interpolation_and_support_radius": [
+    "Siril 当前文档列出 nearest、bilinear、bicubic、pixel-area、Lanczos-4，并默认对 bicubic/Lanczos 做 clamping 以抑制 ringing；任意角度旋转若不裁切会以黑像素填充缺失区。",
+    "Siril drizzle 支持 point、turbo、square、Gaussian、Lanczos2/3；pixfrac 和核改变覆盖孔洞与相关噪声，不能使用统一固定保护带。",
+    "AstroDrizzle 的 pixfrac、kernel、scale 和 DQ 共同决定输出支持；WHT/CTX 是判断边缘和孔洞的直接证据。",
+    "APP 管理员建议少量帧注册时使用 Lanczos-3 并启用 no under/overshoot 来减少星边伪影，但该建议不等于自动裁切半径。",
+    "[不确定]PixInsight、APP 和 DSS 各版本所有插值核的精确有效支持半径及边界填充实现未在本次可访问官方资料中完整公开。"
+  ],
+  "recommended_pipeline_stage": [
+    "几何画幅应在配准变换确定后选择；若能在叠加时直接输出 common/reference/ROI，可避免先生成大面积黑边再依亮度猜测。",
+    "最终可靠裁切应在叠加后、背景建模和校色前完成，并保留叠加产生的 coverage/weight/rejection；这与 Siril 常见先裁配准边再做后期的实践一致。",
+    "马赛克或科学产品可保留 union 画幅及 mask/weight；用于卷积、反卷积、去星或神经网络时另保留工作 halo，最终展示阶段再生成更紧的 display crop。",
+    "多通道合成前必须先统一 WCS、shape 和共同有效支持；APP 官方论坛也强调仅靠尺寸或事后裁切不能替代通道重新注册。"
+  ],
+  "crop_geometry_and_framing_mode": [
+    "Siril：current、min、max、cog；min 是全序列共同区，max 是包围所有输入的画幅，cog 以重心改善构图。",
+    "DeepSkyStacker：Normal 由参考帧定框，Mosaic 包含全部 light，Intersection 由所有帧交集定框，Custom Rectangle 在用户矩形内处理。",
+    "Astro Pixel Processor：Full 扩展到包含输入偏移后的全部视场，Reference 保证与参考画幅一致，Crop 可在集成时选定参考画幅中的有限区域；多通道/马赛克需共同注册。",
+    "PixInsight：StarAlignment 可做 match/union mosaic 并生成 mask，DynamicCrop/预览 ROI 提供人工或明确区域裁切；公开资料未显示一个基于亮度自动认定科学可靠边缘的统一工具。",
+    "reproject：find_optimal_celestial_wcs 计算容纳全部输入的 WCS/shape，auto_rotate 可最小化最终包围面积；reproject_and_coadd 返回 mosaic 与 footprint。",
+    "DrizzlePac：默认输出为容纳完整 dithered field 的最小 WCS 画幅，也可由 final_refimage、final_outnx/outny、中心、旋转和尺度完整指定。",
+    "Montage：header template 明确定义输出天区和投影，mMakeHdr 可从输入求包围头，mAdd 可按模板 exact-size 或收缩到实际数据范围；area/count 继续表达覆盖。"
+  ],
+  "guard_band_rule": [
+    "没有跨软件统一的固定像素保护带；应从配准残差、插值/drizzle 核支持、WCS 取整、未来卷积或模型 halo 计算。",
+    "reliable mask 应先按最大支持域腐蚀再求裁切矩形；WHT/area 由高到低的过渡带也应纳入保护，而不只剔除严格为零的最外一列。",
+    "未去马赛克 CFA 裁切必须保持采样相位：Siril 明确把 Bayer 选择约束到 2×2、X-Trans 约束到 6×6，并警告任意旋转会破坏 CFA。",
+    "[不确定]闭源去星或神经网络的支持域需以重叠分块一致性实验标定。"
+  ],
+  "science_roi_constraint": [
+    "选择 common/intersection/min 不能只追求无黑边；若弱信号、比较星、天空环或马赛克面板落在低覆盖边缘，应显式选择 reference/union+mask 或用户 ROI。",
+    "APP Crop、DSS Custom Rectangle、PixInsight ROI/preview 和 DrizzlePac custom WCS 都说明 ROI 是用户或任务约束，而非自动从亮度推断。",
+    "多通道产品需在所有必需通道共同 WCS/shape 上保护目标；APP 官方管理员明确指出不同 full-composition 尺寸意味着通道未必在同一坐标框架内。",
+    "科学 ROI 内若存在 WHT=0、footprint=0 或 area=0，应优先修复叠加/采样或保留 mask，而不是用填充像素消除警报。"
+  ],
+  "information_loss_and_stop_conditions": [
+    "每个 framing 候选应报告保留宽高、面积、角视场、目标/参考星保留率、最低与中位 coverage/weight、零覆盖和内部孔洞面积。",
+    "common/intersection 不是天然最优：单个大偏移坏帧会显著缩小共同区；应先做帧质量筛选，或在达到最低贡献数的区域求可靠矩形。",
+    "达到 ROI 冲突、关键参考星丢失、面积预算超限、辅助平面不同步或 WCS 往返失败时停止自动裁切并转人工复核。",
+    "若继续加大裁切只减少真实暗但覆盖正常的像素，而 coverage/weight/hole 指标不再改善，应停止。",
+    "[不确定]各软件均未提供可跨目标通用的最大裁切百分比；工程实现必须配置化并以回归集标定。"
+  ],
+  "acceptance_and_fallback": [
+    "science-safe：footprint/DQ/weight/context 或 area 等高优先证据齐全，ROI 和辅助平面完整，WCS 验证通过。",
+    "processing-safe：适合背景、校色和常规后期，但边缘 coverage 或误差模型不足以支持定量测量；保留 mask/weight。",
+    "display-only：使用 union 空角填充、修补或美学构图，必须与科学 FITS 分开。",
+    "degraded：只能使用最终亮度/色偏推断，或软件版本行为未能核验；允许保守继续但输出残留风险。",
+    "manual-review：common 与 ROI 冲突、马赛克 footprint 非矩形、多通道覆盖不一致、内部孔洞或候选间损失差异很大。",
+    "回退顺序：调整 framing/输出 WCS或重叠加 → 保留大画幅并传播 mask/weight → 跳过高风险下游 → 独立 display crop。"
+  ],
+  "false_positive_and_failure_modes": [
+    "把 SCI=0 或近黑当 no-data 会误裁真实暗星云、低表面亮度外延和经过背景扣除的负值。",
+    "共同区受单个偏移异常帧控制，可能比基于最低贡献数或权重的可靠核心小很多。",
+    "union/max/mosaic 输出的空角被填黑后，若丢失 footprint/weight，后续背景统计会被污染。",
+    "只检查外边条带会漏掉 drizzle holes、坏列、芯片缝和不规则马赛克内部缺口。",
+    "只看 rejection map 会把成功剔除宇宙线与无覆盖混淆；只看 weight 非零又可能接受极低权重边缘。",
+    "对 CFA 在奇数坐标裁切或任意角旋转会改变采样相位；不同通道分别自动裁切会破坏共同坐标。",
+    "商业软件教程、论坛和当前版本可能不同；没有版本号与产物检查时，不能把界面行为当长期契约。"
+  ],
+  "cfa_and_channel_constraints": [
+    "Siril 官方文档明确：Bayer 裁切按 2×2 边界对齐，X-Trans 按 6×6；任意角旋转应在 debayer 或 Bayer drizzle 后进行。",
+    "APP 多通道/多滤镜工作流要求共同注册并生成相同画幅；Reference composition 可保持跨通道一致。",
+    "PixInsight/WBPP 与 Drizzle 多通道产品也应共享输出 WCS/shape，并在全部必需通道的可靠掩膜交集中验收。",
+    "DSS 可对最终 RGB 通道执行对齐，但这不能恢复已被各通道不同裁切移除的天区。"
+  ],
+  "wcs_and_auxiliary_propagation": [
+    "reproject 的输出由 WCS 与 shape 明确定义，函数同时返回 footprint；Astropy CCDData 切片会同步 data、mask 和 WCS，适合作为裁切数据契约。",
+    "AstroDrizzle 输出 SCI、WHT、CTX/CON 并在同一输出 WCS/shape 下保存；自定义 WCS可显式指定 reference、rotation、scale、outnx/outny、CRPIX。",
+    "Montage 以 header template 驱动所有重投影和合成，同时输出 area 图；裁切或 subimage 后必须保持 header 与 area 同窗。",
+    "Siril 现代版本的几何操作会处理 WCS，但工程管线仍应验证保存后的 CRPIX、shape 与目标天区；跨软件传递时不能只相信显示画面。",
+    "PixInsight/APP/DSS 的专有元数据传播在本次可访问公开资料中不完整，[不确定]应以实际 FITS/XISF 产物抽样验证，而不是推断。"
+  ],
+  "downstream_impact": [
+    "背景建模：空角、低权重和面板接缝会扭曲背景位置与尺度；过度 common crop 又会减少背景采样区域。",
+    "校色和通道合成：不同画幅或 WCS 会造成颜色错位；边缘参考星数量和空间分布下降会降低稳健性。",
+    "反卷积、降噪和去星：零填充或低支持边缘会产生 ringing、接缝和模型伪影，需提前裁切或保留工作 halo。",
+    "拉伸：低权重噪声、黑边和彩边被放大；展示产品可以更积极裁边，但不得覆盖科学产品。",
+    "测光与源检测：必须用 WHT/area/mask 限制有效区域；被拒绝样本、低覆盖和无覆盖需要不同误差处理。",
+    "马赛克：背景匹配、LNC/MBB 或 frame adaptation 解决接缝，不应把所有问题归结为外边裁切。"
+  ],
+  "qa_and_validation": [
+    "Siril：对比 framing=current/min/max/cog 的 shape，检查裁切后黑角、星边 ringing、CFA 相位和 WCS。",
+    "PixInsight：检查 StarAlignment mask、ImageIntegration low/high rejection map，并以弱拉伸确认没有把真实结构当拒绝或边缘伪影。",
+    "APP：检查 Registered viewer、跨通道 shape/WCS、normalization map、LNC/MBB 接缝与 Crop/Reference/Full 画幅。",
+    "DSS：分别验证 Normal/Mosaic/Intersection/Custom Rectangle 的实际输出尺寸和参考帧关系；避免在 drizzle/超像素设置变化后沿用旧注册。",
+    "reproject：可视化每个 footprint 与累计 footprint，检查 exact/interp 边界差异、输出 WCS角点和 auto_rotate 结果。",
+    "DrizzlePac：检查 SCI/WHT/CTX、DQ bits、零权重 holes、输出 WCS/scale/rotation 和 ROI 内权重均匀性。",
+    "Montage：检查 mosaic、area/count 图、header template、mCoverageCheck/mSubset 选择和背景修正前后接缝。",
+    "跨工具统一做 pixel→world→pixel 往返、辅助平面 shape/origin 一致性、ROI/参考星保留和裁切前后面积/角视场报告。"
+  ],
+  "crop_provenance": [
+    "记录软件名、精确版本、framing/composition/result 模式、参考帧或 header template、输出 WCS/shape。",
+    "记录输入 footprint/DQ/weight/context/area/rejection 来源、阈值、插值/drizzle 核、pixfrac、scale 与 DQ bits。",
+    "记录候选和最终矩形相对原图坐标、每边/面积/角视场损失、ROI 与通道约束、接受等级和人工覆盖。",
+    "为 SCI 与所有辅助平面记录校验和，确保续跑不会只加载图像而丢失边界证据。"
+  ],
+  "software_and_literature_practice": [
+    "Siril 官方文档：seqapplyreg 提供 current/min/max/cog；min 裁到全序列共同区，max 计算包围所有图像的画幅；旋转不裁切时缺失处填黑，bicubic/Lanczos 默认 clamping；CFA 裁切遵守 2×2 或 6×6 相位。",
+    "PixInsight 第一方示例/论坛：StarAlignment 可用 Register/Union-mosaic 并生成 mask 检查注册，DynamicCrop 用于移除注册伪影；ImageIntegration 输出拒绝图用于检查异常值拒绝。未找到公开的统一自动亮度裁边规范。",
+    "APP 第一方管理员说明：Full 会扩展画幅以包含全部输入偏移，Reference 保证最终通道共用参考画幅，6)Integrate 的 Crop 可只处理参考画幅中的选择区；多通道马赛克应共同注册，LNC/MBB 用于归一化和接缝。",
+    "DSS 官方开源代码：Normal 由参考 light 定框，Mosaic 包含全部 light，Intersection 由所有帧交集定框，Custom Rectangle 是 Normal 加用户矩形；官方 FAQ 还警告更换 super-pixel 模式后需重新注册。",
+    "Astropy/reproject 官方文档：所有重投影函数返回数据和 footprint；exact 方法可返回分数重叠；find_optimal_celestial_wcs 计算容纳所有输入的 WCS/shape并可 auto_rotate 减小包围面积；coadd 同时返回累计 footprint。",
+    "DrizzlePac 官方文档：AstroDrizzle 将 DQ 允许位、输入权重、pixfrac、kernel 和输出 WCS结合，正式产品包含 SCI/WHT/CTX；默认输出可容纳完整 dithered field，也能完整指定自定义 WCS。",
+    "Montage 官方文档：mProject 生成重投影图和 area 图，mAdd 根据 header template 合成并生成输出 area，可用 count 统计重叠图像数；mCoverageCheck/mSubset 按天区 footprint 选择输入。",
+    "综合推断：这些实践共同支持‘先用几何/权重证据定义可靠区，再按任务 ROI 选矩形；亮度扫描仅作缺少辅助平面时 fallback’，但这一统一分级是本调研的工程归纳，不是某个软件的原生命令。"
+  ],
+  "evidence_sources": [
+    "Siril《Drizzle 与 seqapplyreg framing》，官方文档，访问日期 2026-08-04，https://siril.readthedocs.io/en/latest/preprocessing/drizzle.html",
+    "Siril《几何：Rotate & Crop 与插值 clamping》，官方文档，访问日期 2026-08-04，https://siril.readthedocs.io/en/latest/processing/geometry.html",
+    "Siril《主界面：CFA 裁切约束》，官方文档，访问日期 2026-08-04，https://siril.readthedocs.io/en/latest/GUI/main-interface.html",
+    "PixInsight《Building large mosaics with StarAlignment》，第一方论坛示例，2010 年，https://pixinsight.com/forum/index.php?threads/building-large-mosaics-with-staralignment.1953/",
+    "PixInsight《Messier 31 H-alpha Processing Notes》，官方处理说明，访问日期 2026-08-04，https://www.pixinsight.com/examples/M31-Ha/",
+    "Astro Pixel Processor《RGB combination and same-size requirements》，第一方管理员答复，2017-08-10 至 2019-10-10，https://www.astropixelprocessor.com/community/faq/rgb-combination-and-same-size-requirements/",
+    "Astro Pixel Processor《Cropping a mosaic》，第一方管理员答复，2024-02-15，https://www.astropixelprocessor.com/community/main-forum/cropping-a-mosaic/",
+    "Astro Pixel Processor《Bayer drizzle》，第一方管理员答复，2021-03-20，https://www.astropixelprocessor.com/community/tutorials-workflows/bayer-drizzle/",
+    "DeepSkyStacker《ResultParameters.cpp》，官方开源实现，访问日期 2026-08-04，https://github.com/deepskystacker/DSS/blob/master/DeepSkyStacker/ResultParameters.cpp",
+    "DeepSkyStacker《FAQ》，官方网站，访问日期 2026-08-04，https://deepskystacker.free.fr/english/faq.htm",
+    "Astropy/reproject《Footprint arrays》，官方文档，更新于 2026-06-25，https://reproject.readthedocs.io/en/stable/footprints.html",
+    "Astropy/reproject《Combining images into mosaics》，官方文档，访问日期 2026-08-04，https://reproject.readthedocs.io/en/stable/mosaicking.html",
+    "Astropy/reproject《reproject_and_coadd》，官方 API，访问日期 2026-08-04，https://reproject.readthedocs.io/en/stable/api/reproject.mosaicking.reproject_and_coadd.html",
+    "Astropy《CCDData Class》，官方文档，访问日期 2026-08-04，https://docs.astropy.org/en/stable/nddata/ccddata.html",
+    "STScI《DrizzlePac Handbook 3.0》，官方手册，2025-01，https://hst-docs.stsci.edu/drizzpac",
+    "DrizzlePac《AstroDrizzle API》，官方文档，访问日期 2026-08-04，https://drizzlepac.readthedocs.io/en/latest/_modules/drizzlepac/astrodrizzle.html",
+    "DrizzlePac《Single-visit Mosaic Processing》，官方文档，访问日期 2026-08-04，https://drizzlepac.readthedocs.io/en/latest/mast_data_products/svm_processing.html",
+    "Montage《Toolkit Components》，IPAC 官方文档，访问日期 2026-08-04，https://irsa.ipac.caltech.edu/Montage/docs/components.html",
+    "Montage《Mosaic Notebook》，官方示例，访问日期 2026-08-04，https://montage.ipac.caltech.edu/MontageNotebooks/Mosaic.html",
+    "Montage《M101 Mosaic Tutorial》，IPAC 官方教程，访问日期 2026-08-04，https://irsa.ipac.caltech.edu/Montage/docs/m101tutorial.html"
+  ],
+  "evidence_strength_and_conflicts": [
+    "强证据：Siril、reproject、Astropy、DrizzlePac、Montage 的官方 API/手册，以及 DSS 官方开源实现，直接定义 framing、footprint、WHT/CTX、area、WCS 与输出 shape。",
+    "中等证据：PixInsight 与 APP 的第一方论坛、管理员答复和官方处理示例能够验证功能，但具体界面和默认值可能随版本变化。",
+    "[不确定]APP 2.0 beta 当前是否已实现 2024 年仍在待办的 full-composition 任意裁切，以及 PixInsight/WBPP 当前是否新增覆盖图或自动裁边功能，需按目标发行版实机验证。",
+    "[不确定]DSS 网站旧用户手册访问稳定性较差，因此本项以当前官方源码中的模式文案作为主要证据；模式背后的所有像素权重细节未逐行审计。",
+    "不存在来源冲突的核心结论是：画幅模式和可靠性辅助数据是两个层次；冲突主要来自软件版本、术语和默认构图不同，而非 footprint/weight 优先于亮度猜测这一工程判断。"
+  ],
+  "current_project_fit": [
+    "项目 Stage 1 使用 Siril register -2pass 后 seqapplyreg，但未显式选择 -framing=min/max/cog，也未产出 coverage/weight/context；Stage 2 因而只能从叠加后 RGB 像素反推边缘。",
+    "Stage 2 所处位置正确：在叠加后、背景处理前裁边，符合 Siril 等工具避免黑边污染后续统计的实践。",
+    "当前四边亮度/近黑/色偏扫描相当于低优先 fallback，尚未实现 reproject/DrizzlePac/Montage 风格的 footprint、weight、context 或 area 主证据。",
+    "当前只输出一个轴对齐裁切产品，缺少 common/reference/union/ROI 的显式 framing 契约，也不保留非矩形可靠掩膜和内部孔洞。",
+    "Stage 4 在裁切后重新 platesolve，有利于得到裁后 WCS；但 Stage 2 报告不验证 WCS，也不传播 mask/uncertainty/coverage，stage2 resume 时运行态 crop_report 不会从旁车自动重建。",
+    "项目输入已是 debayer RGB 时不受 CFA 相位约束；但显式载入的未知母版若仍是 CFA，[不确定]当前命令行裁切路径是否始终遵守 Siril GUI 文档中的相位约束需实测。"
+  ],
+  "implementation_recommendations": [
+    "P0：把 Stage 1 使用的 Siril framing 作为显式配置和报告字段，至少区分 reference/current、common/min 和 union/max；不要依赖版本默认值。",
+    "P0：在现有 Stage 2 报告中加入 evidence_source、framing_mode、输入软件版本、WCS/shape、面积与角视场损失、接受等级；像素扫描明确标为 fallback。",
+    "P0：若输入 FITS 已包含 mask/weight/coverage 类扩展或旁车，优先读取并与 SCI 同窗裁切；缺失时才走现有 near-black/chroma 检测。",
+    "P1：对原始 Light 路径从已注册序列生成 coverage_count 或有效曝光权重图，Stage 2 先按 coverage 定义 reliable mask，再使用亮度/色偏诊断插值和通道伪影。",
+    "P1：实现 common/reference/union 三种产物策略；common 求可靠核心，reference 保持固定画幅并带 mask，union 用于马赛克或最大视场且禁止将黑填充当真实背景。",
+    "P1：为 SCI、mask、coverage/weight、WCS 和 ROI 建立同一裁切事务与 shape 校验；resume checkpoint 需携带这些旁车和校验和。",
+    "P1：按插值核、配准残差和后续算子 halo 计算 guard band，替代固定像素；CFA 输入强制周期对齐或先拒绝进入 Stage 2。",
+    "P2：借鉴 DrizzlePac/Montege 的质量产品，保存 coverage、weight/context、rejection 与边界 QA 图；建立 science-safe、processing-safe、display-only、degraded、manual-review 五级输出。",
+    "P2：建立跨软件回归集，验证 Siril framing、DSS/APP/PixInsight 导入产物、Drizzle/reproject/Montage 权重图、WCS 往返和暗星云误判。"
+  ],
+  "uncertain": [
+    "validity_evidence_source",
+    "metrics_and_thresholds",
+    "interpolation_and_support_radius",
+    "guard_band_rule",
+    "wcs_and_auxiliary_propagation",
+    "evidence_strength_and_conflicts",
+    "current_project_fit"
+  ]
+}

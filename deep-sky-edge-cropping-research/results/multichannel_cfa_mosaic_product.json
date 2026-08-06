@@ -1,0 +1,227 @@
+{
+  "name": "多通道、CFA、马赛克与产品目的",
+  "scope_and_question": "研究深空后期中 RGB、LRGB、窄带和多面板马赛克在边缘裁切时怎样定义共同支持区，怎样处理 Bayer 与 X-Trans 原始 CFA 相位，以及 reference、common、union 等画幅策略如何随科学测量、全图处理和展示用途改变。本项不讨论各滤镜的物理通带标定，也不把显示用修补视为观测数据恢复。",
+  "pixel_state_taxonomy": [
+    "单通道有数据：某滤镜或颜色通道有足够覆盖，但其他待联合通道可能无覆盖或低覆盖。",
+    "通道共同有效：所有参与像素级组合的通道在同一输出 WCS 像素上均通过覆盖、权重、DQ 和有限性门禁。",
+    "通道共同低可靠：各通道都有数值，但至少一个通道覆盖、权重或拒绝后样本数不足；颜色比值和窄带映射会被最弱通道支配。",
+    "CFA 几何采样：未去马赛克像素只测一个颜色；Bayer 与 X-Trans 的周期相位属于数据语义，不能把相邻位置当作完整 RGB。",
+    "CFA drizzle 稀疏覆盖：输出位置可能有总贡献却缺少某个颜色的贡献，必须按颜色分别判断覆盖。",
+    "马赛克 union：至少一个面板覆盖；边缘和面板接缝处常有不同有效曝光时间。",
+    "马赛克 common：所有指定面板或全部指定通道同时覆盖；对大范围马赛克通常很小、为空或没有业务意义。",
+    "真实暗信号：在所需通道都有正常权重的暗星云、发射线弱区或暗背景，不应因亮度低而裁掉。"
+  ],
+  "defect_causes": [
+    "不同滤镜在不同夜晚、旋转角、dither、焦距或配准参考下采集，导致各通道 footprint、边缘覆盖和星点位置不完全一致。",
+    "分别叠加 L、R、G、B 或窄带后再各自自动裁切，会得到不同原点和尺寸，逐像素合成时产生色边、空值或隐式再次重采样。",
+    "CFA 图像若从奇数像素原点裁切、错误翻转或旋转，会改变颜色阵列相位；以旧 Bayer pattern 去马赛克会把颜色解释错位。",
+    "Bayer drizzle 或 X-Trans drizzle 的各颜色采样密度不同；抖动不足、放大尺度过高或 pixfrac 较小时可形成颜色相关空洞和边缘噪声。",
+    "多面板马赛克的目标就是保留不规则 union；以四边全有效为唯一标准会为清除角部或接缝低覆盖而删除完整面板。",
+    "reference framing 受参考帧构图支配，maximum 或 union framing 受所有输入外包络支配，minimum 或 common framing 受交集及异常偏移帧支配。"
+  ],
+  "validity_evidence_source": {
+    "优先级": [
+      "每个通道或滤镜在统一输出 WCS 上的几何 footprint、coverage、weight、DQ 和 rejection",
+      "CFA drizzle 时按输出颜色分开的 coverage 或 weight，而不是三通道求和",
+      "输入 CFA pattern、ROWORDER、XBAYROFF、YBAYROFF、传感器类型及已执行几何变换记录",
+      "跨通道恒星配准残差、共同源匹配和 PSF 差异",
+      "最终亮度、近黑比例和边缘色偏统计"
+    ],
+    "说明": "颜色组合是否安全首先是同一天球位置上所需通道是否都有可靠观测，而不是合成图是否看起来不黑。最终像素统计只能作为缺少辅助平面时的降级证据。"
+  },
+  "required_inputs": [
+    "每个 RGB、L、窄带或马赛克面板的 SCI、WCS、几何 footprint、coverage 或 weight、DQ 或 mask、rejection 及曝光信息。",
+    "通道或面板之间的配准变换、参考图选择、输出 WCS、输出尺寸、像素尺度和方向。",
+    "未去马赛克时的 CFA 类型与 pattern、周期、ROWORDER、XBAYROFF、YBAYROFF，以及裁切、翻转、旋转和 drizzle 历史。",
+    "产品目的、需要联合处理的通道集合、科学目标和弱信号 ROI、允许保留的非矩形 mask。"
+  ],
+  "metrics_and_thresholds": {
+    "多通道指标": [
+      "逐通道 coverage、weight 分位数和零权重率；共同 mask 面积、union 面积、common 与 union 面积比。",
+      "每个候选矩形内最弱通道的最小或低分位覆盖、内部空洞率、通道间有效 mask 异或面积。",
+      "跨通道恒星残差、颜色比值在边缘相对内部的偏移、各通道 PSF/FWHM 和背景噪声。"
+    ],
+    "CFA 指标": [
+      "裁切原点和尺寸对 Bayer 周期 2、X-Trans 周期 6 的模数；pattern 与行序元数据在变换前后是否一致。",
+      "CFA drizzle 每种颜色的零权重率、覆盖分位数和颜色间覆盖比，而非只测总 coverage。"
+    ],
+    "阈值原则": "[不确定] 没有适用于所有滤镜、帧数、CFA 阵列和产品目的的统一 coverage 或面积阈值。像素级颜色比、LRGB 合成和统一卷积至少要求所涉及通道通过同一任务门禁；单通道科学分析可使用各自可靠区。阈值应相对于各通道内部权重平台、预期噪声和所需颜色集合配置。"
+  },
+  "algorithm_steps": [
+    "先定义产品合同：单通道科学产品、多通道共同处理产品、马赛克科学 union，或仅展示产品；明确哪些通道必须在每个像素共同存在。",
+    "把所有通道或面板的 SCI 与有效辅助平面重投影到一个已选定的输出 WCS。输出 WCS 应在注册或叠加阶段一次确定，避免为裁切再次旋转插值。",
+    "为每个通道构造 V_channel：合并 footprint、有限性、DQ、coverage、weight、rejection 和该通道噪声门禁；CFA drizzle 则为 R、G、B 分别构造。",
+    "构造 V_union＝任一所需通道或面板可靠，V_common＝所有参与像素级组合的通道可靠；另对每个科学任务构造 V_required，例如 LRGB 合成要求 L/R/G/B，HOO 映射要求 Hα/OIII。",
+    "按配准插值核、PSF 匹配核和下游邻域腐蚀 V_required，得到 processing-safe mask；在其内求受 ROI 和构图约束的最大矩形，或选择参考图画幅与 mask。",
+    "单视场多通道默认导出同一 WCS、同一整数矩形的共同处理产品；同时可保留每通道更大的 science-union 母版和各自 mask。",
+    "多面板马赛克默认保留 union、coverage 与非矩形 mask；只为不支持 mask 的全图算法另求 processing-safe 子矩形，不要求所有面板共同覆盖。",
+    "未去马赛克 CFA 若必须裁切，原点与边界按阵列周期对齐并同步 pattern offset；任意角旋转或缩放推迟到去马赛克或 CFA drizzle 输出之后。",
+    "裁后对所有联合通道使用完全相同的切片，复检尺寸、WCS、共同 mask、颜色边缘和 ROI；展示副本中的填补、羽化或构图旋转另行记录。"
+  ],
+  "geometric_mask_vs_reliable_mask": "多通道几何共同区只表示各 footprint 都触及某位置，不保证某通道有足够权重、拒绝后样本数或完整插值支持；数值共同可靠区还要通过逐通道 coverage、weight、DQ、rejection、有限性和噪声门禁。对 CFA drizzle，总几何覆盖也不等于 R、G、B 都有覆盖。马赛克 union 几何 mask 则有意允许非矩形边界和覆盖阶梯，不能因不是全矩形而统称为坏边。",
+  "internal_hole_policy": [
+    "任一必需通道的内部洞都从该产品的共同可靠 mask 中排除；洞不应靠裁完整行列隐藏。",
+    "单通道独有的小坏点可留在该通道 DQ 中；合成时传播为共同 mask。展示副本可做局部插值但保留插值来源位。",
+    "CFA drizzle 的单色空洞必须按颜色记录，不能因其他颜色有贡献而当作有效彩色像素。",
+    "马赛克芯片间隙或面板之间无覆盖区保留为非矩形 mask；若算法不支持洞，改用分块或安全子矩形。"
+  ],
+  "interpolation_and_support_radius": "跨通道配准、PSF 匹配和卷积都扩大边界不可靠域；共同处理 mask 应按所选重采样核及最大 PSF 匹配核向内腐蚀。未去马赛克 CFA 的普通旋转和缩放不只是扩大支持域，还会混合不同颜色相位，因此应在去马赛克或 CFA drizzle 后进行。Siril 明确提示任意角旋转会破坏 CFA，并指出 CFA drizzle 在放大尺度下因红蓝样本稀疏需要更多数据。[不确定] 当前项目所捆绑 Siril 版本各插值与 drizzle 核在边界的确切离散支持半径仍需脉冲或 mask 传播测试。",
+  "recommended_pipeline_stage": "先在校准后的帧或各通道主图上完成天球对齐，选定所有联合产品共享的输出 WCS，并在配准/叠加时生成逐通道 coverage 与 mask。最终共同矩形应在线性阶段、背景建模和任何跨通道比值、颜色合成、PSF 匹配、反卷积、去星与拉伸之前确定。原始 CFA 裁切若不可避免，应在去马赛克前按 CFA 周期执行；构图旋转应合并进注册输出 WCS，或仅在展示末端执行。",
+  "crop_geometry_and_framing_mode": {
+    "参考图画幅": "以选定参考图的 WCS、尺寸和方向为输出网格，构图稳定且便于多通道一致；参考图外仍须按通道保留无覆盖 mask，不能把填充值当作观测。",
+    "严格共同区": "对所有需要联合的通道取可靠 mask 交集，适合像素级颜色比、统一背景或不支持 mask 的卷积；最弱通道和异常偏移会决定损失。",
+    "阈值共同区": "允许每通道达到各自最低 coverage 或 weight，而不要求所有输入帧满覆盖，通常比逐帧严格交集实用；门禁必须按通道而非合成亮度。",
+    "联合区": "保留任一通道或面板的最大天区和辅助 mask，适合单通道科学测量、目录生成与马赛克母版；不适合无 mask 的像素级颜色运算。",
+    "马赛克画幅": "通常由期望天球区域或全部面板 union 定义，允许非矩形 footprint、接缝和覆盖阶梯；共同区应指每个天空位置所需滤镜共同有效，不是要求所有面板重叠。",
+    "每通道独立画幅": "可作为单通道科学母版，但在 RGB/LRGB/窄带合成前必须重投影和统一裁切；不能仅把数组缩放到同尺寸。"
+  },
+  "guard_band_rule": [
+    "共同 mask 先按每个通道自身的注册核支持腐蚀，再按跨通道 PSF 匹配或联合模型的最大邻域腐蚀。",
+    "未去马赛克裁切使用 CFA 周期网格：Bayer 选择框对齐 2×2，X-Trans 对齐 6×6；若修改原点而不保持相位，必须正确更新 pattern offset。",
+    "候选矩形边界向内取整，所有通道使用同一半开切片；因 CFA 周期取整增加的损失须计入报告。",
+    "马赛克 mask 的斜边和洞用距离变换定义保护带，不用固定四边像素代替。"
+  ],
+  "science_roi_constraint": "先在天球坐标定义目标核心、低表面亮度外延、测光目标与比较星、背景环或采样区，再映射到每个通道 mask。共同处理矩形必须包含硬 ROI 且 ROI 在所有必需通道有足够支持；若某窄带缺少目标外延，不能以其他通道亮度替代。马赛克的面板外延本身可能就是科学 ROI，此时应保留 union+mask 而不是强求一个小共同矩形。",
+  "information_loss_and_stop_conditions": [
+    "按通道报告原始与保留角面积、每侧损失、union/common 比、ROI 裕量、参考星保留率和最弱通道覆盖。",
+    "候选矩形满足产品所需通道集合、处理护带和 ROI 即停止；不得为去除只影响非必需通道的边缘继续裁共同产品。",
+    "如果共同矩形不能保留硬 ROI、最低角面积或构图，应停止自动裁切，改为 union+mask、分通道处理后再合成，或重新注册/叠加。",
+    "CFA 周期对齐后若尺寸低于最低门禁，停止预去马赛克裁切并推迟到去马赛克后。",
+    "[不确定] 通用最大面积损失不存在；科学测量、窄带映射和展示的容忍度必须分别配置。"
+  ],
+  "acceptance_and_fallback": {
+    "科学安全": "保留每通道 SCI、WCS、mask、coverage、weight 和不确定度；单通道测量可使用各自可靠区，多通道测量明确所需通道交集，CFA 相位和来源完整。",
+    "处理安全": "所有待联合通道在同一 WCS 与矩形内通过最低可靠度，并具有注册、PSF 匹配和后续邻域护带。",
+    "仅展示": "允许 union 边缘、羽化、填洞、构图旋转和局部修补，但与线性科学母版分离且不得回流测光。",
+    "退化": "只有合成像素统计、缺失逐通道 coverage、CFA 元数据不完整或共同矩形内仍有通道空洞；限制需要颜色比或精密测量的下游步骤。",
+    "人工复核": "目标 ROI 与某必需通道无覆盖相交、马赛克多连通、通道间 WCS 残差过大、CFA 相位不明或共同区损失过高。"
+  },
+  "false_positive_and_failure_modes": [
+    "把窄带中真实低信号、暗星云或滤镜间物理颜色差异当作黑边或色边。",
+    "从最终 RGB 色偏反推某通道无效，可能混淆真实发射线结构、渐晕、光害梯度和配准误差。",
+    "各通道独立自动裁切后只对齐尺寸，不对齐 WCS 和原点，会形成隐蔽的像素对应错误。",
+    "严格取所有帧或所有面板交集会被异常偏移帧拖垮，也会把真正的马赛克 union 裁成很小区域。",
+    "reference framing 可能在参考图边缘保留其他通道无覆盖像素；maximum framing 会扩大低覆盖边；二者都不能替代 mask。",
+    "只看总 drizzle coverage 会漏掉红色或蓝色零覆盖，尤其在 CFA 稀疏采样和上采样时。",
+    "预去马赛克裁切原点奇偶错误、上下翻转后 ROWORDER 未同步，或对 X-Trans 误用 2×2 规则，会产生全图颜色伪影。",
+    "展示用修补若覆盖原 mask 并作为科学产品保存，会让缺失观测看似正常。",
+    "多通道共同矩形可能删除某单通道独有但有科学价值的外延，因此应同时保留各自 science-union 母版。"
+  ],
+  "cfa_and_channel_constraints": {
+    "Bayer": "Siril 1.5 官方界面把 CFA 裁切框吸附到 2×2 边界，并可在 x、y 各移动最多 1 像素以保持 pattern 起点；FITS 的 XBAYROFF、YBAYROFF 与 ROWORDER 会改变 pattern 解释。",
+    "X-Trans": "Siril 将裁切框吸附到 6×6 边界，并可在各方向移动最多 5 像素；不能沿用 Bayer 的偶数偏移规则。",
+    "几何变换": "未去马赛克 CFA 不允许任意角旋转或普通缩放；应先去马赛克或完成 CFA drizzle。翻转也必须同步行序与 pattern 相位。",
+    "单次彩色相机": "去马赛克后的 RGB 通道共享一个几何网格，但边界插值可靠性仍可能按颜色不同；统一裁切且以最弱颜色支持为门禁。",
+    "LRGB与窄带": "各主图必须共享 WCS、像素尺度、方向和整数切片；像素级组合使用必需通道可靠 mask 交集，单通道分析可保留更大区域。",
+    "CFA drizzle": "R/G/B 贡献应分别统计；红蓝采样更稀疏，Siril 官方说明放大尺度会需要更多输入才能保持覆盖和噪声。"
+  },
+  "wcs_and_auxiliary_propagation": [
+    "所有通道和面板先映射到共同 WCS；共同裁切对 SCI、逐通道 mask、uncertainty、weight、coverage、context 和 rejection 使用完全相同的整数切片。",
+    "更新 NAXIS 与 WCS 参考像素，保留天球坐标不变；目录像素坐标按裁切原点平移。多通道必须断言 WCS 与数组 shape 一致。",
+    "未去马赛克 CFA 同步保存 pattern、ROWORDER、XBAYROFF、YBAYROFF 和裁切原点；若裁切保持完整周期，相位应不变，仍需在文件头与日志中核验。",
+    "马赛克产品保留面板或曝光贡献 context、逐像素 coverage/area 与权重，不能只保存填成零的 RGB 图。"
+  ],
+  "downstream_impact": "共同且带保护区的多通道矩形可避免 RGB 比值、LRGB 合成、窄带映射、光度校色、PSF 匹配、去星和卷积被缺失通道或低覆盖边缘污染。逐通道 union+mask 则能保留单滤镜测量和马赛克外延。错误 CFA 相位会在去马赛克后扩散成周期性色伪影，无法靠后续裁边补救；通道独立裁切或额外重采样会降低星点重合与 PSF。背景建模应读取 coverage mask，展示拉伸与修补必须在科学路径之外。",
+  "qa_and_validation": [
+    "叠加显示每通道 footprint、coverage、weight、共同 mask、union mask、候选矩形和科学 ROI，并检查边缘与接缝。",
+    "断言联合产品所有通道的 shape、WCS、像素尺度、方向和裁切原点一致；在中心、四角和随机星点做天球坐标往返与跨通道残差测试。",
+    "分别统计 R/G/B/L/窄带在矩形内的零权重率、低分位权重、内部空洞和边缘噪声；CFA drizzle 不得只验总 coverage。",
+    "用四种 Bayer pattern、ROWORDER 上下方向、全部 XBAYROFF/YBAYROFF 组合及 X-Trans 相位做彩色棋盘测试，裁后去马赛克结果应与原图对应区域一致。",
+    "比较裁前后共同星的质心、FWHM、颜色比和背景残差；马赛克检查面板接缝、覆盖阶梯和角面积。",
+    "science-safe 与 display-only 分别导出，检查显示用填补没有清除科学母版 mask 或覆盖 provenance。"
+  ],
+  "crop_provenance": "记录产品目的、必需与可选通道、输入文件和滤镜、参考图、输出 WCS、各通道 footprint 与 coverage 定义、common/union 候选、最终像素及天球矩形、每通道面积和权重损失、ROI、CFA 类型/pattern/行序/偏移、drizzle 参数、重采样次数、保护半径、软件版本、人工选择及科学或展示等级。",
+  "software_and_literature_practice": [
+    "Siril 1.5 官方注册提供参考图、最大外包框与最小共同区域等 framing：最大模式保留 union，最小模式裁到序列共同区，说明画幅选择本身就是覆盖与构图取舍。",
+    "Siril 1.5 官方主界面明确：Bayer CFA 裁切吸附到 2×2，X-Trans 吸附到 6×6；任意角旋转会破坏 CFA，应先去马赛克或 Bayer drizzle。",
+    "Siril FITS 文档说明 ROWORDER、XBAYROFF 和 YBAYROFF 共同影响 Bayer pattern 的读取，支持将相位视为必须传播的元数据。",
+    "Siril drizzle 文档说明 CFA drizzle 按当前像素颜色落入输出通道；红蓝采样较稀，放大尺度需要更多输入保证覆盖与噪声。",
+    "STScI 单次访问马赛克流程为同一探测器的各滤镜产品定义共同 metawcs，覆盖全部输入视场，并为每个产品保存 SCI、WHT 和 CON；这是跨滤镜统一网格且保留贡献信息的强实例。",
+    "STScI Bubble Nebula 实例先用一个滤镜构建参考马赛克，再将其他滤镜曝光对齐到该马赛克，体现 reference mosaic 的实际用法。",
+    "Montage 在统一天球投影上按像素天空重叠面积重投影和加权，并输出 area coverage；它支持保留马赛克 union，而不是用矩形黑边检测代表覆盖。",
+    "science-safe、processing-safe、display-only 分级及按任务构造 V_required 是本调研的工程综合，并非这些软件采用相同名称公开的标准。"
+  ],
+  "evidence_sources": [
+    {
+      "标题": "Siril 1.5 主界面：CFA 裁切边界与旋转警告",
+      "网址": "https://siril.readthedocs.io/en/latest/GUI/main-interface.html",
+      "来源类型": "官方软件文档",
+      "日期": "版本 1.5.0；访问于 2026-08-04"
+    },
+    {
+      "标题": "Siril 1.5 FITS：ROWORDER、XBAYROFF 与 YBAYROFF",
+      "网址": "https://siril.readthedocs.io/en/latest/file-formats/FITS.html",
+      "来源类型": "官方软件文档",
+      "日期": "版本 1.5.0；访问于 2026-08-04"
+    },
+    {
+      "标题": "Siril 1.5 注册：reference、maximum 与 minimum framing",
+      "网址": "https://siril.readthedocs.io/_/downloads/en/latest/pdf/",
+      "来源类型": "官方软件手册",
+      "日期": "版本 1.5.0；访问于 2026-08-04"
+    },
+    {
+      "标题": "Siril 1.4 Drizzle 与 CFA drizzle",
+      "网址": "https://siril.readthedocs.io/en/stable/preprocessing/drizzle.html",
+      "来源类型": "官方软件文档",
+      "日期": "稳定版 1.4；访问于 2026-08-04"
+    },
+    {
+      "标题": "DrizzlePac 单次访问马赛克：跨滤镜共同输出 WCS 与辅助平面",
+      "网址": "https://ssb.stsci.edu/hack/astrometry/testing/drizzlepac_v341_html/singlevisit.html",
+      "来源类型": "空间望远镜科学研究所官方软件文档",
+      "日期": "DrizzlePac 3.2 开发文档；访问于 2026-08-04"
+    },
+    {
+      "标题": "HST Bubble Nebula：使用参考滤镜马赛克对齐其他滤镜",
+      "网址": "https://archive.stsci.edu/prepds/heritage/bubble/README.html",
+      "来源类型": "空间望远镜科学研究所数据处理说明",
+      "日期": "2016；访问于 2026-08-04"
+    },
+    {
+      "标题": "Montage 算法：天球重投影、面积覆盖与加权合并",
+      "网址": "https://irsa.ipac.caltech.edu/Montage/docs/algorithms.html",
+      "来源类型": "美国航天局红外科学档案官方软件文档",
+      "日期": "访问于 2026-08-04"
+    },
+    {
+      "标题": "Photutils Background2D：马赛克无覆盖 mask 与普通坏像素 mask",
+      "网址": "https://photutils.readthedocs.io/en/stable/api/photutils.background.Background2D.html",
+      "来源类型": "官方软件文档",
+      "日期": "版本 3.0.0；访问于 2026-08-04"
+    }
+  ],
+  "evidence_strength_and_conflicts": "Siril 对 CFA 周期、旋转限制、Bayer offset 和 framing 的官方说明是直接强证据；STScI 的共同 metawcs、逐滤镜产品和 WHT/CON 是高质量科学管线实例；Montage 与 Photutils 为马赛克面积覆盖和 no-coverage mask 提供独立佐证。它们不冲突，但用途不同：Siril framing 面向序列输出画幅，STScI 和 Montage 倾向保留统一天球网格及辅助覆盖。严格 common、阈值 common、reference 和 union 之间没有唯一优胜者，必须由产品合同选择。[不确定] 各软件自动选参考图、商业软件默认共同区阈值，以及当前捆绑 Siril 具体内核支持半径仍需版本源码或实测核验。",
+  "current_project_fit": [
+    "当前项目的 Light 路径在 Stage 1 使用 Siril calibrate -debayer 后再 register、seqapplyreg 和 stack，因此 Stage 2 面对的是已去马赛克 RGB，通常不再受 CFA 2×2 或 6×6 相位限制。",
+    "当前 Stage 1 没有显式选择 minimum/common framing，也没有保存逐通道或逐帧 coverage、weight、context 和 rejection 产品；Stage 2 只能从合成 RGB 像素推断边缘。",
+    "Stage 2 对当前 RGB 图只执行一个矩形 crop，三个通道数组保持同尺寸；这是单个 OSC RGB 流程的合理最小行为，但不能证明三色边缘同样可靠。",
+    "当前色边清理以四周 2.5% 条带相对中心的 RGB 色偏判断，可能把真实窄带结构、渐晕或通道噪声差异误当伪影；它也不等价于逐通道共同 coverage。",
+    "项目尚无 LRGB、独立窄带主图或多面板马赛克的产品模型；若未来直接复用 Stage 2，各通道独立裁切和马赛克四边裁切会破坏共同 WCS或过度损失 union。",
+    "Stage 2 输出 stage2_corrected.fit 与像素裁切报告，但未记录产品目的、通道集合、共同/联合 mask、角面积或 CFA provenance。",
+    "Stage 4 才进行 platesolve；因此 Stage 2 一般没有新解算的共同 WCS 可用。若输入叠加图已有 WCS，Siril 官方自 1.0 起称 crop 会更新 WCS，但项目仍未做裁后跨通道或往返验证。"
+  ],
+  "implementation_recommendations": {
+    "最高优先级最小改动": [
+      "在 Stage 2 报告新增 product_mode，当前固定为 single_osc_rgb_processing，并明确 cfa_already_debayered=true；避免把现有逻辑误用于原始 CFA 或马赛克。",
+      "对 RGB 边缘分别报告每通道近零率、噪声和候选裁量，最终使用同一矩形；色偏检测触发时标记 radiometric_fallback 和人工复核，不把它声明为共同 coverage 证据。",
+      "记录 Stage 1 framing、参考帧、插值方式和裁切前 WCS 是否存在；裁后核验 RGB shape 与 WCS 元数据一致。"
+    ],
+    "中期增强": [
+      "为输入模型增加 channel/filter/panel、output_wcs、coverage/weight/mask 与 required_channel_set；所有独立通道先统一 WCS，再一次性求 common processing-safe 矩形。",
+      "同时保存每通道 science-union 母版与 mask，以及供现有全图流程使用的共同矩形；按单通道、LRGB、窄带映射和马赛克分别配置产品合同。",
+      "若支持 CFA drizzle，生成逐颜色 coverage，实施 Bayer 2×2 与 X-Trans 6×6 相位测试，并禁止 Stage 2 对未去马赛克数据做不对齐裁切。"
+    ],
+    "长期架构": [
+      "把输出 WCS 与 framing 决策前移到 Stage 1 注册/叠加，支持 reference、common、threshold-common 和 union+mask；跨通道只重采样一次。",
+      "建立 science-safe、processing-safe、display-only 的分支产物与不可逆操作隔离；马赛克默认保持 union、coverage 和非矩形 mask。",
+      "以多滤镜错位、CFA 相位、稀疏 drizzle 和多面板合成集回归共同区、颜色边缘、角面积、WCS 和 provenance。"
+    ]
+  },
+  "uncertain": [
+    "metrics_and_thresholds",
+    "interpolation_and_support_radius",
+    "information_loss_and_stop_conditions",
+    "evidence_strength_and_conflicts"
+  ]
+}

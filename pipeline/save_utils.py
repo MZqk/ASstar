@@ -10,7 +10,7 @@ import numpy as np
 from sirilpy.exceptions import CommandError, DataError, SirilError
 
 
-STAGE_OUTPUT_ALIASES = {
+LEGACY_STAGE_READ_ALIASES = {
     "stage4_color": ("stage4_colorbalanced",),
     "stage4_colorbalanced": ("stage4_color",),
     "stage5_linear": ("stage5_denoised",),
@@ -22,7 +22,7 @@ STAGE_OUTPUT_ALIASES = {
     "stage7_input": ("stage6_input",),
 }
 
-STAGE_JSON_ALIASES = {
+LEGACY_STAGE_JSON_READ_ALIASES = {
     "stage7_quality.json": ("stage6_starless_quality.json",),
     "stage6_starless_quality.json": ("stage7_quality.json",),
     "pre_starless_gate_report.json": ("stage7_5_pre_starless_gate_report.json",),
@@ -31,7 +31,8 @@ STAGE_JSON_ALIASES = {
 
 
 def _stage_output_aliases(stem: str) -> Tuple[str, ...]:
-    aliases = list(STAGE_OUTPUT_ALIASES.get(stem, ()))
+    """Return legacy names for read/migration code; never write them."""
+    aliases = list(LEGACY_STAGE_READ_ALIASES.get(stem, ()))
     return tuple(aliases)
 
 
@@ -83,12 +84,6 @@ def save_stage_output(cmd_with_check: Callable[..., Any], log: Any, stem: str) -
     try:
         cmd_with_check("save", stem)
         log.info(f"阶段产物已保存: {stem}.fit")
-        for alias in _stage_output_aliases(stem):
-            try:
-                cmd_with_check("save", alias)
-                log.info(f"阶段产物已保存: {alias}.fit")
-            except (CommandError, DataError, SirilError, OSError, RuntimeError) as alias_error:
-                log.warn(f"阶段产物兼容别名保存失败 ({alias}): {alias_error}")
         return True
     except (CommandError, DataError, SirilError, OSError, RuntimeError) as e:
         log.warn(f"阶段产物保存失败 ({stem}): {e}")
@@ -110,11 +105,6 @@ def write_stage_json(
             text,
             encoding="utf-8",
         )
-        for alias in STAGE_JSON_ALIASES.get(filename, ()):
-            (process_dir / alias).write_text(
-                text,
-                encoding="utf-8",
-            )
     except OSError as e:
         log.warn(f"写入阶段 JSON 失败 ({filename}): {e}")
 

@@ -51,6 +51,11 @@ except ImportError:  # Support direct execution: python gui/seestar_gui_app.py
 
 def main() -> int:
     app = QApplication(sys.argv)
+    try:
+        from .ui_theme import install_application_theme
+    except ImportError:
+        from ui_theme import install_application_theme  # type: ignore[no-redef]
+    install_application_theme(app)
     window = SeestarGui()
     window.show()
     return app.exec()

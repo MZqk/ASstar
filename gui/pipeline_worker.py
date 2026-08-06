@@ -94,6 +94,21 @@ _SIRIL_DENOISE_SRC_DIAGNOSTIC_RE = re.compile(
 _AI_CREDENTIAL_ENV_KEYS = frozenset(
     {"SEESTAR_AI_API_KEY", "SEESTAR_AI_ARTISTIC_API_KEY"}
 )
+_DISABLED_AI_ENV_KEYS = frozenset(
+    key for key in AI_ENV_ALLOWED_KEYS if key.startswith("SEESTAR_AI_")
+)
+_TASK_RUNTIME_ENV_KEYS = frozenset(
+    {"SEESTAR_TASK_RUN_MANIFEST", "SEESTAR_RESUME_CHECKPOINT_PATH"}
+)
+_WORKER_RUNTIME_ENV_ALLOWED_KEYS = (
+    AI_ENV_ALLOWED_KEYS - _DISABLED_AI_ENV_KEYS
+) | _TASK_RUNTIME_ENV_KEYS
+_DISABLED_STAGE_OUTPUT_RE = re.compile(
+    r'(?:阶段\s*11\b|stage\s*11\b|stage11\b|AI\s*后期|'
+    r'ai_stage11|AI\s*(?:阶段|配置|环境)|SEESTAR_AI_|AI-Artistic|'
+    r'["\']stage["\']\s*:\s*11\b)',
+    re.IGNORECASE,
+)
 _SEMANTIC_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 
 
@@ -201,6 +216,7 @@ class PipelineWorker(QThread):
             input_mode
             if input_mode in {
                 INPUT_MODE_AUTO,
+                INPUT_MODE_STAGE1_PREPARED_RESUME,
                 INPUT_MODE_LINEAR_RESUME,
                 INPUT_MODE_STAGE2_CORRECTED_RESUME,
             }
@@ -208,23 +224,17 @@ class PipelineWorker(QThread):
         )
         self.debug_mode = bool(debug_mode)
         self.network_mode = bool(network_mode)
-        self.ai_stage_enabled = bool(
-            AI_STAGE_RELEASE_ENABLED and ai_stage_enabled
-        )
-        self.ai_runtime_overrides = {
-            str(key): str(value)
-            for key, value in (ai_runtime_overrides or {}).items()
-            if self.ai_stage_enabled and str(key) in AI_ENV_ALLOWED_KEYS
-        }
+        self.ai_stage_enabled = False
+        self.ai_runtime_overrides: dict[str, str] = {}
         self.runtime_overrides = {
             str(key): str(value)
             for key, value in (runtime_overrides or {}).items()
-            if str(key) in AI_ENV_ALLOWED_KEYS
+            if str(key) in _WORKER_RUNTIME_ENV_ALLOWED_KEYS
         }
         self.runtime_unset_keys = {
             str(key)
             for key in (runtime_unset_keys or set())
-            if str(key) in AI_ENV_ALLOWED_KEYS
+            if str(key) in _WORKER_RUNTIME_ENV_ALLOWED_KEYS
         }
         self.graxpert_application_home = graxpert_application_home
 
@@ -264,6 +274,7 @@ class PipelineWorker(QThread):
         self._export_tail_timeout_sec = DEFAULT_EXPORT_TAIL_TIMEOUT_SEC
         self._progress_log_state: dict[str, tuple[float, int]] = {}
         self._native_log_notice_keys: set[str] = set()
+        self._spcc_seed_warning_emitted = False
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -291,6 +302,8 @@ class PipelineWorker(QThread):
         return f"siril:{label}", float(siril_match.group(2))
 
     def _should_emit_process_output(self, text: str) -> bool:
+        if _DISABLED_STAGE_OUTPUT_RE.search(text):
+            return False
         progress = self._progress_log_signature(text)
         if progress is None:
             return True
@@ -337,6 +350,8 @@ class PipelineWorker(QThread):
         return None
 
     def _emit_process_output(self, text: str) -> None:
+        if _DISABLED_STAGE_OUTPUT_RE.search(text):
+            return
         native_notice = self._native_output_notice(text)
         if native_notice is not None:
             key, replacement = native_notice
@@ -347,12 +362,12 @@ class PipelineWorker(QThread):
         if self._should_emit_process_output(text):
             self.log.emit(text)
 
-    def _ai_env_candidates(self) -> list[Path]:
+    def _ai_env_candidates(self) -> list[tuple[Path, str]]:
         return [
-            self.resources / DEFAULT_ENV_RESOURCE_REL,
-            self.resources / AI_ENV_RESOURCE_REL,
-            self.runtime_home / AI_ENV_OVERRIDE_NAME,
-            self.work_dir / AI_ENV_OVERRIDE_NAME,
+            (self.resources / DEFAULT_ENV_RESOURCE_REL, "应用默认配置"),
+            (self.resources / AI_ENV_RESOURCE_REL, "应用扩展配置"),
+            (self.runtime_home / AI_ENV_OVERRIDE_NAME, "运行时覆盖"),
+            (self.work_dir / AI_ENV_OVERRIDE_NAME, "任务目录覆盖"),
         ]
 
     def _load_ai_env_overrides(self) -> tuple[dict[str, str], list[str], list[str]]:
@@ -360,19 +375,25 @@ class PipelineWorker(QThread):
         sources: list[str] = []
         warnings: list[str] = []
 
-        for path in self._ai_env_candidates():
+        for path, source_label in self._ai_env_candidates():
             if not path.exists() or not path.is_file():
                 continue
             parsed, parse_warnings = parse_ai_env_file(path)
-            for secret_key in _AI_CREDENTIAL_ENV_KEYS:
-                parsed.pop(secret_key, None)
-            sources.append(str(path))
-            merged.update(parsed)
-            warnings.extend(parse_warnings)
+            for disabled_key in _DISABLED_AI_ENV_KEYS:
+                parsed.pop(disabled_key, None)
+            if parsed:
+                sources.append(source_label)
+                merged.update(parsed)
+            warnings.extend(
+                warning.replace(str(path), source_label)
+                for warning in parse_warnings
+            )
 
         return merged, sources, warnings
 
     def _inspect_output_for_errors(self, text: str) -> None:
+        if _DISABLED_STAGE_OUTPUT_RE.search(text):
+            return
         lowered = text.lower()
         stripped = text.strip()
         if (
@@ -478,11 +499,6 @@ class PipelineWorker(QThread):
         ):
             if self._saving_png_seen_at is None:
                 self._saving_png_seen_at = time.time()
-        if self._saving_png_seen_at is not None and (
-            (self.ai_stage_enabled and ("阶段 11:" in lowered or "stage 11" in lowered))
-            or "[ai-artistic]" in lowered
-        ):
-            self._export_tail_disarmed = True
         error_markers = (
             "script execution failed",
             "failed to install python module",
@@ -767,13 +783,16 @@ class PipelineWorker(QThread):
         run_ini = temp_dir / "config.1.4.ini"
         run_py = temp_dir / self.pipeline_path.name
         pipeline_dir = self.pipeline_path.parent
-        stage11_module_path = self.pipeline_path.with_name("stage11_ai_postprocess.py")
-        run_stage11_module = temp_dir / stage11_module_path.name
         cpu_limit = compute_siril_cpu_limit()
 
         if not self.pipeline_path.exists():
             raise FileNotFoundError(f"未找到流水线脚本：{self.pipeline_path}")
         for py_file in pipeline_dir.glob("*.py"):
+            if py_file.name in {
+                "stage11_ai_postprocess.py",
+                "ai_artistic_derivative.py",
+            }:
+                continue
             shutil.copy2(py_file, temp_dir / py_file.name)
         stages_dir = pipeline_dir / "stages"
         if stages_dir.exists() and stages_dir.is_dir():
@@ -781,11 +800,6 @@ class PipelineWorker(QThread):
         configs_dir = pipeline_dir / "configs"
         if configs_dir.exists() and configs_dir.is_dir():
             shutil.copytree(configs_dir, temp_dir / "configs", dirs_exist_ok=True)
-        if not stage11_module_path.exists():
-            raise FileNotFoundError(f"未找到 Stage11 模块脚本：{stage11_module_path}")
-        if not run_stage11_module.exists():
-            shutil.copy2(stage11_module_path, run_stage11_module)
-
         self._runtime_plugin_dir = None
         if self.siril_plugin_dir.exists() and self.siril_plugin_dir.is_dir():
             plugin_dst = temp_dir / "siril_plugins"
@@ -851,9 +865,16 @@ class PipelineWorker(QThread):
             / "siril"
             / "siril_cat_healpix8_astro.dat"
         )
+        local_photometric_catalog = (
+            self.runtime_home
+            / ".local"
+            / "share"
+            / "siril"
+            / "siril_cat1_healpix8_xpsamp"
+        )
         patched = normalize_siril_config_template(
             template_text,
-            gaia_photo_catalog=None,
+            gaia_photo_catalog=local_photometric_catalog,
             gaia_astro_catalog=local_astrometric_catalog,
         )
         run_ini.write_text(patched, encoding="utf-8")
@@ -863,6 +884,8 @@ class PipelineWorker(QThread):
         env = scrub_python_env(os.environ.copy())
         for secret_key in _AI_CREDENTIAL_ENV_KEYS:
             env.pop(secret_key, None)
+        for task_key in _TASK_RUNTIME_ENV_KEYS:
+            env.pop(task_key, None)
         ai_env, ai_sources, ai_warnings = self._load_ai_env_overrides()
         applied_keys: list[str] = []
         for key, value in ai_env.items():
@@ -1025,15 +1048,38 @@ class PipelineWorker(QThread):
         env["SEESTAR_INPUT_MODE"] = self.input_mode
         env["SEESTAR_NETWORK_MODE"] = "1" if self.network_mode else "0"
         local_catalog_root = self.runtime_home / ".local" / "share" / "siril"
+        env["SEESTAR_GAIA_PHOTO_CATALOG"] = str(
+            local_catalog_root / "siril_cat1_healpix8_xpsamp"
+        )
         env["SEESTAR_GAIA_ASTRO_CATALOG"] = str(
             local_catalog_root / "siril_cat_healpix8_astro.dat"
         )
-        # Phase 1 hard boundary: the GUI worker cannot enable dormant Stage11,
-        # even if a stale setting or an internal caller requests it.
-        if not self.ai_stage_enabled:
-            for secret_key in _AI_CREDENTIAL_ENV_KEYS:
-                env.pop(secret_key, None)
-        env["SEESTAR_AI_ENABLED"] = "1" if self.ai_stage_enabled else "0"
+        env["SEESTAR_SPCC_DATABASE_DIR"] = str(
+            siril_spcc_database_root_from_home(self.runtime_home)
+        )
+        try:
+            seed_result = sync_siril_spcc_database_seed(
+                default_siril_spcc_database_seed_dir(self.resources),
+                self.runtime_home,
+            )
+            copied_files = seed_result.get("copied_files", [])
+            if copied_files:
+                self._append_event(
+                    "已校验并部署 Siril SPCC 传感器/滤镜数据库："
+                    f"{len(copied_files)} 个文件"
+                )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            env["SEESTAR_SPCC_ENABLE"] = "0"
+            if not self._spcc_seed_warning_emitted:
+                self._spcc_seed_warning_emitted = True
+                self._append_event(
+                    "Siril SPCC 固定元数据不可用，已在启动前禁用 SPCC；"
+                    f"宽带将进入 PCC 异常回退：{error}"
+                )
+        for disabled_key in _DISABLED_AI_ENV_KEYS:
+            env.pop(disabled_key, None)
+        env["SEESTAR_AI_ENABLED"] = "0"
+        env["SEESTAR_AI_ARTISTIC_DERIVATIVE_ENABLED"] = "0"
         return env
 
     def _bounded_timeout_from_env(
@@ -1448,10 +1494,6 @@ class PipelineWorker(QThread):
         self._append_event(
             f"输入模式: {proc_env.get('SEESTAR_INPUT_MODE', self.input_mode)}"
         )
-        self._append_event(
-            f"AI 阶段开关: {'ON' if self.ai_stage_enabled else 'OFF'} "
-            "(controls stage11)"
-        )
         bootstrap_timeout_sec, bootstrap_base_sec, bootstrap_input_bytes = (
             self._bootstrap_timeout_sec(proc_env)
         )
@@ -1468,14 +1510,14 @@ class PipelineWorker(QThread):
         )
         if self._ai_env_sources:
             self._append_event(
-                "AI 环境配置来源: " + ", ".join(self._ai_env_sources)
+                "运行环境配置来源: " + ", ".join(self._ai_env_sources)
             )
             if self._ai_env_applied_keys:
                 self._append_event(
-                    "AI 环境已注入键: " + ", ".join(self._ai_env_applied_keys)
+                    "运行环境已注入键: " + ", ".join(self._ai_env_applied_keys)
                 )
         for warning in self._ai_env_warnings:
-            self._append_event(f"AI 环境配置警告: {warning}")
+            self._append_event(f"运行环境配置警告: {warning}")
 
         try:
             self._proc = subprocess.Popen(

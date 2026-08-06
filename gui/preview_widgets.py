@@ -17,6 +17,7 @@ class LatestPreviewCanvas(QGraphicsView):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self.setObjectName("previewCanvas")
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
         self._pixmap_item = None

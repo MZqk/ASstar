@@ -19,6 +19,17 @@ import run_manifest  # noqa: E402
 
 
 class RunManifestTests(unittest.TestCase):
+    def test_sha256_file_honors_cancellation_between_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "large.fit"
+            source.write_bytes(b"x" * (1024 * 1024 + 1))
+
+            with self.assertRaises(InterruptedError):
+                run_manifest.sha256_file(
+                    source,
+                    cancel_check=lambda: True,
+                )
+
     def _write_result_manifest(
         self,
         root: Path,
