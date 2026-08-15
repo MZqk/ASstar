@@ -972,6 +972,8 @@ class StarunPostProcessor(
         self._stage4_color_review_required: bool = False
         self._stage7_background_color_review_required: bool = False
         self._stage7_background_color_review_gate: Dict[str, Any] = {}
+        self._stage7_stretch_forced_delivery: bool = False
+        self._stage7_forced_delivery_reasons: List[str] = []
         self._channel_semantics: str = "unknown"
         self.channel_profile: Dict[str, Any] = {}
         self.narrowband_channel_mapping: Dict[str, Any] = {}
@@ -2409,6 +2411,8 @@ class StarunPostProcessor(
             self._stage4_color_review_required = False
             self._stage7_background_color_review_required = False
             self._stage7_background_color_review_gate = {}
+            self._stage7_stretch_forced_delivery = False
+            self._stage7_forced_delivery_reasons = []
             self._channel_semantics = "unknown"
             self.channel_profile = {}
             self.narrowband_channel_mapping = {}

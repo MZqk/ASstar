@@ -244,10 +244,13 @@ class PipelineConfig:
     # 阶段 7: Starless 主体拉伸
     stage7_processing_mode: str = "auto"  # auto 使用预览标定；manual 使用签名参数并重建对应亮度契约
     stage7_failure_action: str = "auto_fallback"  # 决定性失败：auto_fallback/preserve_review/stop
+    stage7_rendition_intent: str = "vivid_safe"  # vivid_safe 默认鲜艳安全出图；balanced/conservative 保留更自然或更保守的呈现
+    stage7_forced_delivery_enabled: bool = True  # 自动回退耗尽后，仅允许技术完整、但画质门未过的最佳候选正式降级交付
     stage7_candidate_policy: str = "auto_display90"  # auto_display90/auto_dual/candidate_a_only/candidate_b_only/display90_only
     stage7_display90_strength: float = 0.90  # GUI linked 显示曲线正式候选的保留强度，运行时钳制 0.50–0.95
     stage7_display90_reference_chroma_load_ratio_max: float = 1.05  # 已认证窄带 Display90 相对真实 GUI D 背景色度负载的最大比值
-    stage7_display90_reference_chroma_load_absolute_max: float = 0.40  # GUI D 参考匹配豁免仍允许的候选背景绝对色度负载硬上限
+    stage7_display90_reference_chroma_load_absolute_max: float = 0.30  # GUI D 参考匹配豁免仍允许的候选背景绝对色度负载硬上限
+    stage7_vivid_subject_chroma_enabled: bool = True  # 仅对冻结主体 ROI 的低频色度做保亮度、保余量增强
     stage7_chroma_rescue_max_attempts: int = 3  # 截断固定色度救援安全阶梯；0 表示不尝试
     asinh_stretch: float = 3.0      # Asinh 拉伸强度（越大整体越亮）
     asinh_offset: float = 0.001     # Asinh 偏移，影响暗部起拉位置
@@ -474,6 +477,14 @@ class PipelineConfig:
     stage7_uncalibrated_background_chroma_load_review_max: float = 0.12  # 物理校色不可用时，排除主体/银河信号后的背景绝对色偏超过此值只允许复核交付
     stage7_chroma_rescue_enabled: bool = True  # 双候选仅因背景色噪被拒绝时，允许生成背景限定的保亮度色度抑制救援候选
     stage7_chroma_rescue_strength_levels: Tuple[float, ...] = (0.10, 0.20, 0.35)  # 救援按弱到中三档抑制背景色度；避免临界超限触发强去色
+    stage7_chroma_rescue_max_strength: float = 0.90  # 自适应背景色度救援的绝对上限，主体/核心由冻结掩膜保护
+    stage7_transform_new_hard_clip_ratio_warn: float = 0.0001  # 新增硬高光裁切超过此比例进入告警
+    stage7_transform_new_hard_clip_ratio_max: float = 0.0005  # 新增硬高光裁切不可越过的技术门
+    stage7_transform_unexpected_zero_ratio_max: float = 0.001  # 扣除声明黑点后仍新增纯黑像素的技术上限
+    stage7_color_vector_p95_advisory_max: float = 0.04  # 宽带主体 RGB 色度方向 P95 告警线
+    stage7_color_vector_p95_hard_max: float = 0.08  # 宽带主体 RGB 色度方向 P95 画质拒绝线
+    stage7_narrowband_color_vector_p95_advisory_max: float = 0.10  # 窄带伪色/线发射允许的色度方向告警线
+    stage7_narrowband_color_vector_p95_hard_max: float = 0.20  # 窄带色度方向画质拒绝线
     stage6_processing_mode: str = "auto"  # 阶段6处理方式：auto 去星；preserve 明确保留含星线性图并旁路 Starless 分支
     stage6_failure_action: str = "auto_fallback"  # 决定性失败：auto_fallback/preserve_review/stop
     stage6_starless_backend_policy: str = "auto_chain"  # auto_chain/syqon_only/sasp_only

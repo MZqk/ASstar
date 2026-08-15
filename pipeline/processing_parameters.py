@@ -206,7 +206,7 @@ def _failure_action_spec(stage: int) -> ParameterSpec:
         section="fallback",
         strictness="stop_is_stricter",
         help=(
-            "决定性失败时的处置；不提供忽略硬门并强制接受。"
+            "决定性失败时的处置；任何模式都不允许忽略数值、裁切或结构技术门。"
         ),
     )
 
@@ -964,6 +964,24 @@ PROCESSING_PARAMETER_SPECS += (
 
     # Stage 7: candidate routing and bounded chroma rescue.
     _spec(
+        "stage7_rendition_intent", 7, "成片呈现", "choice",
+        level="recommended",
+        choices=_choice(
+            ("鲜艳且安全", "vivid_safe"),
+            ("自然平衡", "balanced"),
+            ("保守呈现", "conservative"),
+        ),
+        section="execution",
+        help="调整候选生成与选优目标，不放宽裁切、结构或数值完整性门禁。",
+    ),
+    _spec(
+        "stage7_forced_delivery_enabled", 7, "画质失败仍出正式图", "bool",
+        level="recommended",
+        section="fallback",
+        depends_on=(("stage7_failure_action", ("auto_fallback",)),),
+        help="只放行技术完整候选；正式输出会标记 partial_success 与强制交付原因。",
+    ),
+    _spec(
         "stage7_candidate_policy", 7, "拉伸候选", "choice",
         choices=_choice(
             ("自动 A/B/Display90", "auto_display90"),
@@ -1037,6 +1055,12 @@ PROCESSING_PARAMETER_SPECS += (
     _spec("stage7_bright_nebula_star_mask_expand", 7, "亮星区扩张", "int", 1, 8, 1, 0, suffix=" px"),
     _spec("stage7_bright_nebula_star_faint_suppression", 7, "弱信号抑制", "float", 0.0, 1.0, 0.05, 2),
     _spec("stage7_bright_nebula_star_detail_suppression", 7, "细节抑制", "float", 0.0, 0.60, 0.01, 2),
+    _spec(
+        "stage7_vivid_subject_chroma_enabled", 7, "安全主体增色", "bool",
+        section="algorithm",
+        depends_on=(("stage7_rendition_intent", ("vivid_safe",)),),
+        help="仅增强冻结主体区域的低频色度，并逐像素限制到可用 RGB 余量。",
+    ),
     _spec(
         "stage7_chroma_rescue_max_attempts", 7, "色度救援次数", "int",
         0, 3, 1, 0, section="fallback",
@@ -1246,6 +1270,14 @@ PROCESSING_GATE_PARAMETER_SPECS: Tuple[ParameterSpec, ...] = (
     _gate("stage7_stretch_chroma_load_signal_excluded_max", 7, "排除主体后色偏", "float", 0.01, 0.15, 0.005, 3),
     _gate("stage7_uncalibrated_background_chroma_load_review_max", 7, "未校色背景复核线", "float", 0.04, 0.50, 0.01, 2),
     _gate("stage7_chroma_rescue_enabled", 7, "背景色噪救援", "bool"),
+    _gate("stage7_chroma_rescue_max_strength", 7, "背景色度救援上限", "float", 0.10, 0.90, 0.05, 2),
+    _gate("stage7_transform_new_hard_clip_ratio_warn", 7, "新增硬裁切告警", "float", 0.0, 0.005, 0.0001, 4),
+    _gate("stage7_transform_new_hard_clip_ratio_max", 7, "新增硬裁切上限", "float", 0.0001, 0.010, 0.0001, 4),
+    _gate("stage7_transform_unexpected_zero_ratio_max", 7, "异常新增纯黑上限", "float", 0.0001, 0.020, 0.0001, 4),
+    _gate("stage7_color_vector_p95_advisory_max", 7, "宽带色度漂移告警", "float", 0.01, 0.20, 0.01, 2),
+    _gate("stage7_color_vector_p95_hard_max", 7, "宽带色度漂移上限", "float", 0.02, 0.30, 0.01, 2),
+    _gate("stage7_narrowband_color_vector_p95_advisory_max", 7, "窄带色度漂移告警", "float", 0.02, 0.30, 0.01, 2),
+    _gate("stage7_narrowband_color_vector_p95_hard_max", 7, "窄带色度漂移上限", "float", 0.04, 0.40, 0.01, 2),
 
     # Stage 8: enhancement-mask sufficiency and artifact rollback.
     _gate("stage8_mask_signal_coverage_min", 8, "信号蒙版覆盖下限", "float", 0.001, 0.050, 0.001, 3),
@@ -1413,30 +1445,17 @@ _GATE_PROFILE_RULES: Dict[
     "stage7_starless_repair_chroma_reduction_min": (PROFILE_SCALE_LOWER, 0.0, 1.0),
     "stage7_starless_repair_chroma_delta_min": (PROFILE_SCALE_LOWER, 0.0, 1.0),
 
-    # Stage 7: nonlinear preview/result acceptance, not transform targets.
+    # Stage 7: only presentation-attainment gates follow the global profile.
+    # Clipping, structure, LUT conformance and colour-safety limits stay fixed;
+    # vivid_safe changes candidate search rather than weakening those limits.
     "stage7_bg_median_min": (PROFILE_SCALE_LOWER, 0.0, 1.0),
-    "stage7_black_pixel_ratio_max": (PROFILE_SCALE_UPPER, 0.0, 1.0),
-    "stage7_highlight_clip_ratio_max": (PROFILE_SCALE_UPPER, 0.0, 1.0),
-    "stage7_star_growth_ratio_max": (PROFILE_SCALE_UPPER_FROM_ONE, 1.0, None),
-    "stage7_bright_nebula_star_growth_ratio_max": (PROFILE_SCALE_UPPER_FROM_ONE, 1.0, None),
-    "stage7_mtf_reference_p50_relative_error_max": (PROFILE_SCALE_UPPER, 0.0, 1.0),
-    "stage7_mtf_reference_p50_absolute_error_max": (PROFILE_SCALE_UPPER, 0.0, 1.0),
     "stage7_preview_target_p50_min_ratio": (PROFILE_SCALE_LOWER, 0.0, 1.0),
     "stage7_preview_target_p50_hard_min_ratio": (PROFILE_SCALE_LOWER, 0.0, 1.0),
     "stage7_preview_target_p50_max_ratio": (PROFILE_SCALE_UPPER_FROM_ONE, 1.0, None),
     "stage7_diffuse_visibility_score_min": (PROFILE_SCALE_LOWER, 0.0, 1.0),
     "stage7_preview_visibility_retention_min": (PROFILE_SCALE_LOWER, 0.0, 1.0),
-    "stage7_starless_masked_rank_drift_p95_max": (PROFILE_SCALE_UPPER, 0.0, 1.0),
-    "stage7_starless_halo_detail_growth_ratio_max": (PROFILE_SCALE_UPPER_FROM_ONE, 1.0, None),
-    "stage7_local_core_clip_ratio_max": (PROFILE_SCALE_UPPER, 0.0, 1.0),
     "stage7_local_faint_snr_min": (PROFILE_SCALE_LOWER, 0.0, None),
     "stage7_local_dark_separation_min": (PROFILE_SCALE_LOWER, 0.0, 1.0),
-    "stage7_stretch_chroma_noise_score_max": (PROFILE_SCALE_UPPER, 0.0, None),
-    "stage7_stretch_background_mottling_score_max": (PROFILE_SCALE_UPPER, 0.0, None),
-    "stage7_stretch_chroma_load_growth_max": (PROFILE_SCALE_UPPER_FROM_ONE, 1.0, None),
-    "stage7_stretch_chroma_load_low_absolute_max": (PROFILE_SCALE_UPPER, 0.0, 1.0),
-    "stage7_stretch_chroma_load_signal_excluded_max": (PROFILE_SCALE_UPPER, 0.0, 1.0),
-    "stage7_uncalibrated_background_chroma_load_review_max": (PROFILE_SCALE_UPPER, 0.0, 1.0),
 
     # Stage 8: post-enhancement quality acceptance; limited-mode strength caps
     # and mask construction remain static algorithm settings.
@@ -1540,19 +1559,42 @@ _GATE_PROFILE_EXCLUDED_FIELDS = frozenset(
         "stage7_preview_cand_b_p50_ratio",
         "stage7_preview_asinh_p50_max",
         "stage7_preview_asinh_stretch_max",
+        "stage7_black_pixel_ratio_max",
+        "stage7_highlight_clip_ratio_max",
+        "stage7_star_growth_ratio_max",
+        "stage7_bright_nebula_star_growth_ratio_max",
         "stage7_starless_linked_mtf_p50_min",
         "stage7_starless_linked_mtf_diffuse_p50_min",
         "stage7_starless_linked_mtf_preview_p50_ratio",
         "stage7_starless_linked_mtf_p50_max",
         "stage7_starless_linked_mtf_shadow_noise_sigma",
         "stage7_mtf_reference_blackpoint_sigma",
+        "stage7_mtf_reference_p50_relative_error_max",
+        "stage7_mtf_reference_p50_absolute_error_max",
         "stage7_stretch_feedback_retry_max",
         "stage7_starless_structure_gate_enabled",
+        "stage7_starless_masked_rank_drift_p95_max",
+        "stage7_starless_halo_detail_growth_ratio_max",
         "stage7_starless_halo_detail_delta_min",
         "stage7_quantile_fallback_enabled",
         "stage7_target_local_metrics_enabled",
+        "stage7_local_core_clip_ratio_max",
+        "stage7_stretch_chroma_noise_score_max",
+        "stage7_stretch_background_mottling_score_max",
+        "stage7_stretch_chroma_load_growth_max",
+        "stage7_stretch_chroma_load_low_absolute_max",
         "stage7_stretch_chroma_load_low_absolute_tolerance",
+        "stage7_stretch_chroma_load_signal_excluded_max",
+        "stage7_uncalibrated_background_chroma_load_review_max",
         "stage7_chroma_rescue_enabled",
+        "stage7_chroma_rescue_max_strength",
+        "stage7_transform_new_hard_clip_ratio_warn",
+        "stage7_transform_new_hard_clip_ratio_max",
+        "stage7_transform_unexpected_zero_ratio_max",
+        "stage7_color_vector_p95_advisory_max",
+        "stage7_color_vector_p95_hard_max",
+        "stage7_narrowband_color_vector_p95_advisory_max",
+        "stage7_narrowband_color_vector_p95_hard_max",
         "stage8_limited_saturation_max",
         "stage8_limited_core_exclusion_expand",
         "stage8_dualband_palette_quality_warning_tolerance",

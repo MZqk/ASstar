@@ -1495,6 +1495,39 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
             "validated_chroma_rescue",
         )
 
+    def test_stage7_forced_delivery_is_accepted_but_limits_stage8(self):
+        processor = self._new_processor()
+
+        def forced_delivery():
+            processor._stage7_stretch_forced_delivery = True
+            processor._stage7_forced_delivery_reasons = [
+                "background_chroma_noise_score"
+            ]
+            processor._stage7_stretch_fallback_reason = (
+                "forced_quality_delivery"
+            )
+            return (
+                True,
+                True,
+                ["technically safe appearance reject"],
+                "display90_linked_lut",
+            )
+
+        processor._run_stage7_stretching_candidates = forced_delivery
+
+        pipeline_module.run_stage7_stretching(processor)
+
+        self.assertTrue(processor._stage7_stretch_accepted)
+        self.assertEqual(processor._stage7_stretch_output, "stage7_stretched")
+        self.assertEqual(processor.results[-1][1], "degraded")
+        self.assertEqual(
+            processor._stage8_handoff["processing_policy"],
+            "background_only",
+        )
+        metadata = processor.result_metadata[-1]
+        self.assertEqual(metadata["reason_code"], "forced_quality_delivery")
+        self.assertTrue(metadata["details"]["forced_delivery"])
+
     def test_stage7_validated_fallback_reason_distinguishes_rescue_modes(self):
         processor = pipeline_module.StarunPostProcessor()
 
@@ -1675,7 +1708,7 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
         self.assertEqual(key_before, key_after)
         self.assertEqual(
             stage6_services_module.STAGE7_CANDIDATE_RANKING_POLICY,
-            "fixed_hard_gate_lexicographic_v3",
+            "hard_gate_bounded_presentation_score_v4",
         )
 
     def test_stage7_candidate_selection_uses_preview_perceptual_retention(self):
@@ -3252,3 +3285,187 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
         self.assertEqual(current_raw.read_bytes(), b"retry-1-raw")
         self.assertEqual(processor.starless_file, current_starless)
         self.assertEqual(processor.starmask_file, current_starmask)
+
+    def test_stage7_transform_loss_gate_is_non_overridable(self):
+        processor = pipeline_module.StarunPostProcessor()
+        report = {
+            "status": "available",
+            "global": {
+                "newly_hard_clipped_ratio": 0.0006,
+                "newly_zeroed_ratio": 0.0,
+                "unexpected_newly_zeroed_ratio": 0.0,
+            },
+        }
+
+        rejected = processor._stage7_transform_loss_gate(report)
+        self.assertFalse(rejected["accepted"])
+        self.assertTrue(rejected["technical_gate"])
+        self.assertIn("transform_new_hard_clip_ratio", rejected["issues"][0])
+
+        report["global"]["newly_hard_clipped_ratio"] = 0.0002
+        advisory = processor._stage7_transform_loss_gate(report)
+        self.assertTrue(advisory["accepted"])
+        self.assertEqual(advisory["status"], "advisory")
+
+        unavailable = processor._stage7_transform_loss_gate(
+            {"status": "unavailable"}
+        )
+        self.assertFalse(unavailable["accepted"])
+        self.assertEqual(unavailable["issues"], ["transform_loss_unavailable"])
+
+    def test_stage7_color_vector_gate_uses_channel_semantics(self):
+        processor = pipeline_module.StarunPostProcessor()
+        report = {
+            "status": "available",
+            "metrics": {"chromaticity_l1_half_p95": 0.09},
+        }
+
+        processor._channel_semantics = "broadband_rgb"
+        broadband = processor._stage7_color_vector_gate(report)
+        self.assertFalse(broadband["accepted"])
+
+        processor._channel_semantics = "narrowband_composite"
+        narrowband = processor._stage7_color_vector_gate(report)
+        self.assertTrue(narrowband["accepted"])
+        self.assertEqual(narrowband["status"], "ok")
+
+    def test_stage7_adaptive_chroma_rescue_reaches_m8_style_excess(self):
+        processor = pipeline_module.StarunPostProcessor()
+        attempt = {
+            "background_quality_gate": {
+                "metrics": {
+                    "chroma_load": 0.113,
+                    "chroma_load_low_absolute_effective_max": 0.060,
+                },
+                "limits": {"chroma_load_signal_excluded_max": 0.060},
+            }
+        }
+
+        strengths = processor._stage7_chroma_rescue_strengths(attempt)
+
+        self.assertEqual(len(strengths), 3)
+        self.assertGreater(max(strengths), 0.35)
+        self.assertTrue(any(abs(value - 0.4956) < 0.001 for value in strengths))
+
+    def test_stage7_bounded_score_stops_rewarding_oversaturation(self):
+        processor = pipeline_module.StarunPostProcessor()
+
+        def attempt(name: str, saturation: float, safety_load: float) -> dict[str, Any]:
+            retention = {
+                metric: {
+                    "available": True,
+                    "ratio": saturation if metric == "saturation_median" else 0.90,
+                }
+                for metric in (
+                    "visibility",
+                    "subject_span",
+                    "saturation_median",
+                    "microcontrast",
+                )
+            }
+            return {
+                "name": name,
+                "stem": f"stage7_{name}",
+                "status": "ok",
+                "allowed_as_final": True,
+                "technical_safe": True,
+                "adaptation": {"target_aware": {"name": "widefield_nebulosity"}},
+                "rendition_metrics": {"retention": {"metrics": retention}},
+                "background_quality_gate": {
+                    "metrics": {
+                        "chroma_load": safety_load,
+                        "chroma_load_low_absolute_effective_max": 0.06,
+                        "chroma_noise_score": safety_load * 5.0,
+                        "background_mottling_score": safety_load * 6.0,
+                    },
+                    "limits": {
+                        "chroma_load_signal_excluded_max": 0.06,
+                        "chroma_noise_score_max": 0.34,
+                        "background_mottling_score_max": 0.45,
+                    },
+                },
+                "color_vector_gate": {
+                    "metrics": {
+                        "chromaticity_l1_half_p95": min(0.079, safety_load)
+                    },
+                    "limits": {"chromaticity_l1_half_p95_hard_max": 0.08},
+                },
+                "transform_loss_gate": {
+                    "metrics": {"newly_hard_clipped_ratio": safety_load / 120.0},
+                    "limits": {"newly_hard_clipped_ratio_max": 0.0005},
+                },
+                "diagnostics": [],
+                "advisories": [],
+                "risk_score": 1.0,
+            }
+
+        vivid_unsafe = attempt("a_oversaturated", 3.0, 0.059)
+        vivid_safe = attempt("z_vivid_safe", 0.90, 0.0)
+
+        selected = min(
+            [vivid_unsafe, vivid_safe],
+            key=processor._stage7_candidate_selection_key,
+        )
+
+        self.assertEqual(selected["name"], "z_vivid_safe")
+        self.assertEqual(
+            processor._stage7_presentation_score(vivid_unsafe)["utilities"][
+                "saturation_median"
+            ],
+            1.0,
+        )
+
+    def test_stage7_forced_delivery_rejects_any_technical_damage(self):
+        processor = pipeline_module.StarunPostProcessor()
+        appearance_only = {
+            "name": "appearance_only",
+            "stem": "stage7_appearance_only",
+            "status": "ok",
+            "pixel_stats": {
+                "p50": 0.20,
+                "p99": 0.90,
+                "max": 0.95,
+                "dynamic_range": 0.88,
+            },
+            "quality_gates": {"base_quality": {}},
+            "target_local_quality": {
+                "accepted": False,
+                "quality_gates": {
+                    "local_core_clip_ratio": {"hard_failed": False}
+                },
+            },
+            "starless_structure_quality": {"accepted": True},
+            "transform_loss_gate": {"accepted": True},
+            "mtf_reference_quality": {"status": "not_applicable"},
+            "display90_curve_quality": {"status": "not_applicable"},
+            "diagnostics": ["local_faint_snr 0.20<0.40"],
+        }
+        self.assertTrue(
+            processor._stage7_candidate_is_technically_safe(appearance_only)
+        )
+
+        clipped = copy.deepcopy(appearance_only)
+        clipped["transform_loss_gate"] = {"accepted": False}
+        self.assertFalse(processor._stage7_candidate_is_technically_safe(clipped))
+
+        core_overflow = copy.deepcopy(appearance_only)
+        core_overflow["target_local_quality"]["quality_gates"][
+            "local_core_clip_ratio"
+        ]["hard_failed"] = True
+        self.assertFalse(
+            processor._stage7_candidate_is_technically_safe(core_overflow)
+        )
+
+        corrupt = copy.deepcopy(appearance_only)
+        corrupt["starless_structure_quality"] = {"accepted": False}
+        self.assertFalse(processor._stage7_candidate_is_technically_safe(corrupt))
+
+        unverified_mtf = copy.deepcopy(appearance_only)
+        unverified_mtf["method"] = "linked_mtf"
+        unverified_mtf["mtf_reference_quality"] = {
+            "status": "unavailable",
+            "accepted": False,
+        }
+        self.assertFalse(
+            processor._stage7_candidate_is_technically_safe(unverified_mtf)
+        )

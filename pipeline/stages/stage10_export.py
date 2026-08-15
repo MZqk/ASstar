@@ -1372,6 +1372,13 @@ def run_stage10_export(pipeline) -> None:
             False,
         )
     )
+    stage7_forced_delivery = bool(
+        getattr(pipeline, "_stage7_stretch_forced_delivery", False)
+    )
+    stage7_background_color_blocks_normal = bool(
+        stage7_background_color_review_required
+        and not stage7_forced_delivery
+    )
     stage6_starmask_borderline_review_required = bool(
         getattr(
             pipeline,
@@ -1395,7 +1402,7 @@ def run_stage10_export(pipeline) -> None:
         stage2_view_review_required
         or stage3_background_review_required
         or stage4_color_review_required
-        or stage7_background_color_review_required
+        or stage7_background_color_blocks_normal
         or stage6_quality_hard_failed_retained
         or stage6_starmask_borderline_review_required
         or stage9_missing_required_stars
@@ -1443,10 +1450,17 @@ def run_stage10_export(pipeline) -> None:
             "stage3_background_review_required=true; normal delivery is not allowed"
         )
     if stage7_background_color_review_required:
-        messages.append(
-            "stage7_uncalibrated_background_color_review_required=true; "
-            "normal delivery is not allowed; global white balance remains prohibited"
-        )
+        if stage7_forced_delivery:
+            messages.append(
+                "stage7_uncalibrated_background_color_review_required=true; "
+                "technically-safe forced delivery keeps normal names and "
+                "partial_success; global white balance remains prohibited"
+            )
+        else:
+            messages.append(
+                "stage7_uncalibrated_background_color_review_required=true; "
+                "normal delivery is not allowed; global white balance remains prohibited"
+            )
     if stage6_starmask_borderline_review_required:
         messages.append(
             "stage6_starmask_diffuse_residual_borderline=true; "
@@ -2591,8 +2605,34 @@ def run_stage10_export(pipeline) -> None:
                     or final_quality_status != "ok"
                     or issues
                 )
+                forced_appearance_delivery = False
+                if stage7_forced_delivery and issues:
+                    appearance_prefixes = (
+                        "uncalibrated_background_chroma_load",
+                        "background_chroma_noise_extreme",
+                        "background_mottling_extreme",
+                    )
+                    forced_appearance_delivery = all(
+                        str(issue).startswith(appearance_prefixes)
+                        for issue in issues
+                    )
+                if forced_appearance_delivery:
+                    quality_requires_review = False
+                    final_quality["forced_delivery_override"] = {
+                        "applied": True,
+                        "scope": "stage7_appearance_only",
+                        "technical_gates_overridden": False,
+                        "issues": list(issues),
+                    }
+                    status = "degraded" if status == "ok" else status
+                    messages.append(
+                        "Stage10 retained normal output names for Stage7 "
+                        "appearance-only forced delivery"
+                    )
                 final_quality_gate_status = (
-                    "review_required" if quality_requires_review else "ok"
+                    "forced_appearance_delivery"
+                    if forced_appearance_delivery
+                    else "review_required" if quality_requires_review else "ok"
                 )
                 pipeline._write_stage_json("final_quality_report.json", final_quality)
                 pipeline.log.info(
@@ -2995,6 +3035,7 @@ def run_stage10_export(pipeline) -> None:
         or stage_denoise_fallback_used
         or export_fallback_used
         or preserve_review_triggered
+        or stage7_forced_delivery
     )
     stage_reason_code = (
         "stage2_view_review_required"
@@ -3004,11 +3045,13 @@ def run_stage10_export(pipeline) -> None:
         else "stage4_color_review_required"
         if stage4_color_review_required
         else "uncalibrated_background_color_review_required"
-        if stage7_background_color_review_required
+        if stage7_background_color_blocks_normal
         else "starmask_diffuse_residual_borderline"
         if stage6_starmask_borderline_review_required
         else "stage6_quality_hard_failed_retained"
         if stage6_quality_hard_failed_retained
+        else "stage7_forced_quality_delivery"
+        if stage7_forced_delivery
         else final_source_review_reason
         if final_source_review_reason
         else "stage10_failure_policy"
@@ -3046,6 +3089,15 @@ def run_stage10_export(pipeline) -> None:
             "stage4_color_review_required": stage4_color_review_required,
             "stage7_background_color_review_required": (
                 stage7_background_color_review_required
+            ),
+            "stage7_forced_delivery": stage7_forced_delivery,
+            "stage7_forced_delivery_reasons": list(
+                getattr(
+                    pipeline,
+                    "_stage7_forced_delivery_reasons",
+                    [],
+                )
+                or []
             ),
             "stage6_starmask_borderline_review_required": (
                 stage6_starmask_borderline_review_required

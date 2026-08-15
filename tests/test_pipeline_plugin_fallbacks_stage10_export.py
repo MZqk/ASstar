@@ -1804,6 +1804,52 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
             1,
         )
 
+    def test_stage10_stage7_appearance_forced_delivery_keeps_normal_names(self):
+        processor = self._new_processor()
+        self._stage10_final_input(processor)
+        processor.cfg.stage10_quality_repair_enabled = False
+        processor._stage7_stretch_forced_delivery = True
+        processor._stage7_forced_delivery_reasons = [
+            "background_chroma_noise_score"
+        ]
+        processor._stage7_background_color_review_required = True
+        processor._final_quality_report = lambda _stem: (
+            self._stage10_quality_noise_report(chroma=1.20, hard=True)
+        )
+
+        stage10_export(processor)
+
+        self.assertIn(("savetif", "result_processed", "-astro"), processor.cmd_calls)
+        self.assertIn(("save", "result_final"), processor.cmd_calls)
+        self.assertFalse(processor._final_output_review_only)
+        metadata = processor.result_metadata[-1]
+        self.assertEqual(
+            metadata["details"]["final_quality_gate_status"],
+            "forced_appearance_delivery",
+        )
+        self.assertTrue(metadata["details"]["stage7_forced_delivery"])
+
+    def test_stage10_stage7_forced_delivery_never_overrides_core_damage(self):
+        processor = self._new_processor()
+        self._stage10_final_input(processor)
+        processor.cfg.stage10_quality_repair_enabled = False
+        processor._stage7_stretch_forced_delivery = True
+        hard_report = self._stage10_quality_noise_report(chroma=1.20, hard=True)
+        hard_report["issues"] = ["core_clip_score 0.0200>0.0120"]
+        hard_report["hard_issues"] = list(hard_report["issues"])
+        processor._final_quality_report = lambda _stem: dict(hard_report)
+
+        stage10_export(processor)
+
+        self.assertIn(("savetif", "result_review", "-astro"), processor.cmd_calls)
+        self.assertTrue(processor._final_output_review_only)
+        self.assertEqual(
+            processor.result_metadata[-1]["details"][
+                "final_quality_gate_status"
+            ],
+            "review_required",
+        )
+
     def test_stage10_quality_gate_exception_fails_closed_to_review_output(self):
         processor = self._new_processor()
         self._stage10_final_input(processor)

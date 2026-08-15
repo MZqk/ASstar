@@ -49,6 +49,9 @@ CONFIG_TEMPLATE_IN="$LOCAL_TEMPLATE"
 DEFAULT_ENV_SRC="$PROJECT_ROOT/resources/default.env"
 SIRIL_PLUGIN_DIR_SRC="$PROJECT_ROOT/resources/siril_plugins"
 SIRIL_SPCC_DATABASE_SEED_SRC="$PROJECT_ROOT/resources/siril_spcc_database"
+PROJECT_LICENSE_SRC="$PROJECT_ROOT/LICENSE"
+PROJECT_NOTICE_SRC="$PROJECT_ROOT/NOTICE"
+THIRD_PARTY_NOTICES_SRC="$PROJECT_ROOT/THIRD_PARTY_NOTICES"
 APP_REQUIREMENTS="$PROJECT_ROOT/requirements.lock"
 GUI_BUILD_REQUIREMENTS="$PROJECT_ROOT/build/requirements-gui-build.lock"
 SIRIL_PLUGIN_REQUIREMENTS="$SIRIL_PLUGIN_DIR_SRC/requirements.lock"
@@ -260,6 +263,21 @@ require_file() {
   if [[ ! -f "$path" ]]; then
     die "$label is not a file: $path"
   fi
+}
+
+embed_project_legal_notices() {
+  local destination_root="$1"
+  local legal_dir="$destination_root/Legal"
+
+  require_file "$PROJECT_LICENSE_SRC" "Project GPL-3.0-only license"
+  require_file "$PROJECT_NOTICE_SRC" "Project copyright notice"
+  require_file "$THIRD_PARTY_NOTICES_SRC" "Project third-party notices"
+
+  rm -rf "$legal_dir"
+  mkdir -p "$legal_dir"
+  cp "$PROJECT_LICENSE_SRC" "$legal_dir/LICENSE"
+  cp "$PROJECT_NOTICE_SRC" "$legal_dir/NOTICE"
+  cp "$THIRD_PARTY_NOTICES_SRC" "$legal_dir/THIRD_PARTY_NOTICES"
 }
 
 verify_locked_plugin_asset() {
@@ -1000,6 +1018,9 @@ require_exists "$PROJECT_ROOT" "Project root"
 require_exists "$GUI_ENTRY" "GUI entry"
 require_file "$APP_LOGO_PNG" "App logo PNG"
 require_file "$PIPELINE_SRC" "Pipeline script"
+require_file "$PROJECT_LICENSE_SRC" "Project GPL-3.0-only license"
+require_file "$PROJECT_NOTICE_SRC" "Project copyright notice"
+require_file "$THIRD_PARTY_NOTICES_SRC" "Project third-party notices"
 for module_name in "${PIPELINE_REQUIRED_MODULES[@]}"; do
   require_file "$(dirname "$PIPELINE_SRC")/$module_name" "Pipeline runtime module"
 done
@@ -1126,6 +1147,7 @@ APP_RESOURCES="$APP_PATH/Contents/Resources"
 APP_FRAMEWORKS="$APP_PATH/Contents/Frameworks"
 mkdir -p "$APP_RESOURCES/pipeline"
 mkdir -p "$APP_FRAMEWORKS"
+embed_project_legal_notices "$APP_RESOURCES"
 
 log "[BUILD] Embedding core pipeline/config resources..."
 cp "$CONFIG_TEMPLATE" "$APP_RESOURCES/config.1.4.ini.template"
@@ -1249,6 +1271,7 @@ if [[ -d "$SIRIL_PLUGIN_DIR_SRC" ]]; then
     [[ "$OFFLINE_RESOURCE_PACK_DIR" != "/" ]] || die "Refusing to use / as the resource pack path"
     rm -rf "$OFFLINE_RESOURCE_PACK_DIR"
     mkdir -p "$OFFLINE_RESOURCE_PACK_DIR"
+    embed_project_legal_notices "$OFFLINE_RESOURCE_PACK_DIR"
     ditto "$SIRIL_PLUGIN_DIR_SRC" "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins"
     "$BUILD_PYTHON" \
       "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/patches/apply_graxpert_ai_runtime_patch.py" \
@@ -1270,6 +1293,9 @@ require_exists "$APP_RESOURCES/Siril.app" "[VERIFY] Embedded Siril"
 require_exists "$APP_RESOURCES/SirilPythonSeed/venv/bin/python3.12" "[VERIFY] Embedded Siril offline venv seed"
 require_exists "$APP_RESOURCES/SirilPythonSeed/.python_module/sirilpy" "[VERIFY] Embedded Siril offline module seed"
 require_file "$APP_RESOURCES/SirilSPCCDatabaseSeed/manifest.json" "[VERIFY] Embedded Siril SPCC database seed"
+require_file "$APP_RESOURCES/Legal/LICENSE" "[VERIFY] Embedded project GPL-3.0-only license"
+require_file "$APP_RESOURCES/Legal/NOTICE" "[VERIFY] Embedded project copyright notice"
+require_file "$APP_RESOURCES/Legal/THIRD_PARTY_NOTICES" "[VERIFY] Embedded third-party notices"
 GAIA_CATALOG_SCAN_ROOTS=("$APP_PATH")
 if [[ "$BUNDLE_PROFILE" == "core" ]]; then
   GAIA_CATALOG_SCAN_ROOTS+=("$OFFLINE_RESOURCE_PACK_DIR")
@@ -1290,6 +1316,9 @@ if [[ "$BUNDLE_PROFILE" == "full" ]]; then
   require_dir "$APP_RESOURCES/siril_plugins/cosmic_clarity" "[VERIFY] Embedded CosmicClarity models"
 else
   require_dir "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/downloads" "[VERIFY] Core offline resource wheels"
+  require_file "$OFFLINE_RESOURCE_PACK_DIR/Legal/LICENSE" "[VERIFY] Core offline resource GPL-3.0-only license"
+  require_file "$OFFLINE_RESOURCE_PACK_DIR/Legal/NOTICE" "[VERIFY] Core offline resource copyright notice"
+  require_file "$OFFLINE_RESOURCE_PACK_DIR/Legal/THIRD_PARTY_NOTICES" "[VERIFY] Core offline resource third-party notices"
   require_file "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/syqon_starless/zenith.pt" "[VERIFY] Core offline resource SyQon model"
   require_file "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/syqon_starless/zenith.pt.sha256" "[VERIFY] Core offline resource SyQon checksum"
   require_file "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/graxpert/deconvolution-object-ai-models/1.0.1/model.onnx" "[VERIFY] Core offline resource GraXpert object deconvolution model"

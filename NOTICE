@@ -1,0 +1,15 @@
+StarunClient
+Copyright (C) 2026 StarunClient contributors
+
+SPDX-License-Identifier: GPL-3.0-only
+
+Unless a file or bundled third-party component states otherwise, the source
+code in this repository is licensed under the GNU General Public License,
+version 3 only (GPL-3.0-only).  The complete license text is in LICENSE.
+
+When conveying a modified or unmodified GPL-covered build, preserve this
+notice, the copyright notices, the GPL text, and the notices and licenses of
+third-party components.  Provide the Corresponding Source required by GPLv3.
+
+Third-party software, models, data, and other assets are not relicensed by
+this notice.  Their license terms remain controlling; see THIRD_PARTY_NOTICES.

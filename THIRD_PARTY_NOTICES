@@ -1,0 +1,53 @@
+StarunClient third-party notices
+===============================
+
+This file identifies material whose license is different from, or must remain
+available alongside, the project's GPL-3.0-only license.  It is a release
+notice, not a replacement for the complete upstream license texts.  A binary
+release must retain the license files embedded in the bundled wheels and other
+resources, together with these notices.
+
+Source-derived components
+-------------------------
+
+* `pipeline/dualband_palette.py` adapts `Hubble_Palette_from_Dual-Band_OSC.py`
+  by Carlo Mollicone (AstroBOH), GPL-3.0-or-later.  Its copyright and source
+  attribution are retained in that file.
+* `resources/siril_plugins/vendor/siril-scripts/`, when fetched into the
+  offline resource cache, is copyright Team Free-astro and licensed under the
+  MIT License.  Retain its upstream `LICENSE.md` with every distribution that
+  includes this directory.
+* `resources/siril_spcc_database/` carries its own GPLv3 license file.  Do not
+  remove it when distributing the database seed.
+
+Bundled Python runtime components
+---------------------------------
+
+The offline wheel cache under `resources/siril_plugins/downloads/` contains
+third-party packages with their own license files and copyright notices.  In
+particular, the current runtime includes PyQt6 (GPL-3.0-only), PySide6
+(LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only), setiastrosuitepro (GPL-3.0),
+and packages under permissive licenses such as MIT, BSD, and Apache-2.0.
+Keep the original wheels or their installed `*.dist-info` license material in
+the release, and preserve every package's notice.
+
+Models and other non-code assets
+--------------------------------
+
+* The GraXpert Object Deconvolution model at
+  `resources/siril_plugins/graxpert/deconvolution-object-ai-models/1.0.1/` is
+  licensed by the GraXpert Development Team under CC BY-NC-SA 4.0.  It is not
+  covered by GPL-3.0-only.  Attribution, the CC license text, and its
+  NonCommercial and ShareAlike conditions remain in force.
+* Before distributing the SyQon Zenith or CosmicClarity model assets, verify
+  their upstream redistribution terms and include their original notices.
+
+Commercial-release boundary
+---------------------------
+
+GPL-3.0-only permits commercial distribution of GPL-covered software when its
+source and GPL obligations are met.  The bundled GraXpert model's
+CC BY-NC-SA 4.0 license is different: a distribution containing that model
+must not be used for commercial purposes without separate permission from its
+rights holder.  Remove that model or obtain the required permission before a
+commercial release.

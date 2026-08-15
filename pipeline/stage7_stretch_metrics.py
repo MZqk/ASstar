@@ -42,6 +42,8 @@ LOWER_HALF_RECENTERED_MAD_NORMAL_SIGMA_RATIO = 0.5916931999771552
 STRETCH_SEMANTICS_SCHEMA = "starun.siril-stretch-semantics.v1"
 TRANSFORM_LOSS_SCHEMA = "starun.stage7-transform-loss.v1"
 MULTISCALE_CONTRAST_SCHEMA = "starun.stage7-multiscale-contrast.v1"
+RENDITION_METRICS_SCHEMA = "starun.stage7-rendition-metrics.v1"
+RENDITION_CHROMA_SCHEMA = "starun.stage7-subject-chroma.v1"
 MULTISCALE_CONTRAST_RADII = (1, 2, 4, 8, 16)
 SIRIL_MINIMUM_VERSION_CONTRACT = "1.4.0"
 SIRIL_BUNDLED_REFERENCE_VERSION = "1.4.4"
@@ -72,6 +74,301 @@ DISPLAY90_STRENGTH_MAX = 0.95
 DISPLAY90_ANALYSIS_MAX_SIDE = ui_preview.DEFAULT_PREVIEW_MAX_SIDE
 DISPLAY90_REPORT_PERCENTILES = (0.2, 1.0, 10.0, 50.0, 90.0, 99.0, 99.8)
 DISPLAY90_CONFORMANCE_PERCENTILES = (50.0, 90.0, 99.0)
+
+
+def _stage7_mask(
+    masks: Optional[Dict[str, Any]],
+    name: str,
+    shape: tuple[int, int],
+) -> Optional[np.ndarray]:
+    """Return one finite full-resolution mask without rebuilding it per candidate."""
+
+    if not isinstance(masks, dict) or masks.get(name) is None:
+        return None
+    mask = np.asarray(masks[name], dtype=np.float32)
+    if mask.ndim != 2 or tuple(mask.shape) != tuple(shape):
+        return None
+    if not np.all(np.isfinite(mask)):
+        return None
+    return np.clip(mask, 0.0, 1.0)
+
+
+def _stage7_subject_weight(
+    masks: Optional[Dict[str, Any]],
+    shape: tuple[int, int],
+) -> np.ndarray:
+    """Build the stable subject ROI from masks frozen on the Stage 6 source."""
+
+    explicit = _stage7_mask(masks, "subject_mask", shape)
+    if explicit is not None:
+        return explicit
+    layers = [
+        mask
+        for name in (
+            "core_mask",
+            "nebula_mask",
+            "faint_nebula_mask",
+            "galaxy_signal_mask",
+            "star_mask",
+        )
+        if (mask := _stage7_mask(masks, name, shape)) is not None
+    ]
+    if layers:
+        return np.maximum.reduce(layers).astype(np.float32, copy=False)
+    background = _stage7_mask(masks, "background_mask", shape)
+    if background is not None:
+        return (1.0 - background).astype(np.float32, copy=False)
+    return np.ones(shape, dtype=np.float32)
+
+
+def measure_frozen_rendition_metrics(
+    image: np.ndarray,
+    masks: Optional[Dict[str, Any]],
+    *,
+    max_samples: int = 300_000,
+) -> Dict[str, Any]:
+    """Measure presentation quality on Stage 6-derived, candidate-invariant ROIs."""
+
+    try:
+        rgb = _stage7_rgb_float_fullres(np.asarray(image))
+        if not np.all(np.isfinite(rgb)):
+            raise ValueError("rendition image contains non-finite pixels")
+        shape = tuple(int(value) for value in rgb.shape[1:])
+        subject_weight = _stage7_subject_weight(masks, shape)
+        background_weight = _stage7_mask(masks, "background_mask", shape)
+        subject = subject_weight > 0.25
+        if int(np.count_nonzero(subject)) < 64:
+            raise ValueError("frozen subject ROI contains too few pixels")
+        background = (
+            background_weight > 0.50
+            if background_weight is not None
+            else ~subject
+        )
+        background &= ~subject
+        if int(np.count_nonzero(background)) < 64:
+            raise ValueError("frozen background ROI contains too few pixels")
+
+        luminance = (
+            0.2126 * rgb[0]
+            + 0.7152 * rgb[1]
+            + 0.0722 * rgb[2]
+        ).astype(np.float32)
+        peak = np.max(rgb, axis=0)
+        trough = np.min(rgb, axis=0)
+        saturation = np.divide(
+            peak - trough,
+            np.maximum(peak, 1e-6),
+            out=np.zeros_like(peak, dtype=np.float32),
+            where=peak > 1e-6,
+        )
+        local_detail = np.abs(luminance - _box_blur_gray(luminance))
+
+        def sampled(values: np.ndarray, region: np.ndarray) -> np.ndarray:
+            selected = np.asarray(values[region], dtype=np.float32)
+            if selected.size > max_samples:
+                stride = int(np.ceil(selected.size / float(max_samples)))
+                selected = selected[::stride]
+            return selected
+
+        subject_luma = sampled(luminance, subject)
+        subject_saturation = sampled(saturation, subject)
+        subject_detail = sampled(local_detail, subject)
+        background_luma = sampled(luminance, background)
+        bg_median = float(np.median(background_luma))
+        bg_mad = float(np.median(np.abs(background_luma - bg_median)))
+        subject_p50, subject_p75, subject_p99 = np.percentile(
+            subject_luma,
+            [50.0, 75.0, 99.0],
+        )
+        noise_sigma = max(1.4826 * bg_mad, 1e-4)
+        return {
+            "schema": RENDITION_METRICS_SCHEMA,
+            "status": "available",
+            "mask_source": "stage6_frozen_roi",
+            "subject_coverage": float(np.mean(subject)),
+            "background_coverage": float(np.mean(background)),
+            "metrics": {
+                "visibility": float(max(0.0, subject_p75 - bg_median) / noise_sigma),
+                "subject_span": float(max(0.0, subject_p99 - subject_p50)),
+                "saturation_median": float(np.median(subject_saturation)),
+                "saturation_p95": float(np.percentile(subject_saturation, 95.0)),
+                "microcontrast": float(np.percentile(subject_detail, 75.0)),
+                "subject_p50": float(subject_p50),
+                "subject_p99": float(subject_p99),
+                "background_median": bg_median,
+                "background_mad": bg_mad,
+            },
+        }
+    except (IndexError, TypeError, ValueError, FloatingPointError) as error:
+        return {
+            "schema": RENDITION_METRICS_SCHEMA,
+            "status": "unavailable",
+            "mask_source": "stage6_frozen_roi",
+            "reason": str(error),
+            "metrics": {},
+        }
+
+
+def rendition_metric_retention(
+    candidate: Dict[str, Any],
+    preview: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return stable candidate/preview ratios used by the Stage 7 selector."""
+
+    candidate_metrics = dict(candidate.get("metrics") or {})
+    preview_metrics = dict(preview.get("metrics") or {})
+    ratios: Dict[str, Any] = {}
+    for name in (
+        "visibility",
+        "subject_span",
+        "saturation_median",
+        "saturation_p95",
+        "microcontrast",
+    ):
+        try:
+            value = float(candidate_metrics[name])
+            reference = float(preview_metrics[name])
+        except (KeyError, TypeError, ValueError):
+            ratios[name] = {"available": False, "ratio": None}
+            continue
+        available = bool(
+            np.isfinite(value)
+            and np.isfinite(reference)
+            and reference > 1e-9
+        )
+        ratios[name] = {
+            "available": available,
+            "candidate": value,
+            "preview": reference,
+            "ratio": float(value / reference) if available else None,
+        }
+    return {
+        "schema": RENDITION_METRICS_SCHEMA,
+        "status": (
+            "available"
+            if any(item.get("available") for item in ratios.values())
+            else "unavailable"
+        ),
+        "metrics": ratios,
+    }
+
+
+def apply_subject_chroma_rendition(
+    image: np.ndarray,
+    masks: Optional[Dict[str, Any]],
+    *,
+    factor: float,
+    output_headroom: float = 0.995,
+) -> tuple[np.ndarray, Dict[str, Any]]:
+    """Boost only broad subject chroma while preserving luminance and headroom."""
+
+    rgb = _stage7_rgb_float_fullres(np.asarray(image))
+    if not np.all(np.isfinite(rgb)):
+        raise ValueError("subject chroma source contains non-finite pixels")
+    shape = tuple(int(value) for value in rgb.shape[1:])
+    factor = float(np.clip(float(factor), 1.0, 1.20))
+    headroom = float(np.clip(float(output_headroom), 0.95, 0.999))
+    has_frozen_roi = any(
+        _stage7_mask(masks, name, shape) is not None
+        for name in (
+            "subject_mask",
+            "background_mask",
+            "core_mask",
+            "nebula_mask",
+            "faint_nebula_mask",
+            "galaxy_signal_mask",
+            "star_mask",
+        )
+    )
+    if not has_frozen_roi:
+        raise ValueError("vivid-safe chroma requires a valid frozen Stage 6 ROI")
+    subject_weight = _stage7_subject_weight(masks, shape)
+    core_weight = _stage7_mask(masks, "core_mask", shape)
+    if core_weight is not None:
+        subject_weight *= 1.0 - 0.90 * core_weight
+    star_weight = _stage7_mask(masks, "star_mask", shape)
+    if star_weight is not None:
+        subject_weight *= 1.0 - 0.90 * star_weight
+    source_peak = np.max(rgb, axis=0)
+    source_floor = np.min(rgb, axis=0)
+    range_weight = np.minimum(
+        np.clip((headroom - source_peak) / 0.04, 0.0, 1.0),
+        np.clip(source_floor / 0.02, 0.0, 1.0),
+    )
+    boost_weight = np.clip(subject_weight * range_weight, 0.0, 1.0)
+    luminance = (
+        0.2126 * rgb[0]
+        + 0.7152 * rgb[1]
+        + 0.0722 * rgb[2]
+    ).astype(np.float32)
+    chroma = rgb - luminance[None, :, :]
+    broad_chroma = np.stack(
+        [_box_blur_gray(_box_blur_gray(channel)) for channel in chroma],
+        axis=0,
+    ).astype(np.float32)
+    delta = (factor - 1.0) * boost_weight[None, :, :] * broad_chroma
+    delta_luma = (
+        0.2126 * delta[0]
+        + 0.7152 * delta[1]
+        + 0.0722 * delta[2]
+    )
+    delta -= delta_luma[None, :, :]
+
+    safe_scale = np.ones(shape, dtype=np.float32)
+    for channel in range(3):
+        positive = delta[channel] > 0.0
+        negative = delta[channel] < 0.0
+        channel_scale = np.ones(shape, dtype=np.float32)
+        channel_scale[positive] = np.maximum(
+            0.0,
+            (headroom - rgb[channel][positive])
+            / np.maximum(delta[channel][positive], 1e-12),
+        )
+        channel_scale[negative] = np.maximum(
+            0.0,
+            rgb[channel][negative]
+            / np.maximum(-delta[channel][negative], 1e-12),
+        )
+        safe_scale = np.minimum(safe_scale, channel_scale)
+    safe_scale = np.clip(safe_scale, 0.0, 1.0)
+    rendered = rgb + delta * safe_scale[None, :, :]
+    rendered_luma = (
+        0.2126 * rendered[0]
+        + 0.7152 * rendered[1]
+        + 0.0722 * rendered[2]
+    )
+    rendered_peak = np.max(rendered, axis=0)
+    headroom_limited = (
+        (rendered_peak >= headroom - 1e-7)
+        & (source_peak < headroom - 1e-7)
+    )
+    newly_clipped = (
+        (rendered_peak >= 1.0 - TRANSFORM_ZERO_EPSILON)
+        & (source_peak < 1.0 - TRANSFORM_ZERO_EPSILON)
+    )
+    return np.asarray(np.clip(rendered, 0.0, 1.0), dtype=np.float32), {
+        "schema": RENDITION_CHROMA_SCHEMA,
+        "mode": "frozen_subject_broad_chroma",
+        "factor": factor,
+        "output_headroom": headroom,
+        "subject_coverage": float(np.mean(subject_weight > 0.25)),
+        "boosted_coverage": float(np.mean(boost_weight > 0.05)),
+        "core_protection_applied": core_weight is not None,
+        "star_protection_applied": star_weight is not None,
+        "mean_effective_scale": float(np.mean(safe_scale[boost_weight > 0.05]))
+        if np.any(boost_weight > 0.05)
+        else 0.0,
+        "max_luminance_error": float(np.max(np.abs(rendered_luma - luminance))),
+        "newly_clipped_ratio": float(np.mean(newly_clipped)),
+        "headroom_limited_ratio": float(np.mean(headroom_limited)),
+        "background_unchanged": bool(
+            np.allclose(
+                rendered[:, subject_weight <= 1e-6],
+                rgb[:, subject_weight <= 1e-6],
+                atol=2e-7,
+            )
+        ),
+    }
 
 
 def _stage7_rgb_float_fullres(image: np.ndarray) -> np.ndarray:
@@ -499,14 +796,23 @@ def _transform_loss_region(
     }
     if effective_blackpoint.get("status") == "available":
         below = selected_source <= float(effective_blackpoint["value"])
+        unexpected_newly_zeroed = newly_zeroed & ~below
         blackpoint_block.update(
             {
                 "source_below_blackpoint_ratio": float(np.mean(below)),
                 "source_below_blackpoint_ratio_by_channel": _ratio_by_channel(below),
                 "spatial_any_channel_below_ratio": float(np.mean(np.any(below, axis=0))),
                 "spatial_all_channels_below_ratio": float(np.mean(np.all(below, axis=0))),
+                "unexpected_newly_zeroed_ratio": float(
+                    np.mean(unexpected_newly_zeroed)
+                ),
+                "unexpected_newly_zeroed_ratio_by_channel": _ratio_by_channel(
+                    unexpected_newly_zeroed
+                ),
             }
         )
+    else:
+        unexpected_newly_zeroed = newly_zeroed
 
     zero_block = {
         **ratio_block(zero_before, zero_after),
@@ -530,6 +836,12 @@ def _transform_loss_region(
         "zero_ratio_after": zero_block["after"],
         "zero_ratio_growth": zero_block["growth"],
         "newly_zeroed_ratio": zero_block["newly_zeroed_ratio"],
+        "unexpected_newly_zeroed_ratio": float(
+            np.mean(unexpected_newly_zeroed)
+        ),
+        "unexpected_newly_zeroed_ratio_by_channel": _ratio_by_channel(
+            unexpected_newly_zeroed
+        ),
         "zero": zero_block,
         "hard_clip_ratio_before": hard_high_block["before"],
         "hard_clip_ratio_after": hard_high_block["after"],

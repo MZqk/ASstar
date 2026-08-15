@@ -134,7 +134,7 @@ def _display90_reference_evidence(
         ),
         "signal_exclusion_applied": signal_exclusion_applied,
         "signal_exclusion_keys": ["nebula_mask"],
-        "mask_scope": "same_candidate_signal_excluded_background_mask",
+        "mask_scope": "stage6_frozen_signal_excluded_background_mask",
         "reference_application": "gui_rec709_luminance_gain",
         "candidate_application": "linked_rgb_common_lut",
         "lut_sha256": "a" * 64,
@@ -444,7 +444,7 @@ class Display90BackgroundReferenceGateTests(unittest.TestCase):
         self.assertTrue(evidence["curve_authenticated"])
         self.assertEqual(
             evidence["mask_scope"],
-            "same_candidate_signal_excluded_background_mask",
+            "stage6_frozen_signal_excluded_background_mask",
         )
         self.assertEqual(
             evidence["lut_sha256"],
@@ -469,7 +469,7 @@ class Display90BackgroundReferenceGateTests(unittest.TestCase):
         self.assertFalse(rejected["curve_authenticated"])
 
     def test_ratio_and_absolute_boundaries_become_one_advisory(self) -> None:
-        candidate_load = 0.40
+        candidate_load = 0.30
         result = self._gate(candidate_load, candidate_load / 1.05)
 
         self.assertTrue(result["accepted"], result)
@@ -499,14 +499,14 @@ class Display90BackgroundReferenceGateTests(unittest.TestCase):
         )
 
     def test_reference_ratio_or_absolute_limit_excess_remains_hard(self) -> None:
-        ratio_failed = self._gate(0.39, 0.39 / 1.051)
+        ratio_failed = self._gate(0.29, 0.29 / 1.051)
         self.assertFalse(ratio_failed["accepted"])
         self.assertEqual(
             ratio_failed["display90_reference_match"]["reason_code"],
             "display90_reference_chroma_ratio_exceeded",
         )
 
-        absolute_failed = self._gate(0.401, 0.401)
+        absolute_failed = self._gate(0.301, 0.301)
         self.assertFalse(absolute_failed["accepted"])
         self.assertEqual(
             absolute_failed["display90_reference_match"]["reason_code"],
@@ -679,9 +679,22 @@ class Display90RoutingTests(unittest.TestCase):
         )
         self.assertEqual(
             [candidate["name"] for candidate in candidates],
-            ["cand_a", "cand_b", "cand_display90"],
+            [
+                "cand_a",
+                "cand_b",
+                "cand_display82",
+                "cand_display70",
+                "cand_display90",
+            ],
         )
         self.assertEqual(adaptation["display90_calibration"]["status"], "ok")
+        self.assertEqual(
+            [
+                item["name"]
+                for item in adaptation["display_ladder"]["tiers"]
+            ],
+            ["cand_display82", "cand_display70", "cand_display90"],
+        )
 
         processor.cfg.stage7_processing_mode = "manual"
         manual_candidates, _adaptation = (
@@ -777,8 +790,10 @@ class Display90RoutingTests(unittest.TestCase):
         )
         self.assertEqual(
             cfg.stage7_display90_reference_chroma_load_absolute_max,
-            0.40,
+            0.30,
         )
+        self.assertEqual(cfg.stage7_rendition_intent, "vivid_safe")
+        self.assertTrue(cfg.stage7_forced_delivery_enabled)
         self.assertIn("stage7_display90_strength", SPECS_BY_FIELD)
         self.assertIn(
             "stage7_display90_reference_chroma_load_ratio_max",
@@ -859,6 +874,46 @@ class Display90Stage9ContractTests(unittest.TestCase):
             calibration,
         )
         np.testing.assert_array_equal(stage9_pixels, stage7_pixels)
+
+    def test_vivid_safe_child_preserves_display_parent_transfer(self) -> None:
+        image = _linear_rgb()
+        calibration = _calibration(image, strength=0.82)
+        selected = {
+            "name": "cand_vivid_safe",
+            "method": "vivid_safe_chroma",
+            "params": {
+                "parent_name": "cand_display82",
+                "parent_candidate": {
+                    "name": "cand_display82",
+                    "method": "display90_linked_lut",
+                    "params": {"calibration": calibration},
+                },
+            },
+        }
+        transfer = _stage7_matched_domain_transfer_contract(selected, {})
+        with tempfile.TemporaryDirectory() as td:
+            pipeline = types.SimpleNamespace(
+                _stage7_matched_domain_transfer=transfer,
+                _stage7_closed_form_mtf_reference=None,
+                process_dir=Path(td),
+            )
+            resolved = stage9_star_remixing._stage9_resolve_matched_domain_transfer(
+                pipeline
+            )
+
+        self.assertEqual(transfer["selected_candidate_id"], "cand_vivid_safe")
+        self.assertEqual(transfer["tone_candidate_id"], "cand_display82")
+        self.assertEqual(resolved["status"], "ready", resolved)
+        self.assertEqual(resolved["tone_candidate_id"], "cand_display82")
+        stage9_pixels = stage9_star_remixing._stage9_apply_matched_domain_transfer(
+            image,
+            resolved,
+        )
+        expected = stretch_metrics.apply_display90_linked_rgb_stretch(
+            image,
+            calibration,
+        )
+        np.testing.assert_array_equal(stage9_pixels, expected)
 
     def test_corrupt_or_missing_display90_contract_never_uses_mtf(self) -> None:
         image = _linear_rgb()

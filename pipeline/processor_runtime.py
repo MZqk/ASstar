@@ -2958,10 +2958,17 @@ class ProcessorRuntimeMixin:
             or getattr(self, "_stage2_view_review_required", False)
             or getattr(self, "_background_review_required", False)
             or getattr(self, "_stage4_color_review_required", False)
-            or getattr(
-                self,
-                "_stage7_background_color_review_required",
-                False,
+            or (
+                getattr(
+                    self,
+                    "_stage7_background_color_review_required",
+                    False,
+                )
+                and not getattr(
+                    self,
+                    "_stage7_stretch_forced_delivery",
+                    False,
+                )
             )
             or getattr(
                 self,
@@ -3059,11 +3066,33 @@ class ProcessorRuntimeMixin:
                 ),
                 "requires_review": bool(
                     getattr(self, "_stage4_color_review_required", False)
-                    or getattr(
+                    or (
+                        getattr(
+                            self,
+                            "_stage7_background_color_review_required",
+                            False,
+                        )
+                        and not getattr(
+                            self,
+                            "_stage7_stretch_forced_delivery",
+                            False,
+                        )
+                    )
+                ),
+                "stage7_forced_delivery": bool(
+                    getattr(
                         self,
-                        "_stage7_background_color_review_required",
+                        "_stage7_stretch_forced_delivery",
                         False,
                     )
+                ),
+                "stage7_forced_delivery_reasons": list(
+                    getattr(
+                        self,
+                        "_stage7_forced_delivery_reasons",
+                        [],
+                    )
+                    or []
                 ),
                 "background_color_review_gate": dict(
                     getattr(

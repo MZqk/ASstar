@@ -341,7 +341,7 @@ class ProcessingParameterContractTests(unittest.TestCase):
                 )
                 for stage in range(2, 10)
             },
-            {2: 4, 3: 22, 4: 32, 5: 4, 6: 29, 7: 43, 8: 14, 9: 79},
+            {2: 4, 3: 22, 4: 32, 5: 4, 6: 29, 7: 51, 8: 14, 9: 79},
         )
         gate_fields = {spec.field for spec in PROCESSING_GATE_PARAMETER_SPECS}
         self.assertTrue(
@@ -458,6 +458,22 @@ class ProcessingParameterContractTests(unittest.TestCase):
             cfg.stage8_texture_artifact_growth_max,
             1.0
             + (PipelineConfig().stage8_texture_artifact_growth_max - 1.0) * 3.0,
+        )
+        self.assertAlmostEqual(
+            cfg.stage7_diffuse_visibility_score_min,
+            PipelineConfig().stage7_diffuse_visibility_score_min / 3.0,
+        )
+        self.assertEqual(
+            cfg.stage7_highlight_clip_ratio_max,
+            PipelineConfig().stage7_highlight_clip_ratio_max,
+        )
+        self.assertEqual(
+            cfg.stage7_stretch_chroma_noise_score_max,
+            PipelineConfig().stage7_stretch_chroma_noise_score_max,
+        )
+        self.assertEqual(
+            cfg.stage7_transform_new_hard_clip_ratio_max,
+            PipelineConfig().stage7_transform_new_hard_clip_ratio_max,
         )
         self.assertEqual(cfg.stage9_mixed_star_weak_count_min, 6)
         self.assertEqual(cfg.stage7_starless_repair_max_score_growth, 0.0)

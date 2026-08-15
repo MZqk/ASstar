@@ -1032,13 +1032,20 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
         if isinstance(background_color_review_gate, dict)
         else {}
     )
-    stage7_background_color_review_required = bool(
+    stage7_background_color_review_required_raw = bool(
         getattr(
             pipeline,
             "_stage7_background_color_review_required",
             False,
         )
         or background_color_review_gate.get("requires_review", False)
+    )
+    stage7_forced_delivery = bool(
+        getattr(pipeline, "_stage7_stretch_forced_delivery", False)
+    )
+    stage7_background_color_review_required = bool(
+        stage7_background_color_review_required_raw
+        and not stage7_forced_delivery
     )
     final_background_color_review_required = False
     final_background_chroma_load: Optional[float] = None
@@ -1086,10 +1093,25 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
                 "error": str(error),
             }
             final_background_color_review_required = True
-    uncalibrated_background_color_review_required = bool(
-        stage7_background_color_review_required
+    uncalibrated_background_color_review_required_raw = bool(
+        stage7_background_color_review_required_raw
         or final_background_color_review_required
     )
+    uncalibrated_background_color_review_required = bool(
+        uncalibrated_background_color_review_required_raw
+        and not stage7_forced_delivery
+    )
+    if (
+        stage7_forced_delivery
+        and (
+            stage7_background_color_review_required_raw
+            or final_background_color_review_required
+        )
+    ):
+        advisories.append(
+            "stage7_forced_delivery_overrode_background_colour_review "
+            "(appearance-only; technical gates remained enforced)"
+        )
     halo_residue = pipeline._stage7_halo_residue_score()
     selected_stage7_quality = getattr(pipeline, "_stage7_selected_quality", None)
     stage7_quality_derived = (
@@ -1579,6 +1601,10 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
         "uncalibrated_background_color_review_required": (
             uncalibrated_background_color_review_required
         ),
+        "uncalibrated_background_color_review_required_raw": (
+            uncalibrated_background_color_review_required_raw
+        ),
+        "stage7_forced_delivery_override": stage7_forced_delivery,
         "uncalibrated_background_color_review_gate": (
             background_color_review_gate
         ),

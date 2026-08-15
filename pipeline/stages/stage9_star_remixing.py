@@ -3107,14 +3107,19 @@ def _stage9_resolve_matched_domain_transfer(pipeline) -> Dict[str, Any]:
                 "reason_code": (
                     "stage9_display90_transfer_invalid"
                     if method == "display90_linked_lut"
-                    or selected_candidate_id == "cand_display90"
+                    or selected_candidate_id.startswith("cand_display")
                     else "stage9_matched_domain_transfer_invalid"
                 ),
                 "reason": "Stage7 matched-domain transfer schema is invalid",
                 "selected_candidate_id": selected_candidate_id,
             }
         if method == "display90_linked_lut":
-            if selected_candidate_id != "cand_display90":
+            tone_candidate_id = str(
+                transfer.get("tone_candidate_id")
+                or selected_candidate_id
+                or ""
+            )
+            if not tone_candidate_id.startswith("cand_display"):
                 return {
                     "status": "unavailable",
                     "reason_code": "stage9_display90_transfer_invalid",
@@ -3152,6 +3157,7 @@ def _stage9_resolve_matched_domain_transfer(pipeline) -> Dict[str, Any]:
                 "method": method,
                 "source": transfer_source,
                 "selected_candidate_id": selected_candidate_id,
+                "tone_candidate_id": tone_candidate_id,
                 "calibration": calibration,
                 "lut_contract": lut_contract,
                 "fallback_to_linked_mtf_allowed": False,
@@ -3169,7 +3175,7 @@ def _stage9_resolve_matched_domain_transfer(pipeline) -> Dict[str, Any]:
                 "selected_candidate_id": selected_candidate_id,
             }
     else:
-        if selected_candidate_id == "cand_display90":
+        if selected_candidate_id.startswith("cand_display"):
             return {
                 "status": "unavailable",
                 "reason_code": "stage9_display90_transfer_invalid",

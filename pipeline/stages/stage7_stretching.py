@@ -18,6 +18,8 @@ def _run_with_stars_review_stretch(pipeline, separation_state: str) -> None:
     )
     pipeline._stage7_stretch_accepted = False
     pipeline._stage7_stretch_output = None
+    pipeline._stage7_stretch_forced_delivery = False
+    pipeline._stage7_forced_delivery_reasons = []
     pipeline._stage7_background_color_review_required = False
     pipeline._stage7_background_color_review_gate = {
         "status": "not_run",
@@ -83,6 +85,8 @@ def run_stage7_stretching(pipeline) -> None:
     pipeline.log.stage_start(stage_label)
     pipeline._stage7_stretch_accepted = False
     pipeline._stage7_stretch_output = None
+    pipeline._stage7_stretch_forced_delivery = False
+    pipeline._stage7_forced_delivery_reasons = []
     pipeline._stage7_background_color_review_required = False
     pipeline._stage7_background_color_review_gate = {
         "status": "not_run",
@@ -154,16 +158,37 @@ def run_stage7_stretching(pipeline) -> None:
     validated_rescue = bool(
         getattr(pipeline, "_stage7_stretch_validated_rescue", False)
     )
+    forced_delivery = bool(
+        getattr(pipeline, "_stage7_stretch_forced_delivery", False)
+    )
     fallback_reason = str(
         getattr(pipeline, "_stage7_stretch_fallback_reason", "") or ""
     )
     if validated_rescue and not fallback_reason:
         fallback_reason = "validated_stretch_fallback"
     pipeline._stage7_stretch_accepted = bool(
-        stretched and stage_saved and (not stage_degraded or validated_rescue)
+        stretched
+        and stage_saved
+        and (not stage_degraded or validated_rescue or forced_delivery)
     )
     if pipeline._stage7_stretch_accepted:
         pipeline._stage7_stretch_output = pipeline.stretched_name
+    if forced_delivery and pipeline._stage7_stretch_accepted:
+        pipeline._stage8_conservative_mode = True
+        handoff = dict(getattr(pipeline, "_stage8_handoff", {}) or {})
+        handoff.update(
+            processing_policy="background_only",
+            requested_policy="background_only",
+            reason_code="stage7_forced_quality_delivery",
+            reason_text=(
+                "Stage7 forced delivery retained a technically safe image; "
+                "skip further positive colour enhancement"
+            ),
+            reasons=list(
+                getattr(pipeline, "_stage7_forced_delivery_reasons", []) or []
+            ),
+        )
+        pipeline._stage8_handoff = handoff
     if stage_saved:
         diff_note = pipeline._stage_diff_note("stage7_stretched", compare_stem)
         if diff_note:
@@ -197,14 +222,20 @@ def run_stage7_stretching(pipeline) -> None:
     elapsed = pipeline.log.stage_end(stage_label)
     message_text = "；".join(messages)
     if stretched and stage_saved:
-        status = 'degraded' if stage_degraded and not validated_rescue else 'ok'
+        status = 'degraded' if forced_delivery else (
+            'degraded' if stage_degraded and not validated_rescue else 'ok'
+        )
         pipeline._record_stage(
             stage_label,
             status,
             elapsed,
             message_text,
-            fallback_used=validated_rescue,
-            reason_code=(fallback_reason if validated_rescue else ""),
+            fallback_used=bool(validated_rescue or forced_delivery),
+            reason_code=(
+                fallback_reason
+                if validated_rescue or forced_delivery
+                else ""
+            ),
             components={
                 "stretch": {
                     "status": "accepted",
@@ -213,10 +244,13 @@ def run_stage7_stretching(pipeline) -> None:
                     "output": pipeline.stretched_name,
                     "reason_code": (
                         fallback_reason
-                        if validated_rescue
+                        if validated_rescue or forced_delivery
                         else "accepted"
                     ),
-                    "fallback_used": validated_rescue,
+                    "fallback_used": bool(
+                        validated_rescue or forced_delivery
+                    ),
+                    "forced_delivery": forced_delivery,
                 }
             },
             details={
@@ -227,6 +261,15 @@ def run_stage7_stretching(pipeline) -> None:
                         "_stage7_background_color_review_required",
                         False,
                     )
+                ),
+                "forced_delivery": forced_delivery,
+                "forced_delivery_reasons": list(
+                    getattr(
+                        pipeline,
+                        "_stage7_forced_delivery_reasons",
+                        [],
+                    )
+                    or []
                 ),
             },
         )
