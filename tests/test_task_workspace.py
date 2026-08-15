@@ -71,6 +71,26 @@ class TaskWorkspaceTests(unittest.TestCase):
             },
         )
 
+    @staticmethod
+    def _semantic_context() -> dict[str, object]:
+        mapping = {
+            "schema": "starun.narrowband-channel-mapping.v1",
+            "mapping": "unknown",
+            "confidence": 0.0,
+            "evidence": "not_narrowband",
+        }
+        return {
+            "schema": "starun.resume-semantics.v1",
+            "checkpoint_stage": 5,
+            "channel_semantics": "broadband",
+            "channel_profile": {"kind": "broadband"},
+            "narrowband_channel_mapping": mapping,
+            "target_profile": {},
+            "pipeline_policy": {},
+            "color_calibration_report": {},
+            "upstream_review": {},
+        }
+
     def _write_checkpoints(self, workspace, fingerprints) -> dict[str, object]:
         records = {}
         for stage_number in FORMAL_RESUME_STAGES:
@@ -84,8 +104,14 @@ class TaskWorkspaceTests(unittest.TestCase):
                 "path": path.relative_to(workspace.root).as_posix(),
                 "sha256": run_manifest.sha256_file(path),
                 "state": "linear",
-                "plan_hash": "plan-hash",
+                "run_manifest_hash": "run-manifest-hash",
                 "config_fingerprint": fingerprints[key]["fingerprint"],
+                "semantic_context": (
+                    self._semantic_context() if stage_number == 5 else None
+                ),
+                "semantic_context_status": (
+                    "verified" if stage_number == 5 else "not_applicable"
+                ),
             }
         manifest = build_checkpoint_manifest(
             task_id=workspace.task_id,
@@ -194,6 +220,9 @@ class TaskWorkspaceTests(unittest.TestCase):
                     run_manifest_path=run.manifest_path,
                     stage_number=stage_number,
                     artifact_path=artifact,
+                    semantic_context=(
+                        self._semantic_context() if stage_number == 5 else None
+                    ),
                 )
 
             inspection = inspect_task_workspace(
@@ -227,6 +256,9 @@ class TaskWorkspaceTests(unittest.TestCase):
                     run_manifest_path=first_run.manifest_path,
                     stage_number=stage_number,
                     artifact_path=artifact,
+                    semantic_context=(
+                        self._semantic_context() if stage_number == 5 else None
+                    ),
                 )
 
             changed = task_plan.build_resume_fingerprints(
@@ -274,7 +306,8 @@ class TaskWorkspaceTests(unittest.TestCase):
             stale = run.root / "result_final.fit"
             stale.write_bytes(b"stale")
             result = {
-                "schema": "seestar.pipeline-result.v1",
+                "schema": "starun.pipeline-result.v1",
+                "run_id": run.run_id,
                 "status": "success",
                 "outputs": {
                     preview.name: run_manifest.file_record(
@@ -287,6 +320,15 @@ class TaskWorkspaceTests(unittest.TestCase):
                     },
                 },
             }
+            plan = task_plan.build_processing_plan(
+                run_id=run.run_id,
+                generated_at="2026-08-04T01:00:00Z",
+                input_record={"fingerprint": source_record["fingerprint"]},
+                input_state="linear",
+                input_trust="recognized",
+            )
+            run_manifest.atomic_write_json(run.root / "processing-plan.json", plan)
+            result["plan_hash"] = plan["plan_hash"]
             result["manifest_hash"] = run_manifest.canonical_payload_hash(result)
             run_manifest.atomic_write_json(run.root / "pipeline-result.json", result)
 
@@ -362,7 +404,13 @@ class TaskWorkspaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             _, source_record, workspace = self._workspace(Path(td))
 
-            def completed_run(run_id: str, output_name: str, content: bytes):
+            def completed_run(
+                run_id: str,
+                output_name: str,
+                content: bytes,
+                *,
+                debug_mode: bool = False,
+            ):
                 run = begin_task_run(
                     workspace=workspace,
                     source_record=source_record,
@@ -373,9 +421,28 @@ class TaskWorkspaceTests(unittest.TestCase):
                 process = run.root / "process"
                 process.mkdir()
                 (process / "temporary.fit").write_bytes(b"temporary")
+                plan = task_plan.build_processing_plan(
+                    run_id=run.run_id,
+                    generated_at="2026-08-04T01:00:00Z",
+                    input_record={"fingerprint": source_record["fingerprint"]},
+                    input_state="linear",
+                    input_trust="recognized",
+                    metadata={
+                        "config": {
+                            "debug_mode": debug_mode,
+                            "checkpoint_mode": False,
+                        }
+                    },
+                )
+                run_manifest.atomic_write_json(
+                    run.root / "processing-plan.json",
+                    plan,
+                )
                 result = {
-                    "schema": "seestar.pipeline-result.v1",
+                    "schema": "starun.pipeline-result.v1",
+                    "run_id": run.run_id,
                     "status": "success",
+                    "plan_hash": plan["plan_hash"],
                     "outputs": {
                         output.name: run_manifest.file_record(
                             output,
@@ -397,25 +464,44 @@ class TaskWorkspaceTests(unittest.TestCase):
             )
             unrelated = old_run.root / "user-note.txt"
             unrelated.write_text("keep", encoding="utf-8")
+            debug_run, debug_output, debug_process = completed_run(
+                "debug-run",
+                "debug_processed.fit",
+                b"debug-delivery",
+                debug_mode=True,
+            )
             latest_run, latest_output, latest_process = completed_run(
                 "latest-run",
                 "latest_processed.fit",
                 b"latest-delivery",
+                debug_mode=True,
             )
             publish_latest_result_index(
                 run_manifest_path=latest_run.manifest_path
             )
 
-            report = apply_task_retention(workspace.root)
+            report = apply_task_retention(
+                workspace.root,
+            )
 
             self.assertFalse(old_output.exists())
+            self.assertFalse(debug_output.exists())
             self.assertTrue(latest_output.is_file())
             self.assertTrue(unrelated.is_file())
             self.assertFalse(old_process.exists())
+            self.assertTrue(debug_process.is_dir())
             self.assertTrue(latest_process.is_dir())
             self.assertIn(
                 old_output.relative_to(workspace.root).as_posix(),
                 report["deleted_files"],
+            )
+            self.assertIn(
+                debug_process.relative_to(workspace.root).as_posix(),
+                report["preserved_debug_process_directories"],
+            )
+            self.assertEqual(
+                report["retention_scope"],
+                "per_run_frozen_debug_and_checkpoint_settings",
             )
 
     def test_latest_verified_compatible_checkpoint_selects_stage5(self) -> None:

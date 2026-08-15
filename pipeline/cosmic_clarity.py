@@ -9,9 +9,9 @@ from typing import List, Optional, Tuple
 
 ENV_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 ENV_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
-ENV_COSMIC_NATIVE_GPU_KEY = "SEESTAR_COSMIC_NATIVE_GPU"
-ENV_COSMIC_CLASSIC_GPU_KEY = "SEESTAR_COSMIC_CLASSIC_GPU"
-ENV_COSMIC_CLASSIC_ENABLE_KEY = "SEESTAR_COSMIC_CLASSIC_ENABLE"
+ENV_COSMIC_NATIVE_GPU_KEY = "STARUN_COSMIC_NATIVE_GPU"
+ENV_COSMIC_CLASSIC_GPU_KEY = "STARUN_COSMIC_CLASSIC_GPU"
+ENV_COSMIC_CLASSIC_ENABLE_KEY = "STARUN_COSMIC_CLASSIC_ENABLE"
 
 
 def classic_cosmic_clarity_args(
@@ -30,7 +30,7 @@ def classic_cosmic_clarity_args(
         )
         return None
 
-    env_path = os.getenv("SEESTAR_COSMIC_CLARITY_EXECUTABLE", "").strip()
+    env_path = os.getenv("STARUN_COSMIC_CLARITY_EXECUTABLE", "").strip()
     candidates: List[Path] = []
     if env_path:
         candidates.append(Path(env_path).expanduser())
@@ -91,7 +91,7 @@ def classic_cosmic_clarity_candidate_error(pipeline, candidate: Path) -> Optiona
         return f"cannot read wrapper: {e}"
     if '"exec" "${SIRIL_PYTHON_CLI:-python3}" "$0" "$@"' in header:
         return "legacy wrapper does not guard boolean SIRIL_PYTHON_CLI"
-    if "SEESTAR_SIRIL_PYTHON_CLI" not in header:
+    if "STARUN_SIRIL_PYTHON_CLI" not in header:
         return "wrapper missing stable python env fallback"
     return None
 
@@ -204,11 +204,11 @@ def run_cosmic_clarity_native_sharpen_fallback(pipeline, step_key: str) -> Optio
 
 
 def final_denoise_cli_timeout_sec(pipeline) -> int:
-    raw_timeout = str(os.getenv("SEESTAR_SIRILPY_TIMEOUT_SEC", "120")).strip()
+    raw_timeout = str(os.getenv("STARUN_SIRILPY_TIMEOUT_SEC", "300")).strip()
     try:
         sirilpy_timeout = int(float(raw_timeout))
     except (TypeError, ValueError):
-        sirilpy_timeout = 120
+        sirilpy_timeout = 300
     return max(60, min(300, sirilpy_timeout + 60))
 
 
@@ -236,8 +236,8 @@ def cosmic_clarity_native_denoise_cli_options(pipeline) -> Tuple[Tuple[str, ...]
         )
         mode = "luminance"
     strength = str(
-        getattr(pipeline, "_cosmic_clarity_native_denoise_strength_override", "0.5")
-        or "0.5"
+        getattr(pipeline, "_cosmic_clarity_native_denoise_strength_override", "0.28")
+        or "0.28"
     )
 
     args: List[str] = [

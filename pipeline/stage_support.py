@@ -1,4 +1,4 @@
-"""Service mixins for SeestarPostProcessor."""
+"""Service mixins for StarunPostProcessor."""
 from __future__ import annotations
 
 import copy
@@ -17,7 +17,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-import ai_advisory
 import cosmic_clarity
 import plugin_runner
 import review_bundle
@@ -38,8 +37,8 @@ from image_metrics import (
     measure_quality_metrics,
     measure_stage3_signal_preservation,
 )
-from models import ImageFeatures, QualityMetrics, Stage6StretchStrategy, StageResult, TargetType
-from save_utils import save_stage_output, write_ai_raw_response, write_stage_json
+from models import ImageFeatures, QualityMetrics, Stage7StretchStrategy, StageResult, TargetType
+from save_utils import save_stage_output, write_stage_json
 
 try:
     from sirilpy.exceptions import CommandError, DataError, SirilError
@@ -51,32 +50,22 @@ except ImportError:
 try:
     from image_feature_analyzer import analyze_image as analyze_adaptive_image
     from policy_selector import DEFAULT_POLICY, policy_for_profile
-    from stretch_candidate_evaluator import (
-        build_candidate_spec,
-        candidate_modes,
-        choose_best as choose_best_stretch_candidate,
-        score_candidate as score_stretch_candidate,
-    )
     from target_profiler import build_target_profile
 except (ImportError, RuntimeError):
     analyze_adaptive_image = None
     DEFAULT_POLICY = {
         "policy_name": "generic_low_snr_safe",
-        "stage6_stretch": {"fallback_candidate": "asinh_core_protect"},
+        "stage7_stretch": {"fallback_candidate": "asinh_core_protect"},
     }
     policy_for_profile = None
-    build_candidate_spec = None
-    candidate_modes = None
-    choose_best_stretch_candidate = None
-    score_stretch_candidate = None
     build_target_profile = None
 
 ENV_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 ENV_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
-ENV_DEBUG_MODE_KEY = "SEESTAR_DEBUG_MODE"
-ENV_INPUT_MODE_KEY = "SEESTAR_INPUT_MODE"
+ENV_DEBUG_MODE_KEY = "STARUN_DEBUG_MODE"
+ENV_INPUT_MODE_KEY = "STARUN_INPUT_MODE"
 INPUT_MODE_AUTO = "auto"
-INPUT_MODE_LINEAR_RESUME = "result_linear_resume"
+INPUT_MODE_LINEAR_RESUME = "stage5_linear_resume"
 RESULT_BASENAME_TEMPLATE = (
     "$OBJECT:%s$_$STACKCNT:%d$x$EXPTIME:%d$sec"
     "_$DATE-OBS:dm12$_processed"
@@ -198,6 +187,7 @@ class PluginServiceMixin:
         args: Tuple[str, ...] = (),
         timeout_sec: int = 1800,
         verify_image_change: bool = True,
+        uses_siril_connection: bool = True,
     ) -> Optional[str]:
         return plugin_runner.run_plugin_script_cli_subprocess(
             self,
@@ -207,6 +197,7 @@ class PluginServiceMixin:
             args=args,
             timeout_sec=timeout_sec,
             verify_image_change=verify_image_change,
+            uses_siril_connection=uses_siril_connection,
         )
 
 
@@ -280,12 +271,13 @@ class PluginServiceMixin:
     def _syqon_starless_cli_options(
         self,
         *,
-        tile_size: int = 512,
-        overlap: int = 64,
-        axiom: bool = False,
+        profile: syqon_starless.SyQonAttemptProfile = (
+            syqon_starless.SYQON_BASELINE_PROFILE
+        ),
     ) -> Tuple[Tuple[str, ...], int, str]:
         return syqon_starless.syqon_starless_cli_options(
-            self, tile_size=tile_size, overlap=overlap, axiom=axiom
+            self,
+            profile=profile,
         )
 
 
@@ -300,16 +292,8 @@ class PluginServiceMixin:
         return len(seen)
 
 
-    def _collect_star_separation_outputs(self) -> Tuple[Optional[Path], Optional[Path]]:
-        return syqon_starless.collect_star_separation_outputs(self)
-
-
     def _clear_star_separation_outputs(self) -> None:
         syqon_starless.clear_star_separation_outputs(self)
-
-
-    def _syqon_axiom_model_available(self) -> bool:
-        return syqon_starless.syqon_axiom_model_available(self)
 
 
     def _fallback_summary(
@@ -339,25 +323,6 @@ class PluginServiceMixin:
 
 
 class Stage7ServiceMixin:
-    def _normalize_stage7_starless_plan(
-        self,
-        obj: Dict[str, Any],
-    ) -> Optional[Dict[str, Any]]:
-        return ai_advisory.normalize_stage7_starless_plan(self, obj)
-
-
-    def _request_stage7_starless_plan(self) -> Optional[Dict[str, Any]]:
-        return ai_advisory.request_stage7_starless_plan(self)
-
-
-    def _normalize_stage7_ai_quality(self, obj: Dict[str, Any]) -> Dict[str, Any]:
-        return ai_advisory.normalize_stage7_ai_quality(self, obj)
-
-
-    def _request_stage7_quality_ai(self, observations: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        return ai_advisory.request_stage7_quality_ai(self, observations)
-
-
     def _stage7_preflight_summary(self, preflight: Dict[str, Any]) -> str:
         metrics = preflight.get("metrics") if isinstance(preflight, dict) else None
         if not isinstance(metrics, dict):
@@ -488,7 +453,7 @@ class Stage7ServiceMixin:
                 )
 
             if star_growth_ratio is not None:
-                growth_limit = float(self.cfg.stage6_star_growth_ratio_max)
+                growth_limit = float(self.cfg.stage7_star_growth_ratio_max)
                 if star_growth_ratio > growth_limit:
                     level = "high" if star_growth_ratio > growth_limit * 1.20 else "warn"
                     add_issue(
@@ -554,40 +519,19 @@ class Stage7ServiceMixin:
         attempt_name: str,
         *,
         tool_label: str,
-        use_ai: bool = True,
         source_stem: Optional[str] = None,
     ) -> Dict[str, Any]:
         return stage7_quality.stage7_quality_assessment(
             self,
             attempt_name,
             tool_label=tool_label,
-            use_ai=use_ai,
             source_stem=source_stem,
         )
 
 
     def _stage7_prepare_starmask(self) -> None:
         if not self.starmask_file and not self._build_manual_starmask():
-            self.log.warn("手动星点层失败，尝试自动 starmask 回退...")
-            candidates = [
-                self.process_dir / "starmask_clean.fit",
-                self.process_dir / "starmask_raw.fit",
-                self.process_dir / f"{self.stretched_name}_starmask.fit",
-                self.process_dir / f"{self.stretched_name}_starmask.fits",
-                self.process_dir / "starmask.fit",
-                self.process_dir / "starmask.fits",
-                self.process_dir / f"{self.stretched_name}_stars.fit",
-            ]
-            for candidate in candidates:
-                if candidate.exists():
-                    self.starmask_file = candidate
-                    self.log.info(f"星点蒙版: {candidate.name}")
-                    break
-            if not self.starmask_file:
-                fallback_mask = self._find_latest_starmask()
-                if fallback_mask:
-                    self.starmask_file = fallback_mask
-                    self.log.info(f"兜底找到星点蒙版: {fallback_mask.name}")
+            self.log.warn("手动星点层失败，未生成规范 starmask_raw.fit")
 
 
     def _stage7_try_syqon_variant(
@@ -595,12 +539,15 @@ class Stage7ServiceMixin:
         syqon_script: Path,
         *,
         attempt_name: str,
-        tile_size: int,
-        overlap: int,
-        axiom: bool,
+        profile: syqon_starless.SyQonAttemptProfile = (
+            syqon_starless.SYQON_BASELINE_PROFILE
+        ),
     ) -> Optional[str]:
         return syqon_starless.stage7_try_syqon_variant(
-            self, syqon_script, attempt_name=attempt_name, tile_size=tile_size, overlap=overlap, axiom=axiom
+            self,
+            syqon_script,
+            attempt_name=attempt_name,
+            profile=profile,
         )
 
 
@@ -614,16 +561,18 @@ class Stage7ServiceMixin:
             "starmask": None,
             "starmask_raw": None,
             "starmask_kind": None,
+            "pair_id": getattr(self, "_selected_syqon_pair_id", None),
+            "attempt_id": getattr(self, "_selected_syqon_attempt_id", None),
         }
         if not self.process_dir:
             return snapshot
         if self.starless_file and self.starless_file.exists():
             target = self.process_dir / f"starless_{suffix}.fit"
-            shutil.copy2(self.starless_file, target)
+            syqon_starless._atomic_copy(self.starless_file, target)
             snapshot["starless"] = target.stem
         if self.starmask_file and self.starmask_file.exists():
             target = self.process_dir / f"starmask_{suffix}.fit"
-            shutil.copy2(self.starmask_file, target)
+            syqon_starless._atomic_copy(self.starmask_file, target)
             snapshot["starmask"] = target.stem
             snapshot["starmask_kind"] = (
                 "clean" if self.starmask_file.stem == "starmask_clean" else "raw"
@@ -631,7 +580,7 @@ class Stage7ServiceMixin:
         raw_starmask = self.process_dir / "starmask_raw.fit"
         if raw_starmask.exists():
             target_raw = self.process_dir / f"starmask_raw_{suffix}.fit"
-            shutil.copy2(raw_starmask, target_raw)
+            syqon_starless._atomic_copy(raw_starmask, target_raw)
             snapshot["starmask_raw"] = target_raw.stem
         return snapshot
 
@@ -650,14 +599,12 @@ class Stage7ServiceMixin:
         restored_starmask: Optional[Path] = None
         if starmask_stem:
             starmask_src = self.process_dir / f"{starmask_stem}.fit"
-            compatibility_starmask = self.process_dir / "starmask.fit"
-            restore_plan.append((starmask_src, compatibility_starmask))
             if snapshot.get("starmask_kind") == "clean":
                 target_starmask = self.process_dir / "starmask_clean.fit"
-                restore_plan.append((starmask_src, target_starmask))
-                restored_starmask = target_starmask
             else:
-                restored_starmask = compatibility_starmask
+                target_starmask = self.process_dir / "starmask_raw.fit"
+            restore_plan.append((starmask_src, target_starmask))
+            restored_starmask = target_starmask
 
         missing_sources = [source for source, _target in restore_plan if not source.is_file()]
         if missing_sources:
@@ -667,9 +614,11 @@ class Stage7ServiceMixin:
         # Validate every source before replacing any live output.  A corrupt
         # snapshot must not leave starless and starmask from different retries.
         for source, target in restore_plan:
-            shutil.copy2(source, target)
+            syqon_starless._atomic_copy(source, target)
         self.starless_file = target_starless
         self.starmask_file = restored_starmask
+        self._selected_syqon_pair_id = snapshot.get("pair_id")
+        self._selected_syqon_attempt_id = snapshot.get("attempt_id")
 
 
     def _stage7_repair_triggers(self, quality: Optional[Dict[str, Any]]) -> List[str]:
@@ -682,18 +631,16 @@ class Stage7ServiceMixin:
         *,
         source_stem: str,
         attempt_name: str,
-        tile_size: int,
-        overlap: int,
-        axiom: bool,
+        profile: syqon_starless.SyQonAttemptProfile = (
+            syqon_starless.SYQON_BASELINE_PROFILE
+        ),
     ) -> Optional[str]:
         return syqon_starless.stage7_try_syqon_with_source(
             self,
             syqon_script,
             source_stem=source_stem,
             attempt_name=attempt_name,
-            tile_size=tile_size,
-            overlap=overlap,
-            axiom=axiom,
+            profile=profile,
         )
 
 
@@ -796,6 +743,18 @@ class SaspServiceMixin:
         return sasp_runner.run_sasp_stage8_api(self, plan)
 
 
+    def _load_sasp_star_stretch_module(self):
+        return sasp_runner.load_sasp_star_stretch_module(self)
+
+
+    def _run_sasp_star_stretch_api(self):
+        return sasp_runner.run_sasp_star_stretch_api(self)
+
+
+    def _run_nb_to_rgb_stars_api(self):
+        return sasp_runner.run_nb_to_rgb_stars_api(self)
+
+
 class Stage8ServiceMixin:
     def _apply_starless_blue_guard(self, feat: ImageFeatures) -> Optional[str]:
         blue_excess = feat.blue_dominance - max(1.08, feat.red_dominance + 0.12)
@@ -821,17 +780,6 @@ class Stage8ServiceMixin:
         )
 
 
-    def _normalize_stage8_processing_plan(
-        self,
-        obj: Dict[str, Any],
-    ) -> Optional[Dict[str, Any]]:
-        return ai_advisory.normalize_stage8_processing_plan(self, obj)
-
-
-    def _request_stage8_processing_plan(self) -> Optional[Dict[str, Any]]:
-        return ai_advisory.request_stage8_processing_plan(self)
-
-
     def _stage8_restore_rgb_like(self, source_data: np.ndarray, rgb: np.ndarray) -> np.ndarray:
         return stage8_pixels.stage8_restore_rgb_like(self, source_data, rgb)
 
@@ -842,6 +790,18 @@ class Stage8ServiceMixin:
 
     def _stage8_generate_starless_masks(self, image_data: np.ndarray) -> Dict[str, Any]:
         return stage8_pixels.stage8_generate_starless_masks(self, image_data)
+
+
+    def _stage8_starless_readiness_report(
+        self,
+        image_data: np.ndarray,
+        masks: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return stage8_pixels.stage8_starless_readiness_report(
+            self,
+            image_data,
+            masks,
+        )
 
 
     def _stage8_masked_metrics(
@@ -856,7 +816,7 @@ class Stage8ServiceMixin:
         self,
         image_data: Optional[np.ndarray],
         masks: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, float]:
+    ) -> Dict[str, Any]:
         return stage8_pixels.background_quality_metrics(self, image_data, masks)
 
 
@@ -886,9 +846,19 @@ class Stage8ServiceMixin:
     def _stage7_effective_halo_threshold(self) -> float:
         base = float(self.cfg.stage7_halo_residue_score_max)
         target_type = self._active_target_type() if hasattr(self, "_active_target_type") else ""
+        if target_type == "large_galaxy":
+            return max(
+                base,
+                float(self.cfg.stage7_large_galaxy_halo_residue_score_max),
+            )
         if target_type == "bright_emission_reflection_nebula":
             return max(base, float(self.cfg.stage7_bright_nebula_halo_residue_score_max))
         if target_type in stage7_quality.DIFFUSE_EMISSION_NEBULA_TARGET_TYPES:
+            return max(
+                base,
+                stage7_quality.DIFFUSE_EMISSION_HALO_RESIDUE_SCORE_MAX,
+            )
+        if stage7_quality.stage7_has_diffuse_nebula_context(self):
             return max(
                 base,
                 stage7_quality.DIFFUSE_EMISSION_HALO_RESIDUE_SCORE_MAX,
@@ -898,6 +868,23 @@ class Stage8ServiceMixin:
 
     def _stage8_input_enhancement_guard(self) -> Dict[str, Any]:
         return stage8_pixels.stage8_input_enhancement_guard(self)
+
+    def _box_blur_rgb(self, rgb: np.ndarray) -> np.ndarray:
+        """Return a deterministic 3x3 RGB blur used by local repair paths."""
+        arr = np.asarray(rgb, dtype=np.float32)
+        if arr.ndim != 3 or arr.shape[0] != 3:
+            raise ValueError(f"expected RGB CHW array, got shape={arr.shape}")
+        height, width = arr.shape[1], arr.shape[2]
+        padded = np.pad(arr, ((0, 0), (1, 1), (1, 1)), mode="reflect")
+        accumulated = np.zeros_like(arr, dtype=np.float32)
+        for y_offset in range(3):
+            for x_offset in range(3):
+                accumulated += padded[
+                    :,
+                    y_offset:y_offset + height,
+                    x_offset:x_offset + width,
+                ]
+        return accumulated / 9.0
 
 
     def _apply_stage8_masked_pixel_enhancement(
@@ -937,14 +924,6 @@ class Stage8ServiceMixin:
         return stage8_pixels.stage8_target_blue_excess(self, quality_record)
 
 
-    def _normalize_stage8_ai_quality(self, obj: Dict[str, Any]) -> Dict[str, Any]:
-        return ai_advisory.normalize_stage8_ai_quality(self, obj)
-
-
-    def _request_stage8_quality_ai(self, observations: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        return ai_advisory.request_stage8_quality_ai(self, observations)
-
-
     def _stage8_quality_assessment(
         self,
         *,
@@ -964,187 +943,6 @@ class Stage8ServiceMixin:
 
     def _stage8_needs_conservative_rerun(self, quality_record: Dict[str, Any]) -> bool:
         return stage8_pixels.stage8_needs_conservative_rerun(self, quality_record)
-
-
-class AiPostServiceMixin:
-    def _post_json_with_auth(
-        self,
-        endpoint: str,
-        payload: Dict[str, Any],
-        api_key: str,
-        timeout_sec: int,
-    ) -> Dict[str, Any]:
-        if not ai_advisory.network_mode_enabled():
-            raise RuntimeError(
-                "outbound AI request blocked: SEESTAR_NETWORK_MODE is disabled"
-            )
-        return ai_advisory.post_json_with_auth(endpoint, payload, api_key, timeout_sec)
-
-
-    def _build_ai_chat_endpoint_candidates(self, endpoint: str) -> List[str]:
-        return ai_advisory.build_ai_chat_endpoint_candidates(endpoint)
-
-
-    def _extract_chat_content(self, response_obj: Dict[str, Any]) -> str:
-        return ai_advisory.extract_chat_content(self, response_obj)
-
-
-    def _extract_first_json_object(self, text: str) -> Dict[str, Any]:
-        return ai_advisory.extract_first_json_object(self, text)
-
-
-    def _normalize_ai_adjustments(self, obj: Dict[str, Any]) -> Dict[str, float]:
-        return ai_advisory.normalize_ai_adjustments(self, obj)
-
-
-    def _stage11_feature_based_fallback_adjustments(
-        self,
-        source_features: ImageFeatures,
-    ) -> Tuple[Dict[str, float], str]:
-        return ai_advisory.stage11_feature_based_fallback_adjustments(
-            self,
-            source_features,
-        )
-
-
-    def _request_ai_adjustments(self, source_features: ImageFeatures) -> Tuple[Dict[str, float], str]:
-        return ai_advisory.request_ai_adjustments(self, source_features)
-
-
-    def _request_visual_acceptance(
-        self,
-        stage_key: str,
-        review_payload: Dict[str, Any],
-    ) -> Optional[Dict[str, Any]]:
-        return ai_advisory.request_visual_acceptance(self, stage_key, review_payload)
-
-
-    def _box_blur_rgb(self, rgb: np.ndarray) -> np.ndarray:
-        arr = np.asarray(rgb, dtype=np.float32)
-        if arr.ndim != 3 or arr.shape[0] != 3:
-            raise ValueError(f"expected RGB CHW array, got shape={arr.shape}")
-        h, w = arr.shape[1], arr.shape[2]
-        padded = np.pad(arr, ((0, 0), (1, 1), (1, 1)), mode="reflect")
-        acc = np.zeros_like(arr, dtype=np.float32)
-        for y in range(3):
-            for x in range(3):
-                acc += padded[:, y:y + h, x:x + w]
-        return acc / 9.0
-
-
-    def _apply_local_ai_adjustments(
-        self,
-        image_data: np.ndarray,
-        adjustments: Dict[str, float],
-    ) -> np.ndarray:
-        rgb = _to_rgb_float_fullres(image_data)
-        r, g, b = rgb[0], rgb[1], rgb[2]
-        gray = (0.2126 * r + 0.7152 * g + 0.0722 * b).astype(np.float32)
-        bg_threshold = float(np.quantile(gray, 0.30))
-        bg_mask = (gray <= bg_threshold).astype(np.float32)
-        signal_mask = 1.0 - bg_mask
-
-        background_protection = _clamp_float(adjustments.get("background_protection", 0.85), 0.60, 0.98)
-        contrast_delta = _clamp_float(adjustments.get("global_contrast_delta", 0.04), -0.10, 0.12)
-        saturation_delta = _clamp_float(adjustments.get("global_saturation_delta", 0.03), -0.10, 0.12)
-        red_balance_delta = _clamp_float(adjustments.get("red_balance_delta", 0.0), -0.08, 0.08)
-        blue_balance_delta = _clamp_float(adjustments.get("blue_balance_delta", 0.0), -0.08, 0.08)
-        denoise_strength = _clamp_float(adjustments.get("denoise_strength", 0.06), 0.0, 0.20)
-        detail_boost = _clamp_float(adjustments.get("detail_boost", 0.03), 0.0, 0.12)
-
-        rgb = rgb.copy()
-        rgb[0] = np.clip(rgb[0] * (1.0 + red_balance_delta), 0.0, 1.0)
-        rgb[2] = np.clip(rgb[2] * (1.0 + blue_balance_delta), 0.0, 1.0)
-
-        gray = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]).astype(np.float32)
-        sat_gain = (
-            1.0
-            + saturation_delta * (0.25 + 0.75 * signal_mask)
-            * (1.0 - 0.80 * background_protection * bg_mask)
-        )
-        for idx in range(3):
-            rgb[idx] = gray + (rgb[idx] - gray) * sat_gain
-
-        center = float(np.median(gray))
-        contrast_gain = (
-            1.0
-            + contrast_delta * (0.35 + 0.65 * signal_mask)
-            * (1.0 - 0.75 * background_protection * bg_mask)
-        )
-        for idx in range(3):
-            rgb[idx] = center + (rgb[idx] - center) * contrast_gain
-
-        if denoise_strength > 1e-6:
-            blurred = self._box_blur_rgb(rgb)
-            denoise_weight = denoise_strength * (
-                0.20 + 0.80 * (bg_mask * background_protection + 0.15)
-            )
-            denoise_weight = np.clip(denoise_weight, 0.0, 0.35)
-            rgb = rgb * (1.0 - denoise_weight[None, :, :]) + blurred * denoise_weight[None, :, :]
-
-        if detail_boost > 1e-6:
-            blurred = self._box_blur_rgb(rgb)
-            high_pass = rgb - blurred
-            detail_weight = detail_boost * (
-                0.20 + 0.80 * signal_mask
-            ) * (1.0 - 0.75 * background_protection * bg_mask)
-            detail_weight = np.clip(detail_weight, 0.0, 0.20)
-            rgb = rgb + high_pass * detail_weight[None, :, :]
-
-        return np.clip(rgb, 0.0, 1.0)
-
-
-    def _blend_ai_images(self, source_name: str, ai_name: str, output_name: str, strength: float):
-        mixed_strength = _clamp_float(strength, 0.0, 1.0)
-        source_weight = 1.0 - mixed_strength
-        self.cmd_with_check("load", source_name)
-        self.cmd_with_check(
-            "pm",
-            f"${source_name}$ * {source_weight:.6f} + ${ai_name}$ * {mixed_strength:.6f}",
-        )
-        self.cmd_with_check("save", output_name)
-
-
-    def _validate_ai_quality(
-        self,
-        baseline: ImageFeatures,
-        candidate: ImageFeatures,
-    ) -> Tuple[bool, List[str]]:
-        issues: List[str] = []
-
-        bg_delta = abs(candidate.bg_median - baseline.bg_median)
-        if bg_delta > self.cfg.ai_bg_median_delta_max:
-            issues.append(
-                f"background median drift {bg_delta:.4f}>{self.cfg.ai_bg_median_delta_max:.4f}"
-            )
-
-        red_delta = abs(candidate.red_dominance - baseline.red_dominance)
-        if red_delta > self.cfg.ai_color_ratio_delta_max:
-            issues.append(
-                f"red ratio drift {red_delta:.4f}>{self.cfg.ai_color_ratio_delta_max:.4f}"
-            )
-
-        blue_delta = abs(candidate.blue_dominance - baseline.blue_dominance)
-        if blue_delta > self.cfg.ai_color_ratio_delta_max:
-            issues.append(
-                f"blue ratio drift {blue_delta:.4f}>{self.cfg.ai_color_ratio_delta_max:.4f}"
-            )
-
-        baseline_core = max(baseline.core_brightness_ratio, 1e-4)
-        core_growth = candidate.core_brightness_ratio / baseline_core
-        if core_growth > self.cfg.ai_core_growth_ratio_max:
-            issues.append(
-                f"core growth ratio {core_growth:.3f}>{self.cfg.ai_core_growth_ratio_max:.3f}"
-            )
-
-        baseline_star = max(baseline.median_star_size, 1e-4)
-        star_growth = candidate.median_star_size / baseline_star
-        if star_growth > self.cfg.ai_star_growth_ratio_max:
-            issues.append(
-                f"star size growth ratio {star_growth:.3f}>{self.cfg.ai_star_growth_ratio_max:.3f}"
-            )
-
-        return len(issues) == 0, issues
 
 
 class StageSupportMixin:
@@ -1182,32 +980,6 @@ class StageSupportMixin:
                 selected_candidate=selected_candidate,
             )
             if payload.get("status") == "ready":
-                advisor_mode = ai_advisory.advisor_mode(self)
-                if (
-                    bool(getattr(self.cfg, "ai_post_enabled", False))
-                    and stage_key in ai_advisory.VISUAL_ACCEPTANCE_STAGE_KEYS
-                ):
-                    try:
-                        verdict = ai_advisory.request_visual_acceptance(
-                            self,
-                            stage_key,
-                            payload,
-                        )
-                        payload = review_bundle.apply_visual_acceptance(
-                            payload,
-                            verdict,
-                            advisor_mode=advisor_mode,
-                        )
-                    except (OSError, RuntimeError, TypeError, ValueError) as error:
-                        self.log.warn(
-                            f"[{stage_key}] multimodal visual acceptance unavailable: {error}"
-                        )
-                        payload = review_bundle.apply_visual_acceptance(
-                            payload,
-                            None,
-                            advisor_mode=advisor_mode,
-                            error=self._short_text(error, 180),
-                        )
                 self.log.info(
                     f"[{stage_key}] review bundle ready: {payload.get('report_path')}"
                 )
@@ -1246,19 +1018,6 @@ class StageSupportMixin:
         ]
 
 
-    def _find_latest_starmask(self):
-        """兜底扫描 process 目录，返回最新的星点蒙版文件"""
-        mask_files = []
-        for pattern in ('*.fit', '*.fits'):
-            for f in self.process_dir.glob(pattern):
-                stem = f.stem.lower()
-                if 'starmask' in stem or stem.endswith('_stars'):
-                    mask_files.append(f)
-        if not mask_files:
-            return None
-        return max(mask_files, key=lambda p: p.stat().st_mtime)
-
-
     def _build_manual_starmask(self):
         """
         从原拉伸图与去星图构建星点层:
@@ -1270,10 +1029,10 @@ class StageSupportMixin:
             self.log.info("构建手动星点层: stretched - starless")
             self.cmd_with_check("load", self.stretched_name)
             self.cmd_with_check("pm", f"${self.stretched_name}$ - $starless$")
-            self.cmd_with_check("save", "starmask")
-            self.log.info("已生成手动星点层: starmask.fit")
+            self.cmd_with_check("save", "starmask_raw")
+            self.log.info("已生成手动星点层: starmask_raw.fit")
 
-            self.starmask_file = self.process_dir / "starmask.fit"
+            self.starmask_file = self.process_dir / "starmask_raw.fit"
             return True
         except (CommandError, SirilError) as e:
             self.log.warn(f"手动构建星点层失败: {e}")
@@ -1298,15 +1057,81 @@ class StageSupportMixin:
         )
 
 
+    def _stage9_capture_remix_base_identity(self, source_stem: str) -> Dict[str, Any]:
+        """Hash the immutable Stage 9 base used by every remix candidate."""
+        process_dir = getattr(self, "process_dir", None)
+        if not process_dir:
+            return {
+                "status": "unavailable",
+                "source_stem": source_stem,
+                "reason": "process directory unavailable",
+            }
+        source_path = next(
+            (
+                Path(process_dir) / f"{source_stem}{suffix}"
+                for suffix in (".fit", ".fits", ".fts")
+                if (Path(process_dir) / f"{source_stem}{suffix}").is_file()
+            ),
+            None,
+        )
+        if source_path is None:
+            return {
+                "status": "unavailable",
+                "source_stem": source_stem,
+                "reason": "remix base FITS unavailable",
+            }
+        digest = hashlib.sha256()
+        with source_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return {
+            "status": "locked",
+            "source_stem": source_stem,
+            "path": str(source_path),
+            "bytes": int(source_path.stat().st_size),
+            "sha256": digest.hexdigest(),
+        }
+
+
+    def _stage9_verify_remix_base_identity(self, source_stem: str) -> Dict[str, Any]:
+        expected = getattr(self, "_stage9_remix_base_identity", None)
+        if not isinstance(expected, dict) or expected.get("source_stem") != source_stem:
+            expected = self._stage9_capture_remix_base_identity(source_stem)
+            self._stage9_remix_base_identity = expected
+        if expected.get("status") != "locked":
+            return dict(expected)
+        current = self._stage9_capture_remix_base_identity(source_stem)
+        if current.get("status") != "locked":
+            return current
+        if (
+            current.get("sha256") != expected.get("sha256")
+            or current.get("bytes") != expected.get("bytes")
+        ):
+            return {
+                "status": "rejected",
+                "source_stem": source_stem,
+                "reason": "immutable Stage9 remix base changed between candidates",
+                "expected": expected,
+                "actual": current,
+            }
+        return {**expected, "status": "verified"}
+
+
     def _apply_previous_stage_star_remix(self, source_stem: str, starmask_name: str, intensity: float) -> bool:
         """
-        Compose stars onto the previous stage image in pixel space.
+        Compose stars onto the immutable Stage 9 remix base in pixel space.
 
         Siril's `pm $stage6$ ... $starless$ ...` expression can report success while
         leaving the currently loaded stage6 image unchanged. Reading both buffers and
         writing the composed image avoids silently saving stage6 as stage9.
         """
         try:
+            base_identity = self._stage9_verify_remix_base_identity(source_stem)
+            if base_identity.get("status") != "verified":
+                raise RuntimeError(
+                    "Stage9 immutable remix base contract failed: "
+                    f"{base_identity.get('reason', base_identity.get('status'))}"
+                )
             self.cmd_with_check("load", source_stem)
             base_data = self.siril.get_image_pixeldata(preview=False)
             if base_data is None:
@@ -1322,8 +1147,19 @@ class StageSupportMixin:
             weak_mask = None
             bright_mask = None
             alpha_mask = None
+            candidate_masks = dict(
+                getattr(self, "_stage9_candidate_overlay_masks", {}) or {}
+            ).get(starmask_name)
+            if isinstance(candidate_masks, dict):
+                weak_mask = candidate_masks.get("weak")
+                bright_mask = candidate_masks.get("bright")
+                alpha_mask = candidate_masks.get("alpha")
             catalog = getattr(self, "_stage9_star_reference_catalog", None)
-            if isinstance(catalog, dict) and catalog.get("status") == "ok":
+            if (
+                alpha_mask is None
+                and isinstance(catalog, dict)
+                and catalog.get("status") == "ok"
+            ):
                 calibration = dict(
                     getattr(self, "_stage9_starmask_calibration", {}) or {}
                 )
@@ -1334,6 +1170,10 @@ class StageSupportMixin:
                     stage9_quality.build_star_overlay_masks(
                         catalog,
                         strict=strict_overlay,
+                        cfg=self.cfg,
+                        extra_pixels=int(
+                            calibration.get("psf_support_retry_pixels", 0) or 0
+                        ),
                     )
                 )
             configured_weak_intensity = max(
@@ -1365,7 +1205,8 @@ class StageSupportMixin:
             self._stage9_last_star_layer = np.array(stars, copy=True)
 
             # After reading starmask, switch the active Siril image back to the
-            # stage-8 base before replacing its pixels with the composed result.
+            # immutable Stage 9 remix base before replacing its pixels with the
+            # composed result.
             self.cmd_with_check("load", source_stem)
             lock_factory = getattr(self.siril, "image_lock", None)
             if callable(lock_factory):
@@ -1383,7 +1224,7 @@ class StageSupportMixin:
             )
             return True
         except (CommandError, SirilError, DataError, RuntimeError, ValueError) as e:
-            self.log.warn(f"上一阶段星点合成失败: {e}")
+            self.log.warn(f"Stage9 remix base 星点合成失败: {e}")
             return False
 
     def _stage9_assess_current_remix(
@@ -1653,12 +1494,9 @@ class StageSupportMixin:
         _ = adaptive
         candidates: List[Tuple[str, Tuple[str, ...], str]] = [
             ("GraXpert", ("gxp",), "graxpert"),
-            ("GraXpert-BGE", ("graxpert",), "graxpert"),
             ("ADBE", ("adbe",), "plugin"),
             ("DBE", ("dbe",), "plugin"),
             ("AutoDBE", ("autodbe",), "plugin"),
-            ("NOX", ("nox",), "plugin"),
-            ("VeraLux NOX", ("veralux_nox",), "plugin"),
         ]
         if before is None:
             return candidates
@@ -1862,6 +1700,11 @@ class StageSupportMixin:
                 for item in (quality.get("issues") or [])
                 if str(item).strip()
             ]
+            advisories.extend(
+                str(item).strip()
+                for item in (quality.get("advisories") or [])
+                if str(item).strip()
+            )
             dynamic_range_only = bool(quality_issues) and all(
                 item.startswith("starless_dynamic_range_collapse")
                 for item in quality_issues
@@ -1880,18 +1723,48 @@ class StageSupportMixin:
                 derived.get("starless_dynamic_range_ratio", 1.0) or 0.0
             )
             peak_signal = float(derived.get("starless_peak_signal", 1.0) or 0.0)
-            if residual > self.cfg.stage7_residual_star_score_max:
+            residual_gate = stage7_quality.stage7_upper_quality_gate(
+                self.cfg,
+                value=residual,
+                accepted_limit=self.cfg.stage7_residual_star_score_max,
+            )
+            if residual_gate["hard_failed"]:
                 reasons.append(
                     f"stage7_residual_star_score {residual:.3f}>{self.cfg.stage7_residual_star_score_max:.3f}"
                 )
+            elif residual_gate["advisory"]:
+                advisories.append(
+                    f"stage7_residual_star_score {residual:.3f}>"
+                    f"{self.cfg.stage7_residual_star_score_max:.3f} advisory"
+                )
             halo_threshold = self._stage7_effective_halo_threshold()
-            if halo > halo_threshold:
+            halo_gate = stage7_quality.stage7_upper_quality_gate(
+                self.cfg,
+                value=halo,
+                accepted_limit=halo_threshold,
+            )
+            if halo_gate["hard_failed"]:
                 reasons.append(
                     f"stage7_halo_residue_score {halo:.3f}>{halo_threshold:.3f}"
                 )
-            if noise_gain > self.cfg.stage7_starless_noise_gain_max:
+            elif halo_gate["advisory"]:
+                advisories.append(
+                    f"stage7_halo_residue_score {halo:.3f}>"
+                    f"{halo_threshold:.3f} advisory"
+                )
+            noise_gate = stage7_quality.stage7_upper_quality_gate(
+                self.cfg,
+                value=noise_gain,
+                accepted_limit=self.cfg.stage7_starless_noise_gain_max,
+            )
+            if noise_gate["hard_failed"]:
                 reasons.append(
                     f"stage7_starless_noise_gain {noise_gain:.3f}>{self.cfg.stage7_starless_noise_gain_max:.3f}"
+                )
+            elif noise_gate["advisory"]:
+                advisories.append(
+                    f"stage7_starless_noise_gain {noise_gain:.3f}>"
+                    f"{self.cfg.stage7_starless_noise_gain_max:.3f} advisory"
                 )
             dynamic_threshold = float(
                 getattr(self.cfg, "stage7_starless_dynamic_range_min_ratio", 0.55)
@@ -1932,6 +1805,7 @@ class StageSupportMixin:
                 "stage7_cand_rescue_3",
                 "stage7_cand_rescue_2",
                 "stage7_cand_rescue_1",
+                "stage7_cand_display90",
                 "stage7_cand_b",
                 "stage7_cand_a",
                 self.stretched_name,

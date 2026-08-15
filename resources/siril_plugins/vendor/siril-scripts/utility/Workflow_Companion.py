@@ -18,6 +18,7 @@ Version history is maintained in the CHANGELOG dict below.
 """
 
 import sirilpy as s
+s.ensure_installed("PyQt6")
 from sirilpy import LogColor
 
 import base64
@@ -45,12 +46,27 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QMimeData, QPoint, QByteArray, QSize, QTimer
 from PyQt6.QtGui import QDrag, QPixmap, QPainter, QIcon, QPolygon, QColor, QTransform, QPen
 
-VERSION = "1.1.1"
+VERSION = "1.1.4"
 
 # Changelog entries shown in the What's New dialog.
 # Each version maps to a list of one-liner strings matching the header comments.
 # Only entries newer than last_seen_version are shown to the user.
 CHANGELOG: dict[str, list[str]] = {
+    "1.1.4": [
+        "Improved path comparison robustness in order to fix an issue on Windows systems where scripts could show as \"not found\"",
+        "Fixed a bug where discarding unsaved changes on close could corrupt the saved paths in a workflow, causing its scripts to show as \"not found\"",
+    ],
+    "1.1.3": [
+        "Fixed a bug where marking a duplicate function as complete incorrectly marked all other instances of that function complete",
+    ],
+    "1.1.2": [
+        "Ensure PyQt6 is installed",
+        "Allow dragging Steps into Groups",
+        "Added individual run buttons to group items, allowing scripts to be run directly without changing the group's selected item",
+        "Fixed a bug where drag/drop of a duplicate item incorrectly moves the original",
+        "Fixed a bug where notes keys and group selection paths in the state file weren't being stored as relative paths",
+	"Fixed a bug where notes weren't properly handled",
+    ],
     "1.1.1": [
         "On Top state is now persistent between sessions",
         "Font size now inherits the OS system font size",
@@ -200,6 +216,35 @@ def path_to_absolute(p: str, scripts_root: str) -> str:
     rel = p.replace("/", os.sep).replace("\\", os.sep)
     return os.path.join(scripts_root, rel)
 
+def canonical(p: str) -> str:
+    """Return a canonical comparison key for a filesystem path.
+
+    Resolves symlinks, junctions and Windows 8.3 short names via realpath, then
+    case-folds with normcase so that two spellings which point at the same file
+    compare equal on case-insensitive / case-preserving filesystems (Windows,
+    macOS).  This is what lets a script still be recognised when a stored path's
+    casing or short-name form differs from what os.scandir reports now.
+
+    Virtual (non-filesystem) paths - step://, function://, group://, system://,
+    groupitem:// - are returned unchanged so they still compare by their literal
+    form.  For groupitem:// the embedded real path is canonicalised at the point
+    of use (see _heal_path / the missing-detection code), not here."""
+    if not p or p.startswith(NON_SCRIPT_PREFIXES):
+        return p
+    try:
+        return os.path.normcase(os.path.realpath(p))
+    except (OSError, ValueError):
+        # realpath can raise on malformed paths on some platforms - fall back to
+        # a best-effort normalisation that still folds case.
+        return os.path.normcase(os.path.normpath(p))
+
+def build_valid_lookup(scripts: "list[tuple[str, str]]") -> dict:
+    """Map canonical(path) -> authoritative scanned path for filesystem scripts.
+
+    The value is the exact spelling os.scandir produced, so callers can heal a
+    mismatched stored path back to the canonical on-disk form."""
+    return {canonical(p): p for _, p in scripts}
+
 def _migrate_function_path(p: str) -> str:
     """Convert legacy function://INT paths to function://NAME format.
     Returns the path unchanged if already name-based or not a function path."""
@@ -237,10 +282,17 @@ def load_state(scripts_dir: str | None = None) -> tuple[list, set, dict | None, 
                         _abs(p) for p in wf.get("selections", [])]
                     workflows[wf_name]["favorites"] = [
                         _abs(p) for p in wf.get("favorites", [])]
+                    workflows[wf_name]["group_selections"] = {
+                        gid: _abs(item)
+                        for gid, item in wf.get("group_selections", {}).items()}
+                    workflows[wf_name]["notes"] = {
+                        _abs(k): v
+                        for k, v in wf.get("notes", {}).items()}
             else:
                 workflows = raw_workflows
             active_workflow  = data.get("active_workflow", "")
-            notes            = data.get("notes", {})
+            raw_notes        = data.get("notes", {})
+            notes            = {_abs(k): v for k, v in raw_notes.items()} if root else raw_notes
             on_top           = data.get("on_top", True)
             return selections, favorites, geometry, workflows, active_workflow, notes, on_top
     except (FileNotFoundError, json.JSONDecodeError):
@@ -283,13 +335,24 @@ def save_state(paths: list, favs: set, geometry: dict | None = None,
                     path_to_relative(p, root) for p in wf.get("selections", [])]
                 save_workflows[wf_name]["favorites"] = [
                     path_to_relative(p, root) for p in wf.get("favorites", [])]
+                save_workflows[wf_name]["group_selections"] = {
+                    gid: path_to_relative(item, root)
+                    for gid, item in wf.get("group_selections", {}).items()}
+                save_workflows[wf_name]["notes"] = {
+                    path_to_relative(k, root): v
+                    for k, v in wf.get("notes", {}).items()}
             existing["workflows"] = save_workflows
         else:
             existing["workflows"] = workflows
     if active_workflow is not None:
         existing["active_workflow"] = active_workflow
     if notes is not None:
-        existing["notes"] = notes
+        if scripts_dir:
+            root = os.path.normpath(scripts_dir)
+            existing["notes"] = {
+                path_to_relative(k, root): v for k, v in notes.items()}
+        else:
+            existing["notes"] = notes
     if last_step_color is not None:
         existing["last_step_color"] = last_step_color
     if on_top is not None:
@@ -468,11 +531,17 @@ def scan_system_scripts(directory: str) -> list[tuple[str, str]]:
         pass
     return scripts
 
-def make_drag(widget: QWidget, source_id: str, path: str) -> QDrag:
-    """Create a QDrag carrying SOURCE|path and a ghost pixmap of the widget."""
+def make_drag(widget: QWidget, source_id: str, path: str,
+              row_index: int | None = None) -> QDrag:
+    """Create a QDrag carrying SOURCE|path[|row_index] and a ghost pixmap of the widget.
+
+    row_index, when provided, is the 0-based index of the dragged widget within
+    the scrollable rows layout.  It allows the drop handler to identify exactly
+    which duplicate instance is being moved without relying on heuristics.
+    """
     drag = QDrag(widget)
     mime = QMimeData()
-    payload = f"{source_id}|{path}"
+    payload = f"{source_id}|{path}" if row_index is None else f"{source_id}|{path}|{row_index}"
     mime.setData(MIME_TYPE, QByteArray(payload.encode()))
     drag.setMimeData(mime)
 
@@ -485,14 +554,24 @@ def make_drag(widget: QWidget, source_id: str, path: str) -> QDrag:
     drag.setPixmap(pixmap)
     return drag
 
-def parse_mime(event) -> tuple[str, str] | None:
-    """Return (source_id, path) from a drop event, or None if invalid."""
+def parse_mime(event) -> tuple[str, str] | tuple[str, str, int] | None:
+    """Return (source_id, path) or (source_id, path, row_index) from a drop event.
+
+    The optional third element is the 0-based layout row index encoded by
+    make_drag when dragging a RightScriptRow.  All existing callers that only
+    unpack two elements continue to work unchanged.  Returns None if invalid.
+    """
     if not event.mimeData().hasFormat(MIME_TYPE):
         return None
     raw = bytes(event.mimeData().data(MIME_TYPE)).decode()
-    parts = raw.split("|", 1)
-    if len(parts) != 2:
+    parts = raw.split("|", 2)
+    if len(parts) < 2:
         return None
+    if len(parts) == 3:
+        try:
+            return parts[0], parts[1], int(parts[2])
+        except ValueError:
+            pass
     return parts[0], parts[1]
 
 _DOCSTRING_CACHE: dict[str, str] = {}
@@ -1172,8 +1251,35 @@ class ScriptsPanel(QWidget):
         parsed = parse_mime(event)
         if not parsed or parsed[0] != SRC_RIGHT:
             return
-        _, path = parsed
-        self.on_remove(path)
+        path = parsed[1]
+        # If the drag payload includes a row_index (encoded by RightScriptRow),
+        # use it to derive which occurrence of this path to remove so that
+        # dragging back a specific duplicate removes the correct instance.
+        if len(parsed) == 3:
+            drag_row_index = parsed[2]
+            # Count how many times path appears in content slots before drag_row_index.
+            # We rely on on_remove accepting an occurrence kwarg as added in _remove_script.
+            # Re-use the same logic as _reorder_main_list: walk the right panel's
+            # _rows_layout to count preceding occurrences.
+            occurrence = 0
+            try:
+                right_panel = self.on_remove.__self__  # WorkflowCompanionWindow instance
+                rows_layout = right_panel._right_panel._rows_layout
+                slot = 0
+                for i in range(rows_layout.count()):
+                    if slot >= drag_row_index:
+                        break
+                    w = rows_layout.itemAt(i).widget() if rows_layout.itemAt(i) else None
+                    if not isinstance(w, (GroupRow, RightScriptRow)):
+                        continue
+                    if isinstance(w, RightScriptRow) and w.path == path:
+                        occurrence += 1
+                    slot += 1
+            except Exception:
+                occurrence = 0
+            self.on_remove(path, occurrence)
+        else:
+            self.on_remove(path)
         event.acceptProposedAction()
 
 class CheckButton(QPushButton):
@@ -1390,7 +1496,6 @@ class NoteButton(QLabel):
         self.setToolTip("Manual step - no script to run")
         self.setCursor(Qt.CursorShape.ArrowCursor)
         font = self.font()
-        font.setPointSize(font.pointSize())  # inherit system point size; scales correctly on HiDPI/Retina
         self.setFont(font)
 
     def set_color(self, color: str):
@@ -1511,13 +1616,21 @@ class RightScriptRow(QFrame):
             QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes and self._on_remove:
-            self._on_remove(self.path)
+            # _row_occurrence is set by SelectedPanel.rebuild() to the 0-based
+            # occurrence index of this row among duplicates of the same path, so
+            # the correct instance is removed rather than always the first one.
+            occurrence = getattr(self, "_row_occurrence", 0)
+            self._on_remove(self.path, occurrence)
 
     def _toggle_completed(self):
         self._completed = not self._completed
         self._apply_completed_style()
         if self._on_completed_toggle:
-            self._on_completed_toggle(self.path, self._completed)
+            # Use _note_key if set so duplicate function:// entries are
+            # disambiguated (e.g. "function://SAVEAS_DIALOG\x002"), matching
+            # the same key used in rebuild() for the completed= lookup.
+            key = getattr(self, "_note_key", self.path)
+            self._on_completed_toggle(key, self._completed)
 
     def _apply_completed_style(self):
         if self._completed:
@@ -1606,15 +1719,26 @@ class RightScriptRow(QFrame):
         # Rename step if name changed
         if _is_step:
             new_name = name_edit.text().strip()
+            effective_path = self.path
+            renamed = False
             if new_name and new_name != self.name and self._on_step_renamed:
-                self._on_step_renamed(self.path, new_name)
-            # Apply color change
+                # Compute what the new path will be (mirrors logic in _on_step_renamed)
+                old_label = self.path[len(STEP_PREFIX):]
+                suffix = ("#" + old_label.rsplit("#", 1)[-1]
+                          if "#" in old_label and len(old_label.rsplit("#", 1)[-1]) == 6
+                          else "")
+                effective_path = f"{STEP_PREFIX}{new_name}{suffix}"
+                renamed = True
             new_color = selected_color[0]
+            # Apply color first (before rename triggers rebuild)
             if new_color != self._step_color:
                 self._step_color = new_color
                 self._run_btn.set_color(new_color)
                 if self._on_color_changed:
-                    self._on_color_changed(self.path, new_color)
+                    self._on_color_changed(effective_path, new_color)
+            # Now trigger rename — its rebuild will pick up the already-written color
+            if renamed:
+                self._on_step_renamed(self.path, new_name)
         self._note = editor.toPlainText().strip()
         self._update_notes_btn()
         if self._on_notes_changed:
@@ -1681,7 +1805,23 @@ class RightScriptRow(QFrame):
             return
         if (event.pos() - self._drag_start).manhattanLength() < QApplication.startDragDistance():
             return
-        drag = make_drag(self, SRC_RIGHT, self.path)
+        # Encode the layout row index so the drop handler can identify exactly
+        # which duplicate instance is being dragged, without relying on heuristics.
+        row_index = None
+        parent = self.parent()
+        if parent is not None:
+            layout = parent.layout()
+            if layout is not None:
+                slot = 0
+                for i in range(layout.count()):
+                    w = layout.itemAt(i).widget() if layout.itemAt(i) else None
+                    if not isinstance(w, (GroupRow, RightScriptRow)):
+                        continue
+                    if w is self:
+                        row_index = slot
+                        break
+                    slot += 1
+        drag = make_drag(self, SRC_RIGHT, self.path, row_index=row_index)
         drag.exec(Qt.DropAction.MoveAction)
 
     def contextMenuEvent(self, event):
@@ -1737,15 +1877,22 @@ class GroupItemRow(QFrame):
                  on_select, on_remove, group_id: str = "",
                  missing: bool = False, note: str = "",
                  on_notes_changed=None, on_group_notes_btn_refresh=None,
+                 on_step_renamed=None, on_color_changed=None,
+                 step_color: str = DEFAULT_STEP_COLOR,
+                 on_run=None,
                  parent=None):
         super().__init__(parent)
         self.item_path = item_path
         self._group_id = group_id
         self._on_select = on_select
         self._on_remove = on_remove
+        self._on_run = on_run
         self._note = note
         self._on_notes_changed = on_notes_changed
         self._on_group_notes_btn_refresh = on_group_notes_btn_refresh
+        self._on_step_renamed = on_step_renamed
+        self._on_color_changed = on_color_changed
+        self._step_color = step_color
         self._drag_start = QPoint()
 
         layout = QHBoxLayout(self)
@@ -1756,13 +1903,36 @@ class GroupItemRow(QFrame):
         handle.setCursor(Qt.CursorShape.OpenHandCursor)
         layout.addWidget(handle)
 
-        self._radio = RadioButton(selected=is_selected)
-        self._radio.setToolTip("Select this item")
-        self._radio.clicked.connect(self._on_radio_clicked)
-        layout.addWidget(self._radio)
+        _is_step = item_path.startswith(STEP_PREFIX)
+
+        # Per-item play button — runs this item directly without changing radio selection.
+        # Steps have no runnable action so the button is omitted entirely.
+        if not _is_step:
+            self._item_play_btn = PlayButton()
+            self._item_play_btn.setCursor(Qt.CursorShape.ArrowCursor)
+            self._item_play_btn.setToolTip(f"Run '{name}' now")
+            self._item_play_btn.clicked.connect(self._run_this_item)
+            layout.addWidget(self._item_play_btn)
+        else:
+            self._item_play_btn = None
+
+        if _is_step:
+            # Steps render as a dot indicator, not a radio button
+            self._radio = None
+            self._dot = NoteButton(self._step_color)
+            layout.addWidget(self._dot)
+        else:
+            self._radio = RadioButton(selected=is_selected)
+            self._radio.setToolTip("Select this item")
+            self._radio.clicked.connect(self._on_radio_clicked)
+            layout.addWidget(self._radio)
 
         lbl = QLabel(name)
+        if _is_step:
+            lbl.setToolTip("Double-click to rename this step")
+            lbl.mouseDoubleClickEvent = lambda e: self._rename_step()
         layout.addWidget(lbl, stretch=1)
+        self._lbl = lbl
 
         self._notes_btn = PencilButton()
         self._notes_btn.clicked.connect(self._open_notes)
@@ -1776,8 +1946,12 @@ class GroupItemRow(QFrame):
         if missing:
             self.setToolTip("Script not installed.")
             self.setCursor(Qt.CursorShape.ForbiddenCursor)
-            self._radio.setEnabled(False)
-            self._radio.setToolTip("Script not installed.")
+            if self._radio:
+                self._radio.setEnabled(False)
+                self._radio.setToolTip("Script not installed.")
+            if self._item_play_btn:
+                self._item_play_btn.setEnabled(False)
+                self._item_play_btn.setToolTip("Script not installed.")
             lbl.setEnabled(False)
             lbl.setStyleSheet("color: #c0392b;")
             handle.setEnabled(False)
@@ -1788,6 +1962,7 @@ class GroupItemRow(QFrame):
 
     def _open_notes(self):
         name = _resolve_path_name(self.item_path)
+        _is_step = self.item_path.startswith(STEP_PREFIX)
         dlg = QDialog(self)
         dlg.setWindowTitle(f"Notes - {name}")
         dlg.setMinimumWidth(400)
@@ -1802,6 +1977,37 @@ class GroupItemRow(QFrame):
         hf.setPointSize(hf.pointSize() + 1)
         header_lbl.setFont(hf)
         layout.addWidget(header_lbl)
+        if _is_step:
+            layout.addWidget(QLabel("Step name:"))
+            name_edit = QLineEdit(name)
+            layout.addWidget(name_edit)
+            color_lbl = QLabel("Dot color:")
+            layout.addWidget(color_lbl)
+            color_row = QHBoxLayout()
+            color_row.setSpacing(4)
+            selected_color = [self._step_color]
+            color_btns = []
+            def _make_color_click(e, btns=color_btns, sel=selected_color):
+                sel[0] = e
+                for b, (em, _, hi) in zip(btns, STEP_COLORS):
+                    if em == e:
+                        b.setStyleSheet(f"QPushButton {{ background-color: {hi}; border: 2px solid #c9d1d9; border-radius: 16px; padding: 0; min-width: 32px; }}")
+                    else:
+                        b.setStyleSheet("QPushButton { border-radius: 16px; padding: 0; min-width: 32px; }")
+            for emoji, cname, highlight in STEP_COLORS:
+                btn = QPushButton(emoji)
+                btn.setFixedSize(32, 32)
+                btn.setToolTip(cname)
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                if emoji == self._step_color:
+                    btn.setStyleSheet(f"QPushButton {{ background-color: {highlight}; border: 2px solid #c9d1d9; border-radius: 16px; padding: 0; min-width: 32px; }}")
+                else:
+                    btn.setStyleSheet("QPushButton { border-radius: 16px; padding: 0; min-width: 32px; }")
+                btn.clicked.connect(lambda checked, em=emoji: _make_color_click(em))
+                color_btns.append(btn)
+                color_row.addWidget(btn)
+            color_row.addStretch()
+            layout.addLayout(color_row)
         layout.addWidget(QLabel("Notes:"))
         editor = QTextEdit()
         editor.setPlaceholderText("Type your notes here…")
@@ -1816,15 +2022,64 @@ class GroupItemRow(QFrame):
         layout.addWidget(buttons)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
+        if _is_step:
+            new_name = name_edit.text().strip()
+            effective_path = self.item_path
+            renamed = False
+            if new_name and new_name != name and self._on_step_renamed:
+                # Compute what the new path will be (mirrors logic in _on_step_renamed)
+                old_label = self.item_path[len(STEP_PREFIX):]
+                suffix = ("#" + old_label.rsplit("#", 1)[-1]
+                          if "#" in old_label and len(old_label.rsplit("#", 1)[-1]) == 6
+                          else "")
+                effective_path = f"{STEP_PREFIX}{new_name}{suffix}"
+                renamed = True
+            new_color = selected_color[0]
+            color_changed = new_color != self._step_color
+            # Apply color first (before rename triggers rebuild)
+            if color_changed and self._on_color_changed:
+                self._step_color = new_color
+                self._dot.set_color(new_color)
+                self._on_color_changed(effective_path, new_color)
+            # Now trigger rename — its rebuild will pick up the already-written color
+            if renamed:
+                self._on_step_renamed(self.item_path, new_name)
         self._note = editor.toPlainText().strip()
         self._update_notes_btn()
         if self._on_notes_changed:
-            # Key is the composite groupitem:// path so it's 100% independent
             note_key = make_groupitem_path(self._group_id, self.item_path)
             self._on_notes_changed(note_key, self._note)
-        # Immediately refresh the parent GroupRow's pencil border
         if self._on_group_notes_btn_refresh:
             self._on_group_notes_btn_refresh()
+
+    def _rename_step(self):
+        """Open a dialog to rename this manual step."""
+        name = _resolve_path_name(self.item_path)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Rename Step")
+        dlg.setMinimumWidth(300)
+        dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(8)
+        layout.setContentsMargins(12, 12, 12, 8)
+        layout.addWidget(QLabel("Step name:"))
+        name_edit = QLineEdit(name)
+        name_edit.selectAll()
+        layout.addWidget(name_edit)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_name = name_edit.text().strip()
+        if not new_name or new_name == name:
+            return
+        if self._on_step_renamed:
+            self._on_step_renamed(self.item_path, new_name)
 
     def _confirm_remove(self):
         name = _resolve_path_name(self.item_path)
@@ -1838,7 +2093,8 @@ class GroupItemRow(QFrame):
             self._on_remove(self.item_path)
 
     def set_selected(self, selected: bool):
-        self._radio.set_selected(selected)
+        if self._radio:
+            self._radio.set_selected(selected)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1869,6 +2125,11 @@ class GroupItemRow(QFrame):
         if self._on_select:
             self._on_select(self.item_path)
 
+    def _run_this_item(self):
+        if self._on_run:
+            name = _resolve_path_name(self.item_path)
+            self._on_run(self.item_path, name)
+
 
 class GroupRow(QFrame):
     """A collapsible group in the right panel containing radio-selectable items."""
@@ -1881,7 +2142,9 @@ class GroupRow(QFrame):
                  note: str = "", on_notes_changed=None,
                  on_completed_toggle=None, on_group_renamed=None,
                  on_reorder_items=None, missing_paths: set = None,
-                 item_notes: dict = None, parent=None):
+                 item_notes: dict = None, on_step_renamed=None,
+                 on_color_changed=None, step_colors: dict = None,
+                 parent=None):
         super().__init__(parent)
         self.group_path = group_path
         self.name = name
@@ -1904,11 +2167,16 @@ class GroupRow(QFrame):
         self._on_reorder_items = on_reorder_items
         self._missing_paths: set = missing_paths if missing_paths is not None else set()
         self._item_notes: dict = item_notes if item_notes is not None else {}
+        self._on_step_renamed = on_step_renamed
+        self._on_color_changed = on_color_changed
+        self._step_colors: dict = step_colors if step_colors is not None else {}
 
         # If the initially selected item is missing, auto-select the first non-missing
         # item so the group is immediately usable (and the play button stays enabled).
         if self._selected_item and self._selected_item in self._missing_paths:
-            fallback = next((ip for ip in item_paths if ip not in self._missing_paths), "")
+            fallback = next((ip for ip in item_paths
+                             if ip not in self._missing_paths
+                             and not ip.startswith(STEP_PREFIX)), "")
             self._selected_item = fallback
             if fallback and on_select_item:
                 parsed = parse_group_header(group_path)
@@ -2002,9 +2270,13 @@ class GroupRow(QFrame):
                                on_remove=self._on_remove_item_clicked,
                                group_id=self._group_id,
                                missing=is_missing,
-                               note=self._item_notes.get(note_key, ""),
+                               note=self._item_notes.get(note_key) or self._item_notes.get(ip, ""),
                                on_notes_changed=self._on_notes_changed,
-                               on_group_notes_btn_refresh=self._update_notes_btn)
+                               on_group_notes_btn_refresh=self._update_notes_btn,
+                               on_step_renamed=self._on_step_renamed,
+                               on_color_changed=self._on_color_changed,
+                               step_color=self._step_colors.get(ip, DEFAULT_STEP_COLOR),
+                               on_run=self._on_run)
             self._items_layout.addWidget(row)
         # Give the empty items area a minimum height so it is a real drop target.
         # Without this it has zero height and childAt()/geometry() can't find it.
@@ -2012,11 +2284,14 @@ class GroupRow(QFrame):
         self._update_notes_btn()
 
     def _update_play_btn(self):
-        """Enable or disable the play button based on whether the selected item is missing."""
+        """Enable or disable the play button based on whether the selected item is missing or a step."""
         is_missing = bool(self._selected_item and self._selected_item in self._missing_paths)
-        self._play_btn.setEnabled(not is_missing)
+        is_step = bool(self._selected_item and self._selected_item.startswith(STEP_PREFIX))
+        self._play_btn.setEnabled(not is_missing and not is_step)
         if is_missing:
             self._play_btn.setToolTip("Script not installed.")
+        elif is_step:
+            self._play_btn.setToolTip("Manual step — nothing to run")
         else:
             self._play_btn.setToolTip(f"Run selected item in group '{self.name}'")
 
@@ -2043,7 +2318,8 @@ class GroupRow(QFrame):
             if w:
                 w.setEnabled(not self._completed)
         if self._on_completed_toggle:
-            self._on_completed_toggle(self.group_path, self._completed)
+            key = getattr(self, "_note_key", self.group_path)
+            self._on_completed_toggle(key, self._completed)
 
     def _apply_completed_style(self):
         if self._completed:
@@ -2163,9 +2439,6 @@ class GroupRow(QFrame):
             event.acceptProposedAction()
             return
         parsed = parse_mime(event)
-        if parsed and parsed[1].startswith(STEP_PREFIX):
-            event.ignore()
-            return
         if parsed and parsed[0] == SRC_LEFT and not parsed[1].startswith(STEP_PREFIX):
             event.acceptProposedAction()
 
@@ -2174,9 +2447,6 @@ class GroupRow(QFrame):
             event.acceptProposedAction()
             return
         parsed = parse_mime(event)
-        if parsed and parsed[1].startswith(STEP_PREFIX):
-            event.ignore()
-            return
         if parsed and parsed[0] == SRC_LEFT and not parsed[1].startswith(STEP_PREFIX):
             event.acceptProposedAction()
 
@@ -2227,8 +2497,6 @@ class GroupRow(QFrame):
         if not parsed or parsed[0] != SRC_LEFT:
             return
         _, item_path = parsed
-        if item_path.startswith(STEP_PREFIX):
-            return  # steps cannot be added to groups
         # Map drop y into _items_widget coordinate space.
         # If the drop landed on the header (items widget not visible or y < 0), append.
         if self._items_widget.isVisible():
@@ -2441,7 +2709,10 @@ class SelectedPanel(QWidget):
                             on_group_renamed=self.on_group_renamed,
                             on_reorder_items=self._on_reorder_group_items,
                             missing_paths=self.missing_paths,
-                            item_notes=self.notes)
+                            item_notes=self.notes,
+                            on_step_renamed=self.on_step_renamed,
+                            on_color_changed=self.on_color_changed,
+                            step_colors=self.step_colors)
         else:
             return RightScriptRow(path, _name, self.on_run,
                                   is_fav=True, on_fav_toggle=self.on_fav_toggle,
@@ -2470,7 +2741,22 @@ class SelectedPanel(QWidget):
 
         # Favourites are pinned above the scroll area (groups can be favourited too)
         favs = self.favorites
+        # Favourites are pinned above the scroll area (groups can be favourited too)
+        favs = self.favorites
         # Single pass: split into fav/other top-level rows and collect groupitems per group
+        fav_paths = []
+        other_paths = []
+        group_items: dict[str, list] = {}  # gid -> [item_path, ...]
+        for p in self.checked_paths:
+            if p.startswith(GROUPITEM_PREFIX):
+                gi = parse_groupitem(p)
+                if gi:
+                    group_items.setdefault(gi[0], []).append(gi[1])
+            elif p in favs:
+                fav_paths.append(p)
+            else:
+                other_paths.append(p)
+        
         fav_paths = []
         other_paths = []
         group_items: dict[str, list] = {}  # gid -> [item_path, ...]
@@ -2529,14 +2815,17 @@ class SelectedPanel(QWidget):
                                on_collapsed_changed=self._on_group_collapsed,
                                on_add_to_group=self._on_add_to_group,
                                collapsed=self.group_collapsed.get(gid, False),
-                               completed=path in self.completed_paths,
+                               completed=note_key in self.completed_paths,
                                note=self.notes.get(note_key, ""),
                                on_notes_changed=self.on_notes_changed,
                                on_completed_toggle=self.on_completed_toggle,
                                on_group_renamed=self.on_group_renamed,
                                on_reorder_items=self._on_reorder_group_items,
                                missing_paths=self.missing_paths,
-                               item_notes=self.notes)
+                               item_notes=self.notes,
+                               on_step_renamed=self.on_step_renamed,
+                               on_color_changed=self.on_color_changed,
+                               step_colors=self.step_colors)
                 # Store the unique note key on the row so _open_notes reports it correctly
                 row._note_key = note_key
             else:
@@ -2547,12 +2836,14 @@ class SelectedPanel(QWidget):
                                      note=self.notes.get(note_key, ""),
                                      on_notes_changed=self.on_notes_changed,
                                      on_step_renamed=self.on_step_renamed,
-                                     completed=path in self.completed_paths,
+                                     completed=note_key in self.completed_paths,
                                      on_completed_toggle=self.on_completed_toggle,
                                      step_color=self.step_colors.get(path, self.last_step_color),
                                      on_color_changed=self.on_color_changed)
                 # Store the unique note key on the row so _open_notes reports it correctly
                 row._note_key = note_key
+                # _occ already holds the 0-based occurrence index for this path
+                row._row_occurrence = _occ
             self._rows_layout.insertWidget(pos, row)
             pos += 1
 
@@ -2614,8 +2905,17 @@ class SelectedPanel(QWidget):
             event.ignore()
             return
 
-        # Find insertion index within _fav_layout based on drop Y position
-        drop_y = event.position().toPoint().y()
+        # Find insertion index within _fav_layout based on drop Y position.
+        # Map through global coordinates so the Y is relative to _fav_container
+        # itself, not the parent SelectedPanel.  event.position() on macOS can
+        # return coordinates in the parent widget's space when dropEvent is
+        # monkey-patched onto a child widget, causing drop_y to be inflated by
+        # the child's vertical offset and the insertion index to always land at
+        # the end of the list.  This matches the same pattern used by
+        # _viewport_pos() and GroupRow.dropEvent for their coordinate mappings.
+        drop_y = self._fav_container.mapFromGlobal(
+            self.mapToGlobal(event.position().toPoint())
+        ).y()
         insert_idx = self._fav_layout.count()  # default: append
         for i in range(self._fav_layout.count()):
             item = self._fav_layout.itemAt(i)
@@ -2726,6 +3026,23 @@ class SelectedPanel(QWidget):
         gi_path = make_groupitem_path(group_id, item_path)
         if gi_path in self.checked_paths:
             self.checked_paths.remove(gi_path)
+        # Clear the groupitem-keyed note unconditionally — the specific
+        # groupitem:// slot is gone regardless of duplicates.
+        self.notes.pop(gi_path, None)
+        # Also clear the bare item-path note if the item no longer appears
+        # anywhere in checked_paths (neither as a standalone entry nor inside
+        # any group).
+        still_present = (
+            item_path in self.checked_paths
+            or any(
+                p.startswith(GROUPITEM_PREFIX)
+                and parse_groupitem(p) is not None
+                and parse_groupitem(p)[1] == item_path
+                for p in self.checked_paths
+            )
+        )
+        if not still_present:
+            self.notes.pop(item_path, None)
         # If the removed item was selected, auto-select another item in the group
         if self.group_selections.get(group_id) == item_path:
             remaining = [
@@ -2812,9 +3129,17 @@ class SelectedPanel(QWidget):
         return None
 
     def _viewport_pos(self, event) -> "QPoint":
-        return self._scroll.viewport().mapFromGlobal(
-            self.mapToGlobal(event.position().toPoint())
-        )
+        # Take the drop position from the event, never from QCursor.pos().  On
+        # Wayland the compositor stops sending pointer events for the duration
+        # of a drag (motion is routed through wl_data_device instead), so
+        # QCursor.pos() stays frozen at the point where the drag started; every
+        # reorder then computes the row's existing index and silently does
+        # nothing.  event.position() is fed by the drag motion on every platform.
+        # Qt propagates drag/drop events up the parent chain and re-translates
+        # the position at each hop, so by the time SelectedPanel.dropEvent runs
+        # the position is in self's coordinate space regardless of which child
+        # the cursor is physically over.  Map it down into the scroll viewport.
+        return self._scroll.viewport().mapFrom(self, event.position().toPoint())
 
     def _drop_groupitem_into_group(self, item_path: str, src_gid: str,
                                    tgt_group_row: "GroupRow") -> None:
@@ -2906,13 +3231,20 @@ class SelectedPanel(QWidget):
         self.on_changed()
         self.rebuild()
 
-    def _reorder_main_list(self, path: str, idx: int) -> None:
+    def _reorder_main_list(self, path: str, idx: int,
+                           drag_row_index: int | None = None) -> None:
         """Reorder a main-list item to a new layout position.
 
         idx is a 0-based index into the scrollable list rows (GroupRow /
         RightScriptRow only, as returned by drop_index_in_panel).  Favourites
         live in the separate pinned zone above the scroll area, so they are
         never part of this list and must be kept out of the index maths.
+
+        drag_row_index, when provided, is the exact layout slot of the dragged
+        widget encoded at drag-start time.  This eliminates the need for the
+        heuristic used to identify which duplicate instance was dragged, making
+        reordering of duplicate items (e.g. multiple Save As commands) reliable
+        on all platforms.
         """
         favs = self.favorites
 
@@ -2920,26 +3252,50 @@ class SelectedPanel(QWidget):
         other_paths = [p for p in self.checked_paths
                        if p not in favs and not p.startswith(GROUPITEM_PREFIX)]
 
-        # Find the source position within other_paths.
-        # Guard against duplicate step paths by counting how many times the
-        # path appears before the dragged widget in the layout.
-        layout_paths = []
-        for i in range(self._rows_layout.count()):
-            w = self._rows_layout.itemAt(i).widget() if self._rows_layout.itemAt(i) else None
-            if isinstance(w, GroupRow):
-                layout_paths.append(w.group_path)
-            elif isinstance(w, RightScriptRow):
-                layout_paths.append(w.path)
-
-        drag_layout_idx = next((i for i, p in enumerate(layout_paths) if p == path), None)
         occurrences = [i for i, p in enumerate(other_paths) if p == path]
-        if drag_layout_idx is not None and occurrences:
-            preceding = sum(1 for p in layout_paths[:drag_layout_idx] if p == path)
+        if not occurrences:
+            return
+
+        # Determine which occurrence in other_paths is being dragged.
+        # When drag_row_index is available (RightScriptRow drags) use it directly
+        # — count how many times path appears in layout slots before drag_row_index
+        # to find the nth occurrence in other_paths.  Fall back to the old
+        # heuristic only for drags that predate this encoding (e.g. old payloads).
+        if drag_row_index is not None:
+            # Count how many times path appears in content slots strictly before
+            # drag_row_index.  We must iterate over content rows only (GroupRow /
+            # RightScriptRow) using the same slot-counting logic as mouseMoveEvent,
+            # NOT over raw layout indices — non-row widgets (dividers, labels) in
+            # the layout would otherwise shift the count and pick the wrong occurrence.
+            preceding = 0
+            slot = 0
+            for i in range(self._rows_layout.count()):
+                if slot >= drag_row_index:
+                    break
+                w = self._rows_layout.itemAt(i).widget() if self._rows_layout.itemAt(i) else None
+                if not isinstance(w, (GroupRow, RightScriptRow)):
+                    continue
+                if isinstance(w, RightScriptRow) and w.path == path:
+                    preceding += 1
+                slot += 1
             src_idx = occurrences[min(preceding, len(occurrences) - 1)]
         else:
-            src_idx = next((i for i, p in enumerate(other_paths) if p == path), None)
-            if src_idx is None:
-                return
+            # Legacy heuristic for GroupRow drags or old payloads without index.
+            layout_paths = []
+            for i in range(self._rows_layout.count()):
+                w = self._rows_layout.itemAt(i).widget() if self._rows_layout.itemAt(i) else None
+                if isinstance(w, GroupRow):
+                    layout_paths.append(w.group_path)
+                elif isinstance(w, RightScriptRow):
+                    layout_paths.append(w.path)
+            layout_slots = [i for i, p in enumerate(layout_paths) if p == path]
+            drag_layout_idx = layout_slots[-1]
+            for slot in layout_slots:
+                if slot >= idx:
+                    drag_layout_idx = slot
+                    break
+            preceding = sum(1 for p in layout_paths[:drag_layout_idx] if p == path)
+            src_idx = occurrences[min(preceding, len(occurrences) - 1)]
 
         # idx from drop_index_in_panel directly maps to a position in other_paths
         # because _rows_layout contains exactly the same items in the same order.
@@ -2950,6 +3306,38 @@ class SelectedPanel(QWidget):
             dst_idx -= 1
         dst_idx = max(0, min(dst_idx, len(other_paths)))
         other_paths.insert(dst_idx, path)
+
+        # Remap suffixed note keys for the moved path so notes travel with their
+        # items.  Note keys are positional: 1st occurrence -> path, 2nd ->
+        # path + NUL + "1", 3rd -> path + NUL + "2", etc.  After reordering,
+        # the occurrence at src_idx
+        # has moved to dst_idx, so we collect all per-occurrence notes in their
+        # old order, move the dragged one to its new position, then write them
+        # back under the new positional keys.
+        def _note_key(p, n):
+            return p if n == 0 else p + chr(0) + str(n)
+
+        old_occurrence_count = len(occurrences)  # count before the pop
+        if old_occurrence_count > 1:
+            # src_occ / dst_occ are occurrence numbers (0-based) within the
+            # duplicate set — not positions in other_paths.
+            src_occ = preceding  # already computed above
+            # Count how many occurrences of path appear before dst_idx in
+            # other_paths (after the pop, so dst_idx is already adjusted).
+            dst_occ = sum(1 for p in other_paths[:dst_idx] if p == path)
+            # Collect notes in old occurrence order
+            old_notes = [self.notes.get(_note_key(path, n), "")
+                         for n in range(old_occurrence_count)]
+            # Move the dragged note from src_occ to dst_occ
+            note = old_notes.pop(src_occ)
+            old_notes.insert(dst_occ, note)
+            # Write back under new positional keys, clearing any that are now empty
+            for n, note_text in enumerate(old_notes):
+                k = _note_key(path, n)
+                if note_text:
+                    self.notes[k] = note_text
+                else:
+                    self.notes.pop(k, None)
 
         # Rebuild checked_paths: favs first (preserving their order), then
         # other_paths with groupitems re-inserted after their group headers.
@@ -3037,15 +3425,10 @@ class SelectedPanel(QWidget):
         if not (event.mimeData().hasFormat(GROUPITEM_MIME) or parse_mime(event)):
             return
         parsed = parse_mime(event)
-        pos_in_viewport = self._scroll.viewport().mapFromGlobal(
-            self.mapToGlobal(event.position().toPoint())
-        )
-        over_group = self._is_over_group(pos_in_viewport)
-        # Forbidden if: a step is dragged over a group, OR a favorite is dragged
-        # over the main scroll list (favorites can only be reordered in the pinned zone)
+        # Forbidden if a favorite is dragged over the main scroll list
+        # (favorites can only be reordered in the pinned zone)
         is_forbidden = (
-            (parsed and parsed[1].startswith(STEP_PREFIX) and over_group)
-            or (parsed and parsed[0] == SRC_RIGHT and parsed[1] in self.favorites)
+            parsed and parsed[0] == SRC_RIGHT and parsed[1] in self.favorites
         )
         if is_forbidden:
             if not self._forbidden_cursor_active:
@@ -3087,8 +3470,13 @@ class SelectedPanel(QWidget):
         parsed = parse_mime(event)
         if not parsed:
             return
-        source_id, path = parsed
-        # Find the widget being dragged (for skip_widget in drop_index_in_panel)
+        source_id, path = parsed[0], parsed[1]
+        drag_row_index = parsed[2] if len(parsed) == 3 else None
+        # Find the widget being dragged (for skip_widget in drop_index_in_panel).
+        # For GroupRows we locate the widget by path (they are always unique).
+        # For RightScriptRows the drag payload now carries the exact layout row
+        # index, so we use that to find the widget — this correctly handles
+        # duplicate paths (e.g. multiple Save As commands) on all platforms.
         src_widget = None
         if path.startswith(GROUP_PREFIX):
             for i in range(self._rows_layout.count()):
@@ -3096,6 +3484,16 @@ class SelectedPanel(QWidget):
                 if isinstance(w, GroupRow) and w.group_path == path:
                     src_widget = w
                     break
+        elif drag_row_index is not None:
+            slot = 0
+            for i in range(self._rows_layout.count()):
+                w = self._rows_layout.itemAt(i).widget() if self._rows_layout.itemAt(i) else None
+                if not isinstance(w, (GroupRow, RightScriptRow)):
+                    continue
+                if slot == drag_row_index:
+                    src_widget = w
+                    break
+                slot += 1
         idx = drop_index_in_panel(self._scroll, self._rows_layout, pos,
                                   skip_widget=src_widget)
 
@@ -3135,7 +3533,34 @@ class SelectedPanel(QWidget):
                 QTimer.singleShot(500, _cleanup)
                 event.acceptProposedAction()
                 return
-            self.checked_paths.insert(self._layout_idx_to_cp_idx(idx), path)
+            cp_idx = self._layout_idx_to_cp_idx(idx)
+            self.checked_paths.insert(cp_idx, path)
+            # If this path already exists in the list (duplicate), the positional
+            # note keys for all occurrences at or after the insertion point must
+            # be shifted up by one so existing notes stay attached to the correct
+            # row.  Note keys are: path (occ 0), path+NUL+"1" (occ 1), etc.
+            # Count how many times path appears before cp_idx in other_paths to
+            # find the insertion occurrence index.
+            favs = self.favorites
+            other_paths_before = [p for p in self.checked_paths[:cp_idx]
+                                   if p not in favs and not p.startswith(GROUPITEM_PREFIX)]
+            insert_occ = sum(1 for p in other_paths_before if p == path)
+            # Count total existing occurrences (before this insert, so subtract 1
+            # since we already inserted above).
+            total_occ = sum(1 for p in self.checked_paths if p == path) - 1
+            if total_occ > 0 and insert_occ <= total_occ:
+                def _note_key(p, n):
+                    return p if n == 0 else p + chr(0) + str(n)
+                # Shift from the top down to avoid overwriting
+                for n in range(total_occ, insert_occ - 1, -1):
+                    old_key = _note_key(path, n)
+                    new_key = _note_key(path, n + 1)
+                    if old_key in self.notes:
+                        self.notes[new_key] = self.notes.pop(old_key)
+                    else:
+                        self.notes.pop(new_key, None)
+                # The newly inserted slot gets no note
+                self.notes.pop(_note_key(path, insert_occ), None)
 
         # ── Reorder / move from right panel ───────────────────────────────────
         elif source_id == SRC_RIGHT:
@@ -3157,18 +3582,18 @@ class SelectedPanel(QWidget):
             # Exception: if the group is collapsed its items area is hidden, so
             # fall back to _group_row_at so the header still acts as a drop target.
             target = self._group_row_at_items_area(pos)
-            if target is None and not path.startswith((GROUP_PREFIX, STEP_PREFIX)):
+            if target is None and not path.startswith(GROUP_PREFIX):
                 candidate = self._group_row_at(pos)
                 if candidate is not None and candidate._collapsed:
                     target = candidate
-            if target is not None and not path.startswith((GROUP_PREFIX, STEP_PREFIX)):
+            if target is not None and not path.startswith(GROUP_PREFIX):
                 self._move_main_item_into_group(path, target, pos)
                 event.acceptProposedAction()
                 return
-            self._reorder_main_list(path, idx)
+            self._reorder_main_list(path, idx, drag_row_index=drag_row_index)
 
         self.on_changed()
-        self.rebuild(scroll_to_bottom=(source_id == SRC_LEFT))
+        self.rebuild()
         event.acceptProposedAction()
 
 # ── Main window ───────────────────────────────────────────────────────────────
@@ -3182,27 +3607,46 @@ class WorkflowCompanionWindow(QMainWindow):
         self.scripts = scripts
         self._siril = s.SirilInterface()
 
-        valid_paths = {p for _, p in self.scripts}
         _sel, _favs, _geom, _workflows, _active, _notes, _on_top = load_state(scripts_dir)
-        self.missing_paths: set = {p for p in _sel
-                                   if p not in valid_paths
-                                   and not p.startswith(NON_SCRIPT_PREFIXES)}
-        # Also capture missing scripts inside groups (groupitem:// paths)
-        for _p in _sel:
-            if _p.startswith(GROUPITEM_PREFIX):
-                _gi = parse_groupitem(_p)
-                if _gi:
-                    _item_path = _gi[1]
-                    if (_item_path not in valid_paths
-                            and not _item_path.startswith(NON_SCRIPT_PREFIXES)):
-                        self.missing_paths.add(_item_path)
         self.checked_paths: list = list(_sel)  # keep all, including missing
-        self.favorites: set = {p for p in _favs if p in valid_paths or p.startswith((STEP_PREFIX, FUNCTION_PREFIX, GROUP_PREFIX))}
+        self.favorites: set = set(_favs)
         self._saved_geometry: dict | None = _geom
         self.workflows: dict = _workflows
         self._active_workflow: str = _active
         self._workflow_dirty: bool = False
         self.notes: dict = _notes  # {path: note_text}
+
+        # Heal legacy / mismatched paths - notably the absolute paths inherited
+        # from the old Script Launcher state, whose casing or short-name form can
+        # differ from the current scan on case-insensitive filesystems (Windows)
+        # and would otherwise flag every present script as "not found".  Remap
+        # them to the authoritative scanned spelling, then persist the fix once.
+        _healed = self._heal_legacy_paths()
+        valid_canon = set(self._canon_scanned)
+
+        # Determine which selected filesystem scripts are genuinely absent.
+        self.missing_paths: set = {p for p in self.checked_paths
+                                   if not p.startswith(NON_SCRIPT_PREFIXES)
+                                   and canonical(p) not in valid_canon}
+        # Also capture missing scripts inside groups (groupitem:// paths)
+        for _p in self.checked_paths:
+            if _p.startswith(GROUPITEM_PREFIX):
+                _gi = parse_groupitem(_p)
+                if _gi:
+                    _item_path = _gi[1]
+                    if (not _item_path.startswith(NON_SCRIPT_PREFIXES)
+                            and canonical(_item_path) not in valid_canon):
+                        self.missing_paths.add(_item_path)
+        # Keep only favourites that still resolve to a real script (or virtuals).
+        self.favorites = {p for p in self.favorites
+                          if p.startswith((STEP_PREFIX, FUNCTION_PREFIX, GROUP_PREFIX))
+                          or canonical(p) in valid_canon}
+        # Persist the healed paths once (also rewrites any inherited absolute
+        # paths to the portable relative form), so the correction is permanent.
+        if _healed:
+            save_state(self.checked_paths, self.favorites,
+                       scripts_dir=scripts_dir, workflows=self.workflows,
+                       active_workflow=self._active_workflow, notes=self.notes)
         self.step_colors: dict = {}  # {path: emoji} - loaded per workflow
         # Load last used step color from state
         try:
@@ -3572,17 +4016,27 @@ class WorkflowCompanionWindow(QMainWindow):
         else:
             suffix = ""
         new_path = f"{STEP_PREFIX}{new_name}{suffix}"
-        # Each step copy now has a unique path, so replace all occurrences safely
+        # Replace bare step path occurrences (step in the main list)
         for i, p in enumerate(self.checked_paths):
             if p == old_path:
                 self.checked_paths[i] = new_path
+        # Replace groupitem-wrapped step path occurrences (step inside a group)
+        for i, p in enumerate(self.checked_paths):
+            if p.startswith(GROUPITEM_PREFIX):
+                parsed = parse_groupitem(p)
+                if parsed and parsed[1] == old_path:
+                    self.checked_paths[i] = make_groupitem_path(parsed[0], new_path)
         # Move notes if any
         if old_path in self.notes:
             self.notes[new_path] = self.notes.pop(old_path)
             self._right_panel.notes = self.notes
-        # Move step color if any
-        if old_path in self.step_colors:
+        # Move step color if any (skip if already written under new_path by _on_color_changed)
+        if old_path in self.step_colors and new_path not in self.step_colors:
             self.step_colors[new_path] = self.step_colors.pop(old_path)
+            self._right_panel.step_colors = self.step_colors
+        elif old_path in self.step_colors and new_path in self.step_colors:
+            # Color already updated by _on_color_changed; just remove the old key
+            del self.step_colors[old_path]
             self._right_panel.step_colors = self.step_colors
         # Move favorites if any
         if old_path in self.favorites:
@@ -3615,11 +4069,34 @@ class WorkflowCompanionWindow(QMainWindow):
         self._right_panel.rebuild()
 
     def _on_notes_changed(self, path: str, note: str):
-        """Save updated note for a script."""
+        """Save updated note for a script.
+
+        Group item notes are stored under their groupitem:// key AND mirrored to
+        the bare item path, so the note survives when a step is dragged out of a
+        group into the main list (and vice versa).
+        """
         if note:
             self.notes[path] = note
         else:
             self.notes.pop(path, None)
+        # Mirror between groupitem:// key and bare item path so notes are
+        # preserved when a step moves between a group and the main list.
+        parsed = parse_groupitem(path)
+        if parsed:
+            _, item_path = parsed
+            if note:
+                self.notes.setdefault(item_path, note)
+            # Don't delete the bare key on clear — the item may still be in the
+            # main list under that key.
+        elif path.startswith(STEP_PREFIX):
+            # When saved from the main list, mirror into any group that holds this step.
+            for key in list(self.notes.keys()):
+                gi = parse_groupitem(key)
+                if gi and gi[1] == path:
+                    if note:
+                        self.notes[key] = note
+                    else:
+                        self.notes.pop(key, None)
         self._workflow_dirty = True
 
     def _on_right_panel_group_collapsed(self, group_id: str, collapsed: bool):
@@ -3654,18 +4131,13 @@ class WorkflowCompanionWindow(QMainWindow):
         self._update_status()
 
     def _on_color_changed(self, path: str, color: str):
-        """Save updated step dot color."""
+        """Record updated step dot color as a dirty change; do not write to disk
+        immediately so the user can discard via the close dialog."""
         self.step_colors[path] = color
         self._last_step_color = color
         self._workflow_dirty = True
-        # Persist the updated step_colors into the active workflow so each step
-        # keeps its own color after close/reopen without requiring an explicit Save.
-        # Without this, only last_step_color was written and every step fell back
-        # to that single color on next load.
         if self._active_workflow and self._active_workflow in self.workflows:
             self.workflows[self._active_workflow]["step_colors"] = dict(self.step_colors)
-        save_state(self.checked_paths, self.favorites, scripts_dir=self.scripts_dir,
-                   workflows=self.workflows, last_step_color=color)
 
     def _add_script(self, path: str):
         """Called on double-click in the left panel."""
@@ -3674,19 +4146,38 @@ class WorkflowCompanionWindow(QMainWindow):
         self._rebuild_panels()
         self._update_status()
 
-    def _remove_script(self, path: str):
-        """Called when a script is dragged from right back to left, or removed via trash."""
-        # Use index-based removal so only the first occurrence is removed when
-        # duplicate step names share the same path string
-        try:
-            self.checked_paths.pop(self.checked_paths.index(path))
-        except ValueError:
-            pass
+    def _remove_script(self, path: str, occurrence: int = 0):
+        """Called when a script is dragged from right back to left, or removed via trash.
+
+        occurrence is the 0-based index of which duplicate instance to remove.
+        Defaults to 0 (first occurrence) for backwards compatibility.
+        """
+        # Find the Nth occurrence of path so the correct duplicate is removed.
+        target_idx = None
+        seen = 0
+        for i, p in enumerate(self.checked_paths):
+            if p == path:
+                if seen == occurrence:
+                    target_idx = i
+                    break
+                seen += 1
+        if target_idx is None:
+            # Fallback: remove first occurrence if the requested one wasn't found
+            try:
+                target_idx = self.checked_paths.index(path)
+            except ValueError:
+                return
+        self.checked_paths.pop(target_idx)
         # If removing a group, also remove all its groupitems
         if path.startswith(GROUP_PREFIX):
             parsed = parse_group_header(path)
             if parsed:
                 gid = parsed[1]
+                # Clear notes for every groupitem belonging to this group
+                for p in list(self.notes.keys()):
+                    gi = parse_groupitem(p)
+                    if gi and gi[0] == gid:
+                        self.notes.pop(p, None)
                 self.checked_paths[:] = [p for p in self.checked_paths
                                          if not (p.startswith(GROUPITEM_PREFIX)
                                          and parse_groupitem(p) is not None
@@ -3694,6 +4185,12 @@ class WorkflowCompanionWindow(QMainWindow):
                 self._right_panel.group_selections.pop(gid, None)
                 self._right_panel.group_collapsed.pop(gid, None)
         self.favorites.discard(path)
+        # Clear the note for this path only if it no longer appears anywhere
+        # in checked_paths (duplicates are allowed, so keep the note while any
+        # copy remains).
+        if path not in self.checked_paths:
+            self.notes.pop(path, None)
+            self._right_panel.notes = self.notes
         self._workflow_dirty = True
         self._rebuild_panels()
         self._update_status()
@@ -3872,41 +4369,34 @@ class WorkflowCompanionWindow(QMainWindow):
         workflow = self.workflows.get(name)
         if not workflow:
             return
-        valid_paths = {p for _, p in self.scripts}
-        raw_paths = workflow.get("selections", [])
-        missing_paths = [p for p in raw_paths
-                         if p not in valid_paths and not p.startswith(NON_SCRIPT_PREFIXES)]
-        # Also check scripts inside groups (groupitem:// paths)
+        valid_canon = self._valid_canon()
+        # Heal the workflow's stored paths to the authoritative scanned spelling
+        # so a casing / short-name mismatch never masquerades as a missing script.
+        raw_paths = [self._heal_path(p) for p in workflow.get("selections", [])]
+        workflow["selections"] = raw_paths
+
+        def _is_missing(p: str) -> bool:
+            return (not p.startswith(NON_SCRIPT_PREFIXES)
+                    and canonical(p) not in valid_canon)
+
+        self.missing_paths = {p for p in raw_paths if _is_missing(p)}
+        # Also capture missing scripts inside groups (groupitem:// paths)
         for _p in raw_paths:
             if _p.startswith(GROUPITEM_PREFIX):
                 _gi = parse_groupitem(_p)
-                if _gi:
-                    _item_path = _gi[1]
-                    if (_item_path not in valid_paths
-                            and not _item_path.startswith(NON_SCRIPT_PREFIXES)
-                            and _item_path not in missing_paths):
-                        missing_paths.append(_item_path)
+                if _gi and _is_missing(_gi[1]):
+                    self.missing_paths.add(_gi[1])
         # Inform user of any missing scripts (load continues regardless)
-        if missing_paths:
-            missing_names = [os.path.basename(p) for p in missing_paths]
+        if self.missing_paths:
+            missing_names = sorted({os.path.basename(p) for p in self.missing_paths})
             self._warn_missing_scripts(
                 missing_names,
                 context=f"From workflow '{name}':\n"
             )
-        raw_favs = workflow.get("favorites", [])
-        loaded_favs = {p for p in raw_favs if p in valid_paths or p.startswith(STEP_PREFIX)
-                       or p.startswith(FUNCTION_PREFIX) or p.startswith(GROUP_PREFIX)}
-        self.missing_paths = {p for p in raw_paths
-                              if p not in valid_paths and not p.startswith(NON_SCRIPT_PREFIXES)}
-        # Also capture missing scripts inside groups
-        for _p in raw_paths:
-            if _p.startswith(GROUPITEM_PREFIX):
-                _gi = parse_groupitem(_p)
-                if _gi:
-                    _item_path = _gi[1]
-                    if (_item_path not in valid_paths
-                            and not _item_path.startswith(NON_SCRIPT_PREFIXES)):
-                        self.missing_paths.add(_item_path)
+        raw_favs = [self._heal_path(p) for p in workflow.get("favorites", [])]
+        loaded_favs = {p for p in raw_favs
+                       if p.startswith((STEP_PREFIX, FUNCTION_PREFIX, GROUP_PREFIX))
+                       or canonical(p) in valid_canon}
         self._right_panel.missing_paths = self.missing_paths
         raw_completed = workflow.get("completed", [])
         self.completed_paths = set(raw_completed)
@@ -4055,15 +4545,21 @@ class WorkflowCompanionWindow(QMainWindow):
                     return os.path.join(scripts_root, rel)
                 return p  # legacy absolute path - use as-is
 
-            valid_paths = {p for _, p in self.scripts}
-            raw_paths   = [to_absolute(p) for p in data["selections"]]
-            raw_favs    = [to_absolute(p) for p in data.get("favorites", [])]
+            valid_canon = self._valid_canon()
+            # Resolve to absolute, then heal to the authoritative scanned spelling
+            # so an imported path that differs only in casing / short-name form is
+            # recognised rather than reported missing.
+            raw_paths   = [self._heal_path(to_absolute(p)) for p in data["selections"]]
+            raw_favs    = [self._heal_path(to_absolute(p)) for p in data.get("favorites", [])]
 
-            loaded      = [p for p in raw_paths if p in valid_paths or p.startswith(NON_SCRIPT_PREFIXES)]
-            missing_paths = [p for p in raw_paths
-                             if p not in valid_paths and not p.startswith(NON_SCRIPT_PREFIXES)]
-            loaded_favs = [p for p in raw_favs if p in valid_paths or p.startswith(STEP_PREFIX)
-                           or p.startswith(FUNCTION_PREFIX) or p.startswith(GROUP_PREFIX)]
+            def _found(p: str) -> bool:
+                return p.startswith(NON_SCRIPT_PREFIXES) or canonical(p) in valid_canon
+
+            loaded      = [p for p in raw_paths if _found(p)]
+            missing_paths = [p for p in raw_paths if not _found(p)]
+            loaded_favs = [p for p in raw_favs
+                           if p.startswith((STEP_PREFIX, FUNCTION_PREFIX, GROUP_PREFIX))
+                           or canonical(p) in valid_canon]
 
             # If name already exists, ask to overwrite
             if name in self.workflows:
@@ -4085,15 +4581,15 @@ class WorkflowCompanionWindow(QMainWindow):
                 ):
                     return
 
-            # Resolve group_selections values back to absolute paths
+            # Resolve group_selections values back to absolute (healed) paths
             abs_group_selections = {
-                gid: to_absolute(item)
+                gid: self._heal_path(to_absolute(item))
                 for gid, item in data.get("group_selections", {}).items()
             }
 
-            # Resolve notes keys back to absolute paths
+            # Resolve notes keys back to absolute (healed) paths
             abs_notes = {
-                to_absolute(k): v
+                self._heal_path(to_absolute(k)): v
                 for k, v in data.get("notes", {}).items()
             }
 
@@ -4107,9 +4603,7 @@ class WorkflowCompanionWindow(QMainWindow):
                 "notes":            abs_notes,
             }
             # Load it immediately into the right panel
-            self.missing_paths = {p for p in raw_paths
-                                  if p not in valid_paths and not p.startswith(STEP_PREFIX)
-                                   and not p.startswith(FUNCTION_PREFIX)}
+            self.missing_paths = {p for p in raw_paths if not _found(p)}
             self._right_panel.missing_paths = self.missing_paths
             self.step_colors = dict(data.get("step_colors", {}))
             self._right_panel.step_colors = self.step_colors
@@ -4241,8 +4735,85 @@ class WorkflowCompanionWindow(QMainWindow):
         self._left_panel.rebuild(scripts=visible, query=query)
         self._update_status()
 
+    # ── path canonicalisation / legacy healing ────────────────────────────────
+
+    def _valid_canon(self) -> set:
+        """Canonical keys of all scanned filesystem scripts.
+
+        Rebuilds self._canon_scanned (canonical -> authoritative scanned path)
+        from the current scan and returns its key set for O(1) membership tests
+        that are immune to casing / short-name / junction differences."""
+        self._canon_scanned = build_valid_lookup(self.scripts)
+        return set(self._canon_scanned)
+
+    def _heal_path(self, p: str) -> str:
+        """Remap a stored path to the authoritative scanned spelling.
+
+        Fixes legacy paths - notably the absolute paths inherited from the old
+        Script Launcher state file - whose casing / short-name / junction form
+        differs from the current scan but which point at a script that is really
+        present.  Virtual and unknown paths are returned unchanged.  Relies on
+        self._canon_scanned having been populated (via _valid_canon())."""
+        if not p:
+            return p
+        if p.startswith(GROUPITEM_PREFIX):
+            gi = parse_groupitem(p)
+            if gi:
+                return make_groupitem_path(gi[0], self._heal_path(gi[1]))
+            return p
+        if p.startswith(NON_SCRIPT_PREFIXES):
+            return p
+        return self._canon_scanned.get(canonical(p), p)
+
+    def _heal_legacy_paths(self) -> bool:
+        """Rewrite in-memory paths to the authoritative scanned spelling.
+
+        Applies to the live selection, favourites and notes as well as every
+        saved workflow, so both the comparisons and the persisted state agree
+        with the current scan.  Returns True if anything changed, letting the
+        caller persist the correction once so it is fixed permanently."""
+        self._valid_canon()  # (re)build self._canon_scanned
+        changed = False
+
+        def heal_list(seq):
+            nonlocal changed
+            out = []
+            for p in seq:
+                h = self._heal_path(p)
+                changed = changed or (h != p)
+                out.append(h)
+            return out
+
+        def heal_keys(d):
+            nonlocal changed
+            out = {}
+            for k, v in d.items():
+                h = self._heal_path(k)
+                changed = changed or (h != k)
+                out[h] = v
+            return out
+
+        self.checked_paths[:] = heal_list(self.checked_paths)
+        self.favorites = set(heal_list(self.favorites))
+        self.notes = heal_keys(self.notes)
+
+        for wf in self.workflows.values():
+            for key in ("selections", "favorites", "completed"):
+                if key in wf:
+                    wf[key] = heal_list(wf[key])
+            if "group_selections" in wf:
+                new_gs = {}
+                for gid, item in wf["group_selections"].items():
+                    h = self._heal_path(item)
+                    changed = changed or (h != item)
+                    new_gs[gid] = h
+                wf["group_selections"] = new_gs
+            if "notes" in wf:
+                wf["notes"] = heal_keys(wf["notes"])
+        return changed
+
     def _refresh(self):
-        global _DIALOG_GROUPS, _SIRILPY_HAS_DIALOGS
+        global _DIALOG_GROUPS
         self.scripts = scan_scripts(self.scripts_dir)
         system_scripts_dir = find_siril_system_scripts_dir()
         if system_scripts_dir:
@@ -4251,15 +4822,27 @@ class WorkflowCompanionWindow(QMainWindow):
         # Re-scan functions (Siril built-in dialogs)
         _DIALOG_GROUPS = _build_dialog_groups()
 
-        valid_paths = {p for _, p in self.scripts}
-        # Build the set of valid function paths from the refreshed _DIALOG_GROUPS
-        if _DIALOG_GROUPS:
-            valid_paths |= {f"{FUNCTION_PREFIX}{d.name}"
-                            for dialogs in _DIALOG_GROUPS.values() for d in dialogs}
-        # Update missing_paths - don't remove anything from checked_paths
+        # A rescan may reveal scripts that were previously missing (e.g. just
+        # installed) - heal any stored paths back to the canonical spelling and,
+        # if anything changed, persist the correction once (as at startup) so the
+        # fix survives even if the session ends without another state write.
+        valid_canon = self._valid_canon()
+        if self._heal_legacy_paths():
+            save_state(self.checked_paths, self.favorites,
+                       scripts_dir=self.scripts_dir, workflows=self.workflows,
+                       active_workflow=self._active_workflow, notes=self.notes)
+        # Update missing_paths - don't remove anything from checked_paths.
+        # Virtual entries (step/function/group/system/groupitem) are never
+        # "missing on disk"; groupitem embeds a real path checked separately.
         self.missing_paths = {p for p in self.checked_paths
-                              if p not in valid_paths and not p.startswith(STEP_PREFIX)
-                                   and not p.startswith(FUNCTION_PREFIX)}
+                              if not p.startswith(NON_SCRIPT_PREFIXES)
+                              and canonical(p) not in valid_canon}
+        for _p in self.checked_paths:
+            if _p.startswith(GROUPITEM_PREFIX):
+                _gi = parse_groupitem(_p)
+                if _gi and not _gi[1].startswith(NON_SCRIPT_PREFIXES) \
+                        and canonical(_gi[1]) not in valid_canon:
+                    self.missing_paths.add(_gi[1])
         self._right_panel.missing_paths = self.missing_paths
         self._search_input.clear()
         self._rebuild_panels()
@@ -4468,9 +5051,11 @@ class WorkflowCompanionWindow(QMainWindow):
             "<p>&#8226; Manual steps show a colored circle instead of a play button. Color can be changed in the Notes dialog.</p>"
             "<p>&#8226; Double-click a step&#39;s label to rename it, or use the pencil button to rename it and add notes together.</p>"
             "<p>&#8226; Steps can be reordered, starred, completed, and removed.</p>"
+            "<p>&#8226; To add a step to a group, first create the step and then drag it into the group.</p>"
             "<h3>GROUPS</h3>"
             "<p>&#8226; Click Add Group to create a group.</p>"
-            "<p>&#8226; Drag items into the group and select which one runs when the Play button is clicked.</p>"
+            "<p>&#8226; Drag items into the group and select which one runs when the Group Play button is clicked.</p>"
+            "<p>&#8226; Click a Group's item Play button to run the script or function without changing the Group's selected item.</p>"
             "<p>&#8226; When the group is marked complete, all items within the group are disabled.</p>"
             "<h3>NOTES</h3>"
             "<p>&#8226; Click the pencil button on any row to add or edit a note.</p>"
@@ -4631,14 +5216,50 @@ class WorkflowCompanionWindow(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-            # Discard: revert notes from saved workflow, clear panel state
+            # Discard: revert notes, step_colors, and workflows to saved state
             try:
                 with open(STATE_FILE, "r", encoding="utf-8") as fh:
                     saved = json.load(fh)
                 saved_wf = saved.get("workflows", {}).get(self._active_workflow, {})
-                self.notes = dict(saved_wf.get("notes", {}))
+                # The state file stores paths in relative form, but every
+                # in-memory path is absolute and save_state() (called below)
+                # relativises again.  Restore to absolute - and heal to the
+                # authoritative scanned spelling - so save_state relativises
+                # correctly instead of double-relativising the already-relative
+                # strings against the process CWD (which corrupts the stored
+                # paths and makes the scripts show as "not found" next launch).
+                root = os.path.normpath(self.scripts_dir) if self.scripts_dir else None
+                self._valid_canon()  # populate self._canon_scanned for _heal_path
+
+                def _restore(p):
+                    if root:
+                        ab = path_to_absolute(p, root)
+                        ab = (os.path.normpath(ab)
+                              if ab and not ab.startswith(NON_SCRIPT_PREFIXES) else ab)
+                    else:
+                        ab = p
+                    return self._heal_path(ab)
+
+                self.notes = {_restore(k): v for k, v in saved_wf.get("notes", {}).items()}
+                self.step_colors = dict(saved_wf.get("step_colors", {}))
+                self._last_step_color = saved.get("last_step_color", DEFAULT_STEP_COLOR)
+                # Revert the workflow dict itself so the discarded step_colors
+                # are not re-written to disk by the save_state call below.  Its
+                # path-bearing fields are restored to absolute (healed) form for
+                # the same reason as the notes above.
+                if self._active_workflow and self._active_workflow in self.workflows:
+                    reverted = dict(saved_wf)
+                    reverted["selections"] = [_restore(p) for p in saved_wf.get("selections", [])]
+                    reverted["favorites"]  = [_restore(p) for p in saved_wf.get("favorites", [])]
+                    reverted["group_selections"] = {
+                        gid: _restore(item)
+                        for gid, item in saved_wf.get("group_selections", {}).items()}
+                    reverted["notes"] = self.notes
+                    self.workflows[self._active_workflow] = reverted
             except (FileNotFoundError, json.JSONDecodeError):
                 self.notes = {}
+                self.step_colors = {}
+                self._last_step_color = DEFAULT_STEP_COLOR
             self.checked_paths.clear()
             self.favorites.clear()
             self._active_workflow = ""
@@ -4646,7 +5267,8 @@ class WorkflowCompanionWindow(QMainWindow):
         geom = {"x": g.x(), "y": g.y(), "w": g.width(), "h": g.height()}
         on_top = self._ontop_chk.isChecked()
         save_state(self.checked_paths, self.favorites, scripts_dir=self.scripts_dir, geometry=geom,
-                   active_workflow=self._active_workflow, notes=self.notes, on_top=on_top)
+                   workflows=self.workflows, active_workflow=self._active_workflow,
+                   notes=self.notes, on_top=on_top)
         super().closeEvent(event)
 
     def toggle_ontop(self, checked: bool):
@@ -4786,7 +5408,7 @@ class WorkflowCompanionWindow(QMainWindow):
 
 
 def main():
-    global STATE_FILE, _DIALOG_GROUPS, _SIRILPY_HAS_DIALOGS
+    global STATE_FILE, _DIALOG_GROUPS
 
     app = QApplication.instance() or QApplication(sys.argv)
 

@@ -11,7 +11,7 @@ The script offers two photometry methods:
 
 Inspired by Mike Cranfield's script
 
-(c) Cyril Richard 2025
+(c) Cyril Richard 2026
 SPDX-License-Identifier: GPL-3.0-or-later
 """
 
@@ -21,6 +21,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 # 1.1.1  Improved error handling and added fallback to partner Gaia archives
 # 1.1.2  Commented Gaia archives part due to server issue
 # 1.1.3  If no CLI arguments, run in GUI mode by default
+# 1.1.4  Update SPCC detection following the new keyword in 1.5
 
 import sirilpy as s
 s.ensure_installed('PyQt6')
@@ -52,7 +53,7 @@ import astropy.units as u
 # NOTE: We import Gaia only when needed to avoid connection attempts at startup
 import csv
 
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 
 if not s.check_module_version('>=0.6.42'):
     print("Error: requires sirilpy module >= 0.6.42")
@@ -1641,11 +1642,15 @@ class HRDiagramDialog(QMainWindow):
         """Start the Gaia query and photometry process"""
         # Check if SPCC has been applied
         try:
+            # Siril writes the full name in HISTORY, not the "SPCC" acronym
+            SPCC_MARKERS = ('SPECTROPHOTOMETRIC', 'SPCC')
+
             history = self.siril.get_image_history()
             spcc_found = False
             if history:
                 for entry in history:
-                    if 'SPCC' in entry.upper():
+                    entry_upper = entry.upper()
+                    if any(marker in entry_upper for marker in SPCC_MARKERS):
                         spcc_found = True
                         break
             
@@ -1880,3 +1885,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

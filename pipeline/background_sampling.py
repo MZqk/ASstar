@@ -16,11 +16,13 @@ from stage3_contract import (
     STAGE3_RADIAL_BIC_DELTA_MIN,
     STAGE3_RADIAL_RESIDUAL_SPAN_RATIO_MAX,
     STAGE3_SIGNIFICANCE_SIGMA,
+    normalize_stage3_gate_profile,
+    stage3_gate_thresholds,
 )
 
 
-STAGE3_PROCESS_EVIDENCE_SCHEMA = "seestar.stage3-process-evidence.v1"
-STAGE3_BACKGROUND_VALIDATION_SCHEMA = "seestar.stage3-background-validation.v1"
+STAGE3_PROCESS_EVIDENCE_SCHEMA = "starun.stage3-process-evidence.v1"
+STAGE3_BACKGROUND_VALIDATION_SCHEMA = "starun.stage3-background-validation.v1"
 
 
 def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
@@ -1147,18 +1149,23 @@ def split_background_sample_points(
     image: Any,
     *,
     validation_ratio: float = 0.25,
-    minimum_total: int = 32,
-    minimum_fit: int = 24,
-    minimum_validation: int = 8,
+    minimum_total: int = 12,
+    minimum_fit: int = 8,
+    minimum_validation: int = 4,
 ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]], Dict[str, Any]]:
     """Deterministically reserve spatially distributed samples for validation."""
     source_points = [
         (float(point[0]), float(point[1]))
         for point in points
     ]
-    minimum_total = max(32, int(minimum_total))
-    minimum_fit = max(24, int(minimum_fit))
-    minimum_validation = max(8, int(minimum_validation))
+    minimum_total = max(12, int(minimum_total))
+    minimum_fit = max(8, int(minimum_fit))
+    minimum_validation = max(4, int(minimum_validation))
+    fit_minimum_cells = min(STAGE3_MIN_SPATIAL_GRID_CELLS, minimum_fit)
+    validation_minimum_cells = min(
+        STAGE3_MIN_SPATIAL_GRID_CELLS,
+        minimum_validation,
+    )
     validation_ratio = _clamp(validation_ratio, 0.10, 0.40)
     try:
         luminance, _scale = _native_luminance(image)
@@ -1309,9 +1316,12 @@ def split_background_sample_points(
         )
         validation_ready = _coverage_ready(
             validation_coverage,
-            minimum_cells=8,
+            minimum_cells=validation_minimum_cells,
         )
-        fit_ready = _coverage_ready(fit_coverage, minimum_cells=8)
+        fit_ready = _coverage_ready(
+            fit_coverage,
+            minimum_cells=fit_minimum_cells,
+        )
         selection_key = (
             int(validation_ready and fit_ready),
             min(
@@ -1372,8 +1382,14 @@ def split_background_sample_points(
     ready = bool(
         len(fit_points) >= minimum_fit
         and len(validation_points) >= minimum_validation
-        and _coverage_ready(fit_coverage, minimum_cells=8)
-        and _coverage_ready(validation_coverage, minimum_cells=8)
+        and _coverage_ready(
+            fit_coverage,
+            minimum_cells=fit_minimum_cells,
+        )
+        and _coverage_ready(
+            validation_coverage,
+            minimum_cells=validation_minimum_cells,
+        )
     )
     report = {
         "status": "ready" if ready else "insufficient_safe_coverage",
@@ -1385,6 +1401,8 @@ def split_background_sample_points(
         "minimum_total": minimum_total,
         "minimum_fit": minimum_fit,
         "minimum_validation": minimum_validation,
+        "fit_minimum_grid_cells": fit_minimum_cells,
+        "validation_minimum_grid_cells": validation_minimum_cells,
         "fit_coverage": fit_coverage,
         "validation_coverage": validation_coverage,
         "fit_points": [[x, y] for x, y in fit_points] if ready else [],
@@ -1673,7 +1691,7 @@ def assess_background_process(
         and spatial.get("spatial_variation_supported")
     )
     pattern_detected = bool((pattern_report or {}).get("detected", False))
-    radial_multiplicative = bool(
+    radial_shape_supported = bool(
         spatial.get("radial_multiplicative_pattern_supported", False)
     )
     diffuse = bool(
@@ -1689,9 +1707,14 @@ def assess_background_process(
     elif pattern_detected and not spatial_supported:
         mechanism = "directional_pattern_or_walking_noise"
         correction_mode = "defer_to_calibration_or_stacking"
-    elif radial_multiplicative:
-        mechanism = "multiplicative_vignetting_or_flat_error"
-        correction_mode = "master_flat_review"
+    elif radial_shape_supported:
+        # A radial profile in one already-integrated image is not sufficient
+        # evidence to distinguish multiplicative flat-field error from an
+        # additive radial sky gradient.  Keep the flat-field interpretation as
+        # an advisory, but let the normal held-out-sky and target-fidelity gates
+        # decide whether a bounded subtraction candidate is safe.
+        mechanism = "radial_low_frequency_gradient_ambiguous"
+        correction_mode = "subtract_with_master_flat_advisory"
     elif spatial_supported:
         mechanism = "additive_low_frequency_gradient"
         correction_mode = "subtract"
@@ -1706,9 +1729,6 @@ def assess_background_process(
         hard_blocks.append("insufficient_source_masked_true_sky_support")
     if mechanism == "directional_pattern_or_walking_noise":
         hard_blocks.append("directional_noise_is_not_a_sky_gradient")
-    if mechanism == "multiplicative_vignetting_or_flat_error":
-        hard_blocks.append("multiplicative_error_requires_flat_field_review")
-
     low_complexity_required = bool(
         diffuse
         or target_type in {"large_galaxy", "galaxy", "dark_nebula"}
@@ -1717,8 +1737,16 @@ def assess_background_process(
     )
     should_evaluate = bool(
         not hard_blocks
-        and mechanism == "additive_low_frequency_gradient"
+        and mechanism in {
+            "additive_low_frequency_gradient",
+            "radial_low_frequency_gradient_ambiguous",
+        }
     )
+    advisory_reasons: List[str] = []
+    if radial_shape_supported:
+        advisory_reasons.append(
+            "radial_shape_cannot_distinguish_additive_gradient_from_flat_error"
+        )
     return {
         "schema_version": STAGE3_PROCESS_EVIDENCE_SCHEMA,
         "calibration_status": "process_safety_contract_not_industry_standard",
@@ -1741,6 +1769,8 @@ def assess_background_process(
         "correction_mode": correction_mode,
         "spatial_variation_supported": spatial_supported,
         "directional_pattern_detected": pattern_detected,
+        "radial_shape_supported": radial_shape_supported,
+        "advisory_reasons": advisory_reasons,
         "low_complexity_required": low_complexity_required,
         "model_complexity_limit": (
             "polynomial_degree_1"
@@ -1759,30 +1789,86 @@ def assess_background_process(
     }
 
 
+def _stage3_gate_result(
+    profile: str,
+    warnings: List[str],
+    hard_issues: List[str],
+    **payload: Any,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Build a compatible normal/soft-warning/hard-rejection gate report."""
+    normalized = normalize_stage3_gate_profile(profile)
+    warnings = list(dict.fromkeys(str(item) for item in warnings if item))
+    hard_issues = list(dict.fromkeys(str(item) for item in hard_issues if item))
+    accepted = not hard_issues
+    severity = (
+        "hard_rejected"
+        if hard_issues
+        else ("soft_warning" if warnings else "normal")
+    )
+    report = {
+        "status": (
+            "rejected"
+            if hard_issues
+            else ("accepted_with_warnings" if warnings else "accepted")
+        ),
+        "accepted": accepted,
+        "severity": severity,
+        "warnings": warnings,
+        "hard_issues": hard_issues,
+        "issues": hard_issues + warnings,
+        "profile": normalized,
+        "effective_thresholds": stage3_gate_thresholds(normalized),
+        **payload,
+    }
+    return accepted, report
+
+
 def assess_single_background_validation(
     baseline: Dict[str, Any],
     candidate: Dict[str, Any],
+    *,
+    gate_profile: str = "output_first",
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Require a candidate to improve held-out sky beyond sampling uncertainty."""
+    """Classify held-out background evidence using the selected gate profile."""
+    profile = normalize_stage3_gate_profile(gate_profile)
+    thresholds = stage3_gate_thresholds(profile)
+    strict = bool(thresholds.get("strict_legacy"))
+    unavailable = "held-out background/RMS metrics are unavailable"
     if baseline.get("status") != "ready" or candidate.get("status") != "ready":
-        return False, {
-            "status": "rejected",
-            "accepted": False,
-            "issues": ["held-out background/RMS metrics are unavailable"],
-            "baseline": baseline or {},
-            "candidate": candidate or {},
-        }
+        return _stage3_gate_result(
+            profile,
+            [] if strict else [unavailable],
+            [unavailable] if strict else [],
+            baseline=baseline or {},
+            candidate=candidate or {},
+        )
     try:
         baseline_span = float(baseline["robust_span"])
         candidate_span = float(candidate["robust_span"])
         baseline_noise = float(baseline["patch_mad_median"])
         candidate_noise = float(candidate["patch_mad_median"])
     except (KeyError, TypeError, ValueError):
-        return False, {
-            "status": "rejected",
-            "accepted": False,
-            "issues": ["held-out background/RMS metrics are incomplete"],
-        }
+        incomplete = "held-out background/RMS metrics are incomplete"
+        return _stage3_gate_result(
+            profile,
+            [] if strict else [incomplete],
+            [incomplete] if strict else [],
+        )
+    if not all(
+        math.isfinite(value)
+        for value in (
+            baseline_span,
+            candidate_span,
+            baseline_noise,
+            candidate_noise,
+        )
+    ):
+        nonfinite = "held-out background/RMS metrics contain non-finite values"
+        return _stage3_gate_result(
+            profile,
+            [] if strict else [nonfinite],
+            [nonfinite] if strict else [],
+        )
     baseline_span_se = background_span_standard_error(baseline)
     candidate_span_se = background_span_standard_error(candidate)
     three_sigma = max(
@@ -1794,78 +1880,171 @@ def assess_single_background_validation(
     span_not_worse = bool(candidate_span <= baseline_span + three_sigma)
     material_improvement = bool(span_improvement > three_sigma)
     rms_not_worse = bool(candidate_noise <= baseline_noise + three_sigma)
-    issues: List[str] = []
+    warnings: List[str] = []
     if not span_not_worse:
-        issues.append("held-out spatial background span worsened")
+        warnings.append("held-out spatial background span worsened")
     if not material_improvement:
-        issues.append("held-out span improvement is below sampling uncertainty")
+        warnings.append("held-out span improvement is below sampling uncertainty")
     if not rms_not_worse:
-        issues.append("held-out background RMS increased beyond sampling uncertainty")
-    accepted = not issues
-    return accepted, {
-        "status": "accepted" if accepted else "rejected",
-        "accepted": accepted,
-        "issues": issues,
-        "baseline_span": baseline_span,
-        "candidate_span": candidate_span,
-        "span_improvement": span_improvement,
-        "sampling_uncertainty_3sigma": three_sigma,
-        "uncertainty_method": (
+        warnings.append("held-out background RMS increased beyond sampling uncertainty")
+
+    hard_issues: List[str] = []
+    if strict:
+        hard_issues.extend(warnings)
+        warnings = []
+    else:
+        sigma_unit = max(three_sigma / STAGE3_SIGNIFICANCE_SIGMA, 1e-12)
+        hard_sigma = float(thresholds["hard_significance_sigma"])
+        span_worsening = max(0.0, candidate_span - baseline_span)
+        rms_worsening = max(0.0, candidate_noise - baseline_noise)
+        span_ratio = candidate_span / max(baseline_span, 1e-12)
+        rms_ratio = candidate_noise / max(baseline_noise, 1e-12)
+        if (
+            span_ratio > float(thresholds["span_hard_ratio"])
+            and span_worsening / sigma_unit > hard_sigma
+        ):
+            hard_issues.append(
+                "held-out spatial background span is excessively worse "
+                f"({span_ratio:.2f}x, {span_worsening / sigma_unit:.2f} sigma)"
+            )
+        if (
+            rms_ratio > float(thresholds["rms_hard_ratio"])
+            and rms_worsening / sigma_unit > hard_sigma
+        ):
+            hard_issues.append(
+                "held-out background RMS is excessively worse "
+                f"({rms_ratio:.2f}x, {rms_worsening / sigma_unit:.2f} sigma)"
+            )
+
+    accepted, report = _stage3_gate_result(
+        profile,
+        warnings,
+        hard_issues,
+        baseline_span=baseline_span,
+        candidate_span=candidate_span,
+        span_improvement=span_improvement,
+        sampling_uncertainty_3sigma=three_sigma,
+        uncertainty_method=(
             "correlation_aware_span_difference"
             if "patch_median_uncertainty" in baseline
             and "patch_median_uncertainty" in candidate
             else "legacy_pixel_independence_fallback"
         ),
-        "material_improvement": material_improvement,
-        "span_not_worse": span_not_worse,
-        "baseline_background_rms": baseline_noise,
-        "candidate_background_rms": candidate_noise,
-        "background_rms_not_worse": rms_not_worse,
-        "baseline_median": baseline.get("median"),
-        "candidate_median": candidate.get("median"),
-    }
+        material_improvement=material_improvement,
+        span_not_worse=span_not_worse,
+        baseline_background_rms=baseline_noise,
+        candidate_background_rms=candidate_noise,
+        background_rms_not_worse=rms_not_worse,
+        baseline_median=baseline.get("median"),
+        candidate_median=candidate.get("median"),
+    )
+    return accepted, report
 
 
 def assess_target_fidelity(
     preservation: Dict[str, Any],
     *,
     low_complexity_required: bool,
+    gate_profile: str = "output_first",
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Reject statistically supported target loss or excess model structure.
+    """Classify target-fidelity changes as normal, warning, or hard rejection.
 
     The comparison is meaningful only when target flux is referenced to a
     degree-1 sky plane fitted on the held-out samples.  A three-sigma decision
     boundary is applied to measured uncertainty rather than to a product-wide
     flux-retention percentage.
     """
+    profile = normalize_stage3_gate_profile(gate_profile)
+    thresholds = stage3_gate_thresholds(profile)
+    strict = bool(thresholds.get("strict_legacy"))
     report = preservation or {}
-    issues: List[str] = []
+    warnings: List[str] = []
+    hard_issues: List[str] = []
     if not report.get("available"):
-        issues.append("target fidelity metrics are unavailable")
+        (hard_issues if strict else warnings).append(
+            "target fidelity metrics are unavailable"
+        )
     if report.get("target_sky_reference") != "heldout_sky_plane_degree_1":
-        issues.append("target flux lacks an independent held-out sky reference")
+        (hard_issues if strict else warnings).append(
+            "target flux lacks an independent held-out sky reference"
+        )
 
     try:
         flux_significance = float(report["target_flux_change_significance"])
     except (KeyError, TypeError, ValueError):
         flux_significance = math.nan
-        issues.append("target flux-change significance is unavailable")
-    if (
-        math.isfinite(flux_significance)
-        and flux_significance < -STAGE3_SIGNIFICANCE_SIGMA
-    ):
-        issues.append(
-            "background-referenced target flux loss exceeds three-sigma "
-            f"uncertainty ({flux_significance:.2f} sigma)"
+    if not math.isfinite(flux_significance):
+        (hard_issues if strict else warnings).append(
+            "target flux-change significance is unavailable"
         )
+
+    try:
+        flux_retention = float(report["target_flux_retention_ratio"])
+    except (KeyError, TypeError, ValueError):
+        flux_retention = math.nan
+    if not math.isfinite(flux_retention):
+        (hard_issues if strict else warnings).append(
+            "target flux-retention ratio is unavailable"
+        )
+    if math.isfinite(flux_significance):
+        if flux_significance < -STAGE3_SIGNIFICANCE_SIGMA:
+            message = (
+                "background-referenced target flux loss exceeds three-sigma "
+                f"uncertainty ({flux_significance:.2f} sigma)"
+            )
+            (hard_issues if strict else warnings).append(message)
+        elif flux_significance > STAGE3_SIGNIFICANCE_SIGMA and not strict:
+            warnings.append(
+                "background-referenced target flux growth exceeds three-sigma "
+                f"uncertainty (+{flux_significance:.2f} sigma)"
+            )
+    if not strict and math.isfinite(flux_retention):
+        if not (
+            float(thresholds["flux_retention_soft_min"])
+            <= flux_retention
+            <= float(thresholds["flux_retention_soft_max"])
+        ):
+            warnings.append(
+                f"target flux retention is outside the preferred range ({flux_retention:.3f})"
+            )
+        hard_sigma = float(thresholds["hard_significance_sigma"])
+        if (
+            flux_retention < float(thresholds["flux_retention_hard_min"])
+            and math.isfinite(flux_significance)
+            and flux_significance < -hard_sigma
+        ):
+            hard_issues.append(
+                f"target flux loss is excessive ({flux_retention:.3f}, {flux_significance:.2f} sigma)"
+            )
+        if (
+            flux_retention > float(thresholds["flux_retention_hard_max"])
+            and math.isfinite(flux_significance)
+            and flux_significance > hard_sigma
+        ):
+            hard_issues.append(
+                f"target flux growth is excessive ({flux_retention:.3f}, +{flux_significance:.2f} sigma)"
+            )
 
     try:
         morphology = float(report["target_morphology_correlation"])
     except (KeyError, TypeError, ValueError):
         morphology = math.nan
-        issues.append("target morphology correlation is unavailable")
+        (hard_issues if strict else warnings).append(
+            "target morphology correlation is unavailable"
+        )
     if not math.isfinite(morphology):
-        issues.append("target morphology correlation is non-finite")
+        (hard_issues if strict else warnings).append(
+            "target morphology correlation is non-finite"
+        )
+    elif not strict:
+        if morphology < float(thresholds["morphology_soft_min"]):
+            warnings.append(
+                f"target morphology correlation is low ({morphology:.5f})"
+            )
+        if morphology < float(thresholds["morphology_hard_min"]):
+            hard_issues.append(
+                f"target morphology correlation is excessively low ({morphology:.5f})"
+            )
 
     try:
         structure_significance = float(
@@ -1873,41 +2052,72 @@ def assess_target_fidelity(
         )
     except (KeyError, TypeError, ValueError):
         structure_significance = math.nan
-        if low_complexity_required:
-            issues.append("target change-structure significance is unavailable")
+    if low_complexity_required and not math.isfinite(structure_significance):
+        (hard_issues if strict else warnings).append(
+            "target change-structure significance is unavailable"
+        )
     if (
         low_complexity_required
         and math.isfinite(structure_significance)
         and structure_significance > STAGE3_SIGNIFICANCE_SIGMA
     ):
-        issues.append(
+        message = (
             "candidate introduced target-region structure beyond the authorized "
             f"degree-1 model ({structure_significance:.2f} sigma)"
         )
+        (hard_issues if strict else warnings).append(message)
+    if (
+        not strict
+        and low_complexity_required
+        and math.isfinite(structure_significance)
+        and structure_significance > float(thresholds["structure_hard_sigma"])
+    ):
+        hard_issues.append(
+            "candidate introduced excessive target-region structure "
+            f"({structure_significance:.2f} sigma)"
+        )
 
-    accepted = not issues
-    return accepted, {
-        "status": "accepted" if accepted else "rejected",
-        "accepted": accepted,
-        "issues": issues,
-        "uncertainty_basis": "held-out_sky_plane_three_sigma",
-        "low_complexity_required": bool(low_complexity_required),
-        "target_flux_retention_ratio": report.get("target_flux_retention_ratio"),
-        "target_flux_change_significance": (
+    try:
+        centroid_shift = float(report["target_centroid_shift_fraction"])
+    except (KeyError, TypeError, ValueError):
+        centroid_shift = math.nan
+    if not strict and not math.isfinite(centroid_shift):
+        warnings.append("target centroid shift is unavailable")
+    if not strict and math.isfinite(centroid_shift):
+        if centroid_shift > float(thresholds["centroid_soft_max"]):
+            warnings.append(
+                f"target centroid shift is elevated ({centroid_shift:.5f})"
+            )
+        if centroid_shift > float(thresholds["centroid_hard_max"]):
+            hard_issues.append(
+                f"target centroid shift is excessive ({centroid_shift:.5f})"
+            )
+
+    accepted, gate = _stage3_gate_result(
+        profile,
+        warnings,
+        hard_issues,
+        uncertainty_basis="held-out_sky_plane_three_sigma",
+        low_complexity_required=bool(low_complexity_required),
+        target_flux_retention_ratio=(
+            flux_retention if math.isfinite(flux_retention) else None
+        ),
+        target_flux_change_significance=(
             flux_significance if math.isfinite(flux_significance) else None
         ),
-        "target_morphology_correlation": (
+        target_morphology_correlation=(
             morphology if math.isfinite(morphology) else None
         ),
-        "target_change_residual_significance": (
+        target_change_residual_significance=(
             structure_significance
             if math.isfinite(structure_significance)
             else None
         ),
-        "target_centroid_shift_fraction": report.get(
-            "target_centroid_shift_fraction"
+        target_centroid_shift_fraction=(
+            centroid_shift if math.isfinite(centroid_shift) else None
         ),
-    }
+    )
+    return accepted, gate
 
 
 def assess_compound_background_validation(
@@ -1919,8 +2129,11 @@ def assess_compound_background_validation(
     improvement_min: float = 0.10,
     zero_point_abs_max: float = 0.01,
     zero_point_rel_max: float = 0.15,
+    gate_profile: str = "output_first",
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Fail closed unless the compound model improves held-out sky patches."""
+    """Classify compound-model evidence without hiding output-first warnings."""
+    profile = normalize_stage3_gate_profile(gate_profile)
+    strict = bool(stage3_gate_thresholds(profile).get("strict_legacy"))
     reports = {
         "baseline": baseline or {},
         "best_single": best_single or {},
@@ -1933,14 +2146,13 @@ def assess_compound_background_validation(
         if report.get("status") != "ready"
     ]
     if unavailable:
-        return False, {
-            "status": "rejected",
-            "accepted": False,
-            "issues": [
-                "validation metrics unavailable: " + ", ".join(unavailable)
-            ],
-            "measurements": reports,
-        }
+        message = "validation metrics unavailable: " + ", ".join(unavailable)
+        return _stage3_gate_result(
+            profile,
+            [] if strict else [message],
+            [message] if strict else [],
+            measurements=reports,
+        )
     counts = {
         int(report.get("sample_count", 0) or 0)
         for report in reports.values()
@@ -1950,12 +2162,13 @@ def assess_compound_background_validation(
         or not counts
         or min(counts) < STAGE3_MIN_VALIDATION_PATCHES
     ):
-        return False, {
-            "status": "rejected",
-            "accepted": False,
-            "issues": ["validation sample counts are inconsistent"],
-            "measurements": reports,
-        }
+        message = "validation sample counts are inconsistent"
+        return _stage3_gate_result(
+            profile,
+            [] if strict else [message],
+            [message] if strict else [],
+            measurements=reports,
+        )
     try:
         baseline_span = float(baseline["robust_span"])
         single_span = float(best_single["robust_span"])
@@ -1963,12 +2176,13 @@ def assess_compound_background_validation(
         polynomial_median = float(polynomial["median"])
         compound_median = float(compound["median"])
     except (KeyError, TypeError, ValueError):
-        return False, {
-            "status": "rejected",
-            "accepted": False,
-            "issues": ["validation metrics are incomplete"],
-            "measurements": reports,
-        }
+        message = "validation metrics are incomplete"
+        return _stage3_gate_result(
+            profile,
+            [] if strict else [message],
+            [message] if strict else [],
+            measurements=reports,
+        )
     numeric_values = (
         baseline_span,
         single_span,
@@ -1977,19 +2191,21 @@ def assess_compound_background_validation(
         compound_median,
     )
     if not all(math.isfinite(value) for value in numeric_values):
-        return False, {
-            "status": "rejected",
-            "accepted": False,
-            "issues": ["validation metrics contain non-finite values"],
-            "measurements": reports,
-        }
+        message = "validation metrics contain non-finite values"
+        return _stage3_gate_result(
+            profile,
+            [] if strict else [message],
+            [message] if strict else [],
+            measurements=reports,
+        )
     if single_span <= 1e-10:
-        return False, {
-            "status": "rejected",
-            "accepted": False,
-            "issues": ["best single-stage candidate has no measurable residual span"],
-            "measurements": reports,
-        }
+        message = "best single-stage candidate has no measurable residual span"
+        return _stage3_gate_result(
+            profile,
+            [] if strict else [message],
+            [message] if strict else [],
+            measurements=reports,
+        )
 
     improvement_min = _clamp(improvement_min, 0.0, 0.80)
     improvement = (single_span - compound_span) / single_span
@@ -2014,20 +2230,30 @@ def assess_compound_background_validation(
             "held-out zero-point drift "
             f"{zero_point_drift:.6f}>{zero_point_limit:.6f}"
         )
-    accepted = not issues
-    return accepted, {
-        "status": "accepted" if accepted else "rejected",
-        "accepted": accepted,
-        "issues": issues,
-        "span_improvement_ratio": improvement,
-        "span_improvement_min": improvement_min,
-        "baseline_not_worse": baseline_not_worse,
-        "zero_point_drift": zero_point_drift,
-        "zero_point_limit": zero_point_limit,
-        "zero_point_abs_max": float(zero_point_abs_max),
-        "zero_point_rel_max": float(zero_point_rel_max),
-        "measurements": reports,
-    }
+    _single_ok, single_gate = assess_single_background_validation(
+        baseline,
+        compound,
+        gate_profile=profile,
+    )
+    warnings = list(issues) + list(single_gate.get("warnings") or [])
+    hard_issues = list(single_gate.get("hard_issues") or [])
+    if strict:
+        hard_issues.extend(warnings)
+        warnings = []
+    return _stage3_gate_result(
+        profile,
+        warnings,
+        hard_issues,
+        span_improvement_ratio=improvement,
+        span_improvement_min=improvement_min,
+        baseline_not_worse=baseline_not_worse,
+        zero_point_drift=zero_point_drift,
+        zero_point_limit=zero_point_limit,
+        zero_point_abs_max=float(zero_point_abs_max),
+        zero_point_rel_max=float(zero_point_rel_max),
+        single_candidate_gate=single_gate,
+        measurements=reports,
+    )
 
 
 def select_background_route(
@@ -2051,7 +2277,10 @@ def select_background_route(
     if isinstance(process_report, dict) and process_report:
         gradient_supported = bool(
             process_report.get("spatial_variation_supported", False)
-            and process_report.get("correction_mode") == "subtract"
+            and process_report.get("correction_mode") in {
+                "subtract",
+                "subtract_with_master_flat_advisory",
+            }
         )
         evidence_basis = "source_masked_heldout_spatial_process"
     else:
@@ -2126,14 +2355,31 @@ def pattern_candidate_gate(
     after: Dict[str, Any],
     *,
     growth_max: float = 0.12,
+    gate_profile: str = "output_first",
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Reject a background candidate that introduces or amplifies banding."""
+    """Classify introduced/amplified directional pattern noise."""
+    profile = normalize_stage3_gate_profile(gate_profile)
+    thresholds = stage3_gate_thresholds(profile)
+    strict = bool(thresholds.get("strict_legacy"))
     if before.get("status") != "ok" or after.get("status") != "ok":
-        return True, {
-            "status": "not_available",
-            "accepted": True,
-            "reason": "directional pattern metrics unavailable",
-        }
+        if strict:
+            return True, {
+                "status": "not_available",
+                "accepted": True,
+                "severity": "normal",
+                "warnings": [],
+                "hard_issues": [],
+                "issues": [],
+                "profile": profile,
+                "effective_thresholds": thresholds,
+                "reason": "directional pattern metrics unavailable",
+            }
+        return _stage3_gate_result(
+            profile,
+            ["directional pattern metrics are unavailable"],
+            [],
+            reason="directional pattern metrics unavailable",
+        )
     before_score = float(before.get("pattern_score", 0.0) or 0.0)
     after_score = float(after.get("pattern_score", 0.0) or 0.0)
     growth = after_score - before_score
@@ -2144,18 +2390,32 @@ def pattern_candidate_gate(
     growth_max = _clamp(growth_max, 0.02, 0.40)
     introduced = bool(after.get("detected")) and not bool(before.get("detected"))
     worsened = bool(growth > growth_max and after_score >= threshold)
-    accepted = not (introduced or worsened)
-    return accepted, {
-        "status": "accepted" if accepted else "rejected",
-        "accepted": accepted,
-        "pattern_score_before": before_score,
-        "pattern_score_after": after_score,
-        "pattern_score_growth": growth,
-        "growth_max": growth_max,
-        "introduced_pattern_noise": introduced,
-        "worsened_pattern_noise": worsened,
-        "after_kind": after.get("kind"),
-    }
+    warning_message = "candidate introduced or materially worsened directional pattern noise"
+    warnings = [warning_message] if introduced or worsened else []
+    hard_issues: List[str] = []
+    if strict:
+        hard_issues = warnings
+        warnings = []
+    elif (
+        after_score > float(thresholds["pattern_hard_score"])
+        and growth > float(thresholds["pattern_hard_growth"])
+    ):
+        hard_issues.append(
+            "candidate introduced excessive directional pattern noise "
+            f"(score={after_score:.3f}, growth={growth:.3f})"
+        )
+    return _stage3_gate_result(
+        profile,
+        warnings,
+        hard_issues,
+        pattern_score_before=before_score,
+        pattern_score_after=after_score,
+        pattern_score_growth=growth,
+        growth_max=growth_max,
+        introduced_pattern_noise=introduced,
+        worsened_pattern_noise=worsened,
+        after_kind=after.get("kind"),
+    )
 
 
 __all__ = [

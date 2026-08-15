@@ -1,4 +1,4 @@
-"""Service mixins for SeestarPostProcessor."""
+"""Service mixins for StarunPostProcessor."""
 from __future__ import annotations
 
 import copy
@@ -16,13 +16,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-import ai_advisory
 import cosmic_clarity
 import plugin_runner
 import sasp_runner
 import scunet_denoise
 import syqon_starless
 import stage7_quality
+from stage7_pixel_domain import canonicalize_stage7_pixels_01
 import stage7_repair
 import stage8_pixels
 from image_metrics import (
@@ -32,8 +32,8 @@ from image_metrics import (
     format_feature_summary,
     measure_quality_metrics,
 )
-from models import ImageFeatures, QualityMetrics, Stage6StretchStrategy, StageResult, TargetType
-from save_utils import save_stage_output, write_ai_raw_response, write_stage_json
+from models import ImageFeatures, QualityMetrics, Stage7StretchStrategy, StageResult, TargetType
+from save_utils import save_stage_output, write_stage_json
 
 try:
     from sirilpy.exceptions import CommandError, DataError, SirilError
@@ -45,33 +45,23 @@ except ImportError:
 try:
     from image_feature_analyzer import analyze_image as analyze_adaptive_image
     from policy_selector import DEFAULT_POLICY, policy_for_profile
-    from stretch_candidate_evaluator import (
-        build_candidate_spec,
-        candidate_modes,
-        choose_best as choose_best_stretch_candidate,
-        score_candidate as score_stretch_candidate,
-    )
     from target_profiler import build_target_profile, normalize_target_profile
 except (ImportError, RuntimeError):
     analyze_adaptive_image = None
     DEFAULT_POLICY = {
         "policy_name": "generic_low_snr_safe",
-        "stage6_stretch": {"fallback_candidate": "asinh_core_protect"},
+        "stage7_stretch": {"fallback_candidate": "asinh_core_protect"},
     }
     policy_for_profile = None
-    build_candidate_spec = None
-    candidate_modes = None
-    choose_best_stretch_candidate = None
-    score_stretch_candidate = None
     build_target_profile = None
     normalize_target_profile = None
 
 ENV_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 ENV_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
-ENV_DEBUG_MODE_KEY = "SEESTAR_DEBUG_MODE"
-ENV_INPUT_MODE_KEY = "SEESTAR_INPUT_MODE"
+ENV_DEBUG_MODE_KEY = "STARUN_DEBUG_MODE"
+ENV_INPUT_MODE_KEY = "STARUN_INPUT_MODE"
 INPUT_MODE_AUTO = "auto"
-INPUT_MODE_LINEAR_RESUME = "result_linear_resume"
+INPUT_MODE_LINEAR_RESUME = "stage5_linear_resume"
 RESULT_BASENAME_TEMPLATE = (
     "$OBJECT:%s$_$STACKCNT:%d$x$EXPTIME:%d$sec"
     "_$DATE-OBS:dm12$_processed"
@@ -174,64 +164,83 @@ class TargetRuntimeMixin:
         return self._adaptive_features_from_image(data)
 
 
+    def _pixel_distribution_stats_from_canonical(
+        self,
+        image_data_01: np.ndarray,
+        pixel_domain: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Measure a previously validated Stage 7 float32 0..1 buffer."""
+        arr = np.asarray(image_data_01, dtype=np.float32)
+        flat = arr.reshape(-1)
+        p01, p50, p90, p99 = np.percentile(flat, [1.0, 50.0, 90.0, 99.0])
+        min_v = float(np.min(flat))
+        max_v = float(np.max(flat))
+        median = float(np.median(flat))
+        dynamic = max_v - min_v
+        global_dark_ratio = float(np.mean(flat <= 0.010))
+        object_signal_ratio = float(
+            (float(p99) - float(p50)) / max(float(p50), 0.003)
+        )
+        safe_preview_visibility = float(
+            (float(p99) - float(p50)) / max(float(p99), 0.010)
+        )
+        core_peak_ratio = float(max_v / max(float(p50), 0.003))
+        visibility_too_low = (
+            global_dark_ratio > 0.985
+            and float(p99) < 0.020
+            and safe_preview_visibility < 0.35
+        )
+        nearly_black = (
+            visibility_too_low
+            or
+            (
+                float(p99) <= 0.006
+                and float(p90) <= 0.003
+                and safe_preview_visibility < 0.12
+                and core_peak_ratio < 3.0
+            )
+            or (
+                float(p99) <= 0.012
+                and dynamic <= 0.004
+                and object_signal_ratio < 1.0
+                and safe_preview_visibility < 0.15
+                and core_peak_ratio < 2.5
+            )
+        )
+        nearly_white = (float(p01) >= 0.92) or (median >= 0.98)
+        invalid_dynamic = (
+            (not math.isfinite(dynamic))
+            or dynamic <= 1e-5
+            or float(p99) <= float(p01) + 1e-5
+        )
+        return {
+            "min": min_v,
+            "max": max_v,
+            "median": median,
+            "p01": float(p01),
+            "p50": float(p50),
+            "p90": float(p90),
+            "p99": float(p99),
+            "dynamic_range": float(dynamic),
+            "global_dark_ratio": global_dark_ratio,
+            "object_signal_ratio": object_signal_ratio,
+            "safe_preview_visibility_score": safe_preview_visibility,
+            "core_peak_ratio": core_peak_ratio,
+            "is_visibility_too_low": bool(visibility_too_low),
+            "is_nearly_black": bool(nearly_black),
+            "is_nearly_white": bool(nearly_white),
+            "invalid_dynamic_range": bool(invalid_dynamic),
+            "pixel_domain": dict(pixel_domain),
+        }
+
+
     def _pixel_distribution_stats(self, image_data: Any) -> Dict[str, Any]:
         try:
-            arr = np.asarray(image_data, dtype=np.float32)
-            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-            if arr.size == 0:
-                raise ValueError("empty image")
-            flat = arr.reshape(-1)
-            p01, p50, p90, p99 = np.percentile(flat, [1.0, 50.0, 90.0, 99.0])
-            min_v = float(np.min(flat))
-            max_v = float(np.max(flat))
-            median = float(np.median(flat))
-            dynamic = max_v - min_v
-            global_dark_ratio = float(np.mean(flat <= 0.010))
-            object_signal_ratio = float((float(p99) - float(p50)) / max(float(p50), 0.003))
-            safe_preview_visibility = float((float(p99) - float(p50)) / max(float(p99), 0.010))
-            core_peak_ratio = float(max_v / max(float(p50), 0.003))
-            visibility_too_low = (
-                global_dark_ratio > 0.985
-                and float(p99) < 0.020
-                and safe_preview_visibility < 0.35
+            arr, pixel_domain = canonicalize_stage7_pixels_01(image_data)
+            return self._pixel_distribution_stats_from_canonical(
+                arr,
+                pixel_domain,
             )
-            nearly_black = (
-                visibility_too_low
-                or
-                (
-                    float(p99) <= 0.006
-                    and float(p90) <= 0.003
-                    and safe_preview_visibility < 0.12
-                    and core_peak_ratio < 3.0
-                )
-                or (
-                    float(p99) <= 0.012
-                    and dynamic <= 0.004
-                    and object_signal_ratio < 1.0
-                    and safe_preview_visibility < 0.15
-                    and core_peak_ratio < 2.5
-                )
-            )
-            nearly_white = (float(p01) >= 0.92) or (median >= 0.98)
-            invalid_dynamic = (not math.isfinite(dynamic)) or dynamic <= 1e-5 or float(p99) <= float(p01) + 1e-5
-            return {
-                "min": min_v,
-                "max": max_v,
-                "median": median,
-                "p01": float(p01),
-                "p50": float(p50),
-                "p90": float(p90),
-                "p99": float(p99),
-                "dynamic_range": float(dynamic),
-                "global_dark_ratio": global_dark_ratio,
-                "object_signal_ratio": object_signal_ratio,
-                "safe_preview_visibility_score": safe_preview_visibility,
-                "core_peak_ratio": core_peak_ratio,
-                "is_visibility_too_low": bool(visibility_too_low),
-                "is_nearly_black": bool(nearly_black),
-                "is_nearly_white": bool(nearly_white),
-                "invalid_dynamic_range": bool(invalid_dynamic),
-            }
         except (RuntimeError, TypeError, ValueError, IndexError, FloatingPointError) as e:
             return {
                 "error": self._short_text(e, 160),

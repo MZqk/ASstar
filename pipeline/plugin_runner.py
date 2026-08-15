@@ -1,4 +1,4 @@
-"""Plugin command and CLI fallback helpers for the Seestar pipeline."""
+"""Plugin command and CLI fallback helpers for the Starun pipeline."""
 
 from __future__ import annotations
 
@@ -244,6 +244,7 @@ def plugin_output_failure_reason(pipeline, script_name: str, output_text: str) -
         "traceback (most recent call last):",
         "cosmic clarity process failed",
         "cosmic clarity sharpening process failed",
+        "could not send output to siril:",
         "error:",
     )
     if not any(marker in lowered for marker in failure_markers):
@@ -256,6 +257,7 @@ def plugin_output_failure_reason(pipeline, script_name: str, output_text: str) -
         if (
             "modulenotfounderror:" in line_lower
             or "cosmic clarity" in line_lower and "failed" in line_lower
+            or "could not send output to siril:" in line_lower
             or line_lower.startswith("error:")
             or "traceback (most recent call last):" in line_lower
         ):
@@ -321,30 +323,35 @@ def run_plugin_script_cli_subprocess(
     args: Tuple[str, ...] = (),
     timeout_sec: int = 1800,
     verify_image_change: bool = False,
+    uses_siril_connection: bool = True,
 ) -> Optional[str]:
     """
     以外部 Python 子进程调用脚本 CLI 模式（不走 Siril pyscript GUI 路径）。
     """
     pipeline._last_plugin_script_error = None
     python_cli = ""
-    raw_python_cli = os.getenv("SIRIL_PYTHON_CLI", "").strip()
-    if raw_python_cli:
+    for python_cli_env_key in (
+        "STARUN_SIRIL_PYTHON_CLI",
+        "SIRIL_PYTHON_CLI",
+    ):
+        raw_python_cli = os.getenv(python_cli_env_key, "").strip()
+        if not raw_python_cli:
+            continue
         lowered = raw_python_cli.lower()
         if lowered in ENV_TRUE_VALUES or lowered in ENV_FALSE_VALUES:
-            raw_python_cli = ""
-        else:
-            candidate_path = Path(raw_python_cli).expanduser()
-            if candidate_path.exists() and candidate_path.is_file():
-                python_cli = str(candidate_path)
-            else:
-                resolved = shutil.which(raw_python_cli)
-                if resolved:
-                    python_cli = resolved
-                else:
-                    pipeline.log.warn(
-                        "SIRIL_PYTHON_CLI is not executable; "
-                        f"ignore value: {raw_python_cli}"
-                    )
+            continue
+        candidate_path = Path(raw_python_cli).expanduser()
+        if candidate_path.exists() and candidate_path.is_file():
+            python_cli = str(candidate_path)
+            break
+        resolved = shutil.which(raw_python_cli)
+        if resolved:
+            python_cli = resolved
+            break
+        pipeline.log.warn(
+            f"{python_cli_env_key} is not executable; "
+            f"ignore value: {raw_python_cli}"
+        )
 
     if not python_cli:
         sys_exec = (sys.executable or "").strip()
@@ -355,7 +362,7 @@ def run_plugin_script_cli_subprocess(
 
     if python_cli:
         os.environ["SIRIL_PYTHON_CLI"] = python_cli
-        os.environ.setdefault("SEESTAR_SIRIL_PYTHON_CLI", python_cli)
+        os.environ["STARUN_SIRIL_PYTHON_CLI"] = python_cli
 
     if not python_cli:
         pipeline._last_plugin_script_error = (
@@ -382,16 +389,18 @@ def run_plugin_script_cli_subprocess(
     env = isolated_plugin_subprocess_env(os.environ)
     env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
-    raw_timeout = str(env.get("SEESTAR_SIRILPY_TIMEOUT_SEC", "")).strip()
+    raw_timeout = str(env.get("STARUN_SIRILPY_TIMEOUT_SEC", "")).strip()
     if not raw_timeout:
-        env["SEESTAR_SIRILPY_TIMEOUT_SEC"] = "120"
+        env["STARUN_SIRILPY_TIMEOUT_SEC"] = "300"
     env["SIRIL_PYTHON_CLI"] = python_cli
-    env.setdefault("SEESTAR_SIRIL_PYTHON_CLI", python_cli)
+    env["STARUN_SIRIL_PYTHON_CLI"] = python_cli
     cwd = str(pipeline.process_dir or pipeline.work_dir or Path.cwd())
 
     pipeline.log.info(f"{step_key} 使用 CLI 子进程: {script_path.name}")
     pipeline.log.debug(f"{step_key} CLI 命令: {' '.join(cmd)}")
-    parent_was_connected = bool(getattr(pipeline.siril, "connected", False))
+    parent_was_connected = bool(
+        uses_siril_connection and getattr(pipeline.siril, "connected", False)
+    )
     log_sink_paused = False
     if parent_was_connected:
         try:

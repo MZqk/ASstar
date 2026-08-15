@@ -24,6 +24,9 @@ and a thumbnail table of the found galaxies.
 # 1.2.2 Fix selection of loading result image in Siril
 # 1.2.3 Add minimal support for object types other than galaxies
 # 1.2.4 If no CLI arguments, run in GUI mode by default
+# 1.2.5 Add LDN/LBN catalog entries, tweak object type filters (still not working completely)
+# 1.2.6 Add optical magnitude limit filter (B/V/R/G/g/r bands)
+# 1.2.7 Pixel-perfect overlay image: fixed border budget, exact axes placement
 
 # Core module imports
 import os
@@ -72,7 +75,7 @@ import astropy.units as u
 from astroquery.simbad import Simbad
 import pandas as pd
 
-VERSION = "1.2.4"
+VERSION = "1.2.7"
 CONFIG_FILENAME = "Galaxy_Annotations.conf"
 
 # ============================================================================
@@ -98,11 +101,13 @@ class QueryOptions:
     catalogs: dict
     include_unknown_size: bool = True
     include_other_types: bool = False
-    
+    mag_limit: float = 99.0  # 99 = no limit
+
     def get_config(self):
         return {
            'include_unknown_size': self.include_unknown_size,
-           'include_other_types': self.include_other_types
+           'include_other_types': self.include_other_types,
+           'mag_limit': self.mag_limit
         }
     
 @dataclass
@@ -242,22 +247,29 @@ class AnnotationWorker(QObject):
         # Query Simbad
         simbad = Simbad()
         simbad.TIMEOUT = 120
-        simbad.add_votable_fields("otype", 
-          "galdim_majaxis", "galdim_minaxis", "galdim_angle", "galdim_qual", 
-          "rvz_redshift", "rvz_qual", "V")
+        simbad.add_votable_fields("otype",
+          "galdim_majaxis", "galdim_minaxis", "galdim_angle", "galdim_qual",
+          "rvz_redshift", "rvz_qual", "V", "B", "R", "G", "g", "r")
     
         target_coord = SkyCoord(ra=center_ra, dec=center_dec, unit=(u.deg, u.deg), frame='icrs')
         (TL_ra, TL_dec) = self.siril.pix2radec(0, 0)
-        radius_deg = max([abs(center_ra - TL_ra), abs(center_dec - TL_dec)])
+        corner_coord = SkyCoord(ra=TL_ra, dec=TL_dec, unit=(u.deg, u.deg), frame='icrs')
+        radius_deg = target_coord.separation(corner_coord).deg
         # minimum size of galaxies we want to annotate
         (pixsize_ra, pixsize_dec) = self.siril.pix2radec(1, 1)
-        pixsize_arcmin = 60 * max([abs(pixsize_ra - TL_ra), abs(pixsize_dec - TL_dec)])
+        pixel_coord = SkyCoord(ra=pixsize_ra, dec=pixsize_dec, unit=(u.deg, u.deg), frame='icrs')
+        origin_coord = SkyCoord(ra=TL_ra, dec=TL_dec, unit=(u.deg, u.deg), frame='icrs')
+        pixsize_arcmin = origin_coord.separation(pixel_coord).arcminute
         minsize_arcmin = minsize_pixels * pixsize_arcmin 
         radius = f"{radius_deg}d"
         # query for galaxies only or also other objects
         type_criteria = "otype='Galaxy..'"
         if self.query_opts.include_other_types:
-           type_criteria = "(otype='Galaxy..' OR otype='SNR' OR otype='PN' OR otype='Cl*..' OR otype='ISM..')"
+           ism_types = " OR ".join([f"otype='{t}'" for t in (
+               'SNR', 'PN', 'CL*', 'CL*..',
+               'ISM', 'HII', 'SFR', 'Cld', 'MoC', 'DNe', 'GNe', 'RNe',
+               'sh', 'glb', 'CGb', 'flt', 'cor', 'bub')])
+           type_criteria = f"(otype='Galaxy..' OR {ism_types})"
         # limit the query to galaxies with at least minsize (or unknown size)
         size_criteria = f"galdim_majaxis>{minsize_arcmin}"
         if self.query_opts.include_unknown_size: 
@@ -283,6 +295,12 @@ class AnnotationWorker(QObject):
         df = df[(df.px > min_patch_size) & (df.py > min_patch_size) 
               & (df.px < W-min_patch_size) & (df.py < H-min_patch_size)]
         print(f"Filtered query result by image coordinates: {df.shape[0]} entries")
+
+        # filter by magnitude (optical bands only; objects with no optical mag are kept)
+        if self.query_opts.mag_limit < 99.0:
+            optical_mag = df[['V', 'B', 'R', 'G', 'g', 'r']].min(axis=1)
+            df = df[optical_mag.isna() | (optical_mag <= self.query_opts.mag_limit)]
+            print(f"Filtered by magnitude limit {self.query_opts.mag_limit}: {df.shape[0]} entries")
 
         # filter by catalog
         # get catalog/TYPE of object by simple string manipulation
@@ -331,12 +349,27 @@ class AnnotationWorker(QObject):
         dpi = 200
         label_distance = base_scale_pixels / 5
         plt.style.use('dark_background')
-        # figure size in inch for the upper image with overlays
-        # Try to get roughly the size of the input image...
-        extra_axis_label_size_inches = 1.15 # estimated extra size for axis labels
-        fig = plt.figure(
-            figsize=(W / dpi + extra_axis_label_size_inches, H / dpi + extra_axis_label_size_inches))
-        ax1 = plt.subplot(projection=wcs, label='overlays')
+
+        # Border sizes in pixels to accommodate axis labels and title.
+        # These are intentionally generous so labels are never clipped.
+        border_left   = max(120, int(base_scale_pixels * 1.2))
+        border_bottom = max(80,  int(base_scale_pixels * 0.8))
+        border_right  = 20
+        border_top    = max(120,  int(base_scale_pixels))
+
+        fig_w_px = W + border_left + border_right
+        fig_h_px = H + border_bottom + border_top
+
+        fig = plt.figure(figsize=(fig_w_px / dpi, fig_h_px / dpi), dpi=dpi)
+
+        # Position axes so the image region is exactly W×H pixels
+        ax1 = fig.add_axes([
+            border_left   / fig_w_px,
+            border_bottom / fig_h_px,
+            W             / fig_w_px,
+            H             / fig_h_px,
+        ], projection=wcs, label='overlays')
+
         ax1.imshow(img[::sub, ::sub])
         ax1.coords.grid(True, color='white', ls=':', alpha=self.output_opts.overlay_alpha)
         ax1.coords[0].set_axislabel('Right Ascension (J2000)')
@@ -477,10 +510,34 @@ class AnnotationWorker(QObject):
             patch = img[y1:y2, x1:x2]
             all_patches.append(patch)
             filter_idxs.append(i)
+
+        # Measure the actual space consumed by axis labels and title via a
+        # dry-run render, then resize the figure so the image area stays
+        # exactly W×H pixels with no wasted border space.
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        tight_bb = fig.get_tightbbox(renderer)          # full content bbox in inch
+        ax_bb    = ax1.get_window_extent(renderer)      # axes (image) region in display pixels
         
-        plt.tight_layout()
+        # Overrun on each side: how much content sticks out beyond the axes edge
+        pad = 4  # small constant padding in pixels to avoid clipping
+        over_left   = max(0, ax_bb.x0 - (dpi * tight_bb.x0))   + pad
+        over_bottom = max(0, ax_bb.y0 - (dpi * tight_bb.y0))   + pad
+        over_right  = max(over_left, (dpi * tight_bb.x1) - ax_bb.x1 + pad)
+        over_top    = max(0, (dpi * tight_bb.y1) - ax_bb.y1)   + pad
+
+        new_fig_w_px = W + over_left + over_right
+        new_fig_h_px = H + over_bottom + over_top
+        fig.set_size_inches(new_fig_w_px / dpi, new_fig_h_px / dpi)
+        ax1.set_position([
+            over_left   / new_fig_w_px,
+            over_bottom / new_fig_h_px,
+            W           / new_fig_w_px,
+            H           / new_fig_h_px,
+        ])
+        
         self.progress_update.emit("Saving overlay image...", 0.2)
-        plt.savefig(output_overlay_fname, bbox_inches='tight', pad_inches=0.1, dpi=dpi)
+        plt.savefig(output_overlay_fname, dpi=dpi)
         self.progress_update.emit("Finished overlay image", 0.3)
         overlay_image = plt.imread(output_overlay_fname)
 
@@ -818,6 +875,23 @@ class AnnotationsScriptGUI(QMainWindow):
             "planetary nebula (PN) or globular clusters. May or may not work\n"
             "depending on the field of view of your image.")
         query_layout.addWidget(self.include_other_types_check)
+
+        mag_box = QHBoxLayout()
+        mag_box.addWidget(QLabel("Magnitude limit (optical): "))
+        from PyQt6.QtWidgets import QDoubleSpinBox
+        self.mag_limit_spin = QDoubleSpinBox()
+        self.mag_limit_spin.setRange(1.0, 99.0)
+        self.mag_limit_spin.setSingleStep(0.5)
+        self.mag_limit_spin.setDecimals(1)
+        self.mag_limit_spin.setValue(self.query_opts.mag_limit)
+        self.mag_limit_spin.setSpecialValueText("no limit")
+        self.mag_limit_spin.setToolTip(
+            "Exclude objects dimmer than this magnitude (B, V, R, G, g, or r band — whichever is available).\n"
+            "Objects with no optical magnitude data are always included.\n"
+            "Set to 99 to disable the filter.")
+        mag_box.addWidget(self.mag_limit_spin)
+        mag_box.addStretch()
+        query_layout.addLayout(mag_box)
         
         layout.addWidget(query_group)        
 
@@ -919,6 +993,7 @@ class AnnotationsScriptGUI(QMainWindow):
                 self.output_opts.label_amount = self.labels_slider.value()
                 self.query_opts.include_unknown_size = self.include_unknown_size_check.isChecked()
                 self.query_opts.include_other_types = self.include_other_types_check.isChecked()
+                self.query_opts.mag_limit = self.mag_limit_spin.value()
 
                 # update config file
                 self.save_config_file(self.query_opts, self.output_opts)
@@ -935,7 +1010,7 @@ class AnnotationsScriptGUI(QMainWindow):
                 self.thread.start()
 
         except SirilError as e:
-            messagebox.showerror("Error", str(e))
+            QMessageBox.critical(self, "Error", str(e))
 
     
     def on_progress(self, message, percent):
@@ -1012,6 +1087,8 @@ class AnnotationsScriptGUI(QMainWindow):
             'AGC': CatalogEntry('Arecibo General Catalog', '#895d8a', True),
             'FIRST': CatalogEntry('FIRST Survey Catalogs', '#a3dae7', False),
             '2MASS': CatalogEntry('Two Micron All Sky Survey', '#895447', False),
+            'LDN': CatalogEntry('Lynds Dark Nebula Catalog', '#a0522d', False),
+            'LBN': CatalogEntry('Lynds Bright Nebula Catalog', '#ffd700', False),
             'Other': CatalogEntry('Other catalogs', '#ad7fa8', False)
         }
         
@@ -1031,6 +1108,7 @@ class AnnotationsScriptGUI(QMainWindow):
                 output_opts.overlay_type = OverlayType.from_str(config['Output']['overlay_type'])
                 query_opts.include_unknown_size = config['Query'].getboolean('include_unknown_size', fallback=True)
                 query_opts.include_other_types = config['Query'].getboolean('include_other_types', fallback=False)
+                query_opts.mag_limit = config['Query'].getfloat('mag_limit', fallback=99.0)
                 
                 for key,value in config['Catalogs'].items():
                     value_dict = ast.literal_eval(value)

@@ -105,6 +105,103 @@ class LocalAdjustmentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "monotonic"):
             apply_local_adjustment_recipe(_synthetic_nebula(), recipe)
 
+    def test_hue_selective_saturation_targets_only_requested_color_band(self) -> None:
+        image = np.empty((3, 120, 160), dtype=np.float32)
+        image[:, :, :80] = np.asarray([0.32, 0.16, 0.14], dtype=np.float32)[
+            :, None, None
+        ]
+        image[:, :, 80:] = np.asarray([0.14, 0.18, 0.32], dtype=np.float32)[
+            :, None, None
+        ]
+        recipe = {
+            "schema": LOCAL_ADJUSTMENT_SCHEMA,
+            "id": "test_hue_selective",
+            "operations": [
+                {
+                    "type": "hue_selective_saturation",
+                    "mask": "subject",
+                    "profile": "test_red",
+                    "bands": [
+                        {
+                            "id": "red",
+                            "center": 0.0,
+                            "width": 30.0,
+                            "feather": 0.80,
+                            "amount": 0.10,
+                        }
+                    ],
+                    "opacity": 1.0,
+                }
+            ],
+        }
+
+        candidate, report = apply_local_adjustment_recipe(
+            image,
+            recipe,
+            masks={"subject": np.ones((120, 160), dtype=np.float32)},
+        )
+
+        before_luma = np.tensordot(
+            np.asarray([0.2126, 0.7152, 0.0722], dtype=np.float32),
+            image,
+            axes=(0, 0),
+        )
+        after_luma = np.tensordot(
+            np.asarray([0.2126, 0.7152, 0.0722], dtype=np.float32),
+            candidate,
+            axes=(0, 0),
+        )
+        before_chroma = np.max(image, axis=0) - np.min(image, axis=0)
+        after_chroma = np.max(candidate, axis=0) - np.min(candidate, axis=0)
+
+        self.assertTrue(report["accepted"], report)
+        self.assertLess(float(np.max(np.abs(after_luma - before_luma))), 1e-6)
+        self.assertGreater(
+            float(np.mean(after_chroma[:, :80] - before_chroma[:, :80])),
+            0.005,
+        )
+        self.assertLess(
+            float(np.max(np.abs(candidate[:, :, 80:] - image[:, :, 80:]))),
+            1e-6,
+        )
+        operation = report["operations"][0]
+        self.assertEqual(operation["type"], "hue_selective_saturation")
+        self.assertEqual(operation["profile"], "test_red")
+        self.assertEqual(operation["bands"][0]["id"], "red")
+
+    def test_hue_selective_saturation_rejects_excessive_chroma_growth(self) -> None:
+        image = np.empty((3, 64, 64), dtype=np.float32)
+        image[:] = np.asarray([0.75, 0.10, 0.10], dtype=np.float32)[
+            :, None, None
+        ]
+        recipe = {
+            "schema": LOCAL_ADJUSTMENT_SCHEMA,
+            "operations": [
+                {
+                    "type": "hue_selective_saturation",
+                    "mask": "subject",
+                    "bands": [
+                        {
+                            "id": "red",
+                            "center": 0.0,
+                            "width": 40.0,
+                            "feather": 0.80,
+                            "amount": 0.15,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        _candidate, report = apply_local_adjustment_recipe(
+            image,
+            recipe,
+            masks={"subject": np.ones((64, 64), dtype=np.float32)},
+        )
+
+        self.assertFalse(report["accepted"], report)
+        self.assertIn("active_chroma_p95_growth", report["issues"])
+
 
 if __name__ == "__main__":
     unittest.main()

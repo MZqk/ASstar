@@ -48,10 +48,12 @@ class PipelineExceptionPolicyTests(unittest.TestCase):
             boundaries,
             Counter(
                 {
-                    ("seestar_Superimpose.py", "guarded"): 1,
-                    ("seestar_Superimpose.py", "cmd_with_check"): 1,
-                    ("seestar_Superimpose.py", "_record_stage"): 2,
-                    ("seestar_Superimpose.py", "run"): 1,
+                    ("starun.py", "guarded"): 1,
+                    ("starun.py", "cmd_with_check"): 1,
+                    ("starun.py", "_record_stage"): 2,
+                    ("starun.py", "run"): 1,
+                    ("stage2_crop_detector.py", "detect_native_contour_crop"): 2,
+                    ("syqon_starless.py", "record_syqon_derived_generation"): 1,
                 }
             ),
         )
@@ -59,7 +61,7 @@ class PipelineExceptionPolicyTests(unittest.TestCase):
         run_handler = next(
             handler
             for path, handler, owner_name in catch_all_handlers
-            if path.name == "seestar_Superimpose.py" and owner_name == "run"
+            if path.name == "starun.py" and owner_name == "run"
         )
         self.assertEqual(run_handler.name, "e")
         self.assertIn("traceback.format_exc()", ast.unparse(run_handler))

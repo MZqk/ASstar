@@ -1,2 +1,4 @@
-# Tooling used to regenerate dependency lock files.
+# Repository test and dependency-lock tooling.
 pip-tools>=7.5.3,<8
+pytest>=9.1,<10
+pytest-cov>=7,<8

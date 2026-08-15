@@ -33,7 +33,7 @@ except ImportError:
     )
 
 
-PROCESSING_PLAN_SCHEMA = "seestar.processing-plan.v2"
+PROCESSING_PLAN_SCHEMA = "starun.processing-plan.v2"
 
 
 class InputTrust(str, Enum):
@@ -181,7 +181,7 @@ def build_resume_fingerprints(
     input_fingerprint: str,
     stage_config: Mapping[int, Mapping[str, Any]],
 ) -> Dict[str, Dict[str, Any]]:
-    """Build cumulative compatibility hashes for Stage 1/2/5 checkpoints.
+    """Build cumulative configuration fingerprints for Stage 1/2/5 checkpoints.
 
     ``stage_config`` must contain only result-affecting, already-redacted
     configuration for its stage.  Runtime/retry/UI-only settings should not be

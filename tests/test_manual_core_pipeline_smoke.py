@@ -9,15 +9,28 @@ import unittest
 from pathlib import Path
 
 from pipeline import run_manifest
+from pipeline import task_plan
 from tests import manual_core_pipeline_smoke as smoke
 
 
 class ManualCorePipelineSmokeTests(unittest.TestCase):
+    @staticmethod
+    def _write_plan(work_dir: Path, run_id: str = "smoke-run") -> dict[str, object]:
+        plan = task_plan.build_processing_plan(
+            run_id=run_id,
+            generated_at="2026-08-14T00:00:00Z",
+            input_record={"fingerprint": "smoke-input"},
+            input_state="linear",
+            input_trust="recognized",
+        )
+        run_manifest.atomic_write_json(work_dir / "processing-plan.json", plan)
+        return plan
+
     def test_launcher_command_defaults_to_network_and_explicit_runtime(self) -> None:
         args = smoke.build_parser().parse_args(
             [
                 "--mode",
-                "stage2_corrected_resume",
+                "auto",
                 "--work-dir",
                 "/tmp/core-work",
                 "--siril-app",
@@ -31,17 +44,17 @@ class ManualCorePipelineSmokeTests(unittest.TestCase):
 
         command = smoke.build_launcher_command(args, args.mode)
 
-        self.assertIn("gui.seestar_pipeline_dev", command)
-        self.assertIn("stage2_corrected_resume", command)
+        self.assertIn("gui.starun_pipeline_dev", command)
+        self.assertIn("auto", command)
         self.assertIn("--debug", command)
-        self.assertIn("--network", command)
-        self.assertNotIn("seestar_gui_dev", command)
+        self.assertNotIn("--network", command)
+        self.assertNotIn("starun_gui_dev", command)
 
     def test_launcher_command_can_force_offline_mode(self) -> None:
         args = smoke.build_parser().parse_args(
             [
                 "--mode",
-                "stage2_corrected_resume",
+                "auto",
                 "--work-dir",
                 "/tmp/core-work",
                 "--offline",
@@ -52,14 +65,18 @@ class ManualCorePipelineSmokeTests(unittest.TestCase):
 
         self.assertFalse(args.network)
         self.assertNotIn("--network", command)
+        self.assertIn("--offline", command)
 
     def test_verify_result_manifest_checks_current_outputs_and_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             work_dir = Path(td)
             output = work_dir / "M_42_processed_final.fit"
             output.write_bytes(b"fits-output")
+            plan = self._write_plan(work_dir)
             payload = {
-                "schema": "seestar.pipeline-result.v1",
+                "schema": "starun.pipeline-result.v1",
+                "run_id": plan["run_id"],
+                "plan_hash": plan["plan_hash"],
                 "status": "partial_success",
                 "outputs": {
                     output.name: run_manifest.file_record(
@@ -87,7 +104,10 @@ class ManualCorePipelineSmokeTests(unittest.TestCase):
             work_dir = Path(td)
             output = work_dir / "result_final.fit"
             output.write_bytes(b"fits-output")
+            plan = self._write_plan(work_dir)
             payload = {
+                "run_id": plan["run_id"],
+                "plan_hash": plan["plan_hash"],
                 "status": "success",
                 "outputs": {
                     output.name: run_manifest.file_record(output, base_dir=work_dir)
@@ -111,7 +131,10 @@ class ManualCorePipelineSmokeTests(unittest.TestCase):
             work_dir = Path(td)
             output = work_dir / "result_final.fit"
             output.write_bytes(b"original")
+            plan = self._write_plan(work_dir)
             payload = {
+                "run_id": plan["run_id"],
+                "plan_hash": plan["plan_hash"],
                 "status": "success",
                 "outputs": {
                     output.name: run_manifest.file_record(output, base_dir=work_dir)

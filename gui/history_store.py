@@ -39,7 +39,7 @@ except ImportError:  # Support direct execution from the gui directory.
     )
 
 
-HISTORY_SCHEMA = "seestar.gui-history.v1"
+HISTORY_SCHEMA = "starun.gui-history.v1"
 HISTORY_FILENAME = "history-index.json"
 
 STATUS_PREPARING = "preparing"
@@ -93,7 +93,7 @@ def default_history_path() -> Path:
         Path.home()
         / "Library"
         / "Application Support"
-        / "SeestarSuperimpose"
+        / "Starun"
         / HISTORY_FILENAME
     )
 
@@ -212,7 +212,7 @@ def load_verified_pipeline_result(run_root: Path) -> dict[str, Any] | None:
     path = run_root.resolve() / "pipeline-result.json"
     if not path.is_file():
         return None
-    return _verified_signed_payload(path, "seestar.pipeline-result.v1")
+    return _verified_signed_payload(path, "starun.pipeline-result.v1")
 
 
 def verified_result_files(
@@ -260,10 +260,10 @@ def validate_deletable_task_root(candidate: Path) -> TaskWorkspace:
     if not raw.exists() or not raw.is_dir():
         raise UnsafeTaskDeletionError("任务目录不存在或不是目录")
     if raw.name == TASK_CONTAINER_NAME:
-        raise UnsafeTaskDeletionError("不能删除 SeestarSuperimpose 容器目录")
+        raise UnsafeTaskDeletionError("不能删除 Starun 容器目录")
     if raw.parent.name != TASK_CONTAINER_NAME:
         raise UnsafeTaskDeletionError(
-            "任务目录必须是 SeestarSuperimpose 的直接子目录"
+            "任务目录必须是 Starun 的直接子目录"
         )
 
     try:
@@ -274,7 +274,7 @@ def validate_deletable_task_root(candidate: Path) -> TaskWorkspace:
         raise UnsafeTaskDeletionError("删除目标不是普通任务目录")
     if resolved.parent.name != TASK_CONTAINER_NAME:
         raise UnsafeTaskDeletionError(
-            "解析后的任务目录不在 SeestarSuperimpose 容器下"
+            "解析后的任务目录不在 Starun 容器下"
         )
 
     try:

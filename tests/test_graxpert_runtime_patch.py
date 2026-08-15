@@ -50,6 +50,8 @@ class GraXpertRuntimePatchTests(unittest.TestCase):
             self.assertIn("return_first_output=True", patched)
             self.assertIn("background = np.asarray(background)", patched)
             self.assertIn("Invalid GraXpert background shape", patched)
+            self.assertIn('parser.add_argument("-nogpu"', patched)
+            self.assertIn("BGE is CPU-only", patched)
             self.assertNotIn(
                 "removing both leading axes collapses it to 2D",
                 patched,
@@ -80,6 +82,7 @@ class GraXpertRuntimePatchTests(unittest.TestCase):
             patched = target.read_text(encoding="utf-8")
             self.assertIn("return_first_output=True", patched)
             self.assertIn("Invalid GraXpert background shape", patched)
+            self.assertIn('parser.add_argument("-nogpu"', patched)
             self.assertFalse(patcher.apply_patch(target))
 
 

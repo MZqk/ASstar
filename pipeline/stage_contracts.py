@@ -1,10 +1,4 @@
-"""Canonical product-stage, checkpoint, and artifact contracts.
-
-This module deliberately separates stable product terminology from legacy
-runtime labels and aliases.  New task plans use the canonical names here;
-legacy names are read-only compatibility inputs and are never canonical
-outputs.
-"""
+"""Canonical product-stage, checkpoint, and artifact contracts."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,8 +6,8 @@ from enum import Enum
 from typing import Any, Dict, Tuple
 
 
-PIPELINE_CONTRACT_SCHEMA = "seestar.pipeline-stage-contract.v1"
-PIPELINE_CONTRACT_VERSION = "1.0.0"
+PIPELINE_CONTRACT_SCHEMA = "starun.pipeline-stage-contract.v2"
+PIPELINE_CONTRACT_VERSION = "2.0.0"
 PRODUCT_STAGE_NUMBERS = tuple(range(1, 11))
 FORMAL_RESUME_STAGES = (1, 2, 5)
 
@@ -23,7 +17,6 @@ class StagePhase(str, Enum):
 
     LINEAR = "linear"
     NONLINEAR = "nonlinear"
-    OPTIONAL = "optional"
 
 
 @dataclass(frozen=True)
@@ -37,8 +30,6 @@ class StageContract:
     primary_artifact: str
     runtime_label: str
     formal_resume_checkpoint: bool = False
-    legacy_read_aliases: Tuple[str, ...] = ()
-    product_stage: bool = True
 
     @property
     def display_label(self) -> str:
@@ -58,8 +49,6 @@ class StageContract:
             "primary_artifact": self.primary_artifact,
             "artifact_prefix": self.artifact_prefix,
             "formal_resume_checkpoint": self.formal_resume_checkpoint,
-            "legacy_read_aliases": list(self.legacy_read_aliases),
-            "product_stage": self.product_stage,
         }
 
 
@@ -97,7 +86,6 @@ _STAGE_CONTRACTS = (
         StagePhase.LINEAR,
         "stage4_color.fit",
         "阶段 4: 图像解析 + 色彩校准",
-        legacy_read_aliases=("stage4_colorbalanced.fit",),
     ),
     StageContract(
         5,
@@ -107,7 +95,6 @@ _STAGE_CONTRACTS = (
         "stage5_linear.fit",
         "阶段 5: 线性反卷积 / 轻降噪",
         formal_resume_checkpoint=True,
-        legacy_read_aliases=("stage5_denoised.fit", "result_linear.fit"),
     ),
     StageContract(
         6,
@@ -116,7 +103,6 @@ _STAGE_CONTRACTS = (
         StagePhase.LINEAR,
         "stage6_starless.fit",
         "阶段 6: 去星与星点层准备",
-        legacy_read_aliases=("stage7_starless.fit",),
     ),
     StageContract(
         7,
@@ -133,7 +119,6 @@ _STAGE_CONTRACTS = (
         StagePhase.NONLINEAR,
         "stage8_enhanced.fit",
         "阶段 8: Starless 深加工",
-        legacy_read_aliases=("starless_enhanced.fit",),
     ),
     StageContract(
         9,
@@ -150,15 +135,6 @@ _STAGE_CONTRACTS = (
         StagePhase.NONLINEAR,
         "stage10_final.fit",
         "阶段 10: 最终降噪与导出",
-    ),
-    StageContract(
-        11,
-        "ai_postprocess",
-        "AI 后期美化",
-        StagePhase.OPTIONAL,
-        "stage11_ai_output.fit",
-        "阶段 11: AI 后期美化",
-        product_stage=False,
     ),
 )
 
@@ -208,14 +184,14 @@ def pipeline_contract_manifest() -> Dict[str, Any]:
         "formal_resume_stages": list(FORMAL_RESUME_STAGES),
         "stage_artifact_pattern": "stageN_<semantic>.<extension>",
         "result_artifact_pattern": "result_<delivery>.<extension>",
-        "stages": [contract.to_dict() for contract in _STAGE_CONTRACTS],
+        "stages": [contract.to_dict() for contract in product_stage_contracts()],
         "result_artifacts": dict(RESULT_ARTIFACT_FAMILIES),
     }
 
 
 def _validate_contract_registry() -> None:
     numbers = tuple(contract.number for contract in _STAGE_CONTRACTS)
-    if numbers != tuple(range(1, 12)):
+    if numbers != PRODUCT_STAGE_NUMBERS:
         raise RuntimeError(f"pipeline stage contracts are not contiguous: {numbers}")
     primary_artifacts = set()
     for contract in _STAGE_CONTRACTS:

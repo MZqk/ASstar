@@ -24,28 +24,46 @@ SPDX-License-Identifier: GPL-3.0-or-later
 0.1.4   Added nbstars as an optional filter. 
 0.1.5   Adds multi-session support to calibrate each session separately
 0.1.6   Handle working directory with spaces
-0.1.7   Added tooltips 
+0.1.7   Added tooltips
+0.1.8   Adds satellite removal using setiastropro AI4
+0.1.9	Add GUI to create excutable config file 
  
 """
 
 import sys
 import os
+import subprocess
 import sirilpy as s
 import argparse
 import re
 import shlex
 
-VERSION = "0.1.7"
+VERSION = "0.1.9"
 	
 # PyQt6 for GUI
 try:
 	from PyQt6.QtWidgets import (
-		QApplication, QDialog, QLabel, QLineEdit, QPushButton, QCheckBox, QToolTip,
-		QVBoxLayout, QHBoxLayout, QFormLayout, QDialogButtonBox, QMessageBox, QTextEdit
+		QApplication, QDialog, QLabel, QLineEdit, QPushButton, QCheckBox, QToolTip, QGroupBox,
+		QVBoxLayout, QHBoxLayout, QFormLayout, QDialogButtonBox, QMessageBox, QTextEdit, QFileDialog
 	)
 except ImportError:
 	# Silently fail if PyQt6 is not installed, as it's optional for CLI mode.
 	pass
+
+def create_execute_config(config_file_path, ):
+	utility = config_file_path.split('_')[1].split('.')[0]
+	start_dir = ""  # e.g., "/home/user" or "" for default
+	file_filter = "All Files (*)"
+	file_path, _ = QFileDialog.getOpenFileName(parent=None, caption=f"Select the executable for {utility}", directory=start_dir, filter=file_filter)
+	
+	if file_path:
+		print("Selected file:", file_path)
+		with open(config_file_path, 'w') as file:
+			file.write(file_path)
+		sys.exit(0)
+	else:
+		print("No file selected")
+		sys.exit(0)	
 
 def master_bias(bias_dir, process_dir):
 	if os.path.exists(os.path.join(workdir, 'process/bias_stacked.fit')) or os.path.exists(os.path.join(workdir, 'process/bias_stacked.fit.fz')):
@@ -132,6 +150,51 @@ def register(process_dir):
 		siril.cmd(
 			f"seqapplyreg {light_seq} -filter-bkg={bkg} -filter-nbstars={stars} -filter-round={roundf} -filter-wfwhm={wfwhm} {drizzle} {flat}")
 
+def satellite_removal(workdir):
+	os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+	config_dir = siril.get_siril_configdir()
+	if os.path.isfile (f"{config_dir}/sirilcc_saspro.conf"):
+		config_file_path = (f"{config_dir}/sirilcc_saspro.conf")
+		with open(config_file_path, 'r') as file:
+			executable_path = file.readline().strip()
+			python_path = executable_path.replace("setiastrosuitepro", "python")
+	else:
+		if len(sys.argv) == 1:
+			create_execute_config(f"{config_dir}/sirilcc_saspro.conf")
+		else:	
+			print(f"Executable not configured. Please create file 'sirilcc_saspro.conf' in your siril config directory {config_dir} with a line containing the path to setiastrosuitepro.")
+			sys.exit(1)
+
+	os.chdir(workdir)		
+	os.rename('lights', 'lights_preremoval')
+	os.mkdir('lights')
+	os.chdir('lights_preremoval')
+	for image in os.listdir():
+		if image.endswith(('.fits', '.fit', '.fts', '.fz')):
+			siril.log(f"Running satellite trail removal on {image}")
+			newimage = (f"{os.path.splitext(image)[0]}.fit")
+			cmd = [python_path, executable_path, "cc", "satellite", "--gpu", "--mode", "full", "--clip-trail", "-i", f"{image}", "-o", f"{workdir}/lights/{newimage}"]
+			
+			my_env = os.environ.copy()
+			my_env.pop("PYTHONPATH", None)
+			process = subprocess.Popen(cmd, shell=False, env=my_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8')
+			percent_re = re.compile(r"(\d+\.?\d*)" + "%")
+			if process.stdout:
+				for line in iter(process.stdout.readline, ''):
+					line = line.strip()
+					if not line:
+						continue
+					m = percent_re.search(line)
+					if m:
+						try:
+							pct = float(m.group(1))
+							siril.update_progress(f"Satellite trail removal", pct / 100.0)
+						except ValueError:
+							siril.log(line)
+					else:
+							siril.log(line)
+			process.wait()
+
 def stack(process_dir):
 	siril.cmd(f"cd {process_dir}")
 	siril.cmd("load pp_light_00001")
@@ -155,7 +218,7 @@ def run_gui():
 	class PreprocessingDialog(QDialog):
 		def __init__(self, parent=None):
 			super().__init__(parent)
-			self.setWindowTitle("Siril Pre-processing")
+			self.setWindowTitle("Siril Preprocessing")
 			self.setFixedWidth(int(self.width() * 1.10))
 
 			layout = QVBoxLayout(self)
@@ -168,22 +231,6 @@ def run_gui():
 				print("Working directory does not exist:", e)
 				sys.exit(1)
 
-			self.background_input = QLineEdit("100%")
-			form_layout.addRow("Background filter (XX% or X):", self.background_input)
-			
-			self.round_input = QLineEdit("100%")
-			form_layout.addRow("Round filter (XX% or X):", self.round_input)
-
-			self.stars_input = QLineEdit("100%")
-			form_layout.addRow("Number of stars (XX% or X):", self.stars_input)
-				
-			self.wfwhm_input = QLineEdit("100%")
-			form_layout.addRow("wFWHM filter (XX% or X):", self.wfwhm_input)
-
-			self.feather_input = QLineEdit("0")
-			self.feather_input.setToolTip("Apply feather mask on image borders in 'n' pixels")
-			form_layout.addRow("Feathering (px):", self.feather_input)
-
 			self.drizzle = QCheckBox("Drizzle (scale), enable for OSC")
 			self.drizzle_input = QLineEdit("1")
 			self.drizzle_input.setToolTip("File size inceases by square of value")
@@ -193,8 +240,31 @@ def run_gui():
 			drizzle_layout.addWidget(self.drizzle_input)
 			form_layout.addRow(self.drizzle, drizzle_layout)
 			
-			self.bkg_extract_cb = QCheckBox("Extract Background")
+			self.satellite_cb = QCheckBox("Satellite trail removal")
+			form_layout.addRow(self.satellite_cb)
+
+			self.no_calibration_cb = QCheckBox("No Calibration")
+			form_layout.addRow(self.no_calibration_cb)
+
+			self.bkg_extract_cb = QCheckBox("Background extraction")
 			form_layout.addRow(self.bkg_extract_cb)
+			
+			filter_group = QGroupBox("Quality filters")
+			filter_form = QFormLayout(filter_group)
+						
+			self.background_input = QLineEdit("100%")
+			filter_form.addRow("Background filter (XX% or X):", self.background_input)
+			
+			self.round_input = QLineEdit("100%")
+			filter_form.addRow("Round filter (XX% or X):", self.round_input)
+
+			self.stars_input = QLineEdit("100%")
+			filter_form.addRow("Number of stars filter (XX% or X):", self.stars_input)
+				
+			self.wfwhm_input = QLineEdit("100%")
+			filter_form.addRow("wFWHM filter (XX% or X):", self.wfwhm_input)
+
+			form_layout.addRow(filter_group)
 
 			self.platesolve_cb = QCheckBox("Platesolve, optionally provide focal lenght")
 			self.platesolve_input = QLineEdit()
@@ -205,18 +275,19 @@ def run_gui():
 			platesolve_layout.addWidget(self.platesolve_input)
 			form_layout.addRow(self.platesolve_cb, platesolve_layout)
 
-			self.no_calibration_cb = QCheckBox("No Calibration")
-			form_layout.addRow(self.no_calibration_cb)
+			self.feather_input = QLineEdit("0")
+			self.feather_input.setToolTip("Apply feather mask on image borders in 'n' pixels")
+			form_layout.addRow("Feathering (px):", self.feather_input)
 
-			self.multi_cb = QCheckBox("Multi session calibration")
+			self.multi_group = QGroupBox("Multi session calibration")
+			self.multi_group.setCheckable(True)
+			self.multi_group.setChecked(False)
+			multi_layout = QVBoxLayout(self.multi_group)
 			self.multi_input = QTextEdit()
 			self.multi_input.setFixedHeight(100)
 			self.multi_input.setToolTip("Add working directories here")
-			self.multi_input.setEnabled(False)
-			self.multi_cb.toggled.connect(self.multi_input.setEnabled)
-			multi_layout = QHBoxLayout()
 			multi_layout.addWidget(self.multi_input)
-			form_layout.addRow(self.multi_cb, multi_layout)
+			form_layout.addRow(self.multi_group)
 
 			layout.addLayout(form_layout)
 
@@ -229,6 +300,7 @@ def run_gui():
 		def get_values(self):
 			return {
 				"workdir": self.workdir_input.text(),
+				"satellite": self.satellite_cb.isChecked(),
 				"background": self.background_input.text(),
 				"round": self.round_input.text(),
 				"stars": self.stars_input.text(),
@@ -238,7 +310,7 @@ def run_gui():
 				"bkg_extract": self.bkg_extract_cb.isChecked(),
 				"platesolve": self.platesolve_input.text() if self.platesolve_cb.isChecked() and self.platesolve_input.text() else self.platesolve_cb.isChecked(),
 				"no_calibration": self.no_calibration_cb.isChecked(),
-				"multi": shlex.split(self.multi_input.toPlainText()) if self.multi_cb.isChecked() else False,
+				"multi": shlex.split(self.multi_input.toPlainText()) if self.multi_group.isChecked() else False,
 			}
 
 	app = QApplication.instance() or QApplication(sys.argv)
@@ -289,6 +361,8 @@ def run_gui():
 
 		if values["workdir"]:
 			cli_args.extend(["-d", values["workdir"]])
+		if values["satellite"]:
+			cli_args.append("-sr")
 		if values["background"]:
 			cli_args.extend(["-b", values["background"]])
 		if values["round"]:
@@ -338,6 +412,7 @@ def main_logic(argv):
 	parser.add_argument("-ps", "--platesolve", nargs='?', const=True, help="platesolve, optionally provide focal lenght")
 	parser.add_argument("-r", "--round", nargs='+',	help="round filter settings, XX%% or X")
 	parser.add_argument("-s", "--stars", nargs='+', help="# of stars filter settings, XX%% or X")
+	parser.add_argument("-sr", "--satellite", help="satellite trail removal", action="store_true")	
 	parser.add_argument("-v","--version", help="print the version and exit",action="store_true")
 	parser.add_argument("-w", "--wfwhm", nargs='+',	help="wfwhm filter settings, XX%% or X")
 	parser.add_argument("-z", "--drizzle", nargs='+', help="set drizzle scaling, required for OSC images")
@@ -391,6 +466,8 @@ def main_logic(argv):
 			w = 0
 			while n > w:
 				workdir = args.multi_session[w]
+				if args.satellite:
+					satellite_removal(workdir)
 				process_dir = os.path.join(workdir, 'process')
 				master_bias(os.path.join(workdir, 'biases'), process_dir)
 				master_flat(os.path.join(workdir, 'flats'), process_dir)
@@ -413,21 +490,25 @@ def main_logic(argv):
 				w +=1
 			workdir = args.multi_session[0]
 			process_dir = os.path.join(workdir, 'process')
-
 		else:
+			if args.satellite:
+				satellite_removal(workdir)
 			master_bias(os.path.join(workdir, 'biases'), process_dir)
 			master_flat(os.path.join(workdir, 'flats'), process_dir)
 			master_dark(os.path.join(workdir, 'darks'), process_dir)
 			light(os.path.join(workdir, 'lights'), process_dir)
+
 		if args.bkg:
 			bkg_extract(process_dir)
 			light_seq = 'bkg_pp_light'
 		else:
 			light_seq = 'pp_light'
+
 		if args.platesolve:
 			platesolve(process_dir)
 		register(process_dir)
 		stack(process_dir)
+
 		if olddir:
 			os.rename(workdir, olddir)
 			siril.cmd("cd",f'"{olddir}"')

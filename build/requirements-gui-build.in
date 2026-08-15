@@ -1,0 +1,8 @@
+# Dependencies used only to freeze the macOS GUI entrypoint.
+#
+# Scientific/model runtimes for Siril plugins stay in
+# resources/siril_plugins/downloads and must not be installed here.
+PyInstaller==6.20.0
+PySide6==6.11.1
+numpy==2.4.6
+astropy==7.2.0

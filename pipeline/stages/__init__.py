@@ -1,1 +1,1 @@
-"""Stage modules for the SeeStar processing pipeline."""
+"""Stage modules for the Starun processing pipeline."""

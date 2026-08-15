@@ -42,11 +42,11 @@ class StageContractTests(unittest.TestCase):
         for artifact in stage_contracts.RESULT_ARTIFACT_FAMILIES.values():
             self.assertTrue(artifact.startswith("result_"))
 
-    def test_legacy_names_are_read_aliases_not_primary_artifacts(self) -> None:
+    def test_legacy_read_aliases_are_removed(self) -> None:
         stage5 = stage_contracts.stage_contract(5)
 
         self.assertEqual(stage5.primary_artifact, "stage5_linear.fit")
-        self.assertIn("result_linear.fit", stage5.legacy_read_aliases)
+        self.assertFalse(hasattr(stage5, "legacy_read_aliases"))
         self.assertNotIn(
             "result_linear.fit",
             [item.primary_artifact for item in stage_contracts.product_stage_contracts()],
@@ -55,10 +55,13 @@ class StageContractTests(unittest.TestCase):
     def test_manifest_exposes_product_contract(self) -> None:
         manifest = stage_contracts.pipeline_contract_manifest()
 
+        self.assertEqual(manifest["schema"], "starun.pipeline-stage-contract.v2")
+        self.assertEqual(manifest["version"], "2.0.0")
         self.assertEqual(manifest["formal_resume_stages"], [1, 2, 5])
         self.assertEqual(manifest["linear_stages"], [1, 2, 3, 4, 5, 6])
         self.assertEqual(manifest["nonlinear_stages"], [7, 8, 9, 10])
-        self.assertFalse(manifest["stages"][-1]["product_stage"])
+        self.assertEqual(len(manifest["stages"]), 10)
+        self.assertTrue(all("product_stage" not in item for item in manifest["stages"]))
 
 
 if __name__ == "__main__":

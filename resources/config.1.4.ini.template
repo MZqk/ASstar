@@ -1,5 +1,5 @@
 [core]
-wd=/Users/mz/SeeStar/test/SeestarSuperimpose/ngc7000-ab5d90c56734/runs/20260804T113126Z-3840e693/process
+wd=/tmp
 extension=.fit
 force_16bit=false
 fits_save_icc=true

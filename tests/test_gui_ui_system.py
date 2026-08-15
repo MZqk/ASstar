@@ -45,7 +45,7 @@ def test_platform_profiles_change_only_desktop_policy() -> None:
     assert windows.native_menu_bar is False
     assert macos.control_height == 30
     assert windows.control_height == 32
-    assert macos.start_shortcut == "Meta+Return"
+    assert macos.start_shortcut == "Ctrl+Return"
     assert windows.start_shortcut == "Ctrl+Return"
 
 
@@ -65,6 +65,8 @@ def test_stylesheet_covers_component_and_pipeline_states() -> None:
     for selector in (
         'QPushButton[variant="primary"]',
         'QPushButton[variant="destructive"]',
+        'QPushButton[variant="quiet"]:checked',
+        'QLabel#sidebarPrimary',
         'QLabel[stageState="running"]',
         'QLabel[stageState="completed"]',
         'QLabel[stageState="safe_passthrough"]',

@@ -1,4 +1,4 @@
-"""Focused image-preview widgets for the Seestar macOS workspace."""
+"""Focused image-preview widgets for the Starun macOS workspace."""
 
 from __future__ import annotations
 

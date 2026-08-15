@@ -217,7 +217,7 @@ class Stage3BackgroundSamplingTests(unittest.TestCase):
             8,
         )
         fit, validation, report = split_background_sample_points(
-            points[:31],
+            points[:11],
             image,
         )
         self.assertEqual((fit, validation), ([], []))
@@ -279,10 +279,20 @@ class Stage3BackgroundSamplingTests(unittest.TestCase):
             polynomial_metrics,
             drifted_metrics,
         )
-        self.assertFalse(accepted)
+        self.assertTrue(accepted)
+        self.assertEqual(gate["severity"], "soft_warning")
         self.assertTrue(
             any("zero-point drift" in issue for issue in gate["issues"])
         )
+        strict_accepted, strict_gate = assess_compound_background_validation(
+            baseline_metrics,
+            single_metrics,
+            polynomial_metrics,
+            drifted_metrics,
+            gate_profile="strict",
+        )
+        self.assertFalse(strict_accepted)
+        self.assertEqual(strict_gate["severity"], "hard_rejected")
 
     def test_validation_uses_correlation_aware_patch_uncertainty(self):
         rng = np.random.default_rng(44)
@@ -310,7 +320,7 @@ class Stage3BackgroundSamplingTests(unittest.TestCase):
         )
         self.assertEqual(
             validation["schema_version"],
-            "seestar.stage3-background-validation.v1",
+            "starun.stage3-background-validation.v1",
         )
         self.assertEqual(
             validation["uncertainty_method"],
@@ -352,13 +362,13 @@ class Stage3BackgroundSamplingTests(unittest.TestCase):
         self.assertEqual(process["mechanism"], "additive_low_frequency_gradient")
         self.assertEqual(
             process["schema_version"],
-            "seestar.stage3-process-evidence.v1",
+            "starun.stage3-process-evidence.v1",
         )
         self.assertTrue(process["should_evaluate"])
         self.assertTrue(process["low_complexity_required"])
         self.assertEqual(process["model_complexity_limit"], "polynomial_degree_1")
 
-    def test_process_evidence_routes_radial_vignetting_to_flat_review(self):
+    def test_process_evidence_evaluates_radial_gradient_with_flat_advisory(self):
         rng = np.random.default_rng(61)
         height, width = 320, 400
         y, x = np.mgrid[:height, :width]
@@ -391,15 +401,24 @@ class Stage3BackgroundSamplingTests(unittest.TestCase):
 
         self.assertEqual(
             process["mechanism"],
-            "multiplicative_vignetting_or_flat_error",
+            "radial_low_frequency_gradient_ambiguous",
         )
-        self.assertFalse(process["should_evaluate"])
+        self.assertTrue(process["should_evaluate"])
+        self.assertEqual(
+            process["correction_mode"],
+            "subtract_with_master_flat_advisory",
+        )
+        self.assertTrue(process["radial_shape_supported"])
         self.assertIn(
-            "multiplicative_error_requires_flat_field_review",
-            process["hard_block_reasons"],
+            "radial_shape_cannot_distinguish_additive_gradient_from_flat_error",
+            process["advisory_reasons"],
         )
+        self.assertEqual(process["hard_block_reasons"], [])
+        route = select_background_route({}, {"detected": False}, process_report=process)
+        self.assertTrue(route["gradient_supported"])
+        self.assertEqual(route["route"], "low_frequency_gradient")
 
-    def test_target_fidelity_uses_heldout_sky_plane_and_rejects_source_loss(self):
+    def test_target_fidelity_softens_moderate_source_loss_by_default(self):
         rng = np.random.default_rng(73)
         height, width = 256, 320
         y, x = np.mgrid[:height, :width]
@@ -416,14 +435,8 @@ class Stage3BackgroundSamplingTests(unittest.TestCase):
         oversubtracted = corrected - 0.35 * target
         sky_points = [
             (24.0, 24.0),
-            (100.0, 24.0),
-            (210.0, 24.0),
             (295.0, 24.0),
-            (24.0, 120.0),
-            (295.0, 120.0),
             (24.0, 230.0),
-            (100.0, 230.0),
-            (210.0, 230.0),
             (295.0, 230.0),
         ]
 
@@ -453,11 +466,134 @@ class Stage3BackgroundSamplingTests(unittest.TestCase):
             1.0,
             delta=0.002,
         )
-        self.assertFalse(bad_ok)
+        self.assertTrue(bad_ok, bad_gate)
+        self.assertEqual(bad_gate["severity"], "soft_warning")
         self.assertLess(bad["target_flux_change_significance"], -3.0)
         self.assertTrue(
             any("target flux loss" in issue for issue in bad_gate["issues"])
         )
+        strict_ok, strict_gate = assess_target_fidelity(
+            bad,
+            low_complexity_required=True,
+            gate_profile="strict",
+        )
+        self.assertFalse(strict_ok)
+        self.assertEqual(strict_gate["severity"], "hard_rejected")
+
+    def test_target_fidelity_output_first_rejects_only_extreme_change(self):
+        report = {
+            "available": True,
+            "target_sky_reference": "heldout_sky_plane_degree_1",
+            "target_flux_retention_ratio": 4.5,
+            "target_flux_change_significance": 135.0,
+            "target_morphology_correlation": 0.45,
+            "target_change_residual_significance": 1.0,
+            "target_centroid_shift_fraction": 0.13,
+        }
+
+        accepted, gate = assess_target_fidelity(
+            report,
+            low_complexity_required=False,
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(gate["profile"], "output_first")
+        self.assertEqual(gate["severity"], "hard_rejected")
+        self.assertTrue(any("flux growth is excessive" in issue for issue in gate["hard_issues"]))
+
+    def test_target_fidelity_balanced_uses_intermediate_hard_limits(self):
+        base = {
+            "available": True,
+            "target_sky_reference": "heldout_sky_plane_degree_1",
+            "target_flux_retention_ratio": 1.0,
+            "target_flux_change_significance": 0.0,
+            "target_morphology_correlation": 0.55,
+            "target_change_residual_significance": 1.0,
+            "target_centroid_shift_fraction": 0.11,
+        }
+
+        output_ok, output_gate = assess_target_fidelity(
+            base,
+            low_complexity_required=False,
+            gate_profile="output_first",
+        )
+        balanced_ok, balanced_gate = assess_target_fidelity(
+            base,
+            low_complexity_required=False,
+            gate_profile="balanced",
+        )
+
+        self.assertTrue(output_ok, output_gate)
+        self.assertEqual(output_gate["severity"], "soft_warning")
+        self.assertFalse(balanced_ok)
+        self.assertEqual(balanced_gate["severity"], "hard_rejected")
+        self.assertEqual(balanced_gate["profile"], "balanced")
+
+    def test_batch_regression_m31_m33_softens_graxpert_rejections(self):
+        # Frozen metrics from the 2026-08-11 M31/M33 Stage 3 reports.
+        samples = {
+            "M31": (0.7021789879, -13.5163206, 0.9742678011, 0.0033138954, 19.3588124),
+            "M33": (0.4198179414, -6.1838996, 0.9465315208, 0.0124553912, 4.3946548),
+        }
+        for label, values in samples.items():
+            with self.subTest(label=label):
+                flux, significance, morphology, centroid, structure = values
+                accepted, gate = assess_target_fidelity(
+                    {
+                        "available": True,
+                        "target_sky_reference": "heldout_sky_plane_degree_1",
+                        "target_flux_retention_ratio": flux,
+                        "target_flux_change_significance": significance,
+                        "target_morphology_correlation": morphology,
+                        "target_centroid_shift_fraction": centroid,
+                        "target_change_residual_significance": structure,
+                    },
+                    low_complexity_required=True,
+                    gate_profile="output_first",
+                )
+                self.assertTrue(accepted, gate)
+                self.assertEqual(gate["severity"], "soft_warning")
+
+    def test_batch_regression_dwarf_ic434_extreme_plugins_stay_hard_rejected(self):
+        # ADBE/DBE/AutoDBE flux growth observed in the Dwarf IC434 batch.
+        samples = (
+            (5.4603697378, 176.6057993, 0.4638830871, 0.1691496149),
+            (4.4231739503, 134.8946439, 0.4396387106, 0.1308457798),
+            (5.3597662307, 172.0481022, 0.4502337119, 0.1642541962),
+        )
+        for flux, significance, morphology, centroid in samples:
+            with self.subTest(flux=flux):
+                accepted, gate = assess_target_fidelity(
+                    {
+                        "available": True,
+                        "target_sky_reference": "heldout_sky_plane_degree_1",
+                        "target_flux_retention_ratio": flux,
+                        "target_flux_change_significance": significance,
+                        "target_morphology_correlation": morphology,
+                        "target_centroid_shift_fraction": centroid,
+                        "target_change_residual_significance": 1.0,
+                    },
+                    low_complexity_required=True,
+                    gate_profile="output_first",
+                )
+                self.assertFalse(accepted)
+                self.assertEqual(gate["severity"], "hard_rejected")
+
+    def test_missing_gate_metrics_degrade_unless_strict(self):
+        accepted, gate = assess_target_fidelity(
+            {},
+            low_complexity_required=True,
+        )
+        strict_accepted, strict_gate = assess_target_fidelity(
+            {},
+            low_complexity_required=True,
+            gate_profile="strict",
+        )
+
+        self.assertTrue(accepted)
+        self.assertEqual(gate["severity"], "soft_warning")
+        self.assertFalse(strict_accepted)
+        self.assertEqual(strict_gate["severity"], "hard_rejected")
 
     def test_single_validation_uses_sampling_uncertainty_not_score_thresholds(self):
         baseline = {
@@ -507,12 +643,50 @@ class Stage3BackgroundSamplingTests(unittest.TestCase):
             weak_improvement,
         )
 
-        self.assertFalse(accepted)
+        self.assertTrue(accepted, gate)
+        self.assertEqual(gate["severity"], "soft_warning")
         self.assertEqual(
             gate["uncertainty_method"],
             "correlation_aware_span_difference",
         )
         self.assertFalse(gate["material_improvement"])
+        strict_accepted, strict_gate = assess_single_background_validation(
+            baseline,
+            weak_improvement,
+            gate_profile="strict",
+        )
+        self.assertFalse(strict_accepted)
+        self.assertEqual(strict_gate["severity"], "hard_rejected")
+
+    def test_single_validation_balanced_rejects_intermediate_span_worsening(self):
+        baseline = {
+            "status": "ready",
+            "robust_span": 0.010,
+            "patch_mad_median": 0.004,
+            "patch_median_uncertainty": 0.0005,
+        }
+        candidate = {
+            "status": "ready",
+            "robust_span": 0.020,
+            "patch_mad_median": 0.004,
+            "patch_median_uncertainty": 0.0005,
+        }
+
+        output_ok, output_gate = assess_single_background_validation(
+            baseline,
+            candidate,
+            gate_profile="output_first",
+        )
+        balanced_ok, balanced_gate = assess_single_background_validation(
+            baseline,
+            candidate,
+            gate_profile="balanced",
+        )
+
+        self.assertTrue(output_ok, output_gate)
+        self.assertEqual(output_gate["severity"], "soft_warning")
+        self.assertFalse(balanced_ok)
+        self.assertEqual(balanced_gate["severity"], "hard_rejected")
 
     def test_smooth_gradient_is_not_directional_pattern_noise(self):
         report = analyze_directional_pattern_noise(_gradient_image())
@@ -608,7 +782,7 @@ class Stage3BackgroundSamplingTests(unittest.TestCase):
         self.assertTrue(route["subsky_existing_allowed"])
         self.assertTrue(route["requires_review"])
 
-    def test_candidate_gate_rejects_introduced_pattern_noise(self):
+    def test_candidate_gate_softens_introduced_pattern_noise_by_default(self):
         before = analyze_directional_pattern_noise(_gradient_image())
         image = _gradient_image()
         y, x = np.mgrid[: image.shape[0], : image.shape[1]]
@@ -618,9 +792,45 @@ class Stage3BackgroundSamplingTests(unittest.TestCase):
 
         accepted, gate = pattern_candidate_gate(before, after)
 
-        self.assertFalse(accepted)
+        self.assertTrue(accepted, gate)
         self.assertTrue(gate["introduced_pattern_noise"])
-        self.assertEqual(gate["status"], "rejected")
+        self.assertEqual(gate["status"], "accepted_with_warnings")
+        strict_accepted, strict_gate = pattern_candidate_gate(
+            before,
+            after,
+            gate_profile="strict",
+        )
+        self.assertFalse(strict_accepted)
+        self.assertEqual(strict_gate["status"], "rejected")
+
+    def test_pattern_gate_balanced_rejects_intermediate_extreme(self):
+        before = {
+            "status": "ok",
+            "pattern_score": 0.40,
+            "detected": False,
+        }
+        after = {
+            "status": "ok",
+            "pattern_score": 0.88,
+            "detected": True,
+            "thresholds": {"pattern_score_min": 0.55},
+        }
+
+        output_ok, output_gate = pattern_candidate_gate(
+            before,
+            after,
+            gate_profile="output_first",
+        )
+        balanced_ok, balanced_gate = pattern_candidate_gate(
+            before,
+            after,
+            gate_profile="balanced",
+        )
+
+        self.assertTrue(output_ok, output_gate)
+        self.assertEqual(output_gate["severity"], "soft_warning")
+        self.assertFalse(balanced_ok)
+        self.assertEqual(balanced_gate["severity"], "hard_rejected")
 
 
 if __name__ == "__main__":

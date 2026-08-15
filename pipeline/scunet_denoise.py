@@ -22,37 +22,27 @@ def run_siril_scunet_denoise_fallback(
     """
     Run the Siril-SCUNet fallback chain.
 
-    The script path is preferred because it keeps behavior aligned with the
-    plugin package; command aliases are kept as compatibility fallbacks.
+    Only command interfaces that accept an explicit strength are eligible.
+    The bundled SCUNet script is an interactive GUI whose slider defaults to
+    0.50 and exposes no auditable headless strength argument, so invoking it
+    here would silently bypass PipelineConfig.
     """
     pipeline._last_scunet_fallback_error = None
-    script_reason: Optional[str] = None
     scunet_script = pipeline._find_plugin_script(("processing/SCUNet_Denoise.py",))
     if scunet_script is not None:
-        used = pipeline._run_plugin_script_cli_subprocess(
-            step_key,
-            "Siril-SCUNet Denoise",
-            scunet_script,
-            args=(),
-            timeout_sec=300,
-        )
-        if used:
-            return used
         script_reason = (
-            getattr(pipeline, "_last_plugin_script_error", None)
-            or f"{scunet_script.name}: execution failed"
+            "SCUNet_Denoise.py is interactive and has no explicit headless "
+            "strength contract; skipped"
         )
     else:
         script_reason = "SCUNet_Denoise.py 脚本缺失"
 
     strength_text = f"{_clamp_float(strength, 0.0, 1.0):.2f}"
     candidates = [
-        ("Siril-SCUNet Denoise", ("siril_scunet_denoise",)),
         ("Siril-SCUNet Denoise", ("siril_scunet_denoise", strength_text)),
-        ("Siril-SCUNet Denoise", ("scunet_denoise",)),
         ("Siril-SCUNet Denoise", ("scunet_denoise", strength_text)),
-        ("Siril-SCUNet Denoise", ("siril_scunet",)),
-        ("Siril-SCUNet Denoise", ("scunet",)),
+        ("Siril-SCUNet Denoise", ("siril_scunet", strength_text)),
+        ("Siril-SCUNet Denoise", ("scunet", strength_text)),
         ("Siril-SCUNet Denoise", ("scunet", f"-strength={strength_text}")),
     ]
 

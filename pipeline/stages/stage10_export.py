@@ -8,6 +8,8 @@ import numpy as np
 from sirilpy.exceptions import CommandError, SirilError
 
 from channel_semantics import BROADBAND_RGB_OSC
+from color_quality_metrics import build_color_quality_report, resolve_color_contract
+from local_adjustments import dilate_mask, feather_mask
 from managed_output import export_managed_outputs
 from models import PipelineStage
 from output_color import build_output_color_manifest
@@ -17,12 +19,23 @@ from pipeline_safety import (
     should_skip_final_denoise,
 )
 from save_utils import export_final_outputs
+import stage8_pixels
+import stage9_quality
 
 
 _STAGE10_CHROMA_FOCUS_MIN = 0.34
 _STAGE10_SEPARATE_MIN = 0.70
 _STAGE10_FULL_BG_STD_MIN = 0.018
 _STAGE10_FULL_MOTTLING_MIN = 0.45
+_STAGE10_DENOISE_STRENGTH = 0.28
+_STAGE10_STAR_PROTECTION_COVERAGE_MAX = 0.35
+_STAGE10_QUALITY_CHROMA_REPAIR_STRENGTH = 0.35
+_STAGE10_QUALITY_TEXTURE_REPAIR_STRENGTH = 0.20
+_STAGE10_QUALITY_RISK_IMPROVEMENT_MIN = 0.15
+_STAGE10_QUALITY_SIGNAL_CORRELATION_MIN = 0.995
+_STAGE10_QUALITY_SIGNAL_FLUX_RATIO_MIN = 0.98
+_STAGE10_QUALITY_SIGNAL_FLUX_RATIO_MAX = 1.02
+_STAGE10_QUALITY_CORE_CLIP_GROWTH_MAX = 0.001
 
 
 def _metric_value(metrics: Dict[str, Any], name: str) -> float:
@@ -320,28 +333,243 @@ def _stage10_denoise_input(pipeline) -> Tuple[Optional[np.ndarray], Dict[str, An
         if image_data is None:
             raise RuntimeError("empty Stage10 denoise input")
         image = np.asarray(image_data)
-        metric_reader = getattr(pipeline, "_background_quality_metrics", None)
-        metrics = metric_reader(image) if callable(metric_reader) else {}
-        plan = _select_stage10_denoise_plan(
-            metrics if isinstance(metrics, dict) else {},
-            color_input=_is_color_image(image),
-            cfg=getattr(pipeline, "cfg", None),
-        )
-        # Only chroma mode needs the pre-denoise pixels to restore luminance.
-        # Avoid retaining a second full-resolution image for full/separate/skip.
-        snapshot = (
-            np.array(image, copy=True)
-            if plan["selected_mode"] == "chroma"
-            else None
-        )
-        return snapshot, plan
     except (AttributeError, CommandError, SirilError, RuntimeError, TypeError, ValueError) as error:
-        pipeline.log.warn(f"Stage10 denoise input metrics unavailable: {error}")
+        pipeline.log.warn(f"Stage10 denoise input unavailable: {error}")
         return None, _select_stage10_denoise_plan(
             {},
             color_input=True,
             cfg=getattr(pipeline, "cfg", None),
         )
+
+    try:
+        metric_reader = getattr(pipeline, "_background_quality_metrics", None)
+        metrics = metric_reader(image) if callable(metric_reader) else {}
+    except (AttributeError, CommandError, SirilError, RuntimeError, TypeError, ValueError) as error:
+        pipeline.log.warn(f"Stage10 denoise input metrics unavailable: {error}")
+        metrics = {}
+
+    plan = _select_stage10_denoise_plan(
+        metrics if isinstance(metrics, dict) else {},
+        color_input=_is_color_image(image),
+        cfg=getattr(pipeline, "cfg", None),
+    )
+    # Every active denoise mode is transactional: the frozen source is needed
+    # both for star-protected recomposition and for fail-closed rollback. The
+    # low-noise skip path deliberately avoids retaining a full-resolution copy.
+    snapshot = (
+        np.array(image, copy=True)
+        if plan["selected_mode"] != "skip"
+        else None
+    )
+    return snapshot, plan
+
+
+def _stage10_spatial_shape(image: np.ndarray) -> Tuple[int, int]:
+    arr = np.asarray(image)
+    if arr.ndim == 2:
+        return int(arr.shape[0]), int(arr.shape[1])
+    if arr.ndim != 3:
+        raise ValueError(f"unsupported Stage10 image shape={arr.shape}")
+    if arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+        return int(arr.shape[1]), int(arr.shape[2])
+    if arr.shape[-1] in (1, 3, 4):
+        return int(arr.shape[0]), int(arr.shape[1])
+    if arr.shape[0] in (1, 3, 4):
+        return int(arr.shape[1]), int(arr.shape[2])
+    raise ValueError(f"cannot determine Stage10 image layout from shape={arr.shape}")
+
+
+def _stage10_expanded_mask(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    source = np.asarray(image)
+    spatial = np.asarray(mask)
+    if source.ndim == 2 and source.shape == spatial.shape:
+        return spatial
+    if source.ndim == 3 and source.shape[1:] == spatial.shape:
+        return spatial[np.newaxis, ...]
+    if source.ndim == 3 and source.shape[:2] == spatial.shape:
+        return spatial[..., np.newaxis]
+    raise ValueError(
+        "Stage10 star-protection shape mismatch: "
+        f"image={source.shape}, mask={spatial.shape}"
+    )
+
+
+def _build_stage10_star_protection_mask(
+    pipeline,
+    original: Optional[np.ndarray],
+) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+    """Build a bounded mask only from Stage 9's validated star catalog."""
+    report: Dict[str, Any] = {
+        "schema": "starun.stage10-star-protection.v1",
+        "status": "unavailable",
+        "source": "stage9_validated_star_reference_catalog",
+        "reason": "unknown",
+    }
+    if original is None:
+        report["reason"] = "frozen_stage10_input_unavailable"
+        return None, report
+    if not hasattr(pipeline, "_stage9_stars_applied"):
+        report["reason"] = "stage9_star_contract_unavailable"
+        return None, report
+    if not bool(getattr(pipeline, "_stage9_stars_applied", False)):
+        report["reason"] = "stage9_stars_not_applied"
+        return None, report
+
+    catalog = getattr(pipeline, "_stage9_star_reference_catalog", None)
+    if not isinstance(catalog, dict) or str(catalog.get("status", "")) != "ok":
+        report["reason"] = (
+            str(catalog.get("reason") or "stage9_star_reference_catalog_unavailable")
+            if isinstance(catalog, dict)
+            else "stage9_star_reference_catalog_unavailable"
+        )
+        return None, report
+
+    try:
+        _weak, _bright, union = stage9_quality.build_star_overlay_masks(
+            catalog,
+            strict=False,
+        )
+        hard_core = np.asarray(union, dtype=bool)
+        if hard_core.shape != _stage10_spatial_shape(np.asarray(original)):
+            raise ValueError(
+                "validated Stage9 catalog is not aligned with Stage10 input: "
+                f"catalog={hard_core.shape}, input={_stage10_spatial_shape(np.asarray(original))}"
+            )
+        if not np.any(hard_core):
+            raise ValueError("validated Stage9 star support is empty")
+
+        outer = dilate_mask(hard_core, iterations=1)
+        feathered = feather_mask(outer, radius=2)
+        protection = np.maximum(
+            hard_core.astype(np.float32),
+            np.asarray(feathered, dtype=np.float32),
+        )
+        if not np.all(np.isfinite(protection)):
+            raise ValueError("Stage10 star-protection mask contains non-finite values")
+        protection = np.clip(protection, 0.0, 1.0)
+        hard_coverage = float(np.mean(hard_core))
+        protected_coverage = float(np.mean(protection > 0.01))
+        weighted_coverage = float(np.mean(protection))
+        coverage_max = _config_value(
+            getattr(pipeline, "cfg", None),
+            "stage10_star_protection_coverage_max",
+            _STAGE10_STAR_PROTECTION_COVERAGE_MAX,
+            0.05,
+            0.60,
+        )
+        if protected_coverage > coverage_max:
+            raise ValueError(
+                "Stage10 star-protection coverage exceeds safety limit: "
+                f"{protected_coverage:.6f}>{coverage_max:.6f}"
+            )
+    except (KeyError, RuntimeError, TypeError, ValueError) as error:
+        report["reason"] = str(error)
+        return None, report
+
+    report.update(
+        {
+            "status": "ready",
+            "reason": "validated_stage9_catalog",
+            "hard_coverage": hard_coverage,
+            "protected_coverage": protected_coverage,
+            "weighted_coverage": weighted_coverage,
+            "coverage_max": coverage_max,
+            "hard_core_bit_exact": True,
+            "feather_radius": 2,
+            "dilation_iterations": 1,
+        }
+    )
+    return protection, report
+
+
+def _star_protected_denoised_image(
+    original: np.ndarray,
+    denoised: np.ndarray,
+    protection_mask: np.ndarray,
+) -> np.ndarray:
+    """Restore protected star pixels and feather their boundary into the result."""
+    source = np.asarray(original)
+    candidate = np.asarray(denoised)
+    if source.shape != candidate.shape:
+        raise ValueError(
+            "Stage10 protected merge shape mismatch: "
+            f"original={source.shape}, denoised={candidate.shape}"
+        )
+    if not np.all(np.isfinite(source)) or not np.all(np.isfinite(candidate)):
+        raise ValueError("Stage10 protected merge received non-finite pixels")
+
+    mask = np.clip(np.asarray(protection_mask, dtype=np.float32), 0.0, 1.0)
+    if not np.all(np.isfinite(mask)):
+        raise ValueError("Stage10 protected merge mask contains non-finite values")
+    expanded = _stage10_expanded_mask(source, mask)
+    source_float = source.astype(np.float64, copy=False)
+    candidate_float = candidate.astype(np.float64, copy=False)
+    merged_float = candidate_float * (1.0 - expanded) + source_float * expanded
+
+    if np.issubdtype(source.dtype, np.integer):
+        info = np.iinfo(source.dtype)
+        merged = np.rint(np.clip(merged_float, info.min, info.max)).astype(source.dtype)
+    else:
+        merged = merged_float.astype(source.dtype, copy=False)
+    merged = np.where(expanded <= 0.0, candidate, merged)
+    merged = np.where(expanded >= 1.0 - 1e-7, source, merged)
+    return merged.astype(source.dtype, copy=False)
+
+
+def _set_stage10_pixels(pipeline, pixels: np.ndarray, *, label: str) -> None:
+    setter = getattr(pipeline, "_set_current_image_pixeldata", None)
+    if callable(setter):
+        setter(pixels, label=label)
+        return
+    lock_factory = getattr(pipeline.siril, "image_lock", None)
+    if callable(lock_factory):
+        with lock_factory():
+            pipeline.siril.set_image_pixeldata(pixels)
+        return
+    pipeline.siril.set_image_pixeldata(pixels)
+
+
+def _apply_stage10_star_protected_result(
+    pipeline,
+    original: Optional[np.ndarray],
+    protection_mask: Optional[np.ndarray],
+) -> Tuple[bool, str]:
+    if original is None or protection_mask is None:
+        return False, "frozen input or validated star-protection mask unavailable"
+    try:
+        denoised = pipeline.siril.get_image_pixeldata(preview=False)
+        if denoised is None:
+            raise RuntimeError("empty Stage10 denoised image")
+        merged = _star_protected_denoised_image(
+            original,
+            np.asarray(denoised),
+            protection_mask,
+        )
+        _set_stage10_pixels(
+            pipeline,
+            merged,
+            label="Stage10 star-protected denoise merge",
+        )
+        return True, "validated Stage9 star support restored with feathered boundary"
+    except (AttributeError, CommandError, SirilError, RuntimeError, TypeError, ValueError) as error:
+        return False, str(error)
+
+
+def _rollback_stage10_denoise(
+    pipeline,
+    original: Optional[np.ndarray],
+) -> Tuple[bool, str]:
+    if original is None:
+        return False, "frozen Stage10 input unavailable"
+    try:
+        _set_stage10_pixels(
+            pipeline,
+            original,
+            label="Stage10 denoise safety rollback",
+        )
+        return True, "frozen pre-denoise input restored"
+    except (AttributeError, CommandError, SirilError, RuntimeError, TypeError, ValueError) as error:
+        return False, str(error)
 
 
 def _apply_stage10_chroma_only_result(
@@ -390,17 +618,706 @@ def _run_stage10_scunet_fallback(
     return pipeline._run_siril_scunet_denoise_fallback(step_key, strength)
 
 
+def _stage10_current_pixels(pipeline) -> Optional[np.ndarray]:
+    try:
+        image = pipeline.siril.get_image_pixeldata(preview=False)
+        if image is None:
+            return None
+        return np.array(image, copy=True)
+    except (
+        AttributeError,
+        CommandError,
+        SirilError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def _stage10_quality_noise_risk(report: Dict[str, Any]) -> float:
+    metrics = report.get("metrics") or {}
+    limits = metrics.get("noise_gate_limits") or {}
+    if not isinstance(metrics, dict) or not isinstance(limits, dict):
+        return float("inf")
+
+    pairs = (
+        ("background_chroma_noise_score", "chroma_advisory_max"),
+        ("background_mottling_score", "mottling_advisory_max"),
+        ("starless_artifact_score", "artifact_advisory_max"),
+        (
+            "local_texture_residual_outlier_score",
+            "texture_outlier_score_hard_max",
+        ),
+        (
+            "local_texture_affected_patch_ratio",
+            "texture_affected_ratio_hard_max",
+        ),
+    )
+    risk = 0.0
+    measured = False
+    for metric_name, limit_name in pairs:
+        try:
+            value = float(metrics[metric_name])
+            limit = float(limits[limit_name])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(value) or not math.isfinite(limit) or limit <= 0.0:
+            continue
+        measured = True
+        risk += max(0.0, value / limit - 1.0)
+    return risk if measured else float("inf")
+
+
+def _stage10_quality_repairable(report: Dict[str, Any]) -> Tuple[bool, str]:
+    if str(report.get("severity") or "") != "hard_reject":
+        return False, "final_quality_is_not_hard_reject"
+    hard_issues = report.get("hard_issues")
+    if not isinstance(hard_issues, list) or not hard_issues:
+        return False, "structured_hard_issues_unavailable"
+    recoverable_prefixes = (
+        "background_chroma_noise_extreme",
+        "background_mottling_extreme",
+        "starless_artifact_extreme",
+        "local_texture_residual_extreme",
+        "background_noise_combined_growth",
+    )
+    unsupported = [
+        str(issue)
+        for issue in hard_issues
+        if not str(issue).startswith(recoverable_prefixes)
+    ]
+    if unsupported:
+        return False, "non_repairable_hard_issues:" + ",".join(unsupported[:3])
+    return True, "recoverable_noise_only"
+
+
+def _stage10_quality_repair_candidate(
+    pipeline,
+    original: np.ndarray,
+    report: Dict[str, Any],
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    source = np.asarray(original)
+    rgb, layout = _rgb_float(source)
+    frozen_masks = getattr(
+        pipeline,
+        "_stage10_quality_frozen_background_masks",
+        None,
+    )
+    if not isinstance(frozen_masks, dict) or not frozen_masks:
+        raise ValueError("frozen signal-excluded background masks unavailable")
+    background = np.asarray(
+        frozen_masks["background_mask"],
+        dtype=np.float32,
+    )
+    background_weight = stage8_pixels._stage8_exclusive_background_weight(
+        frozen_masks,
+        background,
+    )
+    if background_weight.shape != rgb.shape[1:]:
+        raise ValueError(
+            "quality repair background mask shape mismatch: "
+            f"mask={background_weight.shape}, image={rgb.shape[1:]}"
+        )
+
+    star_protection, star_report = _build_stage10_star_protection_mask(
+        pipeline,
+        source,
+    )
+    if star_protection is None:
+        raise ValueError(
+            "validated Stage9 star protection unavailable: "
+            f"{star_report.get('reason', 'unknown')}"
+        )
+    repair_weight = np.clip(
+        background_weight * (1.0 - np.asarray(star_protection, dtype=np.float32)),
+        0.0,
+        1.0,
+    )
+    if float(np.mean(repair_weight > 0.05)) <= 0.01:
+        raise ValueError("quality repair background coverage is too small")
+
+    metrics = report.get("metrics") or {}
+    limits = metrics.get("noise_gate_limits") or {}
+    chroma = _metric_value(metrics, "background_chroma_noise_score")
+    mottling = _metric_value(metrics, "background_mottling_score")
+    artifact = _metric_value(metrics, "starless_artifact_score")
+    patch_variance = _metric_value(metrics, "local_patch_variance")
+    patch_limit = max(_metric_value(metrics, "local_patch_variance_max"), 1e-9)
+    texture_outlier = _metric_value(
+        metrics,
+        "local_texture_residual_outlier_score",
+    )
+    texture_affected = _metric_value(
+        metrics,
+        "local_texture_affected_patch_ratio",
+    )
+    chroma_repair = chroma > _metric_value(limits, "chroma_advisory_max")
+    texture_repair = bool(
+        patch_variance > patch_limit
+        or mottling > _metric_value(limits, "mottling_advisory_max")
+        or artifact > _metric_value(limits, "artifact_advisory_max")
+        or (
+            texture_outlier
+            > _metric_value(limits, "texture_outlier_score_hard_max")
+            and texture_affected
+            > _metric_value(limits, "texture_affected_ratio_hard_max")
+        )
+    )
+    if not chroma_repair and not texture_repair:
+        raise ValueError("hard noise report has no repairable active metric")
+
+    gray = (
+        0.2126 * rgb[0]
+        + 0.7152 * rgb[1]
+        + 0.0722 * rgb[2]
+    ).astype(np.float32)
+    candidate_rgb = np.array(rgb, copy=True)
+    if chroma_repair:
+        red_green = rgb[0] - rgb[1]
+        blue_green = rgb[2] - rgb[1]
+        repaired_red_green = red_green - (
+            red_green - stage8_pixels._box_blur_gray(red_green)
+        ) * (_STAGE10_QUALITY_CHROMA_REPAIR_STRENGTH * repair_weight)
+        repaired_blue_green = blue_green - (
+            blue_green - stage8_pixels._box_blur_gray(blue_green)
+        ) * (_STAGE10_QUALITY_CHROMA_REPAIR_STRENGTH * repair_weight)
+        repaired_green = (
+            gray
+            - 0.2126 * repaired_red_green
+            - 0.0722 * repaired_blue_green
+        )
+        candidate_rgb = np.stack(
+            (
+                repaired_green + repaired_red_green,
+                repaired_green,
+                repaired_green + repaired_blue_green,
+            ),
+            axis=0,
+        ).astype(np.float32)
+
+    texture_affected_ratio = 0.0
+    if texture_repair:
+        blur = stage8_pixels._box_blur_gray(gray)
+        residual = gray - blur
+        patch = 16
+        h, w = gray.shape
+        tile_records: List[Tuple[int, int, float]] = []
+        for y in range(0, max(h - patch + 1, 1), patch):
+            for x in range(0, max(w - patch + 1, 1), patch):
+                tile_weight = repair_weight[y:y + patch, x:x + patch]
+                if not tile_weight.size or float(np.mean(tile_weight)) <= 0.65:
+                    continue
+                tile_residual = residual[y:y + patch, x:x + patch]
+                total = max(float(np.sum(tile_weight)), 1e-6)
+                mean = float(np.sum(tile_residual * tile_weight) / total)
+                rms = float(
+                    np.sqrt(
+                        np.sum(((tile_residual - mean) ** 2) * tile_weight)
+                        / total
+                    )
+                )
+                tile_records.append((y, x, rms))
+        texture_weight = np.zeros_like(gray, dtype=np.float32)
+        if tile_records:
+            tile_rms = np.asarray(
+                [record[2] for record in tile_records],
+                dtype=np.float64,
+            )
+            tile_median = float(np.median(tile_rms))
+            tile_mad = float(np.median(np.abs(tile_rms - tile_median)))
+            tile_scale = max(1.4826 * tile_mad, tile_median * 0.15, 1e-6)
+            affected = 0
+            for y, x, rms in tile_records:
+                if (rms - tile_median) / tile_scale <= 4.0:
+                    continue
+                affected += 1
+                texture_weight[y:y + patch, x:x + patch] = repair_weight[
+                    y:y + patch,
+                    x:x + patch,
+                ]
+            texture_affected_ratio = affected / max(len(tile_records), 1)
+        if artifact > _metric_value(limits, "artifact_advisory_max"):
+            texture_weight = np.maximum(texture_weight, repair_weight)
+        repaired_luma = gray - residual * (
+            _STAGE10_QUALITY_TEXTURE_REPAIR_STRENGTH * texture_weight
+        )
+        candidate_luma = (
+            0.2126 * candidate_rgb[0]
+            + 0.7152 * candidate_rgb[1]
+            + 0.0722 * candidate_rgb[2]
+        )
+        candidate_rgb += (repaired_luma - candidate_luma)[None, :, :]
+
+    bg_std = max(_metric_value(metrics, "bg_std"), 0.0)
+    delta_limit = max(0.002, min(0.02, 3.0 * bg_std))
+    delta = np.clip(candidate_rgb - rgb, -delta_limit, delta_limit)
+    candidate_rgb = np.clip(rgb + delta, 0.0, 1.0)
+    candidate = _restore_rgb_like(source, candidate_rgb, layout)
+    candidate = _star_protected_denoised_image(
+        source,
+        candidate,
+        np.asarray(star_protection, dtype=np.float32),
+    )
+    if candidate.shape != source.shape or not np.all(np.isfinite(candidate)):
+        raise ValueError("quality repair candidate is invalid")
+    return candidate, {
+        "mode": "bounded_signal_excluded_noise_repair",
+        "chroma_repair": bool(chroma_repair),
+        "texture_repair": bool(texture_repair),
+        "chroma_strength": _STAGE10_QUALITY_CHROMA_REPAIR_STRENGTH,
+        "texture_strength": _STAGE10_QUALITY_TEXTURE_REPAIR_STRENGTH,
+        "delta_limit": delta_limit,
+        "background_coverage": float(np.mean(repair_weight > 0.05)),
+        "texture_affected_patch_ratio": texture_affected_ratio,
+        "star_protection": star_report,
+    }
+
+
+def _stage10_quality_repair_structure_metrics(
+    pipeline,
+    original: np.ndarray,
+    candidate: np.ndarray,
+) -> Dict[str, float]:
+    original_rgb, _layout = _rgb_float(original)
+    candidate_rgb, _candidate_layout = _rgb_float(candidate)
+    original_luma = (
+        0.2126 * original_rgb[0]
+        + 0.7152 * original_rgb[1]
+        + 0.0722 * original_rgb[2]
+    )
+    candidate_luma = (
+        0.2126 * candidate_rgb[0]
+        + 0.7152 * candidate_rgb[1]
+        + 0.0722 * candidate_rgb[2]
+    )
+    masks = getattr(pipeline, "_stage10_quality_frozen_background_masks", None)
+    if not isinstance(masks, dict) or not masks:
+        raise ValueError("frozen background masks unavailable for structure check")
+    background = np.asarray(masks["background_mask"], dtype=np.float32)
+    exclusive = stage8_pixels._stage8_exclusive_background_weight(
+        masks,
+        background,
+    )
+    signal_weight = np.clip(1.0 - exclusive, 0.0, 1.0)
+    signal = signal_weight > 0.25
+    if int(np.sum(signal)) < 64:
+        raise ValueError("insufficient protected signal pixels for structure check")
+    before_values = original_luma[signal].astype(np.float64)
+    after_values = candidate_luma[signal].astype(np.float64)
+    before_std = float(np.std(before_values))
+    after_std = float(np.std(after_values))
+    if before_std <= 1e-9 or after_std <= 1e-9:
+        correlation = 1.0 if np.allclose(before_values, after_values, atol=1e-6) else 0.0
+    else:
+        correlation = float(np.corrcoef(before_values, after_values)[0, 1])
+    before_flux = float(np.sum(before_values * signal_weight[signal]))
+    after_flux = float(np.sum(after_values * signal_weight[signal]))
+    flux_ratio = after_flux / max(before_flux, 1e-9)
+    original_clip = float(np.mean(original_luma >= 0.985))
+    candidate_clip = float(np.mean(candidate_luma >= 0.985))
+    return {
+        "signal_luminance_correlation": correlation,
+        "signal_flux_ratio": flux_ratio,
+        "core_clip_growth": candidate_clip - original_clip,
+    }
+
+
+def _attempt_stage10_quality_repair(
+    pipeline,
+    initial_report: Dict[str, Any],
+    *,
+    source_trusted: bool,
+) -> Dict[str, Any]:
+    repairable, reason = _stage10_quality_repairable(initial_report)
+    repair: Dict[str, Any] = {
+        "attempted": False,
+        "status": "not_requested",
+        "reason": reason,
+    }
+    if not source_trusted:
+        repair.update(status="skipped", reason="stage10_source_not_trusted")
+        initial_report["repair"] = repair
+        pipeline._stage10_quality_repair_report = dict(repair)
+        return initial_report
+    if not repairable:
+        initial_report["repair"] = repair
+        pipeline._stage10_quality_repair_report = dict(repair)
+        return initial_report
+    frozen_masks = getattr(
+        pipeline,
+        "_stage10_quality_frozen_background_masks",
+        None,
+    )
+    if not isinstance(frozen_masks, dict) or not frozen_masks:
+        repair.update(status="skipped", reason="trusted_background_masks_unavailable")
+        initial_report["repair"] = repair
+        pipeline._stage10_quality_repair_report = dict(repair)
+        return initial_report
+
+    repair.update(attempted=True, status="attempting", reason=reason)
+    pipeline._stage10_quality_repair_report = dict(repair)
+    original = _stage10_current_pixels(pipeline)
+    if original is None:
+        repair.update(status="failed", reason="stage10_final_pixels_unavailable")
+        initial_report["repair"] = repair
+        pipeline._stage10_quality_repair_report = dict(repair)
+        return initial_report
+    if not pipeline._save_stage_output("stage10_pre_quality_repair"):
+        repair.update(status="failed", reason="pre_repair_checkpoint_save_failed")
+        initial_report["repair"] = repair
+        pipeline._stage10_quality_repair_report = dict(repair)
+        return initial_report
+
+    try:
+        candidate, candidate_metadata = _stage10_quality_repair_candidate(
+            pipeline,
+            original,
+            initial_report,
+        )
+        repair["candidate"] = candidate_metadata
+        _set_stage10_pixels(
+            pipeline,
+            candidate,
+            label="Stage10 bounded final-quality repair",
+        )
+        if not pipeline._save_stage_output("stage10_quality_repair_candidate"):
+            raise RuntimeError("quality repair candidate checkpoint save failed")
+        reporter = getattr(pipeline, "_final_quality_report", None)
+        if not callable(reporter):
+            raise RuntimeError("final quality reporter unavailable for repair")
+        candidate_report = reporter("stage10_quality_repair_candidate")
+        if not isinstance(candidate_report, dict):
+            raise TypeError("quality repair candidate report must be a mapping")
+        structure = _stage10_quality_repair_structure_metrics(
+            pipeline,
+            original,
+            candidate,
+        )
+        initial_risk = _stage10_quality_noise_risk(initial_report)
+        candidate_risk = _stage10_quality_noise_risk(candidate_report)
+        risk_improvement = (
+            (initial_risk - candidate_risk) / max(initial_risk, 1e-9)
+            if math.isfinite(initial_risk) and math.isfinite(candidate_risk)
+            else float("-inf")
+        )
+        repair.update(
+            candidate_severity=candidate_report.get("severity"),
+            candidate_hard_issues=list(candidate_report.get("hard_issues") or []),
+            initial_noise_risk=initial_risk,
+            candidate_noise_risk=candidate_risk,
+            risk_improvement=risk_improvement,
+            structure=structure,
+        )
+        accepted = bool(
+            not candidate_report.get("hard_issues")
+            and str(candidate_report.get("severity") or "") != "hard_reject"
+            and risk_improvement >= _STAGE10_QUALITY_RISK_IMPROVEMENT_MIN
+            and structure["signal_luminance_correlation"]
+            >= _STAGE10_QUALITY_SIGNAL_CORRELATION_MIN
+            and _STAGE10_QUALITY_SIGNAL_FLUX_RATIO_MIN
+            <= structure["signal_flux_ratio"]
+            <= _STAGE10_QUALITY_SIGNAL_FLUX_RATIO_MAX
+            and structure["core_clip_growth"]
+            <= _STAGE10_QUALITY_CORE_CLIP_GROWTH_MAX
+        )
+        if not accepted:
+            raise RuntimeError("quality repair candidate did not satisfy acceptance gates")
+        if not pipeline._save_stage_output("stage10_final"):
+            raise RuntimeError("accepted quality repair final checkpoint save failed")
+        repair.update(status="accepted", reason="all_acceptance_gates_passed")
+        pipeline._stage10_quality_repair_report = dict(repair)
+        final_report = reporter("stage10_final")
+        if not isinstance(final_report, dict):
+            raise TypeError("accepted quality repair report must be a mapping")
+        final_report["repair"] = dict(repair)
+        return final_report
+    except (
+        AttributeError,
+        CommandError,
+        OSError,
+        RuntimeError,
+        SirilError,
+        TypeError,
+        ValueError,
+        FloatingPointError,
+    ) as error:
+        rollback_ok = False
+        rollback_error = ""
+        try:
+            pipeline.cmd_with_check("load", "stage10_pre_quality_repair")
+            rollback_ok = bool(pipeline._save_stage_output("stage10_final"))
+        except (AttributeError, CommandError, RuntimeError, SirilError) as rollback_exc:
+            rollback_error = str(rollback_exc)
+        repair.update(
+            status="rolled_back" if rollback_ok else "rollback_failed",
+            reason=str(error),
+            rollback_ok=rollback_ok,
+            rollback_error=rollback_error or None,
+        )
+        pipeline._stage10_quality_repair_report = dict(repair)
+        initial_report["repair"] = dict(repair)
+        if not rollback_ok:
+            hard_issues = list(initial_report.get("hard_issues") or [])
+            hard_issues.append("stage10_quality_repair_rollback_failed")
+            initial_report["hard_issues"] = list(dict.fromkeys(hard_issues))
+            initial_report["issues"] = list(initial_report["hard_issues"])
+            initial_report["severity"] = "hard_reject"
+            initial_report["status"] = "needs_conservative_rerun"
+            initial_report["final_quality"] = "poor"
+            initial_report["needs_conservative_rerun"] = True
+        return initial_report
+
+
+def _write_stage10_color_rebalance_report(
+    pipeline,
+    *,
+    pre_denoise: Optional[np.ndarray],
+    pre_rebalance: Optional[np.ndarray],
+    final_pixels: Optional[np.ndarray],
+    requested_saturation: float,
+    effective_saturation: float,
+    applied_saturation: float,
+    blocked_reason: str = "",
+) -> Dict[str, Any]:
+    """Record denoise and post-denoise color changes without gating delivery."""
+    channel_profile = getattr(pipeline, "channel_profile", {}) or {}
+    if not isinstance(channel_profile, dict) or not channel_profile:
+        channel_profile = {
+            "kind": str(
+                getattr(pipeline, "_channel_semantics", "unknown") or "unknown"
+            )
+        }
+    contract = resolve_color_contract(
+        channel_profile=channel_profile,
+        color_report=getattr(pipeline, "color_calibration_report", {}) or {},
+        palette_report=getattr(pipeline, "_stage8_palette_report", {}) or {},
+    )
+    unavailable = {
+        "schema": "starun.color-quality-report.v1",
+        "stage": "stage10",
+        "status": "unavailable",
+        "mode": "report_only",
+        "used_for_gate": False,
+        "contract": contract,
+        "issues": ["Stage10 color measurement pixels are unavailable"],
+    }
+    baseline = pre_denoise if pre_denoise is not None else pre_rebalance
+    if baseline is None or pre_rebalance is None or final_pixels is None:
+        denoise_delta = dict(unavailable)
+        rebalance_delta = dict(unavailable)
+        end_to_end = dict(unavailable)
+    else:
+        denoise_delta = build_color_quality_report(
+            baseline,
+            pre_rebalance,
+            stage="stage10",
+            baseline_name="stage10_pre_denoise_memory",
+            candidate_name="stage10_post_denoise_memory",
+            contract=contract,
+            operation="final_denoise_color_delta",
+        )
+        rebalance_delta = build_color_quality_report(
+            pre_rebalance,
+            final_pixels,
+            stage="stage10",
+            baseline_name="stage10_post_denoise_memory",
+            candidate_name="stage10_final_memory",
+            contract=contract,
+            requested_saturation=requested_saturation,
+            effective_saturation=effective_saturation,
+            applied_saturation=applied_saturation,
+            operation="post_denoise_budgeted_saturation",
+        )
+        end_to_end = build_color_quality_report(
+            baseline,
+            final_pixels,
+            stage="stage10",
+            baseline_name="stage10_pre_denoise_memory",
+            candidate_name="stage10_final_memory",
+            contract=contract,
+            requested_saturation=requested_saturation,
+            effective_saturation=effective_saturation,
+            applied_saturation=applied_saturation,
+            operation="denoise_and_final_rebalance_end_to_end",
+        )
+
+    ledger = list(getattr(pipeline, "_color_adjustment_ledger", []) or [])
+    for delta in (denoise_delta, rebalance_delta):
+        entry = delta.get("ledger_entry")
+        if isinstance(entry, dict):
+            ledger.append(dict(entry))
+    pipeline._color_adjustment_ledger = ledger
+    report = {
+        "schema": "starun.stage10-color-rebalance.v1",
+        "status": (
+            "reported"
+            if all(
+                item.get("status") == "reported"
+                for item in (denoise_delta, rebalance_delta, end_to_end)
+            )
+            else "unavailable"
+        ),
+        "mode": "report_only",
+        "used_for_gate": False,
+        "operation_order": [
+            "final_denoise_or_safe_skip",
+            "star_protected_merge_or_rollback",
+            "budgeted_saturation_rebalance",
+            "stage10_checkpoint_and_export",
+        ],
+        "decision": {
+            "requested_saturation": round(float(requested_saturation), 7),
+            "effective_saturation": round(float(effective_saturation), 7),
+            "applied_saturation": round(float(applied_saturation), 7),
+            "execution_blocked_reason": str(blocked_reason or "") or None,
+            "automatic_chroma_loss_threshold_used": False,
+            "reason": (
+                "thresholds_require_validation-corpus calibration; current run "
+                "uses only the existing Stage4 budget and Stage9 local-risk guard"
+            ),
+        },
+        "contract": contract,
+        "denoise_delta": denoise_delta,
+        "post_denoise_rebalance_delta": rebalance_delta,
+        "end_to_end_delta": end_to_end,
+        "cross_stage_ledger": list(ledger),
+    }
+    pipeline._stage10_color_rebalance_report = dict(report)
+    writer = getattr(pipeline, "_write_stage_json", None)
+    if callable(writer):
+        writer("stage10_color_rebalance_report.json", report)
+    return report
+
+
+def _stage10_config_choice(
+    cfg: Any,
+    field: str,
+    default: str,
+    allowed: Tuple[str, ...],
+) -> str:
+    value = str(getattr(cfg, field, default) or default).strip().lower()
+    return value if value in allowed else default
+
+
+def _stage10_record_policy_event(
+    pipeline,
+    *,
+    action: str,
+    event: str,
+    reason: str,
+    source: str,
+) -> None:
+    recorder = getattr(pipeline, "_record_stage_policy_event", None)
+    if callable(recorder):
+        recorder(10, event=event, reason=reason, source=source)
+    writer = getattr(pipeline, "_write_stage_json", None)
+    if callable(writer):
+        writer(
+            "stage10_failure_policy.json",
+            {
+                "schema": "starun.stage10-failure-policy.v1",
+                "stage": 10,
+                "failure_action": action,
+                "event": event,
+                "reason": reason,
+                "source": source,
+            },
+        )
+
+
+def _stage10_terminal_failure(
+    pipeline,
+    stage_label: str,
+    messages: List[str],
+    *,
+    reason_code: str,
+    reason: str,
+    action: str,
+    strict_stop: bool,
+) -> None:
+    """Write Stage 10 diagnostics/result and withhold every final export."""
+
+    pipeline._final_output_review_only = True
+    _stage10_record_policy_event(
+        pipeline,
+        action=action,
+        event="strict_stop" if strict_stop else "output_withheld",
+        reason=reason,
+        source="stage10",
+    )
+    messages.append(f"Stage10 output withheld: {reason}")
+    elapsed = pipeline.log.stage_end(stage_label)
+    pipeline._record_stage(
+        stage_label,
+        "failed",
+        elapsed,
+        "；".join(messages),
+        reason_code=reason_code,
+        details={
+            "failure_action": action,
+            "strict_stop": bool(strict_stop),
+            "final_export_generated": False,
+        },
+    )
+    if strict_stop:
+        raise RuntimeError(f"Stage 10 用户严格停止：{reason}")
+
+
 def run_stage10_export(pipeline) -> None:
     """
     阶段 10: 最终降噪与导出
-    - 最终色彩微调
-    - SCUNet 最终降噪（若可用）
+    - SCUNet / CosmicClarity 最终降噪（若可用）
+    - 降噪后按剩余预算做最终色彩微调
     - 导出 TIFF/PNG/FITS
     """
     stage_label = PipelineStage.EXPORT.label
     pipeline.log.stage_start(stage_label)
     status = "ok"
     messages: List[str] = []
+    pipeline._stage10_color_rebalance_report = {}
+    pipeline._stage10_quality_repair_report = {
+        "attempted": False,
+        "status": "not_requested",
+    }
+    pipeline._stage10_quality_frozen_background_masks = None
+    pipeline._stage10_quality_frozen_background_sampling = None
+    pipeline._stage10_quality_baseline_stem = ""
+    processing_mode = _stage10_config_choice(
+        pipeline.cfg,
+        "stage10_processing_mode",
+        "auto",
+        ("auto", "preserve"),
+    )
+    failure_action = _stage10_config_choice(
+        pipeline.cfg,
+        "stage10_failure_action",
+        "auto_fallback",
+        ("auto_fallback", "preserve_review", "stop"),
+    )
+    denoise_backend_policy = _stage10_config_choice(
+        pipeline.cfg,
+        "stage10_denoise_backend_policy",
+        "auto_chain",
+        ("auto_chain", "cosmic_only", "scunet_only"),
+    )
+    preserve_mode = processing_mode == "preserve"
+    final_denoise_enabled = bool(
+        getattr(pipeline.cfg, "stage10_final_denoise_enabled", True)
+    )
+    final_saturation_enabled = bool(
+        getattr(pipeline.cfg, "stage10_final_saturation_enabled", True)
+    )
+    quality_repair_enabled = bool(
+        getattr(pipeline.cfg, "stage10_quality_repair_enabled", True)
+    )
+    preserve_review_triggered = False
+    failure_policy_reason = ""
+    messages.append(
+        "Stage10 policy "
+        f"mode={processing_mode}; denoise_backend={denoise_backend_policy}; "
+        f"failure_action={failure_action}"
+    )
     stage9_contract_known = hasattr(pipeline, "_stage9_stars_applied")
     stage9_stars_required = bool(
         getattr(pipeline, "_stage9_stars_required", False)
@@ -408,6 +1325,20 @@ def run_stage10_export(pipeline) -> None:
     stage9_stars_applied = bool(
         getattr(pipeline, "_stage9_stars_applied", False)
     )
+    stage9_output_contains_stars = bool(
+        getattr(
+            pipeline,
+            "_stage9_output_contains_stars",
+            stage9_stars_applied,
+        )
+    )
+    active_target_type = ""
+    target_type_getter = getattr(pipeline, "_active_target_type", None)
+    if callable(target_type_getter):
+        try:
+            active_target_type = str(target_type_getter() or "")
+        except (AttributeError, RuntimeError, SirilError, TypeError, ValueError):
+            active_target_type = ""
     stage9_missing_required_stars = bool(
         stage9_contract_known
         and stage9_stars_required
@@ -416,8 +1347,44 @@ def run_stage10_export(pipeline) -> None:
     stage9_starmask_stretch_failed = bool(
         getattr(pipeline, "_stage9_starmask_stretch_failed", False)
     )
+    stage9_psf_review_required = bool(
+        getattr(pipeline, "_stage9_psf_review_required", False)
+    )
+    stage9_review_candidate_selected = bool(
+        getattr(pipeline, "_stage9_review_candidate_selected", False)
+    )
+    stage9_remix_formally_accepted = bool(
+        getattr(pipeline, "_stage9_remix_formally_accepted", False)
+    )
     stage4_color_review_required = bool(
         getattr(pipeline, "_stage4_color_review_required", False)
+    )
+    stage2_view_review_required = bool(
+        getattr(pipeline, "_stage2_view_review_required", False)
+    )
+    stage3_background_review_required = bool(
+        getattr(pipeline, "_background_review_required", False)
+    )
+    stage7_background_color_review_required = bool(
+        getattr(
+            pipeline,
+            "_stage7_background_color_review_required",
+            False,
+        )
+    )
+    stage6_starmask_borderline_review_required = bool(
+        getattr(
+            pipeline,
+            "_stage6_starmask_borderline_review_required",
+            False,
+        )
+    )
+    stage6_quality_hard_failed_retained = bool(
+        getattr(
+            pipeline,
+            "_stage6_quality_hard_failed_retained",
+            False,
+        )
     )
     forced_review_only = bool(
         getattr(pipeline.cfg, "force_review_only_output", False)
@@ -425,10 +1392,21 @@ def run_stage10_export(pipeline) -> None:
     review_only_output = forced_review_only or bool(
         getattr(pipeline, "_stage9_bypassed_bad_starless", False)
     ) or (
-        stage4_color_review_required
+        stage2_view_review_required
+        or stage3_background_review_required
+        or stage4_color_review_required
+        or stage7_background_color_review_required
+        or stage6_quality_hard_failed_retained
+        or stage6_starmask_borderline_review_required
         or stage9_missing_required_stars
         or stage9_starmask_stretch_failed
+        or stage9_psf_review_required
+        or stage9_review_candidate_selected
     )
+    final_source_review_reason = ""
+    final_quality_gate_status = "pending"
+    final_quality_gate_error = ""
+    final_quality_reason_code = ""
     pipeline._final_output_review_only = False
     if stage9_missing_required_stars:
         messages.append(
@@ -439,14 +1417,88 @@ def run_stage10_export(pipeline) -> None:
         messages.append(
             "stage9_starmask_stretch_failed=true; normal delivery is not allowed"
         )
+    if stage9_review_candidate_selected:
+        messages.append(
+            "stage9_review_candidate_selected=true while "
+            "stage9_remix_formally_accepted="
+            f"{str(stage9_remix_formally_accepted).lower()}; stars are present "
+            "but the remix exceeded a formal quality gate, so normal delivery "
+            "is not allowed"
+        )
+    elif stage9_psf_review_required:
+        messages.append(
+            "stage9_psf_review_required=true; PSF subgroup evidence is partial "
+            "and normal delivery is not allowed"
+        )
     if stage4_color_review_required:
         messages.append(
             "stage4_color_review_required=true; normal delivery is not allowed"
+        )
+    if stage2_view_review_required:
+        messages.append(
+            "stage2_view_review_required=true; normal delivery is not allowed"
+        )
+    if stage3_background_review_required:
+        messages.append(
+            "stage3_background_review_required=true; normal delivery is not allowed"
+        )
+    if stage7_background_color_review_required:
+        messages.append(
+            "stage7_uncalibrated_background_color_review_required=true; "
+            "normal delivery is not allowed; global white balance remains prohibited"
+        )
+    if stage6_starmask_borderline_review_required:
+        messages.append(
+            "stage6_starmask_diffuse_residual_borderline=true; "
+            "normal delivery is not allowed"
+        )
+    if stage6_quality_hard_failed_retained:
+        messages.append(
+            "stage6_quality_hard_failed_retained=true; "
+            "normal delivery is not allowed"
         )
     if forced_review_only:
         messages.append(
             "force_review_only_output=true; normal delivery names are disabled"
         )
+    if (
+        stage9_contract_known
+        and stage9_stars_required
+        and not stage9_output_contains_stars
+    ):
+        _stage10_record_policy_event(
+            pipeline,
+            action=failure_action,
+            event="required_stars_output_withheld",
+            reason="verified final source does not contain required stars",
+            source="required_stars_contract",
+        )
+        messages.append(
+            "required-stars final source is unavailable; no Starless-only "
+            "candidate will be published as a final/review output"
+        )
+        pipeline._final_output_review_only = True
+        elapsed = pipeline.log.stage_end(stage_label)
+        pipeline._record_stage(
+            stage_label,
+            "failed",
+            elapsed,
+            "；".join(messages),
+            reason_code="required_stars_output_withheld",
+            details={
+                "stars_required": True,
+                "stars_applied": stage9_stars_applied,
+                "output_contains_stars": False,
+                "stage9_output_withheld": bool(
+                    getattr(pipeline, "_stage9_output_withheld", False)
+                ),
+            },
+        )
+        if failure_action == "stop":
+            raise RuntimeError(
+                "Stage 10 用户严格停止：required-stars output withheld"
+            )
+        return
 
     # 按优先级加载最终图像
     final_file = "stage9_remixed"
@@ -454,14 +1506,23 @@ def run_stage10_export(pipeline) -> None:
     preferred_final_source = str(
         getattr(pipeline, "_stage9_final_source", None) or final_file
     )
-    final_candidates = [
-        preferred_final_source,
-        final_file,
-        "input_state_passthrough",
-        "starless_enhanced",
-        pipeline.stretched_name or "stage7_stretched",
-        "stage7_stretched",
-    ]
+    verified_preserve_source = bool(
+        stage9_contract_known and stage9_output_contains_stars
+    )
+    final_candidates = (
+        [preferred_final_source]
+        if preserve_mode and verified_preserve_source
+        else []
+        if preserve_mode
+        else [
+            preferred_final_source,
+            final_file,
+            "input_state_passthrough",
+            "stage8_enhanced",
+            pipeline.stretched_name or "stage7_stretched",
+            "stage7_stretched",
+        ]
+    )
     for candidate in dict.fromkeys(
         str(item) for item in final_candidates if item
     ):
@@ -477,16 +1538,139 @@ def run_stage10_export(pipeline) -> None:
         except (CommandError, SirilError):
             messages.append(f"final_candidate_load_failed={candidate}")
             continue
+    if preserve_mode and not final_loaded:
+        reason = (
+            "verified Stage9 with-stars source unavailable for preserve mode"
+        )
+        _stage10_terminal_failure(
+            pipeline,
+            stage_label,
+            messages,
+            reason_code="preserve_source_unavailable",
+            reason=reason,
+            action=failure_action,
+            strict_stop=failure_action == "stop",
+        )
+        return
     if not final_loaded:
         status = "degraded"
         messages.append("最终候选图加载失败，沿用当前 Siril 图像")
     input_source_fallback_used = bool(
         final_loaded and final_file != preferred_final_source
     )
-    pipeline.log.info(f"使用最终图像: {final_file}")
+    if input_source_fallback_used:
+        final_source_review_reason = "final_source_recovery_review_required"
+        review_only_output = True
+        messages.append(
+            "final source recovered from a non-preferred checkpoint "
+            f"({preferred_final_source}->{final_file}); fail-closed review-only output"
+        )
+        pipeline.log.warn(
+            "Stage10 首选最终源不可用，已从较早检查点恢复；"
+            "本轮只允许导出 result_review*"
+        )
+    elif not final_loaded:
+        final_source_review_reason = "final_source_unavailable_review_required"
+        review_only_output = True
+        messages.append(
+            "final source lineage unavailable; current Siril image retained "
+            "only for fail-closed review output"
+        )
+        pipeline.log.warn(
+            "Stage10 无法确认最终图像来源；当前 Siril 图像只允许"
+            "导出为 result_review*"
+        )
+    if final_loaded:
+        pipeline.log.info(f"使用最终图像: {final_file}")
+        pipeline._stage10_quality_baseline_stem = final_file
+    else:
+        pipeline.log.warn("使用来源未确认的 Siril 当前图像生成复核产物")
 
-    # 色彩微调
-    pipeline.log.info("色彩最终优化...")
+    def handle_decisive_failure(
+        reason: str,
+        *,
+        source: str,
+        resave_checkpoint: bool = False,
+    ) -> str:
+        """Apply Stage 10 policy without ever accepting a failed candidate."""
+
+        nonlocal review_only_output
+        nonlocal status
+        nonlocal final_file
+        nonlocal final_loaded
+        nonlocal final_source_review_reason
+        nonlocal preserve_review_triggered
+        nonlocal failure_policy_reason
+        _stage10_record_policy_event(
+            pipeline,
+            action=failure_action,
+            event="decisive_failure",
+            reason=reason,
+            source=source,
+        )
+        if failure_action == "auto_fallback":
+            return "auto_fallback"
+        failure_policy_reason = reason
+        if failure_action == "stop":
+            _stage10_terminal_failure(
+                pipeline,
+                stage_label,
+                messages,
+                reason_code="strict_stop",
+                reason=reason,
+                action=failure_action,
+                strict_stop=True,
+            )
+        source_path = pipeline.process_dir / f"{preferred_final_source}.fit"
+        if not (
+            stage9_contract_known
+            and stage9_output_contains_stars
+            and source_path.is_file()
+        ):
+            _stage10_terminal_failure(
+                pipeline,
+                stage_label,
+                messages,
+                reason_code="preserve_review_source_unavailable",
+                reason=(
+                    f"{reason}; verified Stage9 with-stars rollback source unavailable"
+                ),
+                action=failure_action,
+                strict_stop=False,
+            )
+            return "terminal"
+        try:
+            pipeline.cmd_with_check("load", preferred_final_source)
+            if resave_checkpoint and not pipeline._save_stage_output(
+                "stage10_final"
+            ):
+                raise RuntimeError("restored stage10_final checkpoint save failed")
+        except (CommandError, RuntimeError, SirilError) as error:
+            _stage10_terminal_failure(
+                pipeline,
+                stage_label,
+                messages,
+                reason_code="preserve_review_rollback_failed",
+                reason=f"{reason}; Stage9 rollback failed: {error}",
+                action=failure_action,
+                strict_stop=False,
+            )
+            return "terminal"
+        final_file = preferred_final_source
+        final_loaded = True
+        pipeline._stage10_quality_baseline_stem = preferred_final_source
+        preserve_review_triggered = True
+        review_only_output = True
+        status = "degraded" if status == "ok" else status
+        final_source_review_reason = "stage10_preserve_review"
+        messages.append(
+            "Stage10 preserve_review restored verified Stage9 with-stars source: "
+            f"{reason}"
+        )
+        return "preserved"
+
+    # Compute the budget now; execute the color command only after denoise.
+    pipeline.log.info("计算降噪后最终色彩补偿预算...")
     color_limits = color_safety_limits(
         getattr(pipeline, "pipeline_policy", {}) or {},
         getattr(pipeline, "color_calibration_report", {}) or {},
@@ -498,14 +1682,34 @@ def run_stage10_export(pipeline) -> None:
     requested_final_saturation = (
         0.0
         if (
-            bool(getattr(pipeline, "_skip_stage10_color_adjustments", False))
+            preserve_mode
+            or not final_saturation_enabled
+            or bool(
+                getattr(pipeline, "_skip_stage10_color_adjustments", False)
+            )
+            or stage9_review_candidate_selected
             or not channel_color_adjustments_allowed
         )
-        else float(pipeline.cfg.final_saturation)
+        else _config_value(
+            pipeline.cfg,
+            "final_saturation",
+            0.15,
+            0.0,
+            0.25,
+        )
     )
-    if bool(getattr(pipeline, "_skip_stage10_color_adjustments", False)):
+    if preserve_mode:
+        messages.append("Stage10 preserve mode skipped final saturation")
+    elif not final_saturation_enabled:
+        messages.append("Stage10 final saturation disabled by task configuration")
+    elif bool(getattr(pipeline, "_skip_stage10_color_adjustments", False)):
         messages.append(
             "Stage10 color adjustment skipped by input-state review guard"
+        )
+    elif stage9_review_candidate_selected:
+        messages.append(
+            "Stage10 color adjustment skipped because the Stage9 remix is a "
+            "bounded review candidate rather than a formally accepted candidate"
         )
     elif not channel_color_adjustments_allowed:
         messages.append(
@@ -547,37 +1751,29 @@ def run_stage10_export(pipeline) -> None:
             )
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             pipeline.log.warn(f"Stage10 saturation guard report failed: {error}")
-    if abs(effective_final_saturation) > 1e-8:
-        try:
-            pipeline.cmd_with_check(
-                "satu",
-                f"{effective_final_saturation:.6f}",
-                str(pipeline.cfg.final_bg_factor),
-            )
-            pipeline._saturation_boost_applied = float(
-                getattr(pipeline, "_saturation_boost_applied", 0.0)
-            ) + max(0.0, effective_final_saturation)
-        except (CommandError, SirilError) as e:
-            pipeline.log.warn(f"最终饱和度调整跳过: {e}")
-            status = "degraded"
-            messages.append(f"最终饱和度调整失败: {e}")
-    else:
-        if stage9_color_guard["applied"]:
-            messages.append(
-                "Stage10 saturation skipped by Stage9 local color risk guard"
-            )
-        else:
-            messages.append("Stage10 saturation skipped: Stage4 color budget exhausted")
-
+    # The actual saturation command is deliberately deferred until the final
+    # denoiser and the validated star-protection merge have completed.
     denoise_input_pixels, denoise_plan = _stage10_denoise_input(pipeline)
     selected_denoise_mode = str(denoise_plan["selected_mode"])
     cosmic_clarity_mode = str(denoise_plan["cosmic_clarity_mode"])
+    final_denoise_strength = _config_value(
+        getattr(pipeline, "cfg", None),
+        "stage10_final_denoise_strength",
+        _STAGE10_DENOISE_STRENGTH,
+        0.05,
+        0.50,
+    )
+    final_denoise_strength_text = f"{final_denoise_strength:.6g}"
     pipeline._cosmic_clarity_native_denoise_mode_override = cosmic_clarity_mode
-    pipeline._cosmic_clarity_native_denoise_strength_override = "0.5"
+    pipeline._cosmic_clarity_native_denoise_strength_override = (
+        final_denoise_strength_text
+    )
+    denoise_plan["requested_strength"] = final_denoise_strength
     input_metrics = denoise_plan["input_metrics"]
     pipeline.log.info(
         "[Stage10] denoise mode selection "
         f"selected={selected_denoise_mode}, cosmic_clarity={cosmic_clarity_mode}, "
+        f"strength={final_denoise_strength_text}, "
         f"chroma={float(input_metrics['chroma_noise_score']):.3f}, "
         f"bg_std={float(input_metrics['bg_std']):.5f}, "
         f"mottling={float(input_metrics['background_mottling_score']):.3f}"
@@ -609,18 +1805,51 @@ def run_stage10_export(pipeline) -> None:
     )
     review_only_denoise_skip = bool(review_only_output)
     low_noise_denoise_skip = selected_denoise_mode == "skip"
-    skip_final_denoise = (
+    preserve_mode_denoise_skip = bool(preserve_mode)
+    configured_denoise_skip = bool(not final_denoise_enabled)
+    skip_before_star_protection = (
         review_only_denoise_skip
         or duplicate_denoise_skip
         or low_noise_denoise_skip
+        or preserve_mode_denoise_skip
+        or configured_denoise_skip
     )
-    final_denoise_script = pipeline._find_plugin_script(
-        ("processing/CosmicClarity_Denoise.py",)
+    star_protection_mask: Optional[np.ndarray] = None
+    star_protection_report: Dict[str, Any] = {
+        "schema": "starun.stage10-star-protection.v1",
+        "status": "not_required",
+        "reason": "denoise_skipped_by_existing_guard",
+        "applied": False,
+    }
+    if not skip_before_star_protection:
+        star_protection_mask, star_protection_report = (
+            _build_stage10_star_protection_mask(
+                pipeline,
+                denoise_input_pixels,
+            )
+        )
+        star_protection_report["applied"] = False
+    star_protection_denoise_skip = bool(
+        not skip_before_star_protection and star_protection_mask is None
     )
-    final_denoise_executable_args = pipeline._classic_cosmic_clarity_args(
-        "sirilcc_denoise.conf",
-        "CosmicClarity Denoise",
+    skip_final_denoise = (
+        skip_before_star_protection or star_protection_denoise_skip
     )
+    denoise_plan["star_protection"] = star_protection_report
+    denoise_plan["processing_mode"] = processing_mode
+    denoise_plan["backend_policy"] = denoise_backend_policy
+    denoise_plan["final_denoise_enabled"] = final_denoise_enabled
+    if denoise_backend_policy == "scunet_only":
+        final_denoise_script = None
+        final_denoise_executable_args = None
+    else:
+        final_denoise_script = pipeline._find_plugin_script(
+            ("processing/CosmicClarity_Denoise.py",)
+        )
+        final_denoise_executable_args = pipeline._classic_cosmic_clarity_args(
+            "sirilcc_denoise.conf",
+            "CosmicClarity Denoise",
+        )
     if skip_final_denoise:
         if review_only_denoise_skip:
             denoise_primary = "review-only fast export guard"
@@ -628,17 +1857,39 @@ def run_stage10_export(pipeline) -> None:
         elif duplicate_denoise_skip:
             denoise_primary = "duplicate-denoise guard"
             denoise_effective = "stage5 denoise retained"
-        else:
+        elif low_noise_denoise_skip:
             denoise_primary = "low-noise metric guard"
             denoise_effective = "low-noise input retained"
+        elif preserve_mode_denoise_skip:
+            denoise_primary = "preserve-mode pixel guard"
+            denoise_effective = "verified Stage9 source retained"
+        elif configured_denoise_skip:
+            denoise_primary = "task denoise switch"
+            denoise_effective = "Stage9 source retained"
+        else:
+            denoise_primary = "star-protection fail-closed guard"
+            denoise_effective = "pre-denoise source retained"
         denoise_primary_status = "skipped"
         denoise_effective_status = "skipped_safe"
+    elif denoise_backend_policy == "scunet_only":
+        denoise_primary = "Siril-SCUNet Denoise"
+        final_scunet_used = pipeline._run_siril_scunet_denoise_fallback(
+            "最终降噪",
+            final_denoise_strength,
+        )
+        if final_scunet_used:
+            denoise_primary_status = "success"
+            denoise_effective = final_scunet_used
+            denoise_effective_status = "success"
+        else:
+            denoise_primary_status = "failed"
+            denoise_effective_status = "failed"
     elif final_denoise_script is not None and final_denoise_executable_args is not None:
         cli_args: List[str] = [
             "-denoising_mode",
             cosmic_clarity_mode,
             "-denoise_strength",
-            "0.5",
+            final_denoise_strength_text,
             "-use_gpu",
             *final_denoise_executable_args,
         ]
@@ -707,10 +1958,14 @@ def run_stage10_export(pipeline) -> None:
                         getattr(pipeline, "_last_plugin_script_error", None)
                         or "CosmicClarity_Native.py unavailable"
                     )
-                    final_scunet_used = _run_stage10_scunet_fallback(
-                        pipeline,
-                        "最终降噪回退",
-                        0.28,
+                    final_scunet_used = (
+                        _run_stage10_scunet_fallback(
+                            pipeline,
+                            "最终降噪回退",
+                            final_denoise_strength,
+                        )
+                        if denoise_backend_policy == "auto_chain"
+                        else None
                     )
                     if final_scunet_used:
                         denoise_effective = final_scunet_used
@@ -765,10 +2020,14 @@ def run_stage10_export(pipeline) -> None:
                 getattr(pipeline, "_last_plugin_script_error", None)
                 or "CosmicClarity_Native.py unavailable"
             )
-            final_scunet_used = _run_stage10_scunet_fallback(
-                pipeline,
-                "最终降噪回退",
-                0.28,
+            final_scunet_used = (
+                _run_stage10_scunet_fallback(
+                    pipeline,
+                    "最终降噪回退",
+                    final_denoise_strength,
+                )
+                if denoise_backend_policy == "auto_chain"
+                else None
             )
             if final_scunet_used:
                 denoise_effective = final_scunet_used
@@ -819,10 +2078,14 @@ def run_stage10_export(pipeline) -> None:
                 getattr(pipeline, "_last_plugin_script_error", None)
                 or "CosmicClarity_Native.py unavailable"
             )
-            final_scunet_used = _run_stage10_scunet_fallback(
-                pipeline,
-                "最终降噪回退",
-                0.28,
+            final_scunet_used = (
+                _run_stage10_scunet_fallback(
+                    pipeline,
+                    "最终降噪回退",
+                    final_denoise_strength,
+                )
+                if denoise_backend_policy == "auto_chain"
+                else None
             )
             if final_scunet_used:
                 denoise_effective = final_scunet_used
@@ -874,13 +2137,37 @@ def run_stage10_export(pipeline) -> None:
             "mottling="
             f"{float(input_metrics['background_mottling_score']):.3f})"
         )
+    elif preserve_mode_denoise_skip:
+        pipeline.log.info(
+            "Stage10 preserve 模式保留已验证 Stage9 含星源，跳过末端降噪"
+        )
+        messages.append("Stage10 preserve mode retained Stage9 pixels")
+    elif configured_denoise_skip:
+        pipeline.log.info("Stage10 末端降噪已由任务配置关闭")
+        messages.append("Stage10 final denoise disabled by task configuration")
+    elif star_protection_denoise_skip:
+        protection_reason = str(
+            star_protection_report.get("reason")
+            or "validated Stage9 star mask unavailable"
+        )
+        pipeline.log.warn(
+            "Stage10 星点保护 mask 不可用，安全跳过末端降噪: "
+            f"{protection_reason}"
+        )
+        messages.append(
+            "Stage10 star-protection guard skipped final denoise; "
+            f"reason={protection_reason}"
+        )
     elif final_denoise_used:
         pipeline.log.info("已执行最终降噪（作为最后一步处理）")
         messages.append(f"最终降噪使用 {final_denoise_used}")
     elif final_scunet_used:
         pipeline.log.info("已执行 Siril-SCUNet 最终降噪（代码回退）")
         messages.append(f"最终降噪使用 {final_scunet_used}")
-    elif getattr(pipeline.cfg, "aberration_api_enabled", False):
+    elif (
+        denoise_backend_policy == "auto_chain"
+        and getattr(pipeline.cfg, "aberration_api_enabled", False)
+    ):
         pipeline.log.warn("最终降噪脚本不可用，尝试 Aberration API 作为回退")
         local_model = pipeline._resolve_local_aberration_model()
         aberration_used = pipeline._run_aberration_api("最终降噪", model_path=local_model)
@@ -947,6 +2234,61 @@ def run_stage10_export(pipeline) -> None:
         else:
             effective_denoise_mode = "full"
 
+        protection_applied, protection_note = (
+            _apply_stage10_star_protected_result(
+                pipeline,
+                denoise_input_pixels,
+                star_protection_mask,
+            )
+        )
+        star_protection_report["applied"] = bool(protection_applied)
+        star_protection_report["apply_note"] = protection_note
+        if protection_applied:
+            messages.append(f"Stage10 star-protected denoise merge: {protection_note}")
+        else:
+            rollback_ok, rollback_note = _rollback_stage10_denoise(
+                pipeline,
+                denoise_input_pixels,
+            )
+            star_protection_report["rollback_status"] = (
+                "success" if rollback_ok else "failed"
+            )
+            star_protection_report["rollback_note"] = rollback_note
+            denoise_fallback_used = True
+            denoise_fallback_reason = "star_protection_merge_rollback"
+            if rollback_ok:
+                denoise_effective = "pre-denoise source retained"
+                denoise_effective_status = "rolled_back_safe"
+                effective_denoise_mode = "skipped"
+                pipeline.log.warn(
+                    "Stage10 星点保护回混失败，已恢复降噪前输入: "
+                    f"{protection_note}"
+                )
+                messages.append(
+                    "Stage10 star-protection merge failed; frozen input restored: "
+                    f"{protection_note}"
+                )
+            else:
+                denoise_effective_status = "protection_failed"
+                effective_denoise_mode = "unsafe_review"
+                review_only_output = True
+                status = "degraded" if status == "ok" else status
+                pipeline.log.error(
+                    "Stage10 星点保护回混与回滚均失败，仅允许 review-only 导出: "
+                    f"merge={protection_note}; rollback={rollback_note}"
+                )
+                messages.append(
+                    "Stage10 star-protection merge and rollback failed; "
+                    "forced review-only output"
+                )
+
+    if (
+        not skip_final_denoise
+        and denoise_effective_status
+        not in {"success", "rolled_back_safe", "protection_failed"}
+    ):
+        denoise_effective_status = "failed"
+
     denoise_plan.update(
         {
             "effective_mode": effective_denoise_mode,
@@ -955,6 +2297,11 @@ def run_stage10_export(pipeline) -> None:
             "skipped_by_duplicate_guard": bool(duplicate_denoise_skip),
             "skipped_by_review_only": bool(review_only_denoise_skip),
             "skipped_by_low_noise_guard": bool(low_noise_denoise_skip),
+            "skipped_by_preserve_mode": bool(preserve_mode_denoise_skip),
+            "skipped_by_task_switch": bool(configured_denoise_skip),
+            "skipped_by_star_protection_guard": bool(
+                star_protection_denoise_skip
+            ),
             "fallback_used": bool(denoise_fallback_used),
             "fallback_reason": denoise_fallback_reason or None,
         }
@@ -967,6 +2314,33 @@ def run_stage10_export(pipeline) -> None:
             pipeline.log.warn(f"Stage10 denoise plan report failed: {error}")
             messages.append("stage10_denoise_plan.json 写入失败")
 
+    if denoise_effective_status in {"failed", "protection_failed"}:
+        policy_outcome = handle_decisive_failure(
+            "all final denoise candidates failed"
+            if denoise_effective_status == "failed"
+            else "star-protection merge and rollback failed",
+            source="final_denoise",
+        )
+        if policy_outcome == "terminal":
+            return
+        if policy_outcome == "preserved":
+            denoise_effective = "verified Stage9 source restored"
+            denoise_effective_status = "rolled_back_safe"
+            effective_denoise_mode = "skipped"
+            denoise_fallback_used = True
+            denoise_fallback_reason = "preserve_review"
+            denoise_plan.update(
+                {
+                    "effective_mode": effective_denoise_mode,
+                    "effective_component": denoise_effective,
+                    "effective_status": denoise_effective_status,
+                    "fallback_used": True,
+                    "fallback_reason": "preserve_review",
+                }
+            )
+            if callable(stage_json_writer):
+                stage_json_writer("stage10_denoise_plan.json", denoise_plan)
+
     messages.append(
         f"final_denoise_primary={denoise_primary}; "
         f"primary_status={denoise_primary_status}; "
@@ -976,10 +2350,122 @@ def run_stage10_export(pipeline) -> None:
         f"effective_mode={effective_denoise_mode}"
     )
 
+    pre_rebalance_pixels = _stage10_current_pixels(pipeline)
+    stage10_applied_saturation = 0.0
+    stage10_saturation_failed = False
+    stage10_color_rebalance_blocked_reason = (
+        "preserve_review"
+        if preserve_review_triggered
+        else "denoise_safety_failure"
+        if denoise_effective_status == "protection_failed"
+        else ""
+    )
+    if (
+        abs(effective_final_saturation) > 1e-8
+        and not stage10_color_rebalance_blocked_reason
+    ):
+        try:
+            pipeline.log.info("最终降噪后执行预算内色彩补偿...")
+            pipeline.cmd_with_check(
+                "satu",
+                f"{effective_final_saturation:.6f}",
+                str(
+                    int(
+                        round(
+                            _config_value(
+                                pipeline.cfg,
+                                "final_bg_factor",
+                                1.0,
+                                0.0,
+                                10.0,
+                            )
+                        )
+                    )
+                ),
+            )
+            stage10_applied_saturation = float(effective_final_saturation)
+            pipeline._saturation_boost_applied = float(
+                getattr(pipeline, "_saturation_boost_applied", 0.0)
+            ) + max(0.0, stage10_applied_saturation)
+            messages.append(
+                "Stage10 applied final saturation after denoise and "
+                "star-protected merge"
+            )
+        except (CommandError, SirilError) as e:
+            stage10_saturation_failed = True
+            pipeline.log.warn(f"最终饱和度调整跳过: {e}")
+            status = "degraded"
+            messages.append(f"最终饱和度调整失败: {e}")
+    elif stage10_color_rebalance_blocked_reason:
+        messages.append(
+            "Stage10 saturation skipped after denoise protection/rollback failure"
+        )
+    elif stage9_color_guard["applied"]:
+        messages.append(
+            "Stage10 saturation skipped by Stage9 local color risk guard"
+        )
+    elif requested_final_saturation == 0.0:
+        messages.append("Stage10 saturation skipped by color-operation policy")
+    else:
+        messages.append("Stage10 saturation skipped: Stage4 color budget exhausted")
+
+    final_color_pixels = _stage10_current_pixels(pipeline)
+    try:
+        stage10_color_report = _write_stage10_color_rebalance_report(
+            pipeline,
+            pre_denoise=denoise_input_pixels,
+            pre_rebalance=pre_rebalance_pixels,
+            final_pixels=final_color_pixels,
+            requested_saturation=requested_final_saturation,
+            effective_saturation=effective_final_saturation,
+            applied_saturation=stage10_applied_saturation,
+            blocked_reason=stage10_color_rebalance_blocked_reason,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        stage10_color_report = {
+            "schema": "starun.stage10-color-rebalance.v1",
+            "status": "unavailable",
+            "mode": "report_only",
+            "used_for_gate": False,
+            "issues": [str(error)],
+        }
+        pipeline._stage10_color_rebalance_report = dict(stage10_color_report)
+        pipeline.log.warn(f"Stage10 color rebalance report failed: {error}")
+        messages.append("stage10_color_rebalance_report.json 写入失败")
+
+    if stage10_saturation_failed:
+        policy_outcome = handle_decisive_failure(
+            "final saturation command failed",
+            source="final_saturation",
+        )
+        if policy_outcome == "terminal":
+            return
+
+    final_quality: Dict[str, Any] = {}
     stage_saved = pipeline._save_stage_output("stage10_final")
     if not stage_saved and status == "ok":
         status = "degraded"
         messages.append("stage10 输出保存失败")
+    if not stage_saved:
+        final_quality_gate_status = "checkpoint_unavailable"
+        final_quality_gate_error = "stage10_final checkpoint save failed"
+        final_quality_reason_code = "final_quality_checkpoint_unavailable"
+        review_only_output = True
+        messages.append(
+            "final quality gate unavailable because stage10_final.fit was not saved; "
+            "fail-closed review-only output"
+        )
+        pipeline.log.warn(
+            "Stage10 规范检查点保存失败，无法完成最终质量门；"
+            "本轮只允许导出 result_review*"
+        )
+        policy_outcome = handle_decisive_failure(
+            "stage10_final checkpoint save failed",
+            source="checkpoint",
+            resave_checkpoint=True,
+        )
+        if policy_outcome == "terminal":
+            return
     elif stage_saved:
         diff_note = pipeline._stage_diff_note("stage10_final", final_file)
         if diff_note:
@@ -994,8 +2480,10 @@ def run_stage10_export(pipeline) -> None:
                     "color_policy_limits": color_limits,
                     "effective_final_saturation": effective_final_saturation,
                     "channel_semantics": channel_semantics,
+                    "target_type": active_target_type or "unknown",
                     "stage9_local_color_saturation_guard": stage9_color_guard,
                     "denoise_plan": denoise_plan,
+                    "color_rebalance_report": stage10_color_report,
                 },
             )
             if review.get("report_path"):
@@ -1003,9 +2491,109 @@ def run_stage10_export(pipeline) -> None:
         feature_note = pipeline._feature_summary_note("最终导出前特征")
         if feature_note:
             messages.append(feature_note)
-        if hasattr(pipeline, "_final_quality_report"):
+        final_quality_reporter = getattr(pipeline, "_final_quality_report", None)
+        if callable(final_quality_reporter):
             try:
-                final_quality = pipeline._final_quality_report("stage10_final")
+                final_quality = final_quality_reporter("stage10_final")
+                if not isinstance(final_quality, dict):
+                    raise TypeError("final quality report must be a mapping")
+                quality_repair_source_trusted = bool(
+                    not review_only_output
+                    and final_loaded
+                    and not input_source_fallback_used
+                    and final_file == preferred_final_source
+                    and stage9_contract_known
+                    and (not stage9_stars_required or stage9_stars_applied)
+                    and not bool(
+                        getattr(pipeline, "_stage8_fallback_used", False)
+                    )
+                    and not bool(
+                        getattr(pipeline, "_stage9_bypassed_bad_starless", False)
+                    )
+                    and not stage9_missing_required_stars
+                    and not bool(
+                        getattr(
+                            pipeline,
+                            "_stage9_starmask_preparation_failed",
+                            False,
+                        )
+                    )
+                    and not stage9_starmask_stretch_failed
+                )
+                if (
+                    quality_repair_enabled
+                    and not preserve_mode
+                    and not preserve_review_triggered
+                ):
+                    final_quality = _attempt_stage10_quality_repair(
+                        pipeline,
+                        final_quality,
+                        source_trusted=quality_repair_source_trusted,
+                    )
+                else:
+                    repair_reason = (
+                        "preserve_mode"
+                        if preserve_mode
+                        else "preserve_review"
+                        if preserve_review_triggered
+                        else "disabled_by_task_configuration"
+                    )
+                    pipeline._stage10_quality_repair_report = {
+                        "attempted": False,
+                        "status": "disabled",
+                        "reason": repair_reason,
+                    }
+                    final_quality["repair"] = dict(
+                        pipeline._stage10_quality_repair_report
+                    )
+                repair_record = final_quality.get("repair") or {}
+                if isinstance(repair_record, dict) and repair_record.get("attempted"):
+                    messages.append(
+                        "stage10_quality_repair="
+                        f"{repair_record.get('status', 'unknown')}"
+                    )
+                    if (
+                        repair_record.get("status") == "accepted"
+                        and hasattr(pipeline, "_create_stage_review_bundle")
+                    ):
+                        repair_review = pipeline._create_stage_review_bundle(
+                            "stage10_quality_repair",
+                            "stage10_pre_quality_repair",
+                            "stage10_final",
+                            context={
+                                "repair": repair_record,
+                                "target_type": active_target_type or "unknown",
+                            },
+                        )
+                        if repair_review.get("report_path"):
+                            messages.append(
+                                f"quality_repair_review_bundle={repair_review['report_path']}"
+                            )
+                final_quality_value = str(
+                    final_quality.get("final_quality", "") or ""
+                ).strip().lower()
+                final_quality_status = str(
+                    final_quality.get("status", "") or ""
+                ).strip().lower()
+                needs_conservative_rerun = final_quality.get(
+                    "needs_conservative_rerun"
+                )
+                issues = final_quality.get("issues")
+                if not isinstance(needs_conservative_rerun, bool):
+                    raise TypeError(
+                        "final quality report needs_conservative_rerun must be bool"
+                    )
+                if not isinstance(issues, list):
+                    raise TypeError("final quality report issues must be a list")
+                quality_requires_review = bool(
+                    needs_conservative_rerun
+                    or final_quality_value != "ok"
+                    or final_quality_status != "ok"
+                    or issues
+                )
+                final_quality_gate_status = (
+                    "review_required" if quality_requires_review else "ok"
+                )
                 pipeline._write_stage_json("final_quality_report.json", final_quality)
                 pipeline.log.info(
                     "[Stage10] final_quality="
@@ -1018,21 +2606,71 @@ def run_stage10_export(pipeline) -> None:
                     f"{final_quality.get('final_quality')} "
                     f"status={final_quality.get('status')}"
                 )
-                if bool(final_quality.get("needs_conservative_rerun", False)):
+                if quality_requires_review:
                     review_only_output = True
-                if final_quality.get("final_quality") != "ok":
+                    final_quality_reason_code = "final_quality_requires_review"
                     status = "degraded" if status == "ok" else status
-                    issues = final_quality.get("issues", [])
-                    if isinstance(issues, list) and issues:
+                    if issues:
                         issue_text = ", ".join(str(x) for x in issues[:2])
                         pipeline.log.warn(f"[Stage10] final_quality_issues={issue_text}")
                         messages.append("final_quality_issues=" + issue_text)
                     else:
-                        messages.append("final_quality=poor")
-            except (OSError, RuntimeError, TypeError, ValueError) as e:
-                pipeline.log.warn(f"final quality report failed: {e}")
-                messages.append("final_quality_report 写入失败")
+                        messages.append(
+                            "final quality report contract is not fully ok; "
+                            "fail-closed review-only output"
+                        )
+                    policy_outcome = handle_decisive_failure(
+                        "final quality gate rejected Stage10 candidate",
+                        source="final_quality_gate",
+                        resave_checkpoint=True,
+                    )
+                    if policy_outcome == "terminal":
+                        return
+            except (
+                AttributeError,
+                CommandError,
+                OSError,
+                RuntimeError,
+                SirilError,
+                TypeError,
+                ValueError,
+            ) as e:
+                final_quality_gate_status = "unavailable"
+                final_quality_gate_error = str(e)
+                final_quality_reason_code = "final_quality_gate_unavailable"
+                review_only_output = True
+                pipeline.log.warn(f"final quality gate unavailable: {e}")
+                messages.append(
+                    "final quality gate unavailable; fail-closed review-only output: "
+                    f"{e}"
+                )
                 status = "degraded" if status == "ok" else status
+                policy_outcome = handle_decisive_failure(
+                    "final quality gate unavailable",
+                    source="final_quality_gate",
+                    resave_checkpoint=True,
+                )
+                if policy_outcome == "terminal":
+                    return
+        else:
+            final_quality_gate_status = "unavailable"
+            final_quality_gate_error = "final quality reporter unavailable"
+            final_quality_reason_code = "final_quality_gate_unavailable"
+            review_only_output = True
+            messages.append(
+                "final quality reporter unavailable; fail-closed review-only output"
+            )
+            pipeline.log.warn(
+                "Stage10 最终质量门实现不可用；本轮只允许导出 "
+                "result_review*"
+            )
+            policy_outcome = handle_decisive_failure(
+                "final quality reporter unavailable",
+                source="final_quality_gate",
+                resave_checkpoint=True,
+            )
+            if policy_outcome == "terminal":
+                return
 
     managed_export_enabled = bool(
         getattr(pipeline.cfg, "stage10_managed_output_enabled", True)
@@ -1056,7 +2694,7 @@ def run_stage10_export(pipeline) -> None:
             ValueError,
         ) as error:
             managed_export_report = {
-                "schema": "seestar.managed-output.v1",
+                "schema": "starun.managed-output.v1",
                 "status": "partial",
                 "ready": False,
                 "mode": "independent_managed_derivatives",
@@ -1082,7 +2720,7 @@ def run_stage10_export(pipeline) -> None:
             "review_only_output=true; normal result_processed/result_final names withheld"
         )
         pipeline.log.warn(
-            "最终质量门控要求保守重跑；本轮仅导出 result_review* 复核产物，"
+            "Stage10 安全门要求复核；本轮仅导出 result_review* 复核产物，"
             "不写入普通 result_processed/result_final 名称"
         )
     else:
@@ -1126,6 +2764,12 @@ def run_stage10_export(pipeline) -> None:
         messages=messages,
         export_report=export_report,
     )
+    export_report["color_rebalance_report"] = {
+        "file": "stage10_color_rebalance_report.json",
+        "status": stage10_color_report.get("status", "unavailable"),
+        "used_for_gate": False,
+        "applied_saturation": stage10_applied_saturation,
+    }
     pipeline._write_stage_json("stage10_export_report.json", export_report)
     if managed_export_enabled and managed_pixels is not None:
         scientific_names = {
@@ -1153,6 +2797,8 @@ def run_stage10_export(pipeline) -> None:
                 base_filename=base_filename,
                 output_format=getattr(pipeline.cfg, "output_format", "all"),
                 scientific_paths=scientific_paths,
+                target_type=active_target_type,
+                stars_required=stage9_stars_required,
             )
             pipeline._write_stage_json(
                 "managed_output_report.json",
@@ -1163,7 +2809,9 @@ def run_stage10_export(pipeline) -> None:
                 f"{managed_export_report.get('status', 'unknown')} "
                 f"artifacts={len(managed_export_report.get('artifacts') or [])} "
                 "scientific_unchanged="
-                f"{str(bool((managed_export_report.get('scientific_archive') or {}).get('unchanged', False))).lower()}"
+                f"{str(bool((managed_export_report.get('scientific_archive') or {}).get('unchanged', False))).lower()} "
+                "display_visibility="
+                f"{str((managed_export_report.get('display_visibility') or {}).get('status', 'not_requested'))}"
             )
             if not bool(managed_export_report.get("ready", False)):
                 messages.append(
@@ -1171,7 +2819,7 @@ def run_stage10_export(pipeline) -> None:
                 )
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             managed_export_report = {
-                "schema": "seestar.managed-output.v1",
+                "schema": "starun.managed-output.v1",
                 "status": "partial",
                 "ready": False,
                 "mode": "independent_managed_derivatives",
@@ -1198,6 +2846,7 @@ def run_stage10_export(pipeline) -> None:
             review_only=review_only_output,
             exported_after=export_started_at,
             managed_export_report=managed_export_report,
+            source_color_contract=stage10_color_report.get("contract"),
         )
         pipeline._output_color_manifest = output_color_manifest
         pipeline._write_stage_json(
@@ -1214,7 +2863,7 @@ def run_stage10_export(pipeline) -> None:
         )
     except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
         pipeline._output_color_manifest = {
-            "schema": "seestar.output-color-manifest.v1",
+            "schema": "starun.output-color-manifest.v1",
             "mode": "report_only",
             "rewrote_outputs": False,
             "status": "unavailable",
@@ -1226,6 +2875,12 @@ def run_stage10_export(pipeline) -> None:
     if denoise_effective_status == "success":
         denoise_component_status = "applied"
         denoise_reason_code = denoise_fallback_reason or "accepted"
+    elif denoise_effective_status == "rolled_back_safe":
+        denoise_component_status = "skipped"
+        denoise_reason_code = "star_protection_merge_rollback"
+    elif denoise_effective_status == "protection_failed":
+        denoise_component_status = "failed"
+        denoise_reason_code = "star_protection_rollback_failed"
     elif review_only_denoise_skip:
         denoise_component_status = "skipped"
         denoise_reason_code = "review_only_output"
@@ -1235,6 +2890,15 @@ def run_stage10_export(pipeline) -> None:
     elif low_noise_denoise_skip:
         denoise_component_status = "skipped"
         denoise_reason_code = "auto_low_noise"
+    elif preserve_mode_denoise_skip:
+        denoise_component_status = "skipped"
+        denoise_reason_code = "preserve_mode"
+    elif configured_denoise_skip:
+        denoise_component_status = "skipped"
+        denoise_reason_code = "disabled_by_task_configuration"
+    elif star_protection_denoise_skip:
+        denoise_component_status = "skipped"
+        denoise_reason_code = "star_protection_unavailable"
     else:
         denoise_component_status = "failed"
         denoise_reason_code = "all_final_denoisers_failed"
@@ -1245,6 +2909,8 @@ def run_stage10_export(pipeline) -> None:
         "primary_status": denoise_primary_status,
         "selected_mode": selected_denoise_mode,
         "effective_mode": effective_denoise_mode,
+        "requested_strength": final_denoise_strength,
+        "star_protection": star_protection_report,
         "reason_code": denoise_reason_code,
         "fallback_used": bool(denoise_fallback_used),
         "input": final_file if final_loaded else None,
@@ -1292,6 +2958,35 @@ def run_stage10_export(pipeline) -> None:
         ),
         "fallback_used": export_fallback_used,
     }
+    color_component = {
+        "status": (
+            "failed"
+            if stage10_saturation_failed
+            else "applied"
+            if abs(stage10_applied_saturation) > 1e-8
+            else "skipped"
+        ),
+        "method": "post_denoise_budgeted_saturation",
+        "reason_code": (
+            "command_failed"
+            if stage10_saturation_failed
+            else stage10_color_rebalance_blocked_reason
+            if stage10_color_rebalance_blocked_reason
+            else "accepted"
+            if abs(stage10_applied_saturation) > 1e-8
+            else "stage9_local_color_risk"
+            if stage9_color_guard["applied"]
+            else "color_operation_policy"
+            if requested_final_saturation == 0.0
+            else "stage4_budget_exhausted"
+        ),
+        "requested_saturation": requested_final_saturation,
+        "effective_saturation": effective_final_saturation,
+        "applied_saturation": stage10_applied_saturation,
+        "report_status": stage10_color_report.get("status", "unavailable"),
+        "report": "stage10_color_rebalance_report.json",
+        "fallback_used": False,
+    }
     stage_denoise_fallback_used = bool(
         denoise_fallback_used and denoise_effective_status == "success"
     )
@@ -1299,10 +2994,27 @@ def run_stage10_export(pipeline) -> None:
         input_source_fallback_used
         or stage_denoise_fallback_used
         or export_fallback_used
+        or preserve_review_triggered
     )
     stage_reason_code = (
-        "stage4_color_review_required"
+        "stage2_view_review_required"
+        if stage2_view_review_required
+        else "stage3_background_review_required"
+        if stage3_background_review_required
+        else "stage4_color_review_required"
         if stage4_color_review_required
+        else "uncalibrated_background_color_review_required"
+        if stage7_background_color_review_required
+        else "starmask_diffuse_residual_borderline"
+        if stage6_starmask_borderline_review_required
+        else "stage6_quality_hard_failed_retained"
+        if stage6_quality_hard_failed_retained
+        else final_source_review_reason
+        if final_source_review_reason
+        else "stage10_failure_policy"
+        if failure_policy_reason
+        else final_quality_reason_code
+        if final_quality_reason_code
         else denoise_fallback_reason
         if stage_denoise_fallback_used
         else "final_source_recovery"
@@ -1321,13 +3033,70 @@ def run_stage10_export(pipeline) -> None:
         fallback_used=stage_fallback_used,
         reason_code=stage_reason_code,
         details={
+            "processing_mode": processing_mode,
+            "failure_action": failure_action,
+            "denoise_backend_policy": denoise_backend_policy,
+            "preserve_review_triggered": preserve_review_triggered,
+            "failure_policy_reason": failure_policy_reason or None,
             "review_only_output": bool(review_only_output),
+            "stage2_view_review_required": stage2_view_review_required,
+            "stage3_background_review_required": (
+                stage3_background_review_required
+            ),
             "stage4_color_review_required": stage4_color_review_required,
-            "final_source": final_file,
+            "stage7_background_color_review_required": (
+                stage7_background_color_review_required
+            ),
+            "stage6_starmask_borderline_review_required": (
+                stage6_starmask_borderline_review_required
+            ),
+            "stage6_quality_hard_failed_retained": (
+                stage6_quality_hard_failed_retained
+            ),
+            "stage7_background_color_review_gate": dict(
+                getattr(
+                    pipeline,
+                    "_stage7_background_color_review_gate",
+                    {},
+                )
+                or {}
+            ),
+            "final_source": final_file if final_loaded else None,
+            "preferred_final_source": preferred_final_source,
+            "final_source_review_required": bool(final_source_review_reason),
+            "retained_unverified_current_image": not final_loaded,
+            "final_quality_gate_status": final_quality_gate_status,
+            "final_quality_gate_error": final_quality_gate_error or None,
+            "final_quality_severity": final_quality.get("severity"),
+            "final_quality_warning_count": len(
+                final_quality.get("warnings") or []
+            ),
+            "stage10_quality_repair": dict(
+                final_quality.get("repair")
+                or getattr(pipeline, "_stage10_quality_repair_report", {})
+                or {}
+            ),
+            "managed_output_ready": bool(
+                managed_export_report
+                and managed_export_report.get("ready", False)
+            ),
+            "stage10_color_rebalance_report_status": stage10_color_report.get(
+                "status", "unavailable"
+            ),
+            "color_adjustment_ledger_entries": len(
+                getattr(pipeline, "_color_adjustment_ledger", []) or []
+            ),
+            "display_visibility_status": str(
+                (
+                    (managed_export_report or {}).get("display_visibility")
+                    or {}
+                ).get("status", "not_requested")
+            ),
         },
         components={
             "input_source": input_source_component,
             "denoise": denoise_component,
+            "color_rebalance": color_component,
             "export": export_component,
         },
     )

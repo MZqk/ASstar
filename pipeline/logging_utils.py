@@ -1,4 +1,4 @@
-"""Lightweight logging helpers for the Seestar pipeline."""
+"""Lightweight logging helpers for the Starun pipeline."""
 from __future__ import annotations
 
 import time

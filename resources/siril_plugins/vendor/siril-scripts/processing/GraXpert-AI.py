@@ -55,6 +55,11 @@ Models licensed as CC-BY-NC-SA-4.0
 # 2.0.2  Fix issue with the deconvolution strength slider not working
 # 2.0.3  Fix issue with sequence processing losing metadata, remove BGE GPU
 #        (causes errors on some systems and fast enough not to need GPU)
+# 2.0.4  If no CLI arguments, run in GUI mode by default
+# 2.0.5  Fix Undo unavailable when launched via Workflow Companion or pyscript
+# 2.1.0  Siril 1.5 removes the core/graxpert_path config item: for sirilpy
+#        >= 1.1.13 store the GraXpert executable path in the script's own
+#        config file, settable via the GUI ("Set GraXpert Executable")
 
 import os
 import re
@@ -93,7 +98,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QComboBox, QPushButton, QSlider, QSpinBox, QDoubleSpinBox, QCheckBox,
     QFrame, QListWidget, QScrollArea, QProgressBar, QMessageBox, QDialog,
-    QRadioButton, QButtonGroup, QGroupBox, QSizePolicy, QStackedWidget
+    QRadioButton, QButtonGroup, QGroupBox, QSizePolicy, QStackedWidget,
+    QFileDialog
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont
@@ -102,21 +108,82 @@ import numpy as np
 from astropy.io import fits
 from appdirs import user_data_dir
 
-VERSION = "2.0.3"
+VERSION = "2.1.0"
 DENOISE_CONFIG_FILENAME = "graxpert_denoise_model.conf"
 BGE_CONFIG_FILENAME = "graxpert_bge_model.conf"
 DECONVOLVE_STARS_CONFIG_FILENAME = "graxpert_deconv_stars_model.conf"
 DECONVOLVE_OBJECTS_CONFIG_FILENAME = "graxpert_deconv_obj_model.conf"
+EXECUTABLE_CONFIG_FILENAME = "graxpert_executable.conf"
 
 _graxpert_mutex = threading.Lock()
 _graxpert_version = None
 
+def use_own_executable_config():
+    """
+    Whether the script should manage the GraXpert executable path itself
+    rather than reading it from Siril's 'core/graxpert_path' config item.
+
+    Siril 1.5 removes the 'core/graxpert_path' config item, so for sirilpy
+    >= 1.1.0 the script stores the executable path in its own config file.
+    """
+    return s.needs_module_version('>=1.1.13')
+
+def get_executable_config_path(siril):
+    """Return the path to the script's GraXpert executable config file."""
+    if siril is None or not siril.connected:
+        return None
+    config_dir = siril.get_siril_configdir()
+    if not config_dir:
+        return None
+    return os.path.join(config_dir, EXECUTABLE_CONFIG_FILENAME)
+
+def read_executable_config(siril):
+    """Read the GraXpert executable path from the script's config file."""
+    config_file_path = get_executable_config_path(siril)
+    if not config_file_path or not os.path.isfile(config_file_path):
+        return None
+    try:
+        with open(config_file_path, 'r', encoding='utf-8') as file:
+            lines = file.readlines()
+            if lines:
+                executable = lines[0].strip()
+                return executable or None
+    except Exception as e:
+        print(f"Error reading GraXpert executable config: {str(e)}")
+    return None
+
+def write_executable_config(siril, executable):
+    """Save the GraXpert executable path to the script's config file."""
+    config_file_path = get_executable_config_path(siril)
+    if not config_file_path:
+        return False
+    try:
+        with open(config_file_path, 'w', encoding='utf-8') as file:
+            file.write((executable or "") + "\n")
+        return True
+    except Exception as e:
+        print(f"Error saving GraXpert executable config: {str(e)}")
+        return False
+
+def executable_help_text():
+    """Help text telling the user where to set the GraXpert executable."""
+    if use_own_executable_config():
+        return ("Please set the location of the GraXpert executable using the "
+                "'Set GraXpert Executable' button in the GraXpert AI window.")
+    return ("Please set the location of the GraXpert executable in "
+            "Siril Preferences -> Miscellaneous")
+
 def get_executable(siril):
     if siril is None or not siril.connected:
         return None
+    if use_own_executable_config():
+        # Siril 1.5+ no longer provides the 'core/graxpert_path' config item,
+        # so the script manages the executable path itself.
+        return read_executable_config(siril)
     executable = siril.get_siril_config('core', 'graxpert_path')
-    print(executable)
-    return None if 'not set' in executable else executable
+    if executable is None or 'not set' in executable:
+        return None
+    return executable
 
 def check_graxpert_version(executable):
     """
@@ -490,6 +557,21 @@ class GUIInterface(QMainWindow):
 
         main_layout.addWidget(advanced_group)
 
+        # GraXpert executable selection. Only shown when the script manages the
+        # executable path itself (sirilpy >= 1.1.13); for older versions the path
+        # comes from Siril's preferences.
+        if use_own_executable_config():
+            exe_group = QGroupBox("GraXpert Executable")
+            exe_layout = QHBoxLayout(exe_group)
+            self.executable_path_label = QLabel()
+            self.executable_path_label.setWordWrap(True)
+            exe_layout.addWidget(self.executable_path_label, 1)
+            exe_browse_btn = QPushButton("Set GraXpert Executable")
+            exe_browse_btn.clicked.connect(self._on_set_executable)
+            exe_layout.addWidget(exe_browse_btn)
+            main_layout.addWidget(exe_group)
+            self._refresh_executable_label()
+
         # Action buttons
         buttons_layout = QHBoxLayout()
 
@@ -857,6 +939,36 @@ class GUIInterface(QMainWindow):
         # Resize window to fit new content
         self.adjustSize()
 
+    def _refresh_executable_label(self):
+        """Refresh the label showing the configured GraXpert executable."""
+        executable = get_executable(self.siril)
+        self.executable_path_label.setText(executable if executable else "<not set>")
+
+    def _on_set_executable(self):
+        """Prompt for the GraXpert executable and save it to the config file."""
+        current = get_executable(self.siril) or ""
+        start_dir = os.path.dirname(current) if current else os.path.expanduser("~")
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self, "Select GraXpert executable", start_dir)
+        if not path:
+            return
+
+        # Validate that the chosen file is a working GraXpert executable
+        version = check_graxpert_version(path)
+        if version is None:
+            QMessageBox.critical(
+                self, "Invalid executable",
+                "The selected file does not appear to be a working GraXpert "
+                "executable. Please check the path and try again.")
+            return
+
+        if write_executable_config(self.siril, path):
+            self._refresh_executable_label()
+            self._update_progress(f"GraXpert executable set (version {version})")
+        else:
+            QMessageBox.critical(
+                self, "Error", "Failed to save the GraXpert executable path.")
+
     def load_model_manager(self):
         """Load a model manager dialog"""
         model_manager = GraXpertModelManager(self, self.siril, self.update_dropdowns)
@@ -1147,12 +1259,12 @@ class GraXpertModelManager(QDialog):
         graxpert_executable = get_executable(siril)
         if graxpert_executable is None:
             QMessageBox.critical(self, "GraXpert not found",
-                               "Please set the location of the GraXpert executable in Siril Preferences -> Miscellaneous")
+                               executable_help_text())
             return
         check_graxpert_version(graxpert_executable)
         if _graxpert_version is None:
             QMessageBox.critical(self, "Error checking GraXpert version",
-                               "Please check the location of the GraXpert executable in Siril Preferences -> Miscellaneous")
+                               executable_help_text())
             return
         self.operations = get_available_operations()
 
@@ -1686,8 +1798,7 @@ class DenoiserProcessing:
             if self.siril.is_image_loaded():
                 try:
                     with self.siril.image_lock():
-                        if not self.siril.is_cli():
-                            self.siril.undo_save_state(f"GraXpert AI denoise: strength {strength:.2f}")
+                        self.siril.undo_save_state(f"GraXpert AI denoise: strength {strength:.2f}")
                         self.siril.set_image_pixeldata(blended)
                 except s.ImageDialogOpenError:
                     messagebox.showerror("Image dialog open", "An image dialog is open: please close it and try again.")
@@ -2435,8 +2546,7 @@ class DeconvolutionProcessing:
             if self.siril.is_image_loaded():
                 try:
                     with self.siril.image_lock():
-                        if not self.siril.is_cli():
-                            self.siril.undo_save_state(f"GraXpert AI deconvolve: strength {strength:.2f}")
+                        self.siril.undo_save_state(f"GraXpert AI deconvolve: strength {strength:.2f}")
                         self.siril.set_image_pixeldata(deconvolved)
                 except s.ImageDialogOpenError:
                     messagebox.showerror("Image dialog open", "An image dialog is open: please close it and try again.")
@@ -2912,8 +3022,7 @@ class BGEProcessing:
             if self.siril.is_image_loaded():
                 try:
                     with self.siril.image_lock():
-                        if not self.siril.is_cli():
-                            self.siril.undo_save_state(f"GraXpert AI BGE: {correction_type}")
+                        self.siril.undo_save_state(f"GraXpert AI BGE: {correction_type}")
                         self.siril.set_image_pixeldata(corrected)
                 except s.ImageDialogOpenError:
                     messagebox.showerror("Image dialog open", "An image dialog is open: please close it and try again.")
@@ -3559,7 +3668,7 @@ def main():
     try:
         siril.connect()
 
-        if siril.is_cli():
+        if siril.is_cli() and len(sys.argv) > 1:
             # Top level argument parser
             parser = argparse.ArgumentParser(
                 description=f"GraXpert AI Tools - Siril CLI v{VERSION}",

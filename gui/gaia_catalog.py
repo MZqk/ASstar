@@ -116,7 +116,7 @@ def download_gaia_catalog(
     catalog_part = destination.with_name(f".{GAIA_CATALOG_FILENAME}.part")
     request = urllib.request.Request(
         GAIA_CATALOG_URL,
-        headers={"User-Agent": "SeestarSuperimpose/1.0 GaiaCatalogInstaller"},
+        headers={"User-Agent": "Starun/1.0 GaiaCatalogInstaller"},
     )
     try:
         _check_cancelled(stop_event)

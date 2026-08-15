@@ -61,6 +61,8 @@ Pipeline:
   1.0.16 Fix: masters_dir was deleted before phase 4, so _flat_arg / _bias_arg
          / _dark_arg found no masters during light calibration; move cleanup
          to after _phase_calibrate_register_stack completes
+  1.0.17 Add right-click context menu to override file types, allowing the
+         correct type to be forced on files with an incorrect FITS header
 """
 
 import json
@@ -85,7 +87,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QProgressBar, QHeaderView,
     QLineEdit, QFileDialog, QSizePolicy,
     QDialog, QCheckBox, QDialogButtonBox, QDoubleSpinBox,
-    QAbstractItemView,
+    QAbstractItemView, QMenu
 )
 from PyQt6.QtGui import QFont, QColor, QDragEnterEvent, QDropEvent
 from sirilpy import LogColor
@@ -97,7 +99,7 @@ from astropy.io import fits as astrofits
 # =============================================================================
 
 APP_NAME         = "Siril Wizard – Automatic Multi-Session Processing"
-VERSION          = "1.0.16"
+VERSION          = "1.0.17"
 FITS_SUFFIXES    = {'.fits', '.fit', '.fts'}
 FITS_FZ_SUFFIXES = {'.fits.fz', '.fit.fz', '.fts.fz'}
 FITS_EXTS      = tuple(FITS_SUFFIXES | FITS_FZ_SUFFIXES)
@@ -685,7 +687,7 @@ class PreprocessingEngine:
         best_delta: float          = float('inf')
         tolerance   = flat_exptime * 0.20  # 20 % tolerance
 
-        def _check(f: Path):
+        def _check(f: Path, trust_type: bool = False):
             nonlocal best_path, best_delta
             if not is_fits_file(f):
                 return
@@ -693,9 +695,15 @@ class PreprocessingEngine:
                 with astrofits.open(f, memmap=True,
                                      ignore_missing_simple=True) as hdul:
                     h = _find_image_header(hdul)
-                    imgtype = normalize_imagetyp(str(h.get('IMAGETYP', '')))
-                    if imgtype not in ('dark', 'darkflat'):
-                        return
+                    # trust_type=True for subs already bucketed as 'darkflat'
+                    # in memory: their type may have been forced by the user to
+                    # work around a missing/incorrect IMAGETYP, so re-reading it
+                    # from disk here would wrongly reject them. EXPTIME is still
+                    # taken from the header in all cases (that's what we match).
+                    if not trust_type:
+                        imgtype = normalize_imagetyp(str(h.get('IMAGETYP', '')))
+                        if imgtype not in ('dark', 'darkflat'):
+                            return
                     et = h.get('EXPTIME', h.get('EXPOSURE', None))
                     if et is None:
                         return
@@ -715,11 +723,12 @@ class PreprocessingEngine:
             for f in self.external_darks.rglob('*'):
                 _check(f)
 
-        # 3. Raw subs explicitly tagged IMAGETYP=DarkFlat (or similar) in input dir
+        # 3. Raw subs bucketed as 'darkflat' in memory (from IMAGETYP=DarkFlat
+        #    or from a user type override). Trust the in-memory type here.
         for session_buckets in self._by.values():
             for fi_list in session_buckets.get('darkflat', {}).values():
                 for fi in fi_list:
-                    _check(fi['path'])
+                    _check(fi['path'], trust_type=True)
 
         if best_path is not None:
             self._log(
@@ -1955,6 +1964,8 @@ class FITSOrganizerWindow(QMainWindow):
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.tree.keyPressEvent = self._tree_key_press
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._show_context_menu)
         root.addWidget(self.tree, stretch=1)
 
         # ── Options panel ─────────────────────────────────────────────────────
@@ -2278,6 +2289,75 @@ class FITSOrganizerWindow(QMainWindow):
             self.status_label.setText(
                 f'{len(self._all_infos)} file(s)  –  {n_subs} sub(s)'
                 f'  |  {n_masters} master(s)')
+
+    def _show_context_menu(self, pos):
+        """Display right-click menu to override file types."""
+        if self._proc_worker and self._proc_worker.isRunning():
+            return
+
+        selected = self.tree.selectedItems()
+        if not selected:
+            return
+
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu { background:#1a1a2e; color:#dddddd; border:1px solid #444466; padding: 4px; }
+            QMenu::item { padding: 6px 24px 6px 8px; border-radius: 4px; }
+            QMenu::item:selected { background:#5BA3FF; color:#ffffff; }
+        """)
+
+        # Map actions to the internal string types
+        actions = {
+            menu.addAction('💡  Force as Light'): 'light',
+            menu.addAction('🌓  Force as Flat'): 'flat',
+            menu.addAction('🌓🌑 Force as Dark Flat'): 'darkflat',
+            menu.addAction('🌑  Force as Dark'): 'dark',
+            menu.addAction('⚡  Force as Bias'): 'bias',
+        }
+
+        # Show menu at cursor position
+        action = menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+        if action in actions:
+            self._change_file_type(actions[action])
+
+    def _change_file_type(self, new_type: str):
+        """Update the imgtype for all selected files and rebuild the tree."""
+        paths_to_change: set[str] = set()
+
+        # Recursively gather file paths, same as deletion
+        def _collect_leaves(item: QTreeWidgetItem):
+            path_key = item.data(0, Qt.ItemDataRole.UserRole)
+            if path_key:
+                paths_to_change.add(path_key)
+            for i in range(item.childCount()):
+                _collect_leaves(item.child(i))
+
+        for item in self.tree.selectedItems():
+            _collect_leaves(item)
+
+        if not paths_to_change:
+            return
+
+        # Update the underlying data model. Masters are left untouched: they
+        # are already-built calibration files, and overriding their type would
+        # silently move them between master groups.
+        changed = 0
+        for fi in self._all_infos:
+            if fi['is_master']:
+                continue
+            if str(fi['path'].resolve()) in paths_to_change:
+                if fi['imgtype'] != new_type:
+                    fi['imgtype'] = new_type
+                    changed += 1
+
+        # Rebuild the UI to reflect the new grouping
+        if changed > 0:
+            self._build_tree(self._all_infos)
+            self.siril.log(
+                f'Forced {changed} file(s) to type: {new_type}',
+                LogColor.BLUE
+            )
 
     def _on_dropped(self, raw_paths: list[str]):
         fits_files = collect_fits(raw_paths)

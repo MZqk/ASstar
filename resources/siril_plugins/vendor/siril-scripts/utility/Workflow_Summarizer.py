@@ -199,7 +199,7 @@ class WorkflowWorker(QThread):
                     self.progress.emit("Generating summary...")
                     # Generate response with file using the new API
                     response = client.models.generate_content(
-                        model='gemini-2.5-flash',
+                        model='gemini-flash-latest',
                         contents=[
                             types.Part.from_uri(
                                 file_uri=self.uploaded_file.uri,

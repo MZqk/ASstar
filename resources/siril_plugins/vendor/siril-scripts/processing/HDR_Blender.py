@@ -44,18 +44,18 @@ the sum of the weight maps adds up to a unity image, for inspection.
 """
 
 # Version Log
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 # 1.0.0: AKB - initial release
 # 1.0.1: Added low memory mode and exposure calibration
+# 1.0.2: Added psutil in dep
 
 import sys
 import os
 import json
 from pathlib import Path
-import psutil
 
 import sirilpy as s
-s.ensure_installed("PyQt6")
+s.ensure_installed("psutil", "PyQt6")
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -66,6 +66,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 import numpy as np
+import psutil
 
 def get_memory_info():
     """Get available system memory in bytes"""

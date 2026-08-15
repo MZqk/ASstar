@@ -7,7 +7,7 @@ from typing import Any, Dict, Iterable, Optional
 import numpy as np
 
 
-NOISE_MODEL_SCHEMA = "seestar.multiscale-noise-model.v1"
+NOISE_MODEL_SCHEMA = "starun.multiscale-noise-model.v1"
 DEFAULT_MAX_SIDE = 1024
 DEFAULT_SCALES = (1, 2, 4, 8, 16)
 
@@ -410,6 +410,95 @@ def _quality_metrics(
     }
 
 
+def assess_denoise_candidate(
+    before_image: Any,
+    after_image: Any,
+    *,
+    detail_retention_min: float = 0.82,
+    noise_reduction_min: float = 0.05,
+    chroma_noise_growth_max: float = 1.05,
+) -> Dict[str, Any]:
+    """使用同一组指标验收任意 Stage 5 线性降噪候选。"""
+    _before_source, before = _full_float_chw(before_image)
+    _after_source, after = _full_float_chw(after_image)
+    if before.shape != after.shape:
+        raise ValueError(
+            "denoise candidate shape changed: "
+            f"before={before.shape}, after={after.shape}"
+        )
+
+    metrics = _quality_metrics(before, after)
+    metrics["finite"] = bool(
+        np.all(np.isfinite(np.asarray(after_image)))
+    )
+    chroma_growth: Optional[float] = None
+    if before.shape[0] >= 3:
+        chroma_before = float(metrics["background_chroma_sigma_before"])
+        chroma_after = float(metrics["background_chroma_sigma_after"])
+        if chroma_before <= 1e-9:
+            chroma_growth = 1.0 if chroma_after <= 1e-9 else 1.0e9
+        else:
+            chroma_growth = chroma_after / chroma_before
+    metrics["background_chroma_noise_growth"] = chroma_growth
+
+    limits = {
+        "detail_retention_min": max(
+            0.70,
+            min(0.98, float(detail_retention_min)),
+        ),
+        "noise_reduction_min": max(
+            0.0,
+            min(0.50, float(noise_reduction_min)),
+        ),
+        "chroma_noise_growth_max": max(
+            1.0,
+            min(1.50, float(chroma_noise_growth_max)),
+        ),
+        "clip_growth_max": 0.001,
+        "background_median_drift_max": 0.003,
+        "bright_spread_growth_max": 0.03,
+    }
+    issues: list[str] = []
+    if not metrics["finite"]:
+        issues.append("nonfinite_output")
+    if metrics["clip_growth"] > limits["clip_growth_max"]:
+        issues.append("clip_growth")
+    if metrics["background_median_drift"] > limits["background_median_drift_max"]:
+        issues.append("background_median_drift")
+    if metrics["signal_detail_retention"] < limits["detail_retention_min"]:
+        issues.append("signal_detail_retention")
+    if metrics["bright_spread_growth"] > limits["bright_spread_growth_max"]:
+        issues.append("bright_spread_growth")
+    if (
+        chroma_growth is not None
+        and chroma_growth > limits["chroma_noise_growth_max"]
+    ):
+        issues.append("background_chroma_noise_growth")
+
+    low_noise_input = metrics["background_luma_sigma_before"] <= 1e-5
+    if (
+        not low_noise_input
+        and metrics["background_noise_reduction"] < limits["noise_reduction_min"]
+    ):
+        issues.append("insufficient_noise_reduction")
+    accepted = not issues and not low_noise_input
+    status = (
+        "accepted"
+        if accepted
+        else "skipped_low_noise"
+        if low_noise_input
+        else "rejected"
+    )
+    return {
+        "schema": "starun.denoise-quality-gate.v1",
+        "status": status,
+        "accepted": accepted,
+        "metrics": metrics,
+        "limits": limits,
+        "issues": issues,
+    }
+
+
 def multiscale_denoise_candidate(
     image: Any,
     *,
@@ -419,6 +508,7 @@ def multiscale_denoise_candidate(
     chroma_threshold_multiplier: float = 1.90,
     detail_retention_min: float = 0.82,
     noise_reduction_min: float = 0.05,
+    chroma_noise_growth_max: float = 1.05,
 ) -> tuple[np.ndarray, Dict[str, Any]]:
     """Build and gate a deterministic linear denoise candidate."""
     source, before = _full_float_chw(image)
@@ -488,46 +578,27 @@ def multiscale_denoise_candidate(
 
     candidate = before * (1.0 - blend[None, :, :]) + filtered * blend[None, :, :]
     candidate = np.clip(candidate, 0.0, 1.0).astype(np.float32)
-    metrics = _quality_metrics(before, candidate)
-    limits = {
-        "detail_retention_min": max(0.70, min(0.98, float(detail_retention_min))),
-        "noise_reduction_min": max(0.0, min(0.50, float(noise_reduction_min))),
-        "clip_growth_max": 0.001,
-        "background_median_drift_max": 0.003,
-        "bright_spread_growth_max": 0.03,
-    }
-    issues: list[str] = []
-    if not metrics["finite"]:
-        issues.append("nonfinite_output")
-    if metrics["clip_growth"] > limits["clip_growth_max"]:
-        issues.append("clip_growth")
-    if metrics["background_median_drift"] > limits["background_median_drift_max"]:
-        issues.append("background_median_drift")
-    if metrics["signal_detail_retention"] < limits["detail_retention_min"]:
-        issues.append("signal_detail_retention")
-    if metrics["bright_spread_growth"] > limits["bright_spread_growth_max"]:
-        issues.append("bright_spread_growth")
-    low_noise_input = metrics["background_luma_sigma_before"] <= 1e-5
-    if (
-        not low_noise_input
-        and metrics["background_noise_reduction"] < limits["noise_reduction_min"]
-    ):
-        issues.append("insufficient_noise_reduction")
-    accepted = not issues and not low_noise_input
-    status = "accepted" if accepted else "skipped_low_noise" if low_noise_input else "rejected"
+    gate = assess_denoise_candidate(
+        before,
+        candidate,
+        detail_retention_min=detail_retention_min,
+        noise_reduction_min=noise_reduction_min,
+        chroma_noise_growth_max=chroma_noise_growth_max,
+    )
     report = {
-        "schema": "seestar.multiscale-denoise-candidate.v1",
-        "status": status,
-        "accepted": accepted,
+        "schema": "starun.multiscale-denoise-candidate.v1",
+        "status": gate["status"],
+        "accepted": gate["accepted"],
         "algorithm": "luma_opponent_chroma_multiscale_soft_threshold",
         "strength": safe_strength,
         "radii": [int(value) for value in radii],
         "component_scales": component_reports,
-        "metrics": metrics,
-        "limits": limits,
-        "issues": issues,
+        "metrics": gate["metrics"],
+        "limits": gate["limits"],
+        "issues": gate["issues"],
+        "quality_gate_schema": gate["schema"],
         "transaction": {
-            "baseline": "stage5_pre_multiscale.fit",
+            "baseline": "stage5_pre_denoise.fit",
             "candidate": "stage5_multiscale_candidate.fit",
             "rollback_required_on_rejection": True,
         },
@@ -536,6 +607,7 @@ def multiscale_denoise_candidate(
 
 
 __all__ = [
+    "assess_denoise_candidate",
     "build_noise_model_report",
     "multiscale_denoise_candidate",
 ]

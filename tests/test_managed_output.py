@@ -85,6 +85,98 @@ class ManagedOutputTests(unittest.TestCase):
             self.assertTrue(
                 manifest["summary"]["managed_export_ready"]
             )
+            self.assertTrue(
+                manifest["summary"]["display_visibility_verified"]
+            )
+
+    def test_dark_galaxy_display_is_stretched_then_audited_from_final_png(self) -> None:
+        height, width = 180, 240
+        y_grid, x_grid = np.mgrid[:height, :width]
+        galaxy = np.exp(
+            -0.5
+            * (
+                ((x_grid - width * 0.50) / (width * 0.20)) ** 2
+                + ((y_grid - height * 0.52) / (height * 0.12)) ** 2
+            )
+        )
+        green = 0.075 + 0.055 * galaxy
+        image = np.stack((green * 1.03, green, green * 0.94)).astype(np.float32)
+        for y_pos, x_pos, value in (
+            (20, 30, 0.45),
+            (40, 180, 0.35),
+            (80, 40, 0.40),
+            (130, 190, 0.50),
+            (155, 90, 0.30),
+            (60, 120, 0.40),
+        ):
+            image[:, y_pos, x_pos] = np.clip(
+                image[:, y_pos, x_pos] + value,
+                0.0,
+                1.0,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = export_managed_outputs(
+                image,
+                work_dir=root,
+                base_filename="result_review",
+                output_format="png",
+                target_type="large_galaxy",
+                stars_required=True,
+            )
+
+            self.assertTrue(report["ready"], report)
+            visibility = report["display_visibility"]
+            self.assertEqual(visibility["input_pixels"]["status"], "failed")
+            self.assertLess(
+                visibility["input_pixels"]["metrics"]["green_median"],
+                0.08,
+            )
+            self.assertEqual(
+                visibility["transform"]["name"],
+                "linked_review_visibility_stretch",
+            )
+            final_png = visibility["final_png"]
+            self.assertEqual(final_png["source"], "decoded_final_png")
+            self.assertEqual(final_png["status"], "passed")
+            self.assertGreater(final_png["metrics"]["green_median"], 0.70)
+            self.assertTrue(final_png["checks"]["galaxy_visibility"]["passed"])
+            self.assertTrue(final_png["checks"]["star_visibility"]["passed"])
+            self.assertTrue(
+                (root / "result_review_display_srgb.png").is_file()
+            )
+
+    def test_unreadable_display_candidate_is_not_published_as_display(self) -> None:
+        image = np.full((3, 96, 128), 0.075, dtype=np.float32)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stale_display = root / "result_review_display_srgb.png"
+            stale_display.write_bytes(b"stale managed derivative")
+            report = export_managed_outputs(
+                image,
+                work_dir=root,
+                base_filename="result_review",
+                output_format="png",
+                target_type="large_galaxy",
+                stars_required=True,
+            )
+
+            self.assertFalse(report["ready"])
+            self.assertFalse(stale_display.exists())
+            self.assertEqual(report["display_visibility"]["status"], "failed")
+            self.assertEqual(
+                report["artifacts"][0]["status"],
+                "rejected_not_published",
+            )
+            failed = report["display_visibility"]["final_png"]["failed_checks"]
+            self.assertIn("pixel_brightness", failed)
+            self.assertIn("galaxy_visibility", failed)
+            self.assertIn("star_visibility", failed)
+            self.assertTrue(
+                any("display_png_visibility_failed" in issue for issue in report["issues"])
+            )
 
 
 if __name__ == "__main__":

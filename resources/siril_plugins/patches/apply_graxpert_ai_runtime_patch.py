@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply Seestar runtime fixes to a copied GraXpert-AI.py script.
+"""Apply Starun runtime fixes to a copied GraXpert-AI.py script.
 
 The source files under resources/siril_plugins/vendor/siril-scripts are kept
 as upstream files. This patcher is applied only to copied runtime/build trees.
@@ -291,6 +291,20 @@ NEW_PADDING = """\
 """
 
 
+OLD_BGE_KEEP_BACKGROUND_ARGUMENT = """\
+        parser.add_argument("-keep_bg", action="store_true", help="Keep the extracted background")
+"""
+
+
+NEW_BGE_KEEP_BACKGROUND_ARGUMENT = """\
+        parser.add_argument("-keep_bg", action="store_true", help="Keep the extracted background")
+        # BGE is already CPU-only upstream. Accept -nogpu so callers can state
+        # that execution contract explicitly and share one stable CLI policy.
+        parser.add_argument("-nogpu", action="store_true", default=False,
+                            help="Explicitly use CPU execution (BGE is CPU-only)")
+"""
+
+
 def resolve_target(path: Path) -> Path:
     if path.is_file():
         return path
@@ -324,6 +338,15 @@ def apply_patch(path: Path) -> bool:
             )
     if OLD_PADDING in patched:
         patched = patched.replace(OLD_PADDING, NEW_PADDING, 1)
+    if (
+        OLD_BGE_KEEP_BACKGROUND_ARGUMENT in patched
+        and NEW_BGE_KEEP_BACKGROUND_ARGUMENT not in patched
+    ):
+        patched = patched.replace(
+            OLD_BGE_KEEP_BACKGROUND_ARGUMENT,
+            NEW_BGE_KEEP_BACKGROUND_ARGUMENT,
+            1,
+        )
     changed = patched != text
     if changed:
         target.write_text(patched, encoding="utf-8", newline="")

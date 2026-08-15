@@ -13,7 +13,7 @@ from copy import deepcopy
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 
-GEOMETRY_SCHEMA = "seestar.device-geometry.v1"
+GEOMETRY_SCHEMA = "starun.device-geometry.v1"
 DEFAULT_FOCAL_LENGTH_MM = 160.0
 DEFAULT_PIXEL_SIZE_UM = 2.9
 AUTO_APPLY_CONFIDENCE_MIN = 0.85
@@ -50,18 +50,200 @@ _IDENTITY_KEYS = (
     "SENSOR",
     "TELESCOP",
     "TELESCOPE",
+    "CREATOR",
+    "ORIGIN",
 )
 
 _KNOWN_PROFILES = (
     {
         "id": "seestar_s30_pro_imx585",
-        "match_all": ("s30", "pro"),
+        "identity_aliases": (
+            "zwo seestar s30 pro",
+            "seestar s30 pro",
+            "s30 pro",
+        ),
         "instrument": "Seestar S30 Pro",
         "sensor": "Sony IMX585",
+        "spcc_sensor": "Sony IMX585",
+        "spcc_default_filter": "UV/IR Block",
+        "spcc_clear_filter": "UV/IR Block",
+        "spcc_light_pollution_filter": "ZWO Seestar LP",
+        "narrowband_filter_aliases": ("lp", "lp_starless"),
+        "spcc_dualband": {
+            "r_wavelength_nm": 656.28,
+            "r_bandwidth_nm": 20.0,
+            "g_wavelength_nm": 500.70,
+            "g_bandwidth_nm": 30.0,
+            "b_wavelength_nm": 500.70,
+            "b_bandwidth_nm": 30.0,
+        },
         "focal_length_mm": 160.0,
         "pixel_size_um": 2.9,
+        "confidence": 0.90,
+    },
+    {
+        "id": "seestar_s30_imx662",
+        "identity_aliases": (
+            "zwo seestar s30",
+            "seestar s30",
+            "s30",
+        ),
+        "identity_excludes": ("pro",),
+        "instrument": "Seestar S30",
+        "sensor": "Sony IMX662",
+        "spcc_sensor": "ZWO Seestar S30",
+        "spcc_default_filter": "UV/IR Block",
+        "spcc_clear_filter": "UV/IR Block",
+        "spcc_light_pollution_filter": "ZWO Seestar LP",
+        "narrowband_filter_aliases": ("lp", "lp_starless"),
+        "spcc_dualband": {
+            "r_wavelength_nm": 656.28,
+            "r_bandwidth_nm": 20.0,
+            "g_wavelength_nm": 500.70,
+            "g_bandwidth_nm": 30.0,
+            "b_wavelength_nm": 500.70,
+            "b_bandwidth_nm": 30.0,
+        },
+        "focal_length_mm": 150.0,
+        "pixel_size_um": 2.9,
+        "confidence": 0.90,
+    },
+    {
+        "id": "seestar_s50_imx462",
+        "identity_aliases": (
+            "zwo seestar s50",
+            "seestar s50",
+            "s50",
+        ),
+        "instrument": "Seestar S50",
+        "sensor": "Sony IMX462",
+        "spcc_sensor": "ZWO Seestar S50",
+        "spcc_default_filter": "UV/IR Block",
+        "spcc_clear_filter": "UV/IR Block",
+        "spcc_light_pollution_filter": "ZWO Seestar LP",
+        "narrowband_filter_aliases": ("lp", "lp_starless"),
+        "spcc_dualband": {
+            "r_wavelength_nm": 656.28,
+            "r_bandwidth_nm": 20.0,
+            "g_wavelength_nm": 500.70,
+            "g_bandwidth_nm": 30.0,
+            "b_wavelength_nm": 500.70,
+            "b_bandwidth_nm": 30.0,
+        },
+        "focal_length_mm": 250.0,
+        "pixel_size_um": 2.9,
+        "confidence": 0.90,
+    },
+    {
+        "id": "dwarflab_dwarf_mini_imx662",
+        "identity_aliases": (
+            "dwarflab dwarf mini",
+            "dwarf mini",
+            "dwarfmini",
+        ),
+        "instrument": "DWARF mini",
+        "sensor": "Sony IMX662",
+        "spcc_sensor": "Sony IMX662",
+        "spcc_default_filter": "Dwarf Mini Astro",
+        "spcc_clear_filter": "Dwarf Mini Astro",
+        "narrowband_filter_aliases": (
+            "duo-band",
+            "dual-band",
+            "duoband",
+            "dualband",
+        ),
+        "spcc_dualband": {
+            "r_wavelength_nm": 656.28,
+            "r_bandwidth_nm": 18.0,
+            "g_wavelength_nm": 500.70,
+            "g_bandwidth_nm": 30.0,
+            "b_wavelength_nm": 500.70,
+            "b_bandwidth_nm": 30.0,
+        },
+        "focal_length_mm": 150.0,
+        "pixel_size_um": 2.9,
+        "confidence": 0.90,
+    },
+    {
+        "id": "dwarflab_dwarf_3_imx678",
+        "identity_aliases": (
+            "dwarflab dwarf 3",
+            "dwarf 3",
+            "dwarf iii",
+            "dwarfiii",
+            "dwarf3",
+        ),
+        "instrument": "DWARF 3",
+        "sensor": "Sony IMX678",
+        "spcc_sensor": "Sony IMX678",
+        "spcc_default_filter": "UV/IR Block",
+        "spcc_clear_filter": "UV/IR Block",
+        "narrowband_filter_aliases": (
+            "duo-band",
+            "dual-band",
+            "duoband",
+            "dualband",
+        ),
+        "spcc_dualband": {
+            "r_wavelength_nm": 656.28,
+            "r_bandwidth_nm": 18.0,
+            "g_wavelength_nm": 500.70,
+            "g_bandwidth_nm": 30.0,
+            "b_wavelength_nm": 500.70,
+            "b_bandwidth_nm": 30.0,
+        },
+        "focal_length_mm": 150.0,
+        "pixel_size_um": 2.0,
+        "confidence": 0.90,
+    },
+    {
+        "id": "dwarflab_dwarf_2_imx415",
+        "identity_aliases": (
+            "dwarflab dwarf 2",
+            "dwarf 2",
+            "dwarf ii",
+            "dwarfii",
+            "dwarf2",
+        ),
+        "instrument": "DWARF 2",
+        "sensor": "Sony IMX415",
+        "spcc_sensor": "Sony IMX415",
+        "spcc_default_filter": "UV/IR Block",
+        "spcc_clear_filter": "UV/IR Block",
+        "focal_length_mm": 100.0,
+        "pixel_size_um": 1.45,
         "confidence": 0.88,
     },
+)
+
+_KNOWN_SPCC_SENSOR_ALIASES = (
+    ("imx415", "Sony IMX415"),
+    ("imx462", "Sony IMX462"),
+    ("imx585", "Sony IMX585"),
+    ("imx662", "Sony IMX662"),
+    ("imx678", "Sony IMX678"),
+)
+_KNOWN_UNSUPPORTED_WIDE_SENSOR_ALIASES = (
+    "imx307",
+    "imx586",
+    "os02k10",
+)
+_WIDE_PATH_KEYS = (
+    "SENSOR",
+    "DETECTOR",
+    "CAMERA",
+    "INSTRUME",
+    "INSTRUMENT",
+    "LENS",
+    "OPTIC",
+)
+_REPORT_INSTRUMENT_KEYS = ("TELESCOP", "TELESCOPE", "OPTIC", "LENS")
+_REPORT_SENSOR_KEYS = (
+    "SENSOR",
+    "DETECTOR",
+    "CAMERA",
+    "INSTRUME",
+    "INSTRUMENT",
 )
 
 
@@ -153,12 +335,185 @@ def _shape_value(image_shape: Optional[Mapping[str, Any]], name: str) -> int:
         return 0
 
 
-def _matching_profile(identity_text: str) -> Optional[Dict[str, Any]]:
-    lowered = identity_text.casefold()
+def _normalized_identity(value: Any) -> str:
+    normalized = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        str(value or "").casefold(),
+    )
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _identity_alias_matches(value: str, alias: str) -> bool:
+    normalized_value = _normalized_identity(value)
+    normalized_alias = _normalized_identity(alias)
+    if not normalized_value or not normalized_alias:
+        return False
+    if len(normalized_alias) <= 3:
+        return normalized_value == normalized_alias or normalized_value.startswith(
+            f"{normalized_alias} "
+        )
+    return normalized_alias in normalized_value
+
+
+def _matching_profile(identity_values: Sequence[str]) -> Optional[Dict[str, Any]]:
     for profile in _KNOWN_PROFILES:
-        if all(token in lowered for token in profile["match_all"]):
+        excludes = tuple(profile.get("identity_excludes", ()))
+        if any(
+            _normalized_identity(excluded)
+            in _normalized_identity(value).split()
+            for value in identity_values
+            for excluded in excludes
+        ):
+            continue
+        aliases = tuple(profile.get("identity_aliases", ()))
+        if any(
+            _identity_alias_matches(value, alias)
+            for value in identity_values
+            for alias in aliases
+        ):
             return dict(profile)
     return None
+
+
+def resolve_smart_device_profile(
+    metadata: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Resolve a supported smart telescope from FITS identity metadata."""
+    indexed = _metadata_index(metadata or {})
+    identity_values = [
+        str(indexed[key]).strip()
+        for key in _IDENTITY_KEYS
+        if key in indexed and str(indexed[key]).strip()
+    ]
+    profile = _matching_profile(identity_values)
+    if profile and smart_device_wide_path_reason(metadata):
+        return None
+    return profile
+
+
+def _first_report_identity_value(
+    indexed: Mapping[str, Any],
+    keys: Sequence[str],
+) -> tuple[Optional[str], Optional[str]]:
+    for key in keys:
+        raw_value = _unpack_metadata_value(indexed.get(key))
+        value = " ".join(str(raw_value or "").replace("\x00", " ").split())
+        normalized = _normalized_identity(value)
+        if value and normalized and not normalized.startswith("unknown"):
+            return value, key
+    return None, None
+
+
+def resolve_device_report_identity(
+    metadata: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Resolve display-only device identity without inventing a known profile."""
+    profile = resolve_smart_device_profile(metadata)
+    if profile:
+        profile_id = str(profile.get("id") or "").strip() or None
+        source = (
+            f"known_device_profile:{profile_id}"
+            if profile_id
+            else "known_device_profile"
+        )
+        return {
+            "source": "known_device_profile",
+            "instrument": str(profile.get("instrument") or "unknown"),
+            "instrument_source": source,
+            "sensor": str(profile.get("sensor") or "unknown"),
+            "sensor_source": source,
+            "device_profile_id": profile_id,
+        }
+
+    indexed = _metadata_index(metadata or {})
+    instrument, instrument_key = _first_report_identity_value(
+        indexed,
+        _REPORT_INSTRUMENT_KEYS,
+    )
+    sensor, sensor_key = _first_report_identity_value(
+        indexed,
+        _REPORT_SENSOR_KEYS,
+    )
+    return {
+        "source": "header_derived" if instrument or sensor else "unknown",
+        "instrument": instrument or "unknown",
+        "instrument_source": (
+            f"fits_header:{instrument_key}" if instrument_key else "unknown"
+        ),
+        "sensor": sensor or "unknown",
+        "sensor_source": f"fits_header:{sensor_key}" if sensor_key else "unknown",
+        "device_profile_id": None,
+    }
+
+
+def resolve_smart_device_narrowband_filter(
+    metadata: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Resolve vendor-specific dual-band FILTER values from FITS metadata."""
+    profile = resolve_smart_device_profile(metadata)
+    if not profile or not isinstance(profile.get("spcc_dualband"), dict):
+        return None
+
+    aliases = {
+        _normalized_identity(alias)
+        for alias in profile.get("narrowband_filter_aliases", ())
+        if _normalized_identity(alias)
+    }
+    if not aliases:
+        return None
+
+    indexed = _metadata_index(metadata or {})
+    for key in ("FILTER", "FILTER1", "FILTER2", "INSFLNAM"):
+        raw_value = indexed.get(key)
+        normalized = _normalized_identity(raw_value)
+        if normalized and normalized in aliases:
+            return {
+                "profile_id": profile.get("id"),
+                "instrument": profile.get("instrument"),
+                "header_key": key,
+                "filter_value": str(_unpack_metadata_value(raw_value) or "").strip(),
+                "normalized_filter": normalized,
+            }
+    return None
+
+
+def smart_device_wide_path_reason(
+    metadata: Optional[Mapping[str, Any]],
+) -> Optional[str]:
+    """Return evidence that a smart-telescope frame uses its wide camera."""
+    indexed = _metadata_index(metadata or {})
+    for key in _WIDE_PATH_KEYS:
+        value = _normalized_identity(indexed.get(key))
+        if not value:
+            continue
+        compact = value.replace(" ", "")
+        for alias in _KNOWN_UNSUPPORTED_WIDE_SENSOR_ALIASES:
+            if alias in compact:
+                return f"fits_header:{key}:{alias}"
+        if any(token in value for token in ("wide angle", "wideangle")):
+            return f"fits_header:{key}:wide_angle"
+
+    focal, focal_key = _first_value(indexed, _FOCAL_KEYS)
+    if focal is not None and focal_key and focal < 30.0:
+        return f"fits_header:{focal_key}:short_focal_length={focal:g}"
+    return None
+
+
+def resolve_spcc_sensor_from_metadata(
+    metadata: Optional[Mapping[str, Any]],
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve an exact Siril sensor label without inferring optical geometry."""
+    indexed = _metadata_index(metadata or {})
+    for key in ("SENSOR", "DETECTOR", "CAMERA", "INSTRUME", "INSTRUMENT"):
+        value = _normalized_identity(indexed.get(key))
+        if not value:
+            continue
+        compact = value.replace(" ", "")
+        for alias, label in _KNOWN_SPCC_SENSOR_ALIASES:
+            if alias in compact:
+                return label, f"fits_header:{key}"
+    return None, None
 
 
 def _select(candidates: list[Dict[str, Any]], field: str) -> Dict[str, Any]:
@@ -238,7 +593,13 @@ def build_device_geometry_report(
         if key in indexed and str(indexed[key]).strip()
     ]
     identity_text = " | ".join(identity_values)
-    profile = _matching_profile(identity_text)
+    profile = _matching_profile(identity_values)
+    profile_rejection_reason = (
+        smart_device_wide_path_reason(indexed) if profile else None
+    )
+    if profile_rejection_reason:
+        profile = None
+    report_identity = resolve_device_report_identity(indexed)
     if profile:
         candidates.extend(
             (
@@ -261,8 +622,8 @@ def build_device_geometry_report(
             )
         )
 
-    env_focal = _positive_float(environment.get("SEESTAR_STAGE4_PLATESOLVE_FOCAL"))
-    env_pixel = _positive_float(environment.get("SEESTAR_STAGE4_PLATESOLVE_PIXELSIZE"))
+    env_focal = _positive_float(environment.get("STARUN_STAGE4_PLATESOLVE_FOCAL"))
+    env_pixel = _positive_float(environment.get("STARUN_STAGE4_PLATESOLVE_PIXELSIZE"))
     if env_focal is not None:
         candidates.append(
             _candidate(
@@ -271,7 +632,7 @@ def build_device_geometry_report(
                 source="environment_override",
                 confidence=0.60,
                 priority=60,
-                evidence="SEESTAR_STAGE4_PLATESOLVE_FOCAL",
+                evidence="STARUN_STAGE4_PLATESOLVE_FOCAL",
             )
         )
     if env_pixel is not None:
@@ -282,7 +643,7 @@ def build_device_geometry_report(
                 source="environment_override",
                 confidence=0.60,
                 priority=60,
-                evidence="SEESTAR_STAGE4_PLATESOLVE_PIXELSIZE",
+                evidence="STARUN_STAGE4_PLATESOLVE_PIXELSIZE",
             )
         )
 
@@ -368,6 +729,8 @@ def build_device_geometry_report(
         "identity": {
             "metadata_text": identity_text or None,
             "matched_profile": profile,
+            "profile_rejection_reason": profile_rejection_reason,
+            **report_identity,
         },
         "selected": {
             "focal_length_mm": selected_focal,
@@ -430,9 +793,9 @@ def activate_device_geometry_report(
     result = deepcopy(dict(report))
     environment = environ if environ is not None else os.environ
     explicit_override = bool(
-        str(environment.get("SEESTAR_STAGE4_PLATESOLVE_FOCAL", "") or "").strip()
+        str(environment.get("STARUN_STAGE4_PLATESOLVE_FOCAL", "") or "").strip()
         or str(
-            environment.get("SEESTAR_STAGE4_PLATESOLVE_PIXELSIZE", "") or ""
+            environment.get("STARUN_STAGE4_PLATESOLVE_PIXELSIZE", "") or ""
         ).strip()
     )
     decision = result.get("decision") or {}
@@ -599,5 +962,7 @@ def validate_active_geometry(
 __all__ = [
     "activate_device_geometry_report",
     "build_device_geometry_report",
+    "resolve_device_report_identity",
+    "resolve_smart_device_narrowband_filter",
     "validate_active_geometry",
 ]

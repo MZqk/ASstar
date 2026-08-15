@@ -14,7 +14,16 @@ try:
         LightGroup,
         discover_input,
     )
-    from pipeline.task_plan import build_resume_fingerprints
+    from pipeline.processing_parameters import (
+        effective_parameter_value,
+        normalize_processing_parameters,
+    )
+    from pipeline.task_plan import (
+        InputTrust,
+        StagePlanAction,
+        build_resume_fingerprints,
+        build_stage_steps,
+    )
     from pipeline.task_workspace import (
         TaskRun,
         TaskWorkspace,
@@ -37,7 +46,16 @@ except ImportError:  # Support direct execution from the gui directory.
         LightGroup,
         discover_input,
     )
-    from pipeline.task_plan import build_resume_fingerprints
+    from pipeline.processing_parameters import (  # type: ignore[no-redef]
+        effective_parameter_value,
+        normalize_processing_parameters,
+    )
+    from pipeline.task_plan import (  # type: ignore[no-redef]
+        InputTrust,
+        StagePlanAction,
+        build_resume_fingerprints,
+        build_stage_steps,
+    )
     from pipeline.task_workspace import (
         TaskRun,
         TaskWorkspace,
@@ -53,9 +71,8 @@ except ImportError:  # Support direct execution from the gui directory.
 INPUT_MODE_AUTO = "auto"
 INPUT_MODE_STAGE1_PREPARED_RESUME = "stage1_prepared_resume"
 INPUT_MODE_STAGE2_CORRECTED_RESUME = "stage2_corrected_resume"
-INPUT_MODE_STAGE5_LINEAR_RESUME = "result_linear_resume"
-TASK_RUN_MANIFEST_ENV = "SEESTAR_TASK_RUN_MANIFEST"
-RESUME_CHECKPOINT_PATH_ENV = "SEESTAR_RESUME_CHECKPOINT_PATH"
+INPUT_MODE_STAGE5_LINEAR_RESUME = "stage5_linear_resume"
+TASK_RUN_MANIFEST_ENV = "STARUN_TASK_RUN_MANIFEST"
 
 
 @dataclass(frozen=True)
@@ -91,19 +108,59 @@ class TaskPlanPresentation:
 def describe_input_plan(discovery: InputDiscovery) -> TaskPlanPresentation:
     """Return one concise, truthful plan for the task setup card."""
 
-    if discovery.kind == InputKind.PRODUCT_TASK and discovery.resume_after_stage:
-        stage_number = int(discovery.resume_after_stage)
+    resume_stage = (
+        int(discovery.resume_after_stage)
+        if discovery.kind == InputKind.PRODUCT_TASK
+        and discovery.resume_after_stage
+        else None
+    )
+    if resume_stage is not None:
+        input_state = "linear"
+        input_trust = InputTrust.VERIFIED
+    elif discovery.kind == InputKind.REVIEW_FILE:
+        input_state = "nonlinear"
+        input_trust = InputTrust.REVIEW_REQUIRED
+    else:
+        input_state = "unknown"
+        input_trust = (
+            InputTrust.RECOGNIZED
+            if discovery.accepted
+            else InputTrust.REVIEW_REQUIRED
+        )
+    try:
+        steps = build_stage_steps(
+            input_state=input_state,
+            input_trust=input_trust,
+            resume_after_stage=resume_stage,
+        )
+    except ValueError:
+        steps = []
+    verified_stages = [
+        int(step["stage"])
+        for step in steps
+        if step["action"] == StagePlanAction.VERIFIED.value
+    ]
+    executed_stages = [
+        int(step["stage"])
+        for step in steps
+        if step["action"] == StagePlanAction.EXECUTE.value
+    ]
+
+    if resume_stage is not None and verified_stages:
         return TaskPlanPresentation(
             summary=(
-                f"自动计划：Stage 1–{stage_number} 已验证，"
-                f"从 Stage {stage_number + 1} 继续。"
+                f"自动计划：Stage 1–{resume_stage} 已验证，"
+                f"从 Stage {resume_stage + 1} 继续。"
             ),
             linear_phase=(
-                f"✓ Stage 1–{stage_number} · ○ Stage {stage_number + 1}–6"
+                f"✓ Stage 1–{resume_stage} · ○ Stage {resume_stage + 1}–6"
             ),
             nonlinear_phase="○ 将执行 · Stage 7–10",
         )
-    if discovery.kind == InputKind.REVIEW_FILE:
+    if (
+        discovery.kind == InputKind.REVIEW_FILE
+        and executed_stages == [1, 2]
+    ):
         return TaskPlanPresentation(
             summary=(
                 "自动计划：Stage 1 导入、Stage 2 安全校正，"
@@ -119,15 +176,6 @@ def describe_input_plan(discovery: InputDiscovery) -> TaskPlanPresentation:
                 "重新叠加并串行处理；线性校验不通过时自动改为复核输出。"
             ),
             linear_phase="○ 重新叠加与线性处理 · Stage 1–6",
-            nonlinear_phase="○ 校验通过后执行 · Stage 7–10",
-        )
-    if discovery.kind == InputKind.LEGACY_DIRECTORY:
-        return TaskPlanPresentation(
-            summary=(
-                "自动计划：保持旧目录只读，将已验证旧断点"
-                "作为外部母版从 Stage 1 安全导入。"
-            ),
-            linear_phase="○ 只读迁移与线性处理 · Stage 1–6",
             nonlinear_phase="○ 校验通过后执行 · Stage 7–10",
         )
     if discovery.kind in {InputKind.MASTER_FILE, InputKind.PRODUCT_TASK}:
@@ -149,37 +197,41 @@ def describe_input_plan(discovery: InputDiscovery) -> TaskPlanPresentation:
 def stage_config_from_processing_settings(
     settings: Mapping[str, Any],
 ) -> Dict[int, Dict[str, Any]]:
-    """Map only result-affecting Stage 1-5 settings into resume hashes."""
+    """Map v4 intent into cumulative Stage 1/2/5 resume hashes."""
 
-    values = dict(settings or {})
+    normalized, _adjustments = normalize_processing_parameters(settings)
+    stages = normalized["stages"]
+
+    def stage_values(stage: int) -> Dict[str, Any]:
+        entry = stages[str(stage)]
+        return {
+            "mode": entry["mode"],
+            "overrides": dict(entry["overrides"]),
+            "gate_profile": normalized["gate_profile"],
+        }
+
     return {
         1: {
             "source_import": "read_only_task_manifest",
             "light_preprocess": "debayer_register_stack_v1",
+            "stage1_register_fail_ratio_max": effective_parameter_value(
+                normalized,
+                "stage1_register_fail_ratio_max",
+            ),
         },
-        2: {"boundary_correction": "autocrop_v1"},
-        3: {"background_policy": "safe_candidate_v1"},
-        4: {
-            key: values.get(key)
-            for key in (
-                "color_calibration",
-                "filter_hint",
-                "pcc_timeout_sec",
-                "local_wb_gain_limit",
-            )
+        2: {
+            "boundary_correction": "native_crop_v4",
+            "auto_tune_enabled": bool(
+                normalized["general"]["auto_tune_enabled"]
+            ),
+            **stage_values(2),
         },
+        3: {"background_policy": "safe_candidate_v2", **stage_values(3)},
+        4: {"color_policy": "spcc_first_v2", **stage_values(4)},
         5: {
-            key: values.get(key)
-            for key in (
-                "denoise_mode",
-                "deconvolution_mode",
-                "graxpert_model_path",
-                "compute_mode",
-                "builtin_denoise_strength",
-                "graxpert_deconv_strength",
-                "rl_iterations",
-                "rl_maxstars",
-            )
+            "linear_cleanup": "task_overrides_v2",
+            "compute_mode": str(normalized["general"]["compute_mode"]),
+            **stage_values(5),
         },
     }
 
@@ -226,24 +278,6 @@ def _external_source_records(
             cancel_check=cancel_check,
         )
         return ((source, discovery.master_file.stem),)
-    if discovery.kind == InputKind.LEGACY_DIRECTORY:
-        if discovery.master_file is None:
-            raise WorkspaceError("旧版目录没有已验证的迁移源")
-        source = build_source_record(
-            source_kind=InputKind.MASTER_FILE.value,
-            selected_path=discovery.selected_path,
-            files=(discovery.master_file,),
-            group={
-                "migration": "legacy_read_only_v1",
-                "legacy_directory": str(discovery.selected_path),
-                "legacy_checkpoint": discovery.details.get("checkpoint"),
-                "legacy_stage": discovery.details.get("legacy_stage"),
-                "legacy_manifest_hash": discovery.details.get("manifest_hash"),
-                "legacy_plan_hash": discovery.details.get("plan_hash"),
-            },
-            cancel_check=cancel_check,
-        )
-        return ((source, f"旧版迁移 · {discovery.master_file.name}"),)
     if discovery.kind == InputKind.LIGHT_DIRECTORY:
         return tuple(
             (
@@ -309,7 +343,14 @@ def prepare_task_queue(
 
     if not discovery.accepted:
         raise WorkspaceError(discovery.errors[0] if discovery.errors else discovery.summary)
-    stage_config = stage_config_from_processing_settings(processing_settings)
+    try:
+        normalized_processing, _adjustments = normalize_processing_parameters(
+            processing_settings,
+            validate_paths=True,
+        )
+    except (TypeError, ValueError) as error:
+        raise WorkspaceError(f"处理参数无效：{error}") from error
+    stage_config = stage_config_from_processing_settings(normalized_processing)
     prepared: list[PreparedTask] = []
 
     if discovery.kind == InputKind.PRODUCT_TASK:
@@ -346,10 +387,9 @@ def prepare_task_queue(
                 resume_record if isinstance(resume_record, Mapping) else None
             ),
             checkpoint_fingerprints=current_fingerprints,
+            processing_parameters=processing_settings,
         )
         overrides = {TASK_RUN_MANIFEST_ENV: str(run.manifest_path)}
-        if isinstance(resume_record, Mapping):
-            overrides[RESUME_CHECKPOINT_PATH_ENV] = str(resume_record["path"])
         prepared.append(
             PreparedTask(
                 queue_index=1,
@@ -387,6 +427,7 @@ def prepare_task_queue(
                 source_record=source,
                 run_id=_run_id(now),
                 checkpoint_fingerprints=current_fingerprints,
+                processing_parameters=processing_settings,
             )
             prepared.append(
                 PreparedTask(
@@ -410,7 +451,6 @@ def prepare_task_queue(
 __all__ = [
     "PreparedTask",
     "PreparedTaskQueue",
-    "RESUME_CHECKPOINT_PATH_ENV",
     "TASK_RUN_MANIFEST_ENV",
     "TaskPlanPresentation",
     "describe_input_plan",

@@ -112,6 +112,74 @@ class OutputColorAuditTests(unittest.TestCase):
             "none",
         )
 
+    def test_managed_png_profile_alone_does_not_prove_display_visibility(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            display_path = root / "result_processed_display_srgb.png"
+            _write_png(display_path, srgb=True)
+            managed_report = {
+                "ready": True,
+                "artifacts": [
+                    {
+                        "role": "display",
+                        "status": "written",
+                        "path": str(display_path),
+                    }
+                ],
+            }
+
+            manifest = build_output_color_manifest(
+                work_dir=root,
+                base_filename="result_processed",
+                fit_filename="result_final",
+                fallback_base="result_processed",
+                fallback_fit_base="result_final",
+                output_format="png",
+                channel_semantics="broadband_rgb_osc",
+                review_only=False,
+                managed_export_report=managed_report,
+            )
+
+        self.assertTrue(manifest["summary"]["display_profiles_verified"])
+        self.assertFalse(manifest["summary"]["display_visibility_verified"])
+        self.assertFalse(manifest["summary"]["managed_export_ready"])
+        self.assertIn(
+            "PNG pixel brightness/subject/star visibility missing or failed",
+            manifest["summary"]["activation_blockers"],
+        )
+
+    def test_manifest_discloses_unverified_source_to_srgb_conversion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = build_output_color_manifest(
+                work_dir=Path(temporary),
+                base_filename="result_processed",
+                fit_filename="result_final",
+                fallback_base="result_processed",
+                fallback_fit_base="result_final",
+                output_format="fit",
+                channel_semantics="broadband_rgb_osc",
+                review_only=False,
+                source_color_contract={
+                    "schema": "starun.color-contract.v1",
+                    "rendition_intent": "photometrically_anchored",
+                    "working_color_state": {
+                        "profile": "unknown",
+                        "profile_verified": False,
+                        "conversion_lineage_verified": False,
+                    },
+                },
+            )
+
+        disclosure = manifest["color_state_disclosure"]
+        self.assertFalse(disclosure["source_profile_verified"])
+        self.assertFalse(
+            disclosure["source_to_target_conversion_lineage_verified"]
+        )
+        self.assertFalse(
+            disclosure["source_to_srgb_pixel_conversion_performed_by_manifest"]
+        )
+        self.assertIn("does not prove", disclosure["limitation"])
+
 
 if __name__ == "__main__":
     unittest.main()

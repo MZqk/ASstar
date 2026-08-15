@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence
 
 try:
-    from . import run_manifest
+    from . import run_manifest, task_plan
+    from .processing_parameters import (
+        default_processing_parameters,
+        normalize_processing_parameters,
+        processing_gate_profile_audit,
+    )
     from .stage_contracts import (
         FORMAL_RESUME_STAGES,
         PIPELINE_CONTRACT_SCHEMA,
@@ -20,6 +25,12 @@ try:
     )
 except ImportError:
     import run_manifest
+    import task_plan
+    from processing_parameters import (
+        default_processing_parameters,
+        normalize_processing_parameters,
+        processing_gate_profile_audit,
+    )
     from stage_contracts import (
         FORMAL_RESUME_STAGES,
         PIPELINE_CONTRACT_SCHEMA,
@@ -29,19 +40,86 @@ except ImportError:
     )
 
 
-TASK_MANIFEST_SCHEMA = "seestar.task-manifest.v1"
-CHECKPOINT_MANIFEST_SCHEMA = "seestar.checkpoint-manifest.v1"
-RUN_MANIFEST_SCHEMA = "seestar.task-run.v1"
+TASK_MANIFEST_SCHEMA = "starun.task-manifest.v1"
+CHECKPOINT_MANIFEST_SCHEMA = "starun.checkpoint-manifest.v1"
+RUN_MANIFEST_SCHEMA = "starun.task-run.v1"
+RESUME_SEMANTIC_SCHEMA = "starun.resume-semantics.v1"
 TASK_MANIFEST_NAME = "task-manifest.json"
 RUN_MANIFEST_NAME = "run-manifest.json"
 CHECKPOINT_MANIFEST_REL = Path("checkpoints") / "checkpoint-manifest.json"
 LATEST_RESULT_MANIFEST_REL = Path("results") / "latest-result.json"
 RETENTION_MANIFEST_REL = Path("results") / "retention.json"
-TASK_CONTAINER_NAME = "SeestarSuperimpose"
+TASK_CONTAINER_NAME = "Starun"
 
 
 class WorkspaceError(RuntimeError):
     pass
+
+
+def _json_safe_contract_value(value: Any) -> Any:
+    """Normalize checkpoint metadata without admitting executable objects."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_safe_contract_value(child)
+            for key, child in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_contract_value(child) for child in value]
+    if isinstance(value, Path):
+        return str(value)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    scalar = getattr(value, "item", None)
+    if callable(scalar):
+        try:
+            return _json_safe_contract_value(scalar())
+        except (TypeError, ValueError):
+            pass
+    return str(value)
+
+
+def _normalize_resume_semantic_context(
+    value: Any,
+    *,
+    stage_number: int,
+) -> Optional[Dict[str, Any]]:
+    """Validate the signed upstream semantics carried by a formal checkpoint."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise WorkspaceError("续跑语义契约必须为映射")
+    normalized = _json_safe_contract_value(
+        run_manifest.redact_sensitive(dict(value))
+    )
+    if not isinstance(normalized, dict):
+        raise WorkspaceError("续跑语义契约无法规范化")
+    if str(normalized.get("schema") or "") != RESUME_SEMANTIC_SCHEMA:
+        raise WorkspaceError("续跑语义契约 schema 不受支持")
+    try:
+        semantic_stage = int(normalized.get("checkpoint_stage"))
+    except (TypeError, ValueError) as error:
+        raise WorkspaceError("续跑语义契约缺少 checkpoint_stage") from error
+    if semantic_stage != stage_number:
+        raise WorkspaceError("续跑语义契约与断点阶段不匹配")
+    if stage_number == 5:
+        if not str(normalized.get("channel_semantics") or "").strip():
+            raise WorkspaceError("Stage 5 续跑语义缺少通道语义")
+        required_mappings = (
+            "channel_profile",
+            "target_profile",
+            "pipeline_policy",
+            "color_calibration_report",
+            "upstream_review",
+        )
+        for key in required_mappings:
+            if not isinstance(normalized.get(key), Mapping):
+                raise WorkspaceError(f"Stage 5 续跑语义缺少 {key}")
+        if not normalized.get("narrowband_channel_mapping"):
+            raise WorkspaceError("Stage 5 续跑语义缺少通道映射契约")
+        star_reference = normalized.get("stage5_star_reference_report")
+        if star_reference is not None and not isinstance(star_reference, Mapping):
+            raise WorkspaceError("Stage 5 续跑星表语义无效")
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -324,6 +402,7 @@ def begin_task_run(
     run_id: str,
     resume_record: Optional[Mapping[str, Any]] = None,
     checkpoint_fingerprints: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    processing_parameters: Optional[Mapping[str, Any]] = None,
     generated_at: Optional[str] = None,
 ) -> TaskRun:
     """Create one immutable-input run directory below an existing task."""
@@ -368,8 +447,6 @@ def begin_task_run(
     run_root = workspace.runs_dir / normalized_run_id
     if run_root.exists():
         raise WorkspaceError(f"运行目录已存在，未覆盖：{run_root}")
-    run_root.mkdir(parents=True, exist_ok=False)
-    manifest_path = run_root / RUN_MANIFEST_NAME
     normalized_resume: Optional[Dict[str, Any]] = None
     if resume_record is not None:
         normalized_resume = dict(resume_record)
@@ -397,12 +474,38 @@ def begin_task_run(
             raise WorkspaceError("续跑文件 SHA-256 不匹配")
         if str(normalized_resume.get("state") or "").lower() != "linear":
             raise WorkspaceError("续跑文件不是已验证线性状态")
-        if not str(normalized_resume.get("plan_hash") or "").strip() or not str(
+        if not str(normalized_resume.get("run_manifest_hash") or "").strip() or not str(
             normalized_resume.get("config_fingerprint") or ""
         ).strip():
-            raise WorkspaceError("续跑记录缺少计划或配置指纹")
+            raise WorkspaceError("续跑记录缺少运行清单或配置指纹")
+        normalized_resume["semantic_context"] = _normalize_resume_semantic_context(
+            normalized_resume.get("semantic_context"),
+            stage_number=resume_stage,
+        )
+        if resume_stage == 5 and normalized_resume["semantic_context"] is None:
+            raise WorkspaceError("Stage 5 续跑记录缺少语义契约")
+        normalized_resume["semantic_context_status"] = (
+            "verified"
+            if normalized_resume["semantic_context"] is not None
+            else "not_applicable"
+        )
         normalized_resume["path"] = str(checkpoint_path)
 
+    try:
+        normalized_processing_parameters, processing_parameter_adjustments = (
+            normalize_processing_parameters(
+                processing_parameters or default_processing_parameters(),
+                validate_paths=True,
+            )
+        )
+    except (TypeError, ValueError) as error:
+        raise WorkspaceError(f"处理参数无效：{error}") from error
+    processing_gate_profile = processing_gate_profile_audit(
+        normalized_processing_parameters
+    )
+
+    run_root.mkdir(parents=True, exist_ok=False)
+    manifest_path = run_root / RUN_MANIFEST_NAME
     payload = _signed_payload(
         {
             "schema": RUN_MANIFEST_SCHEMA,
@@ -418,6 +521,9 @@ def begin_task_run(
             "source": source,
             "resume": normalized_resume,
             "checkpoint_fingerprints": normalized_fingerprints,
+            "processing_parameters": normalized_processing_parameters,
+            "processing_gate_profile": processing_gate_profile,
+            "processing_parameter_adjustments": processing_parameter_adjustments,
         }
     )
     run_manifest.atomic_write_json(manifest_path, payload)
@@ -455,6 +561,7 @@ def publish_formal_checkpoint(
     run_manifest_path: Path,
     stage_number: int,
     artifact_path: Path,
+    semantic_context: Optional[Mapping[str, Any]] = None,
     completed_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Atomically promote one accepted linear stage to task-level retention."""
@@ -477,6 +584,12 @@ def publish_formal_checkpoint(
     artifact_sha256 = run_manifest.sha256_file(artifact)
     if not artifact_sha256:
         raise WorkspaceError(f"无法读取阶段产物：{artifact}")
+    normalized_semantic_context = _normalize_resume_semantic_context(
+        semantic_context,
+        stage_number=stage_number,
+    )
+    if stage_number == 5 and normalized_semantic_context is None:
+        raise WorkspaceError("Stage 5 正式断点必须包含语义契约")
 
     task_root = Path(str(run_payload.get("task_directory") or "")).resolve()
     workspace, source = open_task_workspace(task_root)
@@ -567,10 +680,16 @@ def publish_formal_checkpoint(
             "size": _safe_size(destination),
             "sha256": copied_sha256,
             "state": "linear",
-            "plan_hash": str(run_payload.get("manifest_hash") or ""),
+            "run_manifest_hash": str(run_payload.get("manifest_hash") or ""),
             "config_fingerprint": str(fingerprint_record["fingerprint"]),
             "run_id": run_payload.get("run_id"),
             "completed_at": str(completed_at or run_manifest.utc_timestamp()),
+            "semantic_context": normalized_semantic_context,
+            "semantic_context_status": (
+                "verified"
+                if normalized_semantic_context is not None
+                else "not_applicable"
+            ),
         }
         checkpoint_manifest = build_checkpoint_manifest(
             task_id=workspace.task_id,
@@ -611,7 +730,7 @@ def publish_latest_result_index(*, run_manifest_path: Path) -> Dict[str, Any]:
     result_path = run_root / "pipeline-result.json"
     result = run_manifest.load_json(result_path)
     if result is None or str(result.get("schema") or "") != (
-        "seestar.pipeline-result.v1"
+        "starun.pipeline-result.v1"
     ):
         raise WorkspaceError("pipeline-result.json 缺失或 schema 不受支持")
     expected_hash = str(result.get("manifest_hash") or "")
@@ -621,6 +740,20 @@ def publish_latest_result_index(*, run_manifest_path: Path) -> Dict[str, Any]:
         unsigned
     ):
         raise WorkspaceError("pipeline-result.json 哈希无效")
+    plan = run_manifest.load_json(run_root / "processing-plan.json")
+    plan_verification = task_plan.verify_processing_plan(plan or {})
+    if not plan_verification.get("verified"):
+        raise WorkspaceError(
+            "processing-plan.json 校验失败："
+            + str(plan_verification.get("detail") or "unknown error")
+        )
+    plan_hash = str(plan.get("plan_hash") or "") if isinstance(plan, Mapping) else ""
+    if str(result.get("plan_hash") or "") != plan_hash:
+        raise WorkspaceError("pipeline-result.json 引用的处理计划哈希不匹配")
+    if str(result.get("run_id") or "") != str(run_payload.get("run_id") or "") or str(
+        plan.get("run_id") or ""
+    ) != str(run_payload.get("run_id") or ""):
+        raise WorkspaceError("处理计划、运行清单与结果的 run_id 不一致")
     status = str(result.get("status") or "")
     if status not in {"success", "partial_success", "review_required"}:
         raise WorkspaceError(f"运行状态 {status or 'unknown'} 不能发布为最新结果")
@@ -654,7 +787,7 @@ def publish_latest_result_index(*, run_manifest_path: Path) -> Dict[str, Any]:
 
     payload = _signed_payload(
         {
-            "schema": "seestar.latest-result.v1",
+            "schema": "starun.latest-result.v1",
             "generated_at": run_manifest.utc_timestamp(),
             "task_id": workspace.task_id,
             "run_id": run_payload.get("run_id"),
@@ -679,7 +812,7 @@ def latest_result_files(
 
     payload, _detail = _load_signed_payload(
         task_root.expanduser().resolve() / LATEST_RESULT_MANIFEST_REL,
-        "seestar.latest-result.v1",
+        "starun.latest-result.v1",
     )
     if payload is None:
         return ()
@@ -713,7 +846,7 @@ def latest_result_directory(task_root: Path) -> Optional[Path]:
     root = task_root.expanduser().resolve()
     payload, _detail = _load_signed_payload(
         root / LATEST_RESULT_MANIFEST_REL,
-        "seestar.latest-result.v1",
+        "starun.latest-result.v1",
     )
     if payload is None:
         return None
@@ -735,12 +868,27 @@ def latest_result_directory(task_root: Path) -> Optional[Path]:
     return run_directory
 
 
+def _run_requested_intermediate_retention(run_root: Path) -> bool:
+    """Return whether verified settings require a full process directory."""
+    plan = run_manifest.load_json(run_root / "processing-plan.json")
+    if not isinstance(plan, Mapping) or not task_plan.verify_processing_plan(
+        plan
+    ).get("verified"):
+        return False
+    metadata = plan.get("metadata")
+    config = metadata.get("config") if isinstance(metadata, Mapping) else None
+    return bool(
+        isinstance(config, Mapping)
+        and config.get("debug_mode") is True
+        and config.get("checkpoint_mode") is not True
+    )
+
+
 def apply_task_retention(
     task_root: Path,
-    *,
-    preserve_intermediates: bool = False,
 ) -> Dict[str, Any]:
-    """Keep verified latest delivery outputs and compact older app-owned runs."""
+    """Keep the latest delivery and compact old runs by each frozen Debug flag.
+    """
 
     root = task_root.expanduser().resolve()
     workspace, source = open_task_workspace(root)
@@ -750,12 +898,13 @@ def apply_task_retention(
 
     deleted_files: list[str] = []
     removed_process_dirs: list[str] = []
+    preserved_debug_process_dirs: list[str] = []
     skipped: list[str] = []
     preserved_output_names = {
         "processing-plan.json",
         "pipeline-result.json",
         "run-manifest.json",
-        "seestar_diagnostics.zip",
+        "starun_diagnostics.zip",
     }
     for run_root in sorted(workspace.runs_dir.iterdir(), key=lambda path: path.name):
         if not run_root.is_dir() or run_root.is_symlink():
@@ -775,9 +924,12 @@ def apply_task_retention(
 
         is_latest_run = run_root.resolve() == latest_run.resolve()
         process_dir = run_root / "process"
+        run_preserves_intermediates = _run_requested_intermediate_retention(
+            run_root
+        )
         if (
             not is_latest_run
-            and not preserve_intermediates
+            and not run_preserves_intermediates
             and process_dir.is_dir()
             and not process_dir.is_symlink()
         ):
@@ -788,13 +940,22 @@ def apply_task_retention(
                 )
             except OSError as error:
                 skipped.append(f"{run_root.name}/process: {error}")
+        elif (
+            not is_latest_run
+            and run_preserves_intermediates
+            and process_dir.is_dir()
+            and not process_dir.is_symlink()
+        ):
+            preserved_debug_process_dirs.append(
+                process_dir.relative_to(root).as_posix()
+            )
 
         if is_latest_run:
             continue
         result_path = run_root / "pipeline-result.json"
         result = run_manifest.load_json(result_path)
         if result is None or str(result.get("schema") or "") != (
-            "seestar.pipeline-result.v1"
+            "starun.pipeline-result.v1"
         ):
             skipped.append(f"{run_root.name}: pipeline result is unavailable")
             continue
@@ -836,13 +997,14 @@ def apply_task_retention(
 
     payload = _signed_payload(
         {
-            "schema": "seestar.retention-report.v1",
+            "schema": "starun.retention-report.v1",
             "generated_at": run_manifest.utc_timestamp(),
             "task_id": workspace.task_id,
             "latest_run_id": latest_run.name,
-            "preserve_intermediates": bool(preserve_intermediates),
+            "retention_scope": "per_run_frozen_debug_and_checkpoint_settings",
             "deleted_files": deleted_files,
             "removed_process_directories": removed_process_dirs,
+            "preserved_debug_process_directories": preserved_debug_process_dirs,
             "skipped": skipped,
         }
     )
@@ -908,8 +1070,17 @@ def _checkpoint_compatible(
         return False, f"{key} artifact contract mismatch", None
     if str(record.get("state") or "").lower() != "linear":
         return False, f"{key} state is not linear", None
-    if not str(record.get("plan_hash") or "").strip():
-        return False, f"{key} plan hash is missing", None
+    if not str(record.get("run_manifest_hash") or "").strip():
+        return False, f"{key} run manifest hash is missing", None
+    try:
+        semantic_context = _normalize_resume_semantic_context(
+            record.get("semantic_context"),
+            stage_number=stage_number,
+        )
+    except WorkspaceError as error:
+        return False, f"{key} semantic context is invalid: {error}", None
+    if stage_number == 5 and semantic_context is None:
+        return False, f"{key} semantic context is missing", None
     config_fingerprint = str(record.get("config_fingerprint") or "").strip()
     if not config_fingerprint:
         return False, f"{key} config fingerprint is missing", None
@@ -1016,7 +1187,7 @@ def inspect_task_workspace(
                 "resume_after_stage": stage_number,
                 "checkpoint": key,
                 "checkpoint_path": str(checkpoint_path),
-                "plan_hash": record.get("plan_hash"),
+                "run_manifest_hash": record.get("run_manifest_hash"),
                 "config_fingerprint": record.get("config_fingerprint"),
                 "resume_record": {
                     **dict(record),
@@ -1037,6 +1208,7 @@ __all__ = [
     "CHECKPOINT_MANIFEST_SCHEMA",
     "RUN_MANIFEST_NAME",
     "RUN_MANIFEST_SCHEMA",
+    "RESUME_SEMANTIC_SCHEMA",
     "LATEST_RESULT_MANIFEST_REL",
     "RETENTION_MANIFEST_REL",
     "TASK_CONTAINER_NAME",

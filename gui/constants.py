@@ -1,4 +1,4 @@
-"""Shared constants for the Seestar GUI."""
+"""Shared constants for the Starun GUI."""
 
 FITS_SUFFIXES = (".fit", ".fits", ".fts")
 LIGHT_FRAME_EXPANSION_FACTOR = 3.0

@@ -1,24 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build Seestar Superimpose macOS app bundle with:
+# Build Starun macOS app bundle with:
 # - Embedded Siril extracted from packages/siril-1.4.4-arm64.dmg
 # - Embedded Python 3.13.12 runtime from packages/python-3.13.12-macos11.pkg
 #
 # Usage:
 #   ./build_macos_app.sh [--app-name NAME] [--output-dir DIR]
-#                        [--gui-entry /path/to/seestar_gui_app.py]
-#                        [--pipeline-src /path/to/seestar_Superimpose.py]
+#                        [--build-python /path/to/python]
+#                        [--gui-entry /path/to/starun_gui_app.py]
+#                        [--pipeline-src /path/to/starun.py]
 #                        [--config-template /path/to/config.1.4.ini.template]
-#                        [--ai-env /path/to/ai.env]
 #                        [--siril-src /path/to/Siril.app]
 #                        [--codesign-identity "Developer ID Application: ..."]
 #                        [--bundle-profile full|core]
 #                        [--offline-resource-pack-dir DIR]
 #                        [--help]
 
-APP_NAME="SeestarSuperimpose"
+APP_NAME="Starun"
 BUILD_PYTHON=""
+BUILD_PYTHON_OVERRIDE=""
 APP_BUNDLE_ID="StarunC"
 APP_SHORT_VERSION="0.1"
 APP_BUILD_VERSION="1"
@@ -30,26 +31,26 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PACKAGES_DIR="$PROJECT_ROOT/packages"
 OUTPUT_DIR="$PROJECT_ROOT/release"
-GUI_ENTRY="$PROJECT_ROOT/gui/seestar_gui_app.py"
-APP_LOGO_PNG="$PROJECT_ROOT/gui/SeestarSuperimpose.png"
-PIPELINE_SRC="$PROJECT_ROOT/pipeline/seestar_Superimpose.py"
-STAGE11_MODULE_SRC="$PROJECT_ROOT/pipeline/stage11_ai_postprocess.py"
+GUI_ENTRY="$PROJECT_ROOT/gui/starun_gui_app.py"
+APP_LOGO_PNG="$PROJECT_ROOT/gui/Starun.png"
+PIPELINE_SRC="$PROJECT_ROOT/pipeline/starun.py"
 PIPELINE_REQUIRED_MODULES=(
+  stage2_crop_detector.py
   stage3_contract.py
   stage_contracts.py
   task_plan.py
   input_discovery.py
   task_workspace.py
+  processing_parameters.py
   ui_preview.py
 )
 LOCAL_TEMPLATE="$PROJECT_ROOT/resources/config.1.4.ini.template"
 CONFIG_TEMPLATE_IN="$LOCAL_TEMPLATE"
 DEFAULT_ENV_SRC="$PROJECT_ROOT/resources/default.env"
-AI_ENV_SRC="$PROJECT_ROOT/resources/ai.env"
-AI_CREDENTIAL_PACKAGER="$PROJECT_ROOT/build/package_ai_credentials.py"
 SIRIL_PLUGIN_DIR_SRC="$PROJECT_ROOT/resources/siril_plugins"
 SIRIL_SPCC_DATABASE_SEED_SRC="$PROJECT_ROOT/resources/siril_spcc_database"
 APP_REQUIREMENTS="$PROJECT_ROOT/requirements.lock"
+GUI_BUILD_REQUIREMENTS="$PROJECT_ROOT/build/requirements-gui-build.lock"
 SIRIL_PLUGIN_REQUIREMENTS="$SIRIL_PLUGIN_DIR_SRC/requirements.lock"
 SIRIL_PLUGIN_DOWNLOADS_DIR="$SIRIL_PLUGIN_DIR_SRC/downloads"
 USER_CONFIG="$HOME/Library/Application Support/org.siril.Siril/siril/config.1.4.ini"
@@ -62,12 +63,63 @@ OFFLINE_RESOURCE_PACK_DIR=""
 SIRIL_RUNTIME_STATE="$HOME/Library/Application Support/org.siril.Siril/siril"
 SIRIL_SEED_MODULE="$SIRIL_RUNTIME_STATE/.python_module"
 
+# These runtimes are installed into the independent Siril Python 3.12 venv
+# from bundled wheels.  Excluding them from the frozen Python 3.13 GUI avoids
+# packaging the same scientific stack twice without changing offline runtime
+# behavior.
+PYINSTALLER_EXCLUDED_MODULES=(
+  torch
+  torchvision
+  onnx
+  onnxruntime
+  scipy
+  pandas
+  pyarrow
+  numba
+  llvmlite
+  matplotlib
+  botocore
+  aiobotocore
+  s3fs
+  dask
+  dask_image
+  fsspec
+  zarr
+  numcodecs
+  lz4
+  zstandard
+  aiohttp
+  fastavro
+  google_crc32c
+  cv2
+  sep
+  spandrel
+  tifffile
+  einops
+  safetensors
+  PyQt6
+  setiastrosuitepro
+  astroquery
+  lightkurve
+  photutils
+  reproject
+  sklearn
+  skimage
+  networkx
+  sympy
+  skyfield
+  sgp4
+  pytest
+  _pytest
+)
+
 usage() {
   cat <<EOF
 Usage:
   $(basename "$0") [--app-name NAME] [--output-dir DIR]
+                   [--build-python PATH]
                    [--gui-entry PATH] [--pipeline-src PATH]
-                   [--config-template PATH] [--ai-env PATH]
+                   [--config-template PATH]
                    [--siril-src /path/to/Siril.app]
                    [--codesign-identity IDENTITY]
                    [--bundle-profile full|core]
@@ -90,6 +142,10 @@ while [[ $# -gt 0 ]]; do
       OUTPUT_DIR="$2"
       shift 2
       ;;
+    --build-python)
+      BUILD_PYTHON_OVERRIDE="$2"
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
@@ -104,10 +160,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --config-template)
       CONFIG_TEMPLATE_IN="$2"
-      shift 2
-      ;;
-    --ai-env)
-      AI_ENV_SRC="$2"
       shift 2
       ;;
     --siril-src)
@@ -136,11 +188,10 @@ done
 
 # Expand explicit "~/" for user provided path arguments.
 OUTPUT_DIR="${OUTPUT_DIR/#\~/$HOME}"
+BUILD_PYTHON_OVERRIDE="${BUILD_PYTHON_OVERRIDE/#\~/$HOME}"
 GUI_ENTRY="${GUI_ENTRY/#\~/$HOME}"
 PIPELINE_SRC="${PIPELINE_SRC/#\~/$HOME}"
-STAGE11_MODULE_SRC="${STAGE11_MODULE_SRC/#\~/$HOME}"
 CONFIG_TEMPLATE_IN="${CONFIG_TEMPLATE_IN/#\~/$HOME}"
-AI_ENV_SRC="${AI_ENV_SRC/#\~/$HOME}"
 SIRIL_PLUGIN_DIR_SRC="${SIRIL_PLUGIN_DIR_SRC/#\~/$HOME}"
 SIRIL_SRC_APP="${SIRIL_SRC_APP/#\~/$HOME}"
 OFFLINE_RESOURCE_PACK_DIR="${OFFLINE_RESOURCE_PACK_DIR/#\~/$HOME}"
@@ -183,10 +234,12 @@ remove_old_build_outputs() {
 
 resolve_build_python() {
   local py=""
-  if [[ -x "$PROJECT_ROOT/.venv/bin/python" ]]; then
-    py="$PROJECT_ROOT/.venv/bin/python"
+  if [[ -n "$BUILD_PYTHON_OVERRIDE" ]]; then
+    py="$BUILD_PYTHON_OVERRIDE"
   elif [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then
     py="$SCRIPT_DIR/.venv/bin/python"
+  elif [[ -x "$PROJECT_ROOT/.venv/bin/python" ]]; then
+    py="$PROJECT_ROOT/.venv/bin/python"
   elif [[ -x "$HOME/.siril/scripts/.venv/bin/python" ]]; then
     py="$HOME/.siril/scripts/.venv/bin/python"
   else
@@ -209,6 +262,22 @@ require_file() {
   if [[ ! -f "$path" ]]; then
     die "$label is not a file: $path"
   fi
+}
+
+verify_locked_plugin_asset() {
+  local relative_path="$1"
+  local absolute_path="$SIRIL_PLUGIN_DIR_SRC/$relative_path"
+  local checksum_file="$SIRIL_PLUGIN_DIR_SRC/asset-checksums.sha256"
+  local expected=""
+  local actual=""
+  require_file "$checksum_file" "[BUILD] plugin asset checksum manifest"
+  require_file "$absolute_path" "[BUILD] locked plugin asset"
+  expected="$(awk -v path="$relative_path" '$2 == path { print $1; exit }' "$checksum_file")"
+  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] \
+    || die "[BUILD] missing checksum for plugin asset: $relative_path"
+  actual="$(/usr/bin/shasum -a 256 "$absolute_path" | awk '{print $1}')"
+  [[ "$actual" == "$expected" ]] \
+    || die "[BUILD] checksum mismatch for plugin asset: $relative_path"
 }
 
 require_dir() {
@@ -348,6 +417,32 @@ allowed_abis = {target_abi, "abi3", "none"}
 removed = []
 groups = {}
 
+def wheel_preference(tags):
+    """Prefer an exact CPython/arm64 wheel over a generic fallback."""
+    best = (0, 0, 0)
+    for tag in tags:
+        if tag.interpreter == target_abi:
+            interpreter_score = 3
+        elif (
+            tag.interpreter.startswith("cp")
+            and tag.interpreter[2:].isdigit()
+            and int(tag.interpreter[2:]) <= target_version
+            and tag.abi == "abi3"
+        ):
+            interpreter_score = 2
+        elif tag.interpreter in {"py3", "py2.py3"}:
+            interpreter_score = 1
+        else:
+            continue
+        abi_score = 3 if tag.abi == target_abi else 2 if tag.abi == "abi3" else 1
+        platform_score = (
+            3 if tag.platform.endswith("_arm64") else
+            2 if "universal2" in tag.platform else
+            1
+        )
+        best = max(best, (interpreter_score, abi_score, platform_score))
+    return best
+
 for wheel in sorted(download_dir.glob("*.whl")):
     try:
         name, version, _build, tags = parse_wheel_filename(wheel.name)
@@ -370,17 +465,19 @@ for wheel in sorted(download_dir.glob("*.whl")):
         wheel.unlink()
         removed.append(wheel)
         continue
-    groups.setdefault(canonicalize_name(name), []).append((version, wheel))
+    groups.setdefault(canonicalize_name(name), []).append(
+        (version, wheel_preference(tags), wheel)
+    )
 
 for _name, candidates in sorted(groups.items()):
-    candidates.sort(key=lambda item: (item[0], item[1].name))
+    candidates.sort(key=lambda item: (item[0], item[1], item[2].name))
     if _name == "setuptools":
         compatible = [item for item in candidates if item[0].major < 82]
         keep = compatible[-1] if compatible else candidates[-1]
     else:
         keep = candidates[-1]
-    for _version, wheel in candidates:
-        if wheel == keep[1]:
+    for _version, _preference, wheel in candidates:
+        if wheel == keep[2]:
             continue
         wheel.unlink()
         removed.append(wheel)
@@ -406,7 +503,7 @@ download_offline_python_packages() {
     --abi cp312 \
     --abi abi3 \
     --platform "$platform_tag" \
-    --index-url "https://pypi.org/simple" \
+    --index-url "https://mirrors.aliyun.com/pypi/simple/" \
     --dest "$SIRIL_PLUGIN_DOWNLOADS_DIR" \
     -r "$APP_REQUIREMENTS"
 
@@ -419,7 +516,7 @@ download_offline_python_packages() {
     --abi cp312 \
     --abi abi3 \
     --platform "$platform_tag" \
-    --index-url "https://pypi.org/simple" \
+    --index-url "https://mirrors.aliyun.com/pypi/simple/" \
     --dest "$SIRIL_PLUGIN_DOWNLOADS_DIR" \
     -r "$SIRIL_PLUGIN_REQUIREMENTS"
 
@@ -457,7 +554,7 @@ repair_siril_seed_site_packages() {
 is_minimal_siril_seed_entry() {
   local name="$1"
   case "$name" in
-    _distutils_hack|certifi|charset_normalizer|idna|numpy|packaging|pip|pkg_resources|requests|setuptools|sirilpy|urllib3|distutils-precedence.pth)
+    _distutils_hack|certifi|charset_normalizer|idna|numpy|packaging|pip|pkg_resources|requests|setuptools|sirilpy|urllib3|distutils-precedence.pth|*__mypyc.cpython-312-darwin.so)
       return 0
       ;;
     certifi-*.dist-info|charset_normalizer-*.dist-info|idna-*.dist-info|numpy-*.dist-info|packaging-*.dist-info|pip-*.dist-info|requests-*.dist-info|setuptools-*.dist-info|sirilpy-*.dist-info|sirilpy.egg-info|urllib3-*.dist-info)
@@ -512,6 +609,7 @@ mods = (
     "numpy",
     "packaging",
     "requests",
+    "charset_normalizer",
     "urllib3",
     "idna",
     "certifi",
@@ -572,10 +670,149 @@ has_build_deps() {
   local py_bin="$1"
   "$py_bin" - <<'PY'
 import importlib.util, sys
-missing = [m for m in ("PyInstaller", "PySide6") if importlib.util.find_spec(m) is None]
+missing = [
+    module
+    for module in ("PyInstaller", "PySide6", "numpy", "astropy")
+    if importlib.util.find_spec(module) is None
+]
 if missing:
     print(",".join(missing))
     sys.exit(1)
+PY
+}
+
+report_gui_build_environment() {
+  local py_bin="$1"
+  "$py_bin" - "${PYINSTALLER_EXCLUDED_MODULES[@]}" <<'PY'
+import importlib.util
+import sys
+
+present = [name for name in sys.argv[1:] if importlib.util.find_spec(name) is not None]
+if present:
+    print(
+        "[BUILD] Build environment contains runtime-only modules; "
+        "PyInstaller exclusions will prevent duplicate collection: "
+        + ", ".join(present)
+    )
+else:
+    print("[BUILD] GUI build environment is isolated from runtime-only modules.")
+PY
+}
+
+verify_pyinstaller_gui_payload() {
+  local app_path="$1"
+  local analysis_toc="$2"
+
+  require_file "$analysis_toc" "[VERIFY] PyInstaller analysis table"
+  "$BUILD_PYTHON" - "$app_path" "$analysis_toc" \
+    "${PYINSTALLER_EXCLUDED_MODULES[@]}" <<'PY'
+import ast
+import sys
+from pathlib import Path
+
+app_path = Path(sys.argv[1])
+analysis_toc = Path(sys.argv[2])
+excluded = tuple(name.casefold() for name in sys.argv[3:])
+required = ("pyside6", "numpy", "astropy")
+
+
+def iter_toc_entries(value):
+    if isinstance(value, (list, tuple)):
+        if (
+            len(value) == 3
+            and isinstance(value[0], str)
+            and isinstance(value[2], str)
+            and value[2] in {
+                "BINARY",
+                "DATA",
+                "EXTENSION",
+                "PYMODULE",
+                "PYSOURCE",
+                "SYMLINK",
+            }
+        ):
+            yield value
+            return
+        for item in value:
+            yield from iter_toc_entries(item)
+
+
+def is_module(name, module):
+    normalized = name.replace("\\", "/").casefold()
+    return (
+        normalized == module
+        or normalized.startswith(module + ".")
+        or normalized.startswith(module + "/")
+    )
+
+
+toc = ast.literal_eval(analysis_toc.read_text(encoding="utf-8"))
+entry_names = tuple(entry[0] for entry in iter_toc_entries(toc))
+
+missing = [
+    module
+    for module in required
+    if not any(is_module(name, module) for name in entry_names)
+]
+if missing:
+    raise SystemExit(
+        "[VERIFY] Frozen GUI is missing required modules: " + ", ".join(missing)
+    )
+
+unexpected_modules = sorted(
+    {
+        module
+        for module in excluded
+        if any(is_module(name, module) for name in entry_names)
+    }
+)
+if unexpected_modules:
+    raise SystemExit(
+        "[VERIFY] Runtime-only modules leaked into frozen GUI analysis: "
+        + ", ".join(unexpected_modules)
+    )
+
+# Catch orphaned native payloads in addition to Python module entries.
+native_markers = {
+    "torch": ("libtorch", "libc10", "libshm"),
+    "pyarrow": ("libarrow", "libparquet"),
+}
+payload_roots = (
+    app_path / "Contents" / "Frameworks",
+    app_path / "Contents" / "Resources",
+)
+unexpected_paths = []
+for root in payload_roots:
+    if not root.is_dir():
+        continue
+    for path in root.rglob("*"):
+        relative = path.relative_to(root).as_posix().casefold()
+        first = relative.split("/", 1)[0]
+        normalized_first = first.replace("-", "_")
+        for module in excluded:
+            normalized_module = module.replace("-", "_")
+            if (
+                normalized_first == normalized_module
+                or normalized_first.startswith(normalized_module + ".")
+                or normalized_first.startswith(normalized_module + "_")
+            ):
+                unexpected_paths.append(str(path))
+                break
+            if any(marker in first for marker in native_markers.get(module, ())):
+                unexpected_paths.append(str(path))
+                break
+
+if unexpected_paths:
+    sample = "\n".join(f"  - {path}" for path in unexpected_paths[:12])
+    raise SystemExit(
+        "[VERIFY] Runtime-only files leaked into frozen GUI payload:\n" + sample
+    )
+
+print(
+    "[VERIFY] Frozen GUI dependency boundary OK: required="
+    + ",".join(required)
+    + f" excluded={len(excluded)}"
+)
 PY
 }
 
@@ -841,7 +1078,6 @@ require_exists "$PROJECT_ROOT" "Project root"
 require_exists "$GUI_ENTRY" "GUI entry"
 require_file "$APP_LOGO_PNG" "App logo PNG"
 require_file "$PIPELINE_SRC" "Pipeline script"
-require_file "$STAGE11_MODULE_SRC" "Stage11 module script"
 for module_name in "${PIPELINE_REQUIRED_MODULES[@]}"; do
   require_file "$(dirname "$PIPELINE_SRC")/$module_name" "Pipeline runtime module"
 done
@@ -850,6 +1086,7 @@ require_file "$SIRIL_SPCC_DATABASE_SEED_SRC/manifest.json" "Siril SPCC seed mani
 require_file "$SIRIL_SPCC_DATABASE_SEED_SRC/SHA256SUMS" "Siril SPCC seed checksums"
 require_dir "$PACKAGES_DIR" "Packages directory"
 require_file "$PYTHON_PKG" "Python package"
+require_file "$GUI_BUILD_REQUIREMENTS" "GUI build requirements lock"
 if [[ -n "$SIRIL_SRC_APP" ]]; then
   require_dir "$SIRIL_SRC_APP" "Siril app source"
 else
@@ -870,21 +1107,22 @@ if [[ -z "$BUILD_PYTHON" ]]; then
 fi
 
 log "[BUILD] Candidate Python: $BUILD_PYTHON"
-log "[BUILD] Checking build dependencies (PyInstaller, PySide6)..."
+log "[BUILD] Checking GUI build dependencies (PyInstaller, PySide6, numpy, astropy)..."
 if ! has_build_deps "$BUILD_PYTHON"; then
   if [[ -x "$HOME/.siril/scripts/.venv/bin/python" ]] && has_build_deps "$HOME/.siril/scripts/.venv/bin/python"; then
     BUILD_PYTHON="$HOME/.siril/scripts/.venv/bin/python"
     log "[BUILD] Using fallback Python with dependencies: $BUILD_PYTHON"
   else
-    die "Build dependencies missing for $BUILD_PYTHON (requires PyInstaller + PySide6)."
+    die "Build dependencies missing for $BUILD_PYTHON (requires PyInstaller + PySide6 + numpy + astropy)."
   fi
 fi
+report_gui_build_environment "$BUILD_PYTHON"
 
 mkdir -p "$OUTPUT_DIR"
 
 # Keep the build and final bundle on the same filesystem. The existing release
 # remains untouched until the new bundle has passed every verification step.
-BUILD_ROOT="$(mktemp -d "$OUTPUT_DIR/.seestar_build.XXXXXX")"
+BUILD_ROOT="$(mktemp -d "$OUTPUT_DIR/.starun_build.XXXXXX")"
 SIRIL_MOUNT_DIR=""
 SPEC_DIR="$BUILD_ROOT/spec"
 WORK_DIR="$BUILD_ROOT/work"
@@ -907,9 +1145,13 @@ mkdir -p "$PYINSTALLER_CONFIG_DIR"
 log "[BUILD] Using Python: $BUILD_PYTHON"
 log "[BUILD] GUI entry: $GUI_ENTRY"
 log "[BUILD] Pipeline script: $PIPELINE_SRC"
-log "[BUILD] Stage11 module script: $STAGE11_MODULE_SRC"
-log "[BUILD] AI env source: $AI_ENV_SRC"
 log "[BUILD] PyInstaller config dir: $PYINSTALLER_CONFIG_DIR"
+
+PYINSTALLER_EXCLUDE_ARGS=()
+for module_name in "${PYINSTALLER_EXCLUDED_MODULES[@]}"; do
+  PYINSTALLER_EXCLUDE_ARGS+=(--exclude-module "$module_name")
+done
+log "[BUILD] Frozen GUI excludes ${#PYINSTALLER_EXCLUDED_MODULES[@]} Siril runtime-only modules."
 
 download_offline_python_packages
 
@@ -932,19 +1174,6 @@ else
 EOCONFIG
 fi
 
-AI_PACKAGE_SOURCE="$AI_ENV_SRC"
-if [[ ! -f "$AI_PACKAGE_SOURCE" ]]; then
-  AI_PACKAGE_SOURCE="$DEFAULT_ENV_SRC"
-fi
-AI_SANITIZED_ENV="$RES_STAGING/ai.env"
-AI_BOOTSTRAP="$RES_STAGING/ai-trial.bootstrap"
-require_file "$AI_CREDENTIAL_PACKAGER" "[BUILD] AI credential packager"
-require_file "$AI_PACKAGE_SOURCE" "[BUILD] AI configuration source"
-"$BUILD_PYTHON" "$AI_CREDENTIAL_PACKAGER" package \
-  --source "$AI_PACKAGE_SOURCE" \
-  --sanitized-env "$AI_SANITIZED_ENV" \
-  --bootstrap "$AI_BOOTSTRAP"
-
 log "[BUILD] Building base app with PyInstaller..."
 "$BUILD_PYTHON" -m PyInstaller \
   --noconfirm \
@@ -957,12 +1186,14 @@ log "[BUILD] Building base app with PyInstaller..."
   --distpath "$BUILD_DIST_DIR" \
   --workpath "$WORK_DIR" \
   --specpath "$SPEC_DIR" \
+  "${PYINSTALLER_EXCLUDE_ARGS[@]}" \
   "$GUI_ENTRY"
 
 if [[ ! -d "$APP_PATH" ]]; then
   die "Build failed: app not generated at $APP_PATH"
 fi
 
+verify_pyinstaller_gui_payload "$APP_PATH" "$WORK_DIR/$APP_NAME/Analysis-00.toc"
 configure_app_bundle_metadata "$APP_PATH"
 
 # PyInstaller may leave a sibling onedir folder; remove it to avoid confusion.
@@ -987,15 +1218,11 @@ fi
 if [[ -d "$PIPELINE_SRC_DIR/configs" ]]; then
   cp -R "$PIPELINE_SRC_DIR/configs" "$APP_RESOURCES/pipeline/configs"
 fi
-if [[ ! -f "$APP_RESOURCES/pipeline/seestar_Superimpose.py" ]]; then
-  cp "$PIPELINE_SRC" "$APP_RESOURCES/pipeline/seestar_Superimpose.py"
-fi
-if [[ ! -f "$APP_RESOURCES/pipeline/stage11_ai_postprocess.py" ]]; then
-  cp "$STAGE11_MODULE_SRC" "$APP_RESOURCES/pipeline/stage11_ai_postprocess.py"
+if [[ ! -f "$APP_RESOURCES/pipeline/starun.py" ]]; then
+  cp "$PIPELINE_SRC" "$APP_RESOURCES/pipeline/starun.py"
 fi
 require_file "$APP_RESOURCES/config.1.4.ini.template" "[VERIFY] Embedded config template"
-require_file "$APP_RESOURCES/pipeline/seestar_Superimpose.py" "[VERIFY] Embedded pipeline script"
-require_file "$APP_RESOURCES/pipeline/stage11_ai_postprocess.py" "[VERIFY] Embedded Stage11 module"
+require_file "$APP_RESOURCES/pipeline/starun.py" "[VERIFY] Embedded pipeline script"
 for module_name in "${PIPELINE_REQUIRED_MODULES[@]}"; do
   require_file "$APP_RESOURCES/pipeline/$module_name" "[VERIFY] Embedded pipeline runtime module"
 done
@@ -1013,15 +1240,6 @@ embed_siril_spcc_database_seed "$APP_RESOURCES"
 if [[ -f "$DEFAULT_ENV_SRC" ]]; then
   cp "$DEFAULT_ENV_SRC" "$APP_RESOURCES/default.env"
   log "[BUILD] Embedded default env file: $DEFAULT_ENV_SRC"
-fi
-cp "$AI_SANITIZED_ENV" "$APP_RESOURCES/ai.env"
-log "[BUILD] Embedded sanitized AI config: $AI_PACKAGE_SOURCE"
-if [[ -f "$AI_BOOTSTRAP" ]]; then
-  cp "$AI_BOOTSTRAP" "$APP_RESOURCES/ai-trial.bootstrap"
-  # App resources may become root-owned after installation; the encrypted
-  # bootstrap must remain readable by the signed app running as the user.
-  chmod 644 "$APP_RESOURCES/ai-trial.bootstrap"
-  log "[BUILD] Embedded obfuscated Keychain bootstrap"
 fi
 if [[ -d "$SIRIL_PLUGIN_DIR_SRC" ]]; then
   require_glob_exists "$SIRIL_PLUGIN_DIR_SRC/downloads/setiastrosuitepro-*.whl" "[BUILD] setiastrosuitepro wheel (run resources/siril_plugins/download_siril_plugins.sh)"
@@ -1083,12 +1301,16 @@ if [[ -d "$SIRIL_PLUGIN_DIR_SRC" ]]; then
   require_glob_exists "$SIRIL_PLUGIN_DIR_SRC/downloads/safetensors-*.whl" "[BUILD] safetensors wheel missing (run resources/siril_plugins/download_siril_plugins.sh)"
   require_glob_exists "$SIRIL_PLUGIN_DIR_SRC/downloads/torch-*.whl" "[BUILD] torch wheel missing (run resources/siril_plugins/download_siril_plugins.sh)"
   require_glob_exists "$SIRIL_PLUGIN_DIR_SRC/downloads/torchvision-*.whl" "[BUILD] torchvision wheel missing (run resources/siril_plugins/download_siril_plugins.sh)"
-  if [[ ! -f "$SIRIL_PLUGIN_DIR_SRC/vendor/siril-scripts/processing/SyQon-Starless.py" ]] \
-    && [[ ! -f "$SIRIL_PLUGIN_DIR_SRC/vendor/siril-scripts/siril-scripts/processing/SyQon-Starless.py" ]]; then
-    die "[BUILD] SyQon-Starless.py missing (run resources/siril_plugins/download_siril_plugins.sh)"
+  if [[ ! -f "$SIRIL_PLUGIN_DIR_SRC/vendor/siril-scripts/SyQon/Starless.py" ]] \
+    && [[ ! -f "$SIRIL_PLUGIN_DIR_SRC/vendor/siril-scripts/siril-scripts/SyQon/Starless.py" ]]; then
+    die "[BUILD] SyQon Starless script missing (run resources/siril_plugins/download_siril_plugins.sh)"
   fi
-  require_file "$SIRIL_PLUGIN_DIR_SRC/syqon_starless/syqon_starless_inference.py" "[BUILD] SyQon inference engine"
   require_file "$SIRIL_PLUGIN_DIR_SRC/syqon_starless/zenith.pt" "[BUILD] SyQon Zenith model"
+  require_file "$SIRIL_PLUGIN_DIR_SRC/syqon_starless/zenith.pt.sha256" "[BUILD] SyQon Zenith checksum"
+  verify_locked_plugin_asset "patches/apply_syqon_offline_model_patch.py"
+  verify_locked_plugin_asset "vendor/siril-scripts/SyQon/Starless.py"
+  verify_locked_plugin_asset "syqon_starless/zenith.pt"
+  require_file "$SIRIL_PLUGIN_DIR_SRC/graxpert/deconvolution-object-ai-models/1.0.1/model.onnx" "[BUILD] GraXpert object deconvolution model"
   require_file "$SIRIL_PLUGIN_DIR_SRC/cosmic_clarity/deep_denoise_mono_AI4.pth" "[BUILD] CosmicClarity mono denoise model"
   require_file "$SIRIL_PLUGIN_DIR_SRC/cosmic_clarity/deep_denoise_color_AI4.pth" "[BUILD] CosmicClarity color denoise model"
   require_file "$SIRIL_PLUGIN_DIR_SRC/cosmic_clarity/deep_sharp_stellar_AI4.pth" "[BUILD] CosmicClarity stellar sharpen model"
@@ -1099,6 +1321,8 @@ if [[ -d "$SIRIL_PLUGIN_DIR_SRC" ]]; then
     ditto "$SIRIL_PLUGIN_DIR_SRC" "$APP_RESOURCES/siril_plugins"
     "$BUILD_PYTHON" "$APP_RESOURCES/siril_plugins/patches/apply_graxpert_ai_runtime_patch.py" \
       "$APP_RESOURCES/siril_plugins"
+    "$BUILD_PYTHON" "$APP_RESOURCES/siril_plugins/patches/apply_syqon_offline_model_patch.py" \
+      "$APP_RESOURCES/siril_plugins"
     log "[BUILD] Full Offline profile: plugin wheels and models are embedded in the app."
   else
     [[ -n "$OFFLINE_RESOURCE_PACK_DIR" ]] || die "Core profile resource pack path is empty"
@@ -1108,6 +1332,9 @@ if [[ -d "$SIRIL_PLUGIN_DIR_SRC" ]]; then
     ditto "$SIRIL_PLUGIN_DIR_SRC" "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins"
     "$BUILD_PYTHON" \
       "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/patches/apply_graxpert_ai_runtime_patch.py" \
+      "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins"
+    "$BUILD_PYTHON" \
+      "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/patches/apply_syqon_offline_model_patch.py" \
       "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins"
     log "[BUILD] Core profile: app excludes offline plugin wheels and models."
     log "[BUILD] Offline resource pack: $OFFLINE_RESOURCE_PACK_DIR"
@@ -1145,25 +1372,16 @@ fi
 if [[ "$BUNDLE_PROFILE" == "full" ]]; then
   require_dir "$APP_RESOURCES/siril_plugins/downloads" "[VERIFY] Embedded offline wheels"
   require_file "$APP_RESOURCES/siril_plugins/syqon_starless/zenith.pt" "[VERIFY] Embedded SyQon model"
+  require_file "$APP_RESOURCES/siril_plugins/syqon_starless/zenith.pt.sha256" "[VERIFY] Embedded SyQon checksum"
+  require_file "$APP_RESOURCES/siril_plugins/graxpert/deconvolution-object-ai-models/1.0.1/model.onnx" "[VERIFY] Embedded GraXpert object deconvolution model"
   require_dir "$APP_RESOURCES/siril_plugins/cosmic_clarity" "[VERIFY] Embedded CosmicClarity models"
 else
   require_dir "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/downloads" "[VERIFY] Core offline resource wheels"
   require_file "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/syqon_starless/zenith.pt" "[VERIFY] Core offline resource SyQon model"
+  require_file "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/syqon_starless/zenith.pt.sha256" "[VERIFY] Core offline resource SyQon checksum"
+  require_file "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/graxpert/deconvolution-object-ai-models/1.0.1/model.onnx" "[VERIFY] Core offline resource GraXpert object deconvolution model"
   require_dir "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/cosmic_clarity" "[VERIFY] Core offline resource CosmicClarity models"
 fi
-
-AI_CREDENTIAL_SCAN_ARGS=(
-  --scan "$APP_RESOURCES/ai.env"
-  --scan "$APP_PATH/Contents/MacOS/$APP_NAME"
-)
-if [[ -f "$APP_RESOURCES/ai-trial.bootstrap" ]]; then
-  AI_CREDENTIAL_SCAN_ARGS+=(--scan "$APP_RESOURCES/ai-trial.bootstrap")
-fi
-"$BUILD_PYTHON" "$AI_CREDENTIAL_PACKAGER" verify \
-  --source "$AI_PACKAGE_SOURCE" \
-  --sanitized-env "$APP_RESOURCES/ai.env" \
-  --bootstrap "$APP_RESOURCES/ai-trial.bootstrap" \
-  "${AI_CREDENTIAL_SCAN_ARGS[@]}"
 
 log "[BUILD] Applying deep signing with identity: $CODESIGN_IDENTITY"
 /usr/bin/xattr -cr "$APP_PATH" >/dev/null 2>&1 || true

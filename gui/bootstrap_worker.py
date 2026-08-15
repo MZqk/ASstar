@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cancellable runtime bootstrap worker for the Seestar GUI."""
+"""Cancellable runtime bootstrap worker for the Starun GUI."""
 
 from __future__ import annotations
 

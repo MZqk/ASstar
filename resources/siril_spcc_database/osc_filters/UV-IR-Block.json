@@ -1,0 +1,19 @@
+[
+  {
+    "model": "UV/IR Block",
+    "name": "UV/IR Block",
+    "type": "OSC_FILTER",
+    "dataQualityMarker": 3,
+    "dataSource": "Mathematical model",
+    "manufacturer": "N/A",
+    "version": 1,
+    "wavelength": { 
+       "value":  [200,300,390,400,500,600,700,710,800,900,1000,1100],
+       "units": "nm"
+    },
+    "values": {
+      "value": [0.0,0.0,0.0,1.0,1.0,1.0,1.0,0.0,0.0,0.0,0.0,0.0],
+      "range": 1
+    }
+  }
+]

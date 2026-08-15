@@ -6,19 +6,15 @@ Stage 1; only a signed product task may expose a formal resume boundary.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
-try:
-    from . import run_manifest
-except ImportError:
-    import run_manifest
 
-
-INPUT_DISCOVERY_SCHEMA = "seestar.input-discovery.v1"
+INPUT_DISCOVERY_SCHEMA = "starun.input-discovery.v1"
 TASK_MANIFEST_NAME = "task-manifest.json"
 MASTER_SUFFIXES = frozenset({".fit", ".fits", ".fts", ".xisf"})
 FITS_LIGHT_SUFFIXES = frozenset({".fit", ".fits", ".fts"})
@@ -46,10 +42,10 @@ _MANAGED_DIRECTORY_NAMES = frozenset(
         "results",
         "review_bundles",
         "runs",
-        "seestarsuperimpose",
+        "starun",
     }
 )
-_LEGACY_MARKERS = (
+_RETIRED_PROCESSING_MARKERS = (
     "pipeline-result.json",
     "processing-plan.json",
     "result_linear.fit",
@@ -62,7 +58,6 @@ class InputKind(str, Enum):
     LIGHT_DIRECTORY = "light_directory"
     PRODUCT_TASK = "product_task"
     REVIEW_FILE = "review_file"
-    LEGACY_DIRECTORY = "legacy_directory"
     UNSUPPORTED = "unsupported"
 
 
@@ -136,12 +131,7 @@ class InputDiscovery:
             InputKind.PRODUCT_TASK,
             InputKind.REVIEW_FILE,
         }
-        verified_legacy = (
-            self.kind == InputKind.LEGACY_DIRECTORY
-            and self.trust == DiscoveryTrust.VERIFIED
-            and self.master_file is not None
-        )
-        return (regular_input or verified_legacy) and not self.errors
+        return regular_input and not self.errors
 
     @property
     def creates_independent_task(self) -> bool:
@@ -149,7 +139,6 @@ class InputDiscovery:
             InputKind.MASTER_FILE,
             InputKind.LIGHT_DIRECTORY,
             InputKind.REVIEW_FILE,
-            InputKind.LEGACY_DIRECTORY,
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -173,6 +162,20 @@ class InputDiscovery:
             "errors": list(self.errors),
             "details": dict(self.details),
         }
+
+
+@dataclass(frozen=True)
+class SourceHeaderSummary:
+    """Small, UI-safe summary of one selected source file's primary header."""
+
+    source_path: Path
+    status: str
+    device_name: str = ""
+    filter_name: str = ""
+    exposure: str = ""
+    details: Tuple[Tuple[str, str], ...] = ()
+    message: str = ""
+    header_field_count: int = 0
 
 
 def _normalized_name(value: Any, fallback: str = "unknown") -> str:
@@ -207,7 +210,7 @@ def _parse_fits_value(raw: str) -> Any:
 
 
 def read_fits_group_metadata(path: Path) -> Dict[str, Any]:
-    """Read only primary FITS cards needed for Light grouping."""
+    """Read bounded primary FITS cards without loading image pixels."""
 
     metadata: Dict[str, Any] = {}
     try:
@@ -230,6 +233,234 @@ def read_fits_group_metadata(path: Path) -> Dict[str, Any]:
     except OSError:
         return {}
     return metadata
+
+
+def _metadata_value(metadata: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key not in metadata:
+            continue
+        value = metadata.get(key)
+        if value is not None and (
+            not isinstance(value, str) or _normalized_name(value, "")
+        ):
+            return value
+    return None
+
+
+def _metadata_names(metadata: Mapping[str, Any], *keys: str) -> Tuple[str, ...]:
+    values = []
+    seen = set()
+    for key in keys:
+        value = _normalized_name(metadata.get(key), "")
+        identity = value.casefold()
+        if not value or identity in seen:
+            continue
+        seen.add(identity)
+        values.append(value)
+    return tuple(values)
+
+
+def _finite_number(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(str(value).strip().replace("D", "E"))
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _number_text(value: Any) -> str:
+    number = _finite_number(value)
+    if number is None:
+        return _normalized_name(value, "")
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:.6g}"
+
+
+def _measurement_text(value: Any, unit: str) -> str:
+    text = _number_text(value)
+    if not text:
+        return ""
+    return f"{text} {unit}" if _finite_number(value) is not None else text
+
+
+def _positive_integer(value: Any) -> Optional[int]:
+    number = _finite_number(value)
+    if number is None or number <= 0 or not number.is_integer():
+        return None
+    return int(number)
+
+
+def _fits_data_format(value: Any) -> str:
+    bitpix = _finite_number(value)
+    if bitpix is None or not bitpix.is_integer():
+        return _normalized_name(value, "")
+    formats = {
+        8: "8-bit 整数",
+        16: "16-bit 整数",
+        32: "32-bit 整数",
+        64: "64-bit 整数",
+        -32: "32-bit 浮点",
+        -64: "64-bit 浮点",
+    }
+    integer = int(bitpix)
+    return formats.get(integer, f"BITPIX={integer}")
+
+
+def inspect_source_header(path: Path) -> SourceHeaderSummary:
+    """Summarize a selected FITS primary header for non-blocking UI display."""
+
+    source_path = path.expanduser()
+    suffix = source_path.suffix.lower()
+    if suffix not in FITS_LIGHT_SUFFIXES:
+        kind = "XISF" if suffix == ".xisf" else "非 FITS"
+        return SourceHeaderSummary(
+            source_path=source_path,
+            status="unsupported",
+            message=(
+                f"当前仅扫描 FITS 主 Header；{kind} 元数据未读取，"
+                "不影响后续处理。"
+            ),
+        )
+    if not source_path.is_file():
+        return SourceHeaderSummary(
+            source_path=source_path,
+            status="unavailable",
+            message="源文件不可读，未扫描 Header；不影响重新选择输入。",
+        )
+
+    metadata = read_fits_group_metadata(source_path)
+    if not metadata or "SIMPLE" not in metadata:
+        return SourceHeaderSummary(
+            source_path=source_path,
+            status="unavailable",
+            message="未找到可识别的 FITS 主 Header；可继续处理并在 Stage 1 复核。",
+        )
+
+    devices = _metadata_names(
+        metadata,
+        "TELESCOP",
+        "INSTRUME",
+        "CAMERA",
+        "DETECTOR",
+    )
+    filters = _metadata_names(metadata, "FILTER", "FILTER1", "FILTER2")
+    exposure_value = _metadata_value(metadata, "EXPTIME", "EXPOSURE", "EXP_TIME")
+    stack_count = _positive_integer(
+        _metadata_value(metadata, "STACKCNT", "NCOMBINE", "NFRAMES", "FRAMES")
+    )
+    exposure = _measurement_text(exposure_value, "秒")
+    if exposure and stack_count and stack_count > 1 and _finite_number(
+        exposure_value
+    ) is not None:
+        exposure += "/帧"
+
+    details = []
+
+    def add_detail(label: str, value: Any) -> None:
+        text = _normalized_name(value, "")
+        if text:
+            details.append((label, text))
+
+    add_detail(
+        "目标",
+        _metadata_value(metadata, "OBJECT", "OBJNAME", "TARGET"),
+    )
+    add_detail(
+        "拍摄时间",
+        _metadata_value(metadata, "DATE-OBS", "DATEOBS", "DATE"),
+    )
+    if stack_count is not None:
+        add_detail("叠加帧数", stack_count)
+
+    width = _positive_integer(metadata.get("NAXIS1"))
+    height = _positive_integer(metadata.get("NAXIS2"))
+    channels = _positive_integer(metadata.get("NAXIS3"))
+    if width is not None and height is not None:
+        dimensions = f"{width} × {height}"
+        if channels is not None and channels > 1:
+            dimensions += f" × {channels}"
+        add_detail("图像尺寸", dimensions)
+
+    add_detail("数据格式", _fits_data_format(metadata.get("BITPIX")))
+    add_detail(
+        "图像类型",
+        _metadata_value(metadata, "IMAGETYP", "FRAMETYP", "FRAME"),
+    )
+
+    xbin = _positive_integer(
+        _metadata_value(metadata, "XBINNING", "XBIN", "BINNING")
+    )
+    ybin = _positive_integer(_metadata_value(metadata, "YBINNING", "YBIN"))
+    if xbin is not None:
+        add_detail("Binning", f"{xbin} × {ybin or xbin}")
+
+    gain = _metadata_value(metadata, "GAIN", "EGAIN", "CCDGAIN")
+    if gain is not None:
+        add_detail("增益", _number_text(gain))
+
+    temperature = _metadata_value(
+        metadata,
+        "CCD-TEMP",
+        "CCDTEMP",
+        "SENSORT",
+        "SENSOR_T",
+    )
+    if temperature is not None:
+        add_detail("传感器温度", _measurement_text(temperature, "℃"))
+
+    focal_length = _metadata_value(
+        metadata,
+        "FOCALLEN",
+        "FOCAL",
+        "FOCLEN",
+    )
+    if focal_length is not None:
+        add_detail("焦距", _measurement_text(focal_length, "mm"))
+
+    x_pixel = _metadata_value(metadata, "XPIXSZ", "PIXSIZE")
+    y_pixel = _metadata_value(metadata, "YPIXSZ")
+    if x_pixel is not None:
+        x_pixel_text = _number_text(x_pixel)
+        y_pixel_text = _number_text(y_pixel)
+        pixel_size = x_pixel_text
+        if y_pixel_text and y_pixel_text != x_pixel_text:
+            pixel_size += f" × {y_pixel_text}"
+        add_detail("像元尺寸", f"{pixel_size} μm")
+
+    ra = _metadata_value(metadata, "OBJCTRA", "RA", "CRVAL1")
+    dec = _metadata_value(metadata, "OBJCTDEC", "DEC", "CRVAL2")
+    coordinate_parts = []
+    if ra is not None:
+        coordinate_parts.append(f"RA {_normalized_name(ra, '')}")
+    if dec is not None:
+        coordinate_parts.append(f"Dec {_normalized_name(dec, '')}")
+    if coordinate_parts:
+        add_detail("中心坐标", " · ".join(coordinate_parts))
+
+    add_detail(
+        "Bayer 阵列",
+        _metadata_value(metadata, "BAYERPAT", "BAYERPATTERN"),
+    )
+    add_detail(
+        "创建软件",
+        _metadata_value(metadata, "CREATOR", "SWCREATE", "PROGRAM"),
+    )
+
+    return SourceHeaderSummary(
+        source_path=source_path,
+        status="ok",
+        device_name=" · ".join(devices),
+        filter_name=" · ".join(filters),
+        exposure=exposure,
+        details=tuple(details),
+        message=(
+            f"已读取 {len(metadata)} 个 FITS 主 Header 字段；未读取图像像素。"
+        ),
+        header_field_count=len(metadata),
+    )
 
 
 def _relative_parts(path: Path, source_root: Path) -> Tuple[str, ...]:
@@ -365,110 +596,12 @@ def discover_light_groups(
     return tuple(groups)
 
 
-def _looks_like_legacy_directory(path: Path) -> bool:
-    return any((path / name).exists() for name in _LEGACY_MARKERS) or any(
+def _looks_like_retired_processing_directory(path: Path) -> bool:
+    return any(
+        (path / name).exists() for name in _RETIRED_PROCESSING_MARKERS
+    ) or any(
         candidate.is_file() for candidate in path.glob("stage[0-9]*_*.fit")
     )
-
-
-def inspect_legacy_directory(path: Path) -> Dict[str, Any]:
-    """Verify a legacy checkpoint without treating its filename as provenance."""
-
-    root = path.expanduser().resolve()
-    result: Dict[str, Any] = {
-        "recognized": _looks_like_legacy_directory(root),
-        "verified": False,
-        "directory": str(root),
-        "resume_after_stage": None,
-    }
-    manifest_path = root / "pipeline-result.json"
-    manifest = run_manifest.load_json(manifest_path)
-    if manifest is None or str(manifest.get("schema") or "") != (
-        "seestar.pipeline-result.v1"
-    ):
-        result["detail"] = "pipeline-result.json 缺失或 schema 不受支持"
-        return result
-    claimed_manifest_hash = str(manifest.get("manifest_hash") or "")
-    unsigned_manifest = dict(manifest)
-    unsigned_manifest.pop("manifest_hash", None)
-    if not claimed_manifest_hash or claimed_manifest_hash != (
-        run_manifest.canonical_payload_hash(unsigned_manifest)
-    ):
-        result["detail"] = "pipeline-result.json 哈希无效"
-        return result
-
-    plan_hash = str(manifest.get("plan_hash") or "")
-    plan = run_manifest.load_json(root / "processing-plan.json")
-    if plan is None or str(plan.get("schema") or "") != (
-        "seestar.processing-plan.v1"
-    ):
-        result["detail"] = "processing-plan.json 缺失或 schema 不受支持"
-        return result
-    claimed_plan_hash = str(plan.get("plan_hash") or "")
-    unsigned_plan = dict(plan)
-    unsigned_plan.pop("plan_hash", None)
-    if (
-        not plan_hash
-        or not claimed_plan_hash
-        or claimed_plan_hash != plan_hash
-        or claimed_plan_hash != run_manifest.canonical_payload_hash(unsigned_plan)
-    ):
-        result["detail"] = "旧版处理计划与结果清单不匹配"
-        return result
-
-    checkpoints = manifest.get("checkpoints")
-    if not isinstance(checkpoints, Mapping):
-        result["detail"] = "pipeline-result.json 没有断点来源记录"
-        return result
-    rejections: Dict[str, str] = {}
-    for checkpoint_name, stage_number in (
-        ("result_linear", 5),
-        ("stage2_corrected", 2),
-        ("stage1_prepared", 1),
-    ):
-        record = checkpoints.get(checkpoint_name)
-        if not isinstance(record, Mapping):
-            rejections[checkpoint_name] = "missing"
-            continue
-        relative_path = Path(str(record.get("path") or ""))
-        if relative_path.is_absolute() or not relative_path.as_posix():
-            rejections[checkpoint_name] = "checkpoint path is not relative"
-            continue
-        candidate = (root / relative_path).resolve()
-        try:
-            candidate.relative_to(root)
-        except ValueError:
-            rejections[checkpoint_name] = "checkpoint path escapes legacy directory"
-            continue
-        verification = run_manifest.verify_resume_provenance(
-            work_dir=root,
-            input_path=candidate,
-            checkpoint_name=checkpoint_name,
-        )
-        if not verification.get("verified"):
-            rejections[checkpoint_name] = str(
-                verification.get("detail") or "checkpoint verification failed"
-            )
-            continue
-        result.update(
-            {
-                "verified": True,
-                "checkpoint": checkpoint_name,
-                "legacy_stage": stage_number,
-                "checkpoint_path": str(candidate),
-                "manifest_hash": claimed_manifest_hash,
-                "plan_hash": plan_hash,
-                "detail": (
-                    f"已验证旧版 {checkpoint_name}；"
-                    "迁移后作为外部母版从 Stage 1 安全导入"
-                ),
-                "rejections": rejections,
-            }
-        )
-        return result
-    result["detail"] = "没有通过清单、线性状态和 SHA-256 校验的旧版断点"
-    result["rejections"] = rejections
-    return result
 
 
 def discover_input(
@@ -572,37 +705,17 @@ def discover_input(
             details=dict(inspection),
         )
 
-    if _looks_like_legacy_directory(path):
-        inspection = inspect_legacy_directory(path)
-        verified = bool(inspection.get("verified"))
-        checkpoint_path = inspection.get("checkpoint_path")
+    if _looks_like_retired_processing_directory(path):
         return InputDiscovery(
             selected_path=path,
             source_root=path,
-            kind=InputKind.LEGACY_DIRECTORY,
-            trust=(
-                DiscoveryTrust.VERIFIED
-                if verified
-                else DiscoveryTrust.REVIEW_REQUIRED
-            ),
-            summary=(
-                "旧版目录断点已验证，将只读迁移并从 Stage 1 安全导入"
-                if verified
-                else "检测到旧版处理目录，但无法安全迁移"
-            ),
-            master_file=(
-                Path(str(checkpoint_path)) if verified and checkpoint_path else None
-            ),
-            warnings=(
-                "不会根据 stage/result 文件名自动推断起点。",
-                "旧目录保持只读；旧 Stage 5 不会被冒充为当前契约断点。",
-            ),
+            kind=InputKind.UNSUPPORTED,
+            trust=DiscoveryTrust.REVIEW_REQUIRED,
+            summary="旧版处理目录不再支持续跑",
             errors=(
-                ()
-                if verified
-                else (str(inspection.get("detail") or "旧版清单无法验证"),)
+                "请重新选择原始母版文件，并作为新任务从 Stage 1 导入。",
             ),
-            details=dict(inspection),
+            details={"reason": "retired_processing_directory"},
         )
 
     try:
@@ -659,9 +772,10 @@ __all__ = [
     "LightGroup",
     "MASTER_SUFFIXES",
     "REVIEW_SUFFIXES",
+    "SourceHeaderSummary",
     "TASK_MANIFEST_NAME",
     "discover_input",
     "discover_light_groups",
-    "inspect_legacy_directory",
+    "inspect_source_header",
     "read_fits_group_metadata",
 ]

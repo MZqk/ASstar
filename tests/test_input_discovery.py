@@ -20,6 +20,7 @@ from input_discovery import (  # noqa: E402
     InputKind,
     discover_input,
     discover_light_groups,
+    inspect_source_header,
 )
 import run_manifest  # noqa: E402
 
@@ -45,6 +46,70 @@ def _write_fits(path: Path, **metadata: object) -> None:
 
 
 class InputDiscoveryTests(unittest.TestCase):
+    def test_selected_fits_header_is_summarized_without_reading_pixels(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "M42.fit"
+            _write_fits(
+                source,
+                TELESCOP="ZWO Seestar S50",
+                INSTRUME="Sony IMX462",
+                FILTER="Seestar LP",
+                EXPTIME=10.0,
+                STACKCNT=120,
+                OBJECT="M 42",
+                **{
+                    "DATE-OBS": "2026-08-09T20:15:30",
+                    "NAXIS1": 1080,
+                    "NAXIS2": 1920,
+                    "BITPIX": 16,
+                    "XBINNING": 1,
+                    "YBINNING": 1,
+                    "GAIN": 80,
+                    "CCD-TEMP": -5.5,
+                    "FOCALLEN": 250,
+                    "XPIXSZ": 2.9,
+                    "YPIXSZ": 2.9,
+                    "OBJCTRA": "05 35 17.3",
+                    "OBJCTDEC": "-05 23 28",
+                    "BAYERPAT": "RGGB",
+                },
+            )
+
+            summary = inspect_source_header(source)
+
+        self.assertEqual(summary.status, "ok")
+        self.assertEqual(
+            summary.device_name,
+            "ZWO Seestar S50 · Sony IMX462",
+        )
+        self.assertEqual(summary.filter_name, "Seestar LP")
+        self.assertEqual(summary.exposure, "10 秒/帧")
+        details = dict(summary.details)
+        self.assertEqual(details["目标"], "M 42")
+        self.assertEqual(details["叠加帧数"], "120")
+        self.assertEqual(details["图像尺寸"], "1080 × 1920")
+        self.assertEqual(details["数据格式"], "16-bit 整数")
+        self.assertEqual(details["传感器温度"], "-5.5 ℃")
+        self.assertEqual(details["焦距"], "250 mm")
+        self.assertEqual(details["像元尺寸"], "2.9 μm")
+        self.assertIn("未读取图像像素", summary.message)
+
+    def test_source_header_summary_handles_unsupported_and_invalid_files(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            xisf = root / "source.xisf"
+            xisf.write_bytes(b"XISF0100-test")
+            invalid_fits = root / "invalid.fit"
+            invalid_fits.write_bytes(b"not-a-fits-header")
+
+            xisf_summary = inspect_source_header(xisf)
+            invalid_summary = inspect_source_header(invalid_fits)
+
+        self.assertEqual(xisf_summary.status, "unsupported")
+        self.assertIn("XISF", xisf_summary.message)
+        self.assertEqual(invalid_summary.status, "unavailable")
+        self.assertFalse(invalid_summary.device_name)
+
     def test_explicit_xisf_is_master_and_never_guessed_as_resume(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             source = Path(td) / "NGC6910.xisf"
@@ -139,23 +204,24 @@ class InputDiscoveryTests(unittest.TestCase):
 
             result = discover_input(root)
 
-        self.assertEqual(result.kind, InputKind.LEGACY_DIRECTORY)
+        self.assertEqual(result.kind, InputKind.UNSUPPORTED)
+        self.assertFalse(result.accepted)
         self.assertIsNone(result.resume_after_stage)
-        self.assertIn("不会根据", result.warnings[0])
+        self.assertIn("Stage 1", result.errors[0])
 
-    def test_signed_legacy_checkpoint_is_migratable_but_still_starts_stage1(self) -> None:
+    def test_signed_legacy_checkpoint_is_rejected_without_migration(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             checkpoint = root / "result_linear.fit"
             checkpoint.write_bytes(b"trusted-legacy-linear")
             plan = {
-                "schema": "seestar.processing-plan.v1",
+                "schema": "starun.processing-plan.v1",
                 "run_id": "legacy-run",
             }
             plan["plan_hash"] = run_manifest.canonical_payload_hash(plan)
             run_manifest.atomic_write_json(root / "processing-plan.json", plan)
             result_manifest = {
-                "schema": "seestar.pipeline-result.v1",
+                "schema": "starun.pipeline-result.v1",
                 "status": "success",
                 "plan_hash": plan["plan_hash"],
                 "checkpoints": {
@@ -175,12 +241,12 @@ class InputDiscoveryTests(unittest.TestCase):
 
             discovery = discover_input(root)
 
-        self.assertEqual(discovery.kind, InputKind.LEGACY_DIRECTORY)
-        self.assertEqual(discovery.trust, DiscoveryTrust.VERIFIED)
-        self.assertTrue(discovery.accepted)
+        self.assertEqual(discovery.kind, InputKind.UNSUPPORTED)
+        self.assertEqual(discovery.trust, DiscoveryTrust.REVIEW_REQUIRED)
+        self.assertFalse(discovery.accepted)
         self.assertIsNone(discovery.resume_after_stage)
-        self.assertEqual(discovery.master_file, checkpoint.resolve())
-        self.assertIn("Stage 1", discovery.summary)
+        self.assertIsNone(discovery.master_file)
+        self.assertIn("Stage 1", discovery.errors[0])
 
 
 if __name__ == "__main__":

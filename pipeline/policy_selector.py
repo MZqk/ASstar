@@ -49,7 +49,7 @@ DEFAULT_POLICY: Dict[str, Any] = {
         "protect_star_halo": True,
         "avoid_global_sharpen": True,
     },
-    "stage6_stretch": {
+    "stage7_stretch": {
         "candidate_mode": [
             "asinh_core_protect",
             "low_contrast_masked_lift",
@@ -59,20 +59,6 @@ DEFAULT_POLICY: Dict[str, Any] = {
         "forbidden_when_dirty": ["autostretch"],
         "allow_autostretch_as_reference_only": True,
         "fallback_candidate": "low_contrast_masked_lift",
-        "scoring": {
-            "core_blowout_weight": 0.30,
-            "bg_noise_weight": 0.35,
-            "nebulosity_weight": 0.20,
-            "star_bloat_weight": 0.10,
-            "color_shift_weight": 0.05,
-        },
-    },
-    "stage6_5_pre_starless_gate": {
-        "max_bg_dirty_score": 0.35,
-        "max_core_clip_ratio": 0.01,
-        "max_star_halo_risk": 0.60,
-        "require_conservative_starless_input": True,
-        "default_starless_input": "stage7_ultra_conservative_asinh",
     },
 }
 
@@ -103,7 +89,7 @@ BUILTIN_POLICY_OVERLAYS: Dict[str, Dict[str, Any]] = {
             "protect_star_halo": True,
             "avoid_global_sharpen": True,
         },
-        "stage6_stretch": {
+        "stage7_stretch": {
             "candidate_mode": [
                 "bright_nebula_hdr_masked",
                 "asinh_core_protect",
@@ -126,20 +112,6 @@ BUILTIN_POLICY_OVERLAYS: Dict[str, Dict[str, Any]] = {
                     },
                 },
             },
-            "scoring": {
-                "core_blowout_weight": 0.35,
-                "bg_noise_weight": 0.35,
-                "nebulosity_weight": 0.20,
-                "star_bloat_weight": 0.10,
-                "color_shift_weight": 0.05,
-            },
-        },
-        "stage6_5_pre_starless_gate": {
-            "max_bg_dirty_score": 0.35,
-            "max_core_clip_ratio": 0.01,
-            "max_star_halo_risk": 0.65,
-            "require_conservative_starless_input": True,
-            "default_starless_input": "stage7_ultra_conservative_asinh",
         },
     }
 }
@@ -170,7 +142,7 @@ BUILTIN_POLICY_OVERLAYS.update(
                 "protect_star_halo": True,
                 "avoid_global_sharpen": True,
             },
-            "stage6_stretch": {
+            "stage7_stretch": {
                 "candidate_mode": [
                     "masked_galaxy_stretch",
                     "low_contrast_masked_lift",
@@ -181,19 +153,6 @@ BUILTIN_POLICY_OVERLAYS.update(
                 "forbidden_when_dirty": ["autostretch"],
                 "allow_autostretch_as_reference_only": True,
                 "fallback_candidate": "low_contrast_masked_lift",
-                "scoring": {
-                    "core_blowout_weight": 0.30,
-                    "bg_noise_weight": 0.25,
-                    "nebulosity_weight": 0.30,
-                    "star_bloat_weight": 0.10,
-                    "color_shift_weight": 0.05,
-                },
-            },
-            "stage6_5_pre_starless_gate": {
-                "max_bg_dirty_score": 0.40,
-                "max_core_clip_ratio": 0.012,
-                "max_star_halo_risk": 0.70,
-                "default_starless_input": "stage7_conservative_asinh",
             },
         },
         "dark_nebula_low_contrast": {
@@ -220,7 +179,7 @@ BUILTIN_POLICY_OVERLAYS.update(
                 "protect_star_halo": True,
                 "avoid_global_sharpen": True,
             },
-            "stage6_stretch": {
+            "stage7_stretch": {
                 "candidate_mode": [
                     "dark_nebula_masked_lift",
                     "asinh_core_protect",
@@ -231,20 +190,6 @@ BUILTIN_POLICY_OVERLAYS.update(
                 "forbidden_when_dirty": ["autostretch"],
                 "allow_autostretch_as_reference_only": True,
                 "fallback_candidate": "dark_nebula_masked_lift",
-                "scoring": {
-                    "core_blowout_weight": 0.15,
-                    "bg_noise_weight": 0.45,
-                    "nebulosity_weight": 0.25,
-                    "star_bloat_weight": 0.10,
-                    "color_shift_weight": 0.05,
-                },
-            },
-            "stage6_5_pre_starless_gate": {
-                "max_bg_dirty_score": 0.28,
-                "max_core_clip_ratio": 0.008,
-                "max_star_halo_risk": 0.55,
-                "require_conservative_starless_input": True,
-                "default_starless_input": "stage7_ultra_conservative_asinh",
             },
         },
     }

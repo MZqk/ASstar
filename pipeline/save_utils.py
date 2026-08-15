@@ -1,6 +1,5 @@
-"""Save/export helpers for the SeeStar processing pipeline."""
+"""Save/export helpers for the Starun processing pipeline."""
 import json
-import re
 import struct
 import zlib
 from pathlib import Path
@@ -8,32 +7,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from sirilpy.exceptions import CommandError, DataError, SirilError
-
-
-LEGACY_STAGE_READ_ALIASES = {
-    "stage4_color": ("stage4_colorbalanced",),
-    "stage4_colorbalanced": ("stage4_color",),
-    "stage5_linear": ("stage5_denoised",),
-    "stage7_starless": ("stage6_starless",),
-    "stage6_starless": ("stage7_starless",),
-    "stage7_starless_repaired": ("stage6_starless_repaired",),
-    "stage6_starless_repaired": ("stage7_starless_repaired",),
-    "stage6_input": ("stage7_input",),
-    "stage7_input": ("stage6_input",),
-}
-
-LEGACY_STAGE_JSON_READ_ALIASES = {
-    "stage7_quality.json": ("stage6_starless_quality.json",),
-    "stage6_starless_quality.json": ("stage7_quality.json",),
-    "pre_starless_gate_report.json": ("stage7_5_pre_starless_gate_report.json",),
-    "stage7_5_pre_starless_gate_report.json": ("pre_starless_gate_report.json",),
-}
-
-
-def _stage_output_aliases(stem: str) -> Tuple[str, ...]:
-    """Return legacy names for read/migration code; never write them."""
-    aliases = list(LEGACY_STAGE_READ_ALIASES.get(stem, ()))
-    return tuple(aliases)
 
 
 def _png_chunk(tag: bytes, payload: bytes) -> bytes:
@@ -79,6 +52,42 @@ def write_png_rgb16(path: Path, rgb: np.ndarray) -> None:
     path.write_bytes(png_data)
 
 
+def write_png_rgb8(path: Path, rgb: np.ndarray) -> None:
+    """Write a compact 8-bit RGB PNG without adding an image dependency."""
+    arr = np.asarray(rgb, dtype=np.float32)
+    if arr.ndim != 3 or arr.shape[0] != 3:
+        raise ValueError(f"expected RGB CHW array, got shape={arr.shape}")
+
+    arr = np.clip(arr, 0.0, 1.0)
+    h, w = arr.shape[1], arr.shape[2]
+    if h <= 0 or w <= 0:
+        raise ValueError(f"invalid image size: {w}x{h}")
+
+    chw_u8 = np.round(arr * 255.0).astype(np.uint8)
+    hwc_u8 = np.transpose(chw_u8, (1, 2, 0))
+
+    compressor = zlib.compressobj(level=6)
+    idat_parts: List[bytes] = []
+    for row in hwc_u8:
+        row_bytes = b"\x00" + row.tobytes(order="C")
+        compressed = compressor.compress(row_bytes)
+        if compressed:
+            idat_parts.append(compressed)
+    tail = compressor.flush()
+    if tail:
+        idat_parts.append(tail)
+    idat = b"".join(idat_parts)
+
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    png_data = (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"IDAT", idat)
+        + _png_chunk(b"IEND", b"")
+    )
+    path.write_bytes(png_data)
+
+
 def save_stage_output(cmd_with_check: Callable[..., Any], log: Any, stem: str) -> bool:
     """Save per-stage FITS snapshot with stage* naming."""
     try:
@@ -109,47 +118,6 @@ def write_stage_json(
         log.warn(f"写入阶段 JSON 失败 ({filename}): {e}")
 
 
-def write_ai_raw_response(
-    process_dir: Optional[Path],
-    log: Any,
-    counter: int,
-    short_text: Callable[[str, int], str],
-    stage_name: str,
-    *,
-    endpoint_url: str,
-    temperature: float,
-    json_mode: bool,
-    response_obj: Optional[Dict[str, Any]] = None,
-    content: Optional[str] = None,
-    error_text: Optional[str] = None,
-) -> int:
-    next_counter = counter + 1
-    if not process_dir:
-        return next_counter
-
-    safe_stage = re.sub(r"[^A-Za-z0-9_.-]+", "_", stage_name).strip("_") or "stage"
-    stem = f"ai_raw_{next_counter:03d}_{safe_stage}"
-    payload = {
-        "stage": stage_name,
-        "endpoint": endpoint_url,
-        "temperature": temperature,
-        "json_mode": json_mode,
-        "error": error_text,
-        "content_preview": short_text(content or "", 2000),
-        "response": response_obj,
-    }
-    try:
-        (process_dir / f"{stem}.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        if content:
-            (process_dir / f"{stem}.txt").write_text(content, encoding="utf-8")
-    except OSError as e:
-        log.warn(f"写入 AI raw response 失败 ({stage_name}): {e}")
-    return next_counter
-
-
 def export_final_outputs(
     cmd_with_check: Callable[..., Any],
     log: Any,
@@ -176,7 +144,7 @@ def export_final_outputs(
     if "fits" in requested:
         requested.add("fit")
     report: Dict[str, Any] = {
-        "schema": "seestar.stage10-export.v1",
+        "schema": "starun.stage10-export.v1",
         "requested_formats": sorted(requested),
         "outputs": {},
         "fallback_used": False,

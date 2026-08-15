@@ -23,6 +23,7 @@ from image_metrics import (
     measure_quality_metrics,
 )
 from models import ImageFeatures, QualityMetrics
+from narrowband_normalization import validate_narrowband_channel_mapping
 
 ENV_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 ENV_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
@@ -77,7 +78,7 @@ def install_pyqt6_headless_stub(pipeline) -> bool:
         @staticmethod
         def writableLocation(_loc):
             return os.path.expanduser(
-                "~/Library/Application Support/SeestarSuperimpose/runtime_home/setiastro"
+                "~/Library/Application Support/Starun/runtime_home/setiastro"
             )
 
     class _QSettings:
@@ -349,7 +350,7 @@ def resolve_local_aberration_model(pipeline) -> Optional[Path]:
     return None
 
 def preferred_aberration_providers(pipeline, module) -> Tuple[Optional[List[str]], str]:
-    provider_mode = os.getenv("SEESTAR_ABERRATION_PROVIDER", "").strip().lower()
+    provider_mode = os.getenv("STARUN_ABERRATION_PROVIDER", "").strip().lower()
     ort_mod = getattr(module, "ort", None)
     if ort_mod is None:
         return None, "default"
@@ -486,6 +487,71 @@ def run_aberration_api(pipeline, step_key: str, model_path: Optional[Path] = Non
             pipeline.log.debug(traceback.format_exc())
         return None
 
+_SASP_STAGE8_IMPORT_MODULES = (
+    "setiastro.saspro.wavescalede",
+    "setiastro.saspro.widgets.wavelet_utils",
+    "setiastro.saspro.widgets.graphics_views",
+    "setiastro.saspro.widgets.themed_buttons",
+    "setiastro.saspro.widgets",
+)
+
+_SASP_WAVELET_NUMBA_IMPORT_ANCHOR = """try:
+    from setiastro.saspro.legacy.numba_utils import (
+        rgb_to_xyz_numba, xyz_to_lab_numba,
+        lab_to_xyz_numba, xyz_to_rgb_numba,
+    )
+    _HAVE_NUMBA = True
+except ImportError:
+    _HAVE_NUMBA = False
+"""
+
+_SASP_WAVELET_NUMBA_IMPORT_FALLBACK = """try:
+    from setiastro.saspro.legacy.numba_utils import (
+        rgb_to_xyz_numba, xyz_to_lab_numba,
+        lab_to_xyz_numba, xyz_to_rgb_numba,
+    )
+    _HAVE_NUMBA = True
+except ImportError:
+    _HAVE_NUMBA = False
+except RuntimeError as _sasp_numba_error:
+    _sasp_numba_message = str(_sasp_numba_error)
+    if (
+        "cannot cache function" not in _sasp_numba_message
+        or "no locator available" not in _sasp_numba_message
+    ):
+        raise
+    _HAVE_NUMBA = False
+"""
+
+
+def _clear_sasp_stage8_import_modules() -> None:
+    parent_attrs = (
+        ("setiastro.saspro", "wavescalede", "setiastro.saspro.wavescalede"),
+        ("setiastro.saspro", "widgets", "setiastro.saspro.widgets"),
+    )
+    for parent_name, attr_name, module_name in parent_attrs:
+        parent = sys.modules.get(parent_name)
+        child = getattr(parent, attr_name, None) if parent is not None else None
+        if getattr(child, "__name__", None) == module_name:
+            delattr(parent, attr_name)
+    for module_name in _SASP_STAGE8_IMPORT_MODULES:
+        sys.modules.pop(module_name, None)
+
+
+def _patch_sasp_wavelet_numba_fallback(source: str) -> str:
+    normalized = source.replace("\r\n", "\n").replace("\r", "\n")
+    if normalized.count(_SASP_WAVELET_NUMBA_IMPORT_ANCHOR) != 1:
+        raise RuntimeError(
+            "unsupported SASP wavelet_utils layout: "
+            "optional Numba import block not found"
+        )
+    return normalized.replace(
+        _SASP_WAVELET_NUMBA_IMPORT_ANCHOR,
+        _SASP_WAVELET_NUMBA_IMPORT_FALLBACK,
+        1,
+    )
+
+
 def load_sasp_stage8_module(pipeline):
     if pipeline._sasp_stage8_module is not None:
         return pipeline._sasp_stage8_module
@@ -499,6 +565,7 @@ def load_sasp_stage8_module(pipeline):
         )
         return None
 
+    _clear_sasp_stage8_import_modules()
     wheel_token = str(wheel_path)
     if wheel_token not in sys.path:
         sys.path.insert(0, wheel_token)
@@ -507,10 +574,21 @@ def load_sasp_stage8_module(pipeline):
     try:
         pipeline._install_sasp_stage8_widget_import_shims(wheel_path)
     except (ImportError, RuntimeError, AttributeError, OSError) as e:
-        pipeline.log.warn(f"SASP Starless 深加工 widget shim failed: {e}")
+        _clear_sasp_stage8_import_modules()
+        pipeline._sasp_stage8_module_error = (
+            f"widget shim failed: {pipeline._short_text(e)}"
+        )
+        pipeline.log.warn(
+            "SASP Starless 深加工 API unavailable: "
+            f"{pipeline._sasp_stage8_module_error}"
+        )
+        if pipeline.cfg.debug_mode:
+            pipeline.log.debug(traceback.format_exc())
+        return None
     try:
         module = importlib.import_module("setiastro.saspro.wavescalede")
     except (ImportError, RuntimeError, AttributeError) as e:
+        _clear_sasp_stage8_import_modules()
         pipeline._sasp_stage8_module_error = f"import failed: {pipeline._short_text(e)}"
         pipeline.log.warn(f"SASP Starless 深加工 API import failed: {e}")
         if pipeline.cfg.debug_mode:
@@ -519,6 +597,7 @@ def load_sasp_stage8_module(pipeline):
 
     runner = getattr(module, "compute_wavescale_dse", None)
     if not callable(runner):
+        _clear_sasp_stage8_import_modules()
         pipeline._sasp_stage8_module_error = "compute_wavescale_dse is missing"
         pipeline.log.warn("SASP Starless 深加工 API unavailable: missing compute_wavescale_dse")
         return None
@@ -536,6 +615,7 @@ def install_sasp_stage8_widget_import_shims(pipeline, wheel_path: Path) -> None:
     needs wavelet_utils plus two UI symbols for class definitions, so keep
     the import surface narrow and avoid making OpenCV a hard dependency.
     """
+    _clear_sasp_stage8_import_modules()
     widgets_pkg_name = "setiastro.saspro.widgets"
     widgets_pkg = types.ModuleType(widgets_pkg_name)
     widgets_pkg.__path__ = [f"{wheel_path}/setiastro/saspro/widgets"]  # type: ignore[attr-defined]
@@ -569,15 +649,32 @@ def install_sasp_stage8_widget_import_shims(pipeline, wheel_path: Path) -> None:
     setattr(widgets_pkg, "graphics_views", graphics_mod)
 
     wavelet_name = f"{widgets_pkg_name}.wavelet_utils"
-    if wavelet_name not in sys.modules:
+    wavelet_loaded = False
+    try:
         member = "setiastro/saspro/widgets/wavelet_utils.py"
         with zipfile.ZipFile(wheel_path) as zf:
             source = zf.read(member).decode("utf-8")
+        source = _patch_sasp_wavelet_numba_fallback(source)
         wavelet_mod = types.ModuleType(wavelet_name)
         wavelet_mod.__file__ = f"{wheel_path}/{member}"
         sys.modules[wavelet_name] = wavelet_mod
         exec(compile(source, wavelet_mod.__file__, "exec"), wavelet_mod.__dict__)
+        required_callables = ("atrous_decompose", "rgb_to_lab", "lab_to_rgb")
+        missing = [
+            name
+            for name in required_callables
+            if not callable(getattr(wavelet_mod, name, None))
+        ]
+        if missing:
+            raise AttributeError(
+                "SASP wavelet_utils missing required callable(s): "
+                + ", ".join(missing)
+            )
         setattr(widgets_pkg, "wavelet_utils", wavelet_mod)
+        wavelet_loaded = True
+    finally:
+        if not wavelet_loaded:
+            _clear_sasp_stage8_import_modules()
 
 def prepare_stage8_sasp_input(pipeline, image_data):
     arr = np.asarray(image_data)
@@ -638,6 +735,383 @@ def restore_stage8_sasp_output(
         return np.clip(out * max_value, 0, max_value).astype(src_dtype, copy=False)
     return out.astype(np.float32, copy=False)
 
+
+def _stage9_sasp_short_text(pipeline, error: Exception) -> str:
+    formatter = getattr(pipeline, "_short_text", None)
+    if callable(formatter):
+        try:
+            return str(formatter(error))
+        except (AttributeError, TypeError, ValueError):
+            pass
+    return str(error)[:240]
+
+
+def _stage9_sasp_mapping(pipeline) -> Tuple[Dict[str, Any], str]:
+    """Return the frozen Stage 4 Ha/OIII mapping without guessing channels."""
+    mapping = getattr(pipeline, "narrowband_channel_mapping", None)
+    if isinstance(mapping, dict) and mapping:
+        return dict(mapping), "stage4_runtime_contract"
+    profile = getattr(pipeline, "channel_profile", None)
+    if isinstance(profile, dict):
+        profile_mapping = profile.get("narrowband_mapping")
+        if isinstance(profile_mapping, dict) and profile_mapping:
+            return dict(profile_mapping), "channel_profile_contract"
+    return {}, "missing"
+
+
+def _stage9_sasp_write_pixels(pipeline, pixels) -> None:
+    setter = getattr(pipeline.siril, "set_image_pixeldata", None)
+    if not callable(setter):
+        raise RuntimeError("Siril pixel writer is unavailable")
+    setter(pixels)
+
+
+def _stage9_sasp_run_with_lock(pipeline, operation):
+    lock_factory = getattr(pipeline.siril, "image_lock", None)
+    if callable(lock_factory):
+        with lock_factory():
+            return operation()
+    pipeline.log.warn(
+        "Stage9 SASP adapter: image_lock unavailable, running without thread lock"
+    )
+    return operation()
+
+
+def _stage9_sasp_restore_source(pipeline, source_data) -> Optional[str]:
+    if source_data is None:
+        return None
+    try:
+        _stage9_sasp_run_with_lock(
+            pipeline,
+            lambda: _stage9_sasp_write_pixels(pipeline, source_data),
+        )
+        return None
+    except (CommandError, SirilError, OSError, RuntimeError, TypeError, ValueError) as e:
+        return _stage9_sasp_short_text(pipeline, e)
+
+
+def load_sasp_star_stretch_module(pipeline):
+    """Load only the SASP pixel kernel used by Star Stretch.
+
+    The public SASP Star Stretch entry point is a Qt dialog, but its pixel
+    math lives in ``legacy.numba_utils``.  Loading that narrow module keeps
+    Stage 9 headless and avoids depending on an unregistered Siril command.
+    """
+    module = getattr(pipeline, "_sasp_star_stretch_module", None)
+    if module is not None:
+        return module
+    if getattr(pipeline, "_sasp_star_stretch_module_error", None) is not None:
+        return None
+
+    finder = getattr(pipeline, "_find_latest_sasp_wheel", None)
+    wheel_path = finder() if callable(finder) else find_latest_sasp_wheel(pipeline)
+    if wheel_path is None:
+        pipeline._sasp_star_stretch_module_error = (
+            "setiastrosuitepro wheel not found in plugin downloads"
+        )
+        return None
+
+    wheel_token = str(wheel_path)
+    if wheel_token not in sys.path:
+        sys.path.insert(0, wheel_token)
+
+    installer = getattr(pipeline, "_install_pyqt6_headless_stub", None)
+    if callable(installer):
+        installer()
+    try:
+        module = importlib.import_module("setiastro.saspro.legacy.numba_utils")
+    except (ImportError, OSError, RuntimeError, AttributeError, TypeError, ValueError) as e:
+        pipeline._sasp_star_stretch_module_error = (
+            f"kernel import failed: {_stage9_sasp_short_text(pipeline, e)}"
+        )
+        return None
+
+    runner = getattr(module, "applyPixelMath_numba", None)
+    if not callable(runner):
+        pipeline._sasp_star_stretch_module_error = "applyPixelMath_numba is missing"
+        return None
+    pipeline._sasp_star_stretch_module = module
+    pipeline._sasp_star_stretch_module_error = None
+    return module
+
+
+def _apply_sasp_star_stretch_numpy(image: np.ndarray, amount: float) -> np.ndarray:
+    """Exact vectorized form of SASP ``applyPixelMath_numba``."""
+    working = np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
+    factor = float(3.0 ** float(amount))
+    output = (factor * working) / ((factor - 1.0) * working + 1.0)
+    return np.clip(output, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def run_sasp_star_stretch_api(pipeline):
+    """Apply the bundled SASP Star Stretch to the loaded Stage 9 star layer."""
+    enabled = bool(
+        getattr(pipeline.cfg, "stage9_sasp_star_stretch_enabled", True)
+    )
+    amount = _clamp_float(
+        getattr(pipeline.cfg, "stage9_sasp_star_stretch_amount", 3.0),
+        0.50,
+        5.00,
+    )
+    report: Dict[str, Any] = {
+        "schema": "starun.stage9-sasp-star-stretch.v1",
+        "status": "not_run",
+        "enabled": enabled,
+        "amount": amount,
+    }
+    pipeline._last_sasp_star_stretch_error = None
+    if not enabled:
+        report.update({"status": "disabled", "reason": "configuration_disabled"})
+        pipeline._stage9_sasp_star_stretch_report = report
+        return None
+
+    finder = getattr(pipeline, "_find_latest_sasp_wheel", None)
+    wheel_path = finder() if callable(finder) else find_latest_sasp_wheel(pipeline)
+    if wheel_path is None:
+        reason = "setiastrosuitepro wheel not found in plugin downloads"
+        report.update({"status": "skipped", "reason": reason})
+        pipeline._last_sasp_star_stretch_error = reason
+        pipeline._stage9_sasp_star_stretch_report = report
+        pipeline.log.warn(f"SASP Star Stretch API unavailable: {reason}")
+        return None
+
+    report["wheel"] = wheel_path.name
+    source_data = None
+    kernel_fallback_reason = None
+    try:
+        loader = getattr(pipeline, "_load_sasp_star_stretch_module", None)
+        module = loader() if callable(loader) else load_sasp_star_stretch_module(pipeline)
+
+        def _run_with_pixels() -> Tuple[str, str]:
+            nonlocal source_data, kernel_fallback_reason
+            image_data = pipeline.siril.get_image_pixeldata(preview=False)
+            if image_data is None:
+                raise RuntimeError("image buffer is empty")
+            source_data = np.array(image_data, copy=True)
+            input_image, input_layout, input_dtype, scale_back = (
+                prepare_stage8_sasp_input(pipeline, source_data)
+            )
+            if not np.all(np.isfinite(input_image)):
+                raise ValueError("star layer contains nonfinite pixels")
+
+            collapsed_mono = input_layout == "mono"
+            kernel_input = input_image
+            if collapsed_mono:
+                kernel_input = np.repeat(input_image[:, :, None], 3, axis=2)
+            if kernel_input.ndim != 3 or kernel_input.shape[2] not in (1, 3):
+                raise ValueError(
+                    f"unsupported SASP Star Stretch input shape: {kernel_input.shape}"
+                )
+            kernel_input = np.ascontiguousarray(kernel_input, dtype=np.float32)
+
+            engine = "numpy_compatible_fallback"
+            if module is not None:
+                try:
+                    output_image = module.applyPixelMath_numba(kernel_input, amount)
+                    engine = "sasp_numba_kernel"
+                except (OSError, RuntimeError, TypeError, ValueError) as e:
+                    kernel_fallback_reason = _stage9_sasp_short_text(pipeline, e)
+                    output_image = _apply_sasp_star_stretch_numpy(kernel_input, amount)
+            else:
+                kernel_fallback_reason = getattr(
+                    pipeline,
+                    "_sasp_star_stretch_module_error",
+                    "kernel unavailable",
+                )
+                output_image = _apply_sasp_star_stretch_numpy(kernel_input, amount)
+
+            if collapsed_mono:
+                output_image = np.asarray(output_image, dtype=np.float32)[:, :, 0]
+            restored = restore_stage8_sasp_output(
+                pipeline,
+                output_image,
+                input_layout,
+                input_dtype,
+                scale_back,
+            )
+            if restored.shape != source_data.shape:
+                raise ValueError(
+                    "SASP Star Stretch output shape mismatch: "
+                    f"{restored.shape} != {source_data.shape}"
+                )
+            if not np.all(np.isfinite(restored)):
+                raise ValueError("SASP Star Stretch returned nonfinite pixels")
+            if float(np.max(np.abs(restored.astype(np.float32) - source_data))) <= 1e-7:
+                raise RuntimeError("SASP Star Stretch produced no pixel change")
+            _stage9_sasp_write_pixels(pipeline, restored)
+            return engine, input_layout
+
+        engine, input_layout = _stage9_sasp_run_with_lock(pipeline, _run_with_pixels)
+        label = "SASP Star Stretch API"
+        report.update(
+            {
+                "status": "applied",
+                "implementation": label,
+                "engine": engine,
+                "input_layout": input_layout,
+            }
+        )
+        if kernel_fallback_reason:
+            report["kernel_fallback_reason"] = kernel_fallback_reason
+        pipeline.workflow_command_used["SASP Star Stretch"] = label
+        pipeline._stage9_sasp_star_stretch_report = report
+        pipeline.log.info(
+            "SASP Star Stretch API applied "
+            f"(amount={amount:.2f}, engine={engine})"
+        )
+        return label
+    except (CommandError, SirilError, OSError, RuntimeError, TypeError, ValueError) as e:
+        reason = _stage9_sasp_short_text(pipeline, e)
+        rollback_error = _stage9_sasp_restore_source(pipeline, source_data)
+        report.update({"status": "failed_rolled_back", "reason": reason})
+        if rollback_error:
+            report["rollback_error"] = rollback_error
+        pipeline._last_sasp_star_stretch_error = reason
+        pipeline._stage9_sasp_star_stretch_report = report
+        pipeline.log.warn(f"SASP Star Stretch API failed: {reason}")
+        return None
+
+
+def run_nb_to_rgb_stars_api(pipeline):
+    """Apply the headless NB-to-RGB Stars composition on confirmed Ha/OIII data."""
+    enabled = bool(getattr(pipeline.cfg, "stage9_nb_to_rgb_stars_enabled", True))
+    ratio = _clamp_float(
+        getattr(pipeline.cfg, "stage9_nb_to_rgb_stars_ratio", 0.30),
+        0.0,
+        1.0,
+    )
+    mapping, mapping_source = _stage9_sasp_mapping(pipeline)
+    confidence_min = _clamp_float(
+        getattr(pipeline.cfg, "stage4_nbn_mapping_confidence_min", 0.85),
+        0.70,
+        0.99,
+    )
+    report: Dict[str, Any] = {
+        "schema": "starun.stage9-nb-to-rgb-stars.v1",
+        "status": "not_run",
+        "enabled": enabled,
+        "ratio": ratio,
+        "mapping_source": mapping_source,
+        "mapping_confidence_min": confidence_min,
+        # The SASP tool's optional nonlinear stretch is intentionally left to
+        # the following SASP Star Stretch step, so Stage 9 has one auditable
+        # nonlinear star-layer transform.
+        "star_stretch_applied": False,
+        "scnr_applied": False,
+    }
+    pipeline._last_nb_to_rgb_stars_error = None
+    if not enabled:
+        report.update({"status": "disabled", "reason": "configuration_disabled"})
+        pipeline._stage9_nb_to_rgb_stars_report = report
+        return None
+    if str(getattr(pipeline, "_channel_semantics", "")) != "narrowband_composite":
+        report.update(
+            {
+                "status": "skipped",
+                "reason": "channel_semantics_not_narrowband_composite",
+            }
+        )
+        pipeline._stage9_nb_to_rgb_stars_report = report
+        return None
+
+    validation = validate_narrowband_channel_mapping(
+        mapping,
+        confidence_min=confidence_min,
+    )
+    report["mapping_validation"] = validation
+    if not bool(validation.get("valid", False)):
+        report.update(
+            {
+                "status": "skipped",
+                "reason": "ha_oiii_mapping_unconfirmed",
+            }
+        )
+        pipeline._stage9_nb_to_rgb_stars_report = report
+        return None
+
+    finder = getattr(pipeline, "_find_latest_sasp_wheel", None)
+    wheel_path = finder() if callable(finder) else find_latest_sasp_wheel(pipeline)
+    if wheel_path is None:
+        reason = "setiastrosuitepro wheel not found in plugin downloads"
+        report.update({"status": "skipped", "reason": reason})
+        pipeline._last_nb_to_rgb_stars_error = reason
+        pipeline._stage9_nb_to_rgb_stars_report = report
+        pipeline.log.warn(f"NB to RGB Stars API unavailable: {reason}")
+        return None
+
+    report["wheel"] = wheel_path.name
+    source_data = None
+    try:
+        def _run_with_pixels() -> str:
+            nonlocal source_data
+            image_data = pipeline.siril.get_image_pixeldata(preview=False)
+            if image_data is None:
+                raise RuntimeError("image buffer is empty")
+            source_data = np.array(image_data, copy=True)
+            input_image, input_layout, input_dtype, scale_back = (
+                prepare_stage8_sasp_input(pipeline, source_data)
+            )
+            if input_layout == "mono" or input_image.ndim != 3 or input_image.shape[2] != 3:
+                raise ValueError("NB to RGB Stars requires a three-channel star layer")
+            if not np.all(np.isfinite(input_image)):
+                raise ValueError("star layer contains nonfinite pixels")
+
+            # Compatibility formula from SASP NBtoRGBStars._combine_nb_rgb:
+            # H=R, O=(G+B)/2 and no independent SII uses SII=Ha.
+            ha = input_image[:, :, 0]
+            oiii = (input_image[:, :, 1] + input_image[:, :, 2]) * 0.50
+            red = ha
+            green = ratio * ha + (1.0 - ratio) * oiii
+            blue = oiii
+            output_image = np.stack((red, green, blue), axis=2)
+            output_image = np.clip(output_image, 0.0, 1.0).astype(np.float32)
+            restored = restore_stage8_sasp_output(
+                pipeline,
+                output_image,
+                input_layout,
+                input_dtype,
+                scale_back,
+            )
+            if restored.shape != source_data.shape:
+                raise ValueError(
+                    "NB to RGB Stars output shape mismatch: "
+                    f"{restored.shape} != {source_data.shape}"
+                )
+            if not np.all(np.isfinite(restored)):
+                raise ValueError("NB to RGB Stars returned nonfinite pixels")
+            if float(np.max(np.abs(restored.astype(np.float32) - source_data))) <= 1e-7:
+                raise RuntimeError("NB to RGB Stars produced no pixel change")
+            _stage9_sasp_write_pixels(pipeline, restored)
+            return input_layout
+
+        input_layout = _stage9_sasp_run_with_lock(pipeline, _run_with_pixels)
+        label = "NB to RGB Stars API"
+        report.update(
+            {
+                "status": "applied",
+                "implementation": label,
+                "input_layout": input_layout,
+                "source_channels": {"ha": "R", "oiii": ["G", "B"], "sii": "Ha"},
+            }
+        )
+        pipeline.workflow_command_used["NB to RGB Stars"] = label
+        pipeline._stage9_nb_to_rgb_stars_report = report
+        pipeline.log.info(
+            "NB to RGB Stars API applied "
+            f"(Ha:OIII={ratio:.2f}, mapping={mapping_source})"
+        )
+        return label
+    except (CommandError, SirilError, OSError, RuntimeError, TypeError, ValueError) as e:
+        reason = _stage9_sasp_short_text(pipeline, e)
+        rollback_error = _stage9_sasp_restore_source(pipeline, source_data)
+        report.update({"status": "failed_rolled_back", "reason": reason})
+        if rollback_error:
+            report["rollback_error"] = rollback_error
+        pipeline._last_nb_to_rgb_stars_error = reason
+        pipeline._stage9_nb_to_rgb_stars_report = report
+        pipeline.log.warn(f"NB to RGB Stars API failed: {reason}")
+        return None
+
 def run_sasp_stage8_api(pipeline, plan: Optional[Dict[str, Any]] = None):
     pipeline._last_sasp_stage8_error = None
     module = pipeline._load_sasp_stage8_module()
@@ -696,6 +1170,9 @@ def run_sasp_stage8_api(pipeline, plan: Optional[Dict[str, Any]] = None):
                 "mask_gamma_upper": gamma_upper,
             }
             pipeline._last_stage8_masked_diagnostics = diagnostics
+            pipeline._stage8_saturation_execution = dict(
+                diagnostics.get("saturation_execution") or {}
+            )
             for message in messages:
                 pipeline.log.info(message)
             pipeline.siril.set_image_pixeldata(blended)

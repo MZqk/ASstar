@@ -1,4 +1,4 @@
-"""Image feature and quality metrics for the Seestar pipeline."""
+"""Image feature and quality metrics for the Starun pipeline."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from models import ImageFeatures, QualityMetrics
+from stage3_contract import STAGE3_MIN_TARGET_SKY_PLANE_SAMPLES
 
 
 def _clamp_float(value: float, lower: float, upper: float) -> float:
@@ -437,7 +438,10 @@ def measure_stage3_signal_preservation(
             flux_systematic_rms = float(np.hypot(before_sky_rms, after_sky_rms))
 
             def fit_heldout_sky_plane(gray: np.ndarray) -> Optional[Dict[str, Any]]:
-                if not sky_points or len(sky_points) < 6:
+                if (
+                    not sky_points
+                    or len(sky_points) < STAGE3_MIN_TARGET_SKY_PLANE_SAMPLES
+                ):
                     return None
                 analysis_height, analysis_width = gray.shape
                 radius_scale = min(
@@ -481,7 +485,7 @@ def measure_stage3_signal_preservation(
                             mad,
                         )
                     )
-                if len(records) < 6:
+                if len(records) < STAGE3_MIN_TARGET_SKY_PLANE_SAMPLES:
                     return None
                 design = np.asarray(
                     [[1.0, record[0], record[1]] for record in records],

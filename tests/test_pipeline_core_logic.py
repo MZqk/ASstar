@@ -13,7 +13,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PIPELINE_DIR = REPO_ROOT / "pipeline"
-PIPELINE_MODULE_PATH = PIPELINE_DIR / "seestar_Superimpose.py"
+PIPELINE_MODULE_PATH = PIPELINE_DIR / "starun.py"
 if str(PIPELINE_DIR) not in sys.path:
     sys.path.insert(0, str(PIPELINE_DIR))
 
@@ -58,7 +58,7 @@ def _install_sirilpy_stub() -> None:
 def _load_pipeline_module() -> Any:
     _install_sirilpy_stub()
     spec = importlib.util.spec_from_file_location(
-        "seestar_pipeline_core_test_module",
+        "starun_pipeline_core_test_module",
         PIPELINE_MODULE_PATH,
     )
     if spec is None or spec.loader is None:
@@ -86,34 +86,28 @@ class ClampConfigTests(unittest.TestCase):
 
     def test_clamps_low_values_and_preserves_input(self) -> None:
         cfg = pipeline.PipelineConfig()
-        cfg.crop_margin = -1.0
+        cfg.stage2_base_crop_margin = -1.0
         cfg.stage2_center_protect_area_ratio = -1.0
         cfg.bg_samples = -100
         cfg.denoise_mod = -1.0
         cfg.stage5_rl_psf_kernel_size = 2
         cfg.stage7_edge_black_warn = -1.0
         cfg.stage7_edge_black_high = -1.0
-        cfg.stage7_conservative_asinh_stretch = -1.0
-        cfg.stage7_ultra_conservative_asinh_stretch = -1.0
-        cfg.stage7_soft_starless_asinh_stretch = -1.0
 
         tuned = pipeline.clamp_config(cfg)
 
-        self.assertEqual(cfg.crop_margin, -1.0)
-        self.assertEqual(tuned.crop_margin, 0.0)
+        self.assertEqual(cfg.stage2_base_crop_margin, -1.0)
+        self.assertEqual(tuned.stage2_base_crop_margin, 0.0)
         self.assertEqual(tuned.stage2_center_protect_area_ratio, 0.50)
         self.assertEqual(tuned.bg_samples, 12)
         self.assertEqual(tuned.denoise_mod, 0.2)
         self.assertEqual(tuned.stage5_rl_psf_kernel_size, 9)
         self.assertEqual(tuned.stage7_edge_black_warn, 0.04)
         self.assertEqual(tuned.stage7_edge_black_high, 0.04)
-        self.assertEqual(tuned.stage7_conservative_asinh_stretch, 1.6)
-        self.assertEqual(tuned.stage7_ultra_conservative_asinh_stretch, 1.2)
-        self.assertEqual(tuned.stage7_soft_starless_asinh_stretch, 1.05)
 
     def test_clamps_high_values_and_enforces_related_limits(self) -> None:
         cfg = pipeline.PipelineConfig()
-        cfg.crop_margin = 1.0
+        cfg.stage2_base_crop_margin = 1.0
         cfg.stage2_center_protect_area_ratio = 1.0
         cfg.bg_samples = 100
         cfg.denoise_safety_max = 0.40
@@ -121,24 +115,19 @@ class ClampConfigTests(unittest.TestCase):
         cfg.stage5_rl_psf_kernel_size = 98
         cfg.stage7_edge_black_warn = 0.20
         cfg.stage7_edge_black_high = 0.10
-        cfg.stage7_conservative_asinh_stretch = 2.2
-        cfg.stage7_ultra_conservative_asinh_stretch = 3.0
-        cfg.stage7_soft_starless_asinh_stretch = 3.0
 
         tuned = pipeline.clamp_config(cfg)
 
-        self.assertEqual(tuned.crop_margin, 0.06)
+        self.assertEqual(tuned.stage2_base_crop_margin, 0.06)
         self.assertEqual(tuned.stage2_center_protect_area_ratio, 0.95)
         self.assertEqual(tuned.bg_samples, 32)
         self.assertEqual(tuned.denoise_mod, 0.40)
         self.assertEqual(tuned.stage5_rl_psf_kernel_size, 99)
         self.assertEqual(tuned.stage7_edge_black_high, 0.20)
-        self.assertEqual(tuned.stage7_ultra_conservative_asinh_stretch, 2.2)
-        self.assertEqual(tuned.stage7_soft_starless_asinh_stretch, 2.2)
 
     def test_exact_boundary_values_are_stable(self) -> None:
         cfg = pipeline.PipelineConfig(
-            crop_margin=0.06,
+            stage2_base_crop_margin=0.06,
             bg_samples=12,
             bg_tolerance=1.8,
             stage5_rl_psf_kernel_size=99,
@@ -149,7 +138,7 @@ class ClampConfigTests(unittest.TestCase):
 
         tuned = pipeline.clamp_config(cfg)
 
-        self.assertEqual(tuned.crop_margin, 0.06)
+        self.assertEqual(tuned.stage2_base_crop_margin, 0.06)
         self.assertEqual(tuned.bg_samples, 12)
         self.assertEqual(tuned.bg_tolerance, 1.8)
         self.assertEqual(tuned.stage5_rl_psf_kernel_size, 99)
@@ -161,6 +150,7 @@ class ClampConfigTests(unittest.TestCase):
 class AutoTuneConfigTests(unittest.TestCase):
     def test_feature_formula_derivation(self) -> None:
         cfg = pipeline.PipelineConfig()
+        self.assertEqual(cfg.star_intensity, 1.05)
         features = pipeline.ImageFeatures(
             bg_std=0.05,
             star_density=0.005,
@@ -178,7 +168,7 @@ class AutoTuneConfigTests(unittest.TestCase):
             features,
         )
 
-        self.assertAlmostEqual(tuned.crop_margin, 0.025)
+        self.assertAlmostEqual(tuned.stage2_base_crop_margin, 0.025)
         self.assertEqual(tuned.bg_samples, 25)
         self.assertAlmostEqual(tuned.bg_tolerance, 0.875)
         self.assertAlmostEqual(tuned.bg_smooth, 0.69)
@@ -190,11 +180,15 @@ class AutoTuneConfigTests(unittest.TestCase):
         self.assertAlmostEqual(tuned.ghs_stretchamount, 1.85)
         self.assertAlmostEqual(tuned.nebula_saturation, 0.212)
         self.assertAlmostEqual(tuned.star_intensity, 0.972)
-        self.assertAlmostEqual(tuned.star_fallback_intensity, 0.912)
+        self.assertLess(tuned.star_intensity, cfg.star_intensity)
+        self.assertAlmostEqual(tuned.stage9_fallback_intensity_cap, 0.912)
         self.assertAlmostEqual(tuned.final_saturation, 0.082)
         self.assertEqual(result.target_type, pipeline.TargetType.GALAXY)
         reasons = {name: reason for name, _old, _new, reason in result.changed_params}
-        self.assertEqual(reasons["crop_margin"], "feature_formula:crop_margin")
+        self.assertEqual(
+            reasons["stage2_base_crop_margin"],
+            "feature_formula:stage2_base_crop_margin",
+        )
         self.assertEqual(reasons["final_saturation"], "feature_formula:final_saturation")
 
     def test_extreme_features_are_safely_clamped(self) -> None:
@@ -213,11 +207,54 @@ class AutoTuneConfigTests(unittest.TestCase):
             ),
         )
 
-        self.assertLessEqual(tuned.crop_margin, 0.06)
+        self.assertLessEqual(tuned.stage2_base_crop_margin, 0.06)
         self.assertGreaterEqual(tuned.bg_samples, 12)
         self.assertLessEqual(tuned.denoise_mod, tuned.denoise_safety_max)
         self.assertLessEqual(tuned.star_intensity, 1.05)
         self.assertIn("UNKNOWN", " ".join(result.notes))
+
+    def test_safety_clamp_audit_covers_runtime_and_psf_fields(self) -> None:
+        cfg = pipeline.PipelineConfig(
+            max_retries=99,
+            retry_delay=99.0,
+            stage1_register_fail_ratio_max=2.0,
+            stage9_psf_recovery_target_min=-1.0,
+            stage9_psf_recovery_target_max=99.0,
+        )
+
+        _tuned, result = pipeline.auto_tune_config(
+            cfg,
+            pipeline.TargetType.UNKNOWN,
+            pipeline.ImageFeatures(),
+        )
+
+        audit = {
+            name: (old, new, reason)
+            for name, old, new, reason in result.changed_params
+            if reason == "safety_clamp"
+        }
+        expected = {
+            "max_retries",
+            "retry_delay",
+            "stage1_register_fail_ratio_max",
+            "stage9_psf_recovery_target_min",
+            "stage9_psf_recovery_target_max",
+        }
+        self.assertTrue(expected.issubset(audit))
+        self.assertEqual(audit["max_retries"], (99, 3, "safety_clamp"))
+        self.assertEqual(audit["retry_delay"], (99.0, 10.0, "safety_clamp"))
+        self.assertEqual(
+            audit["stage1_register_fail_ratio_max"],
+            (2.0, 0.5, "safety_clamp"),
+        )
+        self.assertEqual(
+            audit["stage9_psf_recovery_target_min"],
+            (-1.0, 0.5, "safety_clamp"),
+        )
+        self.assertEqual(
+            audit["stage9_psf_recovery_target_max"],
+            (99.0, 1.5, "safety_clamp"),
+        )
 
 
 class TargetMatchingTests(unittest.TestCase):

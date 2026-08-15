@@ -72,7 +72,7 @@ def collect_output_records(
     durable_names = {
         "processing-plan.json",
         "result_linear.fit",
-        "seestar_diagnostics.zip",
+        "starun_diagnostics.zip",
     }
     outputs: Dict[str, Dict[str, Any]] = {}
     for path in sorted(work_dir.iterdir(), key=lambda item: item.name):
@@ -86,7 +86,7 @@ def collect_output_records(
         if exported_after is None:
             selected = (
                 lower_name.startswith("result_")
-                or lower_name.startswith("seestar_diagnostics")
+                or lower_name.startswith("starun_diagnostics")
                 or lower_name.startswith("processing-plan")
             )
         else:
@@ -167,66 +167,3 @@ def load_json(path: Path) -> Optional[Dict[str, Any]]:
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return None
     return payload if isinstance(payload, dict) else None
-
-
-def verify_resume_provenance(
-    *,
-    work_dir: Path,
-    input_path: Path,
-    checkpoint_name: str,
-) -> Dict[str, Any]:
-    """Verify a resume checkpoint against the previous durable result manifest."""
-    manifest_path = work_dir / "pipeline-result.json"
-    manifest = load_json(manifest_path)
-    actual_hash = sha256_file(input_path)
-    result: Dict[str, Any] = {
-        "verified": False,
-        "state": "unknown",
-        "checkpoint": checkpoint_name,
-        "input_path": str(input_path),
-        "manifest_path": str(manifest_path),
-        "actual_sha256": actual_hash,
-    }
-    if manifest is None:
-        result["detail"] = "pipeline-result.json is missing or invalid"
-        return result
-    if str(manifest.get("schema") or "") != "seestar.pipeline-result.v1":
-        result["detail"] = "unsupported pipeline-result schema"
-        return result
-    expected_manifest_hash = str(manifest.get("manifest_hash") or "")
-    unsigned_manifest = dict(manifest)
-    unsigned_manifest.pop("manifest_hash", None)
-    actual_manifest_hash = canonical_payload_hash(unsigned_manifest)
-    result["manifest_hash"] = expected_manifest_hash or None
-    if not expected_manifest_hash or actual_manifest_hash != expected_manifest_hash:
-        result["detail"] = "pipeline-result manifest hash is missing or invalid"
-        return result
-    checkpoints = manifest.get("checkpoints")
-    if not isinstance(checkpoints, Mapping):
-        result["detail"] = "manifest has no checkpoint provenance"
-        return result
-    expected = checkpoints.get(checkpoint_name)
-    if not isinstance(expected, Mapping):
-        result["detail"] = f"manifest has no {checkpoint_name} checkpoint"
-        return result
-    expected_hash = str(expected.get("sha256") or "")
-    expected_state = str(expected.get("state") or "unknown").strip().lower()
-    expected_path = Path(str(expected.get("path") or "")).name
-    result["expected_sha256"] = expected_hash or None
-    result["state"] = expected_state
-    if expected_path and expected_path != input_path.name:
-        result["detail"] = "checkpoint filename does not match manifest"
-        return result
-    if not actual_hash or not expected_hash:
-        result["detail"] = "checkpoint hash is unavailable"
-        return result
-    if actual_hash != expected_hash:
-        result["detail"] = "checkpoint SHA-256 does not match manifest"
-        return result
-    if expected_state != "linear":
-        result["detail"] = f"manifest checkpoint state is {expected_state}, not linear"
-        return result
-    result["verified"] = True
-    result["detail"] = "checkpoint SHA-256 and linear state match pipeline-result.json"
-    result["plan_hash"] = manifest.get("plan_hash")
-    return result

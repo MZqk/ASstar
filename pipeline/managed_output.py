@@ -10,8 +10,11 @@ from typing import Any, Dict, Iterable, Optional
 import numpy as np
 
 
-MANAGED_OUTPUT_SCHEMA = "seestar.managed-output.v1"
+MANAGED_OUTPUT_SCHEMA = "starun.managed-output.v1"
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_DISPLAY_LUMA_WEIGHTS = np.asarray((0.2126, 0.7152, 0.0722), dtype=np.float32)
+_GALAXY_TARGET_TYPES = frozenset({"galaxy", "large_galaxy", "small_galaxy"})
+_DIFFUSE_TARGET_MARKERS = ("galaxy", "nebula", "milky_way")
 _SRGB_PROFILE_CANDIDATES = (
     Path("/System/Library/ColorSync/Profiles/sRGB Profile.icc"),
     Path("/Library/ColorSync/Profiles/sRGB Profile.icc"),
@@ -51,12 +54,17 @@ def _png_chunk(tag: bytes, payload: bytes) -> bytes:
     )
 
 
-def write_managed_display_png(path: Path, image: Any) -> Path:
-    """Write a 16-bit RGB PNG with explicit sRGB transfer/chromaticity metadata."""
+def _write_display_rgb_png(path: Path, rgb: np.ndarray) -> Path:
+    """Write already top-down display RGB into the managed PNG container."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(target.name + ".tmp")
-    rgb = _as_display_rgb(image)
+    rgb = np.asarray(rgb, dtype=np.float32)
+    if rgb.ndim != 3 or rgb.shape[0] != 3:
+        raise ValueError(f"expected RGB CHW array, got shape={rgb.shape}")
+    if not np.all(np.isfinite(rgb)):
+        raise ValueError("nonfinite managed-display pixels")
+    rgb = np.clip(rgb, 0.0, 1.0)
     height, width = int(rgb.shape[1]), int(rgb.shape[2])
     pixels = np.transpose(
         np.round(rgb * 65535.0).astype(">u2"),
@@ -117,6 +125,337 @@ def write_managed_display_png(path: Path, image: Any) -> Path:
     return target
 
 
+def write_managed_display_png(path: Path, image: Any) -> Path:
+    """Write a 16-bit RGB PNG with explicit sRGB transfer/chromaticity metadata."""
+    return _write_display_rgb_png(Path(path), _as_display_rgb(image))
+
+
+def _read_managed_display_png(path: Path) -> np.ndarray:
+    """Decode exact pixels from a PNG emitted by ``_write_display_rgb_png``."""
+    target = Path(path)
+    idat = bytearray()
+    width = height = bit_depth = color_type = None
+    with target.open("rb") as handle:
+        if handle.read(8) != _PNG_SIGNATURE:
+            raise ValueError("invalid managed PNG signature")
+        while True:
+            header = handle.read(8)
+            if len(header) != 8:
+                raise ValueError("truncated managed PNG chunk header")
+            length, tag = struct.unpack(">I4s", header)
+            payload = handle.read(length)
+            checksum = handle.read(4)
+            if len(payload) != length or len(checksum) != 4:
+                raise ValueError("truncated managed PNG chunk")
+            expected_crc = zlib.crc32(tag)
+            expected_crc = zlib.crc32(payload, expected_crc) & 0xFFFFFFFF
+            if struct.unpack(">I", checksum)[0] != expected_crc:
+                raise ValueError("managed PNG chunk CRC mismatch")
+            if tag == b"IHDR":
+                if len(payload) != 13:
+                    raise ValueError("invalid managed PNG IHDR")
+                width, height, bit_depth, color_type, compression, filtering, interlace = (
+                    struct.unpack(">IIBBBBB", payload)
+                )
+                if (compression, filtering, interlace) != (0, 0, 0):
+                    raise ValueError("unsupported managed PNG encoding")
+            elif tag == b"IDAT":
+                idat.extend(payload)
+            elif tag == b"IEND":
+                break
+    if not width or not height or bit_depth != 16 or color_type != 2:
+        raise ValueError("managed PNG is not non-interlaced 16-bit RGB")
+    try:
+        raw = zlib.decompress(bytes(idat))
+    except zlib.error as error:
+        raise ValueError(f"managed PNG IDAT decode failed: {error}") from error
+    row_bytes = int(width) * 3 * 2
+    expected_size = int(height) * (row_bytes + 1)
+    if len(raw) != expected_size:
+        raise ValueError(
+            f"managed PNG pixel length mismatch: {len(raw)} != {expected_size}"
+        )
+    rows = []
+    for row_index in range(int(height)):
+        offset = row_index * (row_bytes + 1)
+        if raw[offset] != 0:
+            raise ValueError("managed PNG uses an unexpected row filter")
+        rows.append(raw[offset + 1 : offset + 1 + row_bytes])
+    pixels = np.frombuffer(b"".join(rows), dtype=">u2").reshape(
+        int(height),
+        int(width),
+        3,
+    )
+    return np.transpose(pixels.astype(np.float32) / 65535.0, (2, 0, 1))
+
+
+def _box_blur_gray(gray: np.ndarray) -> np.ndarray:
+    arr = np.asarray(gray, dtype=np.float32)
+    height, width = arr.shape
+    padded = np.pad(arr, ((1, 1), (1, 1)), mode="reflect")
+    result = np.zeros_like(arr, dtype=np.float32)
+    for y_offset in range(3):
+        for x_offset in range(3):
+            result += padded[
+                y_offset : y_offset + height,
+                x_offset : x_offset + width,
+            ]
+    return result / np.float32(9.0)
+
+
+def _pooled_gray(
+    gray: np.ndarray,
+    *,
+    max_side: int,
+    reducer: str,
+) -> np.ndarray:
+    """Bound visibility checks while retaining either diffuse flux or star peaks."""
+    arr = np.asarray(gray, dtype=np.float32)
+    height, width = arr.shape
+    step = max(1, int(np.ceil(max(height, width) / float(max_side))))
+    if step == 1:
+        return arr
+    pooled_height = height // step
+    pooled_width = width // step
+    if pooled_height < 3 or pooled_width < 3:
+        return arr[::step, ::step]
+    blocks = arr[
+        : pooled_height * step,
+        : pooled_width * step,
+    ].reshape(pooled_height, step, pooled_width, step)
+    if reducer == "max":
+        return np.max(blocks, axis=(1, 3))
+    return np.mean(blocks, axis=(1, 3), dtype=np.float32)
+
+
+def _display_luminance(rgb: np.ndarray) -> np.ndarray:
+    return np.sum(
+        np.asarray(rgb, dtype=np.float32) * _DISPLAY_LUMA_WEIGHTS[:, None, None],
+        axis=0,
+        dtype=np.float32,
+    )
+
+
+def _rounded(value: float) -> float:
+    return round(float(value), 6)
+
+
+def audit_display_visibility(
+    rgb: np.ndarray,
+    *,
+    target_type: str = "",
+    stars_required: bool = False,
+) -> Dict[str, Any]:
+    """Measure whether encoded display pixels are bright and astronomically legible."""
+    arr = np.asarray(rgb, dtype=np.float32)
+    if arr.ndim != 3 or arr.shape[0] != 3 or arr.size == 0:
+        raise ValueError(f"expected non-empty RGB CHW array, got shape={arr.shape}")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("nonfinite display-audit pixels")
+    arr = np.clip(arr, 0.0, 1.0)
+    luminance = _display_luminance(arr)
+    p01, p10, median, p90, p99, p999 = np.quantile(
+        luminance,
+        (0.01, 0.10, 0.50, 0.90, 0.99, 0.999),
+    )
+    channel_medians = np.median(arr, axis=(1, 2))
+    black_ratio = float(np.mean(luminance <= 0.01))
+    white_ratio = float(np.mean(np.max(arr, axis=0) >= 0.995))
+    display_range = float(p99 - p10)
+    sparse_signal_range = float(p999 - p10)
+
+    broad = _pooled_gray(luminance, max_side=512, reducer="mean")
+    blur_iterations = max(2, min(8, int(min(broad.shape) // 16)))
+    for _ in range(blur_iterations):
+        broad = _box_blur_gray(broad)
+    broad_bg, broad_p95, broad_p99 = np.quantile(broad, (0.20, 0.95, 0.99))
+    broad_contrast_p95 = float(broad_p95 - broad_bg)
+    broad_contrast_p99 = float(broad_p99 - broad_bg)
+    broad_signal_floor = max(0.025, broad_contrast_p99 * 0.25)
+    broad_signal_coverage = float(np.mean(broad > broad_bg + broad_signal_floor))
+
+    star_map = _pooled_gray(luminance, max_side=1600, reducer="max")
+    star_blur = _box_blur_gray(star_map)
+    high_pass = star_map - star_blur
+    high_pass_center = float(np.median(high_pass))
+    high_pass_mad = float(np.median(np.abs(high_pass - high_pass_center)))
+    bright_floor = max(
+        float(np.quantile(star_map, 0.985)),
+        float(np.median(star_map)) + 0.06,
+    )
+    peak_contrast_floor = max(0.015, high_pass_mad * 6.0)
+    peak_count = 0
+    peak_luminance_median = 0.0
+    peak_contrast_median = 0.0
+    if min(star_map.shape) >= 3:
+        center = star_map[1:-1, 1:-1]
+        center_high_pass = high_pass[1:-1, 1:-1]
+        neighbor_max = np.maximum.reduce(
+            [
+                star_map[:-2, :-2],
+                star_map[:-2, 1:-1],
+                star_map[:-2, 2:],
+                star_map[1:-1, :-2],
+                star_map[1:-1, 2:],
+                star_map[2:, :-2],
+                star_map[2:, 1:-1],
+                star_map[2:, 2:],
+            ]
+        )
+        peak_mask = (
+            (center >= neighbor_max)
+            & (center >= bright_floor)
+            & (center_high_pass >= peak_contrast_floor)
+        )
+        peak_count = int(np.count_nonzero(peak_mask))
+        if peak_count:
+            peak_luminance_median = float(np.median(center[peak_mask]))
+            peak_contrast_median = float(np.median(center_high_pass[peak_mask]))
+
+    target = str(target_type or "").strip().lower()
+    galaxy_required = target in _GALAXY_TARGET_TYPES
+    extended_required = galaxy_required or any(
+        marker in target for marker in _DIFFUSE_TARGET_MARKERS
+    )
+    extended_passed = bool(
+        max(broad_contrast_p95, broad_contrast_p99) >= 0.04
+        and broad_signal_coverage >= 0.003
+    )
+    star_passed = bool(
+        peak_count >= 3
+        and peak_luminance_median >= 0.20
+        and peak_contrast_median >= 0.015
+    )
+    scene_content_visible = bool(
+        sparse_signal_range >= 0.08
+        or extended_passed
+        or star_passed
+    )
+    brightness_passed = bool(
+        median >= 0.10
+        and p90 >= 0.18
+        and scene_content_visible
+        and black_ratio <= 0.80
+        and white_ratio <= 0.20
+    )
+    checks: Dict[str, Dict[str, Any]] = {
+        "pixel_brightness": {
+            "required": True,
+            "passed": brightness_passed,
+            "thresholds": {
+                "luminance_median_min": 0.10,
+                "luminance_p90_min": 0.18,
+                "visible_scene_required": True,
+                "sparse_signal_p999_minus_p10_min": 0.08,
+                "black_pixel_ratio_max": 0.80,
+                "white_clip_ratio_max": 0.20,
+            },
+        },
+        "galaxy_visibility": {
+            "required": galaxy_required,
+            "passed": extended_passed if galaxy_required else None,
+            "thresholds": {
+                "broad_signal_contrast_min": 0.04,
+                "broad_signal_coverage_min": 0.003,
+            },
+        },
+        "extended_subject_visibility": {
+            "required": extended_required and not galaxy_required,
+            "passed": (
+                extended_passed
+                if extended_required and not galaxy_required
+                else None
+            ),
+            "thresholds": {
+                "broad_signal_contrast_min": 0.04,
+                "broad_signal_coverage_min": 0.003,
+            },
+        },
+        "star_visibility": {
+            "required": bool(stars_required),
+            "passed": star_passed if stars_required else None,
+            "detected": star_passed,
+            "thresholds": {
+                "compact_peak_count_min": 3,
+                "peak_luminance_median_min": 0.20,
+                "peak_contrast_median_min": 0.015,
+            },
+        },
+    }
+    failed_checks = [
+        name
+        for name, check in checks.items()
+        if bool(check.get("required")) and check.get("passed") is not True
+    ]
+    return {
+        "schema": "starun.display-visibility.v1",
+        "status": "passed" if not failed_checks else "failed",
+        "passed": not failed_checks,
+        "target_type": target or "unknown",
+        "stars_required": bool(stars_required),
+        "metrics": {
+            "red_median": _rounded(channel_medians[0]),
+            "green_median": _rounded(channel_medians[1]),
+            "blue_median": _rounded(channel_medians[2]),
+            "luminance_p01": _rounded(p01),
+            "luminance_p10": _rounded(p10),
+            "luminance_median": _rounded(median),
+            "luminance_p90": _rounded(p90),
+            "luminance_p99": _rounded(p99),
+            "luminance_p999": _rounded(p999),
+            "p99_minus_p10": _rounded(display_range),
+            "p999_minus_p10": _rounded(sparse_signal_range),
+            "scene_content_visible": scene_content_visible,
+            "black_pixel_ratio": _rounded(black_ratio),
+            "white_clip_ratio": _rounded(white_ratio),
+            "broad_signal_contrast_p95": _rounded(broad_contrast_p95),
+            "broad_signal_contrast_p99": _rounded(broad_contrast_p99),
+            "broad_signal_coverage": _rounded(broad_signal_coverage),
+            "compact_peak_count": peak_count,
+            "peak_luminance_median": _rounded(peak_luminance_median),
+            "peak_contrast_median": _rounded(peak_contrast_median),
+            "peak_contrast_floor": _rounded(peak_contrast_floor),
+        },
+        "checks": checks,
+        "failed_checks": failed_checks,
+    }
+
+
+def _linked_visibility_stretch(rgb: np.ndarray) -> tuple[np.ndarray, Dict[str, Any]]:
+    """Apply a linked observer-only mapping comparable to review previews."""
+    arr = np.asarray(rgb, dtype=np.float32)
+    luminance = _display_luminance(arr)
+    median = float(np.median(luminance))
+    luminance_mad = float(np.median(np.abs(luminance - median)))
+    percentile_high = float(np.quantile(luminance, 0.995))
+    high_floor = median + max(6.0 * luminance_mad, 0.05)
+    high = max(percentile_high, high_floor, 1e-6)
+    normalized = np.clip(arr / high, 0.0, 1.0)
+    normalized_luminance = np.clip(luminance / high, 0.0, 1.0)
+    stretched_luminance = np.sqrt(normalized_luminance).astype(
+        np.float32,
+        copy=False,
+    )
+    gain = np.divide(
+        stretched_luminance,
+        normalized_luminance,
+        out=np.zeros_like(stretched_luminance),
+        where=normalized_luminance > 1e-7,
+    )
+    stretched = np.clip(normalized * gain[None, :, :], 0.0, 1.0)
+    return stretched, {
+        "name": "linked_review_visibility_stretch",
+        "observer_only": True,
+        "high_percentile": 0.995,
+        "high_point": _rounded(high),
+        "percentile_high_point": _rounded(percentile_high),
+        "minimum_high_point": _rounded(high_floor),
+        "luminance_gamma": 0.5,
+        "source_pixels_changed": False,
+        "derivative_pixels_changed": True,
+    }
+
+
 def _valid_icc_profile(data: bytes) -> bool:
     if len(data) < 128:
         return False
@@ -157,7 +496,7 @@ def write_managed_edit_tiff(
         np.round(rgb * 65535.0).astype("<u2"),
         (1, 2, 0),
     ).tobytes(order="C")
-    software = b"Seestar AstroSuite managed export\x00"
+    software = b"Starun AstroSuite managed export\x00"
 
     entry_count = 16
     external_offset = 8 + 2 + entry_count * 12 + 4
@@ -264,8 +603,10 @@ def export_managed_outputs(
     output_format: str,
     scientific_paths: Iterable[Path] = (),
     icc_profile_bytes: Optional[bytes] = None,
+    target_type: str = "",
+    stars_required: bool = False,
 ) -> Dict[str, Any]:
-    """Export independent display/edit assets and prove FITS files were untouched."""
+    """Export independently audited display/edit assets without touching FITS."""
     root = Path(work_dir)
     requested = _requested_formats(output_format)
     scientific = [Path(path) for path in scientific_paths]
@@ -276,24 +617,92 @@ def export_managed_outputs(
     }
     artifacts: list[Dict[str, Any]] = []
     issues: list[str] = []
+    display_visibility: Optional[Dict[str, Any]] = None
+    display_transform: Optional[Dict[str, Any]] = None
 
     if "png" in requested:
         display_path = root / f"{base_filename}_display_srgb.png"
+        wrote_display = False
         try:
-            write_managed_display_png(display_path, image)
-            artifacts.append(
-                {
-                    "role": "display",
-                    "path": str(display_path),
-                    "name": display_path.name,
-                    "format": "png",
-                    "bit_depth": 16,
-                    "color_space": "sRGB IEC61966-2.1",
-                    "profile_mechanism": "sRGB+gAMA+cHRM chunks",
-                    "status": "written",
-                }
+            # Never let a stale derivative from an earlier attempt satisfy the
+            # current run after a failed visibility audit.
+            display_path.unlink(missing_ok=True)
+            source_rgb = _as_display_rgb(image)
+            input_visibility = audit_display_visibility(
+                source_rgb,
+                target_type=target_type,
+                stars_required=stars_required,
             )
+            display_rgb = source_rgb
+            display_transform = {
+                "name": "preserve_accepted_nonlinear_rendering",
+                "observer_only": True,
+                "source_pixels_changed": False,
+                "derivative_pixels_changed": False,
+            }
+            if not bool(input_visibility.get("passed", False)):
+                display_rgb, display_transform = _linked_visibility_stretch(
+                    source_rgb
+                )
+            _write_display_rgb_png(display_path, display_rgb)
+            wrote_display = True
+            final_visibility = audit_display_visibility(
+                _read_managed_display_png(display_path),
+                target_type=target_type,
+                stars_required=stars_required,
+            )
+            final_visibility["source"] = "decoded_final_png"
+            final_visibility["path"] = str(display_path)
+            display_visibility = {
+                "status": final_visibility["status"],
+                "passed": bool(final_visibility["passed"]),
+                "input_pixels": input_visibility,
+                "final_png": final_visibility,
+                "transform": display_transform,
+            }
+            if not bool(final_visibility["passed"]):
+                display_path.unlink(missing_ok=True)
+                wrote_display = False
+                failed = ",".join(final_visibility.get("failed_checks") or [])
+                issues.append(
+                    "display_png_visibility_failed: "
+                    + (failed or "unknown_visibility_failure")
+                )
+                artifacts.append(
+                    {
+                        "role": "display",
+                        "path": str(display_path),
+                        "name": display_path.name,
+                        "format": "png",
+                        "status": "rejected_not_published",
+                        "reason": "final PNG pixel visibility audit failed",
+                        "visibility": final_visibility,
+                        "display_transform": display_transform,
+                    }
+                )
+            else:
+                artifacts.append(
+                    {
+                        "role": "display",
+                        "path": str(display_path),
+                        "name": display_path.name,
+                        "format": "png",
+                        "bit_depth": 16,
+                        "color_space": "sRGB IEC61966-2.1",
+                        "profile_mechanism": "sRGB+gAMA+cHRM chunks",
+                        "status": "written",
+                        "visibility": final_visibility,
+                        "display_transform": display_transform,
+                    }
+                )
         except (OSError, RuntimeError, TypeError, ValueError) as error:
+            if wrote_display:
+                display_path.unlink(missing_ok=True)
+            display_visibility = display_visibility or {
+                "status": "unavailable",
+                "passed": False,
+                "error": str(error),
+            }
             issues.append(f"display_png_failed: {error}")
 
     profile_source = None
@@ -357,10 +766,13 @@ def export_managed_outputs(
         "mode": "independent_managed_derivatives",
         "source_pixels": {
             "checkpoint": "stage10_final.fit",
-            "transform": "preserve_accepted_nonlinear_rendering",
+            "transform": "derivative_specific",
+            "display_transform": display_transform,
+            "editable_transform": "preserve_accepted_nonlinear_rendering",
             "orientation": "fits_bottom_up_to_display_top_down",
             "working_primaries_assumption": "sRGB",
         },
+        "display_visibility": display_visibility,
         "scientific_archive": {
             "policy": "never_rewrite",
             "hashes_before": hashes_before,
@@ -374,6 +786,7 @@ def export_managed_outputs(
 
 __all__ = [
     "MANAGED_OUTPUT_SCHEMA",
+    "audit_display_visibility",
     "export_managed_outputs",
     "find_srgb_icc_profile",
     "write_managed_display_png",

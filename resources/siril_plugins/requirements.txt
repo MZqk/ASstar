@@ -22,7 +22,24 @@ lz4>=4.4.5,<5
 zstandard>=0.25.0,<1
 exifread>=3.5.1,<4
 opencv-python-headless>=4.13.0.92,<5
+# Stage 2 first-party contour detector uses this directly and falls back to
+# its internal binary-mask rectangle implementation when import/calculation fails.
+largestinteriorrectangle>=0.2.1,<1
 requests>=2.34.2,<3
 setuptools>=81.0.0,<82
 wheel>=0.47.0,<1
 platformdirs>=4.10.0,<5
+# AutoBGE.py uses psutil to manage its worker process. Keep it bundled so
+# sirilpy never attempts an online install at runtime.
+psutil>=7.2.2,<8
+# Optional Siril scripts shipped in vendor/siril-scripts.  Keep these in the
+# offline runtime so their ensure_installed() hooks never need network access.
+matplotlib>=3.11.1,<4
+astroquery>=0.4.11,<1
+scikit-image>=0.26.0,<1
+photutils>=3.0.0,<4
+scikit-learn>=1.9.0,<2
+numba>=0.66.0,<1
+pandas>=3.0.5,<4
+qt-themes>=0.4.0,<1
+qtpy>=2.4.3,<3

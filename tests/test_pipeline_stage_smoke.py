@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import types
@@ -47,11 +48,11 @@ _install_sirilpy_stub()
 
 from models import (  # noqa: E402
     ImageFeatures,
-    PipelineCheckpoint,
     PipelineConfig,
     PipelineStage,
 )
 import stage9_quality  # noqa: E402
+import stage7_quality  # noqa: E402
 import stage7_stretch_metrics  # noqa: E402
 import stage7_repair  # noqa: E402
 import starmask_cleanup  # noqa: E402
@@ -62,8 +63,8 @@ from stages import (  # noqa: E402
     stage3_background_extraction,
     stage4_color_calibration,
     stage5_linear_denoise,
-    stage6_stretching,
-    stage7_star_separation,
+    stage7_stretching,
+    stage6_star_separation,
     stage8_nebula_enhancement,
     stage9_star_remixing,
 )
@@ -163,6 +164,14 @@ class PipelineStageTests(unittest.TestCase):
     def test_stage9_manual_like_defaults_are_ordered_and_support_safe(self):
         cfg = PipelineConfig()
 
+        self.assertEqual(cfg.star_intensity, 1.05)
+        self.assertEqual(cfg.stage9_psf_fwhm_ratio_min, 0.93)
+        self.assertEqual(cfg.stage9_psf_fwhm_ratio_max, 1.10)
+        self.assertEqual(cfg.stage9_psf_review_fwhm_ratio_max, 1.65)
+        self.assertEqual(cfg.stage9_psf_recovery_target_min, 0.97)
+        self.assertEqual(cfg.stage9_psf_recovery_target_max, 1.05)
+        self.assertEqual(cfg.stage9_psf_support_radius_max, 6)
+        self.assertEqual(cfg.stage9_psf_support_retry_pixels, 2)
         self.assertEqual(cfg.stage9_source_star_detail_percentile, 98.0)
         self.assertEqual(
             (
@@ -173,7 +182,7 @@ class PipelineStageTests(unittest.TestCase):
             ),
             (0.26, 0.50, 0.75, 0.90),
         )
-        self.assertEqual(cfg.stage9_weak_star_screen_intensity_min, 0.40)
+        self.assertEqual(cfg.stage9_weak_star_screen_intensity_min, 0.55)
         self.assertTrue(cfg.stage9_starmask_chroma_regularization_enabled)
         self.assertEqual(cfg.stage9_starmask_faint_chroma_max, 0.35)
         self.assertEqual(cfg.stage9_starmask_bright_chroma_max, 0.60)
@@ -187,21 +196,92 @@ class PipelineStageTests(unittest.TestCase):
         self.assertEqual(cfg.stage9_local_single_pixel_ratio_max, 0.20)
         self.assertEqual(cfg.stage9_local_cyan_blue_component_area_max, 64)
         self.assertEqual(cfg.stage9_core_color_jump_component_area_max, 64)
+        self.assertTrue(cfg.stage9_unscreen_candidate_enabled)
+        self.assertEqual(cfg.stage9_unscreen_denominator_floor, 0.08)
+        self.assertEqual(cfg.stage9_unscreen_reliable_support_min, 0.80)
+        self.assertEqual(cfg.stage9_unscreen_peak_max, 0.95)
+        self.assertEqual(
+            cfg.stage9_unscreen_roundtrip_relative_improvement_min,
+            0.10,
+        )
+        self.assertEqual(
+            cfg.stage9_unscreen_roundtrip_absolute_improvement_min,
+            0.005,
+        )
         self.assertEqual(cfg.stage7_starmask_diffuse_residual_ratio_max, 0.08)
+        self.assertEqual(cfg.stage7_quality_advisory_multiplier, 2.0)
+        self.assertEqual(cfg.stage7_9_quality_advisory_multiplier, 1.5)
+        self.assertEqual(cfg.stage7_starmask_diffuse_uncertainty_abs, 0.0005)
+        self.assertEqual(
+            cfg.stage7_starmask_diffuse_borderline_star_intensity_scale,
+            0.70,
+        )
+        self.assertEqual(cfg.stage10_final_denoise_strength, 0.28)
+        self.assertEqual(cfg.stage10_star_protection_coverage_max, 0.35)
+        self.assertEqual(
+            cfg.stage10_large_galaxy_local_patch_variance_max,
+            0.00032,
+        )
         self.assertEqual(cfg.stage10_stage9_local_color_risk_strength, 1.0)
+
+    def test_stage7_9_quality_gate_uses_exact_fifty_percent_advisory_band(self):
+        cfg = PipelineConfig(stage7_9_quality_advisory_multiplier=1.5)
+
+        upper_boundary = stage7_quality.stage7_9_upper_quality_gate(
+            cfg,
+            value=1.5,
+            accepted_limit=1.0,
+        )
+        upper_hard = stage7_quality.stage7_9_upper_quality_gate(
+            cfg,
+            value=1.500001,
+            accepted_limit=1.0,
+        )
+        lower_boundary = stage7_quality.stage7_9_lower_quality_gate(
+            cfg,
+            value=2.0 / 3.0,
+            accepted_limit=1.0,
+        )
+        lower_hard = stage7_quality.stage7_9_lower_quality_gate(
+            cfg,
+            value=(2.0 / 3.0) - 0.000001,
+            accepted_limit=1.0,
+        )
+
+        self.assertEqual(upper_boundary["status"], "advisory")
+        self.assertEqual(upper_hard["status"], "hard_failed")
+        self.assertEqual(lower_boundary["status"], "advisory")
+        self.assertEqual(lower_hard["status"], "hard_failed")
+
+    def test_stage7_vectorized_linked_mtf_matches_scalar_reference(self):
+        values = np.linspace(0.0, 1.0, 257, dtype=np.float32)
+        mapped = stage7_stretch_metrics.apply_linked_mtf(
+            values,
+            0.012,
+            0.08,
+            1.0,
+        )
+        expected = np.asarray(
+            [
+                stage7_stretch_metrics.linked_mtf_sample(
+                    value,
+                    0.012,
+                    0.08,
+                    1.0,
+                )
+                for value in values
+            ],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(mapped, expected, atol=1e-6)
 
     def test_formal_stage_labels_are_unique_and_contiguous(self):
         labels = [stage.label for stage in PipelineStage]
 
-        self.assertEqual(len(labels), 11)
-        self.assertEqual(len(set(labels)), 11)
+        self.assertEqual(len(labels), 10)
+        self.assertEqual(len(set(labels)), 10)
         for number, label in enumerate(labels, start=1):
             self.assertTrue(label.startswith(f"阶段 {number}:"))
-
-        self.assertNotIn(
-            PipelineCheckpoint.PRE_STARLESS_COMPATIBILITY_GATE.label,
-            labels,
-        )
 
     def test_stage9_screen_blend_preserves_highlight_headroom(self):
         base = np.full((3, 4, 4), 0.80, dtype=np.float32)
@@ -211,6 +291,135 @@ class PipelineStageTests(unittest.TestCase):
 
         self.assertAlmostEqual(float(mixed[0, 0, 0]), 0.96, places=5)
         self.assertLess(float(mixed.max()), 1.0)
+
+    def test_stage9_unscreen_is_exact_inverse_screen_in_matched_domain(self):
+        rng = np.random.default_rng(20260812)
+        background = rng.uniform(0.01, 0.85, (3, 32, 32)).astype(np.float32)
+        stars = rng.uniform(0.0, 0.80, (3, 32, 32)).astype(np.float32)
+        original = stage9_quality.screen_blend(background, stars, 1.0)
+
+        recovered = stage9_quality.unscreen_layer(
+            original,
+            background,
+            denominator_floor=0.08,
+        )
+        closed = stage9_quality.screen_blend(background, recovered, 1.0)
+
+        self.assertLessEqual(float(np.max(np.abs(closed - original))), 1e-6)
+        dark = stage9_quality.unscreen_layer(
+            np.asarray([[0.11]], dtype=np.float32),
+            np.asarray([[0.10]], dtype=np.float32),
+        )
+        bright = stage9_quality.unscreen_layer(
+            np.asarray([[0.91]], dtype=np.float32),
+            np.asarray([[0.90]], dtype=np.float32),
+        )
+        self.assertAlmostEqual(float(dark[0, 0]), 0.011111, places=5)
+        self.assertAlmostEqual(float(bright[0, 0]), 0.10, places=5)
+
+    def test_stage9_unscreen_stabilization_preserves_trusted_rgb_ratios(self):
+        cfg = PipelineConfig(stage9_unscreen_reliable_support_min=0.50)
+        background = np.full((3, 12, 12), 0.55, dtype=np.float32)
+        trusted = np.zeros_like(background)
+        trusted[:, 4:8, 4:8] = np.asarray([0.20, 0.10, 0.05])[:, None, None]
+        raw_star = np.zeros_like(background)
+        raw_star[:, 4:8, 4:8] = np.asarray([0.60, 0.20, 0.50])[:, None, None]
+        original = stage9_quality.screen_blend(background, raw_star, 1.0)
+        support = np.zeros((12, 12), dtype=bool)
+        support[4:8, 4:8] = True
+
+        stabilized, report = stage9_quality.build_chroma_stable_unscreen_layer(
+            original,
+            background,
+            trusted,
+            support,
+            cfg,
+        )
+
+        self.assertIsNotNone(stabilized)
+        self.assertEqual(report["status"], "ready")
+        output = np.asarray(stabilized)
+        ratio = output[:, 5, 5] / output[0, 5, 5]
+        np.testing.assert_allclose(ratio, [1.0, 0.5, 0.25], atol=1e-6)
+        self.assertGreater(float(output[0, 5, 5]), float(trusted[0, 5, 5]))
+        self.assertEqual(float(np.max(output[:, ~support])), 0.0)
+
+    def test_stage9_unscreen_reliability_fails_closed(self):
+        cfg = PipelineConfig(stage9_unscreen_reliable_support_min=0.80)
+        background = np.full((3, 10, 10), 0.94, dtype=np.float32)
+        trusted = np.full((3, 10, 10), 0.02, dtype=np.float32)
+        support = np.ones((10, 10), dtype=bool)
+        original = stage9_quality.screen_blend(background, trusted, 1.0)
+
+        layer, report = stage9_quality.build_chroma_stable_unscreen_layer(
+            original,
+            background,
+            trusted,
+            support,
+            cfg,
+        )
+
+        self.assertIsNone(layer)
+        self.assertEqual(
+            report["reason_code"],
+            "stage9_unscreen_reliability_insufficient",
+        )
+        self.assertEqual(report["reliable_support_ratio"], 0.0)
+
+    def test_stage9_unscreen_competition_requires_non_regressing_gain(self):
+        cfg = PipelineConfig()
+
+        def candidate(mae, chroma=0.10, recovery=0.90, advisories=()):
+            return {
+                "accepted": True,
+                "reference_fidelity": {
+                    "status": "ok",
+                    "support_rgb_mae": mae,
+                },
+                "star_color_validation": {
+                    "metrics": {"median_chroma_error": chroma}
+                },
+                "metrics": {
+                    "weak_star_recovery_ratio": recovery,
+                    "star_recovery_ratio": recovery,
+                    "star_positive_delta_window_recovery_ratio": recovery,
+                    "star_wing_recovery_ratio": recovery,
+                },
+                "advisories": list(advisories),
+            }
+
+        baseline = candidate(0.050)
+        boundary_winner = candidate(0.045)
+        comparison = stage9_quality.compare_unscreen_candidate(
+            baseline,
+            boundary_winner,
+            cfg,
+        )
+        self.assertTrue(comparison["selected"], comparison)
+
+        chroma_regression = candidate(0.040, chroma=0.121)
+        comparison = stage9_quality.compare_unscreen_candidate(
+            baseline,
+            chroma_regression,
+            cfg,
+        )
+        self.assertFalse(comparison["selected"])
+        self.assertIn("chroma_non_regression", comparison["failed_checks"])
+
+        advisory_regression = candidate(
+            0.040,
+            advisories=("background_lift 0.02>0.01",),
+        )
+        comparison = stage9_quality.compare_unscreen_candidate(
+            baseline,
+            advisory_regression,
+            cfg,
+        )
+        self.assertFalse(comparison["selected"])
+        self.assertIn(
+            "no_new_advisory_category",
+            comparison["failed_checks"],
+        )
 
     def test_stage9_regularizes_faint_single_channel_artifacts(self):
         source = np.zeros((3, 17, 17), dtype=np.float32)
@@ -244,7 +453,7 @@ class PipelineStageTests(unittest.TestCase):
         )
         self.assertGreater(diagnostics["regularized_pixel_ratio"], 0.0)
 
-    def test_stage9_gate_rejects_extreme_chromatic_additions(self):
+    def test_stage9_gate_warns_for_moderate_chromatic_additions(self):
         cfg = PipelineConfig()
         base = np.full((3, 64, 64), 0.04, dtype=np.float32)
         candidate = np.array(base, copy=True)
@@ -262,10 +471,42 @@ class PipelineStageTests(unittest.TestCase):
             report["metrics"]["chromatic_star_addition_ratio"],
             report["limits"]["chromatic_star_addition_ratio"],
         )
-        self.assertTrue(
+        self.assertFalse(
             any(
                 issue.startswith("chromatic_star_addition_ratio")
                 for issue in report["issues"]
+            )
+        )
+        self.assertTrue(
+            any(
+                advisory.startswith("chromatic_star_addition_ratio")
+                for advisory in report["advisories"]
+            )
+        )
+        self.assertEqual(
+            report["quality_gates"]["chromatic_star_addition_ratio"]["status"],
+            "advisory",
+        )
+
+        hard_candidate = np.array(base, copy=True)
+        hard_candidate[2, 8:13, 8:13] += 0.40
+        hard_report = stage9_quality.assess_remix(
+            base,
+            hard_candidate,
+            cfg,
+            attempt="hard_chromatic_artifact",
+            formula="screen",
+        )
+        self.assertEqual(
+            hard_report["quality_gates"]["chromatic_star_addition_ratio"][
+                "status"
+            ],
+            "hard_failed",
+        )
+        self.assertTrue(
+            any(
+                issue.startswith("chromatic_star_addition_ratio")
+                for issue in hard_report["issues"]
             )
         )
 
@@ -299,6 +540,12 @@ class PipelineStageTests(unittest.TestCase):
         core_jump[0, 92:100, 92:101] += 0.10
         cases["core_color_jump_component_max_area"] = core_jump
 
+        expected_gate_status = {
+            "local_connected_component_max_area": "advisory",
+            "local_cyan_blue_component_max_area": "advisory",
+            "local_single_pixel_component_ratio": "hard_failed",
+            "core_color_jump_component_max_area": "advisory",
+        }
         for expected_metric, candidate in cases.items():
             with self.subTest(metric=expected_metric):
                 report = stage9_quality.assess_remix(
@@ -314,9 +561,18 @@ class PipelineStageTests(unittest.TestCase):
                     report["metrics"][expected_metric],
                     report["limits"][expected_metric],
                 )
+                self.assertEqual(
+                    report["quality_gates"][expected_metric]["status"],
+                    expected_gate_status[expected_metric],
+                )
+                messages = (
+                    report["issues"]
+                    if expected_gate_status[expected_metric] == "hard_failed"
+                    else report["advisories"]
+                )
                 self.assertTrue(
-                    any(issue.startswith(expected_metric) for issue in report["issues"]),
-                    report["issues"],
+                    any(message.startswith(expected_metric) for message in messages),
+                    messages,
                 )
 
         nonstellar_report = stage9_quality.assess_remix(
@@ -588,7 +844,7 @@ class PipelineStageTests(unittest.TestCase):
         yy, xx = np.mgrid[-32:32, -32:32]
         profile = np.exp(-(xx * xx + yy * yy) / (2.0 * 1.4**2))
         faint = np.stack([profile * 0.035, profile * 0.030, profile * 0.025]).astype(np.float32)
-        bright = np.stack([profile * 0.45, profile * 0.38, profile * 0.30]).astype(np.float32)
+        bright = np.stack([profile * 0.75, profile * 0.64, profile * 0.53]).astype(np.float32)
 
         faint_plan = stage9_quality.calibrate_starmask_asinh(faint, cfg)
         bright_plan = stage9_quality.calibrate_starmask_asinh(bright, cfg)
@@ -602,12 +858,23 @@ class PipelineStageTests(unittest.TestCase):
             1000.0,
         )
         bright_direct = stage9_quality._solve_asinh_stretch(
-            0.45,
+            0.75,
             0.001,
             0.22,
             1000.0,
         )
         self.assertGreater(faint_direct, bright_direct)
+        self.assertGreater(
+            faint_plan["derived_asinh_stretch"],
+            bright_plan["derived_asinh_stretch"],
+        )
+        for plan in (faint_plan, bright_plan):
+            self.assertTrue(plan["output_profile"]["accepted"])
+            for name, value in plan["output_profile"]["actual"].items():
+                self.assertLessEqual(
+                    value,
+                    plan["output_profile"]["targets"][name] + 1e-4,
+                )
         self.assertLessEqual(faint_plan["predicted_peak"], cfg.stage9_starmask_peak_target + 1e-4)
 
     def test_stage9_mixed_field_preserves_weak_stars_and_compresses_bright_stars(self):
@@ -644,10 +911,12 @@ class PipelineStageTests(unittest.TestCase):
             cfg.stage9_compact_weak_star_retention_min,
         )
         self.assertGreaterEqual(plan["star_retention"], 0.99)
-        self.assertAlmostEqual(plan["predicted_faint"], 0.26, places=3)
-        self.assertAlmostEqual(plan["predicted_mid"], 0.50, places=3)
-        self.assertAlmostEqual(plan["predicted_bright"], 0.75, places=3)
+        self.assertLessEqual(plan["predicted_faint"], 0.2601)
+        self.assertLessEqual(plan["predicted_mid"], 0.5001)
+        self.assertLessEqual(plan["predicted_bright"], 0.7501)
         self.assertLessEqual(plan["predicted_peak"], 0.9001)
+        self.assertTrue(plan["output_profile"]["accepted"])
+        self.assertLessEqual(plan["output_target_scale"], 1.0)
 
         stretched_norm = stage9_quality._normalized(stretched)
         stretched_peak = stage9_quality._pixel_peak(stretched_norm)
@@ -668,6 +937,7 @@ class PipelineStageTests(unittest.TestCase):
             (component_peaks > q90) & (component_peaks <= q997),
             component_peaks > q997,
         )
+
         ordered_medians = [
             float(np.median(output_peaks[group]))
             for group in rank_groups
@@ -732,8 +1002,12 @@ class PipelineStageTests(unittest.TestCase):
             cfg.stage9_unmatched_changed_ratio_max,
         )
         self.assertGreaterEqual(
-            report["metrics"]["star_aperture_recovery_ratio"],
-            cfg.stage9_star_aperture_recovery_ratio_min,
+            report["metrics"]["star_positive_delta_window_recovery_ratio"],
+            cfg.stage9_star_positive_delta_window_recovery_ratio_min,
+        )
+        self.assertGreaterEqual(
+            report["metrics"]["star_positive_delta_window_restored_count"],
+            0,
         )
         self.assertGreaterEqual(
             report["metrics"]["star_wing_recovery_ratio"],
@@ -752,6 +1026,113 @@ class PipelineStageTests(unittest.TestCase):
                 report["metrics"][metric_name],
                 report["limits"][metric_name],
             )
+
+        advisory_cfg = PipelineConfig(stage9_star_support_ratio_max=0.08)
+        advisory_report = stage9_quality.assess_remix(
+            base,
+            candidate,
+            advisory_cfg,
+            attempt="mixed_screen_advisory",
+            formula="screen",
+            star_reference=catalog,
+            star_overlay_mask=overlay_mask,
+        )
+        self.assertTrue(advisory_report["accepted"], advisory_report["issues"])
+        self.assertEqual(
+            advisory_report["quality_gates"]["star_support_ratio"]["status"],
+            "advisory",
+        )
+        self.assertTrue(
+            any(
+                advisory.startswith("star_support_ratio")
+                for advisory in advisory_report["advisories"]
+            )
+        )
+
+    def test_stage9_multi_anchor_uniformly_scales_targets_to_change_budget(self):
+        cfg = PipelineConfig(
+            stage9_starmask_predicted_change_ratio_max=0.05,
+            stage9_changed_pixel_ratio_max=0.05,
+        )
+        stars, _extreme_coordinates = _synthetic_stage9_mixed_star_field()
+        catalog = stage9_quality.build_star_reference_catalog(
+            stars,
+            cfg,
+            source_image=_stage9_source_image(stars),
+        )
+
+        plan = stage9_quality.calibrate_starmask_asinh(
+            stars,
+            cfg,
+            include_support_mask=True,
+            reference_catalog=catalog,
+        )
+
+        self.assertEqual(plan["status"], "ok")
+        self.assertTrue(plan["multi_anchor_curve"])
+        self.assertTrue(plan["coverage_limited"])
+        self.assertLess(plan["output_target_scale"], 1.0)
+        self.assertLessEqual(
+            plan["predicted_change_ratio"],
+            plan["predicted_change_ratio_limit"] + 1e-12,
+        )
+        actual = plan["output_profile"]["actual"]
+        self.assertLess(actual["faint"], actual["mid"])
+        self.assertLess(actual["mid"], actual["bright"])
+        self.assertLess(actual["bright"], actual["peak"])
+
+    def test_stage9_compatibility_stretch_is_only_a_clamped_proposal(self):
+        cfg = PipelineConfig(
+            stage9_starmask_adaptive_stretch_enabled=False,
+            stage9_starmask_asinh_stretch=3.0,
+        )
+        yy, xx = np.mgrid[:128, :128]
+        stars = np.zeros((3, 128, 128), dtype=np.float32)
+        for cy, cx, amplitude in (
+            (18, 21, 0.04),
+            (37, 92, 0.07),
+            (69, 60, 0.12),
+            (99, 31, 0.20),
+            (101, 104, 0.35),
+        ):
+            profile = np.exp(
+                -((xx - cx) ** 2 + (yy - cy) ** 2) / (2.0 * 1.5**2)
+            )
+            stars += np.stack(
+                [profile, profile * 0.85, profile * 0.70]
+            ).astype(np.float32) * amplitude
+
+        plan = stage9_quality.calibrate_starmask_asinh(stars, cfg)
+
+        self.assertEqual(plan["status"], "ok")
+        self.assertEqual(plan["configured_stretch_proposal"], 3.0)
+        self.assertLessEqual(plan["stretch"], 3.0)
+        self.assertTrue(plan["output_profile"]["accepted"])
+        for name, value in plan["output_profile"]["actual"].items():
+            self.assertLessEqual(
+                value,
+                plan["output_profile"]["targets"][name] + 1e-4,
+            )
+
+    def test_stage9_rejects_when_minimum_asinh_exceeds_output_targets(self):
+        cfg = PipelineConfig()
+        stars = np.zeros((3, 128, 128), dtype=np.float32)
+        for cy, cx in ((20, 20), (35, 90), (65, 60), (95, 30), (100, 103)):
+            stars[:, cy - 1 : cy + 2, cx - 1 : cx + 2] = np.asarray(
+                [0.50, 0.45, 0.40],
+                dtype=np.float32,
+            )[:, np.newaxis, np.newaxis]
+
+        plan = stage9_quality.calibrate_starmask_asinh(stars, cfg)
+
+        self.assertEqual(plan["status"], "rejected")
+        self.assertFalse(plan["light_stretch_usable"])
+        self.assertEqual(
+            plan["reason_code"],
+            "stage9_starmask_output_target_exceeded_at_minimum_stretch",
+        )
+        self.assertEqual(plan["stretch"], 1.10)
+        self.assertTrue(plan["output_profile"]["hard_failed"])
 
     def test_stage9_recovery_gate_rejects_missing_stars_and_missing_catalog(self):
         cfg = PipelineConfig()
@@ -887,8 +1268,12 @@ class PipelineStageTests(unittest.TestCase):
 
         self.assertEqual(catalog["status"], "rejected")
         self.assertTrue(catalog["fail_closed"])
-        self.assertGreater(
+        self.assertLess(
             catalog["source_component_density_per_megapixel"],
+            catalog["source_component_density_max"],
+        )
+        self.assertGreater(
+            catalog["source_raw_component_density_per_megapixel"],
             catalog["source_component_density_max"],
         )
         self.assertGreater(
@@ -896,8 +1281,12 @@ class PipelineStageTests(unittest.TestCase):
             catalog["source_single_pixel_component_ratio_max"],
         )
         self.assertIn("source_star_catalog_contamination_risk", catalog["reason"])
-        self.assertEqual(catalog["source_detail_percentile"], 99.5)
+        self.assertEqual(catalog["source_detail_percentile"], 98.0)
         self.assertGreater(len(catalog["source_detail_attempts"]), 1)
+        self.assertGreater(
+            catalog["source_detail_attempts"][-1]["reference_sigma"],
+            catalog["source_detail_attempts"][0]["reference_sigma"],
+        )
 
     def test_stage9_source_catalog_tightens_detail_before_accepting(self):
         cfg = PipelineConfig()
@@ -934,13 +1323,16 @@ class PipelineStageTests(unittest.TestCase):
         )
 
         self.assertEqual(catalog["status"], "ok")
-        self.assertTrue(catalog["source_detail_adaptive_retry"])
+        self.assertFalse(catalog["source_detail_adaptive_retry"])
         self.assertEqual(catalog["source_detail_percentile_requested"], 98.0)
-        self.assertEqual(catalog["source_detail_percentile"], 99.5)
-        self.assertEqual(catalog["matched_component_count"], 60)
-        self.assertTrue(catalog["source_detail_attempts"][0]["contamination_risk"])
+        self.assertEqual(catalog["source_detail_percentile"], 98.0)
+        self.assertGreaterEqual(catalog["matched_component_count"], 60)
         self.assertFalse(
-            catalog["source_detail_attempts"][-1]["contamination_risk"]
+            catalog["source_detail_attempts"][0]["contamination_risk"]
+        )
+        self.assertGreater(
+            catalog["source_raw_single_pixel_component_ratio"],
+            catalog["source_single_pixel_component_ratio"],
         )
 
     def test_stage9_source_catalog_rejects_single_pixel_noise_independently(self):
@@ -964,9 +1356,13 @@ class PipelineStageTests(unittest.TestCase):
         )
 
         self.assertEqual(catalog["status"], "rejected")
-        last_attempt = catalog["source_detail_attempts"][-1]
-        self.assertFalse(last_attempt["density_limit_exceeded"])
-        self.assertTrue(last_attempt["single_pixel_limit_exceeded"])
+        contaminated_attempt = next(
+            attempt
+            for attempt in reversed(catalog["source_detail_attempts"])
+            if attempt["contamination_risk"]
+        )
+        self.assertFalse(contaminated_attempt["density_limit_exceeded"])
+        self.assertTrue(contaminated_attempt["single_pixel_limit_exceeded"])
         self.assertIn("single_pixel_component_ratio=", catalog["reason"])
         self.assertNotIn("component_density_per_megapixel=", catalog["reason"])
 
@@ -1110,6 +1506,418 @@ class PipelineStageTests(unittest.TestCase):
         )
         self.assertLess(strict["compact_wing_iterations"], normal["compact_wing_iterations"])
 
+    @staticmethod
+    def _stage9_preflight_calibration(
+        *,
+        coverage: float,
+        predicted: float = 0.10,
+        status: str = "ok",
+        mask: np.ndarray | None = None,
+    ) -> dict:
+        support = (
+            np.asarray(mask, dtype=bool)
+            if mask is not None
+            else np.zeros((10, 10), dtype=bool)
+        )
+        return {
+            "status": status,
+            "reason": "mock unavailable" if status != "ok" else "",
+            "support_mode": "normal",
+            "compact_support_coverage": coverage,
+            "predicted_change_ratio": predicted,
+            "predicted_change_ratio_limit": 0.30,
+            "weak_star_retention": 1.0 if status == "ok" else 0.0,
+            "weak_star_retention_min": 0.80,
+            "star_retention": 1.0 if status == "ok" else 0.0,
+            "faint_target": 0.26,
+            "mid_target": 0.50,
+            "bright_target": 0.75,
+            "peak_target": 0.90,
+            "output_targets": {
+                "faint": 0.26,
+                "mid": 0.50,
+                "bright": 0.75,
+                "peak": 0.90,
+            },
+            "output_profile_mode": "ordinary_support_pixel_percentiles",
+            "output_profile": {
+                "status": "ok",
+                "accepted": status == "ok",
+                "hard_failed": status != "ok",
+                "actual": {
+                    "faint": 0.20,
+                    "mid": 0.30,
+                    "bright": 0.40,
+                    "peak": 0.50,
+                },
+                "targets": {
+                    "faint": 0.26,
+                    "mid": 0.50,
+                    "bright": 0.75,
+                    "peak": 0.90,
+                },
+                "tolerance": 1e-4,
+                "exceeded_anchors": [],
+            },
+            "_compact_support_mask": support,
+            "_output_profile_sample_mask": support,
+            "star_reference": {
+                "psf_support_radius_max": 6,
+                "psf_support_radius_median_px": 2.0,
+                "psf_support_radius_p95_px": 3.0,
+            },
+        }
+
+    def test_stage9_support_preflight_routes_clear_boundary_and_hard_normal(self):
+        cfg = PipelineConfig()
+        stars = np.zeros((3, 10, 10), dtype=np.float32)
+        masks = (
+            np.eye(10, dtype=bool),
+            np.eye(10, dtype=bool) & (np.indices((10, 10))[0] < 5),
+        )
+        cases = (
+            (0.10, "auto_fallback", "normal_only"),
+            (0.13, "auto_fallback", "dual_competition"),
+            (0.19, "auto_fallback", "strict_only"),
+            (0.13, "preserve_review", "normal_only"),
+        )
+        for normal_coverage, failure_action, expected_route in cases:
+            with self.subTest(
+                normal_coverage=normal_coverage,
+                failure_action=failure_action,
+            ):
+                normal = self._stage9_preflight_calibration(
+                    coverage=normal_coverage,
+                    mask=masks[0],
+                )
+                strict = self._stage9_preflight_calibration(
+                    coverage=0.08,
+                    mask=masks[1],
+                )
+                strict["support_mode"] = "strict_recovery"
+                with patch.object(
+                    stage9_quality,
+                    "calibrate_starmask_asinh",
+                    side_effect=[normal, strict],
+                ):
+                    report = stage9_quality.assess_starmask_support_preflight(
+                        stars,
+                        cfg,
+                        failure_action=failure_action,
+                    )
+                self.assertEqual(report["route"], expected_route)
+
+    def test_stage9_support_preflight_deduplicates_and_handles_unavailable_modes(self):
+        cfg = PipelineConfig()
+        stars = np.zeros((3, 10, 10), dtype=np.float32)
+        shared_mask = np.eye(10, dtype=bool)
+        normal = self._stage9_preflight_calibration(
+            coverage=0.10,
+            mask=shared_mask,
+        )
+        strict = self._stage9_preflight_calibration(
+            coverage=0.10,
+            mask=shared_mask,
+        )
+        strict["support_mode"] = "strict_recovery"
+        with patch.object(
+            stage9_quality,
+            "calibrate_starmask_asinh",
+            side_effect=[normal, strict],
+        ):
+            equivalent = stage9_quality.assess_starmask_support_preflight(
+                stars,
+                cfg,
+            )
+        self.assertEqual(equivalent["route"], "normal_only")
+        self.assertTrue(equivalent["support_masks_equivalent"])
+        self.assertTrue(equivalent["compact_support_enabled"])
+        self.assertFalse(equivalent["pre_stretch_compact_enabled"])
+
+        unavailable = self._stage9_preflight_calibration(
+            coverage=0.0,
+            status="unavailable",
+        )
+        with patch.object(
+            stage9_quality,
+            "calibrate_starmask_asinh",
+            side_effect=[unavailable, unavailable],
+        ):
+            rejected = stage9_quality.assess_starmask_support_preflight(
+                stars,
+                cfg,
+            )
+        self.assertEqual(rejected["route"], "unavailable")
+        self.assertEqual(rejected["status"], "rejected")
+
+        advisory = self._stage9_preflight_calibration(
+            coverage=0.13,
+            mask=np.eye(10, dtype=bool),
+        )
+        with patch.object(
+            stage9_quality,
+            "calibrate_starmask_asinh",
+            side_effect=[advisory, unavailable],
+        ):
+            strict_unavailable = (
+                stage9_quality.assess_starmask_support_preflight(
+                    stars,
+                    cfg,
+                )
+            )
+        self.assertEqual(strict_unavailable["route"], "normal_only")
+        self.assertEqual(
+            strict_unavailable["reason_code"],
+            "stage9_support_preflight_boundary_strict_unavailable",
+        )
+        self.assertEqual(
+            strict_unavailable["skipped_candidates"][0]["support_mode"],
+            "strict_compact",
+        )
+
+        cfg.stage9_compact_starmask_enabled = False
+        with patch.object(
+            stage9_quality,
+            "calibrate_starmask_asinh",
+            return_value=normal,
+        ) as calibrate:
+            disabled = stage9_quality.assess_starmask_support_preflight(
+                stars,
+                cfg,
+            )
+        self.assertEqual(disabled["route"], "normal_only")
+        self.assertEqual(calibrate.call_count, 1)
+        self.assertFalse(disabled["compact_support_enabled"])
+        self.assertFalse(disabled["pre_stretch_compact_enabled"])
+
+        cfg.stage9_starmask_pre_stretch_compact_enabled = True
+        with patch.object(
+            stage9_quality,
+            "calibrate_starmask_asinh",
+            return_value=normal,
+        ) as calibrate:
+            compact_normal_only = (
+                stage9_quality.assess_starmask_support_preflight(
+                    stars,
+                    cfg,
+                )
+            )
+        self.assertEqual(compact_normal_only["route"], "normal_only")
+        self.assertEqual(calibrate.call_count, 1)
+        self.assertFalse(compact_normal_only["compact_support_enabled"])
+        self.assertTrue(
+            compact_normal_only["pre_stretch_compact_enabled"]
+        )
+
+    def test_stage9_support_preflight_uses_actual_plugin_change_coverage(self):
+        cfg = PipelineConfig()
+        stars = np.zeros((3, 10, 10), dtype=np.float32)
+        normal_mask = np.eye(10, dtype=bool)
+        strict_mask = normal_mask & (np.indices((10, 10))[0] < 5)
+        normal = self._stage9_preflight_calibration(
+            coverage=0.10,
+            predicted=0.01,
+            mask=normal_mask,
+        )
+        strict = self._stage9_preflight_calibration(
+            coverage=0.05,
+            predicted=0.02,
+            mask=strict_mask,
+        )
+        strict["support_mode"] = "strict_recovery"
+        plugin = np.zeros_like(stars)
+        plugin[:, normal_mask] = 0.25
+
+        with patch.object(
+            stage9_quality,
+            "calibrate_starmask_asinh",
+            side_effect=[normal, strict],
+        ):
+            measured = stage9_quality.assess_starmask_support_preflight(
+                stars,
+                cfg,
+                plugin_stretched_stars=plugin,
+            )
+
+        normal_summary = measured["candidates"]["normal"]
+        self.assertEqual(measured["route"], "dual_competition")
+        self.assertEqual(
+            measured["reason_code"],
+            "stage9_support_preflight_output_adequacy_dual",
+        )
+        self.assertEqual(
+            normal_summary["predicted_change_source"],
+            "actual_plugin_stretched_pixels",
+        )
+        self.assertAlmostEqual(
+            normal_summary["predicted_change_ratio"],
+            0.10,
+        )
+        self.assertTrue(normal_summary["output_profile"]["accepted"])
+
+        over_target_plugin = np.zeros_like(stars)
+        over_target_plugin[:, normal_mask] = 0.95
+        with patch.object(
+            stage9_quality,
+            "calibrate_starmask_asinh",
+            side_effect=[normal, strict],
+        ):
+            output_rejected = stage9_quality.assess_starmask_support_preflight(
+                stars,
+                cfg,
+                plugin_stretched_stars=over_target_plugin,
+            )
+        rejected_normal = output_rejected["candidates"]["normal"]
+        self.assertEqual(output_rejected["route"], "strict_only")
+        self.assertTrue(
+            rejected_normal["gates"]["starmask_output_targets"]["hard_failed"]
+        )
+        self.assertIn(
+            "peak",
+            rejected_normal["output_profile"]["exceeded_anchors"],
+        )
+
+        advisory_cfg = PipelineConfig(
+            stage9_star_support_ratio_max=0.30,
+            stage9_starmask_predicted_change_ratio_max=0.10,
+        )
+        advisory_mask = np.zeros((10, 10), dtype=bool)
+        advisory_mask[:1, :] = True
+        advisory_mask[1, :3] = True
+        advisory_normal = self._stage9_preflight_calibration(
+            coverage=0.13,
+            predicted=0.01,
+            mask=advisory_mask,
+        )
+        advisory_normal["predicted_change_ratio_limit"] = 0.10
+        advisory_plugin = np.zeros_like(stars)
+        advisory_plugin[:, advisory_mask] = 0.25
+        with patch.object(
+            stage9_quality,
+            "calibrate_starmask_asinh",
+            side_effect=[advisory_normal, strict],
+        ):
+            plugin_advisory = stage9_quality.assess_starmask_support_preflight(
+                stars,
+                advisory_cfg,
+                plugin_stretched_stars=advisory_plugin,
+            )
+        self.assertEqual(plugin_advisory["route"], "dual_competition")
+        self.assertEqual(
+            plugin_advisory["candidates"]["normal"]["gates"][
+                "predicted_change_ratio"
+            ]["status"],
+            "advisory",
+        )
+
+        wide_mask = np.zeros((10, 10), dtype=bool)
+        wide_mask[:2, :] = True
+        wide_normal = self._stage9_preflight_calibration(
+            coverage=0.20,
+            predicted=0.01,
+            mask=wide_mask,
+        )
+        wide_plugin = np.zeros_like(stars)
+        wide_plugin[:, wide_mask] = 0.25
+        with patch.object(
+            stage9_quality,
+            "calibrate_starmask_asinh",
+            side_effect=[wide_normal, strict],
+        ):
+            plugin_strict = stage9_quality.assess_starmask_support_preflight(
+                stars,
+                cfg,
+                plugin_stretched_stars=wide_plugin,
+            )
+        self.assertEqual(plugin_strict["route"], "strict_only")
+        self.assertEqual(
+            plugin_strict["candidates"]["normal"][
+                "predicted_change_source"
+            ],
+            "actual_plugin_stretched_pixels",
+        )
+
+        with patch.object(
+            stage9_quality,
+            "calibrate_starmask_asinh",
+            side_effect=[normal, strict],
+        ):
+            unavailable_measurement = (
+                stage9_quality.assess_starmask_support_preflight(
+                    stars,
+                    cfg,
+                    plugin_stretched_stars=np.zeros(
+                        (3, 8, 8), dtype=np.float32
+                    ),
+                )
+            )
+        unavailable_normal = unavailable_measurement["candidates"]["normal"]
+        self.assertEqual(
+            unavailable_normal["predicted_change_source"],
+            "plugin_measurement_unavailable",
+        )
+        self.assertIsNone(unavailable_normal["predicted_change_ratio"])
+        self.assertTrue(unavailable_normal["hard_failed"])
+        self.assertEqual(unavailable_measurement["route"], "strict_only")
+
+    def test_stage9_support_preflight_public_report_strips_private_masks(self):
+        public = stage9_quality.public_starmask_support_preflight(
+            {
+                "schema": "starun.stage9-starmask_support_preflight.v1",
+                "status": "ready",
+                "route": "normal_only",
+                "_calibrations": {"normal": {"_compact_support_mask": np.ones((2, 2))}},
+            }
+        )
+        self.assertNotIn("_calibrations", public)
+        self.assertEqual(public["route"], "normal_only")
+        json.dumps(public)
+
+    def test_stage9_support_candidate_order_prefers_clean_psf_then_normal_tie(self):
+        def quality(*, ratio: float, advisory: bool = False) -> dict:
+            return {
+                "accepted": True,
+                "advisories": ["boundary"] if advisory else [],
+                "quality_gates": {},
+                "psf_closure": {
+                    "groups": {
+                        "all": {
+                            "status": "ok",
+                            "fwhm_ratio_median": ratio,
+                        }
+                    }
+                },
+                "metrics": {
+                    "weak_star_recovery_ratio": 0.80,
+                    "star_support_ratio": 0.08,
+                    "highlight_clip_growth": 0.001,
+                    "bright_pixel_growth": 0.002,
+                },
+                "limits": {"weak_star_recovery_ratio": 0.70},
+            }
+
+        normal = stage9_star_remixing._stage9_support_candidate_score(
+            quality(ratio=0.97),
+            support_mode="normal",
+        )
+        compact = stage9_star_remixing._stage9_support_candidate_score(
+            quality(ratio=0.99),
+            support_mode="strict_compact",
+        )
+        self.assertLess(compact, normal)
+
+        normal_tie = stage9_star_remixing._stage9_support_candidate_score(
+            quality(ratio=0.99),
+            support_mode="normal",
+        )
+        self.assertLess(normal_tie, compact)
+
+        compact_advisory = stage9_star_remixing._stage9_support_candidate_score(
+            quality(ratio=1.0, advisory=True),
+            support_mode="strict_compact",
+        )
+        self.assertLess(normal_tie, compact_advisory)
+
     def test_stage9_adaptive_starmask_caps_predicted_change_coverage(self):
         peak_map = np.geomspace(1e-7, 0.02, 20000, dtype=np.float32).reshape(100, 200)
 
@@ -1217,12 +2025,89 @@ class PipelineStageTests(unittest.TestCase):
             metrics["limits"]["max_diffuse_residual_ratio"],
         )
 
-        quality = stage7_star_separation._apply_starmask_cleanup_hard_gate(
+        quality = stage6_star_separation._apply_starmask_cleanup_hard_gate(
             {"status": "ok", "issues": [], "derived": {}},
             {"metrics": metrics},
         )
         self.assertEqual(quality["status"], "poor")
         self.assertTrue(quality["derived"]["starmask_cleanup_hard_failed"])
+
+    def test_starmask_diffuse_gate_uses_two_x_advisory_band(self):
+        borderline = starmask_cleanup.classify_diffuse_residual_gate(
+            0.16,
+            0.08,
+            0.0005,
+        )
+        hard_failed = starmask_cleanup.classify_diffuse_residual_gate(
+            0.160001,
+            0.08,
+            0.0005,
+        )
+
+        self.assertEqual(borderline["status"], "borderline")
+        self.assertTrue(borderline["borderline"])
+        self.assertFalse(borderline["hard_failed"])
+        self.assertAlmostEqual(borderline["effective_hard_limit"], 0.16)
+        self.assertAlmostEqual(borderline["advisory_multiplier"], 2.0)
+        self.assertEqual(hard_failed["status"], "hard_failed")
+        self.assertTrue(hard_failed["hard_failed"])
+
+    def test_starmask_lower_gate_uses_half_threshold_advisory_band(self):
+        borderline = starmask_cleanup.classify_lower_bound_gate(0.41, 0.82)
+        hard_failed = starmask_cleanup.classify_lower_bound_gate(0.409999, 0.82)
+
+        self.assertEqual(borderline["status"], "borderline")
+        self.assertTrue(borderline["borderline"])
+        self.assertAlmostEqual(borderline["effective_hard_limit"], 0.41)
+        self.assertEqual(hard_failed["status"], "hard_failed")
+        self.assertTrue(hard_failed["hard_failed"])
+
+    def test_starmask_borderline_gate_keeps_quality_ok_but_marks_review(self):
+        quality = stage6_star_separation._apply_starmask_cleanup_hard_gate(
+            {"status": "ok", "issues": [], "derived": {}},
+            {
+                "metrics": {
+                    "diffuse_residual_ratio": 0.12,
+                    "diffuse_borderline": True,
+                    "diffuse_hard_gate_failed": False,
+                    "limits": {
+                        "max_diffuse_residual_ratio": 0.08,
+                        "diffuse_uncertainty_abs": 0.0005,
+                        "advisory_multiplier": 2.0,
+                        "effective_diffuse_hard_limit": 0.16,
+                    },
+                }
+            },
+        )
+
+        self.assertEqual(quality["status"], "ok")
+        self.assertTrue(quality["derived"]["starmask_cleanup_borderline"])
+        self.assertFalse(quality["derived"]["starmask_cleanup_hard_failed"])
+        self.assertTrue(quality["advisories"])
+
+    def test_starmask_compact_advisory_propagates_without_rejecting_candidate(self):
+        advisory = "compact_retention within advisory band: 0.700<0.820"
+        quality = stage6_star_separation._apply_starmask_cleanup_hard_gate(
+            {"status": "ok", "issues": [], "derived": {}},
+            {
+                "metrics": {
+                    "advisories": [advisory],
+                    "diffuse_residual_ratio": 0.05,
+                    "diffuse_borderline": False,
+                    "diffuse_hard_gate_failed": False,
+                    "limits": {
+                        "max_diffuse_residual_ratio": 0.08,
+                        "advisory_multiplier": 2.0,
+                        "effective_diffuse_hard_limit": 0.16,
+                    },
+                }
+            },
+        )
+
+        self.assertEqual(quality["status"], "ok")
+        self.assertFalse(quality["issues"])
+        self.assertIn(advisory, quality["advisories"])
+        self.assertIn(advisory, quality["local_advisories"])
 
     def test_starmask_cleanup_retries_diffuse_only_pixels_before_hard_reject(self):
         cfg = PipelineConfig(stage7_starmask_nebula_suppression=0.65)
@@ -1264,7 +2149,7 @@ class PipelineStageTests(unittest.TestCase):
             cfg.stage7_starmask_small_star_scale - 0.01,
         )
 
-    def test_starmask_cleanup_rolls_back_before_write_when_compact_stars_are_overcleaned(self):
+    def test_starmask_cleanup_applies_compact_retention_advisory_without_rollback(self):
         yy, xx = np.mgrid[-16:16, -16:16]
         compact = 0.65 * np.exp(-(xx * xx + yy * yy) / (2.0 * 1.2**2))
         diffuse = 0.02 + 0.02 * np.exp(-(xx * xx + yy * yy) / (2.0 * 10.0**2))
@@ -1299,9 +2184,16 @@ class PipelineStageTests(unittest.TestCase):
 
             result = stage7_repair.stage7_clean_starmask(_CleanupPipeline())
 
-        self.assertEqual(result["status"], "rolled_back")
-        self.assertFalse(writes)
-        self.assertNotIn(("save", "starmask"), commands)
+        self.assertEqual(result["status"], "applied")
+        self.assertTrue(writes)
+        self.assertIn(("save", "starmask_clean"), commands)
+        self.assertEqual(result["metrics"]["compact_gate_status"], "borderline")
+        self.assertTrue(
+            any(
+                item.startswith("compact_retention within advisory band")
+                for item in result["metrics"]["advisories"]
+            )
+        )
 
     def test_starmask_cleanup_preserves_raw_and_writes_clean_layer(self):
         yy, xx = np.mgrid[-24:24, -24:24]
@@ -1314,7 +2206,7 @@ class PipelineStageTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             process_dir = Path(tmp)
-            starmask_path = process_dir / "starmask.fit"
+            starmask_path = process_dir / "starmask_raw.fit"
             starmask_path.write_bytes(b"raw-star-layer")
             writes = []
             commands = []
@@ -1344,7 +2236,7 @@ class PipelineStageTests(unittest.TestCase):
         self.assertEqual(raw_bytes, b"raw-star-layer")
         self.assertTrue(writes)
         self.assertIn(("save", "starmask_clean"), commands)
-        self.assertIn(("save", "starmask"), commands)
+        self.assertNotIn(("save", "starmask"), commands)
         self.assertEqual(pipeline.starmask_file.name, "starmask_clean.fit")
 
 
@@ -1372,7 +2264,6 @@ class _Pipeline:
         self.stretched_name = "stage7_stretched"
         self.starless_file = None
         self.starmask_file = None
-        self.pre_starless_gate_report = {}
         self._stage1_input_mode = "stacked"
         self._last_plugin_script_error = None
         self._last_sasp_stage8_api_error = None
@@ -1442,6 +2333,20 @@ class PipelineStageSmokeTests(unittest.TestCase):
 
     def test_stage2_view_correction_smoke(self) -> None:
         with (
+            patch.object(
+                stage2_view_correction,
+                "_detect_native_contour_candidate",
+                return_value=(
+                    None,
+                    "native contour crop skipped: no candidate",
+                    {
+                        "method": "native_contour",
+                        "accepted": False,
+                        "reason": "no_candidate",
+                        "candidate": None,
+                    },
+                ),
+            ),
             patch.object(stage2_view_correction, "_detect_auto_edge_crop", return_value=(None, "no crop")),
             patch.object(stage2_view_correction, "_edge_color_artifact_crop", return_value=""),
         ):
@@ -1449,6 +2354,177 @@ class PipelineStageSmokeTests(unittest.TestCase):
 
         self.assertEqual(self.pipeline.results[-1][1], "ok")
         self.assertTrue((self.process_dir / "stage2_corrected.fit").exists())
+        self.assertEqual(self.pipeline.stage2_crop_report["mode"], "native_no_crop")
+
+    def test_stage2_native_contour_uses_guarded_crop_and_skips_fallback(self) -> None:
+        with (
+            patch.object(
+                stage2_view_correction,
+                "_detect_native_contour_candidate",
+                return_value=(
+                    (4, 4, 92, 92),
+                    "native contour crop detected",
+                    {
+                        "method": "native_contour",
+                        "accepted": True,
+                        "reason": "near_black_boundary_confirmed",
+                        "candidate": {"x": 4, "y": 4, "width": 92, "height": 92},
+                    },
+                ),
+            ),
+            patch.object(stage2_view_correction, "_detect_auto_edge_crop") as detect,
+            patch.object(stage2_view_correction, "_edge_color_artifact_crop") as color_crop,
+        ):
+            stage2_view_correction.run_stage2_view_correction(self.pipeline)
+
+        detect.assert_not_called()
+        color_crop.assert_not_called()
+        self.assertEqual(self.pipeline.results[-1][1], "ok")
+        self.assertEqual(self.pipeline.commands, [("crop", "4", "4", "92", "92")])
+        self.assertEqual(self.pipeline.stage2_crop_report["mode"], "native_contour")
+        self.assertEqual(
+            self.pipeline.stage2_crop_report["total_crop"],
+            {"left": 4, "top": 4, "right": 4, "bottom": 4},
+        )
+
+    def test_stage2_real_native_detector_applies_one_siril_crop(self) -> None:
+        pixels = np.full((3, 100, 120), 0.02, dtype=np.float32)
+        pixels[:, :8, :] = 0.0
+        pixels[:, -8:, :] = 0.0
+        pixels[:, :, :8] = 0.0
+        pixels[:, :, -8:] = 0.0
+        self.pipeline.siril = SimpleNamespace(
+            get_image_shape=lambda: (3, 100, 120),
+            get_image_pixeldata=lambda preview=False: pixels,
+        )
+
+        with (
+            patch.object(stage2_view_correction, "_detect_auto_edge_crop") as detect,
+            patch.object(stage2_view_correction, "_edge_color_artifact_crop") as color_crop,
+        ):
+            stage2_view_correction.run_stage2_view_correction(self.pipeline)
+
+        detect.assert_not_called()
+        color_crop.assert_not_called()
+        self.assertEqual(
+            self.pipeline.commands,
+            [("crop", "8", "8", "104", "84")],
+        )
+        self.assertEqual(self.pipeline.stage2_crop_report["mode"], "native_contour")
+        self.assertTrue(
+            self.pipeline.stage2_crop_report["native_contour"]["accepted"]
+        )
+
+    def test_stage2_field_rotation_crop_runs_once_and_skips_edge_chain(self) -> None:
+        no_contour = (
+            None,
+            "native contour crop skipped: full frame valid",
+            {
+                "method": "native_contour",
+                "accepted": False,
+                "reason": "full_frame_is_valid",
+                "candidate": None,
+            },
+        )
+        field_candidate = (
+            (20, 20, 60, 60),
+            "field-rotation coverage crop detected",
+            {
+                "method": "native_field_rotation",
+                "accepted": True,
+                "reason": "edge_connected_field_rotation_confirmed",
+                "candidate": {"x": 20, "y": 20, "width": 60, "height": 60},
+            },
+        )
+        residual_clear = (
+            None,
+            "field-rotation coverage crop skipped: no residual",
+            {
+                "method": "native_field_rotation",
+                "accepted": False,
+                "reason": "no_significant_edge_connected_coverage_anomaly",
+                "candidate": None,
+            },
+        )
+        with (
+            patch.object(
+                stage2_view_correction,
+                "_detect_native_contour_candidate",
+                return_value=no_contour,
+            ),
+            patch.object(
+                stage2_view_correction,
+                "_detect_field_rotation_candidate",
+                side_effect=(field_candidate, residual_clear),
+            ) as field_detect,
+            patch.object(stage2_view_correction, "_detect_auto_edge_crop") as edge_detect,
+            patch.object(stage2_view_correction, "_edge_color_artifact_crop") as color_crop,
+        ):
+            stage2_view_correction.run_stage2_view_correction(self.pipeline)
+
+        self.assertEqual(field_detect.call_count, 2)
+        edge_detect.assert_not_called()
+        color_crop.assert_not_called()
+        self.assertEqual(self.pipeline.commands, [("crop", "8", "8", "84", "84")])
+        self.assertEqual(
+            self.pipeline.stage2_crop_report["mode"],
+            "native_field_rotation",
+        )
+        self.assertFalse(self.pipeline.stage2_crop_report["requires_review"])
+        self.assertFalse(
+            self.pipeline.stage2_crop_report["field_rotation"]["residual"][
+                "accepted"
+            ]
+        )
+
+    def test_stage2_field_rotation_residual_marks_review_without_second_crop(self) -> None:
+        no_contour = (
+            None,
+            "native contour crop skipped: full frame valid",
+            {
+                "method": "native_contour",
+                "accepted": False,
+                "reason": "full_frame_is_valid",
+                "candidate": None,
+            },
+        )
+        field_candidate = (
+            (20, 20, 60, 60),
+            "field-rotation coverage crop detected",
+            {
+                "method": "native_field_rotation",
+                "accepted": True,
+                "reason": "edge_connected_field_rotation_confirmed",
+                "candidate": {"x": 20, "y": 20, "width": 60, "height": 60},
+            },
+        )
+        with (
+            patch.object(
+                stage2_view_correction,
+                "_detect_native_contour_candidate",
+                return_value=no_contour,
+            ),
+            patch.object(
+                stage2_view_correction,
+                "_detect_field_rotation_candidate",
+                side_effect=(field_candidate, field_candidate),
+            ),
+            patch.object(stage2_view_correction, "_detect_auto_edge_crop") as edge_detect,
+        ):
+            stage2_view_correction.run_stage2_view_correction(self.pipeline)
+
+        edge_detect.assert_not_called()
+        self.assertEqual(len(self.pipeline.commands), 1)
+        self.assertTrue(self.pipeline.stage2_crop_report["requires_review"])
+        self.assertTrue(self.pipeline._stage2_view_review_required)
+        self.assertFalse(
+            getattr(self.pipeline, "_background_review_required", False)
+        )
+        self.assertEqual(self.pipeline.results[-1][1], "degraded")
+        self.assertEqual(
+            self.pipeline.stage2_crop_report["reason_code"],
+            "field_rotation_residual_review",
+        )
 
     def test_stage2_center_area_protection_constrains_aggressive_crop(self) -> None:
         shape = {"channels": 3, "height": 100, "width": 100}
@@ -1482,7 +2558,7 @@ class PipelineStageSmokeTests(unittest.TestCase):
         self.assertTrue(crop_report["crops"][-1]["center_protection_limited"])
         self.assertEqual(len(crop_report["crop_limit_hits"]), 1)
 
-    def test_stage2_center_area_protection_keeps_safe_crop_unchanged(self) -> None:
+    def test_stage2_safe_crop_is_expanded_to_even_boundaries(self) -> None:
         shape = {"channels": 3, "height": 100, "width": 100}
         crop_report = {
             "original_shape": shape,
@@ -1507,9 +2583,9 @@ class PipelineStageSmokeTests(unittest.TestCase):
             reason="test_safe_crop",
         )
 
-        self.assertEqual(applied_rect, (2, 3, 95, 94))
-        self.assertEqual(note, "")
-        self.assertEqual(crop_report["crop_limit_hits"], [])
+        self.assertEqual(applied_rect, (2, 2, 96, 96))
+        self.assertIn("center-area protection constrained crop", note)
+        self.assertEqual(len(crop_report["crop_limit_hits"]), 1)
 
     def test_stage2_center_area_protection_is_cfa_alignment_safe(self) -> None:
         shape = {"channels": 3, "height": 3753, "width": 2111}
@@ -1611,45 +2687,26 @@ class PipelineStageSmokeTests(unittest.TestCase):
         ):
             stage5_linear_denoise.run_stage5_linear_denoise(self.pipeline)
 
-        self.assertEqual(self.pipeline.results[-1][1], "ok")
+        self.assertEqual(self.pipeline.results[-1][1], "degraded")
         self.assertTrue((self.process_dir / "stage5_linear.fit").exists())
 
     def test_stage7_stretching_smoke(self) -> None:
-        self.pipeline._ai_stage_advisory_enabled = lambda _name: False
-        self.pipeline._run_stage6_ai_stretching = lambda allow_ai: (
+        self.pipeline._run_stage7_stretching_candidates = lambda: (
             True,
             False,
-            [f"allow_ai={allow_ai}"],
+            ["local candidates"],
             "asinh",
         )
 
-        stage6_stretching.run_stage7_stretching(self.pipeline)
+        stage7_stretching.run_stage7_stretching(self.pipeline)
 
         self.assertEqual(self.pipeline.results[-1][1], "ok")
         self.assertTrue((self.process_dir / "stage7_stretched.fit").exists())
 
-    def test_stage6_star_separation_smoke(self) -> None:
-        (self.process_dir / "stage5_linear.fit").touch()
-        (self.process_dir / "stage7_conservative_asinh.fit").touch()
-        self.pipeline.pre_starless_gate_report = {
-            "ready_for_starless": False,
-            "reason": ["unsafe input"],
-            "recommended_starless_input": "stage7_conservative_asinh.fit",
-        }
-        self.pipeline.cfg.stage7_skip_unready_starless = True
-        self.pipeline._stage7_update_star_remix_from_quality = lambda _record: {}
-        self.pipeline._export_sasp_exchange_files = lambda: None
-        stage7_star_separation.run_stage6_star_separation(self.pipeline)
-
-        self.assertEqual(self.pipeline.results[-1][1], "skipped")
-        self.assertTrue(self.pipeline._stage7_starless_skipped)
-        self.assertIn(("load", "stage5_linear"), self.pipeline.commands)
-        self.assertNotIn(("load", "stage7_conservative_asinh"), self.pipeline.commands)
-
     def test_stage6_star_separation_source_is_always_linear(self) -> None:
         (self.process_dir / "stage5_linear.fit").touch()
 
-        source, mode, records = stage7_star_separation._prepare_star_separation_source(
+        source, mode, records = stage6_star_separation._prepare_star_separation_source(
             self.pipeline
         )
 
@@ -1682,12 +2739,13 @@ class PipelineStageSmokeTests(unittest.TestCase):
 
     def test_stage9_star_remixing_smoke(self) -> None:
         self.pipeline._stage9_bad_starless_reason = lambda: "poor starless"
-        self.pipeline._stage9_review_safe_source = lambda: "stage7_stretched"
+        (self.process_dir / "stage7_review_with_stars.fit").touch()
 
         stage9_star_remixing.run_stage9_star_remixing(self.pipeline)
 
         self.assertEqual(self.pipeline.results[-1][1], "degraded")
         self.assertTrue(self.pipeline._stage9_bypassed_bad_starless)
+        self.assertTrue(self.pipeline._stage9_output_contains_stars)
 
     def test_stage10_export_smoke(self) -> None:
         (self.process_dir / "stage9_remixed.fit").touch()
@@ -1813,6 +2871,94 @@ class PipelineStageSmokeTests(unittest.TestCase):
 
         self.assertIsNone(snapshot)
         self.assertEqual(plan["selected_mode"], "skip")
+
+    def test_stage10_active_denoise_freezes_input_for_protected_merge(self) -> None:
+        pixels = np.full((3, 32, 32), 0.05, dtype=np.float32)
+        pipeline = SimpleNamespace(
+            cfg=PipelineConfig(),
+            log=_Log(),
+            siril=SimpleNamespace(
+                get_image_pixeldata=lambda preview=False: pixels,
+            ),
+            _background_quality_metrics=lambda _image: {
+                "chroma_noise_score": 0.20,
+                "bg_std": 0.025,
+                "background_mottling_score": 0.20,
+            },
+        )
+
+        snapshot, plan = stage10_export._stage10_denoise_input(pipeline)
+
+        self.assertEqual(plan["selected_mode"], "full")
+        self.assertIsNotNone(snapshot)
+        self.assertIsNot(snapshot, pixels)
+        np.testing.assert_array_equal(snapshot, pixels)
+
+    def test_stage10_star_protected_merge_restores_hard_core(self) -> None:
+        original = np.full((3, 12, 12), 0.8, dtype=np.float32)
+        denoised = np.full((3, 12, 12), 0.2, dtype=np.float32)
+        protection = np.zeros((12, 12), dtype=np.float32)
+        protection[5, 5] = 1.0
+        protection[5, 6] = 0.5
+
+        merged = stage10_export._star_protected_denoised_image(
+            original,
+            denoised,
+            protection,
+        )
+
+        np.testing.assert_array_equal(merged[:, 5, 5], original[:, 5, 5])
+        np.testing.assert_array_equal(merged[:, 0, 0], denoised[:, 0, 0])
+        np.testing.assert_allclose(merged[:, 5, 6], 0.5, atol=1e-7)
+
+    def test_stage10_star_protection_uses_validated_stage9_catalog(self) -> None:
+        weak_core = np.zeros((32, 32), dtype=bool)
+        bright_core = np.zeros((32, 32), dtype=bool)
+        weak_core[7, 8] = True
+        bright_core[20, 22] = True
+        pipeline = SimpleNamespace(
+            cfg=PipelineConfig(),
+            _stage9_stars_applied=True,
+            _stage9_star_reference_catalog={
+                "status": "ok",
+                "source_matched": True,
+                "_weak_core_mask": weak_core,
+                "_bright_core_mask": bright_core,
+            },
+        )
+
+        mask, report = stage10_export._build_stage10_star_protection_mask(
+            pipeline,
+            np.zeros((3, 32, 32), dtype=np.float32),
+        )
+
+        self.assertIsNotNone(mask)
+        self.assertEqual(report["status"], "ready")
+        self.assertEqual(float(mask[7, 8]), 1.0)
+        self.assertEqual(float(mask[20, 22]), 1.0)
+        self.assertLessEqual(
+            report["protected_coverage"],
+            report["coverage_max"],
+        )
+
+    def test_stage10_star_protection_fails_closed_without_catalog(self) -> None:
+        pipeline = SimpleNamespace(
+            cfg=PipelineConfig(),
+            _stage9_stars_applied=True,
+            _stage9_star_reference_catalog={
+                "status": "unavailable",
+                "reason": "catalog gate rejected",
+            },
+        )
+
+        mask, report = stage10_export._build_stage10_star_protection_mask(
+            pipeline,
+            np.zeros((3, 32, 32), dtype=np.float32),
+        )
+
+        self.assertIsNone(mask)
+        self.assertEqual(report["status"], "unavailable")
+        self.assertEqual(report["reason"], "catalog gate rejected")
 
     def test_stage10_low_chroma_still_uses_full_for_background_noise(self) -> None:
         plan = stage10_export._select_stage10_denoise_plan(

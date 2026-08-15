@@ -1,4 +1,4 @@
-"""Semantic design tokens and system-aware Qt styling for Seestar."""
+"""Semantic design tokens and system-aware Qt styling for Starun."""
 
 from __future__ import annotations
 
@@ -226,10 +226,10 @@ QFrame#processingParametersSheet, QFrame#logPanel {{
     border: 1px solid {tokens.border};
     border-radius: 8px;
 }}
-QFrame#sidebarPanel {{
+QFrame#sidebarPanel, QFrame#inspectorPanel {{
     background-color: {tokens.surface_subtle};
-    border: 1px solid {tokens.border};
-    border-radius: 8px;
+    border: none;
+    border-radius: 0;
 }}
 QFrame#phaseBar {{
     background-color: {tokens.surface_subtle};
@@ -289,11 +289,20 @@ QPushButton[variant="destructive"] {{
     border-color: {tokens.error};
     font-weight: 600;
 }}
+QPushButton[variant="destructive"]:disabled {{
+    background-color: {tokens.surface_subtle};
+    color: {tokens.disabled};
+    border-color: {tokens.border};
+}}
 QPushButton[variant="quiet"] {{
     background-color: transparent;
     border-color: transparent;
 }}
 QPushButton[variant="quiet"]:hover {{
+    background-color: {tokens.selection};
+    border-color: transparent;
+}}
+QPushButton[variant="quiet"]:checked {{
     background-color: {tokens.selection};
     border-color: transparent;
 }}
@@ -416,8 +425,11 @@ QProgressBar::chunk {{
     background-color: {tokens.accent};
     border-radius: 3px;
 }}
-QSplitter::handle {{ background-color: transparent; }}
-QSplitter::handle:hover {{ background-color: {tokens.border}; }}
+QSplitter::handle {{
+    background-color: {tokens.border};
+    margin: 0 2px;
+}}
+QSplitter::handle:hover {{ background-color: {tokens.border_strong}; }}
 QScrollArea {{ background-color: transparent; border: none; }}
 QScrollArea > QWidget > QWidget {{ background-color: transparent; }}
 QLabel[role="phase"] {{
@@ -430,6 +442,11 @@ QLabel[role="summary"] {{
     padding: 8px 2px;
     color: {tokens.text_muted};
     border-bottom: 1px solid {tokens.border};
+}}
+QLabel#sidebarPrimary {{
+    padding: 2px 2px 6px 2px;
+    font-size: 14px;
+    font-weight: 650;
 }}
 QLabel[role="phase"][active="true"] {{
     color: {tokens.accent_text};
@@ -541,7 +558,7 @@ class ThemeController(QObject):
             )
         self.app.setPalette(palette)
         self.app.setStyleSheet(build_stylesheet(self.tokens, self.profile))
-        self.app.setProperty("seestarTheme", self.tokens.name)
+        self.app.setProperty("starunTheme", self.tokens.name)
 
     @Slot(object)
     def _scheme_changed(self, _scheme: object) -> None:
@@ -554,11 +571,11 @@ def install_application_theme(
 ) -> ThemeController:
     """Install and retain the system-aware theme controller on ``app``."""
 
-    existing = getattr(app, "_seestar_theme_controller", None)
+    existing = getattr(app, "_starun_theme_controller", None)
     if isinstance(existing, ThemeController):
         return existing
     controller = ThemeController(app, profile)
-    app._seestar_theme_controller = controller  # type: ignore[attr-defined]
+    app._starun_theme_controller = controller  # type: ignore[attr-defined]
     return controller
 
 

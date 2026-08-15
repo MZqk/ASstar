@@ -2,7 +2,6 @@
 """Regression tests for durable plan/result provenance helpers."""
 from __future__ import annotations
 
-import json
 import os
 import sys
 import tempfile
@@ -30,80 +29,8 @@ class RunManifestTests(unittest.TestCase):
                     cancel_check=lambda: True,
                 )
 
-    def _write_result_manifest(
-        self,
-        root: Path,
-        checkpoint: Path,
-        *,
-        state: str = "linear",
-    ) -> None:
-        payload = {
-            "schema": "seestar.pipeline-result.v1",
-            "status": "success",
-            "plan_hash": "plan-hash",
-            "checkpoints": {
-                "result_linear": {
-                    **run_manifest.file_record(checkpoint, base_dir=root),
-                    "state": state,
-                }
-            },
-        }
-        payload["manifest_hash"] = run_manifest.canonical_payload_hash(payload)
-        run_manifest.atomic_write_json(root / "pipeline-result.json", payload)
-
-    def test_matching_signed_linear_checkpoint_is_verified(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            checkpoint = root / "result_linear.fit"
-            checkpoint.write_bytes(b"linear-checkpoint")
-            self._write_result_manifest(root, checkpoint)
-
-            result = run_manifest.verify_resume_provenance(
-                work_dir=root,
-                input_path=checkpoint,
-                checkpoint_name="result_linear",
-            )
-
-        self.assertTrue(result["verified"])
-        self.assertEqual(result["state"], "linear")
-        self.assertEqual(result["plan_hash"], "plan-hash")
-
-    def test_modified_checkpoint_is_not_verified(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            checkpoint = root / "result_linear.fit"
-            checkpoint.write_bytes(b"linear-checkpoint")
-            self._write_result_manifest(root, checkpoint)
-            checkpoint.write_bytes(b"modified")
-
-            result = run_manifest.verify_resume_provenance(
-                work_dir=root,
-                input_path=checkpoint,
-                checkpoint_name="result_linear",
-            )
-
-        self.assertFalse(result["verified"])
-        self.assertIn("does not match", result["detail"])
-
-    def test_tampered_manifest_is_not_verified(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            checkpoint = root / "result_linear.fit"
-            checkpoint.write_bytes(b"linear-checkpoint")
-            self._write_result_manifest(root, checkpoint)
-            manifest_path = root / "pipeline-result.json"
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-            payload["checkpoints"]["result_linear"]["state"] = "unknown"
-            run_manifest.atomic_write_json(manifest_path, payload)
-
-            result = run_manifest.verify_resume_provenance(
-                work_dir=root,
-                input_path=checkpoint,
-                checkpoint_name="result_linear",
-            )
-
-        self.assertFalse(result["verified"])
-        self.assertIn("manifest hash", result["detail"])
+    def test_result_only_resume_helper_is_removed(self) -> None:
+        self.assertFalse(hasattr(run_manifest, "verify_resume_provenance"))
 
     def test_sensitive_config_values_are_redacted_recursively(self) -> None:
         redacted = run_manifest.redact_sensitive(
@@ -141,7 +68,7 @@ class RunManifestTests(unittest.TestCase):
             durable_files = (
                 root / "processing-plan.json",
                 root / "result_linear.fit",
-                root / "seestar_diagnostics.zip",
+                root / "starun_diagnostics.zip",
             )
             for path in durable_files:
                 path.write_bytes(path.name.encode("utf-8"))

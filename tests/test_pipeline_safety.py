@@ -30,17 +30,17 @@ if "sirilpy" not in sys.modules:
     sys.modules["sirilpy.exceptions"] = exceptions
 
 from pipeline_safety import (  # noqa: E402
-    clamp_ai_color_adjustments,
     clamp_saturation_boost,
     color_safety_limits,
     should_bypass_star_separation,
     should_skip_final_denoise,
 )
 from models import StarSeparationState  # noqa: E402
-from stages.stage6_stretching import run_stage7_stretching  # noqa: E402
-from stages.stage7_star_separation import run_stage6_star_separation  # noqa: E402
+from stages.stage7_stretching import run_stage7_stretching  # noqa: E402
+from stages.stage6_star_separation import run_stage6_star_separation  # noqa: E402
 from stages.stage8_nebula_enhancement import run_stage8_nebula_enhancement  # noqa: E402
 from stages.stage9_star_remixing import run_stage9_star_remixing  # noqa: E402
+from sirilpy.exceptions import CommandError  # noqa: E402
 
 
 class _Log:
@@ -74,14 +74,13 @@ class _StarPreservePipeline:
         self.starmask_file = None
         self.pipeline_policy = {}
         self.color_calibration_report = {}
-        self.pre_starless_gate_report = {}
         self.reports: dict[str, object] = {}
         self.records: list[tuple[str, str, float, str]] = []
         self.commands: list[tuple[object, ...]] = []
         self._star_preserve_target_bypass = False
         self._stage7_starless_skipped = False
         self._stage8_conservative_mode = False
-        self._stage8_final_source = "starless_enhanced"
+        self._stage8_final_source = "stage8_enhanced"
         self._stage8_final_quality = "unknown"
         self._stage8_fallback_used = False
         self._stage9_final_source = ""
@@ -93,12 +92,14 @@ class _StarPreservePipeline:
 
     def _save_stage_output(self, stem: str) -> bool:
         (self.process_dir / f"{stem}.fit").write_bytes(b"FIT")
-        if stem == "stage7_starless":
-            (self.process_dir / "stage6_starless.fit").write_bytes(b"FIT")
         return True
 
     def _active_target_type(self) -> str:
         return "globular_cluster"
+
+    @staticmethod
+    def _short_text(value: object, limit: int) -> str:
+        return str(value)[:limit]
 
     def _write_stage_json(self, name: str, payload: object) -> None:
         self.reports[name] = payload
@@ -178,27 +179,6 @@ class PipelineSafetyTests(unittest.TestCase):
             0.02,
         )
 
-    def test_stage11_color_adjustments_obey_remaining_budget_and_gain_caps(self) -> None:
-        limits = {
-            "max_saturation_boost": 0.10,
-            "red_gain_limit": 1.05,
-            "blue_gain_limit": 0.90,
-        }
-        adjusted = clamp_ai_color_adjustments(
-            {
-                "global_saturation_delta": 0.08,
-                "red_balance_delta": 0.08,
-                "blue_balance_delta": 0.08,
-                "background_protection": 0.9,
-            },
-            already_applied=0.06,
-            limits=limits,
-        )
-
-        self.assertAlmostEqual(adjusted["global_saturation_delta"], 0.04)
-        self.assertAlmostEqual(adjusted["red_balance_delta"], 0.05)
-        self.assertAlmostEqual(adjusted["blue_balance_delta"], 0.0)
-
     def test_final_denoise_skips_only_after_safe_later_quality(self) -> None:
         self.assertTrue(
             should_skip_final_denoise(
@@ -257,9 +237,118 @@ class PipelineSafetyTests(unittest.TestCase):
             self.assertEqual(pipeline._stage9_final_source, "stage8_enhanced")
             self.assertTrue((pipeline.process_dir / "stage9_remixed.fit").exists())
 
+    def test_target_bypass_rejected_stage7_keeps_with_stars_review_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline = _StarPreservePipeline(Path(tmpdir))
+            run_stage6_star_separation(pipeline)
+            pipeline._stage7_stretch_accepted = False
+            pipeline._stage7_stretch_output = None
+            pipeline._stage7_review_source = "stage7_review_with_stars"
+            (pipeline.process_dir / "stage7_review_with_stars.fit").write_bytes(
+                b"FIT"
+            )
+
+            command_start = len(pipeline.commands)
+            run_stage8_nebula_enhancement(pipeline)
+
+            stage8_commands = pipeline.commands[command_start:]
+            loaded_stems = [
+                str(command[1])
+                for command in stage8_commands
+                if command and command[0] == "load" and len(command) > 1
+            ]
+            self.assertEqual(loaded_stems, ["stage7_review_with_stars"])
+            self.assertNotIn("starless", loaded_stems)
+            self.assertNotIn("stage6_starless", loaded_stems)
+            self.assertEqual(
+                pipeline._stage8_final_source,
+                "stage8_review_with_stars",
+            )
+            stage8_report = pipeline.reports["stage8_enhancement_report.json"]
+            self.assertEqual(
+                stage8_report["handoff"]["reason_code"],
+                "stage7_stretch_not_accepted_target_bypass",
+            )
+            self.assertTrue(stage8_report["handoff"]["restricted_downstream"])
+
+            run_stage9_star_remixing(pipeline)
+
+            self.assertTrue(pipeline._stage9_bypassed_bad_starless)
+            self.assertFalse(pipeline._stage9_stars_required)
+            self.assertEqual(
+                pipeline._stage9_stars_application_mode,
+                "not_required_star_preserve_review",
+            )
+            self.assertEqual(pipeline.records[-1][1], "degraded")
+
+    def test_target_bypass_rejected_stage7_withholds_when_no_with_stars_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline = _StarPreservePipeline(Path(tmpdir))
+            run_stage6_star_separation(pipeline)
+            pipeline._stage7_stretch_accepted = False
+            pipeline._stage7_stretch_output = None
+            pipeline._stage7_review_source = "missing_stage7_review_with_stars"
+            pipeline._stage6_passthrough_source = "missing_stage6_passthrough"
+            (pipeline.process_dir / "stage6_passthrough.fit").unlink()
+            original_cmd_with_check = pipeline.cmd_with_check
+
+            def checked_cmd_with_check(*args: object) -> None:
+                if args and args[0] == "load" and len(args) > 1:
+                    pipeline.commands.append(args)
+                    source_path = pipeline.process_dir / f"{args[1]}.fit"
+                    if not source_path.exists():
+                        raise CommandError(
+                            f"missing with-stars source: {args[1]}"
+                        )
+                    return
+                original_cmd_with_check(*args)
+
+            pipeline.cmd_with_check = checked_cmd_with_check
+
+            command_start = len(pipeline.commands)
+            run_stage8_nebula_enhancement(pipeline)
+
+            loaded_stems = [
+                str(command[1])
+                for command in pipeline.commands[command_start:]
+                if command and command[0] == "load" and len(command) > 1
+            ]
+            self.assertNotIn("starless", loaded_stems)
+            self.assertNotIn("stage6_starless", loaded_stems)
+            self.assertEqual(pipeline.records[-1][1], "failed")
+            self.assertIsNone(
+                pipeline.reports["stage8_enhancement_report.json"]["source"]
+            )
+            self.assertEqual(
+                pipeline._stage8_final_source,
+                "stage8_review_with_stars",
+            )
+
+            run_stage9_star_remixing(pipeline)
+
+            self.assertTrue(pipeline._stage9_bypassed_bad_starless)
+            self.assertTrue(pipeline._stage9_output_withheld)
+            self.assertEqual(
+                pipeline._stage9_stars_application_mode,
+                "with_stars_review_source_unavailable",
+            )
+            self.assertEqual(pipeline.records[-1][1], "failed")
+            self.assertFalse(
+                (pipeline.process_dir / "stage9_remixed.fit").exists()
+            )
+
     def test_star_tool_failure_uses_with_stars_review_path_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             pipeline = _StarFailurePipeline(Path(tmpdir))
+            stale_starless_artifacts = (
+                "starless.fit",
+                "starless_ai_best_initial.fit",
+                "stage6_starless.fit",
+                "stage6_starless_repaired.fit",
+                "starmask_raw.fit",
+            )
+            for name in stale_starless_artifacts:
+                (pipeline.process_dir / name).write_bytes(b"STALE")
 
             run_stage6_star_separation(pipeline)
 
@@ -270,8 +359,12 @@ class PipelineSafetyTests(unittest.TestCase):
             self.assertIsNone(pipeline.starless_file)
             self.assertIsNone(pipeline.starmask_file)
             self.assertTrue((pipeline.process_dir / "stage6_passthrough.fit").exists())
-            self.assertFalse((pipeline.process_dir / "starless.fit").exists())
-            self.assertFalse((pipeline.process_dir / "stage6_starless.fit").exists())
+            self.assertTrue(
+                all(
+                    not (pipeline.process_dir / name).exists()
+                    for name in stale_starless_artifacts
+                )
+            )
 
             run_stage7_stretching(pipeline)
             self.assertFalse(pipeline._stage7_stretch_accepted)

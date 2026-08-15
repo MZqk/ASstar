@@ -1,5 +1,5 @@
 {
-  "schema": "seestar.siril-spcc-database-seed.v1",
+  "schema": "starun.siril-spcc-database-seed.v1",
   "source": {
     "repository": "https://gitlab.com/free-astro/siril-spcc-database",
     "commit": "3426f0939d53d4d3a1b4c8e620a6faf8212bda32",
@@ -20,19 +20,67 @@
       "path": "VERSION.txt",
       "kind": "version",
       "label": "Pinned source and bundled entry list",
-      "sha256": "cba518b47c32cfe64848ef7c6285f2a869d5895adb6bf03d0c5dcc59343adb6c"
+      "sha256": "90eb05b7ab9572ee5ed0b95053c7c39bda02222faa228414589a9c8b760bdc55"
     },
     {
       "path": "SHA256SUMS",
       "kind": "integrity",
       "label": "Bundled upstream file checksums",
-      "sha256": "c1211031591b2a4449ad52e58a98a22f60c4bfedceccd070378799960030f471"
+      "sha256": "1ae09b103a9d0627b4030979de7670f4d69e088e8b072e5b63581cab2bf46156"
+    },
+    {
+      "path": "osc_sensors/Sony_IMX415.json",
+      "kind": "osc_sensor",
+      "label": "Sony IMX415",
+      "sha256": "db9cfdaa2a713f24b900cc83f8619fc9396e9fccded3e0aed6a7bc973cf115df"
+    },
+    {
+      "path": "osc_sensors/Sony_IMX462.json",
+      "kind": "osc_sensor",
+      "label": "Sony IMX462",
+      "sha256": "3298fde69e7dcd2f6a8317e8c74126d62194bc583b699ce9492a14818205d689"
     },
     {
       "path": "osc_sensors/Sony_IMX585.json",
       "kind": "osc_sensor",
       "label": "Sony IMX585",
       "sha256": "6ee341b9cb3b0f7e950deea9d4d5dc9dd833a23626c0548619bd0d342a849a14"
+    },
+    {
+      "path": "osc_sensors/Sony_IMX662.json",
+      "kind": "osc_sensor",
+      "label": "Sony IMX662",
+      "sha256": "b1b673c085f4537ca3f37805824c8348ba47eecd39bf2b105ec723a319cd7684"
+    },
+    {
+      "path": "osc_sensors/Sony_IMX678.json",
+      "kind": "osc_sensor",
+      "label": "Sony IMX678",
+      "sha256": "36f22ddff63b8ef555f0d54f9d9de8cb86ff64076c88231920e202681f247229"
+    },
+    {
+      "path": "osc_sensors/ZWO_Seestar_S30.json",
+      "kind": "osc_sensor",
+      "label": "ZWO Seestar S30",
+      "sha256": "d72f8253be70578fc5b61ddb57037ece30f393865c0e69212da31592a8195b95"
+    },
+    {
+      "path": "osc_sensors/ZWO_Seestar_S50.json",
+      "kind": "osc_sensor",
+      "label": "ZWO Seestar S50",
+      "sha256": "0c7f5386a13c748104f7ba10b593b7c930a8cb3424a9853ca0d6a29e9144f3a3"
+    },
+    {
+      "path": "osc_filters/UV-IR-Block.json",
+      "kind": "osc_filter",
+      "label": "UV/IR Block",
+      "sha256": "1dc2d866e3c4097fb27d5da41b7e4efef0fa6d119442539c00b4ba319ee61ee1"
+    },
+    {
+      "path": "osc_filters/DWARFLAB_Dwarf_Mini_Astro.json",
+      "kind": "osc_filter",
+      "label": "Dwarf Mini Astro",
+      "sha256": "2959a2ba47add948504ea5d850f2f755a186f88031c027f38ffb0be1c8ac1593"
     },
     {
       "path": "osc_filters/ZWO_Seestar_LP.json",

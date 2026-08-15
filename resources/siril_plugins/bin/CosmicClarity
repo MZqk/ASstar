@@ -1,6 +1,6 @@
 #!/bin/sh
 ''':'
-PY="${SEESTAR_SIRIL_PYTHON_CLI:-${SIRIL_PYTHON_CLI:-python3}}"
+PY="${STARUN_SIRIL_PYTHON_CLI:-${SIRIL_PYTHON_CLI:-python3}}"
 case "$PY" in
   ""|0|1|true|false|yes|no|on|off) PY="python3" ;;
 esac
@@ -51,7 +51,7 @@ def _add_bundled_wheel(plugin_root: Path) -> None:
         )
     wheel = wheels[0]
     extract_root = plugin_root / "cosmic_clarity_runtime" / "wheels" / wheel.stem
-    marker = extract_root / ".seestar_extracted"
+    marker = extract_root / ".starun_extracted"
     if not marker.exists() or marker.read_text(encoding="utf-8", errors="ignore") != wheel.name:
         extract_root.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(wheel) as zf:
@@ -89,7 +89,7 @@ def _add_runtime_site_packages() -> None:
             / "siril"
             / "venv"
         )
-    for key in ("SIRIL_PYTHON_CLI", "SEESTAR_SIRIL_PYTHON_CLI"):
+    for key in ("SIRIL_PYTHON_CLI", "STARUN_SIRIL_PYTHON_CLI"):
         raw = os.environ.get(key, "").strip()
         if not raw:
             continue

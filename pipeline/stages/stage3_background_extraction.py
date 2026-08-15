@@ -6,6 +6,8 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+
 from background_sampling import (
     STAGE3_PROCESS_EVIDENCE_SCHEMA,
     assess_background_process,
@@ -34,6 +36,8 @@ from stage3_contract import (
     STAGE3_MIN_SPATIAL_QUADRANTS,
     STAGE3_MIN_VALIDATION_PATCHES,
     STAGE3_SIGNIFICANCE_SIGMA,
+    normalize_stage3_gate_profile,
+    stage3_gate_thresholds,
     stage3_static_contract_manifest,
 )
 
@@ -50,6 +54,7 @@ DEFAULT_FAINT_NEBULA_AREA_MIN = 0.10
 DEFAULT_FAINT_NEBULA_STRUCTURE_MIN = 0.40
 DEFAULT_NEBULA_PRESERVATION_WEIGHT = 1.6
 DEFAULT_FAINT_NEBULA_PRESERVATION_WEIGHT_MAX = 2.5
+STAGE3_PRIMARY_GRAXPERT_LABEL = "GraXpert-AI BGE CPU"
 
 
 def _stage3_candidate_stem(label: str) -> str:
@@ -185,6 +190,7 @@ def _stage3_preservation_penalty(
     diffuse_context: Optional[Dict[str, Any]] = None,
     stage3_policy: Optional[Dict[str, Any]] = None,
     nebula_weight: Optional[float] = None,
+    gate_profile: str = "output_first",
 ) -> float:
     if not isinstance(preservation, dict) or not preservation.get("available"):
         return 0.0
@@ -199,7 +205,10 @@ def _stage3_preservation_penalty(
     if target_flux_retention is not None:
         try:
             retention = float(target_flux_retention)
-            penalty += max(0.0, 1.0 - retention) * nebula_weight
+            if normalize_stage3_gate_profile(gate_profile) == "strict":
+                penalty += max(0.0, 1.0 - retention) * nebula_weight
+            else:
+                penalty += abs(1.0 - retention) * nebula_weight
         except (TypeError, ValueError):
             pass
     else:
@@ -235,11 +244,33 @@ def _stage3_candidate_sufficient(
     after: Dict[str, Any],
     score: float,
     stage3_policy: Optional[Dict[str, Any]] = None,
+    gate_profile: str = "output_first",
 ) -> bool:
     before = before or {}
     after = after or {}
-    max_score = _stage3_policy_float(stage3_policy, "sufficient_max_background_score", 0.34, minimum=0.0)
-    dirty_max = _stage3_policy_float(stage3_policy, "sufficient_dirty_score_max", 0.32, minimum=0.0)
+    profile = normalize_stage3_gate_profile(gate_profile)
+    thresholds = stage3_gate_thresholds(profile)
+    strict = bool(thresholds.get("strict_legacy"))
+    max_score = (
+        _stage3_policy_float(
+            stage3_policy,
+            "sufficient_max_background_score",
+            float(thresholds["sufficient_max_background_score"]),
+            minimum=0.0,
+        )
+        if strict
+        else float(thresholds["sufficient_max_background_score"])
+    )
+    dirty_max = (
+        _stage3_policy_float(
+            stage3_policy,
+            "sufficient_dirty_score_max",
+            float(thresholds["sufficient_dirty_score_max"]),
+            minimum=0.0,
+        )
+        if strict
+        else float(thresholds["sufficient_dirty_score_max"])
+    )
     dirty_gradient_ratio = _stage3_policy_float(
         stage3_policy,
         "sufficient_dirty_gradient_retention_ratio",
@@ -266,19 +297,27 @@ def _stage3_candidate_sufficient(
         minimum=0.0,
         maximum=1.5,
     )
-    max_std_growth = _stage3_policy_float(
-        stage3_policy,
-        "max_bg_std_growth",
-        1.08,
-        minimum=1.0,
-        maximum=2.0,
+    max_std_growth = (
+        _stage3_policy_float(
+            stage3_policy,
+            "max_bg_std_growth",
+            float(thresholds["sufficient_max_bg_std_growth"]),
+            minimum=1.0,
+            maximum=2.0,
+        )
+        if strict
+        else float(thresholds["sufficient_max_bg_std_growth"])
     )
-    color_shift_max = _stage3_policy_float(
-        stage3_policy,
-        "sufficient_color_shift_max",
-        0.18,
-        minimum=0.0,
-        maximum=2.0,
+    color_shift_max = (
+        _stage3_policy_float(
+            stage3_policy,
+            "sufficient_color_shift_max",
+            float(thresholds["sufficient_color_shift_max"]),
+            minimum=0.0,
+            maximum=2.0,
+        )
+        if strict
+        else float(thresholds["sufficient_color_shift_max"])
     )
     dirty = float(after.get("dirty_background_score", 0.0) or 0.0)
     gradient_before = float(before.get("gradient_score", 0.0) or 0.0)
@@ -286,7 +325,7 @@ def _stage3_candidate_sufficient(
     before_std = max(float(before.get("bg_std", 0.0) or 0.0), 1e-7)
     after_std = float(after.get("bg_std", 0.0) or 0.0)
     color_shift = _stage3_color_shift(before, after)
-    return score <= max_score and not (
+    sufficient = score <= max_score and not (
         dirty > dirty_max and gradient_after >= max(gradient_before * dirty_gradient_ratio, dirty_gradient_floor)
     ) and not (
         gradient_before >= initial_gradient_min and gradient_after > gradient_before * high_gradient_ratio
@@ -294,6 +333,14 @@ def _stage3_candidate_sufficient(
         after_std / before_std > max_std_growth
     ) and not (
         color_shift > color_shift_max
+    )
+    if strict:
+        return sufficient
+    return bool(
+        score <= max_score
+        and dirty <= dirty_max
+        and after_std / before_std <= max_std_growth
+        and color_shift <= color_shift_max
     )
 
 
@@ -386,19 +433,22 @@ def _stage3_graxpert_candidates(pipeline=None) -> List[Tuple[str, Tuple[str, ...
             script_arg = _stage3_quote_arg(pipeline, script)
             return [
                 (
-                    "GraXpert",
-                    ("pyscript", script_arg, "-bge", "-correction", "subtraction", "-smoothing", "0.50"),
-                    "graxpert",
-                ),
-                (
-                    "GraXpert-BGE",
-                    ("pyscript", script_arg, "-bge", "-correction", "subtraction", "-smoothing", "0.35"),
+                    STAGE3_PRIMARY_GRAXPERT_LABEL,
+                    ("pyscript", script_arg, "-bge", "-nogpu"),
                     "graxpert",
                 ),
             ]
+        # Do not present a native alias as the preferred task: the Stage3
+        # contract specifically requires the Python script with -bge -nogpu.
+        # Native aliases remain ordinary backups when that exact task cannot
+        # be constructed.
+        return [
+            ("GraXpert native command", ("gxp",), "graxpert"),
+            ("GraXpert native alias", ("graxpert",), "graxpert"),
+        ]
     return [
-        ("GraXpert", ("gxp",), "graxpert"),
-        ("GraXpert-BGE", ("graxpert",), "graxpert"),
+        ("GraXpert native command", ("gxp",), "graxpert"),
+        ("GraXpert native alias", ("graxpert",), "graxpert"),
     ]
 
 
@@ -424,8 +474,6 @@ def _stage3_theoretical_plugin_candidates(pipeline=None) -> List[Tuple[str, Tupl
     return [
         *_stage3_graxpert_candidates(pipeline),
         *background_plugins,
-        ("NOX", ("nox",), "plugin"),
-        ("VeraLux NOX", ("veralux_nox",), "plugin"),
     ]
 
 
@@ -437,6 +485,16 @@ def _stage3_background_candidate_chain(
     poly_first: bool,
 ) -> Tuple[List[Tuple[str, Tuple[str, ...], str]], List[str], str]:
     plugin_attempts = _stage3_theoretical_plugin_candidates(pipeline)
+    primary_attempts = [
+        record
+        for record in plugin_attempts
+        if record[2] == "graxpert"
+    ]
+    backup_plugin_attempts = [
+        record
+        for record in plugin_attempts
+        if record[2] != "graxpert"
+    ]
     if poly_first:
         builtin_attempts = poly_attempt + rbf_attempts
         builtin_order_reason = "diffuse_signal_safe_samples_poly_before_rbf"
@@ -444,10 +502,32 @@ def _stage3_background_candidate_chain(
         builtin_attempts = rbf_attempts + poly_attempt
         builtin_order_reason = "safe_samples_rbf_before_poly"
 
-    # Custom, audited samples are the primary Stage 3 contract. Plugins remain
-    # bounded fallbacks if Siril cannot consume the samples or the candidate is
-    # rejected by the same preservation gate.
-    chain = builtin_attempts + plugin_attempts
+    cfg = getattr(pipeline, "cfg", None)
+    backend_policy = str(
+        getattr(cfg, "stage3_backend_policy", "auto_chain")
+    )
+    plugin_fallback_enabled = bool(
+        getattr(cfg, "stage3_plugin_fallback_enabled", True)
+    )
+    if backend_policy == "graxpert_only":
+        primary_attempts = [
+            record for record in plugin_attempts if record[2] == "graxpert"
+        ]
+        builtin_attempts = []
+        backup_plugin_attempts = []
+        chain = primary_attempts
+    elif backend_policy == "builtin_only":
+        primary_attempts = []
+        backup_plugin_attempts = []
+        chain = builtin_attempts
+    elif not plugin_fallback_enabled:
+        primary_attempts = []
+        backup_plugin_attempts = []
+        chain = builtin_attempts
+    else:
+        # Audited built-in models own the default route. GraXpert and the
+        # remaining external plugins are conditional output-oriented backups.
+        chain = builtin_attempts + primary_attempts + backup_plugin_attempts
 
     seen = set()
     ordered: List[Tuple[str, Tuple[str, ...], str]] = []
@@ -457,6 +537,12 @@ def _stage3_background_candidate_chain(
             continue
         seen.add(key)
         ordered.append((label, command, source))
+
+    attempt_limit = int(
+        getattr(cfg, "stage3_candidate_attempt_limit", 0) or 0
+    )
+    if attempt_limit > 0:
+        ordered = ordered[:attempt_limit]
 
     if hasattr(pipeline, "log"):
         pipeline.log.info(
@@ -517,6 +603,66 @@ def _stage3_image_fingerprint(pipeline) -> Optional[str]:
         return None
 
 
+def _stage3_candidate_pixel_gate(
+    baseline_image: Any,
+    candidate_image: Any,
+    *,
+    gate_profile: str = "output_first",
+) -> Tuple[bool, Dict[str, Any]]:
+    """Hard-reject unusable or byte-for-byte unchanged candidate pixels."""
+    profile = normalize_stage3_gate_profile(gate_profile)
+    thresholds = stage3_gate_thresholds(profile)
+    if baseline_image is None:
+        return True, {
+            "status": "not_enforced",
+            "accepted": True,
+            "severity": "normal",
+            "warnings": [],
+            "hard_issues": [],
+            "issues": [],
+            "profile": profile,
+            "effective_thresholds": thresholds,
+            "reason": "baseline pixels are unavailable for legacy caller",
+        }
+    hard_issues: List[str] = []
+    try:
+        baseline = np.asarray(baseline_image)
+        candidate = np.asarray(candidate_image)
+    except (TypeError, ValueError) as error:
+        hard_issues.append(f"candidate pixels are unreadable: {error}")
+        baseline = np.asarray([])
+        candidate = np.asarray([])
+    if not hard_issues:
+        if baseline.ndim < 2 or candidate.ndim < 2:
+            hard_issues.append("candidate image dimensions are invalid")
+        elif candidate.shape != baseline.shape:
+            hard_issues.append(
+                "candidate image dimensions changed "
+                f"({tuple(candidate.shape)} != {tuple(baseline.shape)})"
+            )
+        elif not bool(np.all(np.isfinite(candidate))):
+            hard_issues.append("candidate image contains non-finite pixels")
+        elif not bool(np.all(np.isfinite(baseline))):
+            hard_issues.append("Stage 3 baseline contains non-finite pixels")
+        elif bool(np.array_equal(candidate, baseline)):
+            hard_issues.append("candidate command did not change any pixels")
+    accepted = not hard_issues
+    return accepted, {
+        "status": "accepted" if accepted else "rejected",
+        "accepted": accepted,
+        "severity": "normal" if accepted else "hard_rejected",
+        "warnings": [],
+        "hard_issues": hard_issues,
+        "issues": list(hard_issues),
+        "profile": profile,
+        "effective_thresholds": thresholds,
+        "baseline_shape": (
+            list(baseline.shape) if getattr(baseline, "ndim", 0) else None
+        ),
+        "candidate_shape": (
+            list(candidate.shape) if getattr(candidate, "ndim", 0) else None
+        ),
+    }
 def _stage3_try_background_command(
     pipeline,
     label: str,
@@ -606,14 +752,21 @@ def _stage3_decision_thresholds(
 ) -> Dict[str, Any]:
     """Freeze the effective Stage 3 decision and ranking thresholds."""
     contract = stage3_static_contract_manifest()
+    gate_profile = normalize_stage3_gate_profile(
+        getattr(getattr(pipeline, "cfg", None), "stage3_gate_profile", "output_first")
+    )
+    gate_thresholds = stage3_gate_thresholds(gate_profile)
+    strict = bool(gate_thresholds.get("strict_legacy"))
     return {
         **contract,
+        "active_gate_profile": gate_profile,
+        "active_gate_thresholds": gate_thresholds,
         "safe_samples": {
             "target_count": _stage3_cfg_int(
                 pipeline, "stage3_safe_sample_target_count", 40, 16, 64
             ),
             "minimum_count": _stage3_cfg_int(
-                pipeline, "stage3_safe_sample_min_count", 16, 12, 48
+                pipeline, "stage3_safe_sample_min_count", 12, 12, 48
             ),
             "patch_radius": _stage3_cfg_int(
                 pipeline, "stage3_safe_sample_patch_radius", 12, 4, 24
@@ -637,29 +790,29 @@ def _stage3_decision_thresholds(
             "maximum_background_score": _stage3_policy_float(
                 stage3_policy,
                 "sufficient_max_background_score",
-                0.34,
+                float(gate_thresholds["sufficient_max_background_score"]),
                 minimum=0.0,
-            ),
+            ) if strict else float(gate_thresholds["sufficient_max_background_score"]),
             "maximum_dirty_score": _stage3_policy_float(
                 stage3_policy,
                 "sufficient_dirty_score_max",
-                0.32,
+                float(gate_thresholds["sufficient_dirty_score_max"]),
                 minimum=0.0,
-            ),
+            ) if strict else float(gate_thresholds["sufficient_dirty_score_max"]),
             "maximum_bg_std_growth": _stage3_policy_float(
                 stage3_policy,
                 "max_bg_std_growth",
-                1.08,
+                float(gate_thresholds["sufficient_max_bg_std_growth"]),
                 minimum=1.0,
                 maximum=2.0,
-            ),
+            ) if strict else float(gate_thresholds["sufficient_max_bg_std_growth"]),
             "maximum_color_shift": _stage3_policy_float(
                 stage3_policy,
                 "sufficient_color_shift_max",
-                0.18,
+                float(gate_thresholds["sufficient_color_shift_max"]),
                 minimum=0.0,
                 maximum=2.0,
-            ),
+            ) if strict else float(gate_thresholds["sufficient_color_shift_max"]),
         },
         "compound_candidate": {
             "minimum_span_improvement_ratio": _stage3_cfg_float(
@@ -705,23 +858,26 @@ def _stage3_decision_thresholds(
         },
         "final_output_revalidation": {
             "enforced_for_profiled_runs": True,
-            "heldout_span_improvement": "strictly_greater_than_three_sigma",
-            "background_rms": "not_worse_beyond_three_sigma",
-            "maximum_bg_std_growth_warning": _stage3_policy_float(
-                stage3_policy,
-                "max_bg_std_growth",
-                1.10,
-                minimum=1.0,
-                maximum=2.0,
+            "gate_profile": gate_profile,
+            "three_sigma_action": (
+                "hard_reject" if strict else "soft_warning"
+            ),
+            "hard_thresholds": gate_thresholds,
+            "maximum_bg_std_growth_warning": float(
+                gate_thresholds["sufficient_max_bg_std_growth"]
             ),
         },
-        "statistical_selection_shadow": {
-            "method": "pareto_dense_rank_sum_v1",
-            "runtime_selection_affected": False,
+        "statistical_selection": {
+            "method": "pareto_dense_rank_sum_v2",
+            "runtime_selection_affected": True,
             "lower_is_better": [
                 "residual_span_significance_sigma",
-                "target_preservation_penalty",
+                "target_flux_deviation",
+                "target_morphology_loss",
+                "target_centroid_shift_fraction",
+                "target_change_residual_significance",
                 "directional_pattern_penalty",
+                "soft_warning_count",
             ],
         },
     }
@@ -731,39 +887,63 @@ def _stage3_statistical_shadow_selection(
     candidates: List[Dict[str, Any]],
     current_selected: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Compare a statistical/Pareto order without changing runtime selection."""
+    """Return the deterministic runtime Pareto/statistical candidate order."""
     current_label = str((current_selected or {}).get("label") or "") or None
     rows: List[Dict[str, Any]] = []
     for index, candidate in enumerate(candidates):
+        if str(candidate.get("severity") or "") == "hard_rejected":
+            continue
         validation = candidate.get("validation") or {}
         gate = candidate.get("validation_gate") or {}
-        if validation.get("status") != "ready" or gate.get("accepted") is False:
+        if gate.get("accepted") is False:
             continue
-        try:
-            residual_span = float(validation["robust_span"])
-            span_standard_error = float(
-                background_span_standard_error(validation)
-            )
-            preservation_penalty = float(
-                candidate.get("preservation_penalty", 0.0) or 0.0
-            )
-            pattern_penalty = float(
-                candidate.get("directional_pattern_penalty", 0.0) or 0.0
-            )
-            runtime_score = float(candidate.get("score", 999.0))
-        except (KeyError, TypeError, ValueError):
-            continue
-        values = (
-            residual_span,
-            span_standard_error,
-            preservation_penalty,
-            pattern_penalty,
-            runtime_score,
+        preservation = candidate.get("preservation") or {}
+
+        def finite_value(value: Any, default: float) -> float:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return default
+            return parsed if math.isfinite(parsed) else default
+
+        residual_span = finite_value(validation.get("robust_span"), 999.0)
+        span_standard_error = finite_value(
+            background_span_standard_error(validation)
+            if validation.get("status") == "ready"
+            else None,
+            1.0,
         )
-        if not all(math.isfinite(value) for value in values):
-            continue
         if span_standard_error <= 0.0:
-            continue
+            span_standard_error = 1.0
+        retention = finite_value(
+            preservation.get("target_flux_retention_ratio"),
+            1.0,
+        )
+        morphology = finite_value(
+            preservation.get("target_morphology_correlation"),
+            1.0,
+        )
+        centroid = max(
+            0.0,
+            finite_value(preservation.get("target_centroid_shift_fraction"), 0.0),
+        )
+        structure = max(
+            0.0,
+            finite_value(
+                preservation.get("target_change_residual_significance"),
+                0.0,
+            ),
+        )
+        pattern_penalty = max(
+            0.0,
+            finite_value(candidate.get("directional_pattern_penalty"), 0.0),
+        )
+        runtime_score = finite_value(candidate.get("score"), 999.0)
+        gate_warnings = list(candidate.get("gate_warnings") or [])
+        soft_warning_count = len(gate_warnings)
+        candidate_tier = 0 if not gate_warnings and bool(
+            candidate.get("sufficient", True)
+        ) else 1
         uncertainty_3sigma = gate.get("sampling_uncertainty_3sigma")
         span_improvement = gate.get("span_improvement")
         improvement_sigma = None
@@ -783,6 +963,10 @@ def _stage3_statistical_shadow_selection(
                 "candidate_index": index,
                 "label": str(candidate.get("label") or f"candidate_{index + 1}"),
                 "source": candidate.get("source"),
+                "chain_index": index,
+                "candidate_tier": candidate_tier,
+                "soft_warning_count": soft_warning_count,
+                "gate_warnings": gate_warnings,
                 "runtime_selected": str(candidate.get("label") or "")
                 == current_label,
                 "residual_span": residual_span,
@@ -791,7 +975,10 @@ def _stage3_statistical_shadow_selection(
                     residual_span / span_standard_error
                 ),
                 "span_improvement_sigma": improvement_sigma,
-                "target_preservation_penalty": preservation_penalty,
+                "target_flux_deviation": abs(retention - 1.0),
+                "target_morphology_loss": max(0.0, 1.0 - morphology),
+                "target_centroid_shift_fraction": centroid,
+                "target_change_residual_significance": structure,
                 "directional_pattern_penalty": pattern_penalty,
                 "runtime_background_score": runtime_score,
             }
@@ -800,16 +987,22 @@ def _stage3_statistical_shadow_selection(
     if not rows:
         return {
             "status": "unavailable",
-            "method": "pareto_dense_rank_sum_v1",
-            "runtime_selection_affected": False,
+            "method": "pareto_dense_rank_sum_v2",
+            "runtime_selection_affected": True,
             "current_runtime_candidate": current_label,
             "reason": "no candidate has complete held-out statistical evidence",
             "candidates": [],
         }
 
+    best_tier = min(int(row["candidate_tier"]) for row in rows)
+    eligible_rows = [row for row in rows if int(row["candidate_tier"]) == best_tier]
     criteria = (
+        "soft_warning_count",
         "residual_span_significance_sigma",
-        "target_preservation_penalty",
+        "target_flux_deviation",
+        "target_morphology_loss",
+        "target_centroid_shift_fraction",
+        "target_change_residual_significance",
         "directional_pattern_penalty",
     )
 
@@ -821,18 +1014,18 @@ def _stage3_statistical_shadow_selection(
 
     pareto_labels = [
         str(row["label"])
-        for row in rows
+        for row in eligible_rows
         if not any(
             other is not row and dominates(other, row)
-            for other in rows
+            for other in eligible_rows
         )
     ]
     for key in criteria:
-        ordered_values = sorted({float(row[key]) for row in rows})
+        ordered_values = sorted({float(row[key]) for row in eligible_rows})
         ranks = {value: rank for rank, value in enumerate(ordered_values)}
-        for row in rows:
+        for row in eligible_rows:
             row[f"{key}_rank"] = ranks[float(row[key])]
-    for row in rows:
+    for row in eligible_rows:
         row["balanced_rank_sum"] = sum(
             int(row[f"{key}_rank"])
             for key in criteria
@@ -840,20 +1033,21 @@ def _stage3_statistical_shadow_selection(
         row["pareto_front"] = str(row["label"]) in pareto_labels
 
     shadow_order = sorted(
-        rows,
+        eligible_rows,
         key=lambda row: (
             int(row["balanced_rank_sum"]),
             not bool(row["pareto_front"]),
             float(row["residual_span_significance_sigma"]),
             float(row["runtime_background_score"]),
-            str(row["label"]),
+            int(row["chain_index"]),
         ),
     )
     proposed_label = str(shadow_order[0]["label"])
     return {
         "status": "ready",
-        "method": "pareto_dense_rank_sum_v1",
-        "runtime_selection_affected": False,
+        "method": "pareto_dense_rank_sum_v2",
+        "runtime_selection_affected": True,
+        "selected_tier": best_tier,
         "current_runtime_candidate": current_label,
         "shadow_recommended_candidate": proposed_label,
         "selection_would_change": bool(
@@ -868,23 +1062,35 @@ def _stage3_statistical_shadow_selection(
 def _stage3_final_output_validation(
     pipeline,
     *,
+    baseline_image: Any,
     baseline_validation: Dict[str, Any],
     validation_points: List[Tuple[float, float]],
     patch_radius: int,
     minimum_count: int,
     enforced: bool,
 ) -> Dict[str, Any]:
-    """Re-run the held-out hard gate on the reloaded, saved final buffer."""
+    """Re-run the active profile gate on the reloaded, saved final buffer."""
     report: Dict[str, Any] = {
         "status": "not_enforced" if not enforced else "running",
         "enforced": bool(enforced),
-        "evidence_basis": "reloaded_saved_output_heldout_sky_three_sigma",
+        "evidence_basis": "reloaded_saved_output_active_stage3_gate_profile",
     }
     if not enforced:
         report["reason"] = "legacy caller has no profiled production input"
         return report
     try:
         image = pipeline.siril.get_image_pixeldata(preview=False)
+        pixel_gate_ok, pixel_gate = _stage3_candidate_pixel_gate(
+            baseline_image,
+            image,
+            gate_profile=normalize_stage3_gate_profile(
+                getattr(
+                    getattr(pipeline, "cfg", None),
+                    "stage3_gate_profile",
+                    "output_first",
+                )
+            ),
+        )
         candidate_validation = measure_background_validation(
             image,
             validation_points,
@@ -901,6 +1107,24 @@ def _stage3_final_output_validation(
         TypeError,
         ValueError,
     ) as error:
+        profile = normalize_stage3_gate_profile(
+            getattr(
+                getattr(pipeline, "cfg", None),
+                "stage3_gate_profile",
+                "output_first",
+            )
+        )
+        pixel_gate_ok = False
+        pixel_gate = {
+            "status": "rejected",
+            "accepted": False,
+            "severity": "hard_rejected",
+            "warnings": [],
+            "hard_issues": [f"final saved output pixels are unavailable: {error}"],
+            "issues": [f"final saved output pixels are unavailable: {error}"],
+            "profile": profile,
+            "effective_thresholds": stage3_gate_thresholds(profile),
+        }
         candidate_validation = {
             "status": "unavailable",
             "reason": str(error),
@@ -908,11 +1132,22 @@ def _stage3_final_output_validation(
     accepted, gate = assess_single_background_validation(
         baseline_validation,
         candidate_validation,
+        gate_profile=normalize_stage3_gate_profile(
+            getattr(getattr(pipeline, "cfg", None), "stage3_gate_profile", "output_first")
+        ),
     )
+    if not pixel_gate_ok:
+        accepted = False
     report.update(
         {
             "status": "accepted" if accepted else "rejected",
             "accepted": accepted,
+            "severity": (
+                "hard_rejected"
+                if not pixel_gate_ok or not accepted
+                else str(gate.get("severity") or "normal")
+            ),
+            "pixel_integrity_gate": pixel_gate,
             "validation": candidate_validation,
             "validation_gate": gate,
         }
@@ -1070,6 +1305,9 @@ def _stage3_clear_background_samples(pipeline) -> None:
 def _stage3_install_safe_background_samples(
     pipeline,
     points: List[Tuple[float, float]],
+    *,
+    minimum_count: Optional[int] = None,
+    sample_contract: str = "safe_background",
 ) -> Tuple[bool, Dict[str, Any]]:
     """Install and audit Siril's recalculated sample set before ``-existing``.
 
@@ -1077,20 +1315,48 @@ def _stage3_install_safe_background_samples(
     recalculated.  That is not itself a failure: the returned set remains
     usable only when every surviving coordinate came from the audited request,
     the configured minimum is retained, and its spatial coverage is still
-    sufficient.  Unknown samples or collapsed coverage fail closed.
+    sufficient.  ``minimum_count`` belongs to the caller's sampling contract:
+    the ordinary candidate chain uses the global safe-sample minimum, while a
+    compound Polynomial→RBF fit uses its smaller, separately validated fit
+    minimum.  Unknown samples or collapsed coverage fail closed.
     """
+    if minimum_count is None:
+        try:
+            required_count = int(
+                getattr(
+                    getattr(pipeline, "cfg", None),
+                    "stage3_safe_sample_min_count",
+                    12,
+                )
+            )
+        except (TypeError, ValueError):
+            required_count = 12
+    else:
+        try:
+            required_count = int(minimum_count)
+        except (TypeError, ValueError):
+            required_count = STAGE3_MIN_VALIDATION_PATCHES
+    required_count = max(
+        STAGE3_MIN_VALIDATION_PATCHES,
+        min(64, required_count),
+    )
+    contract_name = str(sample_contract or "safe_background")
     setter = getattr(pipeline.siril, "set_image_bgsamples", None)
     if not points:
         return False, {
             "status": "unavailable",
             "installed": False,
             "reason": "safe background sample set is empty",
+            "sample_contract": contract_name,
+            "minimum_count": required_count,
         }
     if not callable(setter):
         return False, {
             "status": "unsupported",
             "installed": False,
             "reason": "Siril Python API does not expose set_image_bgsamples",
+            "sample_contract": contract_name,
+            "minimum_count": required_count,
         }
     try:
         _stage3_clear_background_samples(pipeline)
@@ -1147,24 +1413,11 @@ def _stage3_install_safe_background_samples(
                     "Siril returned background samples outside the audited set"
                 )
 
-            try:
-                minimum_count = int(
-                    getattr(
-                        getattr(pipeline, "cfg", None),
-                        "stage3_safe_sample_min_count",
-                        16,
-                    )
-                )
-            except (TypeError, ValueError):
-                minimum_count = 16
-            minimum_count = max(
-                STAGE3_MIN_VALIDATION_PATCHES,
-                min(64, minimum_count),
-            )
-            if observed_count < minimum_count:
+            if observed_count < required_count:
                 raise RuntimeError(
                     "Siril retained too few audited background samples: "
-                    f"minimum={minimum_count} observed={observed_count}"
+                    f"contract={contract_name} minimum={required_count} "
+                    f"observed={observed_count}"
                 )
 
             requested_x = [float(point[0]) for point in points]
@@ -1222,6 +1475,8 @@ def _stage3_install_safe_background_samples(
             "siril_rejected_positions": rejected_positions,
             "observed_coverage": observed_coverage,
             "command_contract": "subsky -existing",
+            "sample_contract": contract_name,
+            "minimum_count": required_count,
         }
     except (
         AttributeError,
@@ -1238,6 +1493,8 @@ def _stage3_install_safe_background_samples(
             "installed": False,
             "sample_count": len(points),
             "reason": str(error),
+            "sample_contract": contract_name,
+            "minimum_count": required_count,
         }
 
 
@@ -1701,12 +1958,12 @@ def _stage3_background_decision(
 def run_stage3_background_extraction(pipeline) -> None:
     """
     阶段 3: 背景提取
-    - 先生成空间分布安全样点，并以 subsky -existing 建模低频天空梯度
-    - 单阶段内置候选均不充分时，可在冻结验证门下尝试 Polynomial→残差RBF
-    - 复合候选不适用、失败或仍不充分时，再尝试 GraXpert / ADBE / DBE / NOX 回退
+    - 先评估目标感知的内置 Polynomial/RBF 候选
+    - 内置候选不足时依次评估复合模型、GraXpert 和外部插件
+    - 输出优先门禁将一般偏差降为软告警，仅过度异常硬拒绝
     - 条纹和 walking noise 与天空梯度分流，禁止用背景模型静默吞掉结构噪声
     - 每个候选成功后执行质量门控，避免过度扣背景
-    - 候选命令失败或未达到充分质量时，继续 fallback 到下一个候选
+    - 候选命令失败或未达到充分质量时，继续尝试下一个备用候选
     """
     stage_label = PipelineStage.BACKGROUND_EXTRACTION.label
     pipeline.log.stage_start(stage_label)
@@ -1723,11 +1980,15 @@ def run_stage3_background_extraction(pipeline) -> None:
     policy = getattr(pipeline, "pipeline_policy", {}) or {}
     policy_name = policy.get("policy_name", "generic_low_snr_safe") if isinstance(policy, dict) else "generic_low_snr_safe"
     stage3_policy = policy.get("stage3_background", {}) if isinstance(policy, dict) else {}
+    gate_profile = normalize_stage3_gate_profile(
+        getattr(pipeline.cfg, "stage3_gate_profile", "output_first")
+    )
     decision_thresholds = _stage3_decision_thresholds(pipeline, stage3_policy)
     pipeline.log.info(
         "[Stage3] Background policy: "
         f"policy={policy_name} protect_nebulosity={bool(stage3_policy.get('protect_nebulosity', False))} "
-        f"model={','.join(stage3_policy.get('model_priority', []) or [])}"
+        f"model={','.join(stage3_policy.get('model_priority', []) or [])} "
+        f"gate_profile={gate_profile}"
     )
 
     baseline_stem = "stage3_bg_input"
@@ -1822,6 +2083,7 @@ def run_stage3_background_extraction(pipeline) -> None:
     graxpert_runtime_error = False
     graxpert_error_reasons: List[str] = []
     selected_label = ""
+    selected_gate_warnings: List[str] = []
     selected_pattern_report: Dict[str, Any] = {}
     builtin_order_reason = "safe_samples_rbf_before_poly"
     builtin_search_mode = "safe_samples_primary"
@@ -1852,14 +2114,23 @@ def run_stage3_background_extraction(pipeline) -> None:
     compound_selected_degraded = False
     selection_shadow: Dict[str, Any] = {
         "status": "not_run",
-        "method": "pareto_dense_rank_sum_v1",
-        "runtime_selection_affected": False,
+        "method": "pareto_dense_rank_sum_v2",
+        "runtime_selection_affected": True,
     }
     final_output_validation: Dict[str, Any] = {
         "status": "not_run",
         "enforced": False,
     }
     final_output_validation_rejected = False
+    failure_action = str(
+        getattr(pipeline.cfg, "stage3_failure_action", "auto_fallback")
+    )
+    candidate_attempt_limit = max(
+        0,
+        int(getattr(pipeline.cfg, "stage3_candidate_attempt_limit", 0) or 0),
+    )
+    policy_abort_candidate_search = False
+    policy_abort_reason = ""
     attempted_selected_label = ""
 
     target_profile = getattr(pipeline, "target_profile", {}) or {}
@@ -1897,7 +2168,7 @@ def run_stage3_background_extraction(pipeline) -> None:
             min_count=_stage3_cfg_int(
                 pipeline,
                 "stage3_safe_sample_min_count",
-                16,
+                12,
                 12,
                 48,
             ),
@@ -1949,22 +2220,22 @@ def run_stage3_background_extraction(pipeline) -> None:
             minimum_total=_stage3_cfg_int(
                 pipeline,
                 "stage3_compound_min_sample_count",
-                32,
-                32,
+                12,
+                12,
                 64,
             ),
             minimum_fit=_stage3_cfg_int(
                 pipeline,
                 "stage3_compound_fit_min_count",
-                24,
-                24,
+                8,
+                8,
                 56,
             ),
             minimum_validation=_stage3_cfg_int(
                 pipeline,
                 "stage3_compound_validation_min_count",
-                8,
-                8,
+                4,
+                4,
                 20,
             ),
         )
@@ -1982,8 +2253,8 @@ def run_stage3_background_extraction(pipeline) -> None:
                 minimum_count=_stage3_cfg_int(
                     pipeline,
                     "stage3_compound_validation_min_count",
-                    8,
-                    8,
+                    4,
+                    4,
                     20,
                 ),
             )
@@ -2102,8 +2373,42 @@ def run_stage3_background_extraction(pipeline) -> None:
             "pre_route_decision": dict(background_decision),
             "noise_route": noise_route,
         }
+    elif noise_route.get("requires_review") and str(
+        background_decision.get("decision") or "review_required"
+    ) != "apply":
+        background_decision = {
+            **background_decision,
+            "decision": "review_required",
+            "source": "pattern_noise_router",
+            "confidence": max(
+                float(background_decision.get("confidence") or 0.0),
+                float(pattern_report.get("pattern_score") or 0.0),
+            ),
+            "reason": str(
+                noise_route.get("reason")
+                or "directional pattern noise requires review"
+            ),
+            "pre_route_decision": dict(background_decision),
+            "noise_route": noise_route,
+        }
     else:
         background_decision["noise_route"] = noise_route
+    user_preserve = (
+        str(getattr(pipeline.cfg, "stage3_processing_mode", "auto"))
+        == "preserve"
+    )
+    if user_preserve:
+        diagnostic_decision = dict(background_decision)
+        if str(diagnostic_decision.get("decision") or "") == "review_required":
+            pipeline._background_review_required = True
+        background_decision = {
+            **background_decision,
+            "decision": "preserve",
+            "source": "user_processing_parameters",
+            "confidence": 1.0,
+            "reason": "user requested background preservation",
+            "diagnostic_decision": diagnostic_decision,
+        }
     pipeline._stage3_background_decision = background_decision
     decision = str(background_decision.get("decision") or "review_required")
     pipeline.log.info(
@@ -2137,7 +2442,7 @@ def run_stage3_background_extraction(pipeline) -> None:
                     "model_used": None,
                     "candidate_order": [],
                     "attempts": [],
-                    "selection_shadow": {
+                    "selection": {
                         **selection_shadow,
                         "status": "not_applicable",
                         "reason": f"decision={decision}",
@@ -2192,6 +2497,8 @@ def run_stage3_background_extraction(pipeline) -> None:
                 if not stage_saved
                 else "background_not_required"
                 if decision == "skip"
+                else "user_preserve"
+                if user_preserve
                 else "background_not_required_after_process_validation"
                 if decision == "preserve"
                 else "pattern_noise_deferred"
@@ -2256,6 +2563,7 @@ def run_stage3_background_extraction(pipeline) -> None:
         stop_on_sufficient: bool = True,
     ) -> bool:
         nonlocal baseline_saved, graxpert_runtime_error
+        nonlocal policy_abort_candidate_search, policy_abort_reason
         phase_sufficient = False
         if not baseline_saved:
             pipeline.log.warn(
@@ -2263,6 +2571,15 @@ def run_stage3_background_extraction(pipeline) -> None:
             )
             return False
         for label, command, source in attempts:
+            if (
+                candidate_attempt_limit > 0
+                and len(attempt_records) >= candidate_attempt_limit
+            ):
+                pipeline.log.info(
+                    "[Stage3] Candidate attempt limit reached; "
+                    f"skip remaining {phase} candidates"
+                )
+                break
             if not restore_baseline(f"before:{label}"):
                 pipeline.log.warn(
                     f"[Stage3] Stop {phase}: unable to establish clean baseline "
@@ -2285,6 +2602,24 @@ def run_stage3_background_extraction(pipeline) -> None:
                     _stage3_install_safe_background_samples(
                         pipeline,
                         installed_points,
+                        minimum_count=(
+                            _stage3_cfg_int(
+                                pipeline,
+                                "stage3_compound_fit_min_count",
+                                8,
+                                8,
+                                56,
+                            )
+                            if source == "builtin"
+                            and compound_split_report.get("status") == "ready"
+                            else None
+                        ),
+                        sample_contract=(
+                            "compound_fit"
+                            if source == "builtin"
+                            and compound_split_report.get("status") == "ready"
+                            else "safe_background"
+                        ),
                     )
                 )
                 if not sample_ok:
@@ -2305,6 +2640,12 @@ def run_stage3_background_extraction(pipeline) -> None:
                         "不会让 subsky 自动重采样"
                     )
                     if not restore_baseline(f"sample_install_failed:{label}"):
+                        break
+                    if failure_action != "auto_fallback":
+                        policy_abort_candidate_search = True
+                        policy_abort_reason = (
+                            f"{label}: safe background samples unavailable"
+                        )
                         break
                     continue
             else:
@@ -2363,6 +2704,12 @@ def run_stage3_background_extraction(pipeline) -> None:
                 )
                 if not restore_baseline(f"failed:{label}"):
                     break
+                if failure_action != "auto_fallback":
+                    policy_abort_candidate_search = True
+                    policy_abort_reason = (
+                        f"{label}: {failure_reason or 'candidate command failed'}"
+                    )
+                    break
                 continue
 
             after_feat = pipeline._stage3_measure_features(label)
@@ -2375,11 +2722,17 @@ def run_stage3_background_extraction(pipeline) -> None:
                 before_image,
                 after_image,
             )
+            pixel_gate_ok, pixel_gate = _stage3_candidate_pixel_gate(
+                before_image,
+                after_image,
+                gate_profile=gate_profile,
+            )
             fidelity_ok, fidelity_gate = assess_target_fidelity(
                 preservation,
                 low_complexity_required=bool(
                     process_report.get("low_complexity_required", False)
                 ),
+                gate_profile=gate_profile,
             )
             fidelity_enforced = isinstance(input_profile, dict)
             gate_ok, gate_msg = pipeline._stage3_quality_gate(
@@ -2392,6 +2745,13 @@ def run_stage3_background_extraction(pipeline) -> None:
                 issues = ", ".join(fidelity_gate.get("issues") or [])
                 gate_msg = (
                     f"{gate_msg}; target fidelity gate rejected"
+                    + (f": {issues}" if issues else "")
+                )
+            if fidelity_enforced and not pixel_gate_ok:
+                gate_ok = False
+                issues = ", ".join(pixel_gate.get("hard_issues") or [])
+                gate_msg = (
+                    f"{gate_msg}; candidate pixel integrity gate rejected"
                     + (f": {issues}" if issues else "")
                 )
             if pattern_routing_enabled and after_image is not None:
@@ -2427,6 +2787,7 @@ def run_stage3_background_extraction(pipeline) -> None:
                     0.02,
                     0.40,
                 ),
+                gate_profile=gate_profile,
             )
             if not pattern_ok:
                 gate_ok = False
@@ -2453,8 +2814,8 @@ def run_stage3_background_extraction(pipeline) -> None:
                     minimum_count=_stage3_cfg_int(
                         pipeline,
                         "stage3_compound_validation_min_count",
-                        8,
-                        8,
+                        4,
+                        4,
                         20,
                     ),
                     value_scale=baseline_validation.get("value_scale"),
@@ -2467,6 +2828,7 @@ def run_stage3_background_extraction(pipeline) -> None:
             validation_ok, validation_gate = assess_single_background_validation(
                 baseline_validation,
                 candidate_validation,
+                gate_profile=gate_profile,
             )
             validation_enforced = isinstance(input_profile, dict)
             if validation_enforced and not validation_ok:
@@ -2487,21 +2849,42 @@ def run_stage3_background_extraction(pipeline) -> None:
                 required_adaptive_metrics.issubset(before_adaptive)
                 and required_adaptive_metrics.issubset(after_adaptive_candidate)
             )
-            color_shift_limit = _stage3_policy_float(
-                stage3_policy,
-                "sufficient_color_shift_max",
-                0.18,
-                minimum=0.0,
-                maximum=2.0,
+            color_shift_limit = float(
+                stage3_gate_thresholds(gate_profile)["sufficient_color_shift_max"]
+            )
+            gate_warnings = list(
+                dict.fromkeys(
+                    [
+                        *(
+                            fidelity_gate.get("warnings") or []
+                            if fidelity_enforced
+                            else []
+                        ),
+                        *(
+                            validation_gate.get("warnings") or []
+                            if validation_enforced
+                            else []
+                        ),
+                        *(
+                            pattern_gate_report.get("warnings") or []
+                            if pattern_routing_enabled
+                            else []
+                        ),
+                    ]
+                )
             )
             hard_gate_metrics_available = bool(
                 before_feat is not None
                 and after_feat is not None
                 and after_image is not None
+                and pixel_gate_ok
                 and preservation.get("available")
                 and adaptive_metrics_available
-                and color_shift <= color_shift_limit
                 and (not validation_enforced or validation_ok)
+                and (
+                    not validation_enforced
+                    or candidate_validation.get("status") == "ready"
+                )
                 and (
                     not pattern_routing_enabled
                     or (
@@ -2515,9 +2898,21 @@ def run_stage3_background_extraction(pipeline) -> None:
                 "source": source,
                 "phase": phase,
                 "command": list(command),
-                "status": "accepted" if gate_ok else "rejected",
+                "status": (
+                    "accepted_with_warnings"
+                    if gate_ok and gate_warnings
+                    else ("accepted" if gate_ok else "rejected")
+                ),
+                "severity": (
+                    "soft_warning"
+                    if gate_ok and gate_warnings
+                    else ("normal" if gate_ok else "hard_rejected")
+                ),
+                "gate_profile": gate_profile,
+                "gate_warnings": gate_warnings,
                 "quality_message": gate_msg,
                 "preservation": preservation,
+                "pixel_integrity_gate": pixel_gate,
                 "target_fidelity_gate": fidelity_gate,
                 "target_fidelity_enforced": fidelity_enforced,
                 "safe_samples": sample_install_report,
@@ -2537,6 +2932,10 @@ def run_stage3_background_extraction(pipeline) -> None:
                 )
                 if not restore_baseline(f"rejected:{label}"):
                     break
+                if failure_action != "auto_fallback":
+                    policy_abort_candidate_search = True
+                    policy_abort_reason = f"{label}: {gate_msg}"
+                    break
                 continue
 
             candidate_stem = _stage3_candidate_stem(label)
@@ -2555,6 +2954,7 @@ def run_stage3_background_extraction(pipeline) -> None:
                 diffuse_context=diffuse_context,
                 stage3_policy=stage3_policy,
                 nebula_weight=nebula_preservation_weight,
+                gate_profile=gate_profile,
             )
             pattern_penalty = max(
                 0.0,
@@ -2570,9 +2970,21 @@ def run_stage3_background_extraction(pipeline) -> None:
                 after_adaptive_candidate,
                 candidate_score,
                 stage3_policy,
+                gate_profile,
             )
+            if not sufficient:
+                gate_warnings = list(
+                    dict.fromkeys(
+                        gate_warnings
+                        + ["candidate does not meet clean-output sufficiency thresholds"]
+                    )
+                )
+            record_status = "accepted_with_warnings" if gate_warnings else "accepted"
             record.update(
                 {
+                    "status": record_status,
+                    "severity": "soft_warning" if gate_warnings else "normal",
+                    "gate_warnings": gate_warnings,
                     "candidate_stem": candidate_stem if candidate_saved else None,
                     "base_background_score": base_candidate_score,
                     "background_score_components": background_score_components,
@@ -2602,6 +3014,7 @@ def run_stage3_background_extraction(pipeline) -> None:
                         "score": candidate_score,
                         "quality_message": gate_msg,
                         "preservation": preservation,
+                        "pixel_integrity_gate": pixel_gate,
                         "target_fidelity_gate": fidelity_gate,
                         "target_fidelity_enforced": fidelity_enforced,
                         "directional_pattern_noise": after_pattern_report,
@@ -2613,16 +3026,21 @@ def run_stage3_background_extraction(pipeline) -> None:
                         "validation_enforced": validation_enforced,
                         "hard_gate_metrics_available": hard_gate_metrics_available,
                         "sufficient": sufficient,
+                        "severity": "soft_warning" if gate_warnings else "normal",
+                        "gate_profile": gate_profile,
+                        "gate_warnings": gate_warnings,
                     }
                 )
             if not restore_baseline(f"evaluated:{label}"):
                 break
+            clean_sufficient = bool(sufficient and not gate_warnings)
             if sufficient and candidate_saved:
                 pipeline.log.info(
-                    f"背景提取候选足够干净: {label} score={candidate_score:.3f}"
+                    f"背景提取候选{'足够干净' if clean_sufficient else '带软告警可用'}: "
+                    f"{label} score={candidate_score:.3f}"
                 )
-                phase_sufficient = True
-                if stop_on_sufficient:
+                phase_sufficient = phase_sufficient or clean_sufficient
+                if stop_on_sufficient and clean_sufficient:
                     break
                 pipeline.log.info(
                     f"{label} 已合格；继续评估剩余候选以保护弥散星云"
@@ -2804,6 +3222,14 @@ def run_stage3_background_extraction(pipeline) -> None:
             poly_ok, poly_samples = _stage3_install_safe_background_samples(
                 pipeline,
                 compound_fit_points,
+                minimum_count=_stage3_cfg_int(
+                    pipeline,
+                    "stage3_compound_fit_min_count",
+                    8,
+                    8,
+                    56,
+                ),
+                sample_contract="compound_fit_polynomial",
             )
             if not poly_ok:
                 return reject(
@@ -2861,8 +3287,8 @@ def run_stage3_background_extraction(pipeline) -> None:
                 minimum_count=_stage3_cfg_int(
                     pipeline,
                     "stage3_compound_validation_min_count",
-                    8,
-                    8,
+                    4,
+                    4,
                     20,
                 ),
                 value_scale=baseline_validation.get("value_scale"),
@@ -2879,6 +3305,14 @@ def run_stage3_background_extraction(pipeline) -> None:
             rbf_ok, rbf_samples = _stage3_install_safe_background_samples(
                 pipeline,
                 compound_fit_points,
+                minimum_count=_stage3_cfg_int(
+                    pipeline,
+                    "stage3_compound_fit_min_count",
+                    8,
+                    8,
+                    56,
+                ),
+                sample_contract="compound_fit_rbf",
             )
             if not rbf_ok:
                 return reject(
@@ -2925,11 +3359,17 @@ def run_stage3_background_extraction(pipeline) -> None:
                 before_image,
                 after_image,
             )
+            pixel_gate_ok, pixel_gate = _stage3_candidate_pixel_gate(
+                before_image,
+                after_image,
+                gate_profile=gate_profile,
+            )
             fidelity_ok, fidelity_gate = assess_target_fidelity(
                 preservation,
                 low_complexity_required=bool(
                     process_report.get("low_complexity_required", False)
                 ),
+                gate_profile=gate_profile,
             )
             fidelity_enforced = isinstance(input_profile, dict)
             gate_ok, gate_message = pipeline._stage3_quality_gate(
@@ -2942,6 +3382,13 @@ def run_stage3_background_extraction(pipeline) -> None:
                 issues = ", ".join(fidelity_gate.get("issues") or [])
                 gate_message = (
                     f"{gate_message}; target fidelity gate rejected"
+                    + (f": {issues}" if issues else "")
+                )
+            if fidelity_enforced and not pixel_gate_ok:
+                gate_ok = False
+                issues = ", ".join(pixel_gate.get("hard_issues") or [])
+                gate_message = (
+                    f"{gate_message}; candidate pixel integrity gate rejected"
                     + (f": {issues}" if issues else "")
                 )
             if pattern_routing_enabled and after_image is not None:
@@ -2977,6 +3424,7 @@ def run_stage3_background_extraction(pipeline) -> None:
                     0.02,
                     0.40,
                 ),
+                gate_profile=gate_profile,
             )
             if not pattern_ok:
                 gate_ok = False
@@ -3002,15 +3450,12 @@ def run_stage3_background_extraction(pipeline) -> None:
                 required_adaptive_metrics.issubset(before_adaptive)
                 and required_adaptive_metrics.issubset(after_adaptive_candidate)
             )
-            color_shift_limit = _stage3_policy_float(
-                stage3_policy,
-                "sufficient_color_shift_max",
-                0.18,
-                minimum=0.0,
-                maximum=2.0,
+            color_shift_limit = float(
+                stage3_gate_thresholds(gate_profile)["sufficient_color_shift_max"]
             )
             if color_shift > color_shift_limit:
-                gate_ok = False
+                if gate_profile == "strict":
+                    gate_ok = False
                 gate_message = (
                     f"{gate_message}; color shift "
                     f"{color_shift:.3f}>{color_shift_limit:.3f}"
@@ -3019,9 +3464,9 @@ def run_stage3_background_extraction(pipeline) -> None:
                 before_feat is not None
                 and after_feat is not None
                 and after_image is not None
+                and pixel_gate_ok
                 and preservation.get("available")
                 and adaptive_metrics_available
-                and color_shift <= color_shift_limit
                 and (
                     not pattern_routing_enabled
                     or (
@@ -3030,10 +3475,11 @@ def run_stage3_background_extraction(pipeline) -> None:
                     )
                 )
             )
-            if not hard_gate_metrics_available:
+            missing_metric_warning = "compound hard-gate metrics unavailable"
+            if not hard_gate_metrics_available and gate_profile == "strict":
                 gate_ok = False
                 gate_message = (
-                    f"{gate_message}; compound hard-gate metrics unavailable"
+                    f"{gate_message}; {missing_metric_warning}"
                 )
             candidate_validation = (
                 measure_background_validation(
@@ -3049,8 +3495,8 @@ def run_stage3_background_extraction(pipeline) -> None:
                     minimum_count=_stage3_cfg_int(
                         pipeline,
                         "stage3_compound_validation_min_count",
-                        8,
-                        8,
+                        4,
+                        4,
                         20,
                     ),
                     value_scale=baseline_validation.get("value_scale"),
@@ -3066,6 +3512,7 @@ def run_stage3_background_extraction(pipeline) -> None:
                 "validation": candidate_validation,
                 "quality_message": gate_message,
                 "preservation": preservation,
+                "pixel_integrity_gate": pixel_gate,
                 "target_fidelity_gate": fidelity_gate,
                 "target_fidelity_enforced": fidelity_enforced,
                 "directional_pattern_noise": after_pattern_report,
@@ -3095,6 +3542,7 @@ def run_stage3_background_extraction(pipeline) -> None:
                 diffuse_context=diffuse_context,
                 stage3_policy=stage3_policy,
                 nebula_weight=nebula_preservation_weight,
+                gate_profile=gate_profile,
             )
             pattern_penalty = max(
                 0.0,
@@ -3132,6 +3580,7 @@ def run_stage3_background_extraction(pipeline) -> None:
                         0.05,
                         0.15,
                     ),
+                    gate_profile=gate_profile,
                 )
             )
             score_ok, score_gate = _stage3_compound_score_gate(
@@ -3166,7 +3615,29 @@ def run_stage3_background_extraction(pipeline) -> None:
                     "score_gate": score_gate,
                 }
             )
-            if not validation_ok:
+            gate_warnings = list(
+                dict.fromkeys(
+                    [
+                        *(fidelity_gate.get("warnings") or []),
+                        *(pattern_gate_report.get("warnings") or []),
+                        *(validation_gate.get("warnings") or []),
+                        *(
+                            [missing_metric_warning]
+                            if not hard_gate_metrics_available
+                            and gate_profile != "strict"
+                            else []
+                        ),
+                        *(
+                            [
+                                f"color shift {color_shift:.3f}>{color_shift_limit:.3f}"
+                            ]
+                            if color_shift > color_shift_limit
+                            else []
+                        ),
+                    ]
+                )
+            )
+            if not validation_ok and gate_profile == "strict":
                 return reject(
                     "validation_rejected",
                     "; ".join(validation_gate.get("issues") or [
@@ -3174,7 +3645,11 @@ def run_stage3_background_extraction(pipeline) -> None:
                     ]),
                     **common_details,
                 )
-            if not score_ok:
+            if not validation_ok:
+                gate_warnings.extend(validation_gate.get("issues") or [
+                    "compound held-out validation did not show sufficient improvement"
+                ])
+            if not score_ok and gate_profile == "strict":
                 return reject(
                     "score_rejected",
                     "; ".join(score_gate.get("issues") or [
@@ -3182,6 +3657,10 @@ def run_stage3_background_extraction(pipeline) -> None:
                     ]),
                     **common_details,
                 )
+            if not score_ok:
+                gate_warnings.extend(score_gate.get("issues") or [
+                    "compound score improvement is insufficient"
+                ])
 
             candidate_stem = _stage3_candidate_stem(label)
             if not pipeline._save_stage_output(candidate_stem):
@@ -3205,11 +3684,21 @@ def run_stage3_background_extraction(pipeline) -> None:
                 after_adaptive_candidate,
                 candidate_score,
                 stage3_policy,
+                gate_profile,
             )
+            if not sufficient:
+                gate_warnings.append(
+                    "candidate does not meet clean-output sufficiency thresholds"
+                )
+            gate_warnings = list(dict.fromkeys(gate_warnings))
+            clean_sufficient = bool(sufficient and not gate_warnings)
             record = {
                 **base_record,
                 **common_details,
-                "status": "accepted",
+                "status": "accepted_with_warnings" if gate_warnings else "accepted",
+                "severity": "soft_warning" if gate_warnings else "normal",
+                "gate_profile": gate_profile,
+                "gate_warnings": gate_warnings,
                 "candidate_stem": candidate_stem,
                 "sufficient": sufficient,
             }
@@ -3240,13 +3729,18 @@ def run_stage3_background_extraction(pipeline) -> None:
                     "score_gate": score_gate,
                     "hard_gate_metrics_available": True,
                     "sufficient": sufficient,
+                    "severity": "soft_warning" if gate_warnings else "normal",
+                    "gate_profile": gate_profile,
+                    "gate_warnings": gate_warnings,
                 }
             )
             compound_report.update(
                 {
-                    "status": "accepted" if sufficient else "accepted_degraded",
+                    "status": "accepted" if clean_sufficient else "accepted_degraded",
                     "accepted": True,
                     "sufficient": sufficient,
+                    "severity": "soft_warning" if gate_warnings else "normal",
+                    "warnings": gate_warnings,
                     "candidate_stem": candidate_stem,
                     "intermediate_stem": intermediate_stem,
                     "validation_gate": validation_gate,
@@ -3258,7 +3752,7 @@ def run_stage3_background_extraction(pipeline) -> None:
                 "[Stage3] Compound Polynomial→RBF candidate accepted: "
                 f"score={candidate_score:.3f} sufficient={sufficient}"
             )
-            return bool(sufficient)
+            return clean_sufficient
         finally:
             if not rollback_attempted:
                 _stage3_clear_background_samples(pipeline)
@@ -3315,6 +3809,11 @@ def run_stage3_background_extraction(pipeline) -> None:
             poly_first=poly_first,
         )
     )
+    primary_attempts_ordered = [
+        record
+        for record in ordered_attempts
+        if record[2] == "graxpert"
+    ]
     builtin_attempts_ordered = [
         record
         for record in ordered_attempts
@@ -3324,34 +3823,70 @@ def run_stage3_background_extraction(pipeline) -> None:
         record
         for record in ordered_attempts
         if record[2] != "builtin"
+        and record[2] != "graxpert"
     ]
-    evaluate_attempts(
+    builtin_sufficient = evaluate_attempts(
         builtin_attempts_ordered,
-        phase="single_stage_builtin",
-        stop_on_sufficient=True,
-    )
-    builtin_sufficient = any(
-        record.get("source") == "builtin"
-        and bool(record.get("sufficient"))
-        for record in attempt_records
+        phase="builtin_primary",
+        stop_on_sufficient=False,
     )
     compound_sufficient = False
-    if builtin_sufficient:
+    primary_sufficient = False
+    external_sufficient = False
+    if policy_abort_candidate_search:
         compound_report = {
-            "status": "not_required",
+            "status": "skipped_by_failure_policy",
             "triggered": False,
-            "reason": "single_stage_builtin_candidate_is_sufficient",
+            "reason": policy_abort_reason,
             "target_guard": compound_target_guard,
             "sample_split": compound_split_report,
         }
-    else:
+    elif builtin_sufficient:
+        compound_report = {
+            "status": "not_required",
+            "triggered": False,
+            "reason": "builtin_primary_candidate_is_clean_and_sufficient",
+            "target_guard": compound_target_guard,
+            "sample_split": compound_split_report,
+        }
+    elif (
+        candidate_attempt_limit > 0
+        and len(attempt_records) >= candidate_attempt_limit
+    ):
+        compound_report = {
+            "status": "not_triggered",
+            "triggered": False,
+            "reason": "candidate_attempt_limit_reached",
+            "target_guard": compound_target_guard,
+            "sample_split": compound_split_report,
+        }
+    elif bool(
+        getattr(pipeline.cfg, "stage3_compound_candidate_enabled", True)
+    ):
         compound_sufficient = evaluate_compound_candidate()
-    if not builtin_sufficient and not compound_sufficient:
-        evaluate_attempts(
-            external_attempts_ordered,
-            phase="external_fallback",
-            stop_on_sufficient=True,
+    if (
+        not policy_abort_candidate_search
+        and not builtin_sufficient
+        and not compound_sufficient
+    ):
+        primary_sufficient = evaluate_attempts(
+            primary_attempts_ordered,
+            phase="graxpert_conditional_backup",
+            stop_on_sufficient=False,
         )
+    if (
+        not policy_abort_candidate_search
+        and not builtin_sufficient
+        and not compound_sufficient
+        and not primary_sufficient
+    ):
+        external_sufficient = evaluate_attempts(
+            external_attempts_ordered,
+            phase="external_backup",
+            stop_on_sufficient=False,
+        )
+    if external_sufficient:
+        pipeline.log.info("[Stage3] External backup produced a clean sufficient candidate")
     _stage3_clear_background_samples(pipeline)
     graxpert_attempted = any(
         record.get("source") == "graxpert" for record in attempt_records
@@ -3361,25 +3896,53 @@ def run_stage3_background_extraction(pipeline) -> None:
         for record in attempt_records
     )
 
+    if policy_abort_candidate_search:
+        accepted_candidates.clear()
+        restore_baseline("failure_policy_candidate_abort")
+        pipeline._background_review_required = True
+        if hasattr(pipeline, "_record_stage_policy_event"):
+            pipeline._record_stage_policy_event(
+                3,
+                event="candidate_search_stopped",
+                reason=policy_abort_reason,
+                source="candidate_gate",
+            )
+
     if accepted_candidates:
-        selected = min(
+        legacy_selected = min(
             accepted_candidates,
             key=lambda item: (
                 not bool(item.get("sufficient")),
                 float(item.get("score", 999.0)),
             ),
         )
-        attempted_selected_label = str(selected.get("label") or "")
         selection_shadow = _stage3_statistical_shadow_selection(
             accepted_candidates,
-            selected,
+            legacy_selected,
         )
-        if selection_shadow.get("selection_would_change"):
+        recommended_label = str(
+            selection_shadow.get("shadow_recommended_candidate") or ""
+        )
+        selected = next(
+            (
+                candidate
+                for candidate in accepted_candidates
+                if str(candidate.get("label") or "") == recommended_label
+            ),
+            legacy_selected,
+        )
+        selection_shadow["recommended_candidate"] = str(
+            selected.get("label") or ""
+        )
+        selection_shadow["runtime_selected_candidate"] = str(
+            selected.get("label") or ""
+        )
+        attempted_selected_label = str(selected.get("label") or "")
+        if selected is not legacy_selected:
             pipeline.log.info(
-                "[Stage3] Statistical selection shadow differs: "
-                f"runtime={selection_shadow.get('current_runtime_candidate')} "
-                f"shadow={selection_shadow.get('shadow_recommended_candidate')} "
-                "(observational only)"
+                "[Stage3] Statistical selection applied: "
+                f"legacy={legacy_selected.get('label')} "
+                f"selected={selected.get('label')}"
             )
         selected_loaded = False
         try:
@@ -3403,6 +3966,7 @@ def run_stage3_background_extraction(pipeline) -> None:
             bg_ok = True
             selected_source = str(selected.get("source") or "")
             selected_label = str(selected.get("label") or "")
+            selected_gate_warnings = list(selected.get("gate_warnings") or [])
             compound_selected = selected_source == "compound"
             compound_selected_degraded = bool(
                 compound_selected and not selected.get("sufficient")
@@ -3417,6 +3981,10 @@ def run_stage3_background_extraction(pipeline) -> None:
                 f"method={selected.get('label')}; {selected.get('quality_message')}; "
                 f"background_score={float(selected.get('score', 0.0)):.3f}"
             )
+            if selected_gate_warnings:
+                selected_message += (
+                    "; soft_warnings=" + " | ".join(selected_gate_warnings)
+                )
             stage_message = (
                 f"{preflight_message}; {selected_message}"
                 if preflight_message
@@ -3447,6 +4015,7 @@ def run_stage3_background_extraction(pipeline) -> None:
     if bg_ok and stage_saved:
         final_output_validation = _stage3_final_output_validation(
             pipeline,
+            baseline_image=before_image,
             baseline_validation=baseline_validation,
             validation_points=compound_validation_points,
             patch_radius=_stage3_cfg_int(
@@ -3459,8 +4028,8 @@ def run_stage3_background_extraction(pipeline) -> None:
             minimum_count=_stage3_cfg_int(
                 pipeline,
                 "stage3_compound_validation_min_count",
-                8,
-                8,
+                4,
+                4,
                 20,
             ),
             enforced=isinstance(input_profile, dict),
@@ -3468,6 +4037,15 @@ def run_stage3_background_extraction(pipeline) -> None:
         final_output_validation["selected_candidate"] = (
             attempted_selected_label or None
         )
+        final_validation_warnings = list(
+            (final_output_validation.get("validation_gate") or {}).get("warnings")
+            or []
+        )
+        if final_validation_warnings:
+            selected_gate_warnings = list(
+                dict.fromkeys(selected_gate_warnings + final_validation_warnings)
+            )
+            pipeline._background_review_required = True
         if (
             final_output_validation.get("enforced")
             and not final_output_validation.get("accepted", False)
@@ -3507,6 +4085,7 @@ def run_stage3_background_extraction(pipeline) -> None:
             bg_ok = False
             selected_source = ""
             selected_label = ""
+            selected_gate_warnings = []
             selected_preservation = {}
             selected_pattern_report = {}
             compound_selected = False
@@ -3530,12 +4109,8 @@ def run_stage3_background_extraction(pipeline) -> None:
         if hasattr(pipeline, "_adaptive_features_current")
         else {}
     )
-    max_bg_std_growth = _stage3_policy_float(
-        stage3_policy,
-        "max_bg_std_growth",
-        1.10,
-        minimum=1.0,
-        maximum=2.0,
+    max_bg_std_growth = float(
+        stage3_gate_thresholds(gate_profile)["sufficient_max_bg_std_growth"]
     )
     fallback_warning = False
     if bg_ok and before_adaptive and after_adaptive:
@@ -3557,13 +4132,24 @@ def run_stage3_background_extraction(pipeline) -> None:
             )
             pipeline.log.warn(f"[Stage3] {warning_msg}")
             stage_message = f"{stage_message}; {warning_msg}" if stage_message else warning_msg
-    graxpert_runtime_fallback_used = bool(
-        bg_ok and graxpert_runtime_error and selected_source != "graxpert"
+    background_backup_used = bool(
+        bg_ok and selected_source not in ("builtin", "")
+    )
+    background_backup_reason = (
+        "builtin_primary_insufficient_compound_selected"
+        if background_backup_used and selected_source == "compound"
+        else "builtin_and_compound_not_clean_graxpert_selected"
+        if background_backup_used and selected_source == "graxpert"
+        else "graxpert_runtime_error_external_selected"
+        if background_backup_used and graxpert_runtime_error
+        else "builtin_compound_and_graxpert_not_clean_external_selected"
+        if background_backup_used
+        else None
     )
     custom_sample_attempted = any(
         record.get("source") == "builtin" for record in attempt_records
     )
-    custom_sample_fallback_used = bool(
+    custom_sample_backup_used = bool(
         bg_ok
         and selected_source not in ("", "builtin", "compound")
         and custom_sample_attempted
@@ -3577,22 +4163,17 @@ def run_stage3_background_extraction(pipeline) -> None:
         "subsky_existing_enforced": True,
         "install_failed": safe_sample_install_failed,
         "selected_source": selected_source or None,
-        "fallback_used": custom_sample_fallback_used,
+        "backup_used": background_backup_used,
+        "fallback_used": False,
     }
     pipeline._stage3_safe_sample_report = safe_sample_report
     stage_fallback_used = bool(
         profile_fallback_used
-        or graxpert_runtime_fallback_used
-        or custom_sample_fallback_used
-        or compound_selected
         or final_output_validation_rejected
     )
     fallback_reasons = [
         reason
         for reason, enabled in (
-            ("custom_safe_sample_candidate_fallback", custom_sample_fallback_used),
-            ("compound_poly_residual_rbf_fallback", compound_selected),
-            ("graxpert_runtime_fallback", graxpert_runtime_fallback_used),
             ("target_profiler_fallback", profile_fallback_used),
             (
                 "final_output_validation_rejected_baseline_restored",
@@ -3605,8 +4186,11 @@ def run_stage3_background_extraction(pipeline) -> None:
     background_review_required = bool(
         pattern_review_required
         or compound_selected_degraded
+        or bool(selected_gate_warnings)
         or final_output_validation_rejected
         or fallback_warning
+        or not bg_ok
+        or bool(getattr(pipeline, "_background_review_required", False))
     )
     report_quality = (
         "review_required"
@@ -3627,7 +4211,7 @@ def run_stage3_background_extraction(pipeline) -> None:
         )
     if compound_selected_degraded:
         compound_note = (
-            "compound Polynomial→RBF fallback passed safety validation but "
+            "compound Polynomial→RBF backup passed safety validation but "
             "did not reach sufficient background quality; review-only output required"
         )
         stage_message = (
@@ -3642,6 +4226,13 @@ def run_stage3_background_extraction(pipeline) -> None:
                 "schema_version": STAGE3_BACKGROUND_QUALITY_SCHEMA,
                 "algorithm_contract_version": STAGE3_ALGORITHM_CONTRACT_VERSION,
                 "stage": "stage3_background",
+                "backend_policy": str(
+                    getattr(pipeline.cfg, "stage3_backend_policy", "auto_chain")
+                ),
+                "gate_profile": gate_profile,
+                "failure_action": failure_action,
+                "candidate_search_stopped": policy_abort_candidate_search,
+                "candidate_search_stop_reason": policy_abort_reason or None,
                 "policy": policy_name,
                 "decision_thresholds": decision_thresholds,
                 "decision": background_decision,
@@ -3654,6 +4245,11 @@ def run_stage3_background_extraction(pipeline) -> None:
                 "fallback_triggered_by_graxpert_error": bool(
                     graxpert_runtime_error and selected_source != "graxpert"
                 ),
+                "preferred_candidate": "target-aware builtin Polynomial/RBF",
+                "preferred_candidate_sufficient": builtin_sufficient,
+                "backup_used": background_backup_used,
+                "backup_reason": background_backup_reason,
+                "custom_sample_backup_used": custom_sample_backup_used,
                 "builtin_order_reason": builtin_order_reason,
                 "candidate_order": [record[0] for record in ordered_attempts],
                 "evaluated_candidate_order": [
@@ -3687,22 +4283,19 @@ def run_stage3_background_extraction(pipeline) -> None:
                 "before": before_adaptive,
                 "after": after_adaptive,
                 "attempts": attempt_records,
+                "selection": selection_shadow,
                 "selection_shadow": selection_shadow,
+                "selected_gate_warnings": selected_gate_warnings,
                 "final_output_validation": final_output_validation,
                 "rollback_events": rollback_events,
                 "selected_preservation": selected_preservation,
                 "quality": report_quality,
+                "review_required": background_review_required,
                 "fallback_used": stage_fallback_used,
                 "fallback_reasons": fallback_reasons,
                 "fallback_reason": (
                     "final_output_validation_rejected_baseline_restored"
                     if final_output_validation_rejected
-                    else "compound_poly_residual_rbf_fallback"
-                    if compound_selected
-                    else "graxpert_runtime_fallback"
-                    if graxpert_runtime_fallback_used
-                    else "custom_safe_sample_candidate_fallback"
-                    if custom_sample_fallback_used
                     else "target_profiler_fallback"
                     if profile_fallback_used
                     else None
@@ -3749,7 +4342,7 @@ def run_stage3_background_extraction(pipeline) -> None:
                 "rolled_back"
                 if final_output_validation_rejected
                 else "review_required"
-                if compound_selected_degraded
+                if background_review_required and bg_ok
                 else "applied"
                 if bg_ok
                 else "rolled_back"
@@ -3761,20 +4354,19 @@ def run_stage3_background_extraction(pipeline) -> None:
                 if final_output_validation_rejected
                 else "compound_poly_residual_rbf_degraded_review"
                 if compound_selected_degraded
-                else "compound_poly_residual_rbf_fallback_accepted"
-                if compound_selected
+                else "background_soft_warning_review"
+                if selected_gate_warnings
+                else "backup_accepted"
+                if background_backup_used
                 else "accepted"
                 if bg_ok
                 else "no_candidate_accepted"
             ),
             "input": baseline_stem,
             "output": "stage3_bgremoved" if stage_saved else None,
-            "fallback_used": bool(
-                graxpert_runtime_fallback_used
-                or custom_sample_fallback_used
-                or compound_selected
-                or final_output_validation_rejected
-            ),
+            "fallback_used": bool(final_output_validation_rejected),
+            "backup_used": background_backup_used,
+            "backup_reason": background_backup_reason,
         },
         "directional_pattern_router": {
             "status": (
@@ -3790,7 +4382,11 @@ def run_stage3_background_extraction(pipeline) -> None:
         },
     }
     reason_code = (
-        "final_output_validation_rejected"
+        "failure_policy_stop"
+        if policy_abort_candidate_search and failure_action == "stop"
+        else "failure_policy_preserve_review"
+        if policy_abort_candidate_search and failure_action == "preserve_review"
+        else "final_output_validation_rejected"
         if final_output_validation_rejected
         else "no_background_candidate_accepted"
         if not bg_ok
@@ -3800,12 +4396,10 @@ def run_stage3_background_extraction(pipeline) -> None:
         if pattern_review_required
         else "compound_poly_residual_rbf_degraded_review"
         if compound_selected_degraded
-        else "compound_poly_residual_rbf_fallback_accepted"
-        if compound_selected
-        else "graxpert_runtime_fallback"
-        if graxpert_runtime_fallback_used
-        else "custom_safe_sample_candidate_fallback"
-        if custom_sample_fallback_used
+        else "background_soft_warning_review"
+        if selected_gate_warnings
+        else "background_backup_accepted"
+        if background_backup_used
         else "target_profiler_fallback"
         if profile_fallback_used
         else "background_improvement_limited"
@@ -3839,11 +4433,21 @@ def run_stage3_background_extraction(pipeline) -> None:
             degrade_message += "；stage3 输出保存失败"
         pipeline._record_stage(
             stage_label,
-            "degraded",
+            "failed" if failure_action == "stop" else "degraded",
             elapsed,
             degrade_message,
             execution="safe_passthrough",
-            fallback_used=stage_fallback_used,
+            fallback_used=bool(
+                stage_fallback_used or policy_abort_candidate_search
+            ),
+            upstream_passthrough=bool(policy_abort_candidate_search),
             reason_code=reason_code,
+            details={
+                "backend_policy": str(
+                    getattr(pipeline.cfg, "stage3_backend_policy", "auto_chain")
+                ),
+                "failure_action": failure_action,
+                "candidate_search_stopped": policy_abort_candidate_search,
+            },
             components=components,
         )

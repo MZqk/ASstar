@@ -54,6 +54,16 @@ BUILTIN_CATALOG: List[Dict[str, Any]] = [
         "features": ["dark_nebula", "emission_red", "low_contrast"],
         "default_policy": "dark_nebula_low_contrast",
     },
+    {
+        "name": "NGC 6910",
+        "aliases": ["NGC6910"],
+        "type": "open_cluster",
+        "ra_deg": 305.7958,
+        "dec_deg": 40.7717,
+        "size_arcmin": [10.7, 10.7],
+        "features": ["dense_stars", "bright_stars"],
+        "default_policy": "open_cluster_color_preserve",
+    },
 ]
 
 

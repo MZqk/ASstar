@@ -17,6 +17,7 @@ if str(PIPELINE_DIR) not in sys.path:
     sys.path.insert(0, str(PIPELINE_DIR))
 
 import run_manifest  # noqa: E402
+import task_plan  # noqa: E402
 
 
 DEFAULT_WORK_DIR = Path.home() / "SeeStar/sirildev"
@@ -25,11 +26,9 @@ DEFAULT_SIRIL_SEED = (
     Path.home() / "Library/Application Support/org.siril.Siril/siril"
 )
 DEFAULT_RUNTIME_HOME = (
-    Path.home() / "Library/Application Support/SeestarSuperimpose/runtime_home"
+    Path.home() / "Library/Application Support/Starun/runtime_home"
 )
 MODE_LABELS = {
-    "stage2_corrected_resume": "从 stage2_corrected.fit 验证 Stage 3-10（推荐）",
-    "result_linear_resume": "从 result_linear.fit 验证 Stage 6-10",
     "auto": "从原始输入验证完整 Stage 1-10",
 }
 MENU_MODES = tuple(MODE_LABELS)
@@ -46,7 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         choices=MENU_MODES,
-        help="处理入口；省略时显示人工选择菜单",
+        default="auto",
+        help="处理入口（仅支持 auto；续跑由验签产品任务发起）",
     )
     parser.add_argument(
         "--work-dir",
@@ -72,18 +72,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_RUNTIME_HOME,
         help=f"隔离 runtime HOME（默认：{DEFAULT_RUNTIME_HOME}）",
     )
-    network_group = parser.add_mutually_exclusive_group()
-    network_group.add_argument(
-        "--network",
-        dest="network",
-        action="store_true",
-        help="允许在线 Gaia 等请求（默认）",
-    )
-    network_group.add_argument(
+    parser.add_argument(
         "--offline",
-        "--no-network",
         dest="network",
         action="store_false",
+        default=True,
         help="禁用在线 Gaia 等请求，仅验证离线回退链路",
     )
     debug_group = parser.add_mutually_exclusive_group()
@@ -99,7 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="清理大部分 Stage 中间文件",
     )
-    parser.set_defaults(network=True, debug=True)
+    parser.set_defaults(debug=True)
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -108,25 +101,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def select_mode() -> str:
-    if not sys.stdin.isatty():
-        raise RuntimeError("非交互环境必须显式传入 --mode")
-    print("请选择核心流水线验证范围：")
-    for index, mode in enumerate(MENU_MODES, start=1):
-        print(f"  {index}. {MODE_LABELS[mode]}")
-    raw = input("选择 [1]：").strip() or "1"
-    try:
-        return MENU_MODES[int(raw) - 1]
-    except (ValueError, IndexError) as error:
-        raise RuntimeError(f"无效选择：{raw}") from error
-
-
 def build_launcher_command(args: argparse.Namespace, mode: str) -> list[str]:
     command = [
         sys.executable,
         "-u",
         "-m",
-        "gui.seestar_pipeline_dev",
+        "gui.starun_pipeline_dev",
         "--work-dir",
         str(args.work_dir),
         "--input-mode",
@@ -138,8 +118,8 @@ def build_launcher_command(args: argparse.Namespace, mode: str) -> list[str]:
         "--runtime-home",
         str(args.runtime_home),
     ]
-    if args.network:
-        command.append("--network")
+    if not args.network:
+        command.append("--offline")
     if args.debug:
         command.append("--debug")
     return command
@@ -182,6 +162,22 @@ def verify_result_manifest(
     if not claimed_hash or claimed_hash != actual_hash:
         return False, ["pipeline-result.json manifest_hash 校验失败"]
 
+    plan_path = work_dir / "processing-plan.json"
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
+        return False, [f"processing-plan.json 不可读：{error}"]
+    plan_verification = task_plan.verify_processing_plan(plan)
+    if not plan_verification.get("verified"):
+        return False, [
+            "processing-plan.json 校验失败："
+            + str(plan_verification.get("detail") or "unknown error")
+        ]
+    if str(payload.get("plan_hash") or "") != str(plan.get("plan_hash") or ""):
+        return False, ["pipeline-result.json 的 plan_hash 引用不匹配"]
+    if str(payload.get("run_id") or "") != str(plan.get("run_id") or ""):
+        return False, ["pipeline-result.json 与 processing-plan.json 的 run_id 不匹配"]
+
     outputs = payload.get("outputs") or {}
     if not isinstance(outputs, dict) or not outputs:
         return False, ["结果清单没有登记输出文件"]
@@ -204,6 +200,7 @@ def verify_result_manifest(
     details.append(f"pipeline_status={status}")
     details.append(f"verified_outputs={len(outputs)}")
     details.append(f"manifest_hash={claimed_hash}")
+    details.append(f"plan_hash={plan['plan_hash']}")
     if status == "failed":
         return False, details + ["流水线全局状态为 failed"]
 
@@ -221,7 +218,7 @@ def verify_result_manifest(
 
 
 def run_smoke(args: argparse.Namespace) -> int:
-    mode = args.mode or select_mode()
+    mode = args.mode
     command = build_launcher_command(args, mode)
     print("\n核心源码验证配置：")
     print(f"  范围：{MODE_LABELS[mode]}")

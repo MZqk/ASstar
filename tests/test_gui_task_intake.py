@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+import copy
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,7 +15,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from gui.task_intake import (  # noqa: E402
-    RESUME_CHECKPOINT_PATH_ENV,
     TASK_RUN_MANIFEST_ENV,
     describe_input_plan,
     discover_input_for_processing_settings,
@@ -30,6 +30,7 @@ from pipeline.input_discovery import (  # noqa: E402
     discover_input,
 )
 from pipeline.stage_contracts import FORMAL_RESUME_STAGES, stage_contract  # noqa: E402
+from pipeline.processing_parameters import default_processing_parameters  # noqa: E402
 from pipeline.task_workspace import (  # noqa: E402
     CHECKPOINT_MANIFEST_REL,
     build_checkpoint_manifest,
@@ -38,20 +39,34 @@ from pipeline.task_workspace import (  # noqa: E402
 )
 
 
-SETTINGS = {
-    "color_calibration": "pcc",
-    "filter_hint": "auto",
-    "pcc_timeout_sec": 180,
-    "local_wb_gain_limit": 1.2,
-    "denoise_mode": "auto",
-    "deconvolution_mode": "auto",
-    "graxpert_model_path": "",
-    "compute_mode": "auto",
-    "builtin_denoise_strength": 0.5,
-    "graxpert_deconv_strength": 0.3,
-    "rl_iterations": 8,
-    "rl_maxstars": 2000,
-}
+SETTINGS = default_processing_parameters()
+SETTINGS["stages"]["5"]["overrides"].update(
+    {
+        "denoise_mod": 0.5,
+        "stage5_graxpert_deconv_strength": 0.3,
+        "stage5_rl_iters": 8,
+        "stage5_rl_maxstars": 2000,
+    }
+)
+
+
+def _stage5_resume_semantics() -> dict[str, object]:
+    return {
+        "schema": "starun.resume-semantics.v1",
+        "checkpoint_stage": 5,
+        "channel_semantics": "broadband",
+        "channel_profile": {"kind": "broadband"},
+        "narrowband_channel_mapping": {
+            "schema": "starun.narrowband-channel-mapping.v1",
+            "mapping": "unknown",
+            "confidence": 0.0,
+            "evidence": "not_narrowband",
+        },
+        "target_profile": {},
+        "pipeline_policy": {},
+        "color_calibration_report": {},
+        "upstream_review": {},
+    }
 
 
 class GuiTaskIntakeTests(unittest.TestCase):
@@ -116,22 +131,22 @@ class GuiTaskIntakeTests(unittest.TestCase):
                     cancel_check=lambda: True,
                 )
 
-            self.assertFalse((source.parent / "SeestarSuperimpose").exists())
+            self.assertFalse((source.parent / "Starun").exists())
 
-    def test_verified_legacy_directory_creates_read_only_stage1_migration(self) -> None:
+    def test_legacy_directory_is_rejected_without_migration(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "legacy"
             root.mkdir()
             checkpoint = root / "result_linear.fit"
             checkpoint.write_bytes(b"trusted-legacy-linear")
             plan = {
-                "schema": "seestar.processing-plan.v1",
+                "schema": "starun.processing-plan.v1",
                 "run_id": "legacy-run",
             }
             plan["plan_hash"] = run_manifest.canonical_payload_hash(plan)
             run_manifest.atomic_write_json(root / "processing-plan.json", plan)
             result = {
-                "schema": "seestar.pipeline-result.v1",
+                "schema": "starun.pipeline-result.v1",
                 "status": "success",
                 "plan_hash": plan["plan_hash"],
                 "checkpoints": {
@@ -144,23 +159,11 @@ class GuiTaskIntakeTests(unittest.TestCase):
             result["manifest_hash"] = run_manifest.canonical_payload_hash(result)
             run_manifest.atomic_write_json(root / "pipeline-result.json", result)
 
-            queue = prepare_task_queue(
-                discover_input(root),
-                processing_settings=SETTINGS,
-            )
-            task = queue.tasks[0]
-
-        self.assertEqual(task.input_mode, "auto")
-        self.assertIsNone(task.resume_after_stage)
-        self.assertEqual(task.source_record["kind"], "master_file")
-        self.assertEqual(
-            task.source_record["group"]["migration"],
-            "legacy_read_only_v1",
-        )
-        self.assertEqual(
-            Path(task.source_record["files"][0]["path"]),
-            checkpoint.resolve(),
-        )
+            with self.assertRaisesRegex(Exception, "Stage 1"):
+                prepare_task_queue(
+                    discover_input(root),
+                    processing_settings=SETTINGS,
+                )
 
     def test_multiple_light_groups_become_a_serial_task_queue(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -205,12 +208,23 @@ class GuiTaskIntakeTests(unittest.TestCase):
                 processing_settings=SETTINGS,
                 now=datetime(2026, 8, 4, tzinfo=timezone.utc),
             )
+            frozen_parameters = [
+                run_manifest.load_json(task.run.manifest_path)[
+                    "processing_parameters"
+                ]
+                for task in queue.tasks
+            ]
 
         self.assertEqual(len(queue.tasks), 2)
         self.assertEqual([task.queue_index for task in queue.tasks], [1, 2])
         self.assertEqual({task.queue_total for task in queue.tasks}, {2})
         self.assertNotEqual(queue.tasks[0].workspace.root, queue.tasks[1].workspace.root)
         self.assertTrue(all(task.input_mode == "auto" for task in queue.tasks))
+        self.assertEqual(frozen_parameters[0], frozen_parameters[1])
+        self.assertEqual(
+            frozen_parameters[0]["stages"]["5"]["overrides"]["stage5_rl_maxstars"],
+            1000,
+        )
 
     def test_product_task_selects_latest_checkpoint_compatible_with_settings(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -243,8 +257,14 @@ class GuiTaskIntakeTests(unittest.TestCase):
                     "path": path.relative_to(workspace.root).as_posix(),
                     "sha256": run_manifest.sha256_file(path),
                     "state": "linear",
-                    "plan_hash": "previous-plan",
+                    "run_manifest_hash": "previous-run-manifest",
                     "config_fingerprint": fingerprints[key]["fingerprint"],
+                    "semantic_context": (
+                        _stage5_resume_semantics() if stage_number == 5 else None
+                    ),
+                    "semantic_context_status": (
+                        "verified" if stage_number == 5 else "not_applicable"
+                    ),
                 }
             checkpoint_manifest = build_checkpoint_manifest(
                 task_id=workspace.task_id,
@@ -265,12 +285,13 @@ class GuiTaskIntakeTests(unittest.TestCase):
             frozen_run = run_manifest.load_json(task.run.manifest_path)
 
         self.assertEqual(task.resume_after_stage, 5)
-        self.assertEqual(task.input_mode, "result_linear_resume")
-        self.assertEqual(
-            Path(task.runtime_overrides[RESUME_CHECKPOINT_PATH_ENV]).name,
-            "stage5_linear.fit",
-        )
+        self.assertEqual(task.input_mode, "stage5_linear_resume")
         self.assertEqual(frozen_run["resume"]["stage"], 5)
+        self.assertEqual(Path(frozen_run["resume"]["path"]).name, "stage5_linear.fit")
+        self.assertEqual(
+            set(task.runtime_overrides),
+            {TASK_RUN_MANIFEST_ENV},
+        )
 
     def test_product_task_card_rechecks_checkpoint_against_current_settings(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -303,7 +324,7 @@ class GuiTaskIntakeTests(unittest.TestCase):
                     "path": path.relative_to(workspace.root).as_posix(),
                     "sha256": run_manifest.sha256_file(path),
                     "state": "linear",
-                    "plan_hash": "previous-plan",
+                    "run_manifest_hash": "previous-run-manifest",
                     "config_fingerprint": fingerprints[key]["fingerprint"],
                 }
             run_manifest.atomic_write_json(
@@ -314,7 +335,8 @@ class GuiTaskIntakeTests(unittest.TestCase):
                     checkpoints=checkpoint_records,
                 ),
             )
-            changed_settings = {**SETTINGS, "denoise_mode": "off"}
+            changed_settings = copy.deepcopy(SETTINGS)
+            changed_settings["stages"]["5"]["overrides"]["denoise_mod"] = 0.0
 
             discovery = discover_input_for_processing_settings(
                 workspace.root,

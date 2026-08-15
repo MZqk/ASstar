@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.metadata
 import importlib.util
+import json
 import os
 import signal
 import subprocess
@@ -20,7 +22,7 @@ from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-GUI_MODULE_PATH = REPO_ROOT / "gui" / "seestar_gui_app.py"
+GUI_MODULE_PATH = REPO_ROOT / "gui" / "starun_gui_app.py"
 
 
 def _ensure_fake_pyside6() -> None:
@@ -85,6 +87,7 @@ def _ensure_fake_pyside6() -> None:
         "QSplitter",
         "QSpinBox",
         "QStackedWidget",
+        "QTabWidget",
         "QToolBar",
         "QTreeWidget",
         "QTreeWidgetItem",
@@ -106,7 +109,7 @@ def _ensure_fake_pyside6() -> None:
 def _load_gui_module():
     _ensure_fake_pyside6()
     spec = importlib.util.spec_from_file_location(
-        "seestar_gui_runtime_test_module",
+        "starun_gui_runtime_test_module",
         GUI_MODULE_PATH,
     )
     if spec is None or spec.loader is None:
@@ -121,41 +124,41 @@ gui_module = _load_gui_module()
 bootstrap_module = sys.modules[gui_module.BootstrapWorker.__module__]
 pipeline_worker_module = sys.modules[gui_module.PipelineWorker.__module__]
 common_module = sys.modules["common"]
-main_window_module = sys.modules[gui_module.SeestarGui.__module__]
+main_window_module = sys.modules[gui_module.StarunGui.__module__]
 
 
 class GuiRuntimeModesTests(unittest.TestCase):
-    def test_legacy_default_pcc_timeout_migrates_to_180_seconds(self):
-        migrate = main_window_module._migrate_pcc_timeout_setting
-        self.assertEqual(migrate(30, 0), 180)
-        self.assertEqual(migrate(45, 0), 45)
-        self.assertEqual(migrate(30, 2), 30)
-
-    def test_ai_env_allowlist_keeps_runtime_acceleration_and_quality_gates(self):
-        self.assertIn("SEESTAR_GRAXPERT_GPU", common_module.AI_ENV_ALLOWED_KEYS)
+    def test_runtime_env_allowlist_keeps_acceleration_and_quality_gates(self):
+        self.assertIn("STARUN_GRAXPERT_GPU", common_module.RUNTIME_ENV_ALLOWED_KEYS)
         for key in (
-            "SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_REDUCTION_MIN",
-            "SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_DELTA_MIN",
-            "SEESTAR_STAGE7_STARMASK_DIFFUSE_RESIDUAL_RATIO_MAX",
+            "STARUN_STAGE7_STARLESS_REPAIR_CHROMA_REDUCTION_MIN",
+            "STARUN_STAGE7_STARLESS_REPAIR_CHROMA_DELTA_MIN",
+            "STARUN_STAGE7_STARMASK_DIFFUSE_RESIDUAL_RATIO_MAX",
+            "STARUN_STAGE10_LARGE_GALAXY_LOCAL_PATCH_VARIANCE_MAX",
         ):
-            self.assertIn(key, common_module.AI_ENV_ALLOWED_KEYS)
+            self.assertIn(key, common_module.RUNTIME_ENV_ALLOWED_KEYS)
         self.assertNotIn(
-            "SEESTAR_TASK_RUN_MANIFEST",
-            common_module.AI_ENV_ALLOWED_KEYS,
+            "STARUN_TASK_RUN_MANIFEST",
+            common_module.RUNTIME_ENV_ALLOWED_KEYS,
+        )
+        self.assertNotIn(
+            "STARUN_RUNTIME_CAPABILITIES_MANIFEST",
+            common_module.RUNTIME_ENV_ALLOWED_KEYS,
         )
 
-    def test_task_manifest_path_cannot_be_loaded_from_ai_env_file(self):
+    def test_task_manifest_path_cannot_be_loaded_from_runtime_env_file(self):
         with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "ai.env"
+            path = Path(td) / "runtime.env"
             path.write_text(
-                "SEESTAR_TASK_RUN_MANIFEST=/tmp/untrusted-run.json\n"
-                "SEESTAR_OUTPUT_FORMAT=tif,png\n",
+                "STARUN_TASK_RUN_MANIFEST=/tmp/untrusted-run.json\n"
+                "STARUN_RUNTIME_CAPABILITIES_MANIFEST=/tmp/untrusted-capabilities.json\n"
+                "STARUN_OUTPUT_FORMAT=tif,png\n",
                 encoding="utf-8",
             )
 
-            parsed, warnings = common_module.parse_ai_env_file(path)
+            parsed, warnings = common_module.parse_runtime_env_file(path)
 
-            self.assertEqual(parsed, {"SEESTAR_OUTPUT_FORMAT": "tif,png"})
+            self.assertEqual(parsed, {"STARUN_OUTPUT_FORMAT": "tif,png"})
             self.assertEqual(warnings, [])
 
     def test_processing_parameters_expand_inside_task_sheet(self):
@@ -185,7 +188,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             _update_processing_sheet_availability=lambda: None,
         )
 
-        gui_module.SeestarGui._set_processing_parameters_expanded(proxy, True)
+        gui_module.StarunGui._set_processing_parameters_expanded(proxy, True)
 
         self.assertTrue(proxy.processing_parameters_expanded)
         self.assertTrue(panel.visible)
@@ -217,38 +220,39 @@ class GuiRuntimeModesTests(unittest.TestCase):
         )
 
         overrides, unset_keys = (
-            gui_module.SeestarGui._processing_runtime_configuration(
+            gui_module.StarunGui._processing_runtime_configuration(
                 proxy,
                 gui_module.INPUT_MODE_AUTO,
             )
         )
 
-        self.assertEqual(overrides["SEESTAR_OUTPUT_FORMAT"], "tif,png")
-        self.assertEqual(overrides["SEESTAR_FORCE_REVIEW_ONLY_OUTPUT"], "1")
+        self.assertEqual(overrides["STARUN_OUTPUT_FORMAT"], "tif,png")
+        self.assertEqual(overrides["STARUN_FORCE_REVIEW_ONLY_OUTPUT"], "1")
         self.assertEqual(
-            overrides["SEESTAR_STAGE4_FILTER_HINT"],
+            overrides["STARUN_STAGE4_FILTER_HINT"],
             "broadband Seestar LP",
         )
-        self.assertEqual(overrides["SEESTAR_STAGE5_DECONV_ENABLE"], "1")
+        self.assertEqual(overrides["STARUN_STAGE5_DECONV_ENABLE"], "1")
         self.assertEqual(
-            overrides["SEESTAR_STAGE5_GRAXPERT_DECONV_ENABLE"],
+            overrides["STARUN_STAGE5_GRAXPERT_DECONV_ENABLE"],
             "0",
         )
-        self.assertEqual(overrides["SEESTAR_SYQON_GPU"], "0")
-        self.assertEqual(overrides["SEESTAR_GRAXPERT_GPU"], "0")
-        self.assertEqual(overrides["SEESTAR_STAGE4_PCC_TIMEOUT_SEC"], "45")
+        self.assertNotIn("STARUN_SYQON_GPU", overrides)
+        self.assertEqual(overrides["STARUN_GRAXPERT_GPU"], "0")
+        self.assertEqual(overrides["STARUN_STAGE4_SPCC_TIMEOUT_SEC"], "300")
+        self.assertEqual(overrides["STARUN_STAGE4_PCC_TIMEOUT_SEC"], "45")
         self.assertEqual(
-            overrides["SEESTAR_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT"], "1.18"
+            overrides["STARUN_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT"], "1.18"
         )
-        self.assertEqual(overrides["SEESTAR_STAGE5_BUILTIN_DENOISE_MOD"], "0.35")
-        self.assertEqual(overrides["SEESTAR_STAGE5_RL_ITERS"], "12")
-        self.assertEqual(overrides["SEESTAR_STAGE5_RL_MAXSTARS"], "320")
-        self.assertEqual(overrides["SEESTAR_STAGE7_QUALITY_RETRY_MAX"], "3")
+        self.assertEqual(overrides["STARUN_DENOISE_MOD"], "0.35")
+        self.assertEqual(overrides["STARUN_STAGE5_RL_ITERS"], "12")
+        self.assertEqual(overrides["STARUN_STAGE5_RL_MAXSTARS"], "320")
+        self.assertEqual(overrides["STARUN_STAGE7_QUALITY_RETRY_MAX"], "3")
         self.assertEqual(
-            overrides["SEESTAR_STAGE9_WEAK_STAR_RECOVERY_RATIO_MIN"], "0.80"
+            overrides["STARUN_STAGE9_WEAK_STAR_RECOVERY_RATIO_MIN"], "0.80"
         )
-        self.assertIn("SEESTAR_DENOISE_FORCE", unset_keys)
-        self.assertIn("SEESTAR_GRAXPERT_OBJECT_MODEL_PATH", unset_keys)
+        self.assertIn("STARUN_DENOISE_FORCE", unset_keys)
+        self.assertIn("STARUN_GRAXPERT_OBJECT_MODEL_PATH", unset_keys)
 
     def test_processing_runtime_configuration_omits_completed_linear_stages(self):
         proxy = SimpleNamespace(
@@ -275,31 +279,32 @@ class GuiRuntimeModesTests(unittest.TestCase):
         )
 
         overrides, unset_keys = (
-            gui_module.SeestarGui._processing_runtime_configuration(
+            gui_module.StarunGui._processing_runtime_configuration(
                 proxy,
                 gui_module.INPUT_MODE_LINEAR_RESUME,
             )
         )
 
-        self.assertEqual(overrides["SEESTAR_OUTPUT_FORMAT"], "fit")
-        self.assertEqual(overrides["SEESTAR_GRAXPERT_GPU"], "1")
-        self.assertNotIn("SEESTAR_STAGE4_FILTER_HINT", overrides)
-        self.assertNotIn("SEESTAR_STAGE4_PCC_TIMEOUT_SEC", overrides)
-        self.assertNotIn("SEESTAR_STAGE5_RL_ITERS", overrides)
-        self.assertNotIn("SEESTAR_DENOISE_FORCE", overrides)
-        self.assertNotIn("SEESTAR_STAGE5_DECONV_ENABLE", overrides)
-        self.assertEqual(overrides["SEESTAR_STAGE7_QUALITY_RETRY_MAX"], "2")
+        self.assertEqual(overrides["STARUN_OUTPUT_FORMAT"], "fit")
+        self.assertEqual(overrides["STARUN_GRAXPERT_GPU"], "1")
+        self.assertNotIn("STARUN_STAGE4_FILTER_HINT", overrides)
+        self.assertNotIn("STARUN_STAGE4_PCC_TIMEOUT_SEC", overrides)
+        self.assertNotIn("STARUN_STAGE5_RL_ITERS", overrides)
+        self.assertNotIn("STARUN_DENOISE_FORCE", overrides)
+        self.assertNotIn("STARUN_STAGE5_DECONV_ENABLE", overrides)
+        self.assertEqual(overrides["STARUN_STAGE7_QUALITY_RETRY_MAX"], "2")
         self.assertEqual(
-            overrides["SEESTAR_STAGE9_STARMASK_ASINH_STRETCH"], "2.00"
+            overrides["STARUN_STAGE9_STARMASK_ASINH_STRETCH"], "2.00"
         )
         self.assertFalse(unset_keys)
 
     def test_processing_professional_settings_are_safely_clamped(self):
         proxy = SimpleNamespace(_sync_processing_controls_from_state=lambda: None)
 
-        gui_module.SeestarGui._restore_processing_settings(
-            proxy,
-            {
+        with self.assertRaisesRegex(ValueError, "未知顶层字段"):
+            gui_module.StarunGui._restore_processing_settings(
+                proxy,
+                {
                 "pcc_timeout_sec": 999,
                 "local_wb_gain_limit": 9.0,
                 "builtin_denoise_strength": -1.0,
@@ -312,21 +317,8 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 "starless_chroma_strength": 2.0,
                 "starmask_asinh_stretch": 9.0,
                 "weak_star_recovery_ratio": 0.1,
-            },
-        )
-
-        self.assertEqual(proxy.pcc_timeout_sec, 180)
-        self.assertEqual(proxy.local_wb_gain_limit, 1.50)
-        self.assertEqual(proxy.builtin_denoise_strength, 0.20)
-        self.assertEqual(proxy.graxpert_deconv_strength, 0.30)
-        self.assertEqual(proxy.rl_iterations, 40)
-        self.assertEqual(proxy.rl_maxstars, 20)
-        self.assertEqual(proxy.starless_retry_max, 3)
-        self.assertEqual(proxy.starless_repair_strength, 0.85)
-        self.assertEqual(proxy.starless_halo_repair_strength, 0.0)
-        self.assertEqual(proxy.starless_chroma_strength, 0.90)
-        self.assertEqual(proxy.starmask_asinh_stretch, 3.00)
-        self.assertEqual(proxy.weak_star_recovery_ratio, 0.40)
+                },
+            )
 
     def test_pipeline_worker_runtime_overrides_can_unset_env_values(self):
         with tempfile.TemporaryDirectory() as td:
@@ -339,25 +331,24 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 resources=root / "resources",
                 runtime_home=root / "runtime_home",
                 siril_candidates=[],
-                runtime_overrides={"SEESTAR_OUTPUT_FORMAT": "tif,png"},
-                runtime_unset_keys={"SEESTAR_DENOISE_FORCE"},
+                runtime_overrides={"STARUN_OUTPUT_FORMAT": "tif,png"},
+                runtime_unset_keys={"STARUN_DENOISE_FORCE"},
             )
 
             with patch.dict(
                 os.environ,
-                {"SEESTAR_DENOISE_FORCE": "1"},
+                {"STARUN_DENOISE_FORCE": "1"},
                 clear=False,
             ):
                 env = worker._build_env(Path("/tmp/siril-cli"))
 
-            self.assertEqual(env["SEESTAR_OUTPUT_FORMAT"], "tif,png")
-            self.assertNotIn("SEESTAR_DENOISE_FORCE", env)
+            self.assertEqual(env["STARUN_OUTPUT_FORMAT"], "tif,png")
+            self.assertNotIn("STARUN_DENOISE_FORCE", env)
 
-    def test_pipeline_worker_preserves_task_manifest_runtime_overrides(self):
+    def test_pipeline_worker_preserves_run_scoped_manifest_overrides(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             run_manifest = root / "work" / "run-manifest.json"
-            checkpoint = root / "task" / "checkpoints" / "stage5_linear.fit"
             worker = gui_module.PipelineWorker(
                 work_dir=run_manifest.parent,
                 config_template=root / "config.ini",
@@ -367,18 +358,21 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 runtime_home=root / "runtime_home",
                 siril_candidates=[],
                 runtime_overrides={
-                    "SEESTAR_TASK_RUN_MANIFEST": str(run_manifest),
-                    "SEESTAR_RESUME_CHECKPOINT_PATH": str(checkpoint),
+                    "STARUN_TASK_RUN_MANIFEST": str(run_manifest),
+                    "STARUN_RUNTIME_CAPABILITIES_MANIFEST": str(
+                        run_manifest.parent / "runtime-capabilities.json"
+                    ),
                 },
             )
 
             env = worker._build_env(Path("/tmp/siril-cli"))
 
-            self.assertEqual(env["SEESTAR_TASK_RUN_MANIFEST"], str(run_manifest))
+            self.assertEqual(env["STARUN_TASK_RUN_MANIFEST"], str(run_manifest))
             self.assertEqual(
-                env["SEESTAR_RESUME_CHECKPOINT_PATH"],
-                str(checkpoint),
+                env["STARUN_RUNTIME_CAPABILITIES_MANIFEST"],
+                str(run_manifest.parent / "runtime-capabilities.json"),
             )
+            self.assertNotIn("STARUN_RESUME_CHECKPOINT_PATH", env)
 
     def test_pipeline_worker_rejects_inherited_task_manifest_paths(self):
         with tempfile.TemporaryDirectory() as td:
@@ -396,15 +390,19 @@ class GuiRuntimeModesTests(unittest.TestCase):
             with patch.dict(
                 os.environ,
                 {
-                    "SEESTAR_TASK_RUN_MANIFEST": "/tmp/inherited-run.json",
-                    "SEESTAR_RESUME_CHECKPOINT_PATH": "/tmp/inherited-stage5.fit",
+                    "STARUN_TASK_RUN_MANIFEST": "/tmp/inherited-run.json",
+                    "STARUN_RUNTIME_CAPABILITIES_MANIFEST": (
+                        "/tmp/inherited-capabilities.json"
+                    ),
+                    "STARUN_RESUME_CHECKPOINT_PATH": "/tmp/inherited-stage5.fit",
                 },
                 clear=False,
             ):
                 env = worker._build_env(Path("/tmp/siril-cli"))
 
-            self.assertNotIn("SEESTAR_TASK_RUN_MANIFEST", env)
-            self.assertNotIn("SEESTAR_RESUME_CHECKPOINT_PATH", env)
+            self.assertNotIn("STARUN_TASK_RUN_MANIFEST", env)
+            self.assertNotIn("STARUN_RUNTIME_CAPABILITIES_MANIFEST", env)
+            self.assertNotIn("STARUN_RESUME_CHECKPOINT_PATH", env)
 
     def test_pipeline_worker_prefers_bundled_graxpert_object_model(self):
         with tempfile.TemporaryDirectory() as td:
@@ -430,15 +428,15 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 runtime_home=root / "runtime_home",
                 siril_candidates=[],
                 runtime_overrides={
-                    "SEESTAR_STAGE5_GRAXPERT_DECONV_ENABLE": "1",
-                    "SEESTAR_GRAXPERT_OBJECT_MODEL_PATH": str(user_model),
+                    "STARUN_STAGE5_GRAXPERT_DECONV_ENABLE": "1",
+                    "STARUN_GRAXPERT_OBJECT_MODEL_PATH": str(user_model),
                 },
             )
 
             env = worker._build_env(Path("/tmp/siril-cli"))
 
             self.assertEqual(
-                env["SEESTAR_GRAXPERT_OBJECT_MODEL_PATH"],
+                env["STARUN_GRAXPERT_OBJECT_MODEL_PATH"],
                 str(bundled_model),
             )
 
@@ -477,49 +475,9 @@ class GuiRuntimeModesTests(unittest.TestCase):
             os.utime(stale, (100.0, 100.0))
             os.utime(current, (200.0, 200.0))
 
-            selected = gui_module.SeestarGui._find_result_preview(None, work_dir)
+            selected = gui_module.StarunGui._find_result_preview(None, work_dir)
 
             self.assertEqual(selected, current)
-
-    def test_directory_recommendation_prefers_latest_resume_point(self):
-        with tempfile.TemporaryDirectory() as td:
-            work_dir = Path(td)
-            (work_dir / "Light_001.fit").write_bytes(b"fits")
-            (work_dir / gui_module.LINEAR_RESUME_INPUT_NAME).write_bytes(b"fits")
-            proxy = SimpleNamespace(
-                _fits_in_work_dir=lambda wd: list(wd.glob("*.fit")),
-                _linear_resume_input_path=lambda wd: wd / gui_module.LINEAR_RESUME_INPUT_NAME,
-                _stage2_corrected_resume_input_path=lambda wd: wd / gui_module.STAGE2_CORRECTED_INPUT_NAME,
-                _is_candidate_stacked_input=lambda _path, _wd: False,
-            )
-
-            mode, detected = gui_module.SeestarGui._directory_recommendation(
-                proxy,
-                work_dir,
-            )
-
-            self.assertEqual(mode, gui_module.INPUT_MODE_LINEAR_RESUME)
-            self.assertIn("Stage 5 线性断点", detected)
-
-    def test_directory_recommendation_counts_light_frames(self):
-        with tempfile.TemporaryDirectory() as td:
-            work_dir = Path(td)
-            for index in range(3):
-                (work_dir / f"Light_{index:03d}.fit").write_bytes(b"fits")
-            proxy = SimpleNamespace(
-                _fits_in_work_dir=lambda wd: list(wd.glob("*.fit")),
-                _linear_resume_input_path=lambda wd: wd / gui_module.LINEAR_RESUME_INPUT_NAME,
-                _stage2_corrected_resume_input_path=lambda wd: wd / gui_module.STAGE2_CORRECTED_INPUT_NAME,
-                _is_candidate_stacked_input=lambda _path, _wd: False,
-            )
-
-            mode, detected = gui_module.SeestarGui._directory_recommendation(
-                proxy,
-                work_dir,
-            )
-
-            self.assertEqual(mode, gui_module.INPUT_MODE_AUTO)
-            self.assertEqual(detected, "3 个 Light FITS")
 
     def test_quality_report_path_prefers_process_report(self):
         with tempfile.TemporaryDirectory() as td:
@@ -528,7 +486,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             report.parent.mkdir()
             report.write_text("{}\n", encoding="utf-8")
 
-            selected = gui_module.SeestarGui._quality_report_path(
+            selected = gui_module.StarunGui._quality_report_path(
                 SimpleNamespace(),
                 work_dir,
             )
@@ -579,9 +537,9 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 _bootstrap_app_version=lambda: "1.2.3",
             )
 
-            first = gui_module.SeestarGui._bootstrap_fingerprint(proxy)
+            first = gui_module.StarunGui._bootstrap_fingerprint(proxy)
             lock_path.write_text("numpy==2\n", encoding="utf-8")
-            second = gui_module.SeestarGui._bootstrap_fingerprint(proxy)
+            second = gui_module.StarunGui._bootstrap_fingerprint(proxy)
 
             self.assertEqual(first["python_abi"], "cp312")
             self.assertEqual(first["app_version"], "1.2.3")
@@ -627,7 +585,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             _ensure_runtime_requirements_ready=lambda: calls.append("install"),
         )
 
-        result = gui_module.SeestarGui._bootstrap_runtime(
+        result = gui_module.StarunGui._bootstrap_runtime(
             proxy,
             Path("/tmp/work"),
             gui_module.INPUT_MODE_AUTO,
@@ -672,7 +630,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             run_log_file=log_file,
             _run_log_lock=lock,
         )
-        append_text = gui_module.SeestarGui._append_text
+        append_text = gui_module.StarunGui._append_text
         method_globals = append_text.__globals__
         original_cursor = method_globals["QTextCursor"]
         method_globals["QTextCursor"] = SimpleNamespace(
@@ -685,6 +643,86 @@ class GuiRuntimeModesTests(unittest.TestCase):
 
         self.assertEqual(log_file.writes, ["worker output\n"])
         self.assertEqual(log_file.flush_count, 1)
+
+    def test_each_run_creates_log_and_state_before_preflight_without_inheritance(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            resources = root / "resources"
+            runtime_home = root / "runtime-home"
+            first_work = root / "run-1"
+            second_work = root / "run-2"
+            for path in (resources, runtime_home, first_work, second_work):
+                path.mkdir()
+
+            proxy = SimpleNamespace(
+                resources=resources,
+                runtime_home=runtime_home,
+                run_log_path=None,
+                run_log_file=None,
+                run_state_path=None,
+                runtime_capabilities_path=None,
+                _runtime_capability_manifest=None,
+                _run_state_payload={},
+                _run_log_lock=threading.Lock(),
+                _run_state_lock=threading.Lock(),
+                log_view=SimpleNamespace(clear=lambda: None),
+                _display_path=lambda path: str(path),
+            )
+            proxy._close_run_log = lambda: gui_module.StarunGui._close_run_log(proxy)
+            proxy._update_run_state = lambda **kwargs: gui_module.StarunGui._update_run_state(
+                proxy,
+                **kwargs,
+            )
+
+            def append_divider(title, detail_lines=None):
+                proxy.run_log_file.write(title + "\n")
+                for line in detail_lines or ():
+                    proxy.run_log_file.write(str(line) + "\n")
+                proxy.run_log_file.flush()
+
+            proxy._append_divider = append_divider
+            first_task = SimpleNamespace(
+                run=SimpleNamespace(run_id="run-1"),
+                workspace=SimpleNamespace(task_id="task-1"),
+            )
+            second_task = SimpleNamespace(
+                run=SimpleNamespace(run_id="run-2"),
+                workspace=SimpleNamespace(task_id="task-2"),
+            )
+
+            gui_module.StarunGui._begin_run_diagnostics(
+                proxy,
+                first_work,
+                first_task,
+            )
+            first_log = proxy.run_log_path
+            first_handle = proxy.run_log_file
+            first_state = json.loads(
+                (first_work / main_window_module.RUN_STATE_NAME).read_text(encoding="utf-8")
+            )
+            proxy.run_log_file.write("first-run-only\n")
+            proxy.run_log_file.flush()
+
+            gui_module.StarunGui._begin_run_diagnostics(
+                proxy,
+                second_work,
+                second_task,
+            )
+            second_state = json.loads(
+                (second_work / main_window_module.RUN_STATE_NAME).read_text(encoding="utf-8")
+            )
+
+            self.assertTrue(first_handle.closed)
+            self.assertNotEqual(first_log, proxy.run_log_path)
+            self.assertEqual(proxy.run_log_path.parent, second_work)
+            self.assertEqual(first_state["run_id"], "run-1")
+            self.assertEqual(second_state["run_id"], "run-2")
+            self.assertEqual(second_state["log_path"], str(proxy.run_log_path.resolve()))
+            self.assertNotIn(
+                "first-run-only",
+                proxy.run_log_path.read_text(encoding="utf-8"),
+            )
+            gui_module.StarunGui._close_run_log(proxy)
 
     def test_close_event_forces_termination_after_wait_timeout(self):
         calls = []
@@ -717,7 +755,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             _append_event=lambda _message: (_ for _ in ()).throw(OSError("log failed")),
         )
         event = Event()
-        close_event = gui_module.SeestarGui.closeEvent
+        close_event = gui_module.StarunGui.closeEvent
         method_globals = close_event.__globals__
         original_message_box = method_globals["QMessageBox"]
         yes = 1
@@ -740,7 +778,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
     def _make_gui_proxy(self, work_dir: Path, *, input_mode: str):
         resources = work_dir / "resources"
         resources.mkdir(exist_ok=True)
-        pipeline_path = work_dir / "pipeline" / "seestar_Superimpose.py"
+        pipeline_path = work_dir / "pipeline" / "starun.py"
         pipeline_path.parent.mkdir(parents=True, exist_ok=True)
         pipeline_path.write_text("# mock pipeline\n", encoding="utf-8")
         config_template = work_dir / "resources" / "config.1.4.ini.template"
@@ -759,14 +797,13 @@ class GuiRuntimeModesTests(unittest.TestCase):
             _resolve_siril_candidates=lambda: [siril_cli],
             _display_path=lambda path: str(path),
             _current_input_mode=lambda: input_mode,
-            _linear_resume_input_path=lambda wd: gui_module.SeestarGui._linear_resume_input_path(proxy, wd),
-            _stage2_corrected_resume_input_path=lambda wd: gui_module.SeestarGui._stage2_corrected_resume_input_path(proxy, wd),
-            _disk_space_mode_label=lambda estimate: gui_module.SeestarGui._disk_space_mode_label(proxy, estimate),
-            _disk_space_summary_lines=lambda estimate: gui_module.SeestarGui._disk_space_summary_lines(proxy, estimate),
+            _pending_runtime_overrides={},
+            _disk_space_mode_label=lambda estimate: gui_module.StarunGui._disk_space_mode_label(proxy, estimate),
+            _disk_space_summary_lines=lambda estimate: gui_module.StarunGui._disk_space_summary_lines(proxy, estimate),
         )
-        proxy._fits_in_work_dir = lambda wd: gui_module.SeestarGui._fits_in_work_dir(proxy, wd)
+        proxy._fits_in_work_dir = lambda wd: gui_module.StarunGui._fits_in_work_dir(proxy, wd)
         proxy._is_candidate_stacked_input = (
-            lambda path, wd: gui_module.SeestarGui._is_candidate_stacked_input(proxy, path, wd)
+            lambda path, wd: gui_module.StarunGui._is_candidate_stacked_input(proxy, path, wd)
         )
         return proxy
 
@@ -825,15 +862,20 @@ class GuiRuntimeModesTests(unittest.TestCase):
             (plugin_root / "vendor" / "siril-scripts" / "processing" / "AberrationRemover.py").write_text(
                 "x", encoding="utf-8"
             )
-            (plugin_root / "vendor" / "siril-scripts" / "processing" / "SyQon-Starless.py").write_text(
+            (plugin_root / "vendor" / "siril-scripts" / "SyQon").mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            (plugin_root / "vendor" / "siril-scripts" / "SyQon" / "Starless.py").write_text(
                 "x", encoding="utf-8"
             )
             (plugin_root / "syqon_starless").mkdir(parents=True, exist_ok=True)
-            (plugin_root / "syqon_starless" / "syqon_starless_inference.py").write_text(
-                "x", encoding="utf-8"
-            )
             (plugin_root / "syqon_starless" / "zenith.pt").write_text(
                 "x", encoding="utf-8"
+            )
+            (plugin_root / "syqon_starless" / "zenith.pt.sha256").write_text(
+                hashlib.sha256(b"x").hexdigest() + "  zenith.pt\n",
+                encoding="utf-8",
             )
             (plugin_root / "cosmic_clarity").mkdir(parents=True, exist_ok=True)
             for name in (
@@ -846,67 +888,67 @@ class GuiRuntimeModesTests(unittest.TestCase):
 
             proxy = SimpleNamespace(siril_plugin_dir=plugin_root)
             proxy._plugin_download_script_path = (
-                lambda: gui_module.SeestarGui._plugin_download_script_path(proxy)
+                lambda: gui_module.StarunGui._plugin_download_script_path(proxy)
             )
             proxy._plugin_downloads_dir = (
-                lambda: gui_module.SeestarGui._plugin_downloads_dir(proxy)
+                lambda: gui_module.StarunGui._plugin_downloads_dir(proxy)
             )
             proxy._onnxruntime_wheels = (
-                lambda: gui_module.SeestarGui._onnxruntime_wheels(proxy)
+                lambda: gui_module.StarunGui._onnxruntime_wheels(proxy)
             )
             proxy._onnx_wheels = (
-                lambda: gui_module.SeestarGui._onnx_wheels(proxy)
+                lambda: gui_module.StarunGui._onnx_wheels(proxy)
             )
             proxy._pyqt6_wheels = (
-                lambda: gui_module.SeestarGui._pyqt6_wheels(proxy)
+                lambda: gui_module.StarunGui._pyqt6_wheels(proxy)
             )
             proxy._pyqt6_qt6_wheels = (
-                lambda: gui_module.SeestarGui._pyqt6_qt6_wheels(proxy)
+                lambda: gui_module.StarunGui._pyqt6_qt6_wheels(proxy)
             )
             proxy._pyqt6_sip_wheels = (
-                lambda: gui_module.SeestarGui._pyqt6_sip_wheels(proxy)
+                lambda: gui_module.StarunGui._pyqt6_sip_wheels(proxy)
             )
             proxy._pyside6_wheels = (
-                lambda: gui_module.SeestarGui._pyside6_wheels(proxy)
+                lambda: gui_module.StarunGui._pyside6_wheels(proxy)
             )
             proxy._pyside6_addons_wheels = (
-                lambda: gui_module.SeestarGui._pyside6_addons_wheels(proxy)
+                lambda: gui_module.StarunGui._pyside6_addons_wheels(proxy)
             )
             proxy._pyside6_essentials_wheels = (
-                lambda: gui_module.SeestarGui._pyside6_essentials_wheels(proxy)
+                lambda: gui_module.StarunGui._pyside6_essentials_wheels(proxy)
             )
             proxy._shiboken6_wheels = (
-                lambda: gui_module.SeestarGui._shiboken6_wheels(proxy)
+                lambda: gui_module.StarunGui._shiboken6_wheels(proxy)
             )
             proxy._astropy_wheels = (
-                lambda: gui_module.SeestarGui._astropy_wheels(proxy)
+                lambda: gui_module.StarunGui._astropy_wheels(proxy)
             )
             proxy._scipy_wheels = (
-                lambda: gui_module.SeestarGui._scipy_wheels(proxy)
+                lambda: gui_module.StarunGui._scipy_wheels(proxy)
             )
             proxy._tifffile_wheels = (
-                lambda: gui_module.SeestarGui._tifffile_wheels(proxy)
+                lambda: gui_module.StarunGui._tifffile_wheels(proxy)
             )
             proxy._sep_wheels = (
-                lambda: gui_module.SeestarGui._sep_wheels(proxy)
+                lambda: gui_module.StarunGui._sep_wheels(proxy)
             )
             proxy._spandrel_wheels = (
-                lambda: gui_module.SeestarGui._spandrel_wheels(proxy)
+                lambda: gui_module.StarunGui._spandrel_wheels(proxy)
             )
             proxy._einops_wheels = (
-                lambda: gui_module.SeestarGui._einops_wheels(proxy)
+                lambda: gui_module.StarunGui._einops_wheels(proxy)
             )
             proxy._safetensors_wheels = (
-                lambda: gui_module.SeestarGui._safetensors_wheels(proxy)
+                lambda: gui_module.StarunGui._safetensors_wheels(proxy)
             )
             proxy._torch_wheels = (
-                lambda: gui_module.SeestarGui._torch_wheels(proxy)
+                lambda: gui_module.StarunGui._torch_wheels(proxy)
             )
             proxy._torchvision_wheels = (
-                lambda: gui_module.SeestarGui._torchvision_wheels(proxy)
+                lambda: gui_module.StarunGui._torchvision_wheels(proxy)
             )
 
-            missing = gui_module.SeestarGui._missing_plugin_artifacts(proxy)
+            missing = gui_module.StarunGui._missing_plugin_artifacts(proxy)
             self.assertIn("onnx wheel 缺失", missing)
             self.assertIn("onnxruntime wheel 缺失", missing)
             self.assertIn("PyQt6 wheel 缺失", missing)
@@ -978,8 +1020,40 @@ class GuiRuntimeModesTests(unittest.TestCase):
             (plugin_root / "downloads" / "torchvision-0.26.0-cp312-cp312-macosx_11_0_arm64.whl").write_text(
                 "x", encoding="utf-8"
             )
-            missing_after = gui_module.SeestarGui._missing_plugin_artifacts(proxy)
+            missing_after = gui_module.StarunGui._missing_plugin_artifacts(proxy)
             self.assertEqual(missing_after, [])
+
+    def test_requirement_wheel_check_normalizes_dots_underscores_and_hyphens(self):
+        with tempfile.TemporaryDirectory() as td:
+            plugin_root = Path(td)
+            downloads = plugin_root / "downloads"
+            downloads.mkdir()
+            requirements = plugin_root / "requirements.lock"
+            requirements.write_text(
+                "jaraco-classes==3.4.0\n"
+                "opencv-python-headless==4.13.0\n"
+                "missing-package==1.0\n",
+                encoding="utf-8",
+            )
+            (downloads / "jaraco.classes-3.4.0-py3-none-any.whl").write_text(
+                "x", encoding="utf-8"
+            )
+            (
+                downloads
+                / "opencv_python_headless-4.13.0-cp37-abi3-macosx_13_0_arm64.whl"
+            ).write_text("x", encoding="utf-8")
+
+            proxy = SimpleNamespace(_plugin_downloads_dir=lambda: downloads)
+            proxy._requirement_names = (
+                lambda path: gui_module.StarunGui._requirement_names(proxy, path)
+            )
+
+            self.assertEqual(
+                gui_module.StarunGui._missing_requirement_wheels(
+                    proxy, requirements
+                ),
+                ["missing-package"],
+            )
 
     def test_siril_plugin_wheel_abi_is_limited_to_cp312(self):
         compatible = (
@@ -1019,7 +1093,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 _display_path=lambda path: str(path),
             )
 
-            gui_module.SeestarGui._ensure_runtime_sirilpy_timeout_patch(proxy)
+            gui_module.StarunGui._ensure_runtime_sirilpy_timeout_patch(proxy)
             patch_path = site_dir / "sitecustomize.py"
             self.assertTrue(patch_path.is_file())
             patch_text = patch_path.read_text(encoding="utf-8")
@@ -1050,7 +1124,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 _display_path=lambda path: str(path),
             )
 
-            gui_module.SeestarGui._ensure_runtime_opencv_distribution_alias(proxy)
+            gui_module.StarunGui._ensure_runtime_opencv_distribution_alias(proxy)
 
             alias_metadata = (
                 site_dir / "opencv_python-4.13.0.92.dist-info" / "METADATA"
@@ -1090,7 +1164,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 env = worker._build_env(Path("/tmp/siril-cli"))
 
             self.assertEqual(
-                env.get("SEESTAR_INPUT_MODE"),
+                env.get("STARUN_INPUT_MODE"),
                 gui_module.INPUT_MODE_LINEAR_RESUME,
             )
             self.assertEqual(env.get("PYTHONUNBUFFERED"), "1")
@@ -1098,14 +1172,15 @@ class GuiRuntimeModesTests(unittest.TestCase):
             self.assertNotIn("QT_PLUGIN_PATH", env)
             self.assertNotIn("QT_QPA_PLATFORM_PLUGIN_PATH", env)
             self.assertNotIn("QML2_IMPORT_PATH", env)
-            self.assertEqual(env.get("SEESTAR_BOOTSTRAP_TIMEOUT_SEC"), "300")
-            self.assertEqual(env.get("SEESTAR_WATCHDOG_IDLE_TIMEOUT_SEC"), "900")
-            self.assertEqual(env.get("SEESTAR_EXPORT_TAIL_TIMEOUT_SEC"), "120")
-            self.assertEqual(env.get("SEESTAR_TEMP_CLEANUP_TIMEOUT_SEC"), "30")
-            self.assertEqual(env.get("SEESTAR_NETWORK_MODE"), "0")
-            self.assertEqual(env.get("SEESTAR_SPCC_ENABLE"), "0")
+            self.assertEqual(env.get("STARUN_BOOTSTRAP_TIMEOUT_SEC"), "300")
+            self.assertEqual(env.get("STARUN_WATCHDOG_IDLE_TIMEOUT_SEC"), "900")
+            self.assertEqual(env.get("STARUN_EXPORT_TAIL_TIMEOUT_SEC"), "120")
+            self.assertEqual(env.get("STARUN_TEMP_CLEANUP_TIMEOUT_SEC"), "30")
+            self.assertEqual(env.get("STARUN_SIRILPY_TIMEOUT_SEC"), "300")
+            self.assertEqual(env.get("STARUN_NETWORK_MODE"), "1")
+            self.assertEqual(env.get("STARUN_SPCC_ENABLE"), "0")
             self.assertEqual(
-                env.get("SEESTAR_GAIA_PHOTO_CATALOG"),
+                env.get("STARUN_GAIA_PHOTO_CATALOG"),
                 str(
                     root
                     / "runtime_home"
@@ -1115,117 +1190,6 @@ class GuiRuntimeModesTests(unittest.TestCase):
                     / "siril_cat1_healpix8_xpsamp"
                 ),
             )
-
-    def test_pipeline_worker_discards_disabled_ai_runtime_configuration(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            resources = root / "resources"
-            resources.mkdir()
-            (resources / "ai.env").write_text(
-                "SEESTAR_AI_ENDPOINT=https://bundled.example/v1\n"
-                "SEESTAR_AI_MODEL=bundled-model\n"
-                "SEESTAR_AI_API_KEY=plaintext-file-key\n",
-                encoding="utf-8",
-            )
-            worker = gui_module.PipelineWorker(
-                work_dir=root / "work",
-                config_template=root / "config.ini",
-                pipeline_path=root / "pipeline.py",
-                siril_plugin_dir=root / "plugins",
-                resources=resources,
-                runtime_home=root / "runtime_home",
-                siril_candidates=[],
-                ai_stage_enabled=True,
-                ai_runtime_overrides={
-                    "SEESTAR_AI_ENDPOINT": "https://custom.example/v1",
-                    "SEESTAR_AI_MODEL": "custom-model",
-                    "SEESTAR_AI_API_KEY": "keychain-runtime-key",
-                },
-            )
-
-            with patch.dict(
-                os.environ,
-                {"SEESTAR_AI_API_KEY": "parent-process-key"},
-                clear=False,
-            ):
-                env = worker._build_env(Path("/tmp/siril-cli"))
-
-            self.assertFalse(worker.ai_stage_enabled)
-            self.assertEqual(env["SEESTAR_AI_ENABLED"], "0")
-            self.assertEqual(env["SEESTAR_AI_ARTISTIC_DERIVATIVE_ENABLED"], "0")
-            self.assertNotIn("SEESTAR_AI_ENDPOINT", env)
-            self.assertNotIn("SEESTAR_AI_MODEL", env)
-            self.assertNotIn("SEESTAR_AI_API_KEY", env)
-            self.assertNotIn("plaintext-file-key", env.values())
-            self.assertNotIn("parent-process-key", env.values())
-            self.assertEqual(
-                env.get("SEESTAR_GAIA_PHOTO_CATALOG"),
-                str(
-                    root
-                    / "runtime_home"
-                    / ".local"
-                    / "share"
-                    / "siril"
-                    / "siril_cat1_healpix8_xpsamp"
-                ),
-            )
-            self.assertEqual(
-                env.get("SEESTAR_GAIA_ASTRO_CATALOG"),
-                str(
-                    root
-                    / "runtime_home"
-                    / ".local"
-                    / "share"
-                    / "siril"
-                    / "siril_cat_healpix8_astro.dat"
-                ),
-            )
-            self.assertEqual(
-                env.get("SEESTAR_SPCC_DATABASE_DIR"),
-                str(
-                    root
-                    / "runtime_home"
-                    / "Library/Application Support/org.siril.Siril/"
-                    / "siril-spcc-database"
-                ),
-            )
-            self.assertEqual(env.get("SEESTAR_SPCC_ENABLE"), "0")
-            self.assertEqual(worker._temp_cleanup_timeout_sec, 30)
-            self.assertEqual(worker._watchdog_idle_timeout_sec, 900)
-            self.assertEqual(worker._export_tail_timeout_sec, 120)
-
-    def test_pipeline_worker_first_phase_hard_disables_stage11(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            resources = root / "resources"
-            resources.mkdir()
-            worker = gui_module.PipelineWorker(
-                work_dir=root / "work",
-                config_template=root / "config.ini",
-                pipeline_path=root / "pipeline.py",
-                siril_plugin_dir=root / "plugins",
-                resources=resources,
-                runtime_home=root / "runtime_home",
-                siril_candidates=[],
-                ai_stage_enabled=True,
-                ai_runtime_overrides={
-                    "SEESTAR_AI_ENDPOINT": "https://custom.example/v1",
-                    "SEESTAR_AI_MODEL": "custom-model",
-                    "SEESTAR_AI_API_KEY": "keychain-runtime-key",
-                },
-                runtime_overrides={
-                    "SEESTAR_AI_ARTISTIC_API_KEY": "internal-artistic-key",
-                },
-            )
-
-            env = worker._build_env(Path("/tmp/siril-cli"))
-
-            self.assertFalse(worker.ai_stage_enabled)
-            self.assertEqual(env["SEESTAR_AI_ENABLED"], "0")
-            self.assertEqual(env["SEESTAR_AI_ARTISTIC_DERIVATIVE_ENABLED"], "0")
-            self.assertNotIn("SEESTAR_AI_API_KEY", env)
-            self.assertNotIn("SEESTAR_AI_ARTISTIC_API_KEY", env)
-            self.assertFalse(worker.ai_runtime_overrides)
 
     def test_pipeline_worker_bootstrap_timeout_uses_env_and_fits_size(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1246,7 +1210,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             )
 
             effective, base, input_bytes = worker._bootstrap_timeout_sec(
-                {"SEESTAR_BOOTSTRAP_TIMEOUT_SEC": "600"}
+                {"STARUN_BOOTSTRAP_TIMEOUT_SEC": "600"}
             )
 
             self.assertEqual(base, 600)
@@ -1271,10 +1235,10 @@ class GuiRuntimeModesTests(unittest.TestCase):
             worker.log = SimpleNamespace(emit=lambda text: events.append(str(text)))
 
             effective, base, input_bytes = worker._bootstrap_timeout_sec(
-                {"SEESTAR_BOOTSTRAP_TIMEOUT_SEC": "invalid"}
+                {"STARUN_BOOTSTRAP_TIMEOUT_SEC": "invalid"}
             )
             capped, capped_base, _ = worker._bootstrap_timeout_sec(
-                {"SEESTAR_BOOTSTRAP_TIMEOUT_SEC": "99999"}
+                {"STARUN_BOOTSTRAP_TIMEOUT_SEC": "99999"}
             )
 
             self.assertEqual((effective, base, input_bytes), (300, 300, 0))
@@ -1405,10 +1369,6 @@ class GuiRuntimeModesTests(unittest.TestCase):
             model_dir = work_dir / "models" / "1.0.1"
             model_dir.mkdir(parents=True)
             (model_dir / "model.onnx").write_bytes(b"onnx")
-            (work_dir / ".seestar_ai.env").write_text(
-                "SEESTAR_GRAXPERT_OBJECT_MODEL_PATH=models/1.0.1\n",
-                encoding="utf-8",
-            )
             worker = gui_module.PipelineWorker(
                 work_dir=work_dir,
                 config_template=root / "config.ini",
@@ -1422,13 +1382,13 @@ class GuiRuntimeModesTests(unittest.TestCase):
 
             with patch.dict(
                 os.environ,
-                {"SEESTAR_GRAXPERT_OBJECT_MODEL_PATH": ""},
+                {"STARUN_GRAXPERT_OBJECT_MODEL_PATH": "models/1.0.1"},
                 clear=False,
             ):
                 env = worker._build_env(root / "siril-cli")
 
             self.assertEqual(
-                env["SEESTAR_GRAXPERT_OBJECT_MODEL_PATH"],
+                env["STARUN_GRAXPERT_OBJECT_MODEL_PATH"],
                 str(model_dir),
             )
             self.assertEqual(env["HOME"], str(root / "runtime_home"))
@@ -1483,7 +1443,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             )
             worker._inspect_output_for_errors(
                 '[INFO] [PIPELINE_STAGE_DETAIL] '
-                '{"schema":"seestar.pipeline-stage-detail.v1","stage":4,'
+                '{"schema":"starun.pipeline-stage-detail.v1","stage":4,'
                 '"status":"ok","display_status":"ok_with_fallback",'
                 '"fallback_used":true,"components":{}}'
             )
@@ -1508,7 +1468,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             )
 
     def test_gui_formats_stage5_components_and_stage8_limited_outcome(self):
-        component_summary = gui_module.SeestarGui._format_stage_component_summary(
+        component_summary = gui_module.StarunGui._format_stage_component_summary(
             {
                 "components": {
                     "deconvolution": {
@@ -1524,7 +1484,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 }
             }
         )
-        detail_note = gui_module.SeestarGui._format_stage_detail_note(
+        detail_note = gui_module.StarunGui._format_stage_detail_note(
             {
                 "details": {
                     "reason_text": (
@@ -1545,7 +1505,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
         )
         self.assertIn("受限候选未通过质量门，已安全回滚", detail_note)
 
-        upstream_note = gui_module.SeestarGui._format_stage_detail_note(
+        upstream_note = gui_module.StarunGui._format_stage_detail_note(
             {
                 "status": "ok",
                 "fallback_used": False,
@@ -1558,7 +1518,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
         )
         self.assertEqual(upstream_note, "成功（使用 Stage 8 安全旁路源）")
 
-        local_fallback_note = gui_module.SeestarGui._format_stage_detail_note(
+        local_fallback_note = gui_module.StarunGui._format_stage_detail_note(
             {
                 "status": "ok",
                 "fallback_used": True,
@@ -1667,35 +1627,6 @@ class GuiRuntimeModesTests(unittest.TestCase):
             self.assertEqual(worker._completed_run_status(), "CompletedWithWarning")
             self.assertIn("导出成功、收尾异常", "".join(events))
 
-    def test_pipeline_worker_ignores_disabled_stage_output(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            worker = gui_module.PipelineWorker(
-                work_dir=root,
-                config_template=root / "config.ini",
-                pipeline_path=root / "pipeline.py",
-                siril_plugin_dir=root / "plugins",
-                resources=root / "resources",
-                runtime_home=root / "runtime_home",
-                siril_candidates=[],
-                ai_stage_enabled=True,
-            )
-            emitted: list[str] = []
-            progress_events: list[tuple[object, ...]] = []
-            worker.log = SimpleNamespace(emit=emitted.append)
-            worker.progress = SimpleNamespace(
-                emit=lambda *values: progress_events.append(values)
-            )
-            worker._inspect_output_for_errors("Saving PNG: result.png")
-            disabled_line = "[INFO] 阶段 11: AI 后期美化"
-            worker._inspect_output_for_errors(disabled_line)
-            worker._emit_process_output(disabled_line)
-
-            self.assertFalse(worker._export_tail_disarmed)
-            self.assertIsNone(worker._current_pipeline_stage)
-            self.assertEqual(progress_events, [])
-            self.assertEqual(emitted, [])
-
     def test_gui_stage_contract_contains_only_product_stages(self):
         self.assertEqual(
             set(main_window_module.PIPELINE_STAGE_TITLES),
@@ -1703,21 +1634,19 @@ class GuiRuntimeModesTests(unittest.TestCase):
         )
         self.assertNotIn(11, main_window_module.PIPELINE_STAGE_SHORT_TITLES)
 
-    def test_history_log_hides_disabled_stage_lines(self):
+    def test_history_log_preserves_historical_text(self):
         with tempfile.TemporaryDirectory() as td:
             log_path = Path(td) / "historical.log"
             log_path.write_text(
                 "[INFO] Stage 10 completed\n"
-                "[INFO] 阶段 11: AI 后期美化\n"
-                "[INFO] SEESTAR_AI_ENABLED=0\n",
+                "[INFO] historical diagnostic text\n",
                 encoding="utf-8",
             )
 
-            rendered = main_window_module.SeestarGui._history_log_text(log_path)
+            rendered = main_window_module.StarunGui._history_log_text(log_path)
 
             self.assertIn("Stage 10 completed", rendered)
-            self.assertNotIn("阶段 11", rendered)
-            self.assertNotIn("SEESTAR_AI", rendered)
+            self.assertIn("historical diagnostic text", rendered)
 
     def test_pipeline_worker_watchdog_diagnostics_include_required_context(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1786,7 +1715,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
                     proc.wait(timeout=2)
 
     def test_gui_displays_export_success_with_teardown_warning(self):
-        display = gui_module.SeestarGui._display_status(
+        display = gui_module.StarunGui._display_status(
             SimpleNamespace(),
             "CompletedWithWarning",
         )
@@ -1871,7 +1800,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             env = worker._build_env(Path("/tmp/siril-cli"))
 
             self.assertEqual(
-                env.get("SEESTAR_INPUT_MODE"),
+                env.get("STARUN_INPUT_MODE"),
                 gui_module.INPUT_MODE_STAGE2_CORRECTED_RESUME,
             )
 
@@ -1901,6 +1830,44 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 f"{downloads} {runtime_downloads}",
             )
 
+    def test_pipeline_worker_prefers_runtime_venv_python_for_cli_plugins(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime_python = (
+                root
+                / "runtime_home"
+                / "Library/Application Support/org.siril.Siril/siril/venv"
+                / "bin/python3.12"
+            )
+            runtime_python.parent.mkdir(parents=True)
+            runtime_python.write_text("#!/bin/sh\n", encoding="utf-8")
+            runtime_python.chmod(0o755)
+            bundled_python = (
+                root
+                / "resources/Siril.app/Contents/Frameworks/Python.framework"
+                / "Versions/3.12/bin/python3.12"
+            )
+            bundled_python.parent.mkdir(parents=True)
+            bundled_python.write_text("#!/bin/sh\n", encoding="utf-8")
+            bundled_python.chmod(0o755)
+            worker = gui_module.PipelineWorker(
+                work_dir=root / "work",
+                config_template=root / "config.ini",
+                pipeline_path=root / "pipeline.py",
+                siril_plugin_dir=root / "plugins",
+                resources=root / "resources",
+                runtime_home=root / "runtime_home",
+                siril_candidates=[],
+            )
+
+            env = worker._build_env(Path("/tmp/siril-cli"))
+
+            self.assertEqual(env.get("SIRIL_PYTHON_CLI"), str(runtime_python))
+            self.assertEqual(
+                env.get("STARUN_SIRIL_PYTHON_CLI"),
+                str(runtime_python),
+            )
+
     def test_pipeline_worker_copies_target_catalog_and_policies_to_runtime(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1913,14 +1880,8 @@ class GuiRuntimeModesTests(unittest.TestCase):
             )
             pipeline_dir = root / "pipeline"
             pipeline_dir.mkdir()
-            pipeline_path = pipeline_dir / "seestar_Superimpose.py"
+            pipeline_path = pipeline_dir / "starun.py"
             pipeline_path.write_text("# mock\n", encoding="utf-8")
-            (pipeline_dir / "stage11_ai_postprocess.py").write_text(
-                "# disabled module\n", encoding="utf-8"
-            )
-            (pipeline_dir / "ai_artistic_derivative.py").write_text(
-                "# disabled module\n", encoding="utf-8"
-            )
             policy = (
                 pipeline_dir
                 / "configs"
@@ -1970,8 +1931,6 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 ).read_text(),
                 catalog.read_text(),
             )
-            self.assertFalse((temp_dir / "stage11_ai_postprocess.py").exists())
-            self.assertFalse((temp_dir / "ai_artistic_derivative.py").exists())
 
     def test_pipeline_worker_uses_lightweight_plugin_overlay_for_large_resources(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1988,6 +1947,10 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 resource_dir.mkdir(parents=True)
                 (resource_dir / "large.bin").write_bytes(b"x" * 1024)
             (plugin_dir / "syqon_starless" / "zenith.pt").write_bytes(b"model")
+            (plugin_dir / "syqon_starless" / "zenith.pt.sha256").write_text(
+                "checksum\n",
+                encoding="utf-8",
+            )
             (plugin_dir / "model_v2_0_1.onnx").write_bytes(b"graxpert-model")
             (plugin_dir / "bin").mkdir()
             (plugin_dir / "bin" / "helper").write_text("small", encoding="utf-8")
@@ -2015,11 +1978,11 @@ class GuiRuntimeModesTests(unittest.TestCase):
 
             env = worker._build_env(Path("/tmp/siril-cli"))
             self.assertEqual(
-                env.get("SEESTAR_SYQON_MODEL_DIR"),
+                env.get("STARUN_SYQON_MODEL_DIR"),
                 str(plugin_dir / "syqon_starless"),
             )
             self.assertEqual(
-                env.get("SEESTAR_COSMIC_CLARITY_MODEL_DIR"),
+                env.get("STARUN_COSMIC_CLARITY_MODEL_DIR"),
                 str(plugin_dir / "cosmic_clarity"),
             )
 
@@ -2030,6 +1993,10 @@ class GuiRuntimeModesTests(unittest.TestCase):
             syqon_bundle = plugin_dir / "syqon_starless"
             syqon_bundle.mkdir(parents=True)
             (syqon_bundle / "zenith.pt").write_bytes(b"bundled-model")
+            (syqon_bundle / "zenith.pt.sha256").write_text(
+                "checksum\n",
+                encoding="utf-8",
+            )
             runtime_syqon = root / "runtime" / "syqon_starless"
             runtime_syqon.mkdir(parents=True)
             (runtime_syqon / "zenith.pt").write_bytes(b"bundled-model")
@@ -2041,7 +2008,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 _runtime_syqon_starless_dir=lambda: runtime_syqon,
                 _display_path=str,
                 _append_event=events.append,
-                _remove_matching_legacy_runtime_files=lambda bundle, target, names: gui_module.SeestarGui._remove_matching_legacy_runtime_files(
+                _remove_matching_runtime_model_copies=lambda bundle, target, names: gui_module.StarunGui._remove_matching_runtime_model_copies(
                     proxy,
                     bundle,
                     target,
@@ -2049,7 +2016,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 ),
             )
 
-            gui_module.SeestarGui._sync_syqon_starless_bundle(proxy)
+            gui_module.StarunGui._sync_syqon_starless_bundle(proxy)
 
             self.assertFalse((runtime_syqon / "zenith.pt").exists())
             self.assertTrue((runtime_syqon / "user-model.pt").exists())
@@ -2078,7 +2045,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 _bootstrap_state_is_current=lambda _fingerprint: False,
                 _plugin_downloads_dir=lambda: downloads,
             )
-            estimate = gui_module.SeestarGui._estimate_runtime_disk_space(
+            estimate = gui_module.StarunGui._estimate_runtime_disk_space(
                 proxy,
                 {"fingerprint": "changed"},
             )
@@ -2087,7 +2054,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             self.assertEqual(estimate.support_growth_bytes, 0)
             self.assertEqual(
                 estimate.dependency_growth_bytes,
-                int(100 * gui_module.SeestarGui._estimate_runtime_disk_space.__globals__["RUNTIME_DEPENDENCY_EXPANSION_FACTOR"]),
+                int(100 * gui_module.StarunGui._estimate_runtime_disk_space.__globals__["RUNTIME_DEPENDENCY_EXPANSION_FACTOR"]),
             )
 
     def test_core_app_discovers_adjacent_offline_resource_pack(self):
@@ -2095,18 +2062,18 @@ class GuiRuntimeModesTests(unittest.TestCase):
             distribution_root = Path(td)
             resources = (
                 distribution_root
-                / "SeestarSuperimpose.app"
+                / "Starun.app"
                 / "Contents"
                 / "Resources"
             )
             resources.mkdir(parents=True)
             external_plugins = (
                 distribution_root
-                / "SeestarSuperimpose-OfflineResources"
+                / "Starun-OfflineResources"
                 / "siril_plugins"
             )
             external_plugins.mkdir(parents=True)
-            resolver = gui_module.SeestarGui.__init__.__globals__[
+            resolver = gui_module.StarunGui.__init__.__globals__[
                 "default_siril_plugin_dir"
             ]
             resolver_globals = resolver.__globals__
@@ -2128,83 +2095,6 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 resolver_globals["is_frozen"] = original_is_frozen
             self.assertEqual(resolved_full, embedded_plugins)
 
-    @unittest.skip("SPCC runtime and crash-retry path retired")
-    def test_pipeline_worker_spcc_crash_retry_env_disables_spcc(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            worker = gui_module.PipelineWorker(
-                work_dir=root / "work",
-                config_template=root / "config.ini",
-                pipeline_path=root / "pipeline.py",
-                siril_plugin_dir=root / "plugins",
-                resources=root / "resources",
-                runtime_home=root / "runtime_home",
-                siril_candidates=[],
-            )
-            worker._force_disable_spcc_for_retry = True
-
-            env = worker._build_env(Path("/tmp/siril-cli"))
-
-            self.assertEqual(env.get("SEESTAR_SPCC_ENABLE"), "0")
-
-    @unittest.skip("SPCC runtime and crash-retry path retired")
-    def test_pipeline_worker_spcc_crash_retry_resumes_current_stage4_checkpoint(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            work_dir = root / "work"
-            process_dir = work_dir / "process"
-            process_dir.mkdir(parents=True)
-            worker = gui_module.PipelineWorker(
-                work_dir=work_dir,
-                config_template=root / "config.ini",
-                pipeline_path=root / "pipeline.py",
-                siril_plugin_dir=root / "plugins",
-                resources=root / "resources",
-                runtime_home=root / "runtime_home",
-                siril_candidates=[],
-            )
-            worker._capture_artifact_snapshot()
-            checkpoint = process_dir / gui_module.STAGE4_PSOLVED_INPUT_NAME
-            checkpoint.write_bytes(b"current-stage4-psolved")
-
-            selected = worker._prepare_spcc_crash_retry()
-            env = worker._build_env(Path("/tmp/siril-cli"))
-
-            self.assertEqual(selected, checkpoint)
-            self.assertTrue(worker._force_disable_spcc_for_retry)
-            self.assertTrue(worker._resume_stage4_psolved_for_retry)
-            self.assertEqual(env.get("SEESTAR_SPCC_ENABLE"), "0")
-            self.assertEqual(
-                env.get("SEESTAR_INPUT_MODE"),
-                gui_module.INPUT_MODE_STAGE4_PSOLVED_RESUME,
-            )
-
-    @unittest.skip("SPCC runtime and crash-retry path retired")
-    def test_pipeline_worker_does_not_resume_stale_stage4_checkpoint(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            work_dir = root / "work"
-            process_dir = work_dir / "process"
-            process_dir.mkdir(parents=True)
-            checkpoint = process_dir / gui_module.STAGE4_PSOLVED_INPUT_NAME
-            checkpoint.write_bytes(b"stale-stage4-psolved")
-            worker = gui_module.PipelineWorker(
-                work_dir=work_dir,
-                config_template=root / "config.ini",
-                pipeline_path=root / "pipeline.py",
-                siril_plugin_dir=root / "plugins",
-                resources=root / "resources",
-                runtime_home=root / "runtime_home",
-                siril_candidates=[],
-            )
-            worker._capture_artifact_snapshot()
-
-            selected = worker._prepare_spcc_crash_retry()
-
-            self.assertIsNone(selected)
-            self.assertTrue(worker._force_disable_spcc_for_retry)
-            self.assertFalse(worker._resume_stage4_psolved_for_retry)
-
     def test_pipeline_worker_marks_native_termination_marker_as_error(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -2224,120 +2114,6 @@ class GuiRuntimeModesTests(unittest.TestCase):
 
             self.assertTrue(worker._run_had_errors)
             self.assertTrue(worker._native_process_terminated_detected)
-
-    @unittest.skip("SPCC runtime and crash-retry path retired")
-    def test_pipeline_worker_keeps_minus11_retry_and_uses_stage4_resume(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            work_dir = root / "work"
-            process_dir = work_dir / "process"
-            process_dir.mkdir(parents=True)
-            worker = gui_module.PipelineWorker(
-                work_dir=work_dir,
-                config_template=root / "config.ini",
-                pipeline_path=root / "pipeline.py",
-                siril_plugin_dir=root / "plugins",
-                resources=root / "resources",
-                runtime_home=root / "runtime_home",
-                siril_candidates=[Path("/tmp/fake-siril-cli")],
-            )
-            events: list[str] = []
-            done_calls: list[tuple[object, ...]] = []
-            worker.log = SimpleNamespace(emit=lambda text: events.append(str(text)))
-            worker.state = SimpleNamespace(emit=lambda *_args: None)
-            worker.done = SimpleNamespace(emit=lambda *args: done_calls.append(args))
-            worker._prepare_runtime_files = lambda temp: (
-                temp / "run.ssf",
-                temp / "run.ini",
-                temp / "pipeline.py",
-            )
-            run_calls: list[int] = []
-
-            def run_once(*_args):
-                run_calls.append(len(run_calls) + 1)
-                if len(run_calls) == 1:
-                    worker._artifact_snapshot = {}
-                    (process_dir / gui_module.STAGE4_PSOLVED_INPUT_NAME).write_bytes(
-                        b"current-stage4-checkpoint"
-                    )
-                    worker._spcc_cli_crash_detected = True
-                    return False, -11
-                self.assertTrue(worker._force_disable_spcc_for_retry)
-                self.assertTrue(worker._resume_stage4_psolved_for_retry)
-                return True, 0
-
-            worker._run_once = run_once
-
-            worker.run()
-
-            self.assertEqual(run_calls, [1, 2])
-            self.assertTrue(done_calls)
-            self.assertEqual(done_calls[-1][0], "Completed")
-            self.assertIn("stage4_psolved.fit 检查点", "".join(events))
-
-    @unittest.skip("SPCC runtime and crash-retry path retired")
-    def test_pipeline_worker_detects_spcc_command_marker(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            worker = gui_module.PipelineWorker(
-                work_dir=root / "work",
-                config_template=root / "config.ini",
-                pipeline_path=root / "pipeline.py",
-                siril_plugin_dir=root / "plugins",
-                resources=root / "resources",
-                runtime_home=root / "runtime_home",
-                siril_candidates=[],
-            )
-
-            worker._inspect_output_for_errors('input command:spcc "-oscsensor=Sony IMX585"')
-
-            self.assertTrue(worker._spcc_seen_in_run)
-
-    @unittest.skip("SPCC runtime and crash-retry path retired")
-    def test_pipeline_worker_does_not_misattribute_stage6_native_failure_to_spcc(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            worker = gui_module.PipelineWorker(
-                work_dir=root / "work",
-                config_template=root / "config.ini",
-                pipeline_path=root / "pipeline.py",
-                siril_plugin_dir=root / "plugins",
-                resources=root / "resources",
-                runtime_home=root / "runtime_home",
-                siril_candidates=[],
-            )
-
-            worker._inspect_output_for_errors("log: [INFO] 阶段 4: 色彩校准")
-            worker._inspect_output_for_errors('input command:spcc "-oscsensor=Sony IMX585"')
-            worker._inspect_output_for_errors("log: [INFO] 阶段 6: 星点分离")
-            worker._inspect_output_for_errors(
-                "log: [SIRIL_NATIVE_PROCESS_TERMINATED] Bad file descriptor"
-            )
-
-            self.assertEqual(worker._native_termination_stage, 6)
-            self.assertFalse(worker._is_spcc_crash_context(0))
-
-    @unittest.skip("SPCC runtime and crash-retry path retired")
-    def test_pipeline_worker_attributes_stage4_native_failure_to_spcc(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            worker = gui_module.PipelineWorker(
-                work_dir=root / "work",
-                config_template=root / "config.ini",
-                pipeline_path=root / "pipeline.py",
-                siril_plugin_dir=root / "plugins",
-                resources=root / "resources",
-                runtime_home=root / "runtime_home",
-                siril_candidates=[],
-            )
-
-            worker._inspect_output_for_errors("log: [INFO] 阶段 4: 色彩校准")
-            worker._inspect_output_for_errors('input command:spcc "-oscsensor=Sony IMX585"')
-            worker._inspect_output_for_errors(
-                "log: [SIRIL_NATIVE_PROCESS_TERMINATED] SPCC connection closed"
-            )
-
-            self.assertTrue(worker._is_spcc_crash_context(0))
 
     def test_pipeline_worker_marks_degraded_pipeline_summary_as_warning(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2397,31 +2173,6 @@ class GuiRuntimeModesTests(unittest.TestCase):
             )
 
             self.assertEqual(worker._completed_run_status(), "Failed")
-
-    @unittest.skip("SPCC runtime and crash-retry path retired")
-    def test_pipeline_worker_spcc_crash_diagnostics_include_recent_output(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            worker = gui_module.PipelineWorker(
-                work_dir=root / "work",
-                config_template=root / "config.ini",
-                pipeline_path=root / "pipeline.py",
-                siril_plugin_dir=root / "plugins",
-                resources=root / "resources",
-                runtime_home=root / "runtime_home",
-                siril_candidates=[],
-            )
-            events: list[str] = []
-            worker.log = SimpleNamespace(emit=lambda text: events.append(str(text)))
-
-            worker._inspect_output_for_errors('input command:spcc "-oscsensor=Sony IMX585"')
-            worker._inspect_output_for_errors("log: Applying aperture photometry to 991 stars.")
-            worker._append_spcc_crash_diagnostics(-11)
-
-            rendered = "".join(events)
-            self.assertIn("SPCC 崩溃诊断", rendered)
-            self.assertIn("input command:spcc", rendered)
-            self.assertIn("Applying aperture photometry to 991 stars", rendered)
 
     def test_pipeline_worker_configures_runtime_local_spcc_catalog(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2494,12 +2245,26 @@ class GuiRuntimeModesTests(unittest.TestCase):
             )
 
             self.assertTrue(ready, detail)
-            self.assertEqual(result["managed_files"], 8)
+            self.assertEqual(result["managed_files"], 16)
             self.assertTrue(
                 (
                     Path(result["target_root"])
                     / "osc_sensors"
                     / "Sony_IMX585.json"
+                ).is_file()
+            )
+            self.assertTrue(
+                (
+                    Path(result["target_root"])
+                    / "osc_sensors"
+                    / "ZWO_Seestar_S50.json"
+                ).is_file()
+            )
+            self.assertTrue(
+                (
+                    Path(result["target_root"])
+                    / "osc_sensors"
+                    / "Sony_IMX678.json"
                 ).is_file()
             )
 
@@ -2551,7 +2316,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 rendered,
             )
 
-    def test_preflight_errors_require_result_linear_for_resume_mode(self):
+    def test_preflight_errors_require_signed_manifest_for_stage5_resume(self):
         with tempfile.TemporaryDirectory() as td:
             work_dir = Path(td)
             (work_dir / "M42_master.fit").write_bytes(b"stacked")
@@ -2560,14 +2325,14 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 input_mode=gui_module.INPUT_MODE_LINEAR_RESUME,
             )
 
-            errors = gui_module.SeestarGui._preflight_errors(proxy, work_dir)
+            errors = gui_module.StarunGui._preflight_errors(proxy, work_dir)
 
             self.assertTrue(errors)
             self.assertTrue(
-                any(gui_module.LINEAR_RESUME_INPUT_NAME in err for err in errors)
+                any("task-run manifest" in err for err in errors)
             )
 
-    def test_preflight_errors_require_stage2_corrected_for_resume_mode(self):
+    def test_preflight_errors_require_signed_manifest_for_stage2_resume(self):
         with tempfile.TemporaryDirectory() as td:
             work_dir = Path(td)
             (work_dir / "M42_master.fit").write_bytes(b"stacked")
@@ -2576,103 +2341,153 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 input_mode=gui_module.INPUT_MODE_STAGE2_CORRECTED_RESUME,
             )
 
-            errors = gui_module.SeestarGui._preflight_errors(proxy, work_dir)
+            errors = gui_module.StarunGui._preflight_errors(proxy, work_dir)
 
             self.assertTrue(errors)
             self.assertTrue(
-                any(gui_module.STAGE2_CORRECTED_INPUT_NAME in err for err in errors)
+                any("task-run manifest" in err for err in errors)
             )
 
-    def test_linear_resume_disk_estimate_and_summary_use_dedicated_mode(self):
+    def test_preflight_accepts_verified_stage5_manifest_route(self):
+        from pipeline.stage_contracts import pipeline_contract_manifest
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            work_dir = root / "run"
+            work_dir.mkdir()
+            checkpoint = root / "task" / "checkpoints" / "stage5_linear.fit"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_bytes(b"verified-stage5")
+            payload = {
+                "schema": "starun.task-run.v1",
+                "pipeline_contract": pipeline_contract_manifest(),
+                "resume": {
+                    "stage": 5,
+                    "artifact": "stage5_linear.fit",
+                    "path": str(checkpoint),
+                    "sha256": main_window_module.pipeline_run_manifest.sha256_file(
+                        checkpoint
+                    ),
+                    "state": "linear",
+                },
+            }
+            payload["manifest_hash"] = (
+                main_window_module.pipeline_run_manifest.canonical_payload_hash(
+                    payload
+                )
+            )
+            manifest_path = work_dir / "run-manifest.json"
+            main_window_module.pipeline_run_manifest.atomic_write_json(
+                manifest_path,
+                payload,
+            )
+            proxy = SimpleNamespace(
+                _pending_runtime_overrides={
+                    "STARUN_TASK_RUN_MANIFEST": str(manifest_path)
+                },
+                _current_input_mode=lambda: gui_module.INPUT_MODE_LINEAR_RESUME,
+            )
+
+            with patch.object(
+                gui_module.StarunGui,
+                "_inspect_runtime_capabilities",
+                return_value={"blocking_errors": []},
+            ):
+                errors = gui_module.StarunGui._preflight_errors(
+                    proxy,
+                    work_dir,
+                )
+
+            self.assertEqual(errors, [])
+
+    def test_verified_stage5_resume_disk_estimate_uses_manifest_route(self):
         with tempfile.TemporaryDirectory() as td:
             work_dir = Path(td)
-            linear_path = work_dir / gui_module.LINEAR_RESUME_INPUT_NAME
-            linear_path.write_bytes(b"x" * 1024)
             proxy = self._make_gui_proxy(
                 work_dir,
                 input_mode=gui_module.INPUT_MODE_LINEAR_RESUME,
             )
+            proxy._active_prepared_task = SimpleNamespace(
+                run=SimpleNamespace(root=work_dir),
+                source_record={"kind": "master_file", "files": [{"size": 1024}]},
+                resume_after_stage=5,
+                display_label="verified-task",
+            )
 
-            estimate = gui_module.SeestarGui._estimate_disk_space(proxy, work_dir)
+            estimate = gui_module.StarunGui._estimate_disk_space(proxy, work_dir)
             self.assertIsNotNone(estimate)
             assert estimate is not None
             self.assertEqual(estimate.mode, "linear_resume")
-            self.assertEqual(estimate.selected_input_label, gui_module.LINEAR_RESUME_INPUT_NAME)
+            self.assertEqual(estimate.selected_input_label, "Stage 5 已验证断点")
             self.assertEqual(
                 estimate.estimated_peak_growth_bytes,
                 int(
                     1024
-                    * gui_module.SeestarGui._estimate_disk_space.__globals__[
+                    * gui_module.StarunGui._estimate_disk_space.__globals__[
                         "LINEAR_RESUME_STAGE_ARTIFACT_COPIES"
                     ]
                 ),
             )
 
-            summary_lines = gui_module.SeestarGui._disk_space_summary_lines(proxy, estimate)
+            summary_lines = gui_module.StarunGui._disk_space_summary_lines(proxy, estimate)
             self.assertTrue(
                 any("从线性反卷积与降噪后继续" in line for line in summary_lines)
             )
-            self.assertTrue(
-                any(gui_module.LINEAR_RESUME_INPUT_NAME in line for line in summary_lines)
-            )
 
-    def test_stage2_corrected_resume_disk_estimate_and_summary_use_dedicated_mode(self):
+    def test_verified_stage2_resume_disk_estimate_uses_manifest_route(self):
         with tempfile.TemporaryDirectory() as td:
             work_dir = Path(td)
-            process_dir = work_dir / "process"
-            process_dir.mkdir()
-            stage2_path = process_dir / gui_module.STAGE2_CORRECTED_INPUT_NAME
-            stage2_path.write_bytes(b"x" * 1024)
             proxy = self._make_gui_proxy(
                 work_dir,
                 input_mode=gui_module.INPUT_MODE_STAGE2_CORRECTED_RESUME,
             )
+            proxy._active_prepared_task = SimpleNamespace(
+                run=SimpleNamespace(root=work_dir),
+                source_record={"kind": "master_file", "files": [{"size": 1024}]},
+                resume_after_stage=2,
+                display_label="verified-task",
+            )
 
-            estimate = gui_module.SeestarGui._estimate_disk_space(proxy, work_dir)
+            estimate = gui_module.StarunGui._estimate_disk_space(proxy, work_dir)
             self.assertIsNotNone(estimate)
             assert estimate is not None
             self.assertEqual(estimate.mode, "stage2_corrected_resume")
-            self.assertEqual(estimate.selected_input_label, gui_module.STAGE2_CORRECTED_INPUT_NAME)
+            self.assertEqual(estimate.selected_input_label, "Stage 2 已验证断点")
             self.assertEqual(
                 estimate.estimated_peak_growth_bytes,
                 int(
                     1024
-                    * gui_module.SeestarGui._estimate_disk_space.__globals__[
+                    * gui_module.StarunGui._estimate_disk_space.__globals__[
                         "STAGE2_RESUME_STAGE_ARTIFACT_COPIES"
                     ]
                 ),
             )
             self.assertGreaterEqual(
-                gui_module.SeestarGui._estimate_disk_space.__globals__[
+                gui_module.StarunGui._estimate_disk_space.__globals__[
                     "STAGE2_RESUME_STAGE_ARTIFACT_COPIES"
                 ],
                 40.0,
             )
 
-            summary_lines = gui_module.SeestarGui._disk_space_summary_lines(proxy, estimate)
+            summary_lines = gui_module.StarunGui._disk_space_summary_lines(proxy, estimate)
             self.assertTrue(any("从边界校正后继续" in line for line in summary_lines))
-            self.assertTrue(
-                any(gui_module.STAGE2_CORRECTED_INPUT_NAME in line for line in summary_lines)
-            )
 
-    def test_stage0_preview_candidates_follow_input_mode(self):
+    def test_stage0_preview_ignores_root_result_as_resume_checkpoint(self):
         with tempfile.TemporaryDirectory() as td:
             work_dir = Path(td)
             light_b = work_dir / "Light_002.fit"
             light_a = work_dir / "Light_001.fit"
-            resume = work_dir / gui_module.LINEAR_RESUME_INPUT_NAME
+            resume = work_dir / "result_linear.fit"
             for path in (light_b, light_a, resume):
                 path.write_bytes(b"fits")
 
             proxy = SimpleNamespace(
                 _current_input_mode=lambda: gui_module.INPUT_MODE_AUTO,
-                _linear_resume_input_path=lambda wd: wd / gui_module.LINEAR_RESUME_INPUT_NAME,
-                _stage2_corrected_resume_input_path=lambda wd: wd / gui_module.STAGE2_CORRECTED_INPUT_NAME,
                 _fits_in_work_dir=lambda _wd: [light_b, resume, light_a],
                 _is_candidate_stacked_input=lambda _path, _wd: False,
             )
 
-            candidates, label = gui_module.SeestarGui._initial_preview_candidates(
+            candidates, label = gui_module.StarunGui._initial_preview_candidates(
                 proxy,
                 work_dir,
                 gui_module.INPUT_MODE_AUTO,
@@ -2681,14 +2496,14 @@ class GuiRuntimeModesTests(unittest.TestCase):
             self.assertEqual(label, "输入样本 · 2 帧")
 
             resume_candidates, resume_label = (
-                gui_module.SeestarGui._initial_preview_candidates(
+                gui_module.StarunGui._initial_preview_candidates(
                     proxy,
                     work_dir,
                     gui_module.INPUT_MODE_LINEAR_RESUME,
                 )
             )
-            self.assertEqual(resume_candidates, [resume])
-            self.assertEqual(resume_label, "续跑输入")
+            self.assertEqual(resume_candidates, [light_a, light_b])
+            self.assertEqual(resume_label, "输入样本 · 2 帧")
 
     def test_pipeline_worker_emits_preview_events_only_for_product_stages(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2720,6 +2535,115 @@ class GuiRuntimeModesTests(unittest.TestCase):
             self.assertTrue(all(event[2] == "ready" for event in events))
             self.assertTrue(all(event[3] == str(preview_path) for event in events))
 
+    def test_pipeline_worker_reassembles_wrapped_preview_events(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run_dir = (
+                root
+                / "Starun"
+                / "seestars30-ic434-60s-60gain-209frames-03e527ebe65e"
+                / "runs"
+                / "20260808T111023Z-607cc2e4"
+            )
+            preview_path = run_dir / "process" / "ui_preview" / "latest.png"
+            preview_path.parent.mkdir(parents=True)
+            preview_path.write_bytes(b"png")
+            worker = gui_module.PipelineWorker(
+                work_dir=run_dir,
+                config_template=root / "config.ini",
+                pipeline_path=root / "pipeline.py",
+                siril_plugin_dir=root / "plugins",
+                resources=root / "resources",
+                runtime_home=root / "runtime",
+                siril_candidates=[],
+            )
+            events = []
+            diagnostics = []
+            worker.preview = SimpleNamespace(
+                emit=lambda *values: events.append(values)
+            )
+            worker.log = SimpleNamespace(emit=diagnostics.append)
+
+            stage1_payload = json.dumps(
+                {
+                    "stage": 1,
+                    "title": "前期准备",
+                    "status": "ready",
+                    "payload": str(preview_path),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            worker._inspect_output_for_errors(
+                "log: [19:10:28] [INFO] [PIPELINE_PREVIEW] \n"
+            )
+            worker._inspect_output_for_errors(f"log: {stage1_payload}\n")
+
+            worker._inspect_output_for_errors(
+                'log: [19:10:59] [INFO] [PIPELINE_PREVIEW] '
+                '{"stage":4,"title":"图像解析 + \n'
+            )
+            worker._inspect_output_for_errors(
+                'log: 色彩校准","status":"ready","payload":"'
+                f'{preview_path}"}}\n'
+            )
+
+            self.assertEqual(
+                events,
+                [
+                    (1, "前期准备", "ready", str(preview_path)),
+                    (4, "图像解析 + 色彩校准", "ready", str(preview_path)),
+                ],
+            )
+            self.assertFalse(
+                any("无效的阶段预览事件" in event for event in diagnostics)
+            )
+
+    def test_direct_rerun_accepts_existing_file_input(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "M42.xisf"
+            source.write_bytes(b"xisf")
+            selected_paths = []
+            starts = []
+            warnings = []
+            buttons = SimpleNamespace(Yes=1, No=2)
+            message_box = SimpleNamespace(
+                StandardButton=buttons,
+                question=lambda *_args, **_kwargs: buttons.Yes,
+                warning=lambda *args, **_kwargs: warnings.append(args),
+            )
+            proxy = SimpleNamespace(
+                _history_detail_mode=False,
+                _last_run_snapshot={
+                    "work_dir": str(source),
+                    "input_mode": gui_module.INPUT_MODE_AUTO,
+                    "debug_mode_enabled": False,
+                    "network_mode_enabled": True,
+                    "processing_settings": {},
+                },
+                debug_mode_enabled=True,
+                network_mode_enabled=False,
+                _restore_processing_settings=lambda _settings: None,
+                _update_debug_button_text=lambda: None,
+                _update_network_button_text=lambda: None,
+                dir_edit=SimpleNamespace(
+                    setText=lambda value: selected_paths.append(value)
+                ),
+                _start_run=lambda **kwargs: starts.append(kwargs),
+            )
+
+            with patch.object(main_window_module, "QMessageBox", message_box):
+                gui_module.StarunGui._rerun_last_task(proxy)
+
+            self.assertEqual(selected_paths, [str(source)])
+            self.assertEqual(
+                starts,
+                [{}],
+            )
+            self.assertEqual(warnings, [])
+            self.assertFalse(proxy.debug_mode_enabled)
+            self.assertTrue(proxy.network_mode_enabled)
+
     def test_preview_failure_retains_previous_reliable_stage(self):
         class Label:
             def __init__(self):
@@ -2741,7 +2665,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             _append_event=events.append,
         )
 
-        gui_module.SeestarGui._on_pipeline_preview(
+        gui_module.StarunGui._on_pipeline_preview(
             proxy,
             5,
             "线性降噪",

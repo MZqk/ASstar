@@ -21,7 +21,7 @@ except ImportError:  # Support direct execution from the gui directory.
 def preview_cache_path(work_dir: Path) -> Path:
     """Return a deterministic cache path without writing into the user's project."""
     digest = hashlib.sha256(str(work_dir).encode("utf-8")).hexdigest()[:16]
-    root = Path(tempfile.gettempdir()) / "seestar-superimpose-previews" / digest
+    root = Path(tempfile.gettempdir()) / "starun-previews" / digest
     return root / "stage0_input.png"
 
 

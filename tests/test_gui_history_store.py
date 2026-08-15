@@ -240,7 +240,7 @@ class GuiHistoryStoreTests(unittest.TestCase):
             root = Path(td)
             _source_record, workspace, run = self._task(root)
             result = {
-                "schema": "seestar.pipeline-result.v1",
+                "schema": "starun.pipeline-result.v1",
                 "run_id": run.run_id,
                 "status": "success",
                 "outputs": {},

@@ -28,6 +28,11 @@ SPDX-License-Identifier: GPL-3.0-or-later
 0.2.0	Adds cropping and better handling of siril and setiastro python version mismatch
 0.2.1   Add option to separate starmask and starless processing, with starmask combine factor 
 0.2.2   Add option to run synthstar on starmask and GUI improvements
+0.2.3   Add stride input for starnet
+0.2.4   Adds GUI to select SPCC sensors and filters
+0.2.5	Run starnet after SPCC and bge
+0.2.6 	Add aberration correction to SetiAstroPro CC sharpen
+0.2.7	Add GUI to create excutable config file 
 """
 
 import sys
@@ -38,13 +43,13 @@ import sirilpy as s
 import argparse
 import re
 
-VERSION = "0.2.2"
+VERSION = "0.2.7"
 
 # PyQt6 for GUI
 try:
 	from PyQt6.QtWidgets import (
 		QApplication, QComboBox, QDialog, QLabel, QLineEdit, QPushButton, QCheckBox, QToolTip, QScrollArea,
-		QVBoxLayout, QHBoxLayout, QFormLayout, QDialogButtonBox, QMessageBox, QFrame, QGroupBox, QWidget
+		QVBoxLayout, QHBoxLayout, QFormLayout, QDialogButtonBox, QMessageBox, QFrame, QGroupBox, QWidget, QFileDialog
 	)
 except ImportError:
 	# Silently fail if PyQt6 is not installed, as it's optional for CLI mode.
@@ -52,6 +57,21 @@ except ImportError:
 
 original_images = []
 processed_images = []
+
+def create_execute_config(config_file_path, ):
+	utility = config_file_path.split('_')[1].split('.')[0]
+	start_dir = ""  # e.g., "/home/user" or "" for default
+	file_filter = "All Files (*)"
+	file_path, _ = QFileDialog.getOpenFileName(parent=None, caption=f"Select the executable for {utility}", directory=start_dir, filter=file_filter)
+	
+	if file_path:
+		print("Selected file:", file_path)
+		with open(config_file_path, 'w') as file:
+			file.write(file_path)
+		sys.exit(0)
+	else:
+		print("No file selected")
+		sys.exit(0)
 
 # ==============================================================================
 # Prototype sirilpy processing script
@@ -137,9 +157,13 @@ def denoise_CC(workdir):
 			executable_path = file.readline().strip()
 			cc_input_dir = (executable_path.rsplit('/', 1)[0])+"/input"
 			cc_output_dir = (executable_path.rsplit('/', 1)[0])+"/output"
+
 	else:
-		print("Executable not yet configured. It is recommended to use Seti Astro Cosmic Clarity v5.4 or higher.")
-		sys.exit(1)
+		if len(sys.argv) == 1:
+			create_execute_config(f"{config_dir}/sirilcc_denoise.conf")
+		else:
+			print(f"Executable not configured. Please create file 'sirilcc_denoise.conf' in your siril config directory {config_dir} with a line containing the path to setiastrosuitepro.")
+			sys.exit(1)
 
 	os.chdir(cc_input_dir)
 	for oldimage in os.listdir():
@@ -210,9 +234,14 @@ def denoise_SA(workdir):
 		with open(config_file_path, 'r') as file:
 			executable_path = file.readline().strip()
 			python_path = executable_path.replace("setiastrosuitepro", "python")
+
 	else:
-		print(f"Executable not configured. Please create file 'sirilcc_saspro.conf' in your siril config directory {config_dir} with a line containing the path to setiastrosuitepro.")
-		sys.exit(1)
+		if len(sys.argv) == 1:
+			create_execute_config(f"{config_dir}/sirilcc_saspro.conf")
+			python_path = executable_path.replace("setiastrosuitepro", "python")			
+		else:
+			print(f"Executable not configured. Please create file 'sirilcc_saspro.conf' in your siril config directory {config_dir} with a line containing the path to setiastrosuitepro.")
+			sys.exit(1)
 		
 	for image in os.listdir():
 		if image.endswith(('.fits', '.fit', '.fts', '.fz')) and image not in processed_images:
@@ -242,6 +271,35 @@ def denoise_SA(workdir):
 							siril.log(line)
 			process.wait()
 			processed_images.append(f"{image}")		
+
+def get_sensors_filters():
+		siril.connect()
+		siril.cmd("clear")
+		siril.cmd("SPCC_list", "oscsensor")
+		log = (siril.get_siril_log())
+		oscsensors = [((line.split(":",3)[3] if line.count(":")>=3 else line.split(":",1)[-1]).strip()) for line in log.replace("\x00","").splitlines()[2:] if line.strip()]
+		siril.cmd("clear")
+		siril.cmd("SPCC_list", "monosensor")
+		log = (siril.get_siril_log())
+		monosensors = [((line.split(":",3)[3] if line.count(":")>=3 else line.split(":",1)[-1]).strip()) for line in log.replace("\x00","").splitlines()[2:] if line.strip()]
+		siril.cmd("clear")
+		siril.cmd("SPCC_list", "oscfilter")
+		log = (siril.get_siril_log())
+		oscfilters = [((line.split(":",3)[3] if line.count(":")>=3 else line.split(":",1)[-1]).strip()) for line in log.replace("\x00","").splitlines()[2:] if line.strip()]
+		siril.cmd("clear")
+		siril.cmd("SPCC_list", "redfilter")
+		log = (siril.get_siril_log())
+		redfilters = [((line.split(":",3)[3] if line.count(":")>=3 else line.split(":",1)[-1]).strip()) for line in log.replace("\x00","").splitlines()[2:] if line.strip()]		
+		siril.cmd("clear")
+		siril.cmd("SPCC_list", "bluefilter")
+		log = (siril.get_siril_log())
+		bluefilters = [((line.split(":",3)[3] if line.count(":")>=3 else line.split(":",1)[-1]).strip()) for line in log.replace("\x00","").splitlines()[2:] if line.strip()]
+		siril.cmd("clear")
+		siril.cmd("SPCC_list", "greenfilter")
+		log = (siril.get_siril_log())
+		greenfilters = [((line.split(":",3)[3] if line.count(":")>=3 else line.split(":",1)[-1]).strip()) for line in log.replace("\x00","").splitlines()[2:] if line.strip()]		
+		siril.disconnect()
+		return oscsensors, monosensors, oscfilters, redfilters, bluefilters, greenfilters
 			
 def multiprocess(workdir):
 	os.chdir(workdir)
@@ -260,7 +318,7 @@ def multiprocess(workdir):
 
 def pixelmath(workdir):
 	os.chdir(workdir)
-	combine_factor = (args.starnet[1])
+	combine_factor = (args.starnet[2])
 	for starmask in os.listdir():
 		if starmask.startswith("starmask"):
 			stars = starmask
@@ -294,9 +352,13 @@ def sharpen_CC(workdir):
 			executable_path = file.readline().strip()
 			cc_input_dir = (executable_path.rsplit('/', 1)[0])+"/input"
 			cc_output_dir = (executable_path.rsplit('/', 1)[0])+"/output"
+
 	else:
-		print("Executable not yet configured. It is recommended to use Seti Astro Cosmic Clarity v5.4 or higher.")
-		sys.exit(1)
+		if len(sys.argv) == 1:
+			create_execute_config(f"{config_dir}/sirilcc_sharpen.conf")
+		else:
+			print(f"Executable not configured. Please create file 'sirilcc_sharpen.conf' in your siril config directory {config_dir} with a line containing the path to setiastrosuitepro.")
+			sys.exit(1)
 
 	os.chdir(cc_input_dir)
 	for image in os.listdir():
@@ -357,14 +419,18 @@ def sharpen_SA(workdir):
 			executable_path = file.readline().strip()
 			python_path = executable_path.replace("setiastrosuitepro", "python")
 	else:
-		print(f"Executable not configured. Please create file 'sirilcc_saspro.conf' in your siril config directory {config_dir} with a line containing the path to setiastrosuitepro.")
-		sys.exit(1)
+		if len(sys.argv) == 1:
+			create_execute_config(f"{config_dir}/sirilcc_saspro.conf")
+			python_path = executable_path.replace("setiastrosuitepro", "python")			
+		else:
+			print(f"Executable not configured. Please create file 'sirilcc_saspro.conf' in your siril config directory {config_dir} with a line containing the path to setiastrosuitepro.")
+			sys.exit(1)
 		
 	for image in os.listdir():
 		if image.endswith(('.fits', '.fit', '.fts', '.fz')) and image not in processed_images:
 			siril.log(image)
 			newimage = (f"{(image).rsplit('.', 1)[0]}_ssa-{sharpenSA_mode.rsplit( )[0]}-{sharpenSA_non_stellar_amount}-{sharpenSA_stellar_amount}.fit")
-			cmd = [python_path, executable_path, "cc", "sharpen", "--gpu", "--sharpening-mode", f"{sharpenSA_mode}", "--nonstellar-amount", f"{sharpenSA_non_stellar_amount}", "--stellar-amount", f"{sharpenSA_stellar_amount}", "--auto-psf", "-i", f"{image}", "-o", f"{newimage}"]
+			cmd = [python_path, executable_path, "cc", "sharpen", "--gpu", "--stellar-correct-mode", "correct_sharpen", "--sharpening-mode", f"{sharpenSA_mode}", "--nonstellar-amount", f"{sharpenSA_non_stellar_amount}", "--stellar-amount", f"{sharpenSA_stellar_amount}", "--auto-psf", "-i", f"{image}", "-o", f"{newimage}"]
 			print(" ".join(cmd))
 			
 			my_env = os.environ.copy()
@@ -436,7 +502,8 @@ def starnet(workdir):
 			else:
 				print("Upscale factor needs to be a 1 or 2")
 				sys.exit(1)
-			siril.cmd(f"starnet -stretch {upscale}")
+			stride = int(args.starnet[1])
+			siril.cmd(f"starnet -stretch {upscale} -stride={stride}")
 			for starmask in os.listdir():
 				if starmask.startswith("starmask"):
 					siril.cmd("load", starmask)
@@ -495,7 +562,7 @@ def run_gui():
 				return lbl
 
 			def add_aligned_row(form, checkbox, layout):
-				checkbox.setFixedWidth(220)
+				checkbox.setFixedWidth(200)
 				form.addRow(checkbox, layout)
 
 			# --- 1. Basic Setup Group ---
@@ -504,7 +571,7 @@ def run_gui():
 
 			self.crop_cb = QCheckBox("Crop image")
 			self.crop_value = QLineEdit("1")
-			self.crop_value.setFixedWidth(80)
+			self.crop_value.setFixedWidth(40)
 			self.crop_value.setToolTip("Provide one or more crop percentage(s)")
 			self.crop_value.setEnabled(False)
 			self.crop_cb.toggled.connect(self.crop_value.setEnabled)
@@ -517,20 +584,26 @@ def run_gui():
 
 			self.starnet_cb = QCheckBox("Starnet")
 			self.scale_factor = QLineEdit("1")
-			self.scale_factor.setFixedWidth(80)
+			self.scale_factor.setFixedWidth(40)
 			self.scale_factor.setEnabled(False)
+			self.stride = QLineEdit("256")
+			self.stride.setFixedWidth(40)
+			self.stride.setEnabled(False)
 			self.combine_factor = QLineEdit("0.5")
-			self.combine_factor.setFixedWidth(80)
+			self.combine_factor.setFixedWidth(40)
 			self.combine_factor.setEnabled(False)
-			self.synthstar_cb = QCheckBox("Synthstar on starmask")
+			self.synthstar_cb = QCheckBox("Synthstar")
 			self.synthstar_cb.setEnabled(False)
 			self.starnet_cb.toggled.connect(self.scale_factor.setEnabled)
+			self.starnet_cb.toggled.connect(self.stride.setEnabled)
 			self.starnet_cb.toggled.connect(self.combine_factor.setEnabled)
 			self.starnet_cb.toggled.connect(self.synthstar_cb.setEnabled)
 			starnet_layout = QHBoxLayout()
 			starnet_layout.setSpacing(10)
 			starnet_layout.addWidget(create_aligned_label("Scale"))
 			starnet_layout.addWidget(self.scale_factor)
+			starnet_layout.addWidget(create_aligned_label("Stride"))
+			starnet_layout.addWidget(self.stride)
 			starnet_layout.addWidget(create_aligned_label("Star factor:"))
 			starnet_layout.addWidget(self.combine_factor)
 			starnet_layout.addWidget(self.synthstar_cb)
@@ -541,7 +614,7 @@ def run_gui():
 			self.abe_npoints = QLineEdit("100")
 			self.abe_polydegree = QLineEdit("2")
 			self.abe_rbfsmooth = QLineEdit("0.1")
-			self.abe_npoints.setFixedWidth(80)
+			self.abe_npoints.setFixedWidth(40)
 			self.abe_npoints.setEnabled(False)
 			for w in [self.abe_polydegree, self.abe_rbfsmooth]:
 				w.setFixedWidth(40)
@@ -584,23 +657,34 @@ def run_gui():
 			bkg_grax_layout.addStretch()
 			add_aligned_row(basic_form, self.bkg_grax_cb, bkg_grax_layout)
 
-#			self.spcc_cb = QCheckBox("Siril SPCC")
-#			self.spcc_sensor = QLineEdit("")
-#			self.spcc_sensor.setPlaceholderText("sensor name")
-#			self.spcc_filters = QLineEdit("")
-#			self.spcc_filters.setPlaceholderText("filters OSC or R G B")
-#			self.spcc_sensor.setEnabled(False)
-#			self.spcc_filters.setEnabled(False)
-#			self.spcc_cb.toggled.connect(self.spcc_sensor.setEnabled)
-#			self.spcc_cb.toggled.connect(self.spcc_filters.setEnabled)
-#			spcc_layout = QHBoxLayout()
-#			spcc_layout.setSpacing(10)
-#			spcc_layout.addWidget(create_aligned_label("Sensor:"))
-#			spcc_layout.addWidget(self.spcc_sensor)
-#			spcc_layout.addWidget(create_aligned_label("Filter(s):"))
-#			spcc_layout.addWidget(self.spcc_filters)
-#			spcc_layout.addStretch()
-#			add_aligned_row(basic_form, self.spcc_cb, spcc_layout)
+			self.spcc_cb = QCheckBox("SPCC")
+			self.spcc_sensor = QComboBox()
+			self.spcc_sensor.setFixedWidth(80)
+			self.osc_cb = QCheckBox("OSC")
+			self.spcc_filter1 = QComboBox()
+			self.spcc_filter1.setFixedWidth(80)
+			self.spcc_filter2 = QComboBox()
+			self.spcc_filter2.setFixedWidth(80)
+			self.spcc_filter3 = QComboBox()
+			self.spcc_filter3.setFixedWidth(80)
+			self.spcc_sensor.setEnabled(False)
+			self.osc_cb.setEnabled(False)
+			self.spcc_filter1.setEnabled(False)
+			self.spcc_filter2.setEnabled(False)	
+			self.spcc_filter3.setEnabled(False)
+			self.spcc_cb.toggled.connect(self.on_spcc_toggled)
+			self.osc_cb.toggled.connect(lambda: self.on_spcc_toggled(self.spcc_cb.isChecked()))
+			spcc_layout = QHBoxLayout()
+			spcc_layout.setSpacing(10)
+			spcc_layout.addWidget(create_aligned_label("Sensor:"))
+			spcc_layout.addWidget(self.spcc_sensor)
+			spcc_layout.addWidget(self.osc_cb)
+			spcc_layout.addWidget(create_aligned_label("Filter(s):"))
+			spcc_layout.addWidget(self.spcc_filter1)
+			spcc_layout.addWidget(self.spcc_filter2)	
+			spcc_layout.addWidget(self.spcc_filter3)					
+			spcc_layout.addStretch()
+			add_aligned_row(basic_form, self.spcc_cb, spcc_layout)
 
 			scroll_layout.addWidget(basic_group)
 
@@ -821,6 +905,25 @@ def run_gui():
 				self.sharpen_ssa_stellar_amount.setEnabled(False)
 				self.sharpen_ssa_non_stellar_amount.setEnabled(True)
 
+		def on_spcc_toggled(self, checked):
+			self.spcc_sensor.setEnabled(checked)
+			self.osc_cb.setEnabled(checked)
+			self.spcc_filter1.setEnabled(checked)
+			self.spcc_filter2.setEnabled(checked)
+			self.spcc_filter3.setEnabled(checked)
+			if checked:
+				self.spcc_sensor.clear()
+				oscsensors, monosensors, oscfilters, redfilters, bluefilters, greenfilters  = get_sensors_filters()
+				if self.osc_cb.isChecked():
+					self.spcc_sensor.addItems(oscsensors)
+					self.spcc_filter1.addItems(oscfilters)
+					self.spcc_filter2.clear()
+					self.spcc_filter3.clear()					
+				else:
+					self.spcc_sensor.addItems(monosensors)
+					self.spcc_filter1.addItems(redfilters)
+					self.spcc_filter2.addItems(greenfilters)
+					self.spcc_filter3.addItems(bluefilters)
 		def get_values(self):
 			return {
 				"workdir": self.workdir_input.text(),
@@ -837,7 +940,9 @@ def run_gui():
 				"sharpenCC": [self.sharpen_cc_mode.currentText(), self.sharpen_cc_stellar_amount.text(), self.sharpen_cc_non_stellar_amount.text(), self.sharpen_cc_non_stellar_strength.text()] if self.sharpen_cc_cb.isChecked() else None,
 				"sharpenGraX": [self.sharpen_grax_mode.currentText(), self.sharpen_grax_strength.text()] if self.sharpen_grax_cb.isChecked() else None,
 				"sharpenSA": [self.sharpen_ssa_mode.currentText(), self.sharpen_ssa_stellar_amount.text(), self.sharpen_ssa_non_stellar_amount.text()] if self.sharpen_ssa_cb.isChecked() else None,
-				"starnet": [self.scale_factor.text(), self.combine_factor.text()] if self.starnet_cb.isChecked() else None,
+				"spcc": [self.spcc_sensor.currentText(), self.spcc_filter1.currentText(), self.spcc_filter2.currentText(), self.spcc_filter3.currentText(), 
+						 'OSC' if self.osc_cb.isChecked() else 'mono'] if self.spcc_cb.isChecked() else None,
+				"starnet": [self.scale_factor.text(), self.stride.text(), self.combine_factor.text()] if self.starnet_cb.isChecked() else None,
 				"synthstar": self.synthstar_cb.isChecked(),
 				"autostretch": self.autostretch_cb.isChecked(),				
 				"statstretch": [self.stretch_hdr_amount.text(), self.stretch_hdr_knee.text(), self.stretch_boost_amount.text()] if self.stretch_cb.isChecked() else None,
@@ -916,7 +1021,12 @@ def run_gui():
 		if values["sharpenGraX"]:
 			cli_args.extend(["-sg", values["sharpenGraX"][0], values["sharpenGraX"][1]])
 		if values["starnet"]:
-			cli_args.extend(["-sn", values["starnet"][0], values["starnet"][1]])
+			cli_args.extend(["-sn", values["starnet"][0], values["starnet"][1], values["starnet"][2]])
+		if values["spcc"]:
+			if values["spcc"][4] == 'OSC':
+				cli_args.extend(["-cc", values["spcc"][0], values["spcc"][1]])
+			else :
+				cli_args.extend(["-cc", values["spcc"][0], values["spcc"][1], values["spcc"][2], values["spcc"][3]])
 		if values["synthstar"]:
 			cli_args.append("-sy")		
 		if values["autostretch"]:
@@ -940,7 +1050,7 @@ def run_gui():
 # ==============================================================================	
 
 def main_logic(argv):
-	global args, npoints, crop, crop_value, polydegree, rbfsmooth, smooth, bkgGraX, denoiseCC_mode, denoiseCC_strength, denoiseGraX, denoiseSA_mode, denoiseSA_luma_amount, denoiseSA_color_amount, sharpenGraX_mode, sharpenGraX_strength, sharpenCC_mode, sharpenCC_stellar_amount, sharpenCC_non_stellar_amount, sharpenCC_non_stellar_strength, sharpenSA_mode, sharpenSA_stellar_amount, sharpenSA_non_stellar_amount, autostretch, starnet, stretch_hdr_amount, stretch_hdr_knee, stretch_boost_amount, spcc_sensor, spcc_oscfilter, spcc_rfilter, spcc_gfilter, spcc_bfilter, Type
+	global args, npoints, crop, crop_value, polydegree, rbfsmooth, smooth, bkgGraX, denoiseCC_mode, denoiseCC_strength, denoiseGraX, denoiseSA_mode, denoiseSA_luma_amount, denoiseSA_color_amount, sharpenGraX_mode, sharpenGraX_strength, sharpenCC_mode, sharpenCC_stellar_amount, sharpenCC_non_stellar_amount, sharpenCC_non_stellar_strength, sharpenSA_mode, sharpenSA_stellar_amount, sharpenSA_non_stellar_amount, autostretch, starnet, stretch_hdr_amount, stretch_hdr_knee, stretch_boost_amount, spcc_sensor, spcc_oscfilter, spcc_rfilter, spcc_gfilter, spcc_bfilter, Type, sensors, osc_sensors, mono_sensors
 	
 	parser = argparse.ArgumentParser()
 	parser.add_argument("-ab","--abe", nargs='+', action='append', help="AutoBGE, provide npoints, polydegree and rbfsmooth")
@@ -957,9 +1067,9 @@ def main_logic(argv):
 	parser.add_argument("-ds","--denoise", help="run denoise" ,action="store_true")
 	parser.add_argument("-m","--multiprocess", help="saves processed images in unique Processed_N directory" ,action="store_true")	
 	parser.add_argument("-s","--sharpen", help="sharpen (deconvolution)" ,action="store_true")
-	parser.add_argument("-sc","--sharpenCC", nargs='+' ,help="run CC sharpen, provide mode (Stellar Only,Non-Stellar Only,Both), Stellar_amount and/or Non_stellar_amount and Non_stellar_strength")
+	parser.add_argument("-sc","--sharpenCC", nargs='+', action='append', help="run CC sharpen, provide mode (Stellar Only,Non-Stellar Only,Both), Stellar_amount and/or Non_stellar_amount and Non_stellar_strength")
 	parser.add_argument("-sg","--sharpenGraX", nargs='+', action='append', help="sharpen (deconvolution) using GraXpert-AI, provide mode (both, object, stellar) and strength 0.0-1.0")
-	parser.add_argument("-sn","--starnet", nargs=2, help="create starless & starmask images, sharpen and/or denoise on starless, then recombines. Provide scale factor (1 or 2) and star combine factor (0-1)", type = float)
+	parser.add_argument("-sn","--starnet", nargs=3, help="create starless & starmask, sharpen and/or denoise run on starless, then recombines. Provide scale factor (1 or 2), stride value (default 256) and star combine factor (0-1)", type = float)
 	parser.add_argument("-sy","--synthstar", help="Runs synthstar on starmask to correct misshapen stars" ,action="store_true")	
 	parser.add_argument("-ssa","--sharpenSA", nargs='+', action='append' ,help="run SASpro CC sharpen, provide mode (Stellar Only,Non-Stellar Only,Both), Stellar_amount and/or Non_stellar_amount")
 	parser.add_argument("-ss","--statstretch", nargs='+', action='append', help="statistical stretch, provide HDR amount, HDR knee and boost amount")
@@ -987,26 +1097,6 @@ def main_logic(argv):
 		if args.crop:
 			crop(workdir)
 		
-		if args.starnet:
-			starnet(workdir)
-
-		if args.abe:
-			for n in args.abe:
-				npoints = (n[0])
-				polydegree = (n[1])
-				rbfsmooth = (n[2])
-				abe(workdir)
-				
-		if args.bkg:
-			for n in args.bkg:
-				smooth = (n[0])			
-				bkg(workdir)
-
-		if args.bkgGraX:
-			for n in args.bkgGraX:
-				bkgGraX = (n[0])
-				bkg_GraX(workdir)
-
 		if args.spcc:
 			spcc_sensor = (args.spcc[0])
 			if (len (args.spcc)) == 2:
@@ -1021,6 +1111,26 @@ def main_logic(argv):
 				print("spcc needs 2 args for OSC or 4 args for mono")
 				sys.exit(1)
 			spcc(workdir)			
+			
+		if args.abe:
+			for n in args.abe:
+				npoints = (n[0])
+				polydegree = (n[1])
+				rbfsmooth = (n[2])
+				abe(workdir)
+				
+		if args.bkg:
+			for n in args.bkg:
+				smooth = (n[0])			
+				bkg(workdir)
+
+		if args.starnet:
+			starnet(workdir)
+
+		if args.bkgGraX:
+			for n in args.bkgGraX:
+				bkgGraX = (n[0])
+				bkg_GraX(workdir)
 
 		if args.sharpen:
 			sharpen(workdir)

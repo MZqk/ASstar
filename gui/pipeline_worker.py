@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pipeline worker for the Seestar Superimpose GUI."""
+"""Pipeline worker for the Starun GUI."""
 
 from __future__ import annotations
 
@@ -33,21 +33,21 @@ except ImportError:
     from disk_preflight import format_bytes, safe_file_size  # type: ignore[no-redef]
 
 
-BOOTSTRAP_TIMEOUT_ENV = "SEESTAR_BOOTSTRAP_TIMEOUT_SEC"
+BOOTSTRAP_TIMEOUT_ENV = "STARUN_BOOTSTRAP_TIMEOUT_SEC"
 DEFAULT_BOOTSTRAP_TIMEOUT_SEC = 300
 MIN_BOOTSTRAP_TIMEOUT_SEC = 60
 MAX_BOOTSTRAP_TIMEOUT_SEC = 3600
 BOOTSTRAP_TIMEOUT_SEC_PER_GIB = 120
 BYTES_PER_GIB = 1024 * 1024 * 1024
-TEMP_CLEANUP_TIMEOUT_ENV = "SEESTAR_TEMP_CLEANUP_TIMEOUT_SEC"
+TEMP_CLEANUP_TIMEOUT_ENV = "STARUN_TEMP_CLEANUP_TIMEOUT_SEC"
 DEFAULT_TEMP_CLEANUP_TIMEOUT_SEC = 30
 MIN_TEMP_CLEANUP_TIMEOUT_SEC = 1
 MAX_TEMP_CLEANUP_TIMEOUT_SEC = 300
-WATCHDOG_IDLE_TIMEOUT_ENV = "SEESTAR_WATCHDOG_IDLE_TIMEOUT_SEC"
+WATCHDOG_IDLE_TIMEOUT_ENV = "STARUN_WATCHDOG_IDLE_TIMEOUT_SEC"
 DEFAULT_WATCHDOG_IDLE_TIMEOUT_SEC = 900
 MIN_WATCHDOG_IDLE_TIMEOUT_SEC = 60
 MAX_WATCHDOG_IDLE_TIMEOUT_SEC = 7200
-EXPORT_TAIL_TIMEOUT_ENV = "SEESTAR_EXPORT_TAIL_TIMEOUT_SEC"
+EXPORT_TAIL_TIMEOUT_ENV = "STARUN_EXPORT_TAIL_TIMEOUT_SEC"
 DEFAULT_EXPORT_TAIL_TIMEOUT_SEC = 120
 MIN_EXPORT_TAIL_TIMEOUT_SEC = 60
 MAX_EXPORT_TAIL_TIMEOUT_SEC = 120
@@ -91,25 +91,19 @@ _SIRIL_DENOISE_SRC_DIAGNOSTIC_RE = re.compile(
     r"^\s*(?:log:\s*)?error:\s*no suitable data in src fits\s*$",
     re.IGNORECASE,
 )
-_AI_CREDENTIAL_ENV_KEYS = frozenset(
-    {"SEESTAR_AI_API_KEY", "SEESTAR_AI_ARTISTIC_API_KEY"}
-)
-_DISABLED_AI_ENV_KEYS = frozenset(
-    key for key in AI_ENV_ALLOWED_KEYS if key.startswith("SEESTAR_AI_")
-)
 _TASK_RUNTIME_ENV_KEYS = frozenset(
-    {"SEESTAR_TASK_RUN_MANIFEST", "SEESTAR_RESUME_CHECKPOINT_PATH"}
+    {
+        "STARUN_TASK_RUN_MANIFEST",
+        "STARUN_RUNTIME_CAPABILITIES_MANIFEST",
+    }
 )
+_REMOVED_RUNTIME_ENV_KEYS = frozenset({"STARUN_RESUME_CHECKPOINT_PATH"})
 _WORKER_RUNTIME_ENV_ALLOWED_KEYS = (
-    AI_ENV_ALLOWED_KEYS - _DISABLED_AI_ENV_KEYS
+    RUNTIME_ENV_ALLOWED_KEYS
 ) | _TASK_RUNTIME_ENV_KEYS
-_DISABLED_STAGE_OUTPUT_RE = re.compile(
-    r'(?:阶段\s*11\b|stage\s*11\b|stage11\b|AI\s*后期|'
-    r'ai_stage11|AI\s*(?:阶段|配置|环境)|SEESTAR_AI_|AI-Artistic|'
-    r'["\']stage["\']\s*:\s*11\b)',
-    re.IGNORECASE,
-)
 _SEMANTIC_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+_SIRIL_LOG_LINE_RE = re.compile(r"^\s*log:\s?(.*)$")
+_MAX_PENDING_PREVIEW_JSON_CHARS = 64 * 1024
 
 
 def _newest_graxpert_object_model(family_roots: tuple[Path, ...]) -> Path | None:
@@ -147,7 +141,7 @@ def default_graxpert_object_model(
         )
     )
     if bundled_model is not None:
-        return bundled_model, "seestar_app"
+        return bundled_model, "starun_app"
 
     if user_home is None:
         return None, ""
@@ -196,9 +190,7 @@ class PipelineWorker(QThread):
         siril_candidates: list[Path],
         input_mode: str = INPUT_MODE_AUTO,
         debug_mode: bool = False,
-        network_mode: bool = False,
-        ai_stage_enabled: bool = False,
-        ai_runtime_overrides: dict[str, str] | None = None,
+        network_mode: bool = True,
         runtime_overrides: dict[str, str] | None = None,
         runtime_unset_keys: set[str] | None = None,
         graxpert_application_home: Path | None = None,
@@ -224,8 +216,6 @@ class PipelineWorker(QThread):
         )
         self.debug_mode = bool(debug_mode)
         self.network_mode = bool(network_mode)
-        self.ai_stage_enabled = False
-        self.ai_runtime_overrides: dict[str, str] = {}
         self.runtime_overrides = {
             str(key): str(value)
             for key, value in (runtime_overrides or {}).items()
@@ -257,6 +247,7 @@ class PipelineWorker(QThread):
         self._pipeline_summary_failed = 0
         self._pipeline_summary_degraded = 0
         self._pipeline_result_status: str | None = None
+        self._pending_preview_json: str | None = None
         self._recent_process_output: deque[str] = deque(maxlen=80)
         self._last_command = ""
         self._saving_png_seen_at: float | None = None
@@ -265,9 +256,9 @@ class PipelineWorker(QThread):
         self._export_tail_timeout_recovered = False
         self._artifact_snapshot: dict[Path, tuple[int, int]] = {}
         self._last_artifact_scan_ts = 0.0
-        self._ai_env_sources: list[str] = []
-        self._ai_env_applied_keys: list[str] = []
-        self._ai_env_warnings: list[str] = []
+        self._runtime_env_sources: list[str] = []
+        self._runtime_env_applied_keys: list[str] = []
+        self._runtime_env_warnings: list[str] = []
         self._runtime_plugin_dir: Path | None = None
         self._temp_cleanup_timeout_sec = DEFAULT_TEMP_CLEANUP_TIMEOUT_SEC
         self._watchdog_idle_timeout_sec = DEFAULT_WATCHDOG_IDLE_TIMEOUT_SEC
@@ -286,6 +277,104 @@ class PipelineWorker(QThread):
     def _append_event(self, msg: str) -> None:
         self.log.emit(f"[{self._timestamp()}] {msg}\n")
 
+    @staticmethod
+    def _json_object_is_complete(payload: str) -> bool:
+        """Return whether a JSON object closes outside strings."""
+
+        text = payload.lstrip()
+        if not text.startswith("{"):
+            return False
+        depth = 0
+        in_string = False
+        escaped = False
+        for character in text:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    in_string = False
+                continue
+            if character == '"':
+                in_string = True
+            elif character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                if depth == 0:
+                    return True
+        return False
+
+    def _emit_preview_payload(self, raw_payload: str) -> None:
+        try:
+            preview_payload = json.loads(raw_payload)
+            preview_stage = int(preview_payload.get("stage", 0))
+            preview_title = str(preview_payload.get("title") or "").strip()
+            preview_status = str(
+                preview_payload.get("status") or "unavailable"
+            ).strip().lower()
+            preview_value = str(preview_payload.get("payload") or "").strip()
+            if not 1 <= preview_stage <= 10 or preview_status not in {
+                "ready",
+                "unavailable",
+            }:
+                raise ValueError("invalid preview event fields")
+            if preview_status == "ready" and not Path(preview_value).is_file():
+                preview_status = "unavailable"
+                preview_value = "preview file is missing"
+            self.preview.emit(
+                preview_stage,
+                preview_title,
+                preview_status,
+                preview_value,
+            )
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            self._append_event(f"忽略无效的阶段预览事件：{exc}")
+
+    def _consume_preview_event(self, text: str) -> None:
+        """Reassemble preview JSON split across Siril ``log:`` lines."""
+
+        preview_marker = "[PIPELINE_PREVIEW]"
+        preview_index = text.find(preview_marker)
+        if preview_index >= 0:
+            if self._pending_preview_json is not None:
+                self._append_event("忽略未完成的阶段预览事件：收到新的预览事件")
+            fragment = text[
+                preview_index + len(preview_marker):
+            ].rstrip("\r\n").lstrip()
+            self._pending_preview_json = fragment
+        elif self._pending_preview_json is not None:
+            line = text.rstrip("\r\n")
+            continuation = _SIRIL_LOG_LINE_RE.match(line)
+            if continuation is None:
+                self._append_event("忽略未完成的阶段预览事件：日志续行缺失")
+                self._pending_preview_json = None
+                return
+            fragment = continuation.group(1)
+            if not self._pending_preview_json and not fragment.lstrip().startswith("{"):
+                self._append_event("忽略无效的阶段预览事件：JSON 起始内容缺失")
+                self._pending_preview_json = None
+                return
+            self._pending_preview_json += fragment
+        else:
+            return
+
+        payload = self._pending_preview_json
+        if payload is None:
+            return
+        if len(payload) > _MAX_PENDING_PREVIEW_JSON_CHARS:
+            self._append_event("忽略无效的阶段预览事件：JSON 超出长度限制")
+            self._pending_preview_json = None
+            return
+        if payload and not payload.lstrip().startswith("{"):
+            self._pending_preview_json = None
+            self._emit_preview_payload(payload)
+            return
+        if self._json_object_is_complete(payload):
+            self._pending_preview_json = None
+            self._emit_preview_payload(payload)
+
     def _progress_log_signature(self, text: str) -> tuple[str, float] | None:
         plugin_match = _PLUGIN_PROGRESS_RE.search(text)
         if plugin_match:
@@ -302,8 +391,6 @@ class PipelineWorker(QThread):
         return f"siril:{label}", float(siril_match.group(2))
 
     def _should_emit_process_output(self, text: str) -> bool:
-        if _DISABLED_STAGE_OUTPUT_RE.search(text):
-            return False
         progress = self._progress_log_signature(text)
         if progress is None:
             return True
@@ -350,8 +437,6 @@ class PipelineWorker(QThread):
         return None
 
     def _emit_process_output(self, text: str) -> None:
-        if _DISABLED_STAGE_OUTPUT_RE.search(text):
-            return
         native_notice = self._native_output_notice(text)
         if native_notice is not None:
             key, replacement = native_notice
@@ -362,25 +447,20 @@ class PipelineWorker(QThread):
         if self._should_emit_process_output(text):
             self.log.emit(text)
 
-    def _ai_env_candidates(self) -> list[tuple[Path, str]]:
+    def _runtime_env_candidates(self) -> list[tuple[Path, str]]:
         return [
             (self.resources / DEFAULT_ENV_RESOURCE_REL, "应用默认配置"),
-            (self.resources / AI_ENV_RESOURCE_REL, "应用扩展配置"),
-            (self.runtime_home / AI_ENV_OVERRIDE_NAME, "运行时覆盖"),
-            (self.work_dir / AI_ENV_OVERRIDE_NAME, "任务目录覆盖"),
         ]
 
-    def _load_ai_env_overrides(self) -> tuple[dict[str, str], list[str], list[str]]:
+    def _load_runtime_env_defaults(self) -> tuple[dict[str, str], list[str], list[str]]:
         merged: dict[str, str] = {}
         sources: list[str] = []
         warnings: list[str] = []
 
-        for path, source_label in self._ai_env_candidates():
+        for path, source_label in self._runtime_env_candidates():
             if not path.exists() or not path.is_file():
                 continue
-            parsed, parse_warnings = parse_ai_env_file(path)
-            for disabled_key in _DISABLED_AI_ENV_KEYS:
-                parsed.pop(disabled_key, None)
+            parsed, parse_warnings = parse_runtime_env_file(path)
             if parsed:
                 sources.append(source_label)
                 merged.update(parsed)
@@ -392,8 +472,6 @@ class PipelineWorker(QThread):
         return merged, sources, warnings
 
     def _inspect_output_for_errors(self, text: str) -> None:
-        if _DISABLED_STAGE_OUTPUT_RE.search(text):
-            return
         lowered = text.lower()
         stripped = text.strip()
         if (
@@ -450,31 +528,7 @@ class PipelineWorker(QThread):
                     )
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
-        preview_marker = "[PIPELINE_PREVIEW]"
-        preview_index = text.find(preview_marker)
-        if preview_index >= 0:
-            raw_payload = text[preview_index + len(preview_marker):].strip()
-            try:
-                preview_payload = json.loads(raw_payload)
-                preview_stage = int(preview_payload.get("stage", 0))
-                preview_title = str(preview_payload.get("title") or "").strip()
-                preview_status = str(
-                    preview_payload.get("status") or "unavailable"
-                ).strip().lower()
-                preview_value = str(preview_payload.get("payload") or "").strip()
-                if preview_stage < 1 or preview_status not in {"ready", "unavailable"}:
-                    raise ValueError("invalid preview event fields")
-                if preview_status == "ready" and not Path(preview_value).is_file():
-                    preview_status = "unavailable"
-                    preview_value = "preview file is missing"
-                self.preview.emit(
-                    preview_stage,
-                    preview_title,
-                    preview_status,
-                    preview_value,
-                )
-            except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                self._append_event(f"忽略无效的阶段预览事件：{exc}")
+        self._consume_preview_event(text)
         summary_match = _PIPELINE_RUN_SUMMARY_RE.search(text)
         if summary_match:
             self._pipeline_summary_failed = int(summary_match.group(1))
@@ -788,11 +842,6 @@ class PipelineWorker(QThread):
         if not self.pipeline_path.exists():
             raise FileNotFoundError(f"未找到流水线脚本：{self.pipeline_path}")
         for py_file in pipeline_dir.glob("*.py"):
-            if py_file.name in {
-                "stage11_ai_postprocess.py",
-                "ai_artistic_derivative.py",
-            }:
-                continue
             shutil.copy2(py_file, temp_dir / py_file.name)
         stages_dir = pipeline_dir / "stages"
         if stages_dir.exists() and stages_dir.is_dir():
@@ -807,6 +856,7 @@ class PipelineWorker(QThread):
                 "downloads",
                 "syqon_starless",
                 "cosmic_clarity",
+                "graxpert",
                 "model_v2_0_1.onnx",
             }
 
@@ -833,7 +883,7 @@ class PipelineWorker(QThread):
                 )
                 linked_resources.append(name)
             if apply_siril_runtime_patches(plugin_dst):
-                self._append_event("已应用 GraXpert-AI 运行时兼容补丁")
+                self._append_event("已应用 Siril 插件运行时兼容补丁")
             self._runtime_plugin_dir = plugin_dst
             if linked_resources:
                 self._append_event(
@@ -882,42 +932,38 @@ class PipelineWorker(QThread):
 
     def _build_env(self, siril_cli: Path) -> dict[str, str]:
         env = scrub_python_env(os.environ.copy())
-        for secret_key in _AI_CREDENTIAL_ENV_KEYS:
-            env.pop(secret_key, None)
-        for task_key in _TASK_RUNTIME_ENV_KEYS:
+        for task_key in _TASK_RUNTIME_ENV_KEYS | _REMOVED_RUNTIME_ENV_KEYS:
             env.pop(task_key, None)
-        ai_env, ai_sources, ai_warnings = self._load_ai_env_overrides()
+        runtime_env, runtime_sources, runtime_warnings = (
+            self._load_runtime_env_defaults()
+        )
         applied_keys: list[str] = []
-        for key, value in ai_env.items():
+        for key, value in runtime_env.items():
             if not env.get(key):
                 env[key] = value
-                applied_keys.append(key)
-        for key, value in self.ai_runtime_overrides.items():
-            env[key] = value
-            if key not in applied_keys:
                 applied_keys.append(key)
         for key in self.runtime_unset_keys:
             env.pop(key, None)
         for key, value in self.runtime_overrides.items():
             env[key] = value
-        self._ai_env_sources = ai_sources
-        self._ai_env_applied_keys = sorted(applied_keys)
-        self._ai_env_warnings = ai_warnings
+        self._runtime_env_sources = runtime_sources
+        self._runtime_env_applied_keys = sorted(applied_keys)
+        self._runtime_env_warnings = runtime_warnings
 
         default_object_model, default_model_source = default_graxpert_object_model(
             self.siril_plugin_dir,
             user_home=self.graxpert_application_home,
         )
-        user_graxpert_model = env.get("SEESTAR_GRAXPERT_OBJECT_MODEL_PATH", "").strip()
+        user_graxpert_model = env.get("STARUN_GRAXPERT_OBJECT_MODEL_PATH", "").strip()
         if (
-            env.get("SEESTAR_STAGE5_GRAXPERT_DECONV_ENABLE", "1").strip().lower()
+            env.get("STARUN_STAGE5_GRAXPERT_DECONV_ENABLE", "1").strip().lower()
             not in {"0", "false", "no", "off"}
             and default_object_model is not None
         ):
-            env["SEESTAR_GRAXPERT_OBJECT_MODEL_PATH"] = str(default_object_model)
+            env["STARUN_GRAXPERT_OBJECT_MODEL_PATH"] = str(default_object_model)
             source_label = (
-                "Seestar App 内"
-                if default_model_source == "seestar_app"
+                "Starun App 内"
+                if default_model_source == "starun_app"
                 else "本机 GraXpert 应用"
             )
             self._append_event(
@@ -928,7 +974,7 @@ class PipelineWorker(QThread):
             expanded_model = Path(os.path.expandvars(user_graxpert_model)).expanduser()
             if not expanded_model.is_absolute():
                 expanded_model = self.work_dir / expanded_model
-            env["SEESTAR_GRAXPERT_OBJECT_MODEL_PATH"] = str(expanded_model)
+            env["STARUN_GRAXPERT_OBJECT_MODEL_PATH"] = str(expanded_model)
             if expanded_model.exists():
                 self._append_event(f"已配置用户 GraXpert 对象反卷积模型：{expanded_model}")
             else:
@@ -991,7 +1037,7 @@ class PipelineWorker(QThread):
             MIN_EXPORT_TAIL_TIMEOUT_SEC,
             MAX_EXPORT_TAIL_TIMEOUT_SEC,
         )
-        env.setdefault("SEESTAR_SIRILPY_TIMEOUT_SEC", "120")
+        env.setdefault("STARUN_SIRILPY_TIMEOUT_SEC", "300")
         env["PIP_NO_INDEX"] = "1"
         env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
         pip_find_links: list[str] = []
@@ -1007,6 +1053,19 @@ class PipelineWorker(QThread):
                 pip_find_links.append(str(runtime_downloads))
         if pip_find_links:
             env["PIP_FIND_LINKS"] = " ".join(dict.fromkeys(pip_find_links))
+        runtime_python_candidates = (
+            self._siril_venv_dir() / "bin" / "python3.12",
+            self._siril_venv_dir() / "bin" / "python3",
+            self._siril_venv_dir() / "bin" / "python",
+        )
+        runtime_py = next(
+            (
+                candidate
+                for candidate in runtime_python_candidates
+                if candidate.exists() and os.access(candidate, os.X_OK)
+            ),
+            None,
+        )
         bundled_py = (
             self.resources
             / "Siril.app"
@@ -1018,9 +1077,10 @@ class PipelineWorker(QThread):
             / "bin"
             / "python3.12"
         )
-        if bundled_py.exists():
-            env["SIRIL_PYTHON_CLI"] = str(bundled_py)
-            env["SEESTAR_SIRIL_PYTHON_CLI"] = str(bundled_py)
+        python_cli = runtime_py or (bundled_py if bundled_py.exists() else None)
+        if python_cli is not None:
+            env["SIRIL_PYTHON_CLI"] = str(python_cli)
+            env["STARUN_SIRIL_PYTHON_CLI"] = str(python_cli)
 
         bundled_siril_cli = self.resources / "Siril.app" / "Contents" / "MacOS" / "siril-cli"
         if siril_cli == bundled_siril_cli:
@@ -1028,33 +1088,36 @@ class PipelineWorker(QThread):
             env["SIRIL_RELOCATED_RES_DIR"] = str(relocated)
 
         if self._runtime_plugin_dir and self._runtime_plugin_dir.exists():
-            env["SEESTAR_SIRIL_PLUGIN_DIR"] = str(self._runtime_plugin_dir)
+            env["STARUN_SIRIL_PLUGIN_DIR"] = str(self._runtime_plugin_dir)
             classic_wrapper = self._runtime_plugin_dir / "bin" / "CosmicClarity"
             if classic_wrapper.is_file() and os.access(classic_wrapper, os.X_OK):
-                env.setdefault("SEESTAR_COSMIC_CLARITY_EXECUTABLE", str(classic_wrapper))
+                env.setdefault("STARUN_COSMIC_CLARITY_EXECUTABLE", str(classic_wrapper))
             scripts_dir = resolve_siril_scripts_root(self._runtime_plugin_dir)
             if scripts_dir is not None:
                 env["SIRIL_SCRIPTS_DIR"] = str(scripts_dir)
                 env["SIRIL_SCRIPTS_PATH"] = str(scripts_dir)
 
         syqon_models = self.siril_plugin_dir / SYQON_STARLESS_BUNDLE_REL
-        if (syqon_models / "zenith.pt").is_file():
-            env["SEESTAR_SYQON_MODEL_DIR"] = str(syqon_models)
+        if (
+            (syqon_models / "zenith.pt").is_file()
+            and (syqon_models / "zenith.pt.sha256").is_file()
+        ):
+            env["STARUN_SYQON_MODEL_DIR"] = str(syqon_models)
         cosmic_models = self.siril_plugin_dir / COSMIC_CLARITY_BUNDLE_REL
         if cosmic_models.is_dir():
-            env["SEESTAR_COSMIC_CLARITY_MODEL_DIR"] = str(cosmic_models)
+            env["STARUN_COSMIC_CLARITY_MODEL_DIR"] = str(cosmic_models)
 
-        env["SEESTAR_DEBUG_MODE"] = "1" if self.debug_mode else "0"
-        env["SEESTAR_INPUT_MODE"] = self.input_mode
-        env["SEESTAR_NETWORK_MODE"] = "1" if self.network_mode else "0"
+        env["STARUN_DEBUG_MODE"] = "1" if self.debug_mode else "0"
+        env["STARUN_INPUT_MODE"] = self.input_mode
+        env["STARUN_NETWORK_MODE"] = "1" if self.network_mode else "0"
         local_catalog_root = self.runtime_home / ".local" / "share" / "siril"
-        env["SEESTAR_GAIA_PHOTO_CATALOG"] = str(
+        env["STARUN_GAIA_PHOTO_CATALOG"] = str(
             local_catalog_root / "siril_cat1_healpix8_xpsamp"
         )
-        env["SEESTAR_GAIA_ASTRO_CATALOG"] = str(
+        env["STARUN_GAIA_ASTRO_CATALOG"] = str(
             local_catalog_root / "siril_cat_healpix8_astro.dat"
         )
-        env["SEESTAR_SPCC_DATABASE_DIR"] = str(
+        env["STARUN_SPCC_DATABASE_DIR"] = str(
             siril_spcc_database_root_from_home(self.runtime_home)
         )
         try:
@@ -1069,17 +1132,13 @@ class PipelineWorker(QThread):
                     f"{len(copied_files)} 个文件"
                 )
         except (OSError, RuntimeError, TypeError, ValueError) as error:
-            env["SEESTAR_SPCC_ENABLE"] = "0"
+            env["STARUN_SPCC_ENABLE"] = "0"
             if not self._spcc_seed_warning_emitted:
                 self._spcc_seed_warning_emitted = True
                 self._append_event(
                     "Siril SPCC 固定元数据不可用，已在启动前禁用 SPCC；"
                     f"宽带将进入 PCC 异常回退：{error}"
                 )
-        for disabled_key in _DISABLED_AI_ENV_KEYS:
-            env.pop(disabled_key, None)
-        env["SEESTAR_AI_ENABLED"] = "0"
-        env["SEESTAR_AI_ARTISTIC_DERIVATIVE_ENABLED"] = "0"
         return env
 
     def _bounded_timeout_from_env(
@@ -1175,7 +1234,7 @@ class PipelineWorker(QThread):
 
         cleanup_thread = threading.Thread(
             target=remove,
-            name="seestar-temp-cleanup",
+            name="starun-temp-cleanup",
             daemon=True,
         )
         cleanup_thread.start()
@@ -1455,6 +1514,7 @@ class PipelineWorker(QThread):
         self._pipeline_summary_failed = 0
         self._pipeline_summary_degraded = 0
         self._pipeline_result_status = None
+        self._pending_preview_json = None
         self._recent_process_output.clear()
         self._last_command = ""
         self._saving_png_seen_at = None
@@ -1478,8 +1538,8 @@ class PipelineWorker(QThread):
         self._append_event(f"开始启动进程（{self._active_mode}），使用 {siril_cli}")
         self._append_event("命令：" + " ".join(cmd))
         proc_env = self._build_env(siril_cli)
-        proc_env["SEESTAR_SIRIL_CLI"] = str(siril_cli)
-        proc_env["SEESTAR_SIRIL_CONFIG"] = str(run_ini)
+        proc_env["STARUN_SIRIL_CLI"] = str(siril_cli)
+        proc_env["STARUN_SIRIL_CONFIG"] = str(run_ini)
         self._append_event(f"Siril 运行时主目录：{proc_env.get('HOME', '')}")
         self._append_event(
             "Siril Python CLI："
@@ -1492,7 +1552,7 @@ class PipelineWorker(QThread):
             f"联网模式: {'ON' if self.network_mode else 'OFF'}"
         )
         self._append_event(
-            f"输入模式: {proc_env.get('SEESTAR_INPUT_MODE', self.input_mode)}"
+            f"输入模式: {proc_env.get('STARUN_INPUT_MODE', self.input_mode)}"
         )
         bootstrap_timeout_sec, bootstrap_base_sec, bootstrap_input_bytes = (
             self._bootstrap_timeout_sec(proc_env)
@@ -1508,15 +1568,16 @@ class PipelineWorker(QThread):
             f"普通无输出={self._watchdog_idle_timeout_sec}s，"
             f"PNG 导出后收尾无输出={self._export_tail_timeout_sec}s"
         )
-        if self._ai_env_sources:
+        if self._runtime_env_sources:
             self._append_event(
-                "运行环境配置来源: " + ", ".join(self._ai_env_sources)
+                "运行环境配置来源: " + ", ".join(self._runtime_env_sources)
             )
-            if self._ai_env_applied_keys:
+            if self._runtime_env_applied_keys:
                 self._append_event(
-                    "运行环境已注入键: " + ", ".join(self._ai_env_applied_keys)
+                    "运行环境已注入键: "
+                    + ", ".join(self._runtime_env_applied_keys)
                 )
-        for warning in self._ai_env_warnings:
+        for warning in self._runtime_env_warnings:
             self._append_event(f"运行环境配置警告: {warning}")
 
         try:
@@ -1676,7 +1737,7 @@ class PipelineWorker(QThread):
         exit_code = -1
         cli_used = ""
 
-        temp_dir = Path(tempfile.mkdtemp(prefix="seestar_superimpose_embedded_"))
+        temp_dir = Path(tempfile.mkdtemp(prefix="starun_embedded_"))
         try:
             run_ssf, run_ini, _run_py = self._prepare_runtime_files(temp_dir)
 

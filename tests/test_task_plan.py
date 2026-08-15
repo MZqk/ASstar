@@ -63,17 +63,20 @@ class TaskPlanTests(unittest.TestCase):
         self.assertEqual(self._actions(plan), ["execute"] * 10)
         self.assertFalse(plan["route"]["review_only"])  # type: ignore[index]
 
-    def test_verified_stage5_checkpoint_resumes_at_stage6(self) -> None:
-        plan = self._plan(
-            input_trust="verified",
-            resume_after_stage=5,
-            checkpoint_fingerprints=self._fingerprints(),
-        )
+    def test_verified_formal_checkpoints_resume_at_the_next_stage(self) -> None:
+        for stage_number in (1, 2, 5):
+            with self.subTest(stage=stage_number):
+                plan = self._plan(
+                    input_trust="verified",
+                    resume_after_stage=stage_number,
+                    checkpoint_fingerprints=self._fingerprints(),
+                )
 
-        self.assertEqual(
-            self._actions(plan),
-            ["verified"] * 5 + ["execute"] * 5,
-        )
+                self.assertEqual(
+                    self._actions(plan),
+                    ["verified"] * stage_number
+                    + ["execute"] * (10 - stage_number),
+                )
 
     def test_nonlinear_and_unknown_inputs_are_review_only(self) -> None:
         for state in ("nonlinear", "unknown"):
@@ -183,6 +186,21 @@ class TaskPlanTests(unittest.TestCase):
         self.assertIn(
             "contract was modified",
             task_plan.verify_processing_plan(contract_tampered)["detail"],
+        )
+
+    def test_v1_processing_plan_is_explicitly_rejected(self) -> None:
+        plan = self._plan()
+        plan["schema"] = "starun.processing-plan.v1"
+        plan["plan_hash"] = run_manifest.canonical_payload_hash(
+            {key: value for key, value in plan.items() if key != "plan_hash"}
+        )
+
+        verification = task_plan.verify_processing_plan(plan)
+
+        self.assertFalse(verification["verified"])
+        self.assertEqual(
+            verification["detail"],
+            "unsupported processing plan schema",
         )
 
 

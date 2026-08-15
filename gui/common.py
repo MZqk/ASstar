@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared runtime configuration and helpers for the Seestar GUI."""
+"""Shared runtime configuration and helpers for the Starun GUI."""
 
 from __future__ import annotations
 
@@ -15,9 +15,7 @@ from pathlib import Path
 
 
 __all__ = [
-    "AI_ENV_ALLOWED_KEYS",
-    "AI_ENV_OVERRIDE_NAME",
-    "AI_ENV_RESOURCE_REL",
+    "RUNTIME_ENV_ALLOWED_KEYS",
     "APP_RUNTIME_HOME_REL",
     "COSMIC_CLARITY_BUNDLE_REL",
     "COSMIC_CLARITY_REQUIRED_MODEL_FILES",
@@ -27,7 +25,6 @@ __all__ = [
     "INPUT_MODE_STAGE1_PREPARED_RESUME",
     "INPUT_MODE_LINEAR_RESUME",
     "INPUT_MODE_STAGE2_CORRECTED_RESUME",
-    "LINEAR_RESUME_INPUT_NAME",
     "PIPELINE_EXCLUDE_PREFIXES",
     "PIPELINE_EXCLUDE_SUBSTRINGS",
     "PIPELINE_EXCLUDE_SUFFIXES",
@@ -50,7 +47,7 @@ __all__ = [
     "default_siril_spcc_database_seed_dir",
     "is_frozen",
     "normalize_siril_config_template",
-    "parse_ai_env_file",
+    "parse_runtime_env_file",
     "project_root",
     "repair_site_packages_from_pip_vendor",
     "resolve_existing_path",
@@ -371,11 +368,11 @@ def normalize_siril_config_template(
     return "\n".join(lines) + "\n"
 
 
-PIPELINE_RESOURCE_REL = Path("pipeline") / "seestar_Superimpose.py"
+PIPELINE_RESOURCE_REL = Path("pipeline") / "starun.py"
 SIRIL_PLUGIN_RESOURCE_REL = Path("resources") / "siril_plugins"
 SIRIL_SPCC_DATABASE_SEED_REL = Path("SirilSPCCDatabaseSeed")
-SIRIL_SPCC_DATABASE_SEED_SCHEMA = "seestar.siril-spcc-database-seed.v1"
-SIRIL_SPCC_DATABASE_VERSION_MARKER = ".seestar-superimpose-spcc-seed"
+SIRIL_SPCC_DATABASE_SEED_SCHEMA = "starun.siril-spcc-database-seed.v1"
+SIRIL_SPCC_DATABASE_VERSION_MARKER = ".starun-spcc-seed"
 SYQON_STARLESS_BUNDLE_REL = Path("syqon_starless")
 COSMIC_CLARITY_BUNDLE_REL = Path("cosmic_clarity")
 COSMIC_CLARITY_REQUIRED_MODEL_FILES = (
@@ -384,110 +381,130 @@ COSMIC_CLARITY_REQUIRED_MODEL_FILES = (
     "deep_sharp_stellar_AI4.pth",
     "deep_nonstellar_sharp_conditional_psf_AI4.pth",
 )
-APP_RUNTIME_HOME_REL = Path("Library/Application Support/SeestarSuperimpose/runtime_home")
-AI_ENV_RESOURCE_REL = Path("ai.env")
+APP_RUNTIME_HOME_REL = Path("Library/Application Support/Starun/runtime_home")
 DEFAULT_ENV_RESOURCE_REL = Path("default.env")
-AI_ENV_OVERRIDE_NAME = ".seestar_ai.env"
-AI_ENV_ALLOWED_KEYS = frozenset(
+RUNTIME_ENV_ALLOWED_KEYS = frozenset(
     {
-        "SEESTAR_AI_ENABLED",
-        "SEESTAR_AI_ENDPOINT",
-        "SEESTAR_AI_MODEL",
-        "SEESTAR_AI_API_KEY",
-        "SEESTAR_AI_TIMEOUT_SEC",
-        "SEESTAR_AI_STRENGTH",
-        "SEESTAR_AI_PROMPT",
-        "SEESTAR_AI_ADVISOR_MODE",
-        "SEESTAR_AI_STAGE6_ENABLE",
-        "SEESTAR_AI_STAGE7_ENABLE",
-        "SEESTAR_AI_STAGE8_ENABLE",
-        "SEESTAR_AI_ARTISTIC_DERIVATIVE_ENABLED",
-        "SEESTAR_AI_ARTISTIC_ENDPOINT",
-        "SEESTAR_AI_ARTISTIC_MODEL",
-        "SEESTAR_AI_ARTISTIC_API_KEY",
-        "SEESTAR_AI_ARTISTIC_PROMPT",
-        "SEESTAR_AI_ARTISTIC_TIMEOUT_SEC",
-        "SEESTAR_OUTPUT_FORMAT",
-        "SEESTAR_FORCE_REVIEW_ONLY_OUTPUT",
-        "SEESTAR_DENOISE_ENABLE",
-        "SEESTAR_DENOISE_FORCE",
-        "SEESTAR_GRAXPERT_GPU",
-        "SEESTAR_SYQON_GPU",
-        "SEESTAR_SYQON_TIMEOUT_SEC",
-        "SEESTAR_BOOTSTRAP_TIMEOUT_SEC",
-        "SEESTAR_WATCHDOG_IDLE_TIMEOUT_SEC",
-        "SEESTAR_EXPORT_TAIL_TIMEOUT_SEC",
-        "SEESTAR_TEMP_CLEANUP_TIMEOUT_SEC",
-        "SEESTAR_SIRILPY_TIMEOUT_SEC",
-        "SEESTAR_WORKFLOW_PLUGIN_PROBE",
-        "SEESTAR_SPCC_ENABLE",
-        "SEESTAR_STAGE4_PLATESOLVE_ENABLE",
-        "SEESTAR_STAGE4_PLATESOLVE_CATALOGS",
-        "SEESTAR_STAGE4_SPCC_TIMEOUT_SEC",
-        "SEESTAR_STAGE4_SPCC_OSC_SENSOR",
-        "SEESTAR_STAGE4_SPCC_OSC_FILTER",
-        "SEESTAR_STAGE4_SPCC_WHITE_REF",
-        "SEESTAR_STAGE4_SPCC_LIMITMAG",
-        "SEESTAR_STAGE4_SPCC_NB_R_WAVELENGTH_NM",
-        "SEESTAR_STAGE4_SPCC_NB_R_BANDWIDTH_NM",
-        "SEESTAR_STAGE4_SPCC_NB_G_WAVELENGTH_NM",
-        "SEESTAR_STAGE4_SPCC_NB_G_BANDWIDTH_NM",
-        "SEESTAR_STAGE4_SPCC_NB_B_WAVELENGTH_NM",
-        "SEESTAR_STAGE4_SPCC_NB_B_BANDWIDTH_NM",
-        "SEESTAR_GAIA_ASTRO_CATALOG",
-        "SEESTAR_STAGE4_FILTER_HINT",
-        "SEESTAR_STAGE4_PCC_TIMEOUT_SEC",
-        "SEESTAR_STAGE4_LOCAL_STAR_WB_ENABLE",
-        "SEESTAR_STAGE4_LOCAL_STAR_WB_MIN_PIXELS",
-        "SEESTAR_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT",
-        "SEESTAR_STAGE4_LOCAL_STAR_MASK_RADIUS",
-        "SEESTAR_STAGE4_LOCAL_STAR_MASK_COVERAGE_MAX",
-        "SEESTAR_ABERRATION_API_ENABLE",
-        "SEESTAR_ABERRATION_PROVIDER",
-        "SEESTAR_OPTIONAL_COLOR_TRANSFORM",
-        "SEESTAR_COSMIC_CLASSIC_ENABLE",
-        "SEESTAR_COSMIC_CLARITY_EXECUTABLE",
-        "SEESTAR_COSMIC_CLASSIC_GPU",
-        "SEESTAR_COSMIC_NATIVE_GPU",
-        "SEESTAR_STAGE5_BUILTIN_DENOISE_MOD",
-        "SEESTAR_STAGE5_DECONV_ENABLE",
-        "SEESTAR_STAGE5_GRAXPERT_DECONV_ENABLE",
-        "SEESTAR_STAGE5_RL_MAXSTARS",
-        "SEESTAR_STAGE5_RL_PSF_KS",
-        "SEESTAR_STAGE5_RL_ITERS",
-        "SEESTAR_STAGE5_RL_ALPHA",
-        "SEESTAR_STAGE5_RL_GDSTEP",
-        "SEESTAR_STAGE5_RL_STOP",
-        "SEESTAR_STAGE5_GRAXPERT_DECONV_STRENGTH",
-        "SEESTAR_GRAXPERT_OBJECT_MODEL_PATH",
-        "SEESTAR_STAGE7_QUALITY_RETRY_MAX",
-        "SEESTAR_STAGE7_SKIP_UNREADY_STARLESS",
-        "SEESTAR_STAGE7_SOFT_STARLESS_ASINH_STRETCH",
-        "SEESTAR_STAGE7_BRIGHT_NEBULA_HALO_RESIDUE_SCORE_MAX",
-        "SEESTAR_STAGE7_STARLESS_REPAIR_STRENGTH",
-        "SEESTAR_STAGE7_STARLESS_HALO_REPAIR_STRENGTH",
-        "SEESTAR_STAGE7_STARLESS_CHROMA_DENOISE_STRENGTH",
-        "SEESTAR_STAGE7_STARLESS_PIXEL_REPAIR_ENABLE",
-        "SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_REDUCTION_MIN",
-        "SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_DELTA_MIN",
-        "SEESTAR_STAGE7_STARMASK_DIFFUSE_RESIDUAL_RATIO_MAX",
-        "SEESTAR_STAGE8_FORCE_CONSERVATIVE_AFTER_STAGE7_REPAIR",
-        "SEESTAR_STAGE9_STARMASK_STRETCH_ENABLE",
-        "SEESTAR_STAGE9_STARMASK_ASINH_STRETCH",
-        "SEESTAR_STAGE9_STARMASK_ASINH_OFFSET",
+        "STARUN_OUTPUT_FORMAT",
+        "STARUN_FORCE_REVIEW_ONLY_OUTPUT",
+        "STARUN_DENOISE_ENABLE",
+        "STARUN_DENOISE_FORCE",
+        "STARUN_GRAXPERT_GPU",
+        "STARUN_SYQON_TIMEOUT_SEC",
+        "STARUN_BOOTSTRAP_TIMEOUT_SEC",
+        "STARUN_WATCHDOG_IDLE_TIMEOUT_SEC",
+        "STARUN_EXPORT_TAIL_TIMEOUT_SEC",
+        "STARUN_TEMP_CLEANUP_TIMEOUT_SEC",
+        "STARUN_SIRILPY_TIMEOUT_SEC",
+        "STARUN_WORKFLOW_PLUGIN_PROBE",
+        "STARUN_SPCC_ENABLE",
+        "STARUN_STAGE4_PLATESOLVE_ENABLE",
+        "STARUN_STAGE4_PLATESOLVE_CATALOGS",
+        "STARUN_STAGE4_SPCC_TIMEOUT_SEC",
+        "STARUN_STAGE4_SPCC_ONLINE_UNVERIFIED_TIMEOUT_SEC",
+        "STARUN_STAGE4_SPCC_OSC_SENSOR",
+        "STARUN_STAGE4_SPCC_OSC_FILTER",
+        "STARUN_STAGE4_SPCC_WHITE_REF",
+        "STARUN_STAGE4_SPCC_LIMITMAG",
+        "STARUN_STAGE4_SPCC_NB_R_WAVELENGTH_NM",
+        "STARUN_STAGE4_SPCC_NB_R_BANDWIDTH_NM",
+        "STARUN_STAGE4_SPCC_NB_G_WAVELENGTH_NM",
+        "STARUN_STAGE4_SPCC_NB_G_BANDWIDTH_NM",
+        "STARUN_STAGE4_SPCC_NB_B_WAVELENGTH_NM",
+        "STARUN_STAGE4_SPCC_NB_B_BANDWIDTH_NM",
+        "STARUN_GAIA_ASTRO_CATALOG",
+        "STARUN_STAGE4_FILTER_HINT",
+        "STARUN_STAGE4_OFFLINE_FALLBACK_MODE",
+        "STARUN_STAGE4_AUTO_REFERENCE_GLOBAL_WHITE_ENABLE",
+        "STARUN_STAGE4_AUTO_REFERENCE_BACKGROUND_SAMPLE_TARGET",
+        "STARUN_STAGE4_AUTO_REFERENCE_BACKGROUND_SAMPLE_MIN",
+        "STARUN_STAGE4_AUTO_REFERENCE_HOLDOUT_RATIO",
+        "STARUN_STAGE4_AUTO_REFERENCE_BACKGROUND_ERROR_MIN",
+        "STARUN_STAGE4_AUTO_REFERENCE_BACKGROUND_IMPROVEMENT_MIN",
+        "STARUN_STAGE4_AUTO_REFERENCE_STAR_MIN_OBJECTS",
+        "STARUN_STAGE4_AUTO_REFERENCE_STAR_RATIO_MAD_MAX",
+        "STARUN_STAGE4_AUTO_REFERENCE_STAR_SATURATION_RATIO_MAX",
+        "STARUN_STAGE4_AUTO_REFERENCE_GAIN_LIMIT",
+        "STARUN_STAGE4_AUTO_REFERENCE_STAR_IMPROVEMENT_MIN",
+        "STARUN_STAGE4_AUTO_REFERENCE_HIGHLIGHT_CLIP_GROWTH_MAX",
+        "STARUN_STAGE4_AUTO_REFERENCE_BLACK_CLIP_GROWTH_MAX",
+        "STARUN_STAGE4_AUTO_REFERENCE_GRADIENT_GROWTH_MAX",
+        "STARUN_STAGE4_AUTO_REFERENCE_TEXTURE_GROWTH_MAX",
+        "STARUN_STAGE4_AUTO_REFERENCE_TARGET_CHROMA_DRIFT_MAX",
+        "STARUN_STAGE4_PCC_TIMEOUT_SEC",
+        "STARUN_STAGE4_LOCAL_STAR_WB_ENABLE",
+        "STARUN_STAGE4_LOCAL_STAR_WB_MIN_PIXELS",
+        "STARUN_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT",
+        "STARUN_STAGE4_LOCAL_STAR_MASK_RADIUS",
+        "STARUN_STAGE4_LOCAL_STAR_MASK_COVERAGE_MAX",
+        "STARUN_ABERRATION_API_ENABLE",
+        "STARUN_ABERRATION_PROVIDER",
+        "STARUN_OPTIONAL_COLOR_TRANSFORM",
+        "STARUN_STAGE8_DUALBAND_PALETTE_ENABLE",
+        "STARUN_COSMIC_CLASSIC_ENABLE",
+        "STARUN_COSMIC_CLARITY_EXECUTABLE",
+        "STARUN_COSMIC_CLASSIC_GPU",
+        "STARUN_COSMIC_NATIVE_GPU",
+        "STARUN_DENOISE_MOD",
+        "STARUN_STAGE5_DENOISE_CHROMA_NOISE_GROWTH_MAX",
+        "STARUN_STAGE5_DECONV_ENABLE",
+        "STARUN_STAGE5_GRAXPERT_DECONV_ENABLE",
+        "STARUN_STAGE5_RL_MAXSTARS",
+        "STARUN_STAGE5_RL_PSF_KS",
+        "STARUN_STAGE5_RL_ITERS",
+        "STARUN_STAGE5_RL_ALPHA",
+        "STARUN_STAGE5_RL_GDSTEP",
+        "STARUN_STAGE5_RL_STOP",
+        "STARUN_STAGE5_GRAXPERT_DECONV_STRENGTH",
+        "STARUN_GRAXPERT_OBJECT_MODEL_PATH",
+        "STARUN_STAGE7_QUALITY_RETRY_MAX",
+        "STARUN_STAGE7_BRIGHT_NEBULA_HALO_RESIDUE_SCORE_MAX",
+        "STARUN_STAGE7_GALAXY_ROI_HALO_GATE_ENABLE",
+        "STARUN_STAGE7_GALAXY_CORE_PRESERVATION_RATIO_MIN",
+        "STARUN_STAGE7_GALAXY_CORE_CONTRAST_RATIO_MIN",
+        "STARUN_STAGE7_STARLESS_REPAIR_STRENGTH",
+        "STARUN_STAGE7_STARLESS_HALO_REPAIR_STRENGTH",
+        "STARUN_STAGE7_STARLESS_CHROMA_DENOISE_STRENGTH",
+        "STARUN_STAGE7_STARLESS_PIXEL_REPAIR_ENABLE",
+        "STARUN_STAGE7_STARLESS_REPAIR_CHROMA_REDUCTION_MIN",
+        "STARUN_STAGE7_STARLESS_REPAIR_CHROMA_DELTA_MIN",
+        "STARUN_STAGE7_STARMASK_DIFFUSE_RESIDUAL_RATIO_MAX",
+        "STARUN_STAGE8_FORCE_CONSERVATIVE_AFTER_STAGE7_REPAIR",
+        "STARUN_STAGE8_DUALBAND_PALETTE_STRENGTH",
+        "STARUN_STAGE8_DUALBAND_PALETTE_LUMA_DRIFT_MAX",
+        "STARUN_STAGE8_DUALBAND_PALETTE_CLIP_GROWTH_MAX",
+        "STARUN_STAGE8_DUALBAND_PALETTE_QUALITY_WARNING_TOLERANCE",
+        "STARUN_STAGE9_STARMASK_STRETCH_ENABLE",
+        "STARUN_STAGE9_STARMASK_ASINH_STRETCH",
+        "STARUN_STAGE9_STARMASK_ASINH_OFFSET",
+        "STARUN_STAGE10_LARGE_GALAXY_LOCAL_PATCH_VARIANCE_MAX",
     }
 )
 
 
 def default_pipeline_path(resources: Path) -> Path:
-    if is_frozen():
-        return resources / PIPELINE_RESOURCE_REL
-    return project_root() / PIPELINE_RESOURCE_REL
+    runtime_candidate = Path(resources) / PIPELINE_RESOURCE_REL
+    if is_frozen() or runtime_candidate.is_file():
+        return runtime_candidate
+
+    project_resources = project_root() / "resources"
+    try:
+        using_project_resources = Path(resources).resolve() == project_resources.resolve()
+    except OSError:
+        using_project_resources = False
+    if using_project_resources:
+        return project_root() / PIPELINE_RESOURCE_REL
+
+    # An explicit runtime/development overlay is an integrity boundary.  Do not
+    # silently borrow a pipeline from the source checkout when that overlay is
+    # incomplete.
+    return runtime_candidate
 
 
 def default_siril_plugin_dir(resources: Path) -> Path:
+    embedded = Path(resources) / "siril_plugins"
     if is_frozen():
-        env_override = os.environ.get("SEESTAR_OFFLINE_RESOURCE_ROOT", "").strip()
+        env_override = os.environ.get("STARUN_OFFLINE_RESOURCE_ROOT", "").strip()
         env_candidates: list[Path] = []
         if env_override:
             override = Path(env_override).expanduser()
@@ -497,14 +514,23 @@ def default_siril_plugin_dir(resources: Path) -> Path:
         distribution_root = resources.parent.parent.parent
         external_candidates = [
             distribution_root / f"{app_name}-OfflineResources" / "siril_plugins",
-            distribution_root / "SeestarSuperimpose-OfflineResources" / "siril_plugins",
+            distribution_root / "Starun-OfflineResources" / "siril_plugins",
             Path.home()
-            / "Library/Application Support/SeestarSuperimpose/offline_resources/siril_plugins",
+            / "Library/Application Support/Starun/offline_resources/siril_plugins",
         ]
-        embedded = resources / "siril_plugins"
         candidates = [*env_candidates, embedded, *external_candidates]
         return next((path for path in candidates if path.is_dir()), embedded)
-    return project_root() / SIRIL_PLUGIN_RESOURCE_REL
+    if embedded.is_dir():
+        return embedded
+
+    project_resources = project_root() / "resources"
+    try:
+        using_project_resources = Path(resources).resolve() == project_resources.resolve()
+    except OSError:
+        using_project_resources = False
+    if using_project_resources:
+        return project_root() / SIRIL_PLUGIN_RESOURCE_REL
+    return embedded
 
 
 def default_siril_spcc_database_seed_dir(resources: Path) -> Path:
@@ -640,7 +666,7 @@ def sync_siril_spcc_database_seed(
         if target.is_file() and _file_sha256(target) == expected_sha256:
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(f".{target.name}.seestar-tmp")
+        temporary = target.with_name(f".{target.name}.starun-tmp")
         try:
             shutil.copy2(source, temporary)
             if _file_sha256(temporary) != expected_sha256:
@@ -705,10 +731,9 @@ SIRIL_STARLESS_REQUIRED_WHEEL_LABELS = (
 )
 INPUT_MODE_AUTO = "auto"
 INPUT_MODE_STAGE1_PREPARED_RESUME = "stage1_prepared_resume"
-INPUT_MODE_LINEAR_RESUME = "result_linear_resume"
+INPUT_MODE_LINEAR_RESUME = "stage5_linear_resume"
 INPUT_MODE_STAGE2_CORRECTED_RESUME = "stage2_corrected_resume"
 STAGE1_PREPARED_INPUT_NAME = "stage1_prepared.fit"
-LINEAR_RESUME_INPUT_NAME = "result_linear.fit"
 STAGE2_CORRECTED_INPUT_NAME = "stage2_corrected.fit"
 PIPELINE_EXCLUDE_PREFIXES = (
     "light_",
@@ -745,17 +770,28 @@ def resolve_siril_scripts_root(plugin_root: Path) -> Path | None:
 
 
 def apply_siril_runtime_patches(plugin_root: Path, target_root: Path | None = None) -> bool:
-    patcher = plugin_root / "patches" / "apply_graxpert_ai_runtime_patch.py"
-    if not patcher.is_file():
-        return False
-    spec = importlib.util.spec_from_file_location(
-        "seestar_graxpert_ai_runtime_patch", patcher
+    changed = False
+    patchers = (
+        (
+            "starun_graxpert_ai_runtime_patch",
+            plugin_root / "patches" / "apply_graxpert_ai_runtime_patch.py",
+        ),
+        (
+            "starun_syqon_offline_model_patch",
+            plugin_root / "patches" / "apply_syqon_offline_model_patch.py",
+        ),
     )
-    if spec is None or spec.loader is None:
-        return False
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return bool(module.apply_patch(target_root or plugin_root))
+    for module_name, patcher in patchers:
+        if not patcher.is_file():
+            continue
+        spec = importlib.util.spec_from_file_location(module_name, patcher)
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if module.apply_patch(target_root or plugin_root):
+            changed = True
+    return changed
 
 
 def build_siril_cli_command(
@@ -817,7 +853,7 @@ def scrub_python_env(env: dict[str, str]) -> dict[str, str]:
     return env
 
 
-def parse_ai_env_file(path: Path) -> tuple[dict[str, str], list[str]]:
+def parse_runtime_env_file(path: Path) -> tuple[dict[str, str], list[str]]:
     parsed: dict[str, str] = {}
     warnings: list[str] = []
 
@@ -844,7 +880,7 @@ def parse_ai_env_file(path: Path) -> tuple[dict[str, str], list[str]]:
         if not key:
             warnings.append(f"{path}:{lineno} 缺少变量名，已忽略")
             continue
-        if key not in AI_ENV_ALLOWED_KEYS:
+        if key not in RUNTIME_ENV_ALLOWED_KEYS:
             continue
 
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:

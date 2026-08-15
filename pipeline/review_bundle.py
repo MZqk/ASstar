@@ -3,14 +3,15 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional
 
 import numpy as np
 
 from image_metrics import _to_rgb_float_image, measure_image_features, measure_quality_metrics
-from save_utils import write_png_rgb16
+from save_utils import write_png_rgb16, write_png_rgb8
 from sirilpy.exceptions import CommandError, DataError, SirilError
 
 
@@ -41,6 +42,36 @@ def _metric_delta(before: Mapping[str, Any], after: Mapping[str, Any]) -> Dict[s
     return delta
 
 
+def _compact_review_canvas(before_rgb: np.ndarray, after_rgb: np.ndarray) -> np.ndarray:
+    """Build one bounded 2x2, 8-bit-friendly review image."""
+    before = _to_rgb_float_image(before_rgb, max_side=512)
+    after = _to_rgb_float_image(after_rgb, max_side=512)
+    height = min(before.shape[1], after.shape[1])
+    width = min(before.shape[2], after.shape[2])
+    before = before[:, :height, :width]
+    after = after[:, :height, :width]
+    difference = after - before
+    absolute = np.abs(difference)
+    scale = max(float(np.quantile(absolute, 0.995)), 1e-6)
+    absolute_preview = np.flip(np.clip(absolute / scale, 0.0, 1.0), axis=1)
+    luminance_delta = (
+        0.2126 * difference[0]
+        + 0.7152 * difference[1]
+        + 0.0722 * difference[2]
+    )
+    signed = np.zeros_like(after, dtype=np.float32)
+    signed[0] = np.clip(luminance_delta / scale, 0.0, 1.0)
+    signed[2] = np.clip(-luminance_delta / scale, 0.0, 1.0)
+    signed = np.flip(signed, axis=1)
+
+    canvas = np.zeros((3, height * 2, width * 2), dtype=np.float32)
+    canvas[:, :height, :width] = _safe_preview(before)
+    canvas[:, :height, width:] = _safe_preview(after)
+    canvas[:, height:, :width] = absolute_preview
+    canvas[:, height:, width:] = signed
+    return canvas
+
+
 def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     temp_path = path.with_suffix(path.suffix + ".tmp")
     temp_path.write_text(
@@ -65,7 +96,7 @@ def image_data_to_data_url(image_data: Any) -> str:
     # Reuse the deterministic in-project PNG writer without adding Pillow.
     import tempfile
 
-    with tempfile.TemporaryDirectory(prefix="seestar-ai-preview-") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="starun-ai-preview-") as tmpdir:
         path = Path(tmpdir) / "preview.png"
         write_png_rgb16(path, preview)
         return image_path_to_data_url(path)
@@ -160,10 +191,12 @@ def create_image_review_bundle(
         "absolute_difference": output_dir / "difference.png",
         "signed_luminance_difference": output_dir / "signed_difference.png",
     }
+    compact_path = output_dir / "review.png"
     write_png_rgb16(paths["before_preview"], _safe_preview(before_rgb))
     write_png_rgb16(paths["after_preview"], _safe_preview(after_rgb))
     write_png_rgb16(paths["absolute_difference"], absolute_preview)
     write_png_rgb16(paths["signed_luminance_difference"], signed)
+    write_png_rgb8(compact_path, _compact_review_canvas(before_rgb, after_rgb))
 
     before_features = asdict(measure_image_features(np.asarray(before_data)))
     after_features = asdict(measure_image_features(np.asarray(after_data)))
@@ -175,6 +208,13 @@ def create_image_review_bundle(
         "status": "ready",
         "source": dict(source),
         "previews": {key: str(path) for key, path in paths.items()},
+        "compact_preview": str(compact_path),
+        "compact_layout": [
+            "before",
+            "after",
+            "absolute_difference",
+            "signed_luminance_difference",
+        ],
         "metrics": {
             "before": {"features": before_features, "quality": before_quality},
             "after": {"features": after_features, "quality": after_quality},
@@ -205,6 +245,82 @@ def create_image_review_bundle(
     _write_json_atomic(report_path, payload)
     payload["report_path"] = str(report_path)
     return payload
+
+
+def prune_review_bundles(
+    review_root: Path,
+    *,
+    pipeline_status: str,
+    problem_stage_numbers: Iterable[int] = (),
+    preserve_full: bool = False,
+) -> Dict[str, Any]:
+    """Apply final delivery retention to review evidence directories."""
+    result: Dict[str, Any] = {
+        "pipeline_status": str(pipeline_status or "unknown"),
+        "removed_images": [],
+        "kept_compact_images": [],
+        "updated_reports": [],
+    }
+    if not review_root.is_dir():
+        return result
+
+    problem_stages = {int(stage) for stage in problem_stage_numbers}
+    for stage_dir in sorted(review_root.iterdir(), key=lambda path: path.name):
+        if not stage_dir.is_dir() or stage_dir.is_symlink():
+            continue
+        match = re.match(r"^stage(\d+)(?:_|$)", stage_dir.name)
+        stage_number = int(match.group(1)) if match else None
+        keep_compact = bool(
+            not preserve_full
+            and stage_number is not None
+            and stage_number in problem_stages
+        )
+        compact_path = stage_dir / "review.png"
+
+        if not preserve_full:
+            for image_path in sorted(stage_dir.glob("*.png")):
+                if keep_compact and image_path == compact_path:
+                    result["kept_compact_images"].append(str(image_path))
+                    continue
+                try:
+                    image_path.unlink()
+                    result["removed_images"].append(str(image_path))
+                except OSError:
+                    continue
+
+        report_path = stage_dir / "review.json"
+        if not report_path.is_file():
+            continue
+        try:
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+
+        if preserve_full:
+            retention_mode = "full_debug"
+        elif keep_compact and compact_path.is_file():
+            retention_mode = "compact_problem_evidence"
+            payload["previews"] = {"compact_review": str(compact_path)}
+            payload["compact_preview"] = str(compact_path)
+        else:
+            retention_mode = "metrics_only"
+            payload["previews"] = {}
+            payload.pop("compact_preview", None)
+            payload.pop("compact_layout", None)
+        payload["retention"] = {
+            "mode": retention_mode,
+            "pipeline_status": str(pipeline_status or "unknown"),
+            "stage_number": stage_number,
+            "source_fits_retained": bool(preserve_full),
+        }
+        try:
+            _write_json_atomic(report_path, payload)
+            result["updated_reports"].append(str(report_path))
+        except (OSError, TypeError, ValueError):
+            continue
+    return result
 
 
 def apply_visual_acceptance(

@@ -6,7 +6,7 @@ from typing import Any, Dict
 import numpy as np
 
 
-STAR_COLOR_REPAIR_SCHEMA = "seestar.star-color-repair.v1"
+STAR_COLOR_REPAIR_SCHEMA = "starun.star-color-repair.v1"
 _LUMA_WEIGHTS = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
 

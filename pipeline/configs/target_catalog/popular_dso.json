@@ -18,5 +18,6 @@
   {"name":"Lagoon Nebula","aliases":["M8","NGC 6523"],"type":"bright_emission_reflection_nebula","ra_deg":270.925,"dec_deg":-24.38,"size_arcmin":[90,40],"features":["bright_core","large_nebulosity","emission_red"],"default_policy":"bright_nebula_hdr_conservative"},
   {"name":"Trifid Nebula","aliases":["M20","NGC 6514"],"type":"bright_emission_reflection_nebula","ra_deg":270.63,"dec_deg":-23.03,"size_arcmin":[28,28],"features":["bright_core","reflection_blue","emission_red"],"default_policy":"bright_nebula_hdr_conservative"},
   {"name":"Eagle Nebula","aliases":["M16","NGC 6611"],"type":"emission_nebula_widefield","ra_deg":274.7,"dec_deg":-13.806,"size_arcmin":[35,28],"features":["emission_red","dense_stars"],"default_policy":"emission_nebula_widefield"},
-  {"name":"Omega Nebula","aliases":["M17","Swan Nebula","NGC 6618"],"type":"bright_emission_reflection_nebula","ra_deg":275.196,"dec_deg":-16.171,"size_arcmin":[46,37],"features":["bright_core","large_nebulosity","emission_red"],"default_policy":"bright_nebula_hdr_conservative"}
+  {"name":"Omega Nebula","aliases":["M17","Swan Nebula","NGC 6618"],"type":"bright_emission_reflection_nebula","ra_deg":275.196,"dec_deg":-16.171,"size_arcmin":[46,37],"features":["bright_core","large_nebulosity","emission_red"],"default_policy":"bright_nebula_hdr_conservative"},
+  {"name":"NGC 6910","aliases":["NGC6910"],"type":"open_cluster","ra_deg":305.7958,"dec_deg":40.7717,"size_arcmin":[10.7,10.7],"features":["dense_stars","bright_stars"],"default_policy":"open_cluster_color_preserve"}
 ]

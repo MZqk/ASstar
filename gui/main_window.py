@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seestar Superimpose macOS GUI launcher with external pipeline resource."""
+"""Starun macOS GUI launcher with external pipeline resource."""
 
 from __future__ import annotations
 
@@ -89,6 +89,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QSpinBox,
     QStackedWidget,
+    QTabWidget,
     QToolBar,
     QTreeWidget,
     QTreeWidgetItem,
@@ -102,14 +103,58 @@ except ImportError:  # Lightweight Qt stubs used by non-visual unit tests.
     QStyle = None  # type: ignore[assignment,misc]
 
 try:
-    from pipeline.stage_contracts import product_stage_contracts
+    from pipeline import run_manifest as pipeline_run_manifest
+    from pipeline.stage_contracts import (
+        PIPELINE_CONTRACT_SCHEMA,
+        PIPELINE_CONTRACT_VERSION,
+        product_stage_contracts,
+    )
+    from pipeline.processing_parameters import (
+        GATE_PROFILE_CHOICES,
+        GATE_PROFILE_LABELS,
+        GATE_PROFILE_UNLIMITED,
+        PROCESSING_PARAMETERS_SCHEMA,
+        SUPPORTED_PROCESSING_PARAMETERS_SCHEMAS,
+        SPECS_BY_FIELD,
+        SPECS_BY_STAGE,
+        STAGE_TITLES,
+        ParameterSpec,
+        default_processing_parameters,
+        effective_parameter_value,
+        gate_profile_requires_review,
+        normalize_processing_parameters,
+        processing_gate_profile_audit,
+        reset_stage_parameters,
+    )
 except ImportError:  # Support direct execution from the gui directory.
     import sys
 
     repo_root = Path(__file__).resolve().parent.parent
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
-    from pipeline.stage_contracts import product_stage_contracts  # type: ignore[no-redef]
+    from pipeline import run_manifest as pipeline_run_manifest  # type: ignore[no-redef]
+    from pipeline.stage_contracts import (  # type: ignore[no-redef]
+        PIPELINE_CONTRACT_SCHEMA,
+        PIPELINE_CONTRACT_VERSION,
+        product_stage_contracts,
+    )
+    from pipeline.processing_parameters import (  # type: ignore[no-redef]
+        GATE_PROFILE_CHOICES,
+        GATE_PROFILE_LABELS,
+        GATE_PROFILE_UNLIMITED,
+        PROCESSING_PARAMETERS_SCHEMA,
+        SUPPORTED_PROCESSING_PARAMETERS_SCHEMAS,
+        SPECS_BY_FIELD,
+        SPECS_BY_STAGE,
+        STAGE_TITLES,
+        ParameterSpec,
+        default_processing_parameters,
+        effective_parameter_value,
+        gate_profile_requires_review,
+        normalize_processing_parameters,
+        processing_gate_profile_audit,
+        reset_stage_parameters,
+    )
 
 SIRIL_PLUGIN_PYTHON_ABI = "cp312"
 UI_MODE_RECOMMENDED = "recommended"
@@ -117,12 +162,6 @@ UI_MODE_RECOMMENDED = "recommended"
 PIPELINE_STAGE_TITLES = {
     contract.number: contract.title for contract in product_stage_contracts()
 }
-_DISABLED_STAGE_DISPLAY_RE = re.compile(
-    r"(?:阶段\s*11\b|stage\s*11\b|stage11\b|AI\s*后期|"
-    r"ai_stage11|AI\s*(?:阶段|配置|环境)|SEESTAR_AI_|AI-Artistic)",
-    re.IGNORECASE,
-)
-
 PIPELINE_PROGRESS_STATE_LABELS = {
     "waiting": "等待",
     "running": "● 运行中",
@@ -214,6 +253,35 @@ except ImportError:
     )
 
 try:
+    from .runtime_capabilities import (
+        RUNTIME_CAPABILITIES_ENV,
+        RUNTIME_CAPABILITIES_NAME,
+        RUN_STATE_NAME,
+        RUN_STATE_SCHEMA,
+        atomic_write_json as atomic_write_runtime_json,
+        build_runtime_capabilities,
+        capability_summary_lines,
+        probe_network_capabilities,
+        refresh_blocking_errors,
+        update_siril_launch_probe,
+        utc_now as runtime_utc_now,
+    )
+except ImportError:
+    from runtime_capabilities import (  # type: ignore[no-redef]
+        RUNTIME_CAPABILITIES_ENV,
+        RUNTIME_CAPABILITIES_NAME,
+        RUN_STATE_NAME,
+        RUN_STATE_SCHEMA,
+        atomic_write_json as atomic_write_runtime_json,
+        build_runtime_capabilities,
+        capability_summary_lines,
+        probe_network_capabilities,
+        refresh_blocking_errors,
+        update_siril_launch_probe,
+        utc_now as runtime_utc_now,
+    )
+
+try:
     from .preview_widgets import LatestPreviewCanvas
     from .preview_worker import InitialPreviewWorker, preview_cache_path
 except ImportError:
@@ -226,14 +294,22 @@ except ImportError:
 try:
     from .ui_platform import (
         configure_main_window,
+        configure_toolbar_drag_region,
+        constrain_window_to_visible_screens,
         current_platform_profile,
+        normal_window_geometry,
+        restore_window_geometry,
         standard_shortcuts,
     )
     from .ui_theme import install_application_theme, set_style_property
 except ImportError:
     from ui_platform import (  # type: ignore[no-redef]
         configure_main_window,
+        configure_toolbar_drag_region,
+        constrain_window_to_visible_screens,
         current_platform_profile,
+        normal_window_geometry,
+        restore_window_geometry,
         standard_shortcuts,
     )
     try:
@@ -257,6 +333,7 @@ try:
         InputDiscovery,
         InputKind,
         discover_input,
+        inspect_source_header,
     )
     from pipeline.task_workspace import (
         apply_task_retention,
@@ -302,6 +379,7 @@ except ImportError:  # Support direct execution from the gui directory.
         InputDiscovery,
         InputKind,
         discover_input,
+        inspect_source_header,
     )
     from pipeline.task_workspace import (  # type: ignore[no-redef]
         apply_task_retention,
@@ -340,52 +418,77 @@ except ImportError:  # Support direct execution from the gui directory.
 WORKSPACE_EMPTY = "empty"
 WORKSPACE_TASK = "task"
 WORKSPACE_RUN = "run"
-WORKSPACE_HISTORY = "history"
+MAIN_WINDOW_DEFAULT_SIZE = (1280, 800)
+HISTORY_WINDOW_DEFAULT_SIZE = (940, 620)
+PREFERENCES_WINDOW_DEFAULT_SIZE = (620, 420)
 
+_CANONICAL_PROCESSING_DEFAULTS = default_processing_parameters()
 DEFAULT_PROCESSING_SETTINGS = {
-    "output_formats": ("tif", "png", "fit"),
-    "review_only": False,
+    "output_formats": tuple(
+        _CANONICAL_PROCESSING_DEFAULTS["general"]["output_formats"]
+    ),
+    "review_only": bool(
+        _CANONICAL_PROCESSING_DEFAULTS["general"]["review_only"]
+    ),
     "color_calibration": "pcc",
-    "filter_hint": "auto",
+    "filter_hint": str(SPECS_BY_FIELD["stage4_filter_hint"].default),
     "denoise_mode": "auto",
     "deconvolution_mode": "auto",
-    "graxpert_model_path": "",
-    "compute_mode": "auto",
-    "pcc_timeout_sec": 180,
-    "local_wb_gain_limit": 1.20,
-    "builtin_denoise_strength": 0.50,
-    "graxpert_deconv_strength": 0.30,
-    "rl_iterations": 8,
-    "rl_maxstars": 200,
-    "starless_retry_max": 2,
-    "starless_repair_strength": 0.68,
-    "starless_halo_repair_strength": 0.70,
-    "starless_chroma_strength": 0.55,
-    "starmask_asinh_stretch": 2.00,
-    "weak_star_recovery_ratio": 0.70,
+    "graxpert_model_path": str(
+        SPECS_BY_FIELD["graxpert_object_model_path"].default
+    ),
+    "compute_mode": str(
+        _CANONICAL_PROCESSING_DEFAULTS["general"]["compute_mode"]
+    ),
+    "auto_tune_enabled": bool(
+        _CANONICAL_PROCESSING_DEFAULTS["general"]["auto_tune_enabled"]
+    ),
+    "max_retries": int(
+        _CANONICAL_PROCESSING_DEFAULTS["general"]["max_retries"]
+    ),
+    "retry_delay": float(
+        _CANONICAL_PROCESSING_DEFAULTS["general"]["retry_delay"]
+    ),
+    "review_bundle_enabled": bool(
+        _CANONICAL_PROCESSING_DEFAULTS["general"]["review_bundle_enabled"]
+    ),
+    "managed_output_enabled": bool(
+        _CANONICAL_PROCESSING_DEFAULTS["general"]["managed_output_enabled"]
+    ),
+    "checkpoint_mode": bool(
+        _CANONICAL_PROCESSING_DEFAULTS["general"]["checkpoint_mode"]
+    ),
+    "pcc_timeout_sec": int(
+        SPECS_BY_FIELD["stage4_pcc_timeout_sec"].default
+    ),
+    "local_wb_gain_limit": float(
+        SPECS_BY_FIELD["stage4_local_star_wb_gain_limit"].default
+    ),
+    "builtin_denoise_strength": float(SPECS_BY_FIELD["denoise_mod"].default),
+    "graxpert_deconv_strength": float(
+        SPECS_BY_FIELD["stage5_graxpert_deconv_strength"].default
+    ),
+    "rl_iterations": int(SPECS_BY_FIELD["stage5_rl_iters"].default),
+    "rl_maxstars": int(SPECS_BY_FIELD["stage5_rl_maxstars"].default),
+    "starless_retry_max": int(
+        SPECS_BY_FIELD["stage7_quality_retry_max"].default
+    ),
+    "starless_repair_strength": float(
+        SPECS_BY_FIELD["stage7_starless_repair_strength"].default
+    ),
+    "starless_halo_repair_strength": float(
+        SPECS_BY_FIELD["stage7_starless_halo_repair_strength"].default
+    ),
+    "starless_chroma_strength": float(
+        SPECS_BY_FIELD["stage7_starless_chroma_denoise_strength"].default
+    ),
+    "starmask_asinh_stretch": float(
+        SPECS_BY_FIELD["stage9_starmask_asinh_stretch"].default
+    ),
+    "weak_star_recovery_ratio": float(
+        SPECS_BY_FIELD["stage9_weak_star_recovery_ratio_min"].default
+    ),
 }
-PCC_TIMEOUT_SETTINGS_VERSION = 2
-PCC_TIMEOUT_LEGACY_DEFAULT_SEC = 30
-
-
-def _migrate_pcc_timeout_setting(value: object, version: object) -> object:
-    """Raise only the legacy 30-second default; preserve explicit custom values."""
-    try:
-        parsed_version = int(version)
-    except (TypeError, ValueError):
-        parsed_version = 0
-    try:
-        parsed_value = int(value)
-    except (TypeError, ValueError):
-        return value
-    if (
-        parsed_version < PCC_TIMEOUT_SETTINGS_VERSION
-        and parsed_value == PCC_TIMEOUT_LEGACY_DEFAULT_SEC
-    ):
-        return DEFAULT_PROCESSING_SETTINGS["pcc_timeout_sec"]
-    return value
-
-
 VALID_OUTPUT_FORMATS = frozenset({"tif", "png", "fit"})
 VALID_COLOR_CALIBRATION_MODES = frozenset({"pcc"})
 VALID_FILTER_HINT_MODES = frozenset(
@@ -396,7 +499,7 @@ VALID_DECONVOLUTION_MODES = frozenset({"auto", "rl", "off"})
 VALID_COMPUTE_MODES = frozenset({"auto", "cpu"})
 
 
-class SeestarGui(QMainWindow):
+class StarunGui(QMainWindow):
     thread_log = Signal(str)
 
     def __init__(
@@ -408,9 +511,9 @@ class SeestarGui(QMainWindow):
         history_path_override: Path | None = None,
     ) -> None:
         super().__init__()
-        self.setWindowTitle("Seestar 图像后处理")
+        self.setWindowTitle("Starun")
         self.setMinimumSize(980, 680)
-        self.resize(1280, 800)
+        self.resize(*MAIN_WINDOW_DEFAULT_SIZE)
         self.setAcceptDrops(True)
         self.platform_profile = current_platform_profile()
         app = QApplication.instance()
@@ -421,10 +524,22 @@ class SeestarGui(QMainWindow):
             )
         self._ui_thread_ident = threading.get_ident()
         self.settings = settings_override or QSettings(
-            "Seestar",
-            "SeestarSuperimpose",
+            "Starun",
+            "Starun",
         )
         self._restoring_settings = False
+        self._settings_loaded = False
+        self._main_window_geometry_restored = False
+        self._history_window_geometry_restored = False
+        self._restore_main_window_maximized = False
+        self._restore_history_window_maximized = False
+        self._first_show_pending = True
+        self._window_geometry_save_timer = QTimer(self)
+        self._window_geometry_save_timer.setSingleShot(True)
+        self._window_geometry_save_timer.setInterval(450)
+        self._window_geometry_save_timer.timeout.connect(
+            self._save_window_geometry_state
+        )
         self._recent_directories: list[str] = []
         self._recommended_input_mode = INPUT_MODE_AUTO
         self._result_preview_path: Path | None = None
@@ -437,7 +552,7 @@ class SeestarGui(QMainWindow):
         self._ui_running = False
         self._run_terminal_status: str | None = None
         self._last_run_snapshot: dict[str, object] | None = None
-        self._run_input_mode_override: str | None = None
+        self._run_input_mode: str | None = None
         self._input_discovery: InputDiscovery | None = None
         self._prepared_tasks: tuple[PreparedTask, ...] = ()
         self._prepared_task_index = 0
@@ -445,6 +560,8 @@ class SeestarGui(QMainWindow):
         self._last_task_root: Path | None = None
         self.history_store = HistoryStore(history_path_override)
         self._history_return_state = WORKSPACE_EMPTY
+        self._history_return_status = ""
+        self._history_return_task_root: Path | None = None
         self._history_task_records: dict[str, dict[str, object]] = {}
         self._active_history_task_key: str | None = None
         self._active_history_run_id: str | None = None
@@ -481,6 +598,11 @@ class SeestarGui(QMainWindow):
         self.run_log_path: Path | None = None
         self.run_log_file = None
         self._run_log_lock = threading.Lock()
+        self.run_state_path: Path | None = None
+        self.runtime_capabilities_path: Path | None = None
+        self._run_state_payload: dict[str, object] = {}
+        self._run_state_lock = threading.Lock()
+        self._runtime_capability_manifest: dict[str, object] | None = None
         self._current_work_dir: Path | None = None
         self._last_quality_report_path: Path | None = None
         self._pipeline_started_monotonic: float | None = None
@@ -495,10 +617,12 @@ class SeestarGui(QMainWindow):
         self._progress_stage_count = 10
         self.input_mode = INPUT_MODE_AUTO
         self.debug_mode_enabled = False
-        self.network_mode_enabled = False
+        self.network_mode_enabled = True
         self._pending_runtime_overrides: dict[str, str] = {}
         self._pending_runtime_unset_keys: set[str] = set()
         self.processing_parameters_expanded = False
+        self.processing_expert_visible = False
+        self._processing_parameter_input_path: Path | None = None
         self._processing_controls_updating = False
         self.output_formats = tuple(DEFAULT_PROCESSING_SETTINGS["output_formats"])
         self.review_only = bool(DEFAULT_PROCESSING_SETTINGS["review_only"])
@@ -514,6 +638,20 @@ class SeestarGui(QMainWindow):
             DEFAULT_PROCESSING_SETTINGS["graxpert_model_path"]
         )
         self.compute_mode = str(DEFAULT_PROCESSING_SETTINGS["compute_mode"])
+        self.auto_tune_enabled = bool(
+            DEFAULT_PROCESSING_SETTINGS["auto_tune_enabled"]
+        )
+        self.max_retries = int(DEFAULT_PROCESSING_SETTINGS["max_retries"])
+        self.retry_delay = float(DEFAULT_PROCESSING_SETTINGS["retry_delay"])
+        self.review_bundle_enabled = bool(
+            DEFAULT_PROCESSING_SETTINGS["review_bundle_enabled"]
+        )
+        self.managed_output_enabled = bool(
+            DEFAULT_PROCESSING_SETTINGS["managed_output_enabled"]
+        )
+        self.checkpoint_mode = bool(
+            DEFAULT_PROCESSING_SETTINGS["checkpoint_mode"]
+        )
         self.pcc_timeout_sec = int(DEFAULT_PROCESSING_SETTINGS["pcc_timeout_sec"])
         self.local_wb_gain_limit = float(
             DEFAULT_PROCESSING_SETTINGS["local_wb_gain_limit"]
@@ -544,6 +682,19 @@ class SeestarGui(QMainWindow):
         self.weak_star_recovery_ratio = float(
             DEFAULT_PROCESSING_SETTINGS["weak_star_recovery_ratio"]
         )
+        self.processing_parameters = default_processing_parameters(
+            general={
+                "output_formats": list(self.output_formats),
+                "review_only": self.review_only,
+                "compute_mode": self.compute_mode,
+                "auto_tune_enabled": self.auto_tune_enabled,
+                "max_retries": self.max_retries,
+                "retry_delay": self.retry_delay,
+                "review_bundle_enabled": self.review_bundle_enabled,
+                "managed_output_enabled": self.managed_output_enabled,
+                "checkpoint_mode": self.checkpoint_mode,
+            }
+        )
 
         self._init_ui()
         self._progress_timer = QTimer(self)
@@ -551,6 +702,7 @@ class SeestarGui(QMainWindow):
         self._progress_timer.timeout.connect(self._refresh_elapsed_labels)
         self.thread_log.connect(self._append_text)
         self._load_settings()
+        self._settings_loaded = True
         try:
             recovered_runs = self.history_store.mark_incomplete_runs_interrupted()
         except HistoryStoreError as error:
@@ -656,7 +808,7 @@ class SeestarGui(QMainWindow):
         lines.extend(self._section_block("阶段文件命名", [
             "  - 阶段 6 去星: stage6_starless.fit / stage6_starless_quality.json。",
             "  - 阶段 7 拉伸: stage7_stretched.fit / stage7_stretch_quality.json。",
-            "  - 阶段 7 统一使用 stage7_cand_a/b、stage7_preview_ref 与 stage7_stretched 命名。",
+            "  - 阶段 7 使用 stage7_cand_a/b/display90、stage7_preview_ref 与 stage7_stretched 命名。",
         ]))
         lines.extend(self._section_block("当前运行环境", [
             f"  资源根目录: {self._display_path(self.resources)}",
@@ -672,6 +824,17 @@ class SeestarGui(QMainWindow):
     def _reset_view(self) -> None:
         self.log_view.clear()
         self.log_view.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _show_about(self) -> None:
+        QMessageBox.about(
+            self,
+            "关于 Starun",
+            (
+                "<b>Starun</b><br>"
+                f"版本 {self._bootstrap_app_version()}<br><br>"
+                "面向 Seestar 天文图像的离线自动后期处理应用。"
+            ),
+        )
 
     def _show_help(self) -> None:
         dialog = QMessageBox(self)
@@ -805,6 +968,7 @@ class SeestarGui(QMainWindow):
         outer.setContentsMargins(margin, 12, margin, 10)
         outer.setSpacing(self.platform_profile.panel_spacing)
 
+        self._init_actions()
         self._init_toolbar()
         self.workspace_stack = QStackedWidget()
         self.empty_page = self._build_empty_page()
@@ -814,8 +978,9 @@ class SeestarGui(QMainWindow):
         self.workspace_stack.addWidget(self.empty_page)
         self.workspace_stack.addWidget(self.task_page)
         self.workspace_stack.addWidget(self.run_page)
-        self.workspace_stack.addWidget(self.history_page)
         outer.addWidget(self.workspace_stack, 1)
+
+        self._init_history_window()
 
         self._build_log_drawer(outer)
         self._init_status_bar()
@@ -825,6 +990,330 @@ class SeestarGui(QMainWindow):
         self._update_result_actions(None)
         self._show_workspace(WORKSPACE_EMPTY)
 
+    def _init_actions(self) -> None:
+        """Create one command object for every shared desktop operation."""
+
+        shortcuts = standard_shortcuts(self.platform_profile)
+
+        def command(
+            text: str,
+            object_name: str,
+            handler,
+            *,
+            shortcut=None,
+            status_tip: str = "",
+        ) -> QAction:
+            action = QAction(text, self)
+            action.setObjectName(object_name)
+            if shortcut is not None:
+                action.setShortcut(shortcut)
+            if status_tip:
+                action.setStatusTip(status_tip)
+                action.setToolTip(status_tip)
+            action.triggered.connect(handler)
+            return action
+
+        self.open_file_action = command(
+            "打开图像…",
+            "openFileAction",
+            self._choose_input_file,
+            shortcut=shortcuts["open"],
+            status_tip="打开 FITS、XISF 或复核图像",
+        )
+        self.choose_directory_action = command(
+            "打开文件夹…",
+            "openDirectoryAction",
+            self._choose_workdir,
+            shortcut=shortcuts["open_folder"],
+            status_tip="打开 Light 文件夹或产品任务",
+        )
+        self.open_result_action = command(
+            "打开结果文件夹",
+            "openResultAction",
+            self._open_result_dir,
+            status_tip="打开当前任务的实际结果目录",
+        )
+        self.close_window_action = command(
+            "关闭窗口",
+            "closeWindowAction",
+            self._close_active_window,
+            shortcut=shortcuts["close"],
+        )
+        self.close_window_action.setShortcutContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.preferences_action = command(
+            "设置…",
+            "preferencesAction",
+            self._show_preferences,
+            shortcut=shortcuts["preferences"],
+        )
+        self.preferences_action.setMenuRole(QAction.MenuRole.PreferencesRole)
+        self.quit_action = command(
+            "退出 Starun",
+            "quitAction",
+            self.close,
+            shortcut=shortcuts["quit"],
+        )
+        self.quit_action.setMenuRole(QAction.MenuRole.QuitRole)
+
+        edit_commands = (
+            ("undo_action", "撤销", "undoAction", "undo", "undo"),
+            ("redo_action", "重做", "redoAction", "redo", "redo"),
+            ("cut_action", "剪切", "cutAction", "cut", "cut"),
+            ("copy_action", "拷贝", "copyAction", "copy", "copy"),
+            ("paste_action", "粘贴", "pasteAction", "paste", "paste"),
+            (
+                "select_all_action",
+                "全选",
+                "selectAllAction",
+                "selectAll",
+                "select_all",
+            ),
+        )
+        for attribute, text, object_name, method_name, shortcut_name in edit_commands:
+            action = command(
+                text,
+                object_name,
+                lambda _checked=False, name=method_name: (
+                    self._dispatch_focused_edit_command(name)
+                ),
+                shortcut=shortcuts[shortcut_name],
+            )
+            action.setProperty("editCommand", method_name)
+            setattr(self, attribute, action)
+
+        self.toggle_sidebar_action = QAction("显示任务信息侧边栏", self)
+        self.toggle_sidebar_action.setObjectName("toggleSidebarAction")
+        self.toggle_sidebar_action.setCheckable(True)
+        self.toggle_sidebar_action.setChecked(True)
+        self.toggle_sidebar_action.setShortcut(shortcuts["toggle_sidebar"])
+        self.toggle_sidebar_action.toggled.connect(
+            self._set_run_sidebar_visible
+        )
+        self.toggle_inspector_action = QAction("显示检查器", self)
+        self.toggle_inspector_action.setObjectName("toggleInspectorAction")
+        self.toggle_inspector_action.setCheckable(True)
+        self.toggle_inspector_action.setChecked(True)
+        self.toggle_inspector_action.setShortcut(shortcuts["toggle_inspector"])
+        self.toggle_inspector_action.toggled.connect(
+            self._set_run_inspector_visible
+        )
+
+        self.fit_preview_action = command(
+            "适合窗口",
+            "fitPreviewAction",
+            self._fit_run_preview,
+            shortcut=shortcuts["fit_preview"],
+        )
+        self.actual_preview_action = command(
+            "实际大小",
+            "actualPreviewAction",
+            self._show_run_preview_actual_size,
+            shortcut=shortcuts["actual_preview"],
+        )
+        self.zoom_in_action = command(
+            "放大",
+            "zoomInAction",
+            self._zoom_run_preview_in,
+            shortcut=shortcuts["zoom_in"],
+        )
+        self.zoom_out_action = command(
+            "缩小",
+            "zoomOutAction",
+            self._zoom_run_preview_out,
+            shortcut=shortcuts["zoom_out"],
+        )
+        self.toggle_log_action = QAction("显示详细日志", self)
+        self.toggle_log_action.setObjectName("toggleLogAction")
+        self.toggle_log_action.setCheckable(True)
+        self.toggle_log_action.setShortcut(shortcuts["toggle_log"])
+        self.toggle_log_action.toggled.connect(self._on_log_toggled)
+        self.open_log_action = command(
+            "打开日志文件",
+            "openLogAction",
+            self._open_log_file,
+        )
+        self.clear_view_action = command(
+            "清空界面日志",
+            "clearLogAction",
+            self._reset_view,
+        )
+        self.full_screen_action = QAction("进入全屏幕", self)
+        self.full_screen_action.setObjectName("fullScreenAction")
+        self.full_screen_action.setCheckable(True)
+        self.full_screen_action.setShortcut(shortcuts["full_screen"])
+        self.full_screen_action.toggled.connect(self._set_full_screen)
+
+        self.task_options_action = command(
+            "任务选项",
+            "taskOptionsAction",
+            self._show_advanced_settings,
+        )
+        self.start_action = command(
+            "开始处理",
+            "startProcessAction",
+            self._start_run,
+            shortcut=shortcuts["start"],
+        )
+        self.stop_action = command(
+            "停止",
+            "stopProcessAction",
+            self._request_stop_run,
+            shortcut=shortcuts["stop"],
+        )
+        self.return_task_action = command(
+            "返回任务设置",
+            "returnTaskAction",
+            self._return_to_task_setup,
+        )
+        self.rerun_action = command(
+            "重新运行",
+            "rerunAction",
+            self._rerun_last_task,
+            shortcut=shortcuts["rerun"],
+        )
+        self.history_action = command(
+            "历史记录",
+            "historyAction",
+            self._show_history,
+            shortcut=shortcuts["history"],
+            status_tip="打开独立的历史记录窗口",
+        )
+        self.history_action.setShortcutContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.main_window_action = command(
+            "Starun 主窗口",
+            "mainWindowAction",
+            self._show_main_window,
+            status_tip="显示并前置 Starun 主窗口",
+        )
+
+        self.minimize_action = command(
+            "最小化",
+            "minimizeWindowAction",
+            self._minimize_active_window,
+            shortcut=shortcuts["minimize"],
+        )
+        self.minimize_action.setShortcutContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.zoom_window_action = command(
+            "缩放",
+            "zoomWindowAction",
+            self._toggle_window_zoom,
+        )
+        self.bring_all_to_front_action = command(
+            "前置全部窗口",
+            "bringAllToFrontAction",
+            self._bring_all_windows_to_front,
+        )
+        self.help_action = command(
+            "使用说明",
+            "helpAction",
+            self._show_help,
+            shortcut=shortcuts["help"],
+        )
+        self.about_action = command(
+            "关于 Starun",
+            "aboutAction",
+            self._show_about,
+        )
+        self.about_action.setMenuRole(QAction.MenuRole.AboutRole)
+
+        if QStyle is not None:
+            icons = {
+                self.open_file_action: QStyle.StandardPixmap.SP_DirOpenIcon,
+                self.choose_directory_action: QStyle.StandardPixmap.SP_DirOpenIcon,
+                self.open_result_action: QStyle.StandardPixmap.SP_DirOpenIcon,
+                self.toggle_sidebar_action: QStyle.StandardPixmap.SP_FileDialogListView,
+                self.toggle_inspector_action: QStyle.StandardPixmap.SP_FileDialogInfoView,
+                self.history_action: QStyle.StandardPixmap.SP_FileDialogDetailedView,
+                self.return_task_action: QStyle.StandardPixmap.SP_ArrowBack,
+                self.rerun_action: QStyle.StandardPixmap.SP_BrowserReload,
+                self.start_action: QStyle.StandardPixmap.SP_MediaPlay,
+                self.stop_action: QStyle.StandardPixmap.SP_MediaStop,
+            }
+            for action, standard_pixmap in icons.items():
+                action.setIcon(self.style().standardIcon(standard_pixmap))
+
+        shared_actions = (
+            self.open_file_action,
+            self.choose_directory_action,
+            self.open_result_action,
+            self.close_window_action,
+            self.preferences_action,
+            self.quit_action,
+            self.undo_action,
+            self.redo_action,
+            self.cut_action,
+            self.copy_action,
+            self.paste_action,
+            self.select_all_action,
+            self.toggle_sidebar_action,
+            self.toggle_inspector_action,
+            self.fit_preview_action,
+            self.actual_preview_action,
+            self.zoom_in_action,
+            self.zoom_out_action,
+            self.toggle_log_action,
+            self.open_log_action,
+            self.clear_view_action,
+            self.full_screen_action,
+            self.task_options_action,
+            self.start_action,
+            self.stop_action,
+            self.return_task_action,
+            self.rerun_action,
+            self.history_action,
+            self.main_window_action,
+            self.minimize_action,
+            self.zoom_window_action,
+            self.bring_all_to_front_action,
+            self.help_action,
+            self.about_action,
+        )
+        self.command_actions = {
+            action.objectName(): action for action in shared_actions
+        }
+
+        app = QApplication.instance()
+        if isinstance(app, QApplication):
+            app.focusChanged.connect(self._update_edit_actions)
+        self._update_edit_actions()
+
+    def _bind_button_to_action(
+        self,
+        button: QPushButton,
+        action: QAction,
+        *,
+        mirror_text: bool = True,
+    ) -> None:
+        """Let a styled push button invoke and reflect a shared QAction."""
+
+        button.setProperty("commandAction", action.objectName())
+
+        def sync_button() -> None:
+            if mirror_text:
+                button.setText(action.text())
+            button.setIcon(action.icon())
+            button.setEnabled(action.isEnabled())
+            if action.toolTip():
+                button.setToolTip(action.toolTip())
+            if not button.accessibleName():
+                button.setAccessibleName(action.text().replace("…", ""))
+            if button.isCheckable() and button.isChecked() != action.isChecked():
+                button.blockSignals(True)
+                button.setChecked(action.isChecked())
+                button.blockSignals(False)
+
+        button.clicked.connect(
+            lambda _checked=False, shared_action=action: shared_action.trigger()
+        )
+        action.changed.connect(sync_button)
+        sync_button()
+
     def _init_toolbar(self) -> None:
         toolbar = QToolBar("主工具栏", self)
         toolbar.setObjectName("mainToolbar")
@@ -833,92 +1322,87 @@ class SeestarGui(QMainWindow):
         self.addToolBar(toolbar)
         self.main_toolbar = toolbar
 
-        toolbar_title = QLabel("Seestar Superimpose")
-        toolbar_title.setObjectName("toolbarTitle")
-        toolbar.addWidget(toolbar_title)
-        toolbar.addSeparator()
-
-        self.toolbar_directory_btn = QPushButton("选择文件")
-        self.toolbar_directory_btn.setAccessibleName("选择图像文件")
-        if QStyle is not None:
-            self.toolbar_directory_btn.setIcon(
-                self.style().standardIcon(
-                    QStyle.StandardPixmap.SP_DirOpenIcon
-                )
-            )
-        self.toolbar_directory_btn.clicked.connect(self._choose_input_file)
+        self.toolbar_directory_btn = QPushButton()
+        self.toolbar_directory_btn.setAccessibleName("打开图像文件")
+        self._bind_button_to_action(
+            self.toolbar_directory_btn,
+            self.open_file_action,
+        )
         self.toolbar_directory_item = toolbar.addWidget(self.toolbar_directory_btn)
 
-        self.toolbar_settings_btn = QPushButton("设置")
-        self.toolbar_settings_btn.setAccessibleName("展开任务高级设置")
+        self.toolbar_settings_btn = QPushButton()
+        self.toolbar_settings_btn.setAccessibleName("展开当前任务选项")
         self.toolbar_settings_btn.setProperty("variant", "quiet")
-        self.toolbar_settings_btn.clicked.connect(self._show_advanced_settings)
+        self._bind_button_to_action(
+            self.toolbar_settings_btn,
+            self.task_options_action,
+        )
         self.toolbar_settings_item = toolbar.addWidget(self.toolbar_settings_btn)
 
-        self.history_btn = QPushButton("历史记录")
+        self.history_btn = QPushButton()
         self.history_btn.setAccessibleName("查看历史处理记录")
         self.history_btn.setProperty("variant", "quiet")
-        if QStyle is not None:
-            self.history_btn.setIcon(
-                self.style().standardIcon(
-                    QStyle.StandardPixmap.SP_FileDialogDetailedView
-                )
-            )
-        self.history_btn.clicked.connect(self._show_history)
+        self._bind_button_to_action(self.history_btn, self.history_action)
         self.history_item = toolbar.addWidget(self.history_btn)
 
-        spacer = QWidget()
-        spacer.setSizePolicy(
+        self.sidebar_toggle_btn = QPushButton("任务信息")
+        self.sidebar_toggle_btn.setAccessibleName("显示或隐藏任务信息侧边栏")
+        self.sidebar_toggle_btn.setCheckable(True)
+        self.sidebar_toggle_btn.setProperty("variant", "quiet")
+        self._bind_button_to_action(
+            self.sidebar_toggle_btn,
+            self.toggle_sidebar_action,
+            mirror_text=False,
+        )
+        self.sidebar_toggle_item = toolbar.addWidget(self.sidebar_toggle_btn)
+
+        self.window_drag_region = QWidget()
+        self.window_drag_region.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Preferred,
         )
-        toolbar.addWidget(spacer)
+        self.window_drag_region.setMinimumWidth(40)
+        configure_toolbar_drag_region(
+            self.window_drag_region,
+            self.platform_profile,
+        )
+        toolbar.addWidget(self.window_drag_region)
 
-        self.return_task_btn = QPushButton("返回任务设置")
-        if QStyle is not None:
-            self.return_task_btn.setIcon(
-                self.style().standardIcon(
-                    QStyle.StandardPixmap.SP_ArrowBack
-                )
-            )
-        self.return_task_btn.clicked.connect(self._return_to_task_setup)
+        self.inspector_toggle_btn = QPushButton("检查器")
+        self.inspector_toggle_btn.setAccessibleName("显示或隐藏阶段检查器")
+        self.inspector_toggle_btn.setCheckable(True)
+        self.inspector_toggle_btn.setProperty("variant", "quiet")
+        self._bind_button_to_action(
+            self.inspector_toggle_btn,
+            self.toggle_inspector_action,
+            mirror_text=False,
+        )
+        self.inspector_toggle_item = toolbar.addWidget(self.inspector_toggle_btn)
+
+        self.return_task_btn = QPushButton()
+        self._bind_button_to_action(
+            self.return_task_btn,
+            self.return_task_action,
+        )
         self.return_task_item = toolbar.addWidget(self.return_task_btn)
 
-        self.rerun_btn = QPushButton("重新运行")
-        if QStyle is not None:
-            self.rerun_btn.setIcon(
-                self.style().standardIcon(
-                    QStyle.StandardPixmap.SP_BrowserReload
-                )
-            )
-        self.rerun_btn.clicked.connect(self._rerun_last_task)
+        self.rerun_btn = QPushButton()
+        self._bind_button_to_action(self.rerun_btn, self.rerun_action)
         self.rerun_item = toolbar.addWidget(self.rerun_btn)
 
-        self.start_btn = QPushButton("开始处理")
+        self.start_btn = QPushButton()
         self.start_btn.setAccessibleName("开始图像处理")
         self.start_btn.setMinimumWidth(120)
         self.start_btn.setDefault(True)
         self.start_btn.setProperty("variant", "primary")
-        if QStyle is not None:
-            self.start_btn.setIcon(
-                self.style().standardIcon(
-                    QStyle.StandardPixmap.SP_MediaPlay
-                )
-            )
-        self.start_btn.clicked.connect(self._start_run)
+        self._bind_button_to_action(self.start_btn, self.start_action)
         self.start_item = toolbar.addWidget(self.start_btn)
 
-        self.stop_btn = QPushButton("停止")
+        self.stop_btn = QPushButton()
         self.stop_btn.setAccessibleName("停止图像处理")
         self.stop_btn.setMinimumWidth(96)
         self.stop_btn.setProperty("variant", "destructive")
-        if QStyle is not None:
-            self.stop_btn.setIcon(
-                self.style().standardIcon(
-                    QStyle.StandardPixmap.SP_MediaStop
-                )
-            )
-        self.stop_btn.clicked.connect(self._request_stop_run)
+        self._bind_button_to_action(self.stop_btn, self.stop_action)
         self.stop_item = toolbar.addWidget(self.stop_btn)
 
     def _build_empty_page(self) -> QWidget:
@@ -989,7 +1473,7 @@ class SeestarGui(QMainWindow):
         card_layout.addStretch(1)
         layout.addWidget(card)
 
-        reassurance = QLabel("默认离线处理 · 原图不会被覆盖")
+        reassurance = QLabel("默认在线 Gaia 校准 · 可在高级设置切换离线 · 原图不会被覆盖")
         reassurance.setAlignment(Qt.AlignmentFlag.AlignCenter)
         reassurance.setAccessibleName("处理安全说明")
         reassurance.setProperty("tone", "muted")
@@ -1015,14 +1499,6 @@ class SeestarGui(QMainWindow):
         heading_text.addWidget(description)
         heading_row.addLayout(heading_text)
         heading_row.addStretch(1)
-        self.history_back_btn = QPushButton("返回")
-        self.history_back_btn.setAccessibleName("返回之前的页面")
-        if QStyle is not None:
-            self.history_back_btn.setIcon(
-                self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowBack)
-            )
-        self.history_back_btn.clicked.connect(self._leave_history)
-        heading_row.addWidget(self.history_back_btn)
         layout.addLayout(heading_row)
 
         filter_row = QHBoxLayout()
@@ -1044,6 +1520,12 @@ class SeestarGui(QMainWindow):
         )
         filter_row.addWidget(self.history_status_combo)
 
+        self.history_open_btn = QPushButton("查看运行")
+        self.history_open_btn.setAccessibleName("查看选中的历史运行")
+        self.history_open_btn.setEnabled(False)
+        self.history_open_btn.clicked.connect(self._open_selected_history_run)
+        filter_row.addWidget(self.history_open_btn)
+
         self.history_delete_btn = QPushButton("移到废纸篓")
         self.history_delete_btn.setAccessibleName("删除选中的历史任务")
         self.history_delete_btn.setProperty("variant", "destructive")
@@ -1051,6 +1533,15 @@ class SeestarGui(QMainWindow):
         self.history_delete_btn.clicked.connect(self._delete_selected_history_task)
         filter_row.addWidget(self.history_delete_btn)
         layout.addLayout(filter_row)
+
+        self.history_mode_label = QLabel(
+            "当前处理正在运行；可以浏览和搜索历史，查看运行与删除暂不可用。"
+        )
+        self.history_mode_label.setWordWrap(True)
+        self.history_mode_label.setProperty("tone", "muted")
+        self.history_mode_label.setAccessibleName("历史记录只读状态")
+        self.history_mode_label.hide()
+        layout.addWidget(self.history_mode_label)
 
         self.history_tree = QTreeWidget()
         self.history_tree.setObjectName("historyTree")
@@ -1073,7 +1564,7 @@ class SeestarGui(QMainWindow):
             2,
             QHeaderView.ResizeMode.ResizeToContents,
         )
-        self.history_tree.itemDoubleClicked.connect(
+        self.history_tree.itemActivated.connect(
             self._on_history_item_activated
         )
         self.history_tree.itemSelectionChanged.connect(
@@ -1087,6 +1578,17 @@ class SeestarGui(QMainWindow):
         self.history_empty_label.hide()
         layout.addWidget(self.history_empty_label)
         return page
+
+    def _init_history_window(self) -> None:
+        try:
+            from .history_window import HistoryWindow
+        except ImportError:  # Support direct execution from the gui directory.
+            from history_window import HistoryWindow  # type: ignore[no-redef]
+
+        self.history_window = HistoryWindow(self.history_page, self)
+        self.history_window.aboutToClose.connect(
+            self._save_history_window_geometry
+        )
 
     def _build_task_page(self) -> QWidget:
         page = QWidget()
@@ -1117,11 +1619,20 @@ class SeestarGui(QMainWindow):
 
         self.task_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.task_splitter.setChildrenCollapsible(False)
+        self.task_splitter.setHandleWidth(5)
         self.source_card = self._build_source_card()
+        self.source_card.setMinimumWidth(500)
+        self.task_preview_card = self._build_task_preview_card()
+        self.task_preview_card.setMinimumWidth(340)
         self.task_splitter.addWidget(self.source_card)
-        self.task_splitter.addWidget(self._build_task_preview_card())
+        self.task_splitter.addWidget(self.task_preview_card)
         self.task_splitter.setStretchFactor(0, 3)
         self.task_splitter.setStretchFactor(1, 2)
+        self._task_splitter_sizes = [720, 480]
+        self.task_splitter.setSizes(self._task_splitter_sizes)
+        self.task_splitter.splitterMoved.connect(
+            self._on_task_splitter_moved
+        )
         page_layout.addWidget(self.task_splitter, 1)
 
         phase_card = QFrame()
@@ -1202,22 +1713,53 @@ class SeestarGui(QMainWindow):
         self.directory_summary_label.setWordWrap(True)
         source_layout.addWidget(self.directory_summary_label)
 
+        self.source_header_group = QGroupBox("源文件 Header 信息")
+        self.source_header_group.setAccessibleName("源文件 Header 信息")
+        self.source_header_group.setAccessibleDescription(
+            "从当前选择的 FITS 主 Header 读取设备、滤镜、曝光和拍摄信息"
+        )
+        source_header_form = QFormLayout(self.source_header_group)
+        source_header_form.setContentsMargins(12, 10, 12, 10)
+        source_header_form.setSpacing(7)
+
+        self.source_header_device_label = QLabel("未记录")
+        self.source_header_filter_label = QLabel("未记录")
+        self.source_header_exposure_label = QLabel("未记录")
+        self.source_header_details_label = QLabel("未发现其他已知字段")
+        for label, accessible_name in (
+            (self.source_header_device_label, "Header 设备名称"),
+            (self.source_header_filter_label, "Header 滤镜名称"),
+            (self.source_header_exposure_label, "Header 曝光时间"),
+            (self.source_header_details_label, "Header 其他重要信息"),
+        ):
+            label.setAccessibleName(accessible_name)
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setWordWrap(True)
+        source_header_form.addRow("设备名称", self.source_header_device_label)
+        source_header_form.addRow("滤镜名称", self.source_header_filter_label)
+        source_header_form.addRow("曝光时间", self.source_header_exposure_label)
+        source_header_form.addRow("其他重要信息", self.source_header_details_label)
+
+        self.source_header_status_label = QLabel("")
+        self.source_header_status_label.setAccessibleName("Header 扫描状态")
+        self.source_header_status_label.setProperty("tone", "muted")
+        self.source_header_status_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.source_header_status_label.setWordWrap(True)
+        source_header_form.addRow(self.source_header_status_label)
+        self.source_header_group.hide()
+        source_layout.addWidget(self.source_header_group)
+
         mode_row = QHBoxLayout()
         mode_label = QLabel("处理方式")
         self.mode_combo = QComboBox()
         self.mode_combo.setAccessibleName("处理方式")
         self.mode_combo.setAccessibleDescription(
-            "选择自动推荐、完整处理或从已有阶段继续"
+            "根据已验证任务自动选择完整处理或正式断点续跑"
         )
         self.mode_combo.setToolTip(
-            "用途：选择流水线起点；默认：自动推荐。完整处理执行 Stage 1–10；"
-            "从边界校正后继续会跳过 Stage 1–2；从线性反卷积与降噪后继续会跳过 Stage 1–5，"
-            "因此色彩校准、降噪和反卷积设置不再生效。"
+            "流水线起点由输入发现与已验签 task-run manifest 自动决定。"
         )
         self.mode_combo.addItem("自动推荐（完整处理）", UI_MODE_RECOMMENDED)
-        self.mode_combo.addItem("完整处理", INPUT_MODE_AUTO)
-        self.mode_combo.addItem("从边界校正后继续", INPUT_MODE_STAGE2_CORRECTED_RESUME)
-        self.mode_combo.addItem("从线性反卷积与降噪后继续", INPUT_MODE_LINEAR_RESUME)
         self.mode_combo.currentIndexChanged.connect(self._on_input_mode_changed)
         mode_label.setBuddy(self.mode_combo)
         self.mode_combo.hide()
@@ -1240,11 +1782,11 @@ class SeestarGui(QMainWindow):
         self.processing_params_btn = QPushButton("处理参数…")
         self.processing_params_btn.setAccessibleName("配置本次图像处理参数")
         self.processing_params_btn.setAccessibleDescription(
-            "在当前任务设置下方展开或收起输出、色彩校准、线性处理和性能兼容选项"
+            "在当前任务设置下方展开或收起通用配置与 Stage 1–10 分阶段参数"
         )
         self.processing_params_btn.setToolTip(
-            "在下方展开处理参数。所有非敏感参数会保存为下次默认值，"
-            "任务开始后将冻结为本次运行配置。"
+            "在下方展开处理参数。通用配置会保存为应用默认值；"
+            "Stage 1–10 参数仅属于当前输入，并在任务开始后冻结。"
         )
         self.processing_params_btn.setProperty("variant", "compact")
         self.processing_params_btn.clicked.connect(self._configure_processing_parameters)
@@ -1260,12 +1802,12 @@ class SeestarGui(QMainWindow):
         self.network_btn = QCheckBox("允许联网")
         self.network_btn.setAccessibleName("允许联网")
         network_description = (
-            "默认关闭；开启后允许在线星表查询和插件资源补齐"
+            "默认开启；允许在线 Gaia 星表查询和已授权的插件资源补齐"
         )
         self.network_btn.setAccessibleDescription(network_description)
         self.network_btn.setToolTip(
             network_description
-            + "。默认：关闭。离线资源完整时主流程无需联网；关闭时不会尝试在线星表。"
+            + "。只有明确关闭时才进入严格离线模式，并要求本地 Gaia 星表。"
         )
         self.network_btn.setChecked(self.network_mode_enabled)
         self.network_btn.toggled.connect(self._on_network_toggled)
@@ -1323,7 +1865,7 @@ class SeestarGui(QMainWindow):
         self.banner_log_btn = QPushButton("查看详细日志")
         self.banner_log_btn.setAccessibleName("展开详细日志")
         self.banner_log_btn.clicked.connect(
-            lambda: self.log_toggle_btn.setChecked(True)
+            lambda: self.toggle_log_action.setChecked(True)
         )
         warning_layout.addWidget(self.warning_label)
         warning_layout.addStretch(1)
@@ -1335,38 +1877,54 @@ class SeestarGui(QMainWindow):
 
         self.run_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.run_splitter.setChildrenCollapsible(False)
+        self.run_splitter.setHandleWidth(5)
+        self._run_sidebar_width = 240
+        self._run_inspector_width = 300
         self.run_sidebar = self._build_run_sidebar()
+        self.run_detail = self._build_run_preview_card()
+        self.run_inspector = self._build_stage_inspector()
         self.run_splitter.addWidget(self.run_sidebar)
-        self.run_splitter.addWidget(self._build_run_preview_card())
-        self.run_splitter.addWidget(self._build_stage_inspector())
+        self.run_splitter.addWidget(self.run_detail)
+        self.run_splitter.addWidget(self.run_inspector)
         self.run_splitter.setStretchFactor(0, 0)
         self.run_splitter.setStretchFactor(1, 1)
         self.run_splitter.setStretchFactor(2, 0)
-        self.run_splitter.setSizes([250, 720, 290])
+        self.run_splitter.setSizes(
+            [self._run_sidebar_width, 700, self._run_inspector_width]
+        )
         layout.addWidget(self.run_splitter, 1)
         return page
 
     def _build_run_sidebar(self) -> QFrame:
         card = QFrame()
         card.setObjectName("sidebarPanel")
-        card.setMinimumWidth(220)
-        card.setMaximumWidth(320)
+        card.setMinimumWidth(210)
+        card.setMaximumWidth(380)
         layout = QVBoxLayout(card)
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(9)
         layout.addWidget(self._section_title("本次任务"))
 
-        self.run_directory_label = QLabel("工作目录\n—")
+        self.run_task_name_label = QLabel("—")
+        self.run_task_name_label.setObjectName("sidebarPrimary")
+        self.run_task_name_label.setWordWrap(True)
+        self.run_task_name_label.setAccessibleName("当前任务名称")
+        self.run_directory_label = QLabel("位置\n—")
         self.run_directory_label.setWordWrap(True)
         self.run_mode_label = QLabel("处理方式\n—")
-        self.run_options_label = QLabel("高级设置\n—")
-        self.run_options_label.setWordWrap(True)
         for widget in (
             self.run_directory_label,
             self.run_mode_label,
-            self.run_options_label,
         ):
             widget.setProperty("role", "summary")
+            widget.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+        layout.addWidget(self.run_task_name_label)
+        for widget in (
+            self.run_directory_label,
+            self.run_mode_label,
+        ):
             layout.addWidget(widget)
         layout.addStretch(1)
 
@@ -1376,7 +1934,10 @@ class SeestarGui(QMainWindow):
         self.result_preview_btn.clicked.connect(self._open_result_preview)
         self.open_result_btn = QPushButton("打开结果目录")
         self.open_result_btn.setAccessibleName("打开处理结果目录")
-        self.open_result_btn.clicked.connect(self._open_result_dir)
+        self._bind_button_to_action(
+            self.open_result_btn,
+            self.open_result_action,
+        )
         layout.addWidget(self.result_preview_btn)
         layout.addWidget(self.open_result_btn)
         return card
@@ -1411,14 +1972,29 @@ class SeestarGui(QMainWindow):
         controls = QHBoxLayout()
         self.zoom_out_btn = QPushButton("−")
         self.zoom_out_btn.setAccessibleName("缩小预览")
-        self.zoom_out_btn.clicked.connect(self.preview_canvas.zoom_out)
+        self._bind_button_to_action(
+            self.zoom_out_btn,
+            self.zoom_out_action,
+            mirror_text=False,
+        )
         self.fit_preview_btn = QPushButton("适合窗口")
-        self.fit_preview_btn.clicked.connect(self.preview_canvas.fit_to_window)
+        self._bind_button_to_action(
+            self.fit_preview_btn,
+            self.fit_preview_action,
+        )
         self.actual_preview_btn = QPushButton("1:1")
-        self.actual_preview_btn.clicked.connect(self.preview_canvas.actual_pixels)
+        self._bind_button_to_action(
+            self.actual_preview_btn,
+            self.actual_preview_action,
+            mirror_text=False,
+        )
         self.zoom_in_btn = QPushButton("+")
         self.zoom_in_btn.setAccessibleName("放大预览")
-        self.zoom_in_btn.clicked.connect(self.preview_canvas.zoom_in)
+        self._bind_button_to_action(
+            self.zoom_in_btn,
+            self.zoom_in_action,
+            mirror_text=False,
+        )
         controls.addStretch(1)
         for button in (
             self.zoom_out_btn,
@@ -1440,21 +2016,32 @@ class SeestarGui(QMainWindow):
     def _build_stage_inspector(self) -> QFrame:
         card = QFrame()
         card.setObjectName("inspectorPanel")
-        card.setMinimumWidth(250)
-        card.setMaximumWidth(340)
+        card.setMinimumWidth(260)
+        card.setMaximumWidth(420)
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(12, 11, 12, 11)
-        layout.setSpacing(7)
-        layout.addWidget(self._section_title("阶段与质量"))
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.inspector_tabs = QTabWidget()
+        self.inspector_tabs.setObjectName("runInspectorTabs")
+        self.inspector_tabs.setAccessibleName("运行检查器")
+        self.inspector_tabs.setDocumentMode(True)
+        layout.addWidget(self.inspector_tabs)
+
+        stage_tab = QWidget()
+        stage_layout = QVBoxLayout(stage_tab)
+        stage_layout.setContentsMargins(12, 11, 12, 11)
+        stage_layout.setSpacing(7)
+        stage_layout.addWidget(self._section_title("阶段与质量"))
 
         self.run_phase_label = QLabel("线性处理 · Stage 1–6")
         self.run_phase_label.setProperty("tone", "muted")
-        layout.addWidget(self.run_phase_label)
+        stage_layout.addWidget(self.run_phase_label)
 
         self.progress_summary_label = QLabel("当前进度：等待开始")
         self.progress_summary_label.setAccessibleName("处理阶段进度")
         self.progress_summary_label.setWordWrap(True)
-        layout.addWidget(self.progress_summary_label)
+        stage_layout.addWidget(self.progress_summary_label)
 
         self.stage_stepper = QWidget()
         self.stage_stepper.setAccessibleName("处理阶段列表")
@@ -1466,7 +2053,44 @@ class SeestarGui(QMainWindow):
         self.stage_scroll.setWidgetResizable(True)
         self.stage_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.stage_scroll.setWidget(self.stage_stepper)
-        layout.addWidget(self.stage_scroll, 1)
+        stage_layout.addWidget(self.stage_scroll, 1)
+
+        task_tab = QWidget()
+        task_layout = QVBoxLayout(task_tab)
+        task_layout.setContentsMargins(0, 0, 0, 0)
+        self.run_configuration_scroll = QScrollArea()
+        self.run_configuration_scroll.setAccessibleName("本次任务冻结配置")
+        self.run_configuration_scroll.setWidgetResizable(True)
+        self.run_configuration_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        configuration_content = QWidget()
+        configuration_layout = QVBoxLayout(configuration_content)
+        configuration_layout.setContentsMargins(12, 11, 12, 11)
+        configuration_layout.setSpacing(7)
+        configuration_layout.addWidget(self._section_title("冻结的任务配置"))
+        configuration_note = QLabel(
+            "以下配置在任务启动时冻结；历史运行显示当次保存的信息。"
+        )
+        configuration_note.setWordWrap(True)
+        configuration_note.setProperty("tone", "muted")
+        configuration_layout.addWidget(configuration_note)
+        self.run_options_label = QLabel("—")
+        self.run_options_label.setWordWrap(True)
+        self.run_options_label.setProperty("role", "summary")
+        self.run_options_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        configuration_layout.addWidget(self.run_options_label)
+        configuration_layout.addStretch(1)
+        self.run_configuration_scroll.setWidget(configuration_content)
+        task_layout.addWidget(self.run_configuration_scroll)
+
+        self.inspector_tabs.addTab(stage_tab, "阶段")
+        self.inspector_tabs.addTab(task_tab, "任务")
+        self.inspector_tabs.setTabToolTip(0, "查看 Stage 1–10 状态与质量")
+        self.inspector_tabs.setTabToolTip(1, "查看本次运行冻结的配置")
+        self.inspector_tabs.currentChanged.connect(
+            self._on_inspector_tab_changed
+        )
         self._reset_stage_progress(10)
         return card
 
@@ -1474,7 +2098,11 @@ class SeestarGui(QMainWindow):
         self.log_toggle_btn = QPushButton("详细日志")
         self.log_toggle_btn.setAccessibleName("展开详细日志")
         self.log_toggle_btn.setCheckable(True)
-        self.log_toggle_btn.toggled.connect(self._on_log_toggled)
+        self._bind_button_to_action(
+            self.log_toggle_btn,
+            self.toggle_log_action,
+            mirror_text=False,
+        )
 
         self.log_container = QFrame()
         self.log_container.setObjectName("logPanel")
@@ -1487,10 +2115,10 @@ class SeestarGui(QMainWindow):
         log_actions.addStretch(1)
         self.open_log_btn = QPushButton("打开日志文件")
         self.open_log_btn.setAccessibleName("打开完整日志文件")
-        self.open_log_btn.clicked.connect(self._open_log_file)
+        self._bind_button_to_action(self.open_log_btn, self.open_log_action)
         self.clear_view_btn = QPushButton("清空日志")
         self.clear_view_btn.setAccessibleName("清空界面日志")
-        self.clear_view_btn.clicked.connect(self._reset_view)
+        self._bind_button_to_action(self.clear_view_btn, self.clear_view_action)
         log_actions.addWidget(self.open_log_btn)
         log_actions.addWidget(self.clear_view_btn)
         log_layout.addLayout(log_actions)
@@ -1524,69 +2152,226 @@ class SeestarGui(QMainWindow):
         status_bar.addPermanentWidget(self.log_toggle_btn)
 
     def _init_menus(self) -> None:
-        shortcuts = standard_shortcuts(self.platform_profile)
+        menu_bar = self.menuBar()
 
-        file_menu = self.menuBar().addMenu("文件")
-        self.choose_directory_action = QAction("选择目录…", self)
-        self.choose_directory_action.setShortcut(shortcuts["open"])
-        self.choose_directory_action.triggered.connect(self._choose_workdir)
-        file_menu.addAction(self.choose_directory_action)
+        self.file_menu = menu_bar.addMenu("文件")
+        self.file_menu.addAction(self.open_file_action)
+        self.file_menu.addAction(self.choose_directory_action)
+        self.open_recent_menu = self.file_menu.addMenu("打开最近使用")
+        self._refresh_recent_menu()
+        self.file_menu.addSeparator()
+        self.file_menu.addAction(self.open_result_action)
+        self.file_menu.addSeparator()
+        self.file_menu.addAction(self.close_window_action)
+        self.file_menu.addSeparator()
+        self.file_menu.addAction(self.preferences_action)
+        self.file_menu.addAction(self.quit_action)
 
-        self.open_result_action = QAction("打开结果目录", self)
-        self.open_result_action.triggered.connect(self._open_result_dir)
-        file_menu.addAction(self.open_result_action)
-        file_menu.addSeparator()
+        self.edit_menu = menu_bar.addMenu("编辑")
+        self.edit_menu.addAction(self.undo_action)
+        self.edit_menu.addAction(self.redo_action)
+        self.edit_menu.addSeparator()
+        self.edit_menu.addAction(self.cut_action)
+        self.edit_menu.addAction(self.copy_action)
+        self.edit_menu.addAction(self.paste_action)
+        self.edit_menu.addSeparator()
+        self.edit_menu.addAction(self.select_all_action)
+        self.edit_menu.aboutToShow.connect(self._update_edit_actions)
 
-        self.preferences_action = QAction("任务设置…", self)
-        self.preferences_action.setShortcut(shortcuts["preferences"])
-        self.preferences_action.setMenuRole(QAction.MenuRole.PreferencesRole)
-        self.preferences_action.triggered.connect(self._show_advanced_settings)
-        file_menu.addAction(self.preferences_action)
+        self.view_menu = menu_bar.addMenu("显示")
+        self.view_menu.addAction(self.toggle_sidebar_action)
+        self.view_menu.addAction(self.toggle_inspector_action)
+        self.view_menu.addSeparator()
+        self.view_menu.addAction(self.fit_preview_action)
+        self.view_menu.addAction(self.actual_preview_action)
+        self.view_menu.addAction(self.zoom_in_action)
+        self.view_menu.addAction(self.zoom_out_action)
+        self.view_menu.addSeparator()
+        self.view_menu.addAction(self.toggle_log_action)
+        self.view_menu.addAction(self.open_log_action)
+        self.view_menu.addAction(self.clear_view_action)
+        self.view_menu.addSeparator()
+        self.view_menu.addAction(self.full_screen_action)
 
-        self.quit_action = QAction("退出 Seestar Superimpose", self)
-        self.quit_action.setShortcut(shortcuts["quit"])
-        self.quit_action.setMenuRole(QAction.MenuRole.QuitRole)
-        self.quit_action.triggered.connect(self.close)
-        file_menu.addAction(self.quit_action)
+        self.process_menu = menu_bar.addMenu("处理")
+        self.process_menu.addAction(self.task_options_action)
+        self.process_menu.addSeparator()
+        self.process_menu.addAction(self.start_action)
+        self.process_menu.addAction(self.stop_action)
+        self.process_menu.addSeparator()
+        self.process_menu.addAction(self.return_task_action)
+        self.process_menu.addAction(self.rerun_action)
 
-        process_menu = self.menuBar().addMenu("处理")
+        self.window_menu = menu_bar.addMenu("窗口")
+        self.window_menu.addAction(self.minimize_action)
+        self.window_menu.addAction(self.zoom_window_action)
+        self.window_menu.addSeparator()
+        self.window_menu.addAction(self.bring_all_to_front_action)
+        self.window_menu.addSeparator()
+        self.window_menu.addAction(self.main_window_action)
+        self.window_menu.addAction(self.history_action)
 
-        self.start_action = QAction("开始处理", self)
-        self.start_action.setShortcut(shortcuts["start"])
-        self.start_action.triggered.connect(self._start_run)
-        process_menu.addAction(self.start_action)
+        self.help_menu = menu_bar.addMenu("帮助")
+        self.help_menu.addAction(self.help_action)
+        self.help_menu.addSeparator()
+        self.help_menu.addAction(self.about_action)
 
-        self.stop_action = QAction("停止", self)
-        self.stop_action.setShortcut(shortcuts["stop"])
-        self.stop_action.triggered.connect(self._request_stop_run)
-        process_menu.addAction(self.stop_action)
+    def _refresh_recent_menu(self) -> None:
+        menu = getattr(self, "open_recent_menu", None)
+        if menu is None:
+            return
+        menu.clear()
+        if not self._recent_directories:
+            empty_action = menu.addAction("无最近使用的输入")
+            empty_action.setEnabled(False)
+            menu.menuAction().setEnabled(False)
+            return
 
-        self.return_task_action = QAction("返回任务设置", self)
-        self.return_task_action.triggered.connect(self._return_to_task_setup)
-        process_menu.addAction(self.return_task_action)
+        for value in self._recent_directories:
+            recent_action = QAction(self._display_path(value), menu)
+            recent_action.setToolTip(value)
+            recent_action.setData(value)
+            recent_action.triggered.connect(
+                lambda _checked=False, path=value: self._apply_input_path(
+                    Path(path),
+                    remember=True,
+                )
+            )
+            menu.addAction(recent_action)
+        menu.addSeparator()
+        clear_action = menu.addAction("清除菜单")
+        clear_action.triggered.connect(self._clear_recent_directories)
+        menu.menuAction().setEnabled(not self._ui_running)
 
-        self.rerun_action = QAction("重新运行", self)
-        self.rerun_action.setShortcut(shortcuts["rerun"])
-        self.rerun_action.triggered.connect(self._rerun_last_task)
-        process_menu.addAction(self.rerun_action)
+    def _clear_recent_directories(self) -> None:
+        self._recent_directories = []
+        self._refresh_recent_directories()
+        self._save_settings()
 
-        process_menu.addSeparator()
+    def _dispatch_focused_edit_command(self, method_name: str) -> None:
+        widget = QApplication.focusWidget()
+        handler = getattr(widget, method_name, None) if widget is not None else None
+        if callable(handler):
+            handler()
 
-        self.history_action = QAction("历史记录", self)
-        self.history_action.triggered.connect(self._show_history)
-        process_menu.addAction(self.history_action)
+    def _update_edit_actions(self, *_args) -> None:
+        widget = QApplication.focusWidget()
+        widget_enabled = bool(widget is not None and widget.isEnabled())
+        read_only_method = getattr(widget, "isReadOnly", None)
+        read_only = bool(read_only_method()) if callable(read_only_method) else False
+        for action in (
+            self.undo_action,
+            self.redo_action,
+            self.cut_action,
+            self.copy_action,
+            self.paste_action,
+            self.select_all_action,
+        ):
+            method_name = str(action.property("editCommand") or "")
+            handler = getattr(widget, method_name, None) if widget is not None else None
+            enabled = widget_enabled and callable(handler)
+            if method_name in {"undo", "redo", "cut", "paste"} and read_only:
+                enabled = False
+            action.setEnabled(enabled)
 
-        process_menu.addAction(self.open_result_action)
+    def _fit_run_preview(self) -> None:
+        preview = getattr(self, "preview_canvas", None)
+        if preview is not None:
+            preview.fit_to_window()
 
-        help_menu = self.menuBar().addMenu("帮助")
-        self.help_action = QAction("使用说明", self)
-        self.help_action.triggered.connect(self._show_help)
-        help_menu.addAction(self.help_action)
+    def _show_run_preview_actual_size(self) -> None:
+        preview = getattr(self, "preview_canvas", None)
+        if preview is not None:
+            preview.actual_pixels()
 
-        self.open_log_action = QAction("打开日志文件", self)
-        self.open_log_action.triggered.connect(self._open_log_file)
-        self.clear_view_action = QAction("清空日志", self)
-        self.clear_view_action.triggered.connect(self._reset_view)
+    def _zoom_run_preview_in(self) -> None:
+        preview = getattr(self, "preview_canvas", None)
+        if preview is not None:
+            preview.zoom_in()
+
+    def _zoom_run_preview_out(self) -> None:
+        preview = getattr(self, "preview_canvas", None)
+        if preview is not None:
+            preview.zoom_out()
+
+    def _set_full_screen(self, enabled: bool) -> None:
+        if enabled:
+            self._window_was_maximized = self.isMaximized()
+            self.showFullScreen()
+            self.full_screen_action.setText("退出全屏幕")
+            return
+        if self.isFullScreen():
+            if getattr(self, "_window_was_maximized", False):
+                self.showMaximized()
+            else:
+                self.showNormal()
+        self.full_screen_action.setText("进入全屏幕")
+
+    def _active_application_window(self) -> QWidget:
+        focused = QApplication.focusWidget()
+        if focused is not None:
+            focused_window = focused.window()
+            if focused_window.isWindow() and focused_window.isVisible():
+                return focused_window
+        active = QApplication.activeWindow()
+        return active if active is not None else self
+
+    def _show_main_window(self) -> None:
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _close_active_window(self) -> None:
+        self._active_application_window().close()
+
+    def _minimize_active_window(self) -> None:
+        self._active_application_window().showMinimized()
+
+    def _toggle_window_zoom(self) -> None:
+        window = self._active_application_window()
+        if window is self and self.isFullScreen():
+            self.full_screen_action.setChecked(False)
+        elif window.isMaximized():
+            window.showNormal()
+        else:
+            window.showMaximized()
+
+    def _bring_all_windows_to_front(self) -> None:
+        app = QApplication.instance()
+        active = QApplication.activeWindow()
+        if isinstance(app, QApplication):
+            for window in app.topLevelWidgets():
+                if window.isWindow() and window.isVisible():
+                    window.raise_()
+        target = active if active is not None and active.isVisible() else self
+        target.raise_()
+        target.activateWindow()
+
+    @staticmethod
+    def _splitter_sizes_setting(
+        value: object,
+        expected_count: int,
+    ) -> list[int] | None:
+        if isinstance(value, str):
+            candidates = [
+                item
+                for item in re.split(r"[,;\s]+", value.strip("[]() "))
+                if item
+            ]
+        elif isinstance(value, (list, tuple)):
+            candidates = list(value)
+        else:
+            return None
+        try:
+            sizes = [int(item) for item in candidates]
+        except (TypeError, ValueError):
+            return None
+        if len(sizes) != expected_count or any(size <= 0 for size in sizes):
+            return None
+        return sizes
 
     @staticmethod
     def _section_title(text: str) -> QLabel:
@@ -1599,16 +2384,33 @@ class SeestarGui(QMainWindow):
             WORKSPACE_EMPTY,
             WORKSPACE_TASK,
             WORKSPACE_RUN,
-            WORKSPACE_HISTORY,
         } else WORKSPACE_EMPTY
+        if (
+            getattr(self, "_workspace_state", None) == WORKSPACE_TASK
+            and hasattr(self, "task_splitter")
+        ):
+            task_sizes = self.task_splitter.sizes()
+            if len(task_sizes) == 2 and all(size > 0 for size in task_sizes):
+                self._task_splitter_sizes = task_sizes
+        if (
+            getattr(self, "_workspace_state", None) == WORKSPACE_RUN
+            and hasattr(self, "run_splitter")
+        ):
+            run_sizes = self.run_splitter.sizes()
+            if len(run_sizes) == 3:
+                if self.toggle_sidebar_action.isChecked() and run_sizes[0] > 0:
+                    self._run_sidebar_width = run_sizes[0]
+                if self.toggle_inspector_action.isChecked() and run_sizes[2] > 0:
+                    self._run_inspector_width = run_sizes[2]
         self._workspace_state = normalized
         page = {
             WORKSPACE_EMPTY: self.empty_page,
             WORKSPACE_TASK: self.task_page,
             WORKSPACE_RUN: self.run_page,
-            WORKSPACE_HISTORY: self.history_page,
         }[normalized]
         self.workspace_stack.setCurrentWidget(page)
+        if normalized == WORKSPACE_TASK:
+            self.task_splitter.setSizes(self._task_splitter_sizes)
         self._update_toolbar_state()
         self._update_responsive_layout()
 
@@ -1653,34 +2455,48 @@ class SeestarGui(QMainWindow):
             return status in {STATUS_FAILED, STATUS_STOPPED, STATUS_INTERRUPTED}
         return True
 
+    def _history_operations_running(self) -> bool:
+        return bool(
+            self._ui_running
+            or (self.intake_worker and self.intake_worker.isRunning())
+            or (self.bootstrap_worker and self.bootstrap_worker.isRunning())
+            or (self.worker and self.worker.isRunning())
+        )
+
     def _show_history(self) -> None:
-        if self._ui_running or (
-            self.intake_worker and self.intake_worker.isRunning()
-        ) or (
-            self.bootstrap_worker and self.bootstrap_worker.isRunning()
-        ) or (
-            self.worker and self.worker.isRunning()
-        ):
-            return
-        if self._workspace_state != WORKSPACE_HISTORY:
-            if not self._history_detail_mode:
-                self._history_return_state = self._workspace_state
-            self._history_detail_mode = False
-            self._active_history_task_key = None
-            self._active_history_run_id = None
+        if not self._history_detail_mode and not self.history_window.isVisible():
+            self._history_return_state = self._workspace_state
+            self._history_return_status = self.status_label.text()
+            self._history_return_task_root = self._last_task_root
         self._refresh_history_view()
-        self._show_workspace(WORKSPACE_HISTORY)
-        self._set_status_message("历史记录")
+        history_was_maximized = self.history_window.isMaximized()
+        if history_was_maximized and not self.history_window.isVisible():
+            self.history_window.setWindowState(Qt.WindowState.WindowNoState)
+        constrain_window_to_visible_screens(
+            self.history_window,
+            reference=self,
+            resize_to_fit=False,
+        )
+        if history_was_maximized:
+            self.history_window.setWindowState(
+                self.history_window.windowState()
+                | Qt.WindowState.WindowMaximized
+            )
+        self.history_window.show_and_activate(
+            initial_focus=self.history_search_edit
+        )
 
     def _leave_history(self) -> None:
-        target = self._history_return_state
-        if target not in {WORKSPACE_EMPTY, WORKSPACE_TASK, WORKSPACE_RUN}:
-            target = WORKSPACE_EMPTY
-        if target == WORKSPACE_RUN and not self._run_terminal_status:
-            target = WORKSPACE_TASK if self.dir_edit.text().strip() else WORKSPACE_EMPTY
-        self._show_workspace(target)
-        if target == WORKSPACE_EMPTY:
-            self._set_status_text("Idle")
+        self.history_window.close()
+        self.raise_()
+        self.activateWindow()
+
+    def _save_history_window_geometry(self) -> None:
+        window = getattr(self, "history_window", None)
+        if window is None or self._restoring_settings:
+            return
+        self._store_window_geometry_settings()
+        self.settings.sync()
 
     def _set_history_status_badge(
         self,
@@ -1699,6 +2515,20 @@ class SeestarGui(QMainWindow):
     def _refresh_history_view(self, _value: object = None) -> None:
         if not hasattr(self, "history_tree"):
             return
+        user_role = int(Qt.ItemDataRole.UserRole)
+        current_item = self.history_tree.currentItem()
+        selected_task_key = ""
+        selected_kind = ""
+        selected_run_id = ""
+        if current_item is not None:
+            selected_task_key = str(current_item.data(0, user_role) or "")
+            selected_kind = str(current_item.data(0, user_role + 1) or "")
+            selected_run_id = str(current_item.data(0, user_role + 2) or "")
+        expanded_task_keys = {
+            str(item.data(0, user_role) or "")
+            for index in range(self.history_tree.topLevelItemCount())
+            if (item := self.history_tree.topLevelItem(index)).isExpanded()
+        }
         query = self.history_search_edit.text().strip().casefold()
         selected_filter = str(self.history_status_combo.currentData() or "all")
         try:
@@ -1715,7 +2545,7 @@ class SeestarGui(QMainWindow):
             if str(task.get("task_key") or "")
         }
         self.history_tree.clear()
-        user_role = int(Qt.ItemDataRole.UserRole)
+        restored_selection: QTreeWidgetItem | None = None
         visible_count = 0
         for task in tasks:
             task_key = str(task.get("task_key") or "")
@@ -1741,6 +2571,9 @@ class SeestarGui(QMainWindow):
                 + ("" if available else "\n位置不可用"),
             )
             self.history_tree.addTopLevelItem(item)
+            item.setExpanded(task_key in expanded_task_keys)
+            if task_key == selected_task_key and selected_kind == "task":
+                restored_selection = item
             self._set_history_status_badge(
                 item,
                 status,
@@ -1764,6 +2597,12 @@ class SeestarGui(QMainWindow):
                 child.setData(0, user_role + 1, "run")
                 child.setData(0, user_role + 2, run_id)
                 item.addChild(child)
+                if (
+                    task_key == selected_task_key
+                    and selected_kind == "run"
+                    and run_id == selected_run_id
+                ):
+                    restored_selection = child
                 self._set_history_status_badge(
                     child,
                     run_status,
@@ -1771,6 +2610,8 @@ class SeestarGui(QMainWindow):
                 )
             visible_count += 1
 
+        if restored_selection is not None:
+            self.history_tree.setCurrentItem(restored_selection)
         self.history_tree.setVisible(visible_count > 0)
         self.history_empty_label.setVisible(visible_count == 0)
         self._update_history_selection_actions()
@@ -1785,23 +2626,61 @@ class SeestarGui(QMainWindow):
         task_key = str(item.data(0, user_role) or "")
         return self._history_task_records.get(task_key)
 
+    def _selected_history_run_identity(self) -> tuple[str, str] | None:
+        item = self.history_tree.currentItem()
+        if item is None:
+            return None
+        user_role = int(Qt.ItemDataRole.UserRole)
+        if str(item.data(0, user_role + 1) or "") != "run":
+            return None
+        task_key = str(item.data(0, user_role) or "")
+        run_id = str(item.data(0, user_role + 2) or "")
+        return (task_key, run_id) if task_key and run_id else None
+
+    def _selected_history_item_kind(self) -> str:
+        item = self.history_tree.currentItem()
+        if item is None:
+            return ""
+        user_role = int(Qt.ItemDataRole.UserRole)
+        return str(item.data(0, user_role + 1) or "")
+
+    def _history_dialog_parent(self) -> QWidget:
+        return (
+            self.history_window
+            if self.history_window.isVisible()
+            else self
+        )
+
+    def _open_selected_history_run(self) -> None:
+        identity = self._selected_history_run_identity()
+        if identity is not None:
+            self._open_history_run(*identity)
+
     def _update_history_selection_actions(self) -> None:
         if not hasattr(self, "history_delete_btn"):
             return
         task = self._selected_history_task()
-        running = bool(
-            self._ui_running
-            or (self.intake_worker and self.intake_worker.isRunning())
-            or (self.bootstrap_worker and self.bootstrap_worker.isRunning())
-            or (self.worker and self.worker.isRunning())
-        )
+        running = self._history_operations_running()
         available = bool(task and task.get("available", False))
+        run_identity = self._selected_history_run_identity()
+        task_row_selected = self._selected_history_item_kind() == "task"
+        self.history_open_btn.setEnabled(
+            bool(run_identity and available and not running)
+        )
         self.history_delete_btn.setText(
             "移到废纸篓"
             if task is None or available
             else "从历史中移除"
         )
-        self.history_delete_btn.setEnabled(bool(task) and not running)
+        self.history_delete_btn.setEnabled(
+            bool(task and task_row_selected and not running)
+        )
+        self.history_delete_btn.setToolTip(
+            "删除整个任务及其全部运行"
+            if task_row_selected
+            else "如需删除，请先选择任务行"
+        )
+        self.history_mode_label.setVisible(running)
 
     def _clear_deleted_task_state(self, task_root: Path) -> bool:
         deleted = task_root.expanduser().resolve()
@@ -1845,8 +2724,9 @@ class SeestarGui(QMainWindow):
     def _remove_unavailable_history_task(self, task: Mapping[str, object]) -> None:
         task_key = str(task.get("task_key") or "")
         display_name = str(task.get("display_name") or "未命名任务")
+        parent = self._history_dialog_parent()
         answer = QMessageBox.question(
-            self,
+            parent,
             "从历史中移除",
             f"“{display_name}”的任务目录当前不可用。\n\n"
             "此操作只移除历史索引，不会访问或删除任何文件。是否继续？",
@@ -1858,7 +2738,7 @@ class SeestarGui(QMainWindow):
         try:
             removed = self.history_store.remove_task(task_key)
         except (HistoryStoreError, OSError) as error:
-            QMessageBox.warning(self, "无法移除历史", str(error))
+            QMessageBox.warning(parent, "无法移除历史", str(error))
             return
         if removed:
             task_root = Path(str(task.get("task_directory") or "")).expanduser()
@@ -1869,6 +2749,9 @@ class SeestarGui(QMainWindow):
                 self._refresh_history_view()
 
     def _delete_selected_history_task(self) -> None:
+        if self._selected_history_item_kind() != "task":
+            return
+        parent = self._history_dialog_parent()
         if self._ui_running or (
             self.intake_worker and self.intake_worker.isRunning()
         ) or (
@@ -1877,7 +2760,7 @@ class SeestarGui(QMainWindow):
             self.worker and self.worker.isRunning()
         ):
             QMessageBox.information(
-                self,
+                parent,
                 "处理正在运行",
                 "请等待当前任务结束后再删除历史任务。",
             )
@@ -1894,7 +2777,7 @@ class SeestarGui(QMainWindow):
             workspace = validate_deletable_task_root(task_root)
         except UnsafeTaskDeletionError as error:
             QMessageBox.warning(
-                self,
+                parent,
                 "拒绝删除任务",
                 f"删除目标未通过安全校验：\n{error}",
             )
@@ -1912,7 +2795,7 @@ class SeestarGui(QMainWindow):
                 [item for item in task.get("runs", []) if isinstance(item, dict)]
             )
         task_size = directory_size_bytes(workspace.root)
-        dialog = QMessageBox(self)
+        dialog = QMessageBox(parent)
         dialog.setWindowTitle("将任务移到废纸篓")
         dialog.setIcon(QMessageBox.Icon.Warning)
         dialog.setText(
@@ -1938,7 +2821,7 @@ class SeestarGui(QMainWindow):
             workspace = validate_deletable_task_root(workspace.root)
         except UnsafeTaskDeletionError as error:
             QMessageBox.warning(
-                self,
+                parent,
                 "删除目标已变化",
                 f"确认后目标不再满足安全条件，未执行删除：\n{error}",
             )
@@ -1947,7 +2830,7 @@ class SeestarGui(QMainWindow):
             trash_result = QFile.moveToTrash(str(workspace.root))
         except (OSError, RuntimeError, TypeError) as error:
             QMessageBox.warning(
-                self,
+                parent,
                 "无法移到废纸篓",
                 str(error),
             )
@@ -1958,7 +2841,7 @@ class SeestarGui(QMainWindow):
             moved = bool(trash_result)
         if not moved:
             QMessageBox.warning(
-                self,
+                parent,
                 "无法移到废纸篓",
                 "系统未能移动该任务目录。任务文件和历史索引均未更改。",
             )
@@ -1972,17 +2855,17 @@ class SeestarGui(QMainWindow):
             removed = False
             index_update_failed = True
             QMessageBox.warning(
-                self,
+                parent,
                 "任务已移到废纸篓",
                 "任务目录已成功移动，但历史索引更新失败；"
                 f"该记录会显示为位置不可用。\n\n{error}",
             )
         if not removed and not index_update_failed:
             QMessageBox.warning(
-                self,
+                parent,
                 "任务已移到废纸篓",
                 "任务目录已成功移动，但历史索引中未找到对应记录；"
-                "请重新打开历史页面检查。",
+                "请重新打开历史窗口检查。",
             )
         was_current = self._clear_deleted_task_state(workspace.root)
         if was_current:
@@ -2032,12 +2915,7 @@ class SeestarGui(QMainWindow):
                     data = handle.read()
                     prefix = ""
             decoded = data.decode("utf-8", errors="replace")
-            visible_lines = (
-                line
-                for line in decoded.splitlines(keepends=True)
-                if not _DISABLED_STAGE_DISPLAY_RE.search(line)
-            )
-            return prefix + "".join(visible_lines)
+            return prefix + decoded
         except OSError as error:
             return f"无法读取历史日志：{error}\n"
 
@@ -2052,7 +2930,7 @@ class SeestarGui(QMainWindow):
             candidates.append(Path(indexed).expanduser())
         candidates.extend(
             sorted(
-                run_root.glob("seestar_gui_run_*.log"),
+                run_root.glob("starun_gui_run_*.log"),
                 key=safe_mtime,
                 reverse=True,
             )
@@ -2068,15 +2946,23 @@ class SeestarGui(QMainWindow):
         return None
 
     def _open_history_run(self, task_key: str, run_id: str) -> None:
+        parent = self._history_dialog_parent()
+        if self._history_operations_running():
+            QMessageBox.information(
+                parent,
+                "当前处理正在运行",
+                "可以继续浏览历史记录；请等待当前处理结束后再查看历史运行详情。",
+            )
+            return
         task = self.history_store.find_task(task_key)
         if task is None:
-            QMessageBox.warning(self, "历史记录不可用", "所选任务已不在历史索引中。")
+            QMessageBox.warning(parent, "历史记录不可用", "所选任务已不在历史索引中。")
             self._refresh_history_view()
             return
         task_root = Path(str(task.get("task_directory") or "")).expanduser()
         if not task_root.is_dir() or task_root.is_symlink():
             QMessageBox.warning(
-                self,
+                parent,
                 "任务位置不可用",
                 "任务目录不存在或当前磁盘未挂载。",
             )
@@ -2091,7 +2977,7 @@ class SeestarGui(QMainWindow):
             None,
         )
         if run_record is None:
-            QMessageBox.warning(self, "历史记录不可用", "所选运行记录不存在。")
+            QMessageBox.warning(parent, "历史记录不可用", "所选运行记录不存在。")
             return
         try:
             workspace, _run_manifest, run_root = verify_history_run(
@@ -2100,7 +2986,7 @@ class SeestarGui(QMainWindow):
             )
         except (HistoryStoreError, OSError, TypeError, ValueError) as error:
             QMessageBox.warning(
-                self,
+                parent,
                 "历史运行无法验证",
                 str(error),
             )
@@ -2112,6 +2998,8 @@ class SeestarGui(QMainWindow):
         except HistoryStoreError as error:
             result = None
             result_error = str(error)
+        self._save_history_window_geometry()
+        self.history_window.hide()
         status = str(run_record.get("status") or STATUS_INTERRUPTED)
         self._history_detail_mode = True
         self._active_history_task_key = task_key
@@ -2153,37 +3041,40 @@ class SeestarGui(QMainWindow):
         )
         self.stage_timing_label.setText("历史运行 · 阶段耗时见右侧")
         self.run_phase_label.setText(f"历史记录 · {STATUS_LABELS.get(status, status)}")
+        self.run_task_name_label.setText(
+            str(task.get("display_name") or task_root.name)
+        )
         self.run_directory_label.setText(
-            "历史运行目录\n" + self._display_path(run_root)
+            "运行目录\n" + self._display_path(run_root)
+        )
+        history_input_mode = str(
+            run_record.get("input_mode") or INPUT_MODE_AUTO
         )
         self.run_mode_label.setText(
             "处理方式\n"
-            + self._input_mode_label(str(run_record.get("input_mode") or INPUT_MODE_AUTO))
+            + self._input_mode_label(history_input_mode)
         )
         plan_path = run_root / "processing-plan.json"
         option_lines = ["只读历史记录"]
-        if plan_path.is_file():
+        frozen_parameter_lines = self._processing_payload_summary_lines(
+            _run_manifest.get("processing_parameters"),
+            history_input_mode,
+        )
+        if frozen_parameter_lines:
+            option_lines.extend(frozen_parameter_lines)
+        elif plan_path.is_file():
             option_lines.append("参数快照：processing-plan.json")
         if run_record.get("failure_reason"):
             option_lines.append("说明：" + str(run_record["failure_reason"]))
         if result_error:
             option_lines.append("结果清单：验证失败")
-        self.run_options_label.setText("运行信息\n" + "\n".join(option_lines))
+        self.run_options_label.setText("\n".join(option_lines))
 
         self.preview_canvas.clear_image()
         result_files = (
             verified_result_files(run_root, result)
             if isinstance(result, dict)
             else ()
-        )
-        result_files = tuple(
-            path
-            for path in result_files
-            if not (
-                path.name.lower().startswith("result_processed_ai.")
-                or path.name.lower().startswith("result_final_ai.")
-                or "ai_artistic_derivative" in path.parts
-            )
         )
         self._historical_result_files = result_files
         png_files = [path for path in result_files if path.suffix.lower() == ".png"]
@@ -2215,7 +3106,6 @@ class SeestarGui(QMainWindow):
             self.log_view.setPlainText(detail)
 
         has_results = bool(result_files)
-        self.open_result_btn.setEnabled(has_results)
         self.open_result_action.setEnabled(has_results)
         self.result_preview_btn.setEnabled(
             self._result_preview_path is not None
@@ -2241,12 +3131,13 @@ class SeestarGui(QMainWindow):
                 "这是失败或异常中断的只读历史运行。",
                 show_log=True,
             )
-        self.return_task_btn.setText("返回历史记录")
-        self.rerun_btn.setText("重新处理")
         self._show_workspace(WORKSPACE_RUN)
         self._set_status_message(
             f"历史记录 · {STATUS_LABELS.get(status, status or '未知')}"
         )
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
     def _register_history_run(self, task: PreparedTask) -> None:
         self._history_detail_mode = False
@@ -2267,6 +3158,8 @@ class SeestarGui(QMainWindow):
             return
         self._active_history_task_key = str(record.get("task_key") or "") or None
         self._active_history_run_id = task.run.run_id
+        if self.history_window.isVisible():
+            self._refresh_history_view()
 
     def _update_active_history_run(
         self,
@@ -2294,6 +3187,9 @@ class SeestarGui(QMainWindow):
             )
         except (HistoryStoreError, OSError, TypeError, ValueError) as error:
             self._append_event(f"无法更新历史运行：{error}")
+        else:
+            if self.history_window.isVisible():
+                self._refresh_history_view()
 
     def _terminal_history_status(self, ui_status: str, work_dir: Path | None) -> str:
         if ui_status == "Stopped":
@@ -2335,7 +3231,6 @@ class SeestarGui(QMainWindow):
         )
         task_state = self._workspace_state == WORKSPACE_TASK
         run_state = self._workspace_state == WORKSPACE_RUN
-        history_state = self._workspace_state == WORKSPACE_HISTORY
         terminal = bool(run_state and self._run_terminal_status)
         historical_terminal = bool(terminal and self._history_detail_mode)
         can_rerun = bool(
@@ -2353,33 +3248,129 @@ class SeestarGui(QMainWindow):
 
         self.toolbar_directory_item.setVisible(self._workspace_state != WORKSPACE_RUN)
         self.toolbar_settings_item.setVisible(task_state)
+        self.sidebar_toggle_item.setVisible(run_state)
+        self.inspector_toggle_item.setVisible(run_state)
         self.start_item.setVisible(task_state and not running)
         self.stop_item.setVisible(
             (run_state and running) or (task_state and intake_running)
         )
         self.return_task_item.setVisible(terminal and not running)
         self.rerun_item.setVisible(can_rerun)
-        self.return_task_btn.setText(
-            "返回历史记录" if historical_terminal else "返回任务设置"
-        )
         self.return_task_action.setText(
             "返回历史记录" if historical_terminal else "返回任务设置"
         )
-        self.rerun_btn.setText("重新处理" if historical_terminal else "重新运行")
         self.rerun_action.setText("重新处理" if historical_terminal else "重新运行")
-        self.history_btn.setEnabled(not running and not history_state)
-        self.history_action.setEnabled(not running and not history_state)
+        self.history_action.setEnabled(True)
         if hasattr(self, "history_delete_btn"):
             self._update_history_selection_actions()
 
+        self.task_options_action.setEnabled(task_state and not running)
         self.start_action.setEnabled(task_state and not running)
         self.stop_action.setEnabled(
             (run_state and running) or (task_state and intake_running)
         )
         self.return_task_action.setEnabled(terminal and not running)
         self.rerun_action.setEnabled(can_rerun)
+        self.open_file_action.setEnabled(not running)
         self.choose_directory_action.setEnabled(not running)
-        self.preferences_action.setEnabled(task_state and not running)
+        self.open_recent_menu.menuAction().setEnabled(
+            not running and bool(self._recent_directories)
+        )
+        self.toggle_sidebar_action.setEnabled(run_state)
+        self.toggle_inspector_action.setEnabled(run_state)
+        for action in (
+            self.fit_preview_action,
+            self.actual_preview_action,
+            self.zoom_in_action,
+            self.zoom_out_action,
+        ):
+            action.setEnabled(run_state)
+        self.preferences_action.setEnabled(True)
+
+    def _preferences_snapshot(self) -> dict[str, object]:
+        return {
+            "allow_network": bool(self.network_mode_enabled),
+            "keep_intermediate": bool(self.debug_mode_enabled),
+            "checkpoint_mode": bool(self.checkpoint_mode),
+            "output_formats": tuple(self.output_formats),
+            "review_only": bool(self.review_only),
+            "compute_mode": str(self.compute_mode),
+        }
+
+    def _sync_preferences_window(self) -> None:
+        window = getattr(self, "preferences_window", None)
+        if window is None:
+            return
+        window.set_preferences(self._preferences_snapshot())
+        window.set_editable(
+            not self._ui_running,
+            reason="当前批次配置已冻结；处理结束后可修改应用默认值。",
+        )
+
+    def _apply_app_preferences(self, preferences: object) -> None:
+        if not isinstance(preferences, Mapping):
+            return
+        if self._ui_running:
+            self._sync_preferences_window()
+            return
+
+        formats = tuple(
+            str(value)
+            for value in preferences.get("output_formats", self.output_formats)
+            if str(value) in VALID_OUTPUT_FORMATS
+        )
+        compute_mode = str(preferences.get("compute_mode", self.compute_mode))
+        if compute_mode not in VALID_COMPUTE_MODES:
+            compute_mode = str(DEFAULT_PROCESSING_SETTINGS["compute_mode"])
+
+        self.network_mode_enabled = bool(
+            preferences.get("allow_network", self.network_mode_enabled)
+        )
+        self.debug_mode_enabled = bool(
+            preferences.get("keep_intermediate", self.debug_mode_enabled)
+        )
+        self.checkpoint_mode = bool(
+            preferences.get("checkpoint_mode", self.checkpoint_mode)
+        )
+        self.output_formats = formats or tuple(
+            DEFAULT_PROCESSING_SETTINGS["output_formats"]
+        )
+        self.review_only = bool(
+            preferences.get("review_only", self.review_only)
+        )
+        self.compute_mode = compute_mode
+
+        payload = self._processing_settings_snapshot()
+        StarunGui._apply_processing_payload_state(self, payload)
+        self._sync_processing_controls_from_state()
+        self._update_debug_button_text()
+        self._update_network_button_text()
+        self._save_settings()
+        self._sync_preferences_window()
+
+    def _save_preferences_pane(self, index: int) -> None:
+        self.settings.setValue("ui/preferencesPane", max(0, int(index)))
+        self.settings.sync()
+
+    def _show_preferences(self) -> None:
+        window = getattr(self, "preferences_window", None)
+        if window is None:
+            try:
+                from .preferences_window import PreferencesWindow
+            except ImportError:  # Support direct execution from the gui directory.
+                from preferences_window import PreferencesWindow  # type: ignore[no-redef]
+
+            try:
+                initial_pane = int(self.settings.value("ui/preferencesPane", 0))
+            except (TypeError, ValueError):
+                initial_pane = 0
+            window = PreferencesWindow(self, initial_pane=initial_pane)
+            window.preferencesChanged.connect(self._apply_app_preferences)
+            window.paneChanged.connect(self._save_preferences_pane)
+            self.preferences_window = window
+
+        self._sync_preferences_window()
+        window.show_and_activate(reference=self)
 
     def _show_advanced_settings(self) -> None:
         if self._workspace_state != WORKSPACE_TASK:
@@ -2395,9 +3386,35 @@ class SeestarGui(QMainWindow):
         ):
             return
         if self._history_detail_mode:
+            target = self._history_return_state
+            directory_text = self.dir_edit.text().strip()
+            work_dir = Path(directory_text).expanduser() if directory_text else None
+            if target == WORKSPACE_RUN:
+                target = WORKSPACE_TASK if work_dir is not None else WORKSPACE_EMPTY
+            if target == WORKSPACE_TASK and (
+                work_dir is None or not work_dir.exists()
+            ):
+                target = WORKSPACE_EMPTY
+            if target not in {WORKSPACE_EMPTY, WORKSPACE_TASK}:
+                target = WORKSPACE_EMPTY
+
+            self._history_detail_mode = False
             self._historical_run_root = None
             self._historical_result_files = ()
+            self._active_history_task_key = None
+            self._active_history_run_id = None
+            self._run_terminal_status = None
+            self._last_task_root = self._history_return_task_root
             self.run_log_path = None
+            self.warning_card.hide()
+            self._show_workspace(target)
+            if self._history_return_status.startswith("状态："):
+                self._set_status_message(
+                    self._history_return_status.removeprefix("状态：")
+                )
+            else:
+                self._set_status_text("Idle")
+            self._set_running(False)
             self._show_history()
             return
         self._run_terminal_status = None
@@ -2435,6 +3452,42 @@ class SeestarGui(QMainWindow):
                     f"任务目录不可用或身份验证失败：\n{error}",
                 )
                 return
+            historical_processing_parameters = None
+            historical_manifest_error = None
+            historical_run_root = self._historical_run_root
+            if historical_run_root is not None:
+                try:
+                    frozen_run = pipeline_run_manifest.load_json(
+                        historical_run_root / "run-manifest.json"
+                    )
+                    if not isinstance(frozen_run, Mapping):
+                        raise ValueError("运行清单缺失或格式无效")
+                    if frozen_run.get("schema") != "starun.task-run.v1":
+                        raise ValueError("运行清单 schema 不受支持")
+                    claimed_hash = str(frozen_run.get("manifest_hash") or "")
+                    unsigned = dict(frozen_run)
+                    unsigned.pop("manifest_hash", None)
+                    if not claimed_hash or claimed_hash != (
+                        pipeline_run_manifest.canonical_payload_hash(unsigned)
+                    ):
+                        raise ValueError("运行清单验签失败")
+                    raw_parameters = frozen_run.get("processing_parameters")
+                    if raw_parameters is not None:
+                        if not isinstance(raw_parameters, Mapping):
+                            raise ValueError("冻结处理参数格式无效")
+                        historical_processing_parameters, _adjustments = (
+                            normalize_processing_parameters(raw_parameters)
+                        )
+                except (OSError, TypeError, ValueError) as error:
+                    historical_manifest_error = str(error)
+            if historical_manifest_error:
+                QMessageBox.warning(
+                    self,
+                    "无法重新处理",
+                    "上次运行的签名参数清单无法验证，未使用当前设置替代：\n"
+                    f"{historical_manifest_error}",
+                )
+                return
             self._history_detail_mode = False
             self._historical_run_root = None
             self._historical_result_files = ()
@@ -2442,7 +3495,12 @@ class SeestarGui(QMainWindow):
             self._active_history_run_id = None
             self._run_terminal_status = None
             self.run_log_path = None
+            self.history_window.hide()
             self._apply_input_path(task_root, remember=True)
+            if historical_processing_parameters is not None:
+                self._restore_processing_settings(
+                    historical_processing_parameters
+                )
             self._show_workspace(WORKSPACE_TASK)
             self._analyze_selected_directory()
             self._set_status_text("Idle")
@@ -2460,17 +3518,17 @@ class SeestarGui(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        work_dir = Path(str(snapshot.get("work_dir") or "")).expanduser()
-        if not work_dir.is_dir():
-            QMessageBox.warning(self, "无法重新运行", "上一次工作目录已不可用。")
+        source_path = Path(str(snapshot.get("work_dir") or "")).expanduser()
+        if not source_path.exists():
+            QMessageBox.warning(self, "无法重新运行", "上一次输入路径已不可用。")
             return
         self.debug_mode_enabled = bool(snapshot.get("debug_mode_enabled", False))
-        self.network_mode_enabled = bool(snapshot.get("network_mode_enabled", False))
+        self.network_mode_enabled = bool(snapshot.get("network_mode_enabled", True))
         self._restore_processing_settings(snapshot.get("processing_settings"))
         self._update_debug_button_text()
         self._update_network_button_text()
-        self.dir_edit.setText(str(work_dir))
-        self._start_run(input_mode_override=str(snapshot.get("input_mode") or INPUT_MODE_AUTO))
+        self.dir_edit.setText(str(source_path))
+        self._start_run()
 
     def _request_stop_run(self) -> None:
         if not (
@@ -2491,8 +3549,15 @@ class SeestarGui(QMainWindow):
             self._stop_run()
 
     def _update_run_summary(self, work_dir: Path, input_mode: str) -> None:
+        selected_input = self.dir_edit.text().strip()
+        selected_name = (
+            Path(selected_input).expanduser().name
+            if selected_input
+            else work_dir.name
+        )
+        self.run_task_name_label.setText(selected_name or work_dir.name)
         self.run_directory_label.setText(
-            "工作目录\n" + self._display_path(work_dir)
+            "任务目录\n" + self._display_path(work_dir)
         )
         self.run_mode_label.setText(
             "处理方式\n" + self._input_mode_label(input_mode)
@@ -2502,20 +3567,117 @@ class SeestarGui(QMainWindow):
             f"允许联网：{'开启' if self.network_mode_enabled else '关闭'}",
             *self._processing_settings_summary_lines(input_mode),
         ]
-        self.run_options_label.setText("高级设置\n" + "\n".join(options))
+        self.run_options_label.setText("\n".join(options))
+
+    def _set_run_sidebar_visible(self, visible: bool) -> None:
+        sidebar = getattr(self, "run_sidebar", None)
+        splitter = getattr(self, "run_splitter", None)
+        if sidebar is None or splitter is None:
+            return
+        sizes = splitter.sizes()
+        if (
+            not self._restoring_settings
+            and not visible
+            and len(sizes) == 3
+            and sizes[0] > 0
+        ):
+            self._run_sidebar_width = sizes[0]
+        sidebar.setVisible(visible)
+        if visible:
+            restored = splitter.sizes()
+            if len(restored) == 3 and restored[0] < sidebar.minimumWidth():
+                restored[0] = self._run_sidebar_width
+                restored[1] = max(360, restored[1])
+                splitter.setSizes(restored)
+        if not self._restoring_settings:
+            self._save_settings()
+
+    def _on_task_splitter_moved(self, _position: int, _index: int) -> None:
+        sizes = self.task_splitter.sizes()
+        if (
+            self._workspace_state == WORKSPACE_TASK
+            and len(sizes) == 2
+            and all(size > 0 for size in sizes)
+        ):
+            self._task_splitter_sizes = sizes
+
+    def _set_run_inspector_visible(self, visible: bool) -> None:
+        inspector = getattr(self, "run_inspector", None)
+        splitter = getattr(self, "run_splitter", None)
+        if inspector is None or splitter is None:
+            return
+        sizes = splitter.sizes()
+        if (
+            not self._restoring_settings
+            and not visible
+            and len(sizes) == 3
+            and sizes[2] > 0
+        ):
+            self._run_inspector_width = sizes[2]
+        inspector.setVisible(visible)
+        if visible:
+            restored = splitter.sizes()
+            if len(restored) == 3 and restored[2] < inspector.minimumWidth():
+                restored[2] = self._run_inspector_width
+                restored[1] = max(360, restored[1])
+                splitter.setSizes(restored)
+        if not self._restoring_settings:
+            self._save_settings()
+
+    def _on_inspector_tab_changed(self, _index: int) -> None:
+        if not self._restoring_settings:
+            self._save_settings()
 
     def _update_responsive_layout(self) -> None:
         if not hasattr(self, "run_sidebar"):
             return
+        self.run_sidebar.setVisible(self.toggle_sidebar_action.isChecked())
+        self.run_inspector.setVisible(self.toggle_inspector_action.isChecked())
         compact = self.width() < 1100
-        self.run_sidebar.setVisible(
-            self._workspace_state == WORKSPACE_RUN and not compact
-        )
         self.preview_status_label.setVisible(not compact)
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         self._update_responsive_layout()
+        self._schedule_window_geometry_save()
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        if self._first_show_pending:
+            self._first_show_pending = False
+            QTimer.singleShot(0, self._reconcile_main_window_position)
+
+    def _reconcile_main_window_position(self) -> None:
+        if constrain_window_to_visible_screens(self):
+            self._schedule_window_geometry_save()
+
+    def _reconcile_window_positions(self) -> None:
+        """Keep every visible normal window reachable after display changes."""
+
+        changed = constrain_window_to_visible_screens(self)
+        history_window = getattr(self, "history_window", None)
+        if history_window is not None and history_window.isVisible():
+            changed = (
+                constrain_window_to_visible_screens(
+                    history_window,
+                    reference=self,
+                )
+                or changed
+            )
+        preferences_window = getattr(self, "preferences_window", None)
+        if preferences_window is not None and preferences_window.isVisible():
+            changed = (
+                constrain_window_to_visible_screens(
+                    preferences_window,
+                    reference=self,
+                )
+                or changed
+            )
+        if changed:
+            self._schedule_window_geometry_save()
+
+    def _handle_screen_removed(self, _screen) -> None:
+        QTimer.singleShot(0, self._reconcile_window_positions)
 
     def _initial_preview_candidates(
         self,
@@ -2553,14 +3715,6 @@ class SeestarGui(QMainWindow):
             checkpoint_path = discovery.details.get("checkpoint_path")
             if checkpoint_path and Path(str(checkpoint_path)).is_file():
                 return [Path(str(checkpoint_path))], "已验证断点"
-        input_mode = input_mode or self._current_input_mode()
-        if input_mode == INPUT_MODE_LINEAR_RESUME:
-            source = self._linear_resume_input_path(work_dir)
-            return ([source] if source.is_file() else []), "续跑输入"
-        if input_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
-            source = self._stage2_corrected_resume_input_path(work_dir)
-            return ([source] if source.is_file() else []), "续跑输入"
-
         fits = self._fits_in_work_dir(work_dir)
         light_files = sorted(
             (path for path in fits if path.name.lower().startswith("light_")),
@@ -2694,11 +3848,51 @@ class SeestarGui(QMainWindow):
         return True
 
     def _configure_focus_order(self) -> None:
+        if hasattr(self, "_stage_parameter_controls"):
+            stage_widgets: list[QWidget] = []
+            for stage in STAGE_TITLES:
+                stage_widgets.append(self._stage_parameter_headers[stage])
+                for spec in SPECS_BY_STAGE[stage]:
+                    if not spec.stage_mode:
+                        stage_widgets.append(
+                            self._stage_parameter_auto_checks[spec.field]
+                        )
+                    stage_widgets.append(
+                        self._stage_parameter_controls[spec.field]
+                    )
+            focus_chain = (
+                self.dir_edit,
+                self.browse_btn,
+                self.browse_dir_btn,
+                self.recent_combo,
+                self.advanced_toggle_btn,
+                self.processing_params_btn,
+                *self.output_format_checks.values(),
+                self.review_combo,
+                self.compute_combo,
+                self.processing_expert_btn,
+                *stage_widgets,
+                self.processing_defaults_btn,
+                self.debug_btn,
+                self.network_btn,
+                self.start_btn,
+                self.stop_btn,
+                self.quality_report_btn,
+                self.result_preview_btn,
+                self.open_result_btn,
+                self.log_toggle_btn,
+                self.open_log_btn,
+                self.clear_view_btn,
+                self.log_view,
+            )
+            for current, following in zip(focus_chain, focus_chain[1:]):
+                QWidget.setTabOrder(current, following)
+            return
         focus_chain = (
             self.dir_edit,
             self.browse_btn,
+            self.browse_dir_btn,
             self.recent_combo,
-            self.mode_combo,
             self.advanced_toggle_btn,
             self.processing_params_btn,
             *self.output_format_checks.values(),
@@ -3033,6 +4227,12 @@ class SeestarGui(QMainWindow):
         self.debug_btn.setEnabled(not running)
         self.network_btn.setEnabled(not running)
         self._update_toolbar_state()
+        history_window = getattr(self, "history_window", None)
+        if history_window is not None and history_window.isVisible():
+            self._refresh_history_view()
+        sync_preferences = getattr(self, "_sync_preferences_window", None)
+        if callable(sync_preferences):
+            sync_preferences()
 
     def _input_mode_label(self, mode: str) -> str:
         if mode == INPUT_MODE_STAGE1_PREPARED_RESUME:
@@ -3066,15 +4266,6 @@ class SeestarGui(QMainWindow):
             return str(value)
         return INPUT_MODE_AUTO
 
-    def _linear_resume_input_path(self, work_dir: Path) -> Path:
-        return work_dir / LINEAR_RESUME_INPUT_NAME
-
-    def _stage2_corrected_resume_input_path(self, work_dir: Path) -> Path:
-        root_candidate = work_dir / STAGE2_CORRECTED_INPUT_NAME
-        if root_candidate.is_file():
-            return root_candidate
-        return work_dir / "process" / STAGE2_CORRECTED_INPUT_NAME
-
     def _on_input_mode_changed(self, _index: int) -> None:
         self.input_mode = self._current_input_mode()
         self._update_processing_sheet_availability()
@@ -3099,134 +4290,154 @@ class SeestarGui(QMainWindow):
             widget.setToolTip(text)
             widget.setAccessibleDescription(text)
 
+    def _apply_processing_payload_state(self, payload: Mapping[str, object]) -> None:
+        normalized, _adjustments = normalize_processing_parameters(payload)
+        self.processing_parameters = normalized
+        general = normalized["general"]
+        self.output_formats = tuple(general["output_formats"])
+        self.review_only = bool(general["review_only"])
+        self.compute_mode = str(general["compute_mode"])
+        self.auto_tune_enabled = bool(general["auto_tune_enabled"])
+        self.max_retries = int(general["max_retries"])
+        self.retry_delay = float(general["retry_delay"])
+        self.review_bundle_enabled = bool(general["review_bundle_enabled"])
+        self.managed_output_enabled = bool(general["managed_output_enabled"])
+        self.checkpoint_mode = bool(general["checkpoint_mode"])
+
+        def effective(field: str):
+            return effective_parameter_value(normalized, field)
+
+        self.color_calibration = "pcc"
+        self.filter_hint = str(effective("stage4_filter_hint"))
+        denoise_entry = normalized["stages"]["5"]["overrides"]
+        self.denoise_mode = (
+            "on" if denoise_entry.get("denoise_enabled") is True
+            else "off" if denoise_entry.get("denoise_enabled") is False
+            else "auto"
+        )
+        deconv_mode = str(
+            denoise_entry.get("stage5_deconvolution_mode", "auto")
+        )
+        self.deconvolution_mode = (
+            "rl" if deconv_mode == "rl" else "off" if deconv_mode == "off" else "auto"
+        )
+        self.graxpert_model_path = str(effective("graxpert_object_model_path"))
+        self.pcc_timeout_sec = int(effective("stage4_pcc_timeout_sec"))
+        self.local_wb_gain_limit = float(
+            effective("stage4_local_star_wb_gain_limit")
+        )
+        self.builtin_denoise_strength = float(effective("denoise_mod"))
+        self.graxpert_deconv_strength = float(
+            effective("stage5_graxpert_deconv_strength")
+        )
+        self.rl_iterations = int(effective("stage5_rl_iters"))
+        self.rl_maxstars = int(effective("stage5_rl_maxstars"))
+        self.starless_retry_max = int(effective("stage7_quality_retry_max"))
+        self.starless_repair_strength = float(
+            effective("stage7_starless_repair_strength")
+        )
+        self.starless_halo_repair_strength = float(
+            effective("stage7_starless_halo_repair_strength")
+        )
+        self.starless_chroma_strength = float(
+            effective("stage7_starless_chroma_denoise_strength")
+        )
+        self.starmask_asinh_stretch = float(
+            effective("stage9_starmask_asinh_stretch")
+        )
+        self.weak_star_recovery_ratio = float(
+            effective("stage9_weak_star_recovery_ratio_min")
+        )
+
     def _processing_settings_snapshot(self) -> dict[str, object]:
-        return {
+        payload = getattr(self, "processing_parameters", None)
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("schema")
+            not in SUPPORTED_PROCESSING_PARAMETERS_SCHEMAS
+        ):
+            payload = default_processing_parameters()
+        candidate = dict(payload)
+        candidate["general"] = {
             "output_formats": list(self.output_formats),
-            "review_only": self.review_only,
-            "color_calibration": self.color_calibration,
-            "filter_hint": self.filter_hint,
-            "denoise_mode": self.denoise_mode,
-            "deconvolution_mode": self.deconvolution_mode,
-            "graxpert_model_path": self.graxpert_model_path,
-            "compute_mode": self.compute_mode,
-            "pcc_timeout_sec": self.pcc_timeout_sec,
-            "local_wb_gain_limit": self.local_wb_gain_limit,
-            "builtin_denoise_strength": self.builtin_denoise_strength,
-            "graxpert_deconv_strength": self.graxpert_deconv_strength,
-            "rl_iterations": self.rl_iterations,
-            "rl_maxstars": self.rl_maxstars,
-            "starless_retry_max": self.starless_retry_max,
-            "starless_repair_strength": self.starless_repair_strength,
-            "starless_halo_repair_strength": self.starless_halo_repair_strength,
-            "starless_chroma_strength": self.starless_chroma_strength,
-            "starmask_asinh_stretch": self.starmask_asinh_stretch,
-            "weak_star_recovery_ratio": self.weak_star_recovery_ratio,
+            "review_only": bool(self.review_only),
+            "compute_mode": str(self.compute_mode),
+            "auto_tune_enabled": bool(self.auto_tune_enabled),
+            "max_retries": int(self.max_retries),
+            "retry_delay": float(self.retry_delay),
+            "review_bundle_enabled": bool(self.review_bundle_enabled),
+            "managed_output_enabled": bool(self.managed_output_enabled),
+            "checkpoint_mode": bool(self.checkpoint_mode),
         }
+        normalized, _adjustments = normalize_processing_parameters(candidate)
+        self.processing_parameters = normalized
+        return json.loads(json.dumps(normalized, ensure_ascii=False))
 
     def _restore_processing_settings(self, snapshot: object) -> None:
-        values = snapshot if isinstance(snapshot, dict) else {}
-        formats = tuple(
-            str(value)
-            for value in values.get(
-                "output_formats", DEFAULT_PROCESSING_SETTINGS["output_formats"]
-            )
-            if str(value) in VALID_OUTPUT_FORMATS
+        payload = (
+            snapshot
+            if isinstance(snapshot, Mapping)
+            else default_processing_parameters()
         )
-        self.output_formats = formats or tuple(
-            DEFAULT_PROCESSING_SETTINGS["output_formats"]
-        )
-        self.review_only = bool(
-            values.get("review_only", DEFAULT_PROCESSING_SETTINGS["review_only"])
-        )
-
-        def valid_value(key: str, allowed: frozenset[str]) -> str:
-            value = str(values.get(key, DEFAULT_PROCESSING_SETTINGS[key]))
-            return value if value in allowed else str(DEFAULT_PROCESSING_SETTINGS[key])
-
-        self.color_calibration = valid_value(
-            "color_calibration", VALID_COLOR_CALIBRATION_MODES
-        )
-        self.filter_hint = valid_value("filter_hint", VALID_FILTER_HINT_MODES)
-        self.denoise_mode = valid_value("denoise_mode", VALID_DENOISE_MODES)
-        self.deconvolution_mode = valid_value(
-            "deconvolution_mode", VALID_DECONVOLUTION_MODES
-        )
-        self.graxpert_model_path = str(
-            values.get(
-                "graxpert_model_path",
-                DEFAULT_PROCESSING_SETTINGS["graxpert_model_path"],
-            )
-            or ""
-        ).strip()
-        self.compute_mode = valid_value("compute_mode", VALID_COMPUTE_MODES)
-
-        def bounded_value(
-            key: str,
-            lower: float,
-            upper: float,
-            caster,
-        ):
-            try:
-                value = caster(values.get(key, DEFAULT_PROCESSING_SETTINGS[key]))
-            except (TypeError, ValueError):
-                value = caster(DEFAULT_PROCESSING_SETTINGS[key])
-            return max(caster(lower), min(caster(upper), value))
-
-        self.pcc_timeout_sec = bounded_value("pcc_timeout_sec", 5, 180, int)
-        self.local_wb_gain_limit = bounded_value(
-            "local_wb_gain_limit", 1.01, 1.50, float
-        )
-        self.builtin_denoise_strength = bounded_value(
-            "builtin_denoise_strength", 0.20, 0.55, float
-        )
-        self.graxpert_deconv_strength = bounded_value(
-            "graxpert_deconv_strength", 0.20, 0.40, float
-        )
-        self.rl_iterations = bounded_value("rl_iterations", 1, 40, int)
-        self.rl_maxstars = bounded_value("rl_maxstars", 20, 1000, int)
-        self.starless_retry_max = bounded_value("starless_retry_max", 0, 3, int)
-        self.starless_repair_strength = bounded_value(
-            "starless_repair_strength", 0.0, 0.85, float
-        )
-        self.starless_halo_repair_strength = bounded_value(
-            "starless_halo_repair_strength", 0.0, 0.90, float
-        )
-        self.starless_chroma_strength = bounded_value(
-            "starless_chroma_strength", 0.0, 0.90, float
-        )
-        self.starmask_asinh_stretch = bounded_value(
-            "starmask_asinh_stretch", 1.10, 3.00, float
-        )
-        self.weak_star_recovery_ratio = bounded_value(
-            "weak_star_recovery_ratio", 0.40, 0.95, float
-        )
-        self._sync_processing_controls_from_state()
+        normalized, _adjustments = normalize_processing_parameters(payload)
+        StarunGui._apply_processing_payload_state(self, normalized)
+        sync = getattr(self, "_sync_processing_controls_from_state", None)
+        if callable(sync):
+            sync()
+        sync_preferences = getattr(self, "_sync_preferences_window", None)
+        if callable(sync_preferences):
+            sync_preferences()
 
     def _processing_runtime_configuration(
         self,
         input_mode: str,
     ) -> tuple[dict[str, str], set[str]]:
+        payload = getattr(self, "processing_parameters", None)
+        if (
+            isinstance(payload, Mapping)
+            and payload.get("schema")
+            in SUPPORTED_PROCESSING_PARAMETERS_SCHEMAS
+        ):
+            general = payload.get("general", {})
+            formats = tuple(general.get("output_formats", self.output_formats))
+            review_only = bool(
+                general.get("review_only", self.review_only)
+                or gate_profile_requires_review(
+                    str(payload.get("gate_profile") or "default")
+                )
+            )
+            compute_mode = str(general.get("compute_mode", self.compute_mode))
+            accelerated = "0" if compute_mode == "cpu" else "1"
+            return (
+                {
+                    "STARUN_OUTPUT_FORMAT": ",".join(formats),
+                    "STARUN_FORCE_REVIEW_ONLY_OUTPUT": "1" if review_only else "0",
+                    "STARUN_COSMIC_NATIVE_GPU": accelerated,
+                    "STARUN_COSMIC_CLASSIC_GPU": accelerated,
+                    "STARUN_GRAXPERT_GPU": accelerated,
+                },
+                set(),
+            )
         overrides = {
-            "SEESTAR_OUTPUT_FORMAT": ",".join(self.output_formats),
-            "SEESTAR_FORCE_REVIEW_ONLY_OUTPUT": "1" if self.review_only else "0",
-            "SEESTAR_SYQON_GPU": "0" if self.compute_mode == "cpu" else "1",
-            "SEESTAR_COSMIC_NATIVE_GPU": "0" if self.compute_mode == "cpu" else "1",
-            "SEESTAR_COSMIC_CLASSIC_GPU": "0" if self.compute_mode == "cpu" else "1",
-            "SEESTAR_GRAXPERT_GPU": "0" if self.compute_mode == "cpu" else "1",
-            "SEESTAR_STAGE7_QUALITY_RETRY_MAX": str(self.starless_retry_max),
-            "SEESTAR_STAGE7_STARLESS_REPAIR_STRENGTH": (
+            "STARUN_OUTPUT_FORMAT": ",".join(self.output_formats),
+            "STARUN_FORCE_REVIEW_ONLY_OUTPUT": "1" if self.review_only else "0",
+            "STARUN_COSMIC_NATIVE_GPU": "0" if self.compute_mode == "cpu" else "1",
+            "STARUN_COSMIC_CLASSIC_GPU": "0" if self.compute_mode == "cpu" else "1",
+            "STARUN_GRAXPERT_GPU": "0" if self.compute_mode == "cpu" else "1",
+            "STARUN_STAGE7_QUALITY_RETRY_MAX": str(self.starless_retry_max),
+            "STARUN_STAGE7_STARLESS_REPAIR_STRENGTH": (
                 f"{self.starless_repair_strength:.2f}"
             ),
-            "SEESTAR_STAGE7_STARLESS_HALO_REPAIR_STRENGTH": (
+            "STARUN_STAGE7_STARLESS_HALO_REPAIR_STRENGTH": (
                 f"{self.starless_halo_repair_strength:.2f}"
             ),
-            "SEESTAR_STAGE7_STARLESS_CHROMA_DENOISE_STRENGTH": (
+            "STARUN_STAGE7_STARLESS_CHROMA_DENOISE_STRENGTH": (
                 f"{self.starless_chroma_strength:.2f}"
             ),
-            "SEESTAR_STAGE9_STARMASK_ASINH_STRETCH": (
+            "STARUN_STAGE9_STARMASK_ASINH_STRETCH": (
                 f"{self.starmask_asinh_stretch:.2f}"
             ),
-            "SEESTAR_STAGE9_WEAK_STAR_RECOVERY_RATIO_MIN": (
+            "STARUN_STAGE9_WEAK_STAR_RECOVERY_RATIO_MIN": (
                 f"{self.weak_star_recovery_ratio:.2f}"
             ),
         }
@@ -3234,19 +4445,19 @@ class SeestarGui(QMainWindow):
         if input_mode != INPUT_MODE_LINEAR_RESUME:
             overrides.update(
                 {
-                    "SEESTAR_STAGE4_SPCC_TIMEOUT_SEC": str(self.pcc_timeout_sec),
-                    "SEESTAR_STAGE4_PCC_TIMEOUT_SEC": str(self.pcc_timeout_sec),
-                    "SEESTAR_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT": (
+                    "STARUN_STAGE4_SPCC_TIMEOUT_SEC": "300",
+                    "STARUN_STAGE4_PCC_TIMEOUT_SEC": str(self.pcc_timeout_sec),
+                    "STARUN_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT": (
                         f"{self.local_wb_gain_limit:.2f}"
                     ),
-                    "SEESTAR_STAGE5_BUILTIN_DENOISE_MOD": (
+                    "STARUN_DENOISE_MOD": (
                         f"{self.builtin_denoise_strength:.2f}"
                     ),
-                    "SEESTAR_STAGE5_GRAXPERT_DECONV_STRENGTH": (
+                    "STARUN_STAGE5_GRAXPERT_DECONV_STRENGTH": (
                         f"{self.graxpert_deconv_strength:.2f}"
                     ),
-                    "SEESTAR_STAGE5_RL_ITERS": str(self.rl_iterations),
-                    "SEESTAR_STAGE5_RL_MAXSTARS": str(self.rl_maxstars),
+                    "STARUN_STAGE5_RL_ITERS": str(self.rl_iterations),
+                    "STARUN_STAGE5_RL_MAXSTARS": str(self.rl_maxstars),
                 }
             )
             filter_values = {
@@ -3255,12 +4466,12 @@ class SeestarGui(QMainWindow):
                 "seestar_lp": "broadband Seestar LP",
                 "dual_narrowband": "dualband Ha OIII",
             }
-            overrides["SEESTAR_STAGE4_FILTER_HINT"] = filter_values[self.filter_hint]
+            overrides["STARUN_STAGE4_FILTER_HINT"] = filter_values[self.filter_hint]
 
             if self.denoise_mode == "auto":
-                unset_keys.add("SEESTAR_DENOISE_FORCE")
+                unset_keys.add("STARUN_DENOISE_FORCE")
             else:
-                overrides["SEESTAR_DENOISE_FORCE"] = (
+                overrides["STARUN_DENOISE_FORCE"] = (
                     "1" if self.denoise_mode == "on" else "0"
                 )
 
@@ -3272,20 +4483,100 @@ class SeestarGui(QMainWindow):
             deconv_enabled, graxpert_enabled = deconvolution_values[
                 self.deconvolution_mode
             ]
-            overrides["SEESTAR_STAGE5_DECONV_ENABLE"] = deconv_enabled
-            overrides["SEESTAR_STAGE5_GRAXPERT_DECONV_ENABLE"] = graxpert_enabled
+            overrides["STARUN_STAGE5_DECONV_ENABLE"] = deconv_enabled
+            overrides["STARUN_STAGE5_GRAXPERT_DECONV_ENABLE"] = graxpert_enabled
             if self.graxpert_model_path:
-                overrides["SEESTAR_GRAXPERT_OBJECT_MODEL_PATH"] = (
+                overrides["STARUN_GRAXPERT_OBJECT_MODEL_PATH"] = (
                     self.graxpert_model_path
                 )
             else:
-                unset_keys.add("SEESTAR_GRAXPERT_OBJECT_MODEL_PATH")
+                unset_keys.add("STARUN_GRAXPERT_OBJECT_MODEL_PATH")
         return overrides, unset_keys
 
+    @staticmethod
+    def _processing_payload_summary_lines(
+        payload: object,
+        input_mode: str,
+    ) -> list[str]:
+        if not isinstance(payload, Mapping):
+            return []
+        try:
+            normalized, _adjustments = normalize_processing_parameters(payload)
+        except (TypeError, ValueError):
+            return []
+        general = normalized["general"]
+        gate_profile = str(normalized.get("gate_profile") or "default")
+        forced_review = gate_profile_requires_review(gate_profile)
+        format_labels = {"tif": "TIFF", "png": "PNG", "fit": "FITS"}
+        lines = [
+            "通用：输出 "
+            + "/".join(
+                format_labels[value] for value in general["output_formats"]
+            )
+            + (
+                " · 仅复核（无限模式强制）"
+                if forced_review
+                else " · 仅复核"
+                if general["review_only"]
+                else " · 正式结果"
+            )
+            + (
+                " · CPU 兼容"
+                if general["compute_mode"] == "cpu"
+                else " · 自动加速"
+            )
+        ]
+        lines.append(
+            "可靠性："
+            + ("自动调参" if general["auto_tune_enabled"] else "关闭自动调参")
+            + f" · 重试 {general['max_retries']} 次/{general['retry_delay']:g} 秒"
+            + (" · 生成复核包" if general["review_bundle_enabled"] else " · 不生成复核包")
+            + (" · 受管输出" if general["managed_output_enabled"] else " · 原生输出")
+            + (" · 完成后收敛断点" if general["checkpoint_mode"] else " · 常规保留")
+        )
+        multiplier_labels = {
+            "default": "1×",
+            "relaxed": "3×",
+            "unlimited": "10×",
+        }
+        lines.append(
+            "门禁："
+            f"{GATE_PROFILE_LABELS[gate_profile]}（{multiplier_labels[gate_profile]}）"
+        )
+        disabled = (
+            set(range(1, 6))
+            if input_mode == INPUT_MODE_LINEAR_RESUME
+            else {1, 2} if input_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME
+            else {1} if input_mode == INPUT_MODE_STAGE1_PREPARED_RESUME
+            else set()
+        )
+        for stage in STAGE_TITLES:
+            entry = normalized["stages"][str(stage)]
+            count = len(entry["overrides"]) + int(entry["mode"] != "auto")
+            if stage in disabled:
+                state = "已由恢复点完成"
+            elif count:
+                state = f"{count} 项自定义"
+                if entry["mode"] == "preserve":
+                    state += " · 安全保留"
+            else:
+                state = "自动"
+            lines.append(f"Stage {stage} {STAGE_TITLES[stage]}：{state}")
+        return lines
+
     def _processing_settings_summary_lines(self, input_mode: str) -> list[str]:
+        canonical_lines = self._processing_payload_summary_lines(
+            getattr(self, "processing_parameters", None),
+            input_mode,
+        )
+        if canonical_lines:
+            return canonical_lines
         format_labels = {"tif": "TIFF", "png": "PNG", "fit": "FITS"}
         color_labels = {
-            "pcc": f"SPCC 优先（PCC 异常回退，{self.pcc_timeout_sec} 秒）"
+            "pcc": (
+                "SPCC 优先（300 秒；PCC 异常回退，"
+                f"{self.pcc_timeout_sec} 秒）"
+            )
         }
         filter_labels = {
             "auto": "自动识别",
@@ -3336,503 +4627,850 @@ class SeestarGui(QMainWindow):
     def _build_processing_parameters_panel(self) -> QFrame:
         panel = QFrame()
         panel.setObjectName("processingParametersSheet")
-        panel.setAccessibleName("处理参数设置面板")
+        panel.setAccessibleName("Stage 1 到 Stage 10 处理参数设置面板")
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
 
         header = QHBoxLayout()
         title = QLabel("处理参数")
         title.setObjectName("sectionTitle")
-        self.processing_sheet_note = QLabel()
+        self.processing_sheet_note = QLabel("阶段参数仅用于当前任务；通用配置会保留。")
         self.processing_sheet_note.setWordWrap(True)
         self.processing_sheet_note.setProperty("tone", "muted")
-        self.processing_sheet_note.setContentsMargins(8, 0, 8, 0)
+        self.processing_expert_btn = QPushButton("专家参数")
+        self.processing_expert_btn.setCheckable(True)
+        self.processing_expert_btn.setProperty("variant", "quiet")
+        self.processing_expert_btn.setAccessibleName("显示或隐藏专家处理参数")
+        self.processing_expert_btn.setToolTip(
+            "显示算法细节以及 Stage 1–10 的过程与质量门禁阈值；"
+            "隐藏后已自定义值仍会保留并生效。"
+        )
         self.processing_defaults_btn = QPushButton("恢复安全默认值")
         self.processing_defaults_btn.setProperty("variant", "quiet")
         self.processing_defaults_btn.setAccessibleName("恢复处理参数安全默认值")
-        self.processing_defaults_btn.setToolTip(
-            "恢复 TIFF、PNG、FITS、正式输出、自动校色、自动降噪、"
-            "自动反卷积、自动加速，以及所有专业细节的保守默认值。"
-        )
-        header.addWidget(title)
-        header.addWidget(self.processing_sheet_note, 1)
-        header.addWidget(self.processing_defaults_btn)
         self.processing_done_btn = QPushButton("完成")
         self.processing_done_btn.setProperty("variant", "primary")
         self.processing_done_btn.setAccessibleName("收起处理参数设置")
-        self.processing_done_btn.clicked.connect(
-            self._configure_processing_parameters
-        )
+        header.addWidget(title)
+        header.addWidget(self.processing_sheet_note, 1)
+        header.addWidget(self.processing_expert_btn)
+        header.addWidget(self.processing_defaults_btn)
         header.addWidget(self.processing_done_btn)
         layout.addLayout(header)
 
-        groups = QGridLayout()
-        groups.setContentsMargins(0, 0, 0, 0)
-        groups.setHorizontalSpacing(10)
-        groups.setVerticalSpacing(8)
-        groups.setColumnStretch(0, 2)
-        groups.setColumnStretch(1, 3)
-
-        self.processing_output_group = QGroupBox("输出")
-        output_form = QFormLayout(self.processing_output_group)
-        output_form.setContentsMargins(10, 8, 10, 8)
+        self.processing_general_group = QGroupBox("通用配置")
+        general_form = QFormLayout(self.processing_general_group)
+        general_form.setContentsMargins(10, 8, 10, 8)
         output_row = QWidget()
         output_layout = QHBoxLayout(output_row)
         output_layout.setContentsMargins(0, 0, 0, 0)
-        self.output_format_checks: dict[str, QCheckBox] = {}
-        output_help = (
-            "用途：选择最终交付文件；默认：TIFF、PNG、FITS 全部生成。"
-            "TIFF 适合后续编辑，PNG 适合快速查看，FITS 保留科学数据。"
-            "至少必须选择一种格式；所有处理方式均生效。"
-        )
+        self.output_format_checks = {}
         for key, text in (("tif", "TIFF"), ("png", "PNG"), ("fit", "FITS")):
             checkbox = QCheckBox(text)
             checkbox.setAccessibleName(f"输出 {text}")
-            checkbox.setToolTip(output_help)
-            checkbox.setAccessibleDescription(output_help)
             self.output_format_checks[key] = checkbox
             output_layout.addWidget(checkbox)
         output_layout.addStretch(1)
-        output_label = QLabel("输出文件")
-        self._set_parameter_help(output_label, output_row, output_help)
-        output_form.addRow(output_label, output_row)
-
+        general_form.addRow(QLabel("输出文件"), output_row)
         self.review_combo = QComboBox()
         self.review_combo.addItem("正式结果", False)
         self.review_combo.addItem("仅生成待复核结果", True)
-        review_label = QLabel("输出用途")
-        self._set_parameter_help(
-            review_label,
-            self.review_combo,
-            "用途：决定是否占用正式 result_processed/result_final 文件名；"
-            "默认：正式结果。选择“仅复核”时只写 result_review*，"
-            "适合人工检查且不会覆盖正式结果；所有处理方式均生效。",
-        )
-        output_form.addRow(review_label, self.review_combo)
-        groups.addWidget(self.processing_output_group, 0, 0)
-
-        self.processing_color_group = QGroupBox("色彩校准")
-        color_form = QFormLayout(self.processing_color_group)
-        color_form.setContentsMargins(10, 8, 10, 8)
-        self.color_combo = QComboBox()
-        self.color_combo.addItem("SPCC 优先（PCC 异常回退）", "pcc")
-        color_label = QLabel("校准方式")
-        self._set_parameter_help(
-            color_label,
-            self.color_combo,
-            "用途：Stage 4 对确认线性的宽带与双窄带优先执行一次 Gaia DR3 SPCC 物理校色。"
-            "宽带 SPCC 异常时才执行一次 PCC；双窄带不会用宽带 PCC 代替物理校色。"
-            "超时、失败或质量门拒绝后会回到不可变的线性检查点；"
-            "从线性结果继续时不生效。",
-        )
-        color_form.addRow(color_label, self.color_combo)
-
-        self.filter_combo = QComboBox()
-        self.filter_combo.addItem("自动识别", "auto")
-        self.filter_combo.addItem("无滤镜", "no_filter")
-        self.filter_combo.addItem("Seestar LP", "seestar_lp")
-        self.filter_combo.addItem("双窄带 Ha/OIII", "dual_narrowband")
-        filter_label = QLabel("拍摄滤镜")
-        self._set_parameter_help(
-            filter_label,
-            self.filter_combo,
-            "用途：补充 FITS FILTER 缺失时的通道语义；默认自动识别。"
-            "双窄带使用 Ha/OIII 波长与带宽执行 SPCC 物理校色；HOO 艺术映射单独输出，"
-            "不会作为后续主链输入；"
-            "从线性结果继续时不生效。",
-        )
-        color_form.addRow(filter_label, self.filter_combo)
-
-        catalog_row = QWidget()
-        catalog_layout = QVBoxLayout(catalog_row)
-        catalog_layout.setContentsMargins(0, 0, 0, 0)
-        catalog_layout.setSpacing(3)
-        self.gaia_catalog_download_btn = QPushButton(
-            "下载离线 Gaia 解析/PCC 目录（约 1.1 GB）"
-        )
-        self.gaia_catalog_download_btn.setAccessibleName("下载离线 Gaia 解析和 PCC 目录")
-        self.gaia_catalog_download_btn.setToolTip(
-            "从 Siril 官方 Zenodo 数据集下载并校验；解压后约 1.52 GB，"
-            "只保存到应用 runtime home，不写入项目，也不会打包进应用。"
-        )
-        self.gaia_catalog_status = QLabel()
-        self.gaia_catalog_status.setWordWrap(True)
-        self.gaia_catalog_status.setProperty("tone", "muted")
-        catalog_layout.addWidget(self.gaia_catalog_download_btn)
-        catalog_layout.addWidget(self.gaia_catalog_status)
-        catalog_label = QLabel("离线目录")
-        self._set_parameter_help(
-            catalog_label,
-            catalog_row,
-            "用途：安装包含 Gaia DR3 恒星有效温度的 Siril 小型目录，"
-            "支持离线图像解析与 pcc -catalog=localgaia；它不是约 21 GB 的 SPCC xp_sampled 目录。"
-            "目录不会随项目保存或随 App 打包。",
-        )
-        color_form.addRow(catalog_label, catalog_row)
-        groups.addWidget(self.processing_color_group, 0, 1)
-
-        self.processing_performance_group = QGroupBox("性能兼容")
-        performance_form = QFormLayout(self.processing_performance_group)
-        performance_form.setContentsMargins(10, 8, 10, 8)
+        general_form.addRow(QLabel("输出用途"), self.review_combo)
         self.compute_combo = QComboBox()
         self.compute_combo.addItem("自动加速", "auto")
         self.compute_combo.addItem("CPU 兼容模式", "cpu")
-        compute_label = QLabel("计算设备")
-        self._set_parameter_help(
-            compute_label,
-            self.compute_combo,
-            "用途：控制 GraXpert、SyQon 与 CosmicClarity 是否允许自动使用硬件加速；"
-            "默认：自动加速。遇到模型启动失败、显存/统一内存不足或设备兼容问题时"
-            "可切换 CPU，速度会明显降低；所有包含对应插件的处理方式均生效。",
+        general_form.addRow(QLabel("计算设备"), self.compute_combo)
+        self.auto_tune_check = QCheckBox("启用 Stage 1 分析后的自动调参")
+        self.auto_tune_check.setAccessibleName("启用自动调参")
+        general_form.addRow(QLabel("自动调参"), self.auto_tune_check)
+        self.max_retries_spin = QSpinBox()
+        self.max_retries_spin.setRange(0, 3)
+        self.max_retries_spin.setSuffix(" 次")
+        self.max_retries_spin.setKeyboardTracking(False)
+        general_form.addRow(QLabel("失败重试"), self.max_retries_spin)
+        self.retry_delay_spin = QDoubleSpinBox()
+        self.retry_delay_spin.setRange(0.0, 10.0)
+        self.retry_delay_spin.setDecimals(1)
+        self.retry_delay_spin.setSingleStep(0.5)
+        self.retry_delay_spin.setSuffix(" 秒")
+        self.retry_delay_spin.setKeyboardTracking(False)
+        general_form.addRow(QLabel("重试间隔"), self.retry_delay_spin)
+        self.review_bundle_check = QCheckBox("生成复核包（不关闭质量检测）")
+        self.review_bundle_check.setAccessibleName("生成复核包")
+        general_form.addRow(QLabel("复核资料"), self.review_bundle_check)
+        self.managed_output_check = QCheckBox("生成受管 PNG/TIFF 输出")
+        self.managed_output_check.setAccessibleName("生成受管输出")
+        general_form.addRow(QLabel("受管输出"), self.managed_output_check)
+        self.checkpoint_mode_check = QCheckBox(
+            "完成并验证交付后，仅保留正式断点与轻量诊断"
         )
-        performance_form.addRow(compute_label, self.compute_combo)
-        groups.addWidget(self.processing_performance_group, 1, 0)
+        self.checkpoint_mode_check.setAccessibleName("启用正式断点保留模式")
+        general_form.addRow(QLabel("断点保留"), self.checkpoint_mode_check)
+        layout.addWidget(self.processing_general_group)
 
-        self.processing_linear_group = QGroupBox("线性处理")
-        linear_form = QFormLayout(self.processing_linear_group)
-        linear_form.setContentsMargins(10, 8, 10, 8)
-        self.denoise_combo = QComboBox()
-        self.denoise_combo.addItem("自动", "auto")
-        self.denoise_combo.addItem("强制开启", "on")
-        self.denoise_combo.addItem("强制关闭", "off")
-        denoise_label = QLabel("线性降噪")
-        self._set_parameter_help(
-            denoise_label,
-            self.denoise_combo,
-            "用途：控制 Stage 5 线性降噪；默认：自动，由图像噪声特征决定。"
-            "强制开启可能抹除极弱结构，强制关闭可能保留较多色噪；"
-            "从线性结果继续时不生效。",
-        )
-        linear_form.addRow(denoise_label, self.denoise_combo)
-
-        self.deconv_combo = QComboBox()
-        self.deconv_combo.addItem(
-            "自动：GraXpert 应用模型 → 用户模型 → Siril RL",
-            "auto",
-        )
-        self.deconv_combo.addItem("仅 Siril RL", "rl")
-        self.deconv_combo.addItem("关闭反卷积", "off")
-        deconv_label = QLabel("反卷积")
-        self._set_parameter_help(
-            deconv_label,
-            self.deconv_combo,
-            "用途：控制 Stage 5 细节恢复；默认：自动。自动模式优先 Seestar App 内或"
-            "本机 GraXpert 应用的 Object Deconvolution 模型，其次用户模型，"
-            "最后回退 Siril RL。关闭可避免反卷积引入星环，但会损失部分细节；"
-            "从线性结果继续时不生效。",
-        )
-        linear_form.addRow(deconv_label, self.deconv_combo)
-
-        model_row = QWidget()
-        model_layout = QVBoxLayout(model_row)
-        model_layout.setContentsMargins(0, 0, 0, 0)
-        model_layout.setSpacing(4)
-        self.graxpert_model_edit = QLineEdit()
-        self.graxpert_model_edit.setPlaceholderText(
-            "可选：model.onnx 或版本/模型家族目录"
-        )
-        self.graxpert_model_edit.setAccessibleName(
-            "用户 GraXpert 对象反卷积模型路径"
-        )
-        model_actions = QHBoxLayout()
-        self.graxpert_model_file_btn = QPushButton("选择文件…")
-        self.graxpert_model_dir_btn = QPushButton("选择目录…")
-        model_actions.addWidget(self.graxpert_model_file_btn)
-        model_actions.addWidget(self.graxpert_model_dir_btn)
-        model_actions.addStretch(1)
-        model_layout.addWidget(self.graxpert_model_edit)
-        model_layout.addLayout(model_actions)
-        model_label = QLabel("用户模型")
-        model_help = (
-            "用途：在 App 与本机 GraXpert 均无对象反卷积模型时提供官方 model.onnx；"
-            "默认：空。可选择 model.onnx、语义版本目录或模型家族目录。"
-            "路径无效不会阻断任务，自动模式会回退 Siril RL；从线性结果继续时不生效。"
-        )
-        self._set_parameter_help(model_label, model_row, model_help)
-        for widget in (
-            self.graxpert_model_edit,
-            self.graxpert_model_file_btn,
-            self.graxpert_model_dir_btn,
-        ):
-            widget.setToolTip(model_help)
-            widget.setAccessibleDescription(model_help)
-        linear_form.addRow(model_label, model_row)
-
-        self.graxpert_model_status = QLabel()
-        self.graxpert_model_status.setWordWrap(True)
-        self.graxpert_model_status.setProperty("tone", "muted")
-        linear_form.addRow("", self.graxpert_model_status)
-        groups.addWidget(self.processing_linear_group, 1, 1)
-
-        self.processing_professional_group = QGroupBox("专业细节")
-        self.processing_professional_group.setAccessibleName("专业图像处理参数")
-        self.processing_professional_group.setMinimumHeight(150)
-        professional_grid = QGridLayout(self.processing_professional_group)
-        professional_grid.setContentsMargins(10, 8, 10, 8)
-        professional_grid.setHorizontalSpacing(8)
-        professional_grid.setVerticalSpacing(6)
-        for column in (1, 3, 5):
-            professional_grid.setColumnStretch(column, 1)
-        self.processing_prelinear_professional_widgets: list[QWidget] = []
-
-        def integer_spin(
-            minimum: int,
-            maximum: int,
-            step: int = 1,
-            suffix: str = "",
-        ) -> QSpinBox:
-            control = QSpinBox()
-            control.setRange(minimum, maximum)
-            control.setSingleStep(step)
-            control.setSuffix(suffix)
-            control.setKeyboardTracking(False)
-            control.setMinimumWidth(62)
-            return control
-
-        def decimal_spin(
-            minimum: float,
-            maximum: float,
-            step: float,
-            suffix: str = "",
-        ) -> QDoubleSpinBox:
-            control = QDoubleSpinBox()
-            control.setRange(minimum, maximum)
-            control.setDecimals(2)
-            control.setSingleStep(step)
-            control.setSuffix(suffix)
-            control.setKeyboardTracking(False)
-            control.setMinimumWidth(62)
-            return control
-
-        def add_professional_parameter(
-            row: int,
-            pair_column: int,
-            label_text: str,
-            control: QWidget,
-            help_text: str,
-            *,
-            prelinear: bool = False,
-        ) -> None:
-            label = QLabel(label_text)
-            if hasattr(label, "setBuddy"):
-                label.setBuddy(control)
-            self._set_parameter_help(label, control, help_text)
-            parameter_index = row * 6 + pair_column
-            display_row, display_pair = divmod(parameter_index, 3)
-            professional_grid.addWidget(label, display_row, display_pair * 2)
-            professional_grid.addWidget(
-                control,
-                display_row,
-                display_pair * 2 + 1,
+        self.processing_gate_profile_group = QGroupBox("门禁策略（当前任务）")
+        gate_profile_form = QFormLayout(self.processing_gate_profile_group)
+        gate_profile_form.setContentsMargins(10, 8, 10, 8)
+        self.processing_gate_profile_combo = QComboBox()
+        profile_display_labels = {
+            "default": "默认档位（1×）",
+            "relaxed": "放松模式（3×）",
+            "unlimited": "无限模式（10×，强制复核）",
+        }
+        for _label, profile in GATE_PROFILE_CHOICES:
+            self.processing_gate_profile_combo.addItem(
+                profile_display_labels[profile], profile
             )
-            if prelinear:
-                self.processing_prelinear_professional_widgets.extend(
-                    (label, control)
+        self.processing_gate_profile_combo.setAccessibleName("当前任务门禁档位")
+        self.processing_gate_profile_combo.setToolTip(
+            "统一设置 Stage 2–9 明确登记的数值验收阈值；"
+            "结构性安全检查和算法参数不受影响。"
+        )
+        self.processing_gate_profile_combo.setAccessibleDescription(
+            self.processing_gate_profile_combo.toolTip()
+        )
+        gate_profile_label = QLabel("全任务档位")
+        gate_profile_label.setBuddy(self.processing_gate_profile_combo)
+        gate_profile_label.setToolTip(self.processing_gate_profile_combo.toolTip())
+        gate_profile_form.addRow(
+            gate_profile_label,
+            self.processing_gate_profile_combo,
+        )
+        self.processing_gate_profile_banner = QFrame()
+        self.processing_gate_profile_banner.setObjectName("stateBanner")
+        self.processing_gate_profile_banner.setAccessibleName(
+            "当前任务门禁档位状态"
+        )
+        gate_profile_banner_layout = QVBoxLayout(
+            self.processing_gate_profile_banner
+        )
+        gate_profile_banner_layout.setContentsMargins(8, 6, 8, 6)
+        self.processing_gate_profile_note = QLabel()
+        self.processing_gate_profile_note.setWordWrap(True)
+        self.processing_gate_profile_note.setAccessibleName("当前任务门禁档位说明")
+        gate_profile_banner_layout.addWidget(self.processing_gate_profile_note)
+        gate_profile_form.addRow("", self.processing_gate_profile_banner)
+        layout.addWidget(self.processing_gate_profile_group)
+
+        self._stage_parameter_controls: dict[str, QWidget] = {}
+        self._stage_parameter_auto_checks: dict[str, QCheckBox] = {}
+        self._stage_parameter_effective_labels: dict[str, QLabel] = {}
+        self._stage_parameter_row_widgets: dict[str, tuple[QWidget, QWidget]] = {}
+        self._stage_parameter_sections: dict[int, QWidget] = {}
+        self._stage_parameter_headers: dict[int, QPushButton] = {}
+        self._stage_expert_widgets: dict[int, list[QWidget]] = {
+            stage: [] for stage in STAGE_TITLES
+        }
+        self._stage_expert_section_headers: dict[int, dict[str, QPushButton]] = {
+            stage: {} for stage in STAGE_TITLES
+        }
+        self._stage_expert_section_bodies: dict[int, dict[str, QFrame]] = {
+            stage: {} for stage in STAGE_TITLES
+        }
+        self.processing_stage_groups: dict[int, QWidget] = {}
+
+        for stage, stage_title in STAGE_TITLES.items():
+            stage_header = QPushButton()
+            stage_header.setCheckable(True)
+            stage_header.setProperty("variant", "quiet")
+            stage_header.setAccessibleName(f"展开 Stage {stage} {stage_title} 参数")
+            stage_header.toggled.connect(
+                lambda checked, stage_number=stage: self._toggle_processing_stage(
+                    stage_number, checked
                 )
+            )
+            layout.addWidget(stage_header)
 
-        self.pcc_timeout_spin = integer_spin(5, 180, 5, " 秒")
-        add_professional_parameter(
-            0,
-            0,
-            "SPCC/PCC 超时",
-            self.pcc_timeout_spin,
-            "Stage 4 本地或在线 Gaia SPCC/PCC 独立进程的单次等待上限；"
-            "默认 180 秒，范围 5–180 秒。每种方法超时后不会重试，"
-            "会回滚并继续使用安全回退结果。",
-            prelinear=True,
-        )
+            stage_body = QFrame()
+            stage_body.setObjectName(f"processingStage{stage}")
+            stage_form = QFormLayout(stage_body)
+            stage_form.setContentsMargins(18, 6, 10, 10)
+            stage_form.setHorizontalSpacing(12)
+            stage_form.setVerticalSpacing(6)
 
-        self.local_wb_gain_spin = decimal_spin(1.01, 1.50, 0.01, "×")
-        add_professional_parameter(
-            0,
-            1,
-            "WB 增益",
-            self.local_wb_gain_spin,
-            "Stage 4 局部恒星白平衡的单通道最大增益；默认 1.20×。"
-            "数值越高纠偏越强，但过高可能使星色和局部背景偏色。",
-            prelinear=True,
-        )
+            def add_parameter_row(spec: ParameterSpec, target_form: QFormLayout) -> None:
+                control = self._create_processing_parameter_control(spec)
+                self._stage_parameter_controls[spec.field] = control
+                label = QLabel(spec.label)
+                self._set_parameter_help(
+                    label,
+                    control,
+                    spec.help or f"Stage {stage} · {spec.label}",
+                )
+                if spec.stage_mode:
+                    target_form.addRow(label, control)
+                    control.currentIndexChanged.connect(
+                        lambda _index, stage_number=stage, field=spec.field: (
+                            self._on_stage_processing_mode_changed(
+                                stage_number, field
+                            )
+                        )
+                    )
+                    row_widgets = (label, control)
+                else:
+                    row = QWidget()
+                    row_layout = QHBoxLayout(row)
+                    row_layout.setContentsMargins(0, 0, 0, 0)
+                    follows_gate_profile = spec.profile_scaling != "none"
+                    auto_check = QCheckBox(
+                        "跟随档位" if follows_gate_profile else "自动"
+                    )
+                    auto_check.setAccessibleName(
+                        f"{spec.label}"
+                        + ("跟随全任务门禁档位" if follows_gate_profile else "使用自动值")
+                    )
+                    auto_check.setChecked(True)
+                    self._stage_parameter_auto_checks[spec.field] = auto_check
+                    row_layout.addWidget(auto_check)
+                    row_layout.addWidget(control, 1)
+                    if follows_gate_profile:
+                        effective_label = QLabel()
+                        effective_label.setProperty("tone", "muted")
+                        effective_label.setAccessibleName(
+                            f"{spec.label}当前档位有效值"
+                        )
+                        self._stage_parameter_effective_labels[spec.field] = (
+                            effective_label
+                        )
+                        row_layout.addWidget(effective_label, 1)
+                    target_form.addRow(label, row)
+                    auto_check.toggled.connect(
+                        lambda checked, field=spec.field: self._on_stage_parameter_auto_toggled(
+                            field, checked
+                        )
+                    )
+                    if isinstance(control, QComboBox):
+                        control.currentIndexChanged.connect(
+                            lambda _index, field=spec.field: self._on_stage_parameter_value_changed(
+                                field
+                            )
+                        )
+                    elif isinstance(control, (QSpinBox, QDoubleSpinBox)):
+                        control.valueChanged.connect(
+                            lambda _value, field=spec.field: self._on_stage_parameter_value_changed(
+                                field
+                            )
+                        )
+                    elif isinstance(control, QLineEdit):
+                        control.editingFinished.connect(
+                            lambda field=spec.field: self._on_stage_parameter_value_changed(
+                                field
+                            )
+                        )
+                    row_widgets = (label, row)
+                self._stage_parameter_row_widgets[spec.field] = row_widgets
 
-        self.builtin_denoise_spin = decimal_spin(0.20, 0.55, 0.05)
-        add_professional_parameter(
-            0,
-            2,
-            "线性降噪",
-            self.builtin_denoise_spin,
-            "Stage 5 Siril 线性降噪 mod；默认 0.50，范围 0.20–0.55。"
-            "数值越高降噪越强，也越可能削弱微弱尘埃和小尺度结构。",
-            prelinear=True,
-        )
+            stage_specs = SPECS_BY_STAGE[stage]
+            recommended_specs = sorted(
+                (spec for spec in stage_specs if spec.level != "expert"),
+                key=lambda spec: (not spec.stage_mode,),
+            )
+            for spec in recommended_specs:
+                add_parameter_row(spec, stage_form)
 
-        self.graxpert_strength_spin = decimal_spin(0.20, 0.40, 0.01)
-        add_professional_parameter(
-            0,
-            3,
-            "GraXpert 强度",
-            self.graxpert_strength_spin,
-            "Stage 5 GraXpert Object Deconvolution 强度；默认 0.30。"
-            "增大可强化细节，但也会提高星环、锐化噪声和伪影风险。",
-            prelinear=True,
-        )
+            section_titles = {
+                "execution": "执行策略",
+                "algorithm": "算法参数",
+                "process_gate": "过程门禁",
+                "quality_gate": "质量验收",
+                "fallback": "回退与失败",
+            }
+            for section_key, section_title in section_titles.items():
+                section_specs = tuple(
+                    spec
+                    for spec in stage_specs
+                    if spec.level == "expert" and spec.section == section_key
+                )
+                if not section_specs:
+                    continue
+                section_header = QPushButton(f"▸ {section_title}")
+                section_header.setCheckable(True)
+                section_header.setProperty("variant", "quiet")
+                section_header.setAccessibleName(
+                    f"Stage {stage} {section_title}专家参数"
+                )
+                section_body = QFrame()
+                section_form = QFormLayout(section_body)
+                section_form.setContentsMargins(12, 2, 0, 6)
+                section_form.setHorizontalSpacing(12)
+                section_form.setVerticalSpacing(6)
+                for spec in section_specs:
+                    add_parameter_row(spec, section_form)
+                expanded_by_default = section_key == "execution"
+                section_header.setChecked(expanded_by_default)
+                section_header.setText(
+                    f"{'▾' if expanded_by_default else '▸'} {section_title}"
+                )
+                section_body.setVisible(expanded_by_default)
+                section_header.toggled.connect(
+                    lambda checked, header=section_header, body=section_body,
+                    title_text=section_title: (
+                        header.setText(f"{'▾' if checked else '▸'} {title_text}"),
+                        body.setVisible(
+                            bool(self.processing_expert_visible and checked)
+                        ),
+                    )
+                )
+                stage_form.addRow(section_header)
+                stage_form.addRow(section_body)
+                self._stage_expert_widgets[stage].extend(
+                    (section_header, section_body)
+                )
+                self._stage_expert_section_headers[stage][section_key] = section_header
+                self._stage_expert_section_bodies[stage][section_key] = section_body
 
-        self.rl_iterations_spin = integer_spin(1, 40)
-        add_professional_parameter(
-            0,
-            4,
-            "RL 迭代次数",
-            self.rl_iterations_spin,
-            "GraXpert 不可用或选择 Siril RL 时的反卷积迭代次数；默认 8。"
-            "次数越多恢复越强且耗时越长，过高容易放大噪声并产生星环。",
-            prelinear=True,
-        )
+            if stage == 4:
+                catalog_row = QWidget()
+                catalog_layout = QVBoxLayout(catalog_row)
+                catalog_layout.setContentsMargins(0, 0, 0, 0)
+                self.gaia_catalog_download_btn = QPushButton(
+                    "下载离线 Gaia 解析/PCC 目录（约 1.1 GB）"
+                )
+                self.gaia_catalog_status = QLabel()
+                self.gaia_catalog_status.setWordWrap(True)
+                self.gaia_catalog_status.setProperty("tone", "muted")
+                catalog_layout.addWidget(self.gaia_catalog_download_btn)
+                catalog_layout.addWidget(self.gaia_catalog_status)
+                stage_form.addRow(QLabel("离线目录资源"), catalog_row)
 
-        self.rl_maxstars_spin = integer_spin(20, 1000, 20)
-        add_professional_parameter(
-            0,
-            5,
-            "PSF 星数",
-            self.rl_maxstars_spin,
-            "估算 Siril RL 点扩散函数时最多使用的恒星数；默认 200。"
-            "更多样本通常更稳定但更慢；星场稀疏时无需盲目提高。",
-            prelinear=True,
-        )
+            reset_button = QPushButton("恢复本阶段自动参数")
+            reset_button.setProperty("variant", "quiet")
+            reset_button.clicked.connect(
+                lambda _checked=False, stage_number=stage: self._reset_stage_processing_parameters(
+                    stage_number
+                )
+            )
+            stage_form.addRow("", reset_button)
+            self._stage_parameter_headers[stage] = stage_header
+            self._stage_parameter_sections[stage] = stage_body
+            self.processing_stage_groups[stage] = stage_body
+            layout.addWidget(stage_body)
 
-        self.starless_retry_spin = integer_spin(0, 3)
-        add_professional_parameter(
-            1,
-            0,
-            "去星质量重试",
-            self.starless_retry_spin,
-            "Stage 6 去星质量不达标时追加的同源参数重试次数；默认 2，范围 0–3。"
-            "提高会增加耗时，但不会绕过质量门或启用联网下载。",
-        )
-
-        self.starless_repair_spin = decimal_spin(0.00, 0.85, 0.05)
-        add_professional_parameter(
-            1,
-            1,
-            "残星修复",
-            self.starless_repair_spin,
-            "Stage 7 starless 小尺度残星修复强度；默认 0.68。"
-            "过低可能残留星核，过高可能误伤紧凑目标和细小纹理。",
-        )
-
-        self.starless_halo_spin = decimal_spin(0.00, 0.90, 0.05)
-        add_professional_parameter(
-            1,
-            2,
-            "星晕修复",
-            self.starless_halo_spin,
-            "Stage 7 亮星 halo 平滑修复强度；默认 0.70。"
-            "提高可减轻残余光环，但过高会造成亮星周围背景过度平滑。",
-        )
-
-        self.starless_chroma_spin = decimal_spin(0.00, 0.90, 0.05)
-        add_professional_parameter(
-            1,
-            3,
-            "彩噪修复",
-            self.starless_chroma_spin,
-            "Stage 7 starless 背景彩噪修复强度；默认 0.55。"
-            "过高可能降低暗弱区域的真实色彩差异。",
-        )
-
-        self.starmask_stretch_spin = decimal_spin(1.10, 3.00, 0.10)
-        add_professional_parameter(
-            1,
-            4,
-            "星点拉伸",
-            self.starmask_stretch_spin,
-            "Stage 9 星点蒙版统计不可用时的固定 Asinh 回退强度；默认 2.00。"
-            "提高会提亮弱星，同时增加亮星核饱和和星点膨胀风险。",
-        )
-
-        self.weak_star_recovery_spin = decimal_spin(0.40, 0.95, 0.05)
-        add_professional_parameter(
-            1,
-            5,
-            "弱星门槛",
-            self.weak_star_recovery_spin,
-            "Stage 9 候选相对 Stage 8 必须恢复的弱星比例；默认 0.70。"
-            "数值越高质量门越严格，可能拒绝更多候选并触发保守回退。",
-        )
-
-        groups.addWidget(self.processing_professional_group, 2, 0, 1, 2)
-        layout.addLayout(groups)
-
+        self.processing_color_group = self.processing_stage_groups[4]
+        self.processing_linear_group = self.processing_stage_groups[5]
         self.processing_sheet_status = QLabel(
-            "修改后自动保存；点击“开始处理”时冻结为本次任务配置。"
+            "门禁档位与阶段参数只对当前任务生效；专家覆盖优先。"
         )
-        self.processing_sheet_status.setAccessibleName("处理参数保存状态")
         self.processing_sheet_status.setProperty("tone", "muted")
-        self.processing_sheet_status.setContentsMargins(2, 1, 2, 1)
         layout.addWidget(self.processing_sheet_status)
 
         for key, checkbox in self.output_format_checks.items():
             checkbox.toggled.connect(
                 lambda checked, output_key=key: self._on_output_format_toggled(
-                    output_key,
-                    checked,
+                    output_key, checked
                 )
             )
         self.review_combo.currentIndexChanged.connect(
-            self._on_processing_controls_changed
-        )
-        self.filter_combo.currentIndexChanged.connect(
-            self._on_processing_controls_changed
-        )
-        self.denoise_combo.currentIndexChanged.connect(
-            self._on_processing_controls_changed
+            self._on_general_processing_controls_changed
         )
         self.compute_combo.currentIndexChanged.connect(
-            self._on_processing_controls_changed
+            self._on_general_processing_controls_changed
         )
-        self.color_combo.currentIndexChanged.connect(
-            self._on_processing_selection_changed
+        self.auto_tune_check.toggled.connect(
+            self._on_general_processing_controls_changed
         )
-        self.deconv_combo.currentIndexChanged.connect(
-            self._on_processing_selection_changed
+        self.max_retries_spin.valueChanged.connect(
+            self._on_general_processing_controls_changed
         )
-        self.graxpert_model_edit.textChanged.connect(
-            lambda _text: self._update_graxpert_model_status()
+        self.retry_delay_spin.valueChanged.connect(
+            self._on_general_processing_controls_changed
         )
-        self.graxpert_model_edit.editingFinished.connect(
-            self._on_processing_controls_changed
+        self.review_bundle_check.toggled.connect(
+            self._on_general_processing_controls_changed
         )
-        self.graxpert_model_file_btn.clicked.connect(
-            self._select_graxpert_model_file
+        self.managed_output_check.toggled.connect(
+            self._on_general_processing_controls_changed
         )
-        self.graxpert_model_dir_btn.clicked.connect(
-            self._select_graxpert_model_directory
+        self.checkpoint_mode_check.toggled.connect(
+            self._on_general_processing_controls_changed
+        )
+        self.processing_gate_profile_combo.currentIndexChanged.connect(
+            self._on_gate_profile_changed
+        )
+        self.processing_expert_btn.toggled.connect(
+            self._set_processing_expert_visible
         )
         self.processing_defaults_btn.clicked.connect(
             self._restore_processing_defaults
         )
+        self.processing_done_btn.clicked.connect(
+            self._configure_processing_parameters
+        )
         self.gaia_catalog_download_btn.clicked.connect(
             self._toggle_gaia_catalog_download
         )
-        for control in (
-            self.pcc_timeout_spin,
-            self.local_wb_gain_spin,
-            self.builtin_denoise_spin,
-            self.graxpert_strength_spin,
-            self.rl_iterations_spin,
-            self.rl_maxstars_spin,
-            self.starless_retry_spin,
-            self.starless_repair_spin,
-            self.starless_halo_spin,
-            self.starless_chroma_spin,
-            self.starmask_stretch_spin,
-            self.weak_star_recovery_spin,
-        ):
-            control.valueChanged.connect(self._on_processing_controls_changed)
         self._sync_processing_controls_from_state()
+        self._set_processing_expert_visible(self.processing_expert_visible)
+        self._toggle_processing_stage(2, True)
         self._refresh_gaia_catalog_status()
         return panel
 
+    def _create_processing_parameter_control(self, spec: ParameterSpec) -> QWidget:
+        if spec.kind in {"choice", "bool"}:
+            control = QComboBox()
+            choices = (
+                (("开启", True), ("关闭", False))
+                if spec.kind == "bool"
+                else spec.choices
+            )
+            for label, value in choices:
+                control.addItem(label, value)
+            return control
+        if spec.kind == "int":
+            control = QSpinBox()
+            control.setRange(int(spec.minimum), int(spec.maximum))
+            control.setSingleStep(int(spec.step or 1))
+            control.setSuffix(spec.suffix)
+            control.setKeyboardTracking(False)
+            return control
+        if spec.kind == "float":
+            control = QDoubleSpinBox()
+            control.setRange(float(spec.minimum), float(spec.maximum))
+            control.setDecimals(spec.decimals)
+            control.setSingleStep(float(spec.step or 0.01))
+            control.setSuffix(spec.suffix)
+            control.setKeyboardTracking(False)
+            return control
+        control = QLineEdit()
+        if spec.kind == "path":
+            control.setPlaceholderText("选择或粘贴本地 model.onnx 文件")
+        return control
+
+    @staticmethod
+    def _processing_control_value(control: QWidget, spec: ParameterSpec):
+        if isinstance(control, QComboBox):
+            return control.currentData()
+        if isinstance(control, (QSpinBox, QDoubleSpinBox)):
+            return control.value()
+        if isinstance(control, QLineEdit):
+            return control.text().strip()
+        return spec.default
+
+    @staticmethod
+    def _set_processing_control_value(
+        control: QWidget, spec: ParameterSpec, value: object
+    ) -> None:
+        if isinstance(control, QComboBox):
+            index = control.findData(value)
+            control.setCurrentIndex(index if index >= 0 else 0)
+        elif isinstance(control, (QSpinBox, QDoubleSpinBox)):
+            control.setValue(value)
+        elif isinstance(control, QLineEdit):
+            control.setText(str(value or ""))
+
+    @staticmethod
+    def _format_processing_effective_value(
+        spec: ParameterSpec,
+        value: object,
+    ) -> str:
+        if spec.kind == "int":
+            rendered = str(int(value))
+        else:
+            rendered = f"{float(value):.8g}"
+        return f"有效：{rendered}{spec.suffix}"
+
+    def _on_general_processing_controls_changed(self, _value: object = None) -> None:
+        if self._processing_controls_updating:
+            return
+        formats = tuple(
+            key for key, checkbox in self.output_format_checks.items()
+            if checkbox.isChecked()
+        )
+        if not formats:
+            return
+        self.output_formats = formats
+        profile = str(
+            self.processing_parameters.get("gate_profile", "default")
+        )
+        if not gate_profile_requires_review(profile):
+            self.review_only = bool(self.review_combo.currentData())
+        self.compute_mode = str(self.compute_combo.currentData())
+        self.auto_tune_enabled = bool(self.auto_tune_check.isChecked())
+        self.max_retries = int(self.max_retries_spin.value())
+        self.retry_delay = float(self.retry_delay_spin.value())
+        self.review_bundle_enabled = bool(self.review_bundle_check.isChecked())
+        self.managed_output_enabled = bool(self.managed_output_check.isChecked())
+        self.checkpoint_mode = bool(self.checkpoint_mode_check.isChecked())
+        payload = self._processing_settings_snapshot()
+        StarunGui._apply_processing_payload_state(self, payload)
+        self.processing_sheet_status.setText(
+            "通用配置已保存；阶段配置仍只用于当前任务。"
+        )
+        if not self._restoring_settings and getattr(self, "_settings_loaded", False):
+            self._save_settings()
+        sync_preferences = getattr(self, "_sync_preferences_window", None)
+        if callable(sync_preferences):
+            sync_preferences()
+
+    def _on_gate_profile_changed(self, _index: int) -> None:
+        if self._processing_controls_updating:
+            return
+        profile = str(self.processing_gate_profile_combo.currentData() or "")
+        candidate = dict(self.processing_parameters)
+        candidate["gate_profile"] = profile
+        normalized, _adjustments = normalize_processing_parameters(candidate)
+        StarunGui._apply_processing_payload_state(self, normalized)
+        self._sync_processing_controls_from_state()
+        if profile == GATE_PROFILE_UNLIMITED:
+            self.processing_sheet_status.setText(
+                "无限模式已生效：数值门禁按 10× 放宽，本次输出强制待复核。"
+            )
+        else:
+            self.processing_sheet_status.setText(
+                f"门禁策略已切换为{GATE_PROFILE_LABELS[profile]}；仅本次任务生效。"
+            )
+
+    def _update_gate_profile_controls(self) -> None:
+        if not hasattr(self, "processing_gate_profile_combo"):
+            return
+        profile = str(
+            self.processing_parameters.get("gate_profile", "default")
+        )
+        combo_index = self.processing_gate_profile_combo.findData(profile)
+        self.processing_gate_profile_combo.setCurrentIndex(max(0, combo_index))
+        forced_review = gate_profile_requires_review(profile)
+        if profile == "relaxed":
+            note = (
+                "明确登记的数值验收阈值按放松方向扩大 3×；"
+                "结构性检查、布尔门和算法参数保持静态默认。"
+            )
+            tone = "info"
+        elif forced_review:
+            note = (
+                "无限模式：数值验收阈值按放松方向扩大 10×；"
+                "结构性检查仍生效，本次输出强制待复核。"
+            )
+            tone = "warning"
+        else:
+            note = (
+                "使用代码中的静态门禁默认值；专家逐项配置仍可覆盖。"
+            )
+            tone = "info"
+        self.processing_gate_profile_note.setText(note)
+        set_style_property(self.processing_gate_profile_banner, "tone", tone)
+        self.review_combo.setCurrentIndex(
+            max(
+                0,
+                self.review_combo.findData(
+                    True if forced_review else self.review_only
+                ),
+            )
+        )
+        self.review_combo.setEnabled(not forced_review)
+        self.review_combo.setToolTip(
+            "已由无限模式强制待复核；切回其他档位后恢复原选择。"
+            if forced_review
+            else "设置当前任务输出为正式结果或待复核结果。"
+        )
+        self.review_combo.setAccessibleDescription(self.review_combo.toolTip())
+
+    def _on_stage_processing_mode_changed(self, stage: int, field: str) -> None:
+        if self._processing_controls_updating:
+            return
+        control = self._stage_parameter_controls[field]
+        mode = str(control.currentData())
+        self.processing_parameters["stages"][str(stage)]["mode"] = mode
+        normalized, _adjustments = normalize_processing_parameters(
+            self.processing_parameters
+        )
+        StarunGui._apply_processing_payload_state(self, normalized)
+        refresh_dependencies = getattr(
+            self, "_refresh_processing_parameter_dependencies", None
+        )
+        if callable(refresh_dependencies):
+            refresh_dependencies()
+        self._refresh_processing_stage_headers()
+        self.processing_sheet_status.setText(
+            f"Stage {stage} 已设为{control.currentText()}；仅本次任务生效。"
+        )
+
+    def _on_stage_parameter_auto_toggled(self, field: str, automatic: bool) -> None:
+        if self._processing_controls_updating:
+            return
+        spec = SPECS_BY_FIELD[field]
+        control = self._stage_parameter_controls[field]
+        overrides = self.processing_parameters["stages"][str(spec.stage)]["overrides"]
+        if automatic:
+            overrides.pop(field, None)
+        else:
+            if spec.profile_scaling != "none":
+                profile_value = effective_parameter_value(
+                    self.processing_parameters,
+                    field,
+                )
+                previous_block = control.blockSignals(True)
+                try:
+                    self._set_processing_control_value(
+                        control,
+                        spec,
+                        profile_value,
+                    )
+                finally:
+                    control.blockSignals(previous_block)
+            overrides[field] = self._processing_control_value(control, spec)
+        normalized, _adjustments = normalize_processing_parameters(
+            self.processing_parameters
+        )
+        StarunGui._apply_processing_payload_state(self, normalized)
+        self._sync_stage_parameter_controls()
+        refresh_dependencies = getattr(
+            self, "_refresh_processing_parameter_dependencies", None
+        )
+        if callable(refresh_dependencies):
+            refresh_dependencies()
+        self._refresh_processing_stage_headers()
+        self.processing_sheet_status.setText(
+            f"{spec.label}已切换为"
+            f"{'跟随档位' if automatic and spec.profile_scaling != 'none' else '自动' if automatic else '自定义'}。"
+        )
+
+    def _on_stage_parameter_value_changed(self, field: str) -> None:
+        if self._processing_controls_updating:
+            return
+        auto_check = self._stage_parameter_auto_checks[field]
+        automatic = auto_check.isChecked()
+        if automatic:
+            # Controls remain editable while automatic so that the first user
+            # edit is itself the transition to an explicit task override.
+            auto_check.setChecked(False)
+            return
+        spec = SPECS_BY_FIELD[field]
+        value = self._processing_control_value(
+            self._stage_parameter_controls[field], spec
+        )
+        self.processing_parameters["stages"][str(spec.stage)]["overrides"][field] = value
+        normalized, _adjustments = normalize_processing_parameters(
+            self.processing_parameters
+        )
+        StarunGui._apply_processing_payload_state(self, normalized)
+        self._refresh_processing_parameter_dependencies()
+        self._refresh_processing_stage_headers()
+        self.processing_sheet_status.setText(
+            f"Stage {spec.stage} · {spec.label}已更新；仅本次任务生效。"
+        )
+
+    def _reset_stage_processing_parameters(self, stage: int) -> None:
+        self.processing_parameters = reset_stage_parameters(
+            self.processing_parameters, (stage,)
+        )
+        StarunGui._apply_processing_payload_state(
+            self, self.processing_parameters
+        )
+        self._sync_stage_parameter_controls()
+        self._refresh_processing_parameter_dependencies()
+        self._refresh_processing_stage_headers()
+        profile = str(self.processing_parameters.get("gate_profile") or "default")
+        self.processing_sheet_status.setText(
+            f"Stage {stage} 已清除专家覆盖；门禁重新跟随"
+            f"{GATE_PROFILE_LABELS[profile]}。"
+        )
+
+    def _toggle_processing_stage(self, stage: int, checked: bool) -> None:
+        if not hasattr(self, "_stage_parameter_sections"):
+            return
+        if not checked:
+            header = self._stage_parameter_headers[stage]
+            header.blockSignals(True)
+            header.setChecked(True)
+            header.blockSignals(False)
+            return
+        for other_stage, section in self._stage_parameter_sections.items():
+            active = other_stage == stage
+            section.setVisible(active)
+            header = self._stage_parameter_headers[other_stage]
+            if header.isChecked() != active:
+                header.blockSignals(True)
+                header.setChecked(active)
+                header.blockSignals(False)
+        self._refresh_processing_stage_headers()
+
+    def _set_processing_expert_visible(self, visible: bool) -> None:
+        self.processing_expert_visible = bool(visible)
+        button = getattr(self, "processing_expert_btn", None)
+        if button is not None and button.isChecked() != self.processing_expert_visible:
+            button.blockSignals(True)
+            button.setChecked(self.processing_expert_visible)
+            button.blockSignals(False)
+        expert_section_headers = getattr(
+            self, "_stage_expert_section_headers", {}
+        )
+        for stage, headers in expert_section_headers.items():
+            bodies = self._stage_expert_section_bodies.get(stage, {})
+            for section, header in headers.items():
+                header.setVisible(self.processing_expert_visible)
+                body = bodies.get(section)
+                if body is not None:
+                    body.setVisible(
+                        self.processing_expert_visible and header.isChecked()
+                    )
+        if not expert_section_headers:
+            for rows in getattr(self, "_stage_expert_widgets", {}).values():
+                for widget in rows:
+                    widget.setVisible(self.processing_expert_visible)
+        refresh_dependencies = getattr(
+            self, "_refresh_processing_parameter_dependencies", None
+        )
+        if callable(refresh_dependencies):
+            refresh_dependencies()
+        self._refresh_processing_stage_headers()
+        if not self._restoring_settings and getattr(self, "_settings_loaded", False):
+            self._save_settings()
+
+    def _sync_stage_parameter_controls(self) -> None:
+        if not hasattr(self, "_stage_parameter_controls"):
+            return
+        profile_effective_values = {
+            str(record["field"]): record["effective"]
+            for record in processing_gate_profile_audit(
+                self.processing_parameters
+            )["fields"]
+        }
+        self._processing_controls_updating = True
+        try:
+            for stage, specs in SPECS_BY_STAGE.items():
+                entry = self.processing_parameters["stages"][str(stage)]
+                for spec in specs:
+                    if spec.field not in self._stage_parameter_controls:
+                        continue
+                    control = self._stage_parameter_controls[spec.field]
+                    if spec.stage_mode:
+                        self._set_processing_control_value(
+                            control, spec, entry["mode"]
+                        )
+                        continue
+                    automatic = spec.field not in entry["overrides"]
+                    auto_check = self._stage_parameter_auto_checks[spec.field]
+                    auto_check.setChecked(automatic)
+                    effective_label = self._stage_parameter_effective_labels.get(
+                        spec.field
+                    )
+                    if automatic and spec.profile_scaling != "none":
+                        value = profile_effective_values[spec.field]
+                        if effective_label is not None:
+                            effective_label.setText(
+                                self._format_processing_effective_value(
+                                    spec,
+                                    value,
+                                )
+                            )
+                            effective_label.setToolTip(
+                                "当前全任务门禁档位派生后的运行值；"
+                                "取消“跟随档位”后可在专家范围内自定义。"
+                            )
+                            effective_label.setAccessibleDescription(
+                                effective_label.toolTip()
+                            )
+                            effective_label.setVisible(True)
+                        control.setVisible(False)
+                    else:
+                        value = entry["overrides"].get(spec.field, spec.default)
+                        self._set_processing_control_value(control, spec, value)
+                        control.setVisible(True)
+                        if effective_label is not None:
+                            effective_label.setVisible(False)
+        finally:
+            self._processing_controls_updating = False
+        self._refresh_processing_parameter_dependencies()
+
+    def _refresh_processing_parameter_dependencies(self) -> None:
+        """Disable unavailable controls without discarding frozen overrides."""
+        controls = getattr(self, "_stage_parameter_controls", {})
+        payload = getattr(self, "processing_parameters", {})
+        if not controls or not isinstance(payload, Mapping):
+            return
+
+        def current_value(field: str) -> object:
+            dependency_spec = SPECS_BY_FIELD.get(field)
+            if dependency_spec is None:
+                return None
+            entry = payload["stages"][str(dependency_spec.stage)]
+            if dependency_spec.stage_mode:
+                return entry["mode"]
+            return entry["overrides"].get(field, dependency_spec.default)
+
+        for field, control in controls.items():
+            spec = SPECS_BY_FIELD[field]
+            enabled = all(
+                current_value(dependency_field) in allowed_values
+                for dependency_field, allowed_values in spec.depends_on
+            )
+            control.setEnabled(enabled)
+            effective_label = getattr(
+                self,
+                "_stage_parameter_effective_labels",
+                {},
+            ).get(field)
+            if effective_label is not None:
+                effective_label.setEnabled(enabled)
+            auto_check = self._stage_parameter_auto_checks.get(field)
+            if auto_check is not None:
+                auto_check.setEnabled(enabled)
+            row = self._stage_parameter_row_widgets.get(field)
+            if row is not None:
+                row[0].setEnabled(enabled)
+
+    def _refresh_processing_stage_headers(self) -> None:
+        if not hasattr(self, "_stage_parameter_headers"):
+            return
+        for stage, header in self._stage_parameter_headers.items():
+            entry = self.processing_parameters["stages"][str(stage)]
+            custom_count = len(entry["overrides"]) + int(entry["mode"] != "auto")
+            expert_fields = {
+                spec.field for spec in SPECS_BY_STAGE[stage]
+                if spec.level == "expert"
+            }
+            hidden_expert = bool(
+                expert_fields.intersection(entry["overrides"])
+                and not self.processing_expert_visible
+            )
+            arrow = "▾" if header.isChecked() else "▸"
+            profile = str(
+                self.processing_parameters.get("gate_profile") or "default"
+            )
+            suffix = (
+                f" · {custom_count} 项自定义"
+                if custom_count
+                else f" · 跟随{GATE_PROFILE_LABELS[profile]}"
+                if profile != "default"
+                else " · 自动"
+            )
+            if hidden_expert:
+                suffix += " · 专家配置已生效"
+            header.setText(
+                f"{arrow} Stage {stage} · {STAGE_TITLES[stage]}{suffix}"
+            )
+
     def _sync_processing_controls_from_state(self) -> None:
         if not hasattr(self, "output_format_checks"):
+            return
+        if hasattr(self, "_stage_parameter_controls"):
+            self._processing_controls_updating = True
+            try:
+                for key, checkbox in self.output_format_checks.items():
+                    checkbox.setChecked(key in self.output_formats)
+                self.review_combo.setCurrentIndex(
+                    max(0, self.review_combo.findData(self.review_only))
+                )
+                self.compute_combo.setCurrentIndex(
+                    max(0, self.compute_combo.findData(self.compute_mode))
+                )
+                self.auto_tune_check.setChecked(self.auto_tune_enabled)
+                self.max_retries_spin.setValue(self.max_retries)
+                self.retry_delay_spin.setValue(self.retry_delay)
+                self.review_bundle_check.setChecked(
+                    self.review_bundle_enabled
+                )
+                self.managed_output_check.setChecked(
+                    self.managed_output_enabled
+                )
+                self.checkpoint_mode_check.setChecked(self.checkpoint_mode)
+                self._update_gate_profile_controls()
+            finally:
+                self._processing_controls_updating = False
+            self._sync_stage_parameter_controls()
+            self._refresh_processing_stage_headers()
+            self._update_processing_sheet_availability()
             return
         self._processing_controls_updating = True
         try:
@@ -3871,6 +5509,55 @@ class SeestarGui(QMainWindow):
 
     def _update_processing_sheet_availability(self) -> None:
         if not hasattr(self, "processing_color_group"):
+            return
+        if hasattr(self, "processing_stage_groups"):
+            input_mode = self._current_input_mode()
+            disabled_stages = (
+                set(range(1, 6))
+                if input_mode == INPUT_MODE_LINEAR_RESUME
+                else {1, 2}
+                if input_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME
+                else {1}
+                if input_mode == INPUT_MODE_STAGE1_PREPARED_RESUME
+                else set()
+            )
+            for stage, body in self.processing_stage_groups.items():
+                enabled = stage not in disabled_stages
+                body.setEnabled(enabled)
+                header = self._stage_parameter_headers[stage]
+                header.setEnabled(enabled)
+                if enabled:
+                    header.setToolTip("配置当前任务的阶段参数")
+                else:
+                    header.setToolTip("该阶段已由已验证恢复点完成，本次不会重跑")
+            checked_stage = next(
+                (
+                    stage for stage, header in self._stage_parameter_headers.items()
+                    if header.isChecked()
+                ),
+                2,
+            )
+            if checked_stage in disabled_stages:
+                next_stage = next(
+                    stage for stage in STAGE_TITLES if stage not in disabled_stages
+                )
+                self._toggle_processing_stage(next_stage, True)
+            if input_mode == INPUT_MODE_LINEAR_RESUME:
+                self.processing_sheet_note.setText(
+                    "Stage 5 恢复点已完成 Stage 1–5；本次配置 Stage 6–10。"
+                )
+            elif input_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
+                self.processing_sheet_note.setText(
+                    "Stage 2 恢复点已验证；本次配置 Stage 3–10。"
+                )
+            elif input_mode == INPUT_MODE_STAGE1_PREPARED_RESUME:
+                self.processing_sheet_note.setText(
+                    "Stage 1 恢复点已验证；本次配置 Stage 2–10。"
+                )
+            else:
+                self.processing_sheet_note.setText(
+                    "门禁档位统一作用于当前任务；专家覆盖隐藏后仍保留并生效。"
+                )
             return
         linear_resume = self._current_input_mode() == INPUT_MODE_LINEAR_RESUME
         self.processing_color_group.setEnabled(not linear_resume)
@@ -3982,7 +5669,6 @@ class SeestarGui(QMainWindow):
     def _on_gaia_catalog_download_failed(self, title: str, detail: str) -> None:
         self._cleanup_gaia_catalog_worker()
         self._refresh_gaia_catalog_status()
-        QMessageBox.critical(self, title, detail)
         self._append_event(f"{title}：{detail}")
 
     def _on_gaia_catalog_download_cancelled(self) -> None:
@@ -4023,6 +5709,9 @@ class SeestarGui(QMainWindow):
             finally:
                 checkbox.blockSignals(False)
             self.processing_sheet_status.setText("至少保留一种输出格式。")
+            return
+        if hasattr(self, "_stage_parameter_controls"):
+            self._on_general_processing_controls_changed()
             return
         self._on_processing_controls_changed()
 
@@ -4090,10 +5779,14 @@ class SeestarGui(QMainWindow):
             self._on_processing_controls_changed()
 
     def _restore_processing_defaults(self) -> None:
-        self._restore_processing_settings(DEFAULT_PROCESSING_SETTINGS)
+        self._restore_processing_settings(default_processing_parameters())
         self._save_settings()
-        self.processing_sheet_status.setText("已恢复并保存安全默认值。")
-        self._append_event("处理参数已恢复为安全默认值。")
+        self.processing_sheet_status.setText(
+            "通用配置与默认门禁档位已恢复；Stage 1–10 已全部恢复自动参数。"
+        )
+        self._append_event(
+            "处理参数已恢复为安全默认值；门禁回到默认档位，阶段覆盖已清除。"
+        )
 
     def _set_processing_parameters_expanded(self, expanded: bool) -> None:
         self.processing_parameters_expanded = bool(expanded)
@@ -4152,6 +5845,9 @@ class SeestarGui(QMainWindow):
                 + ("开启" if self.debug_mode_enabled else "关闭")
             )
             self._save_settings()
+        sync_preferences = getattr(self, "_sync_preferences_window", None)
+        if callable(sync_preferences):
+            sync_preferences()
 
     def _update_network_button_text(self) -> None:
         if self.network_btn.isChecked() != self.network_mode_enabled:
@@ -4169,6 +5865,9 @@ class SeestarGui(QMainWindow):
                 "允许联网已" + ("开启" if self.network_mode_enabled else "关闭")
             )
             self._save_settings()
+        sync_preferences = getattr(self, "_sync_preferences_window", None)
+        if callable(sync_preferences):
+            sync_preferences()
 
     def _on_advanced_toggled(self, expanded: bool) -> None:
         self.advanced_panel.setVisible(expanded)
@@ -4197,6 +5896,10 @@ class SeestarGui(QMainWindow):
             self._save_settings()
 
     def _on_log_toggled(self, expanded: bool) -> None:
+        if self.log_toggle_btn.isChecked() != expanded:
+            self.log_toggle_btn.blockSignals(True)
+            self.log_toggle_btn.setChecked(expanded)
+            self.log_toggle_btn.blockSignals(False)
         self.log_container.setVisible(expanded)
         self.log_toggle_btn.setText("详细日志 ▾" if expanded else "详细日志 ▸")
         self.log_toggle_btn.setAccessibleName(
@@ -4208,15 +5911,84 @@ class SeestarGui(QMainWindow):
     def _load_settings(self) -> None:
         self._restoring_settings = True
         try:
-            saved_geometry = self.settings.value("ui/windowGeometry")
-            if saved_geometry:
-                self.restoreGeometry(saved_geometry)
+            saved_geometry = self.settings.value("ui/windowNormalGeometry")
+            self._main_window_geometry_restored = restore_window_geometry(
+                self,
+                saved_geometry,
+                preferred_size=MAIN_WINDOW_DEFAULT_SIZE,
+            )
+            self._restore_main_window_maximized = self.settings.value(
+                "ui/windowMaximized",
+                False,
+                type=bool,
+            )
+
+            history_geometry = self.settings.value(
+                "ui/historyWindowNormalGeometry"
+            )
+            self._history_window_geometry_restored = restore_window_geometry(
+                self.history_window,
+                history_geometry,
+                preferred_size=HISTORY_WINDOW_DEFAULT_SIZE,
+                reference=self,
+            )
+            self._restore_history_window_maximized = self.settings.value(
+                "ui/historyWindowMaximized",
+                False,
+                type=bool,
+            )
+
+            task_splitter_sizes = self._splitter_sizes_setting(
+                self.settings.value("ui/taskSplitterSizes"),
+                2,
+            )
+            if task_splitter_sizes is not None:
+                self._task_splitter_sizes = task_splitter_sizes
+                self.task_splitter.setSizes(self._task_splitter_sizes)
+            try:
+                sidebar_width = int(
+                    self.settings.value(
+                        "ui/runSidebarWidth",
+                        self._run_sidebar_width,
+                    )
+                )
+            except (TypeError, ValueError):
+                sidebar_width = self._run_sidebar_width
+            try:
+                inspector_width = int(
+                    self.settings.value(
+                        "ui/runInspectorWidth",
+                        self._run_inspector_width,
+                    )
+                )
+            except (TypeError, ValueError):
+                inspector_width = self._run_inspector_width
+            self._run_sidebar_width = min(380, max(210, sidebar_width))
+            self._run_inspector_width = min(420, max(260, inspector_width))
+            self.run_splitter.setSizes(
+                [self._run_sidebar_width, 700, self._run_inspector_width]
+            )
+            self.toggle_sidebar_action.setChecked(
+                self.settings.value("ui/runSidebarVisible", True, type=bool)
+            )
+            self.toggle_inspector_action.setChecked(
+                self.settings.value("ui/runInspectorVisible", True, type=bool)
+            )
+            try:
+                inspector_tab = int(
+                    self.settings.value("ui/runInspectorTab", 0)
+                )
+            except (TypeError, ValueError):
+                inspector_tab = 0
+            self.inspector_tabs.setCurrentIndex(
+                min(max(0, inspector_tab), self.inspector_tabs.count() - 1)
+            )
 
             self.debug_mode_enabled = self.settings.value(
                 "advanced/keepIntermediateFiles", False, type=bool
             )
             self.network_mode_enabled = self.settings.value(
-                "advanced/allowNetwork", False, type=bool
+                "advanced/allowNetwork", True, type=bool
             )
             saved_formats = self.settings.value(
                 "processing/outputFormats",
@@ -4228,91 +6000,40 @@ class SeestarGui(QMainWindow):
                     for value in saved_formats.split(",")
                     if value.strip()
                 ]
-            saved_pcc_timeout = self.settings.value(
-                "processing/pccTimeoutSec",
-                DEFAULT_PROCESSING_SETTINGS["pcc_timeout_sec"],
-            )
-            saved_pcc_timeout = _migrate_pcc_timeout_setting(
-                saved_pcc_timeout,
-                self.settings.value("processing/pccTimeoutSettingsVersion", 0),
-            )
-            self.settings.setValue(
-                "processing/pccTimeoutSettingsVersion",
-                PCC_TIMEOUT_SETTINGS_VERSION,
-            )
             self._restore_processing_settings(
-                {
-                    "output_formats": list(saved_formats or []),
-                    "review_only": self.settings.value(
-                        "processing/reviewOnly", False, type=bool
-                    ),
-                    "color_calibration": self.settings.value(
-                        "processing/colorCalibration", "auto"
-                    ),
-                    "filter_hint": self.settings.value(
-                        "processing/filterHint", "auto"
-                    ),
-                    "denoise_mode": self.settings.value(
-                        "processing/denoiseMode", "auto"
-                    ),
-                    "deconvolution_mode": self.settings.value(
-                        "processing/deconvolutionMode", "auto"
-                    ),
-                    "graxpert_model_path": self.settings.value(
-                        "processing/graxpertModelPath", ""
-                    ),
-                    "compute_mode": self.settings.value(
-                        "processing/computeMode", "auto"
-                    ),
-                    "pcc_timeout_sec": saved_pcc_timeout,
-                    "local_wb_gain_limit": self.settings.value(
-                        "processing/localWbGainLimit",
-                        DEFAULT_PROCESSING_SETTINGS["local_wb_gain_limit"],
-                    ),
-                    "builtin_denoise_strength": self.settings.value(
-                        "processing/builtinDenoiseStrength",
-                        DEFAULT_PROCESSING_SETTINGS["builtin_denoise_strength"],
-                    ),
-                    "graxpert_deconv_strength": self.settings.value(
-                        "processing/graxpertDeconvStrength",
-                        DEFAULT_PROCESSING_SETTINGS["graxpert_deconv_strength"],
-                    ),
-                    "rl_iterations": self.settings.value(
-                        "processing/rlIterations",
-                        DEFAULT_PROCESSING_SETTINGS["rl_iterations"],
-                    ),
-                    "rl_maxstars": self.settings.value(
-                        "processing/rlMaxStars",
-                        DEFAULT_PROCESSING_SETTINGS["rl_maxstars"],
-                    ),
-                    "starless_retry_max": self.settings.value(
-                        "processing/starlessRetryMax",
-                        DEFAULT_PROCESSING_SETTINGS["starless_retry_max"],
-                    ),
-                    "starless_repair_strength": self.settings.value(
-                        "processing/starlessRepairStrength",
-                        DEFAULT_PROCESSING_SETTINGS["starless_repair_strength"],
-                    ),
-                    "starless_halo_repair_strength": self.settings.value(
-                        "processing/starlessHaloRepairStrength",
-                        DEFAULT_PROCESSING_SETTINGS[
-                            "starless_halo_repair_strength"
-                        ],
-                    ),
-                    "starless_chroma_strength": self.settings.value(
-                        "processing/starlessChromaStrength",
-                        DEFAULT_PROCESSING_SETTINGS["starless_chroma_strength"],
-                    ),
-                    "starmask_asinh_stretch": self.settings.value(
-                        "processing/starmaskAsinhStretch",
-                        DEFAULT_PROCESSING_SETTINGS["starmask_asinh_stretch"],
-                    ),
-                    "weak_star_recovery_ratio": self.settings.value(
-                        "processing/weakStarRecoveryRatio",
-                        DEFAULT_PROCESSING_SETTINGS["weak_star_recovery_ratio"],
-                    ),
-                }
+                default_processing_parameters(
+                    general={
+                        "output_formats": list(saved_formats or []),
+                        "review_only": self.settings.value(
+                            "processing/reviewOnly", False, type=bool
+                        ),
+                        "compute_mode": self.settings.value(
+                            "processing/computeMode", "auto"
+                        ),
+                        "auto_tune_enabled": self.settings.value(
+                            "processing/autoTuneEnabled", True, type=bool
+                        ),
+                        "max_retries": self.settings.value(
+                            "processing/maxRetries",
+                            DEFAULT_PROCESSING_SETTINGS["max_retries"],
+                        ),
+                        "retry_delay": self.settings.value(
+                            "processing/retryDelay",
+                            DEFAULT_PROCESSING_SETTINGS["retry_delay"],
+                        ),
+                        "review_bundle_enabled": self.settings.value(
+                            "processing/reviewBundleEnabled", True, type=bool
+                        ),
+                        "managed_output_enabled": self.settings.value(
+                            "processing/managedOutputEnabled", True, type=bool
+                        ),
+                        "checkpoint_mode": self.settings.value(
+                            "processing/checkpointMode", False, type=bool
+                        ),
+                    }
+                )
             )
+            self.settings.sync()
             self._update_debug_button_text()
             self._update_network_button_text()
 
@@ -4326,11 +6047,16 @@ class SeestarGui(QMainWindow):
                 "ui/processingParametersExpanded", False, type=bool
             )
             self._set_processing_parameters_expanded(processing_expanded)
+            self._set_processing_expert_visible(
+                self.settings.value(
+                    "ui/processingExpertVisible", False, type=bool
+                )
+            )
 
             log_expanded = self.settings.value(
                 "ui/logExpanded", False, type=bool
             )
-            self.log_toggle_btn.setChecked(log_expanded)
+            self.toggle_log_action.setChecked(log_expanded)
             self._on_log_toggled(log_expanded)
 
             recent_value = self.settings.value("recentDirectories", [])
@@ -4355,13 +6081,63 @@ class SeestarGui(QMainWindow):
             self.input_mode = self._current_input_mode()
         finally:
             self._restoring_settings = False
+        if self._restore_main_window_maximized:
+            self.setWindowState(
+                self.windowState() | Qt.WindowState.WindowMaximized
+            )
+        if self._restore_history_window_maximized:
+            self.history_window.setWindowState(
+                self.history_window.windowState()
+                | Qt.WindowState.WindowMaximized
+            )
         self._analyze_selected_directory()
+
+    def _store_window_geometry_settings(self) -> None:
+        """Persist normal rectangles separately from transient window states."""
+
+        self.settings.setValue(
+            "ui/windowNormalGeometry",
+            normal_window_geometry(self),
+        )
+        main_state = self.windowState()
+        main_maximized = bool(
+            main_state & Qt.WindowState.WindowMaximized
+        ) or bool(
+            self.isFullScreen()
+            and getattr(self, "_window_was_maximized", False)
+        )
+        self.settings.setValue("ui/windowMaximized", main_maximized)
+
+        history_window = getattr(self, "history_window", None)
+        if history_window is not None:
+            self.settings.setValue(
+                "ui/historyWindowNormalGeometry",
+                normal_window_geometry(history_window),
+            )
+            history_state = history_window.windowState()
+            self.settings.setValue(
+                "ui/historyWindowMaximized",
+                bool(history_state & Qt.WindowState.WindowMaximized),
+            )
+
+    def _save_window_geometry_state(self) -> None:
+        if self._restoring_settings or not self._settings_loaded:
+            return
+        self._store_window_geometry_settings()
+        self.settings.sync()
+
+    def _schedule_window_geometry_save(self) -> None:
+        timer = getattr(self, "_window_geometry_save_timer", None)
+        if (
+            timer is not None
+            and self._settings_loaded
+            and not self._restoring_settings
+        ):
+            timer.start()
 
     def _save_settings(self) -> None:
         if self._restoring_settings:
             return
-        self.settings.remove("advanced/aiPostprocess")
-        self.settings.remove("ai")
         self.settings.setValue(
             "advanced/keepIntermediateFiles", self.debug_mode_enabled
         )
@@ -4370,48 +6146,20 @@ class SeestarGui(QMainWindow):
             "processing/outputFormats", list(self.output_formats)
         )
         self.settings.setValue("processing/reviewOnly", self.review_only)
-        self.settings.setValue(
-            "processing/colorCalibration", self.color_calibration
-        )
-        self.settings.setValue("processing/filterHint", self.filter_hint)
-        self.settings.setValue("processing/denoiseMode", self.denoise_mode)
-        self.settings.setValue(
-            "processing/deconvolutionMode", self.deconvolution_mode
-        )
-        self.settings.setValue(
-            "processing/graxpertModelPath", self.graxpert_model_path
-        )
         self.settings.setValue("processing/computeMode", self.compute_mode)
-        self.settings.setValue("processing/pccTimeoutSec", self.pcc_timeout_sec)
         self.settings.setValue(
-            "processing/localWbGainLimit", self.local_wb_gain_limit
+            "processing/autoTuneEnabled", self.auto_tune_enabled
+        )
+        self.settings.setValue("processing/maxRetries", self.max_retries)
+        self.settings.setValue("processing/retryDelay", self.retry_delay)
+        self.settings.setValue(
+            "processing/reviewBundleEnabled", self.review_bundle_enabled
         )
         self.settings.setValue(
-            "processing/builtinDenoiseStrength", self.builtin_denoise_strength
+            "processing/managedOutputEnabled", self.managed_output_enabled
         )
         self.settings.setValue(
-            "processing/graxpertDeconvStrength", self.graxpert_deconv_strength
-        )
-        self.settings.setValue("processing/rlIterations", self.rl_iterations)
-        self.settings.setValue("processing/rlMaxStars", self.rl_maxstars)
-        self.settings.setValue(
-            "processing/starlessRetryMax", self.starless_retry_max
-        )
-        self.settings.setValue(
-            "processing/starlessRepairStrength", self.starless_repair_strength
-        )
-        self.settings.setValue(
-            "processing/starlessHaloRepairStrength",
-            self.starless_halo_repair_strength,
-        )
-        self.settings.setValue(
-            "processing/starlessChromaStrength", self.starless_chroma_strength
-        )
-        self.settings.setValue(
-            "processing/starmaskAsinhStretch", self.starmask_asinh_stretch
-        )
-        self.settings.setValue(
-            "processing/weakStarRecoveryRatio", self.weak_star_recovery_ratio
+            "processing/checkpointMode", self.checkpoint_mode
         )
         self.settings.setValue(
             "ui/advancedExpanded", self.advanced_toggle_btn.isChecked()
@@ -4420,14 +6168,323 @@ class SeestarGui(QMainWindow):
             "ui/processingParametersExpanded",
             self.processing_parameters_expanded,
         )
+        self.settings.setValue(
+            "ui/processingExpertVisible",
+            self.processing_expert_visible,
+        )
+        self.settings.setValue(
+            "ui/taskSplitterSizes",
+            self._task_splitter_sizes,
+        )
+        run_sizes = self.run_splitter.sizes()
+        if self._workspace_state == WORKSPACE_RUN and len(run_sizes) == 3:
+            if self.toggle_sidebar_action.isChecked() and run_sizes[0] > 0:
+                self._run_sidebar_width = run_sizes[0]
+            if self.toggle_inspector_action.isChecked() and run_sizes[2] > 0:
+                self._run_inspector_width = run_sizes[2]
+        self.settings.setValue("ui/runSidebarWidth", self._run_sidebar_width)
+        self.settings.setValue("ui/runInspectorWidth", self._run_inspector_width)
+        self.settings.setValue(
+            "ui/runSidebarVisible",
+            self.toggle_sidebar_action.isChecked(),
+        )
+        self.settings.setValue(
+            "ui/runInspectorVisible",
+            self.toggle_inspector_action.isChecked(),
+        )
+        self.settings.setValue(
+            "ui/runInspectorTab",
+            self.inspector_tabs.currentIndex(),
+        )
         self.settings.setValue("ui/logExpanded", self.log_toggle_btn.isChecked())
-        self.settings.setValue("ui/windowGeometry", self.saveGeometry())
+        self._store_window_geometry_settings()
         self.settings.setValue("modeSelection", UI_MODE_RECOMMENDED)
         self.settings.setValue("recentDirectories", self._recent_directories)
         directory = self.dir_edit.text().strip()
         if directory and Path(directory).expanduser().exists():
             self.settings.setValue("lastDirectory", str(Path(directory).expanduser()))
         self.settings.sync()
+
+    def _close_run_log(self) -> None:
+        with self._run_log_lock:
+            if self.run_log_file:
+                self.run_log_file.close()
+                self.run_log_file = None
+
+    def _update_run_state(
+        self,
+        *,
+        phase: str,
+        status: str,
+        detail: str | None = None,
+        errors: list[str] | tuple[str, ...] | None = None,
+        extra: Mapping[str, object] | None = None,
+        strict: bool = False,
+    ) -> None:
+        state_path = getattr(self, "run_state_path", None)
+        if state_path is None:
+            return
+        failure: Exception | None = None
+        try:
+            with self._run_state_lock:
+                payload = dict(getattr(self, "_run_state_payload", {}) or {})
+                payload.update(
+                    {
+                        "schema": RUN_STATE_SCHEMA,
+                        "phase": str(phase),
+                        "status": str(status),
+                        "updated_at": runtime_utc_now(),
+                    }
+                )
+                if detail is not None:
+                    payload["detail"] = str(detail)
+                if errors is not None:
+                    payload["errors"] = [str(error) for error in errors]
+                if extra:
+                    payload.update({str(key): value for key, value in extra.items()})
+                atomic_write_runtime_json(state_path, payload)
+                self._run_state_payload = payload
+        except (OSError, TypeError, ValueError) as error:
+            failure = error
+        if failure is not None:
+            if strict:
+                raise failure
+            self._append_text(f"[{self._timestamp()}] 无法更新本轮状态文件：{failure}\n")
+
+    def _begin_run_diagnostics(
+        self,
+        work_dir: Path,
+        task: PreparedTask,
+    ) -> None:
+        """Create this run's log and mutable state before any preflight output."""
+
+        if not work_dir.is_dir():
+            raise OSError(f"运行目录不存在，无法创建诊断文件：{work_dir}")
+
+        self._close_run_log()
+        self.run_log_path = None
+        self.run_state_path = None
+        self.runtime_capabilities_path = None
+        self._runtime_capability_manifest = None
+        self._run_state_payload = {}
+
+        safe_run_id = re.sub(r"[^A-Za-z0-9._-]+", "-", task.run.run_id).strip("-")
+        safe_run_id = safe_run_id or datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        log_path = work_dir / f"starun_gui_run_{safe_run_id}.log"
+        try:
+            log_file = log_path.open(
+                "x",
+                encoding="utf-8",
+                errors="replace",
+            )
+        except FileExistsError:
+            log_path = work_dir / (
+                f"starun_gui_run_{safe_run_id}_{time.time_ns()}.log"
+            )
+            log_file = log_path.open(
+                "x",
+                encoding="utf-8",
+                errors="replace",
+            )
+
+        self.run_log_path = log_path
+        self.run_log_file = log_file
+        self.run_state_path = work_dir / RUN_STATE_NAME
+        self.runtime_capabilities_path = work_dir / RUNTIME_CAPABILITIES_NAME
+        created_at = runtime_utc_now()
+        self._run_state_payload = {
+            "schema": RUN_STATE_SCHEMA,
+            "run_id": task.run.run_id,
+            "task_id": task.workspace.task_id,
+            "work_dir": str(work_dir.resolve()),
+            "log_path": str(log_path.resolve()),
+            "runtime_capabilities_path": str(
+                self.runtime_capabilities_path.resolve()
+            ),
+            "resources_root": str(self.resources.resolve()),
+            "runtime_home": str(self.runtime_home.resolve()),
+            "created_at": created_at,
+        }
+        try:
+            self._update_run_state(
+                phase="preflight",
+                status=STATUS_PREPARING,
+                detail="run diagnostics created before preflight",
+                errors=[],
+                strict=True,
+            )
+        except Exception:
+            self._close_run_log()
+            raise
+
+        clear_log = getattr(self.log_view, "clear", None)
+        if callable(clear_log):
+            clear_log()
+        self._append_divider(
+            "本次任务诊断已建立",
+            [
+                f"Run ID: {task.run.run_id}",
+                f"日志文件: {self._display_path(self.run_log_path)}",
+                f"状态文件: {self._display_path(self.run_state_path)}",
+                "资源根目录: " + self._display_path(self.resources),
+                "运行时主目录: " + self._display_path(self.runtime_home),
+            ],
+        )
+
+    def _write_runtime_capability_manifest(self) -> None:
+        path = getattr(self, "runtime_capabilities_path", None)
+        manifest = getattr(self, "_runtime_capability_manifest", None)
+        if path is None or not isinstance(manifest, Mapping):
+            return
+        atomic_write_runtime_json(path, manifest)
+
+    def _inspect_runtime_capabilities(self, work_dir: Path) -> dict[str, object]:
+        task = getattr(self, "_active_prepared_task", None)
+        run_id = task.run.run_id if isinstance(task, PreparedTask) else None
+        resources = Path(
+            getattr(self, "resources", Path(self.config_template).parent)
+        )
+        runtime_home = Path(
+            getattr(self, "runtime_home", work_dir / ".starun-runtime")
+        )
+        try:
+            offline_fallback_mode = str(
+                effective_parameter_value(
+                    self.processing_parameters,
+                    "stage4_offline_fallback_mode",
+                )
+            )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            offline_fallback_mode = "auto_local_reference"
+        try:
+            spcc_online_unverified_timeout_sec = int(
+                effective_parameter_value(
+                    self.processing_parameters,
+                    "stage4_spcc_online_unverified_timeout_sec",
+                )
+            )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            spcc_online_unverified_timeout_sec = 90
+        manifest = build_runtime_capabilities(
+            resources_root=resources,
+            runtime_home=runtime_home,
+            siril_candidates=self._resolve_siril_candidates(),
+            config_template=Path(self.config_template),
+            pipeline_path=Path(self.pipeline_path),
+            siril_plugin_dir=Path(self.siril_plugin_dir),
+            network_enabled=bool(getattr(self, "network_mode_enabled", True)),
+            stage4_offline_fallback_mode=offline_fallback_mode,
+            stage4_spcc_online_unverified_timeout_sec=(
+                spcc_online_unverified_timeout_sec
+            ),
+            run_id=run_id,
+        )
+        self._runtime_capability_manifest = manifest
+        StarunGui._write_runtime_capability_manifest(self)
+        return manifest
+
+    def _complete_runtime_capability_preflight(self, progress) -> None:
+        manifest = getattr(self, "_runtime_capability_manifest", None)
+        if not isinstance(manifest, dict):
+            return
+
+        progress("正在验证 Siril 启动能力…")
+        self._check_bootstrap_cancelled()
+        capabilities = manifest.get("capabilities")
+        capabilities = capabilities if isinstance(capabilities, Mapping) else {}
+        siril = capabilities.get("siril")
+        selected_path = (
+            str(siril.get("selected_path") or "")
+            if isinstance(siril, Mapping)
+            else ""
+        )
+        if selected_path:
+            cli = Path(selected_path)
+            runtime_env = scrub_python_env(os.environ.copy())
+            runtime_env["HOME"] = str(self.runtime_home)
+            runtime_env["LANG"] = "en_US.UTF-8"
+            runtime_env["LC_ALL"] = "en_US.UTF-8"
+            if cli == self.bundled_siril_cli:
+                runtime_env["SIRIL_RELOCATED_RES_DIR"] = str(
+                    self.resources / "Siril.app" / "Contents" / "Resources"
+                )
+            try:
+                completed = self._run_bootstrap_process(
+                    [str(cli), "--version"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=20,
+                    env=runtime_env,
+                )
+                output = "\n".join(
+                    part.strip()
+                    for part in (completed.stdout, completed.stderr)
+                    if part and part.strip()
+                )
+                version = next(
+                    (
+                        line.strip()
+                        for line in reversed(output.splitlines())
+                        if line.strip()
+                    ),
+                    "",
+                )
+                launchable = completed.returncode == 0
+                detail = "" if launchable else (output[-500:] or "unknown error")
+                update_siril_launch_probe(
+                    manifest,
+                    launchable=launchable,
+                    version=version,
+                    detail=detail,
+                )
+            except BootstrapCancelled:
+                raise
+            except Exception as error:
+                update_siril_launch_probe(
+                    manifest,
+                    launchable=False,
+                    detail=str(error),
+                )
+        else:
+            update_siril_launch_probe(
+                manifest,
+                launchable=False,
+                detail="no usable Siril CLI candidate",
+            )
+
+        network_capability = capabilities.get("network_endpoints")
+        network_enabled = bool(
+            isinstance(network_capability, Mapping)
+            and network_capability.get("enabled")
+        )
+        progress(
+            "正在探测 Gaia 网络端点…"
+            if network_enabled
+            else "正在确认离线 Gaia 或自动局部参考路线…"
+        )
+        self._check_bootstrap_cancelled()
+        probe_network_capabilities(
+            manifest,
+            timeout_seconds=4.0,
+            check_cancelled=self._check_bootstrap_cancelled,
+        )
+        self._check_bootstrap_cancelled()
+        self._write_runtime_capability_manifest()
+        for line in capability_summary_lines(manifest):
+            self._append_event(line)
+
+        errors = refresh_blocking_errors(manifest)
+        self._write_runtime_capability_manifest()
+        if self.runtime_capabilities_path is not None:
+            self._pending_runtime_overrides[RUNTIME_CAPABILITIES_ENV] = str(
+                self.runtime_capabilities_path
+            )
+        if errors:
+            raise BootstrapError(
+                "运行能力预检失败",
+                "\n".join(f"- {error}" for error in errors),
+            )
 
     def _append_text(self, text: str) -> None:
         if not text:
@@ -4502,16 +6559,30 @@ class SeestarGui(QMainWindow):
         else:
             self._analyze_selected_directory()
 
-    def _apply_work_directory(self, path: Path, *, remember: bool) -> None:
-        """Compatibility alias for callers and stored directory settings."""
-        self._apply_input_path(path, remember=remember)
-
     def _apply_input_path(self, path: Path, *, remember: bool) -> None:
         expanded = path.expanduser()
         try:
             normalized = expanded.resolve()
         except OSError:
             normalized = expanded
+        previous_path = self._processing_parameter_input_path
+        if (
+            previous_path is not None
+            and previous_path != normalized
+            and isinstance(getattr(self, "processing_parameters", None), Mapping)
+        ):
+            self.processing_parameters = reset_stage_parameters(
+                self.processing_parameters
+            )
+            StarunGui._apply_processing_payload_state(
+                self, self.processing_parameters
+            )
+            self._sync_processing_controls_from_state()
+            if not self._restoring_settings:
+                self._append_event(
+                    "已切换输入；门禁恢复默认档位，Stage 1–10 参数恢复为自动。"
+                )
+        self._processing_parameter_input_path = normalized
         self.dir_edit.setText(str(normalized))
         if not (self.worker or self.bootstrap_worker):
             self._progress_timer.stop()
@@ -4546,38 +6617,53 @@ class SeestarGui(QMainWindow):
         has_recent = bool(self._recent_directories)
         self.recent_label.setVisible(has_recent)
         self.recent_combo.setVisible(has_recent)
+        self._refresh_recent_menu()
 
     def _on_recent_directory_selected(self, index: int) -> None:
         value = self.recent_combo.itemData(index)
         if value:
             self._apply_input_path(Path(str(value)), remember=True)
 
-    def _directory_recommendation(self, work_dir: Path) -> tuple[str, str]:
-        fits = self._fits_in_work_dir(work_dir)
-        light_files = [
-            path for path in fits if path.name.lower().startswith("light_")
-        ]
-        stacked_files = [
-            path
-            for path in fits
-            if not path.name.lower().startswith("light_")
-            and self._is_candidate_stacked_input(path, work_dir)
-        ]
+    def _refresh_source_header_summary(self, selected_path: Path | None) -> None:
+        if selected_path is None or not selected_path.is_file():
+            self.source_header_group.hide()
+            return
 
-        if self._linear_resume_input_path(work_dir).is_file():
-            return INPUT_MODE_LINEAR_RESUME, "可用的 Stage 5 线性断点"
-        if self._stage2_corrected_resume_input_path(work_dir).is_file():
-            return INPUT_MODE_STAGE2_CORRECTED_RESUME, "可用的 Stage 2 边界校正断点"
-        if light_files:
-            return INPUT_MODE_AUTO, f"{len(light_files)} 个 Light FITS"
-        if stacked_files:
-            return INPUT_MODE_AUTO, f"{len(stacked_files)} 个可处理 FITS"
-        return INPUT_MODE_AUTO, "未检测到可处理的 FITS"
+        summary = inspect_source_header(selected_path)
+        if summary.status == "ok":
+            missing_value = "未记录"
+            missing_details = "未发现其他已知字段"
+        elif summary.status == "unsupported":
+            missing_value = "当前格式暂未读取"
+            missing_details = "暂无可显示信息"
+        else:
+            missing_value = "无法读取"
+            missing_details = "暂无可显示信息"
+
+        self.source_header_device_label.setText(
+            summary.device_name or missing_value
+        )
+        self.source_header_filter_label.setText(
+            summary.filter_name or missing_value
+        )
+        self.source_header_exposure_label.setText(
+            summary.exposure or missing_value
+        )
+        self.source_header_details_label.setText(
+            "\n".join(
+                f"{label}：{value}" for label, value in summary.details
+            )
+            or missing_details
+        )
+        self.source_header_status_label.setText(summary.message)
+        self.source_header_status_label.setAccessibleDescription(summary.message)
+        self.source_header_group.show()
 
     def _analyze_selected_directory(self) -> None:
         text = self.dir_edit.text().strip()
         selected_path = Path(text).expanduser() if text else None
         if selected_path is None or not selected_path.exists():
+            self._refresh_source_header_summary(None)
             self._input_discovery = None
             self._recommended_input_mode = INPUT_MODE_AUTO
             if self.mode_combo.currentData() == UI_MODE_RECOMMENDED:
@@ -4595,6 +6681,10 @@ class SeestarGui(QMainWindow):
             self.task_preview_status_label.setText("等待选择输入")
             self.preview_status_label.setText("预览：等待输入")
             return
+
+        self._refresh_source_header_summary(
+            selected_path if selected_path.is_file() else None
+        )
 
         discovery = discover_input_for_processing_settings(
             selected_path,
@@ -4665,7 +6755,6 @@ class SeestarGui(QMainWindow):
 
     def _update_result_actions(self, work_dir: Path | None) -> None:
         valid_directory = bool(work_dir and work_dir.is_dir())
-        self.open_result_btn.setEnabled(valid_directory)
         self.open_result_action.setEnabled(valid_directory)
         self._result_preview_path = (
             self._find_result_preview(work_dir) if work_dir is not None else None
@@ -4773,69 +6862,53 @@ class SeestarGui(QMainWindow):
                 selected_input_label=selected_input_label,
             )
 
-        if current_mode == INPUT_MODE_LINEAR_RESUME:
-            source = self._linear_resume_input_path(work_dir)
-            if not source.is_file():
-                return None
+        if current_mode in {
+            INPUT_MODE_STAGE1_PREPARED_RESUME,
+            INPUT_MODE_STAGE2_CORRECTED_RESUME,
+            INPUT_MODE_LINEAR_RESUME,
+        }:
+            return None
+
+        fits = self._fits_in_work_dir(work_dir)
+        if not fits:
+            return None
+
+        light_files = [p for p in fits if p.name.lower().startswith("light_")]
+        stacked_files = [
+            p for p in fits
+            if self._is_candidate_stacked_input(p, work_dir)
+        ]
+
+        if stacked_files:
+            source = max(stacked_files, key=safe_mtime)
             source_bytes = safe_file_size(source)
-            base_growth_bytes = int(source_bytes * LINEAR_RESUME_STAGE_ARTIFACT_COPIES)
+            base_growth_bytes = int(source_bytes * STACKED_STAGE_ARTIFACT_COPIES)
             input_count = 1
             input_bytes = source_bytes
-            mode = "linear_resume"
+            mode = "stacked"
             selected_input_label = source.name
-        elif current_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
-            source = self._stage2_corrected_resume_input_path(work_dir)
-            if not source.is_file():
-                return None
-            source_bytes = safe_file_size(source)
-            base_growth_bytes = int(
-                source_bytes * STAGE2_RESUME_STAGE_ARTIFACT_COPIES
+        elif light_files:
+            input_count = len(light_files)
+            input_bytes = sum(safe_file_size(p) for p in light_files)
+            largest_light_bytes = max((safe_file_size(p) for p in light_files), default=0)
+            average_light_bytes = input_bytes / max(input_count, 1)
+            processed_frame_bytes = max(
+                largest_light_bytes,
+                int(average_light_bytes * LIGHT_FRAME_EXPANSION_FACTOR),
             )
-            input_count = 1
-            input_bytes = source_bytes
-            mode = "stage2_corrected_resume"
-            selected_input_label = source.name
+            preprocess_growth_bytes = int(
+                input_bytes
+                * LIGHT_FRAME_EXPANSION_FACTOR
+                * LIGHT_PREPROCESS_SEQUENCE_COPIES
+            )
+            stacked_stage_growth_bytes = int(
+                processed_frame_bytes * STACKED_STAGE_ARTIFACT_COPIES
+            )
+            base_growth_bytes = preprocess_growth_bytes + stacked_stage_growth_bytes
+            mode = "light"
+            selected_input_label = f"Light_ x {input_count}"
         else:
-            fits = self._fits_in_work_dir(work_dir)
-            if not fits:
-                return None
-
-            light_files = [p for p in fits if p.name.lower().startswith("light_")]
-            stacked_files = [
-                p for p in fits
-                if self._is_candidate_stacked_input(p, work_dir)
-            ]
-
-            if stacked_files:
-                source = max(stacked_files, key=safe_mtime)
-                source_bytes = safe_file_size(source)
-                base_growth_bytes = int(source_bytes * STACKED_STAGE_ARTIFACT_COPIES)
-                input_count = 1
-                input_bytes = source_bytes
-                mode = "stacked"
-                selected_input_label = source.name
-            elif light_files:
-                input_count = len(light_files)
-                input_bytes = sum(safe_file_size(p) for p in light_files)
-                largest_light_bytes = max((safe_file_size(p) for p in light_files), default=0)
-                average_light_bytes = input_bytes / max(input_count, 1)
-                processed_frame_bytes = max(
-                    largest_light_bytes,
-                    int(average_light_bytes * LIGHT_FRAME_EXPANSION_FACTOR),
-                )
-                preprocess_growth_bytes = int(
-                    input_bytes
-                    * LIGHT_FRAME_EXPANSION_FACTOR
-                    * LIGHT_PREPROCESS_SEQUENCE_COPIES
-                )
-                stacked_stage_growth_bytes = int(
-                    processed_frame_bytes * STACKED_STAGE_ARTIFACT_COPIES
-                )
-                base_growth_bytes = preprocess_growth_bytes + stacked_stage_growth_bytes
-                mode = "light"
-                selected_input_label = f"Light_ x {input_count}"
-            else:
-                return None
+            return None
 
         headroom_bytes = max(
             DISK_SPACE_MIN_HEADROOM_BYTES,
@@ -5016,8 +7089,6 @@ class SeestarGui(QMainWindow):
 
         machine = platform.machine().lower()
         current_mode = input_mode or self._current_input_mode()
-        linear_resume_path = self._linear_resume_input_path(work_dir)
-        stage2_corrected_resume_path = self._stage2_corrected_resume_input_path(work_dir)
         lines = [
             "预检摘要：",
             f"  工作目录: {self._display_path(work_dir)}",
@@ -5027,23 +7098,14 @@ class SeestarGui(QMainWindow):
             f"  流水线脚本: {self._display_path(self.pipeline_path)}",
             f"  Siril 插件目录: {self._display_path(self.siril_plugin_dir)}",
         ]
-        if current_mode == INPUT_MODE_LINEAR_RESUME:
+        resume_stage = {
+            INPUT_MODE_STAGE1_PREPARED_RESUME: 1,
+            INPUT_MODE_STAGE2_CORRECTED_RESUME: 2,
+            INPUT_MODE_LINEAR_RESUME: 5,
+        }.get(current_mode)
+        if resume_stage is not None:
             lines.append(
-                "  线性续跑输入: "
-                + (
-                    linear_resume_path.name
-                    if linear_resume_path.is_file()
-                    else f"{LINEAR_RESUME_INPUT_NAME}（未找到）"
-                )
-            )
-        elif current_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
-            lines.append(
-                "  叠加后处理输入: "
-                + (
-                    str(stage2_corrected_resume_path.relative_to(work_dir))
-                    if stage2_corrected_resume_path.is_file()
-                    else f"{STAGE2_CORRECTED_INPUT_NAME}（未找到）"
-                )
+                f"  正式续跑来源: task-run manifest 已验签 Stage {resume_stage} 断点"
             )
         if disk_estimate is not None:
             lines.extend(self._disk_space_summary_lines(disk_estimate))
@@ -5141,79 +7203,108 @@ class SeestarGui(QMainWindow):
         input_mode: str | None = None,
     ) -> list[str]:
         errors: list[str] = []
-        siril_candidates = self._resolve_siril_candidates()
-
-        if not siril_candidates:
-            errors.append("应用资源中未找到可用的内置 Siril CLI。")
-
-        required_files = [
-            ("配置模板", self.config_template),
-            ("流水线脚本", self.pipeline_path),
-        ]
-        for label, path in required_files:
-            if not path.exists():
-                errors.append(f"{label}缺失：{path}")
-
-        for cli in siril_candidates:
-            if not cli.is_file():
-                errors.append(f"Siril CLI 路径无效：{cli}")
-            elif not cli.stat().st_mode & 0o111:
-                errors.append(f"Siril CLI 不可执行：{cli}")
+        try:
+            manifest = StarunGui._inspect_runtime_capabilities(self, work_dir)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            errors.append(f"无法建立运行能力清单：{error}")
+        else:
+            errors.extend(
+                str(error)
+                for error in manifest.get("blocking_errors", [])
+                if str(error)
+            )
 
         if not work_dir.is_dir():
             errors.append(f"工作目录不存在：{work_dir}")
 
         current_mode = input_mode or self._current_input_mode()
-        task_run_manifest = Path(
-            str(
-                getattr(self, "_pending_runtime_overrides", {}).get(
-                    "SEESTAR_TASK_RUN_MANIFEST",
-                    "",
-                )
+        manifest_value = str(
+            getattr(self, "_pending_runtime_overrides", {}).get(
+                "STARUN_TASK_RUN_MANIFEST",
+                "",
             )
-        ).expanduser()
+        ).strip()
+        task_run_manifest = (
+            Path(manifest_value).expanduser() if manifest_value else None
+        )
         has_task_run_manifest = bool(
-            str(task_run_manifest)
+            task_run_manifest is not None
             and task_run_manifest.is_file()
             and task_run_manifest.parent.resolve() == work_dir.resolve()
         )
-        resume_checkpoint = Path(
-            str(
-                getattr(self, "_pending_runtime_overrides", {}).get(
-                    "SEESTAR_RESUME_CHECKPOINT_PATH",
-                    "",
-                )
-            )
-        ).expanduser()
-        if has_task_run_manifest and current_mode in {
-            INPUT_MODE_STAGE1_PREPARED_RESUME,
-            INPUT_MODE_STAGE2_CORRECTED_RESUME,
-            INPUT_MODE_LINEAR_RESUME,
-        }:
-            if not str(resume_checkpoint) or not resume_checkpoint.is_file():
-                errors.append("自动续跑计划缺少已验证的正式断点文件。")
-        elif has_task_run_manifest:
-            pass
-        elif current_mode == INPUT_MODE_STAGE1_PREPARED_RESUME:
-            stage1_path = work_dir / STAGE1_PREPARED_INPUT_NAME
-            if not stage1_path.is_file():
+        expected_resume_stage = {
+            INPUT_MODE_STAGE1_PREPARED_RESUME: 1,
+            INPUT_MODE_STAGE2_CORRECTED_RESUME: 2,
+            INPUT_MODE_LINEAR_RESUME: 5,
+        }.get(current_mode)
+        if expected_resume_stage is not None:
+            if not has_task_run_manifest or task_run_manifest is None:
                 errors.append(
-                    f"续跑模式要求存在 {STAGE1_PREPARED_INPUT_NAME}：{stage1_path}"
+                    "续跑仅接受当前 run 中已验签 task-run manifest 的 Stage 1/2/5 正式断点。"
                 )
-        elif current_mode == INPUT_MODE_LINEAR_RESUME:
-            linear_resume_path = self._linear_resume_input_path(work_dir)
-            if not linear_resume_path.is_file():
-                errors.append(
-                    f"续跑模式要求工作目录根下存在 {LINEAR_RESUME_INPUT_NAME}：{linear_resume_path}"
+            else:
+                payload = pipeline_run_manifest.load_json(task_run_manifest)
+                claimed_hash = str(
+                    (payload or {}).get("manifest_hash") or ""
                 )
-        elif current_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
-            stage2_corrected_path = self._stage2_corrected_resume_input_path(work_dir)
-            if not stage2_corrected_path.is_file():
-                errors.append(
-                    "叠加后处理模式要求工作目录根下或 process/ 下存在 "
-                    f"{STAGE2_CORRECTED_INPUT_NAME}：{stage2_corrected_path}"
+                unsigned = dict(payload or {})
+                unsigned.pop("manifest_hash", None)
+                contract = (
+                    payload.get("pipeline_contract")
+                    if isinstance(payload, Mapping)
+                    else None
                 )
-        else:
+                resume = (
+                    payload.get("resume")
+                    if isinstance(payload, Mapping)
+                    else None
+                )
+                manifest_valid = bool(
+                    isinstance(payload, Mapping)
+                    and payload.get("schema") == "starun.task-run.v1"
+                    and claimed_hash
+                    and claimed_hash
+                    == pipeline_run_manifest.canonical_payload_hash(unsigned)
+                    and isinstance(contract, Mapping)
+                    and contract.get("schema") == PIPELINE_CONTRACT_SCHEMA
+                    and contract.get("version") == PIPELINE_CONTRACT_VERSION
+                )
+                if not manifest_valid or not isinstance(resume, Mapping):
+                    errors.append("task-run manifest 的签名或阶段契约无效。")
+                else:
+                    try:
+                        resume_stage = int(resume.get("stage") or 0)
+                    except (TypeError, ValueError):
+                        resume_stage = 0
+                    checkpoint_value = str(resume.get("path") or "").strip()
+                    checkpoint = (
+                        Path(checkpoint_value).expanduser().resolve()
+                        if checkpoint_value
+                        else None
+                    )
+                    contract_by_stage = {
+                        item.number: item for item in product_stage_contracts()
+                    }
+                    stage_contract = contract_by_stage.get(expected_resume_stage)
+                    checkpoint_sha256 = (
+                        pipeline_run_manifest.sha256_file(checkpoint)
+                        if checkpoint is not None
+                        else None
+                    )
+                    if (
+                        resume_stage != expected_resume_stage
+                        or stage_contract is None
+                        or str(resume.get("artifact") or "")
+                        != stage_contract.primary_artifact
+                        or checkpoint is None
+                        or checkpoint.name != stage_contract.primary_artifact
+                        or not checkpoint_sha256
+                        or checkpoint_sha256 != str(resume.get("sha256") or "")
+                    ):
+                        errors.append(
+                            "task-run manifest 的正式断点阶段、路径或 SHA-256 不匹配。"
+                        )
+        elif not has_task_run_manifest:
             fits = self._fits_in_work_dir(work_dir)
             if not fits:
                 errors.append(f"在 {work_dir} 中未找到 .fit/.fits 输入文件")
@@ -5450,21 +7541,19 @@ class SeestarGui(QMainWindow):
                 continue
             name = re.split(r"[<>=!~;\[\s]", line, maxsplit=1)[0].strip()
             if name:
-                names.append(name.replace("_", "-").lower())
+                names.append(re.sub(r"[-_.]+", "-", name).lower())
         return names
 
     def _missing_requirement_wheels(self, requirements_path: Path) -> list[str]:
         downloads_dir = self._plugin_downloads_dir()
-        wheel_names = [path.name.lower() for path in downloads_dir.glob("*.whl")]
+        wheel_names = [
+            re.sub(r"[-_.]+", "-", path.name).lower()
+            for path in downloads_dir.glob("*.whl")
+        ]
         missing: list[str] = []
         for name in self._requirement_names(requirements_path):
-            normalized = name.replace("-", "_")
-            prefixes = (
-                f"{name}-",
-                f"{normalized}-",
-            )
             if not any(
-                wheel_name.startswith(prefix) for wheel_name in wheel_names for prefix in prefixes
+                wheel_name.startswith(f"{name}-") for wheel_name in wheel_names
             ):
                 missing.append(name)
         return missing
@@ -5478,7 +7567,7 @@ class SeestarGui(QMainWindow):
                 # Unit tests call this method on lightweight proxy objects and
                 # only bind the artifact checks they are asserting. Treat
                 # unbound optional checks as satisfied for those proxies; real
-                # SeestarGui instances still use their bound methods.
+                # StarunGui instances still use their bound methods.
                 return [] if name == "_requests_dependency_wheels_missing" else [Path("__proxy_optional_present__")]
             return method()
 
@@ -5563,7 +7652,7 @@ class SeestarGui(QMainWindow):
         if not call("_torchvision_wheels"):
             missing.append("torchvision wheel 缺失")
         missing_requirement_wheels = []
-        if isinstance(self, SeestarGui):
+        if isinstance(self, StarunGui):
             missing_requirement_wheels = self._missing_requirement_wheels(
                 self._plugin_requirements_path()
             )
@@ -5574,7 +7663,10 @@ class SeestarGui(QMainWindow):
             )
 
         syqon_bundle = plugin_root / SYQON_STARLESS_BUNDLE_REL
-        for name in ("syqon_starless_inference.py", "zenith.pt"):
+        for name in (
+            "zenith.pt",
+            "zenith.pt.sha256",
+        ):
             if not (syqon_bundle / name).is_file():
                 missing.append(f"SyQon Starless {name} 缺失")
 
@@ -5587,7 +7679,7 @@ class SeestarGui(QMainWindow):
                 "CosmicClarity Native 模型缺失（需要 denoise + sharpen 的最小 .pth 集）"
             )
         classic_wrapper = plugin_root / "bin" / "CosmicClarity"
-        if isinstance(self, SeestarGui) and (
+        if isinstance(self, StarunGui) and (
             not classic_wrapper.is_file() or not os.access(classic_wrapper, os.X_OK)
         ):
             missing.append("CosmicClarity classic wrapper 缺失或不可执行")
@@ -5595,8 +7687,13 @@ class SeestarGui(QMainWindow):
         scripts_root = resolve_siril_scripts_root(plugin_root)
         if scripts_root is None:
             missing.append("siril-scripts 目录或 AberrationRemover.py 缺失")
-        elif not (scripts_root / "processing" / "SyQon-Starless.py").is_file():
-            missing.append("SyQon-Starless.py 缺失")
+        elif not any(
+            (scripts_root / relative_path).is_file()
+            for relative_path in (
+                Path("SyQon/Starless.py"),
+            )
+        ):
+            missing.append("SyQon Starless 脚本缺失")
 
         return missing
 
@@ -5673,7 +7770,7 @@ class SeestarGui(QMainWindow):
     def _runtime_cosmic_clarity_dir(self) -> Path:
         return self._siril_state_root() / "cosmic_clarity"
 
-    def _remove_matching_legacy_runtime_files(
+    def _remove_matching_runtime_model_copies(
         self,
         bundle_dir: Path,
         target_dir: Path,
@@ -5702,15 +7799,18 @@ class SeestarGui(QMainWindow):
     def _sync_syqon_starless_bundle(self) -> None:
         bundle_dir = self.siril_plugin_dir / SYQON_STARLESS_BUNDLE_REL
         required_names = [
-            "syqon_starless_inference.py",
             "zenith.pt",
             "zenith.pt.sha256",
             "zenith.pt.date",
             "zenith.pt.verified",
         ]
-        if not bundle_dir.is_dir() or not (bundle_dir / "zenith.pt").is_file():
+        if (
+            not bundle_dir.is_dir()
+            or not (bundle_dir / "zenith.pt").is_file()
+            or not (bundle_dir / "zenith.pt.sha256").is_file()
+        ):
             return
-        reclaimed = self._remove_matching_legacy_runtime_files(
+        reclaimed = self._remove_matching_runtime_model_copies(
             bundle_dir,
             self._runtime_syqon_starless_dir(),
             required_names,
@@ -5736,7 +7836,7 @@ class SeestarGui(QMainWindow):
         ]
         if not model_files:
             return
-        reclaimed = self._remove_matching_legacy_runtime_files(
+        reclaimed = self._remove_matching_runtime_model_copies(
             bundle_dir,
             self._runtime_cosmic_clarity_dir(),
             [source.name for source in model_files],
@@ -5763,8 +7863,8 @@ class SeestarGui(QMainWindow):
             )
         else:
             self._append_event(
-                "本地 Gaia astrometric 星表尚未安装；PCC/platesolve 不会调用 "
-                "localgaia，离线模式下也不会尝试在线目录。"
+                "本地 Gaia astrometric 星表尚未安装；默认在线 Gaia 校准不受影响。"
+                "显式离线模式下不会尝试在线目录，并会跳过需要 localgaia 的校准。"
             )
         self._sync_syqon_starless_bundle()
         self._sync_cosmic_clarity_bundle()
@@ -5777,13 +7877,13 @@ class SeestarGui(QMainWindow):
         marker = runtime_repo / "processing" / "AberrationRemover.py"
         if marker.is_file():
             if apply_siril_runtime_patches(self.siril_plugin_dir, runtime_repo):
-                self._append_event("已应用 GraXpert-AI 运行时兼容补丁")
+                self._append_event("已应用 Siril 插件运行时兼容补丁")
             return
 
         runtime_repo.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(scripts_root, runtime_repo, dirs_exist_ok=True)
         if apply_siril_runtime_patches(self.siril_plugin_dir, runtime_repo):
-            self._append_event("已应用 GraXpert-AI 运行时兼容补丁")
+            self._append_event("已应用 Siril 插件运行时兼容补丁")
         self._append_event(
             "已同步 Siril scripts 仓库到运行时目录: "
             + self._display_path(runtime_repo)
@@ -5850,12 +7950,12 @@ class SeestarGui(QMainWindow):
         )
         wheel_text = (
             "Wheel-Version: 1.0\n"
-            "Generator: seestar-superimpose\n"
+            "Generator: starun\n"
             "Root-Is-Purelib: true\n"
             "Tag: py3-none-any\n"
         )
         top_level_text = "tiffile\n"
-        installer_text = "seestar-superimpose\n"
+        installer_text = "starun\n"
 
         updated_dist = False
         for path, content in (
@@ -5916,12 +8016,12 @@ class SeestarGui(QMainWindow):
             ),
             "WHEEL": (
                 "Wheel-Version: 1.0\n"
-                "Generator: seestar-superimpose\n"
+                "Generator: starun\n"
                 "Root-Is-Purelib: true\n"
                 "Tag: py3-none-any\n"
             ),
             "top_level.txt": "cv2\n",
-            "INSTALLER": "seestar-superimpose\n",
+            "INSTALLER": "starun\n",
         }
         updated = False
         for name, content in files.items():
@@ -5943,7 +8043,7 @@ class SeestarGui(QMainWindow):
         site_dir = resolve_venv_site_packages(venv_dir)
         patch_path = site_dir / "sitecustomize.py"
         patch_code = (
-            '"""Seestar runtime patch: override sirilpy timeout via env."""\n'
+            '"""Starun runtime patch: override sirilpy timeout via env."""\n'
             "import os\n"
             "def _patch_default_timeout(func, timeout):\n"
             "    defaults = getattr(func, '__defaults__', None)\n"
@@ -5953,7 +8053,7 @@ class SeestarGui(QMainWindow):
             "    updated[-1] = timeout\n"
             "    func.__defaults__ = tuple(updated)\n"
             "\n"
-            "raw = os.getenv('SEESTAR_SIRILPY_TIMEOUT_SEC', '').strip()\n"
+            "raw = os.getenv('STARUN_SIRILPY_TIMEOUT_SEC', '').strip()\n"
             "if raw:\n"
             "    try:\n"
             "        timeout = float(raw)\n"
@@ -6043,7 +8143,7 @@ class SeestarGui(QMainWindow):
             raise FileNotFoundError(f"Siril runtime python not found: {python_bin}")
 
         runtime_env = self._runtime_python_env()
-        runtime_env.setdefault("SEESTAR_SIRILPY_TIMEOUT_SEC", "120")
+        runtime_env.setdefault("STARUN_SIRILPY_TIMEOUT_SEC", "300")
         self._ensure_runtime_sirilpy_timeout_patch()
         self._ensure_runtime_tiffile_alias()
         self._ensure_runtime_opencv_distribution_alias()
@@ -6446,7 +8546,7 @@ class SeestarGui(QMainWindow):
         self._append_event(f"onnx/onnxruntime 离线安装完成 (versions={version})。")
 
     def _bootstrap_app_version(self) -> str:
-        env_version = os.environ.get("SEESTAR_APP_VERSION", "").strip()
+        env_version = os.environ.get("STARUN_APP_VERSION", "").strip()
         if env_version:
             return env_version
         info_plist = self.resources.parent / "Info.plist"
@@ -6492,7 +8592,7 @@ class SeestarGui(QMainWindow):
         }
 
     def _bootstrap_state_path(self) -> Path:
-        return self._siril_state_root() / "venv" / ".seestar_runtime_ready.json"
+        return self._siril_state_root() / "venv" / ".starun_runtime_ready.json"
 
     def _bootstrap_state_is_current(self, fingerprint: dict[str, object]) -> bool:
         state_path = self._bootstrap_state_path()
@@ -6532,6 +8632,27 @@ class SeestarGui(QMainWindow):
     ) -> dict[str, object]:
         self._bootstrap_stop_event = stop_event
         try:
+            if isinstance(
+                getattr(self, "_runtime_capability_manifest", None),
+                dict,
+            ):
+                StarunGui._update_run_state(
+                    self,
+                    phase="runtime_preflight",
+                    status=STATUS_PREPARING,
+                    detail="validating Siril launch and Gaia network endpoints",
+                )
+                StarunGui._complete_runtime_capability_preflight(
+                    self,
+                    progress,
+                )
+                StarunGui._update_run_state(
+                    self,
+                    phase="runtime_bootstrap",
+                    status=STATUS_PREPARING,
+                    detail="runtime capability preflight passed",
+                    errors=[],
+                )
             progress("正在分别检查运行环境和工作目录磁盘…")
             self._check_bootstrap_cancelled()
             try:
@@ -6796,7 +8917,6 @@ class SeestarGui(QMainWindow):
         self,
         _checked: bool = False,
         *,
-        input_mode_override: str | None = None,
         prepared_task: PreparedTask | None = None,
     ) -> None:
         if self.intake_worker and self.intake_worker.isRunning():
@@ -6847,15 +8967,28 @@ class SeestarGui(QMainWindow):
         self._active_prepared_task = prepared_task
         self._last_task_root = prepared_task.workspace.root
         work_dir = prepared_task.run.root
+        self._current_work_dir = work_dir
+        try:
+            self._begin_run_diagnostics(work_dir, prepared_task)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            detail = f"无法在预检前创建本轮日志和状态文件：{error}"
+            self._register_history_run(prepared_task)
+            self._update_active_history_run(
+                STATUS_FAILED,
+                failure_reason=detail,
+            )
+            self._current_work_dir = None
+            self._active_prepared_task = None
+            self._prepared_tasks = ()
+            self._prepared_task_index = 0
+            self._active_history_task_key = None
+            self._active_history_run_id = None
+            QMessageBox.critical(self, "运行诊断初始化失败", detail)
+            self._append_text(f"[{self._timestamp()}] {detail}\n")
+            return
         self._register_history_run(prepared_task)
+        self._update_active_history_run(STATUS_PREPARING)
         input_mode = prepared_task.input_mode
-        if input_mode_override in {
-            INPUT_MODE_AUTO,
-            INPUT_MODE_STAGE1_PREPARED_RESUME,
-            INPUT_MODE_LINEAR_RESUME,
-            INPUT_MODE_STAGE2_CORRECTED_RESUME,
-        } and not prepared_task.runtime_overrides:
-            input_mode = str(input_mode_override)
         (
             self._pending_runtime_overrides,
             self._pending_runtime_unset_keys,
@@ -6870,22 +9003,44 @@ class SeestarGui(QMainWindow):
                     f"{model_path}"
                 )
         errors = self._preflight_errors(work_dir, input_mode=input_mode)
+        capability_manifest = getattr(self, "_runtime_capability_manifest", None)
+        if isinstance(capability_manifest, Mapping):
+            for line in capability_summary_lines(capability_manifest):
+                self._append_event(line)
+            if self.runtime_capabilities_path is not None:
+                self._append_event(
+                    "能力清单文件: "
+                    + self._display_path(self.runtime_capabilities_path)
+                )
         if errors:
             self._pending_runtime_overrides.clear()
             self._pending_runtime_unset_keys.clear()
-            QMessageBox.critical(self, "预检失败", "\n\n".join(errors))
             self._append_event("预检失败：")
             for err in errors:
                 self._append_text(f"  - {err}\n")
+            self._update_run_state(
+                phase="terminal",
+                status=STATUS_FAILED,
+                detail="local preflight failed",
+                errors=errors,
+            )
             self._update_active_history_run(
                 STATUS_FAILED,
                 failure_reason="；".join(errors),
             )
+            self._close_run_log()
+            QMessageBox.critical(self, "预检失败", "\n\n".join(errors))
+            self._cleanup_after_run()
             return
 
         self._remember_directory(selected_path)
-        self._current_work_dir = work_dir
-        self._run_input_mode_override = input_mode
+        self._run_input_mode = input_mode
+        self._update_run_state(
+            phase="runtime_preflight",
+            status=STATUS_PREPARING,
+            detail="local runtime and input preflight passed",
+            errors=[],
+        )
         self._last_run_snapshot = {
             "work_dir": str(selected_path),
             "input_mode": input_mode,
@@ -6965,6 +9120,12 @@ class SeestarGui(QMainWindow):
         payload = result if isinstance(result, dict) else {}
         disk_estimate = payload.get("disk_estimate")
         self._append_event("运行环境准备完成，正在启动处理…")
+        self._update_run_state(
+            phase="pipeline_starting",
+            status=STATUS_PREPARING,
+            detail="runtime bootstrap completed",
+            errors=[],
+        )
         self._start_pipeline(work_dir, disk_estimate)
 
     def _on_bootstrap_failed(self, title: str, detail: str) -> None:
@@ -6979,19 +9140,26 @@ class SeestarGui(QMainWindow):
         self.progress_bar.hide()
         self.preview_activity_label.setText("运行环境准备失败")
         self.run_phase_label.setText("准备失败")
-        self.log_toggle_btn.setChecked(True)
+        self.toggle_log_action.setChecked(True)
         self._show_run_banner(
             "error",
             "运行环境准备失败。任务尚未进入图像处理，请查看详细日志后重试。",
             show_log=True,
         )
-        QMessageBox.critical(self, title, detail)
         self._append_event(f"{title}：{detail}")
+        self._update_run_state(
+            phase="terminal",
+            status=STATUS_FAILED,
+            detail=f"{title}：{detail}",
+            errors=[detail],
+        )
         self._update_active_history_run(
             STATUS_FAILED,
             failure_reason=f"{title}：{detail}",
         )
         self._update_result_actions(self._current_work_dir)
+        self._close_run_log()
+        QMessageBox.critical(self, title, detail)
         self._current_work_dir = None
         self._active_prepared_task = None
         self._prepared_tasks = ()
@@ -7018,11 +9186,18 @@ class SeestarGui(QMainWindow):
             show_log=True,
         )
         self._append_event("运行环境准备已停止。")
+        self._update_run_state(
+            phase="terminal",
+            status=STATUS_STOPPED,
+            detail="用户在运行环境准备阶段停止任务",
+            errors=[],
+        )
         self._update_active_history_run(
             STATUS_STOPPED,
             failure_reason="用户在运行环境准备阶段停止任务",
         )
         self._update_result_actions(self._current_work_dir)
+        self._close_run_log()
         self._current_work_dir = None
         self._active_prepared_task = None
         self._prepared_tasks = ()
@@ -7036,15 +9211,29 @@ class SeestarGui(QMainWindow):
         work_dir: Path,
         disk_estimate: DiskSpaceEstimate | None,
     ) -> None:
-        input_mode = self._run_input_mode_override or self._current_input_mode()
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.run_log_path = work_dir / f"seestar_gui_run_{stamp}.log"
-        with self._run_log_lock:
-            self.run_log_file = self.run_log_path.open(
-                "a",
-                encoding="utf-8",
-                errors="replace",
+        input_mode = self._run_input_mode or self._current_input_mode()
+        try:
+            log_is_current = bool(
+                self.run_log_path is not None
+                and self.run_log_file is not None
+                and self.run_log_path.resolve().parent == work_dir.resolve()
             )
+        except OSError:
+            log_is_current = False
+        if not log_is_current:
+            self._on_bootstrap_failed(
+                "运行日志隔离失败",
+                "当前任务没有预检前创建的独立日志；为避免写入上一任务日志，"
+                "本次运行已阻断。",
+            )
+            return
+
+        self._update_run_state(
+            phase="pipeline",
+            status=STATUS_RUNNING,
+            detail="pipeline worker starting",
+            errors=[],
+        )
         self._update_active_history_run(STATUS_RUNNING)
         self._append_divider(
             "本次任务开始",
@@ -7304,6 +9493,22 @@ class SeestarGui(QMainWindow):
                     result = None
                 if result is not None and result.get("failure_reason"):
                     history_failure_reason = str(result["failure_reason"])
+        terminal_errors = (
+            [history_failure_reason]
+            if history_failure_reason
+            else []
+        )
+        self._update_run_state(
+            phase="terminal",
+            status=history_status,
+            detail=f"GUI status={status}",
+            errors=terminal_errors,
+            extra={
+                "exit_code": int(exit_code),
+                "cli_used": str(cli_used),
+                "had_errors": bool(had_errors),
+            },
+        )
         self._update_active_history_run(
             history_status,
             failure_reason=history_failure_reason,
@@ -7318,7 +9523,7 @@ class SeestarGui(QMainWindow):
         self._run_terminal_status = status
         self._set_status_text(status)
         if status not in {"Completed", "CompletedWithWarning", "Stopped"}:
-            self.log_toggle_btn.setChecked(True)
+            self.toggle_log_action.setChecked(True)
         self._append_event(
             f"处理结束：状态={self._display_status(status)}，退出码={exit_code}，CLI={cli_used}"
         )
@@ -7336,7 +9541,6 @@ class SeestarGui(QMainWindow):
                 )
                 retention = apply_task_retention(
                     self._active_prepared_task.workspace.root,
-                    preserve_intermediates=self.debug_mode_enabled,
                 )
                 self._append_event(
                     "任务保留策略已应用："
@@ -7419,19 +9623,45 @@ class SeestarGui(QMainWindow):
             self.worker.deleteLater()
             self.worker = None
 
-        with self._run_log_lock:
-            if self.run_log_file:
-                self.run_log_file.close()
-                self.run_log_file = None
+        self._close_run_log()
+        if keep_queue:
+            # The next queued task must establish all diagnostics before its
+            # own preflight; no path from this run is allowed to remain active.
+            self.run_log_path = None
+            self.run_state_path = None
+            self.runtime_capabilities_path = None
+            self._run_state_payload = {}
+            self._runtime_capability_manifest = None
 
         self._current_work_dir = None
-        self._run_input_mode_override = None
+        self._run_input_mode = None
         if not keep_queue:
             self._active_prepared_task = None
             self._prepared_tasks = ()
             self._prepared_task_index = 0
             self._active_history_task_key = None
             self._active_history_run_id = None
+
+    def changeEvent(self, event) -> None:  # type: ignore[override]
+        super().changeEvent(event)
+        try:
+            from PySide6.QtCore import QEvent
+
+            window_state_change = event.type() == QEvent.Type.WindowStateChange
+        except (AttributeError, ImportError, RuntimeError, TypeError):
+            window_state_change = False
+        action = getattr(self, "full_screen_action", None)
+        if window_state_change and action is not None:
+            full_screen = self.isFullScreen()
+            action.blockSignals(True)
+            action.setChecked(full_screen)
+            action.blockSignals(False)
+            action.setText("退出全屏幕" if full_screen else "进入全屏幕")
+            self._schedule_window_geometry_save()
+
+    def moveEvent(self, event) -> None:  # type: ignore[override]
+        super().moveEvent(event)
+        self._schedule_window_geometry_save()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         active_worker = None
@@ -7495,4 +9725,8 @@ class SeestarGui(QMainWindow):
         save_settings = getattr(self, "_save_settings", None)
         if callable(save_settings):
             save_settings()
+        for attribute in ("history_window", "preferences_window"):
+            auxiliary = getattr(self, attribute, None)
+            if auxiliary is not None and auxiliary.isVisible():
+                auxiliary.close()
         event.accept()

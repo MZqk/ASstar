@@ -9,8 +9,8 @@ from stage_contracts import PIPELINE_CONTRACT_SCHEMA, PIPELINE_CONTRACT_VERSION
 from sirilpy.exceptions import SirilError
 
 
-TASK_RUN_MANIFEST_ENV = "SEESTAR_TASK_RUN_MANIFEST"
-TASK_RUN_MANIFEST_SCHEMA = "seestar.task-run.v1"
+TASK_RUN_MANIFEST_ENV = "STARUN_TASK_RUN_MANIFEST"
+TASK_RUN_MANIFEST_SCHEMA = "starun.task-run.v1"
 _TASK_SOURCE_KINDS = frozenset(
     {"master_file", "light_directory", "review_file"}
 )
@@ -126,7 +126,7 @@ def run_stage1_preparation(pipeline) -> None:
         stacked_files = []
         light_files = []
     else:
-        # 兼容旧运行目录；新任务不再依赖目录扫描选择输入。
+        # Standalone developer runs may still start from an explicit work dir.
         fit_files = pipeline._find_fit_files()
 
         # 分类: 候选叠加文件 vs Light_ 原始单帧

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 
-OUTPUT_COLOR_SCHEMA = "seestar.output-color-manifest.v1"
+OUTPUT_COLOR_SCHEMA = "starun.output-color-manifest.v1"
 
 
 def _requested_formats(output_format: str) -> set[str]:
@@ -245,6 +245,7 @@ def build_output_color_manifest(
     review_only: bool,
     exported_after: Optional[float] = None,
     managed_export_report: Optional[Dict[str, Any]] = None,
+    source_color_contract: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Inspect current exports without converting, tagging, or rewriting them."""
     requested = _requested_formats(output_format)
@@ -279,6 +280,9 @@ def build_output_color_manifest(
         for item in tiff_artifacts
         if str(item.get("name") or "").endswith("_edit_srgb.tif")
     ]
+    requested_display = "png" in requested
+    requested_edit = "tif" in requested
+    display_visibility_ok: Optional[bool] = None
     if managed_export_report is not None:
         display_profiles_ok = bool(managed_png_artifacts) and all(
             bool(item.get("display_profile_verified"))
@@ -288,6 +292,20 @@ def build_output_color_manifest(
             bool(item.get("icc_profile_present"))
             for item in managed_tiff_artifacts
         )
+        written_managed_displays = [
+            item
+            for item in (managed_export_report.get("artifacts") or [])
+            if item.get("role") == "display" and item.get("status") == "written"
+        ]
+        display_visibility_ok = (
+            bool(written_managed_displays)
+            and all(
+                bool((item.get("visibility") or {}).get("passed", False))
+                for item in written_managed_displays
+            )
+            if requested_display
+            else None
+        )
     else:
         display_profiles_ok = bool(png_artifacts) and all(
             bool(item.get("display_profile_verified"))
@@ -296,11 +314,27 @@ def build_output_color_manifest(
         edit_profiles_ok = bool(tiff_artifacts) and all(
             bool(item.get("icc_profile_present")) for item in tiff_artifacts
         )
-    requested_display = "png" in requested
-    requested_edit = "tif" in requested
     ready = bool(
         (not requested_display or display_profiles_ok)
         and (not requested_edit or edit_profiles_ok)
+        and (
+            managed_export_report is None
+            or not requested_display
+            or display_visibility_ok is True
+        )
+    )
+    color_contract = dict(source_color_contract or {})
+    working_color_state = color_contract.get("working_color_state") or {}
+    working_color_state = (
+        dict(working_color_state)
+        if isinstance(working_color_state, dict)
+        else {}
+    )
+    source_profile_verified = bool(
+        working_color_state.get("profile_verified", False)
+    )
+    conversion_lineage_verified = bool(
+        working_color_state.get("conversion_lineage_verified", False)
     )
 
     return {
@@ -313,6 +347,25 @@ def build_output_color_manifest(
         "rewrote_outputs": False,
         "managed_export": managed_export_report,
         "channel_semantics": str(channel_semantics or "unknown"),
+        "source_color_contract": color_contract or None,
+        "color_state_disclosure": {
+            "source_profile_verified": source_profile_verified,
+            "source_to_target_conversion_lineage_verified": (
+                conversion_lineage_verified
+            ),
+            "source_to_srgb_pixel_conversion_performed_by_manifest": False,
+            "managed_container_metadata_action": (
+                "direct pixel quantization plus sRGB metadata/profile assignment"
+                if managed_export_report is not None
+                else "inspection_only"
+            ),
+            "limitation": (
+                None
+                if source_profile_verified and conversion_lineage_verified
+                else "source primaries/TRC/white point are unverified; an sRGB tag "
+                "alone does not prove a source-to-sRGB pixel conversion"
+            ),
+        },
         "review_only": bool(review_only),
         "requested_formats": sorted(requested),
         "desired_contract": {
@@ -341,6 +394,7 @@ def build_output_color_manifest(
             "managed_png_count": len(managed_png_artifacts),
             "managed_tiff_count": len(managed_tiff_artifacts),
             "display_profiles_verified": display_profiles_ok,
+            "display_visibility_verified": display_visibility_ok,
             "editable_profiles_verified": edit_profiles_ok,
             "ready_for_future_managed_export": ready,
             "managed_export_ready": bool(
@@ -358,6 +412,12 @@ def build_output_color_manifest(
                     (
                         requested_edit and not edit_profiles_ok,
                         "TIFF ICC metadata missing or unverified",
+                    ),
+                    (
+                        managed_export_report is not None
+                        and requested_display
+                        and display_visibility_ok is not True,
+                        "PNG pixel brightness/subject/star visibility missing or failed",
                     ),
                 )
                 if condition

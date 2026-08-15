@@ -1,4 +1,4 @@
-Siril SPCC database seed for SeestarSuperimpose
+Siril SPCC database seed for Starun
 
 Source: https://gitlab.com/free-astro/siril-spcc-database
 Pinned commit: 3426f0939d53d4d3a1b4c8e620a6faf8212bda32
@@ -6,9 +6,16 @@ Pinned commit date: 2026-06-03 09:10:55 +0000
 License: GPL-3.0-only (see LICENSE.md)
 
 Bundled SPCC entries:
+- OSC sensor: Sony IMX415
+- OSC sensor: Sony IMX462
 - OSC sensor: Sony IMX585
+- OSC sensor: Sony IMX662
+- OSC sensor: Sony IMX678
+- OSC sensor: ZWO Seestar S30
+- OSC sensor: ZWO Seestar S50
+- OSC filter: UV/IR Block
+- OSC filter: Dwarf Mini Astro
 - OSC filter: ZWO Seestar LP
 - OSC filter: No filter
 - White reference: Average Spiral Galaxy
 - White reference: Star, type G2(v)
-

@@ -13,6 +13,7 @@ if str(PIPELINE_DIR) not in sys.path:
     sys.path.insert(0, str(PIPELINE_DIR))
 
 from noise_model import (  # noqa: E402
+    assess_denoise_candidate,
     build_noise_model_report,
     multiscale_denoise_candidate,
 )
@@ -109,6 +110,51 @@ class NoiseModelReportTests(unittest.TestCase):
 
         self.assertFalse(report["accepted"])
         self.assertEqual(report["status"], "skipped_low_noise")
+
+    def test_common_gate_rejects_candidate_without_noise_reduction(self) -> None:
+        rng = np.random.default_rng(41)
+        before = np.clip(
+            0.08 + rng.normal(0.0, 0.008, size=(3, 128, 128)),
+            0.0,
+            1.0,
+        ).astype(np.float32)
+
+        report = assess_denoise_candidate(before, before.copy())
+
+        self.assertFalse(report["accepted"])
+        self.assertEqual(report["status"], "rejected")
+        self.assertIn("insufficient_noise_reduction", report["issues"])
+
+    def test_common_gate_rejects_background_chroma_noise_growth(self) -> None:
+        rng = np.random.default_rng(73)
+        base = 0.08 + rng.normal(0.0, 0.007, size=(128, 128))
+        before = np.stack((base, base, base), axis=0).astype(np.float32)
+        after = before.copy()
+        opponent_noise = rng.normal(0.0, 0.004, size=(128, 128)).astype(
+            np.float32
+        )
+        after[0] += opponent_noise
+        after[2] += opponent_noise
+
+        report = assess_denoise_candidate(before, after)
+
+        self.assertFalse(report["accepted"])
+        self.assertIn("background_chroma_noise_growth", report["issues"])
+
+    def test_common_gate_rejects_nonfinite_candidate_pixels(self) -> None:
+        rng = np.random.default_rng(97)
+        before = np.clip(
+            0.08 + rng.normal(0.0, 0.006, size=(3, 128, 128)),
+            0.0,
+            1.0,
+        ).astype(np.float32)
+        after = before.copy()
+        after[0, 4, 7] = np.nan
+
+        report = assess_denoise_candidate(before, after)
+
+        self.assertFalse(report["accepted"])
+        self.assertIn("nonfinite_output", report["issues"])
 
 
 if __name__ == "__main__":

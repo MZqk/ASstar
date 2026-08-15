@@ -6,6 +6,10 @@ import numpy as np
 
 from image_metrics import _to_rgb_float_fullres
 from models import PipelineStage
+from stage2_crop_detector import (
+    detect_field_rotation_crop,
+    detect_native_contour_crop,
+)
 from sirilpy.exceptions import CommandError, SirilError
 
 
@@ -98,7 +102,11 @@ def _detect_auto_edge_crop(pipeline, is_adaptive: bool = False) -> Tuple[Optiona
     target = float(getattr(pipeline.cfg, "stage2_edge_black_target", 0.10))
     black_line_limit = max(0.015, min(0.08, target * 0.35))
     dark_level_limit = max(black_threshold * 1.25, bg_median - max(bg_std * 2.0, 0.004))
-    cast_limit = max(0.010, center_cast * 2.8)
+    cast_limit = max(
+        float(getattr(pipeline.cfg, "stage2_edge_cast_absolute_max", 0.010)),
+        center_cast
+        * float(getattr(pipeline.cfg, "stage2_edge_cast_detect_ratio_max", 2.8)),
+    )
     max_scan_x = max(4, int(width * 0.25))
     max_scan_y = max(4, int(height * 0.25))
     stable_run = max(6, int(min(width, height) * 0.006))
@@ -307,6 +315,27 @@ def _stage2_constrain_crop_to_center(
     applied_top = max(current_top, min(requested_top, int(protection["top"])))
     applied_right = min(current_right, max(requested_right, int(protection["right"])))
     applied_bottom = min(current_bottom, max(requested_bottom, int(protection["bottom"])))
+
+    # Keep every Stage 2 crop aligned to even absolute boundaries.  Expand
+    # outward where possible so alignment never removes more valid pixels than
+    # the detector requested; an odd outer image edge is rounded inward only
+    # after the even-aligned center protection rectangle has been retained.
+    if applied_left % 2:
+        applied_left = max(current_left, applied_left - 1)
+    if applied_top % 2:
+        applied_top = max(current_top, applied_top - 1)
+    if applied_right % 2:
+        applied_right = (
+            applied_right + 1
+            if applied_right < current_right
+            else applied_right - 1
+        )
+    if applied_bottom % 2:
+        applied_bottom = (
+            applied_bottom + 1
+            if applied_bottom < current_bottom
+            else applied_bottom - 1
+        )
     applied_w = applied_right - applied_left
     applied_h = applied_bottom - applied_top
     if applied_w <= 0 or applied_h <= 0:
@@ -370,6 +399,124 @@ def _stage2_crop_totals(crop_report: dict) -> dict:
     }
 
 
+def _detect_native_contour_candidate(
+    pipeline,
+) -> Tuple[Optional[Tuple[int, int, int, int]], str, dict]:
+    """Run the pure first-party detector against the current Siril pixels."""
+
+    try:
+        image_data = pipeline.siril.get_image_pixeldata(preview=False)
+    except (
+        AttributeError,
+        CommandError,
+        SirilError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        report = {
+            "method": "native_contour",
+            "accepted": False,
+            "reason": "image_data_read_failed",
+            "candidate": None,
+            "error": str(error),
+        }
+        return None, "native contour crop skipped: image data read failed", report
+    if image_data is None:
+        report = {
+            "method": "native_contour",
+            "accepted": False,
+            "reason": "image_data_unavailable",
+            "candidate": None,
+        }
+        return None, "native contour crop skipped: image data unavailable", report
+    result = detect_native_contour_crop(
+        _to_rgb_float_fullres(np.asarray(image_data))
+    )
+    report = result.as_report()
+    if not result.accepted or result.rect is None:
+        return None, f"native contour crop skipped: {result.reason}", report
+    x, y, crop_w, crop_h = result.rect
+    evidence = result.evidence or {}
+    source = str(evidence.get("rectangle_source") or "unknown")
+    note = (
+        "native contour crop detected "
+        f"(x={x}, y={y}, w={crop_w}, h={crop_h}, source={source}, "
+        f"removed_black={float(evidence.get('removed_near_black_ratio', 0.0)):.3f})"
+    )
+    return result.rect, note, report
+
+
+def _detect_field_rotation_candidate(
+    pipeline,
+) -> Tuple[Optional[Tuple[int, int, int, int]], str, dict]:
+    """Detect edge-connected field-rotation coverage loss in current pixels."""
+
+    if not bool(
+        getattr(pipeline.cfg, "stage2_field_rotation_detection_enabled", True)
+    ):
+        report = {
+            "method": "native_field_rotation",
+            "accepted": False,
+            "reason": "disabled_by_configuration",
+            "candidate": None,
+        }
+        return None, "field-rotation coverage crop disabled", report
+    try:
+        image_data = pipeline.siril.get_image_pixeldata(preview=False)
+    except (
+        AttributeError,
+        CommandError,
+        SirilError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        report = {
+            "method": "native_field_rotation",
+            "accepted": False,
+            "reason": "image_data_read_failed",
+            "candidate": None,
+            "error": str(error),
+        }
+        return None, "field-rotation coverage crop skipped: image data read failed", report
+    if image_data is None:
+        report = {
+            "method": "native_field_rotation",
+            "accepted": False,
+            "reason": "image_data_unavailable",
+            "candidate": None,
+        }
+        return None, "field-rotation coverage crop skipped: image data unavailable", report
+    result = detect_field_rotation_crop(
+        _to_rgb_float_fullres(np.asarray(image_data)),
+        noise_ratio_min=float(
+            getattr(pipeline.cfg, "stage2_field_rotation_noise_ratio_min", 1.35)
+        ),
+        chroma_ratio_min=float(
+            getattr(pipeline.cfg, "stage2_field_rotation_chroma_ratio_min", 1.20)
+        ),
+    )
+    report = result.as_report()
+    if not result.accepted or result.rect is None:
+        return (
+            None,
+            f"field-rotation coverage crop skipped: {result.reason}",
+            report,
+        )
+    x, y, crop_w, crop_h = result.rect
+    evidence = result.evidence or {}
+    note = (
+        "field-rotation coverage crop detected "
+        f"(x={x}, y={y}, w={crop_w}, h={crop_h}, "
+        f"connected={float(evidence.get('edge_connected_ratio', 0.0)):.3f}, "
+        f"retained={float(evidence.get('candidate_retained_ratio', 0.0)):.3f})"
+    )
+    return result.rect, note, report
+
+
 def _stage2_apply_crop(
     pipeline,
     crop_report: dict,
@@ -430,6 +577,9 @@ def _stage2_apply_crop(
     return applied_rect, protection_note
 
 
+STAGE2_COLOR_ARTIFACT_MIN_RETAINED_RATIO = 0.90
+
+
 def _edge_color_artifact_crop(pipeline, crop_report: Optional[dict] = None) -> str:
     image_data = pipeline.siril.get_image_pixeldata(preview=False)
     shape = pipeline.siril.get_image_shape()
@@ -439,8 +589,11 @@ def _edge_color_artifact_crop(pipeline, crop_report: Optional[dict] = None) -> s
     if rgb.ndim != 3 or rgb.shape[1] < 80 or rgb.shape[2] < 80:
         return ""
     _channels, height, width = rgb.shape
-    strip_w = max(8, int(width * 0.025))
-    strip_h = max(8, int(height * 0.025))
+    strip_ratio = float(
+        getattr(pipeline.cfg, "stage2_color_cleanup_strip_ratio", 0.025)
+    )
+    strip_w = max(8, int(width * strip_ratio))
+    strip_h = max(8, int(height * strip_ratio))
     center = rgb[
         :,
         int(height * 0.22) : int(height * 0.78),
@@ -453,10 +606,17 @@ def _edge_color_artifact_crop(pipeline, crop_report: Optional[dict] = None) -> s
         "top": rgb[:, :strip_h, :],
         "bottom": rgb[:, height - strip_h :, :],
     }
+    absolute_limit = float(
+        getattr(pipeline.cfg, "stage2_edge_cast_absolute_max", 0.010)
+    )
+    relative_limit = float(
+        getattr(pipeline.cfg, "stage2_edge_cast_cleanup_ratio_max", 2.6)
+    )
     bad_sides = {
         name: _edge_color_cast_score(strip)
         for name, strip in sides.items()
-        if _edge_color_cast_score(strip) > max(0.010, center_cast * 2.6)
+        if _edge_color_cast_score(strip)
+        > max(absolute_limit, center_cast * relative_limit)
     }
     if not bad_sides:
         return ""
@@ -466,7 +626,12 @@ def _edge_color_artifact_crop(pipeline, crop_report: Optional[dict] = None) -> s
     crop_bottom = strip_h if "bottom" in bad_sides else 0
     crop_w = width - crop_left - crop_right
     crop_h = height - crop_top - crop_bottom
-    if crop_w <= width * 0.90 or crop_h <= height * 0.90:
+    # This is a fixed safety invariant, not a tuning parameter: color-edge
+    # cleanup must retain more than 90% of each current image dimension.
+    if (
+        crop_w <= width * STAGE2_COLOR_ARTIFACT_MIN_RETAINED_RATIO
+        or crop_h <= height * STAGE2_COLOR_ARTIFACT_MIN_RETAINED_RATIO
+    ):
         return ""
     if crop_report is not None:
         applied_rect, protection_note = _stage2_apply_crop(
@@ -513,14 +678,16 @@ def run_stage2_view_correction(pipeline) -> None:
     stage_label = PipelineStage.VIEW_CORRECTION.label
     pipeline.log.stage_start(stage_label)
     status = "ok"
+    review_reason_code = ""
     messages: List[str] = []
+    pipeline._stage2_view_review_required = False
     try:
         initial_shape = _stage2_shape_dict(pipeline.siril.get_image_shape())
     except (CommandError, SirilError, OSError, RuntimeError, TypeError, ValueError):
         initial_shape = {}
     crop_report = {
         "stage": "stage2_crop",
-        "mode": "auto_edge_detection",
+        "mode": "native_no_crop",
         "original_shape": initial_shape,
         "current_shape": initial_shape,
         "total_left": 0,
@@ -528,6 +695,7 @@ def run_stage2_view_correction(pipeline) -> None:
         "total_crop": {"left": 0, "top": 0, "right": 0, "bottom": 0},
         "crops": [],
         "crop_limit_hits": [],
+        "requires_review": False,
         "target_edge_black_ratio": float(getattr(pipeline.cfg, "stage2_edge_black_target", 0.03)),
         "center_protection": _stage2_center_protection(
             initial_shape,
@@ -536,13 +704,99 @@ def run_stage2_view_correction(pipeline) -> None:
     }
     pipeline.stage2_crop_report = crop_report
 
-    # 裁切边缘
-    pipeline.log.info("自动识别黑边/叠加边缘并裁切...")
+    if str(getattr(pipeline.cfg, "stage2_processing_mode", "auto")) == "preserve":
+        crop_report["mode"] = "user_preserve"
+        diagnostics = pipeline._measure_current_features()
+        edge_black_ratio = (
+            float(getattr(diagnostics, "edge_black_ratio", 0.0) or 0.0)
+            if diagnostics is not None
+            else None
+        )
+        requires_review = bool(
+            edge_black_ratio is not None
+            and edge_black_ratio
+            > float(
+                getattr(
+                    pipeline.cfg,
+                    "stage2_preserve_review_edge_black_max",
+                    0.30,
+                )
+            )
+        )
+        if requires_review:
+            pipeline._stage2_view_review_required = True
+        stage_saved = pipeline._save_stage_output("stage2_corrected")
+        crop_report.update(
+            {
+                "status": "ok" if stage_saved else "degraded",
+                "execution": "safe_passthrough",
+                "reason_code": "user_preserve",
+                "requires_review": requires_review,
+                "diagnostics": {"edge_black_ratio": edge_black_ratio},
+                "final_shape": initial_shape,
+                "messages": ["user requested original boundary preservation"],
+            }
+        )
+        if hasattr(pipeline, "_write_stage_json"):
+            pipeline._write_stage_json("stage2_crop_report.json", crop_report)
+        elapsed = pipeline.log.stage_end(stage_label)
+        pipeline._record_stage(
+            stage_label,
+            "ok" if stage_saved else "degraded",
+            elapsed,
+            "用户选择保留原图；已生成 Stage 2 安全直通产物",
+            execution="safe_passthrough",
+            reason_code="user_preserve",
+            details={
+                "output": "stage2_corrected" if stage_saved else None,
+                "requires_review": requires_review,
+                "edge_black_ratio": edge_black_ratio,
+            },
+        )
+        return
+
+    failure_action = str(
+        getattr(pipeline.cfg, "stage2_failure_action", "auto_fallback")
+    )
+    if failure_action != "auto_fallback":
+        if not pipeline._save_stage_output("stage2_input_checkpoint"):
+            messages.append("stage2 immutable input checkpoint could not be saved")
+
+    if bool(getattr(pipeline.cfg, "stage2_base_crop_enabled", False)):
+        margin = float(getattr(pipeline.cfg, "stage2_base_crop_margin", 0.02))
+        width = int(initial_shape.get("width", 0) or 0)
+        height = int(initial_shape.get("height", 0) or 0)
+        trim_x = max(0, int(round(width * margin)))
+        trim_y = max(0, int(round(height * margin)))
+        if trim_x or trim_y:
+            applied_rect, protection_note = _stage2_apply_crop(
+                pipeline,
+                crop_report,
+                trim_x,
+                trim_y,
+                width - 2 * trim_x,
+                height - 2 * trim_y,
+                reason="user_base_crop",
+            )
+            if protection_note:
+                messages.append(protection_note)
+            messages.append(
+                "base crop applied" if applied_rect is not None
+                else "base crop blocked by center protection"
+            )
+            if applied_rect is not None:
+                crop_report["mode"] = "user_base_crop"
+
+    native_contour_applied = False
     try:
-        crop_rect, crop_note = _detect_auto_edge_crop(pipeline, is_adaptive=False)
-        messages.append(crop_note)
-        if crop_rect:
-            x, y, crop_w, crop_h = crop_rect
+        pipeline.log.info("运行第一方轮廓/最大内接矩形边界检测...")
+        contour_rect, contour_note, contour_report = (
+            _detect_native_contour_candidate(pipeline)
+        )
+        crop_report["native_contour"] = contour_report
+        messages.append(contour_note)
+        if contour_rect is not None:
+            x, y, crop_w, crop_h = contour_rect
             applied_rect, protection_note = _stage2_apply_crop(
                 pipeline,
                 crop_report,
@@ -550,26 +804,176 @@ def run_stage2_view_correction(pipeline) -> None:
                 y,
                 crop_w,
                 crop_h,
-                reason="initial_auto_edge",
+                reason="native_contour",
             )
             if protection_note:
                 messages.append(protection_note)
-            if applied_rect is None:
-                pipeline.log.warn("中心面积保护已阻止本次边界裁切")
-                status = "degraded"
-            else:
-                applied_x, applied_y, applied_w, applied_h = applied_rect
-                pipeline.log.info(
-                    f"已自动裁切 (x={applied_x}, y={applied_y}, "
-                    f"w={applied_w}, h={applied_h})"
+            if applied_rect is not None:
+                native_contour_applied = True
+                crop_report["mode"] = "native_contour"
+                crop_report["native_contour"]["applied_crop"] = {
+                    "x": int(applied_rect[0]),
+                    "y": int(applied_rect[1]),
+                    "width": int(applied_rect[2]),
+                    "height": int(applied_rect[3]),
+                }
+                crop_report["native_contour"]["center_protection_limited"] = bool(
+                    protection_note
                 )
-        else:
-            pipeline.log.info(crop_note)
-    except (CommandError, SirilError) as e:
-        pipeline.log.warn(f"裁切失败: {e}")
+                pipeline.log.info(contour_note)
+            else:
+                crop_report["native_contour"]["accepted"] = False
+                crop_report["native_contour"]["reason"] = (
+                    "center_protection_blocked"
+                )
+    except (CommandError, SirilError) as error:
         status = "degraded"
+        crop_report["native_contour"] = {
+            "method": "native_contour",
+            "accepted": False,
+            "reason": "crop_command_failed",
+            "candidate": None,
+            "error": pipeline._short_text(error, 160),
+        }
+        messages.append(
+            "native contour crop command failed: "
+            f"{pipeline._short_text(error, 160)}"
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        crop_report["native_contour"] = {
+            "method": "native_contour",
+            "accepted": False,
+            "reason": "detector_error",
+            "candidate": None,
+            "error": pipeline._short_text(error, 160),
+        }
+        messages.append(
+            "native contour crop skipped: "
+            f"{pipeline._short_text(error, 160)}"
+        )
 
-    if status == "ok":
+    field_rotation_applied = False
+    if not native_contour_applied:
+        try:
+            pipeline.log.info("运行第一方场旋低覆盖边缘检测...")
+            field_rect, field_note, field_report = (
+                _detect_field_rotation_candidate(pipeline)
+            )
+            crop_report["field_rotation"] = field_report
+            messages.append(field_note)
+            if field_rect is not None:
+                x, y, crop_w, crop_h = field_rect
+                applied_rect, protection_note = _stage2_apply_crop(
+                    pipeline,
+                    crop_report,
+                    x,
+                    y,
+                    crop_w,
+                    crop_h,
+                    reason="native_field_rotation",
+                )
+                if protection_note:
+                    messages.append(protection_note)
+                if applied_rect is not None:
+                    field_rotation_applied = True
+                    crop_report["mode"] = "native_field_rotation"
+                    crop_report["field_rotation"]["applied_crop"] = {
+                        "x": int(applied_rect[0]),
+                        "y": int(applied_rect[1]),
+                        "width": int(applied_rect[2]),
+                        "height": int(applied_rect[3]),
+                    }
+                    crop_report["field_rotation"][
+                        "center_protection_limited"
+                    ] = bool(protection_note)
+                    pipeline.log.info(field_note)
+
+                    _residual_rect, residual_note, residual_report = (
+                        _detect_field_rotation_candidate(pipeline)
+                    )
+                    crop_report["field_rotation"]["residual"] = residual_report
+                    messages.append(f"post-crop {residual_note}")
+                    if bool(residual_report.get("accepted")):
+                        crop_report["requires_review"] = True
+                        crop_report["reason_code"] = (
+                            "field_rotation_residual_review"
+                        )
+                        pipeline._stage2_view_review_required = True
+                        status = "degraded"
+                        review_reason_code = "field_rotation_residual_review"
+                        messages.append(
+                            "field-rotation coverage anomaly remains after "
+                            "70% center protection; manual review required"
+                        )
+                else:
+                    crop_report["field_rotation"]["accepted"] = False
+                    crop_report["field_rotation"]["reason"] = (
+                        "center_protection_blocked"
+                    )
+        except (CommandError, SirilError) as error:
+            status = "degraded"
+            crop_report["field_rotation"] = {
+                "method": "native_field_rotation",
+                "accepted": False,
+                "reason": "crop_command_failed",
+                "candidate": None,
+                "error": pipeline._short_text(error, 160),
+            }
+            messages.append(
+                "field-rotation crop command failed: "
+                f"{pipeline._short_text(error, 160)}"
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            crop_report["field_rotation"] = {
+                "method": "native_field_rotation",
+                "accepted": False,
+                "reason": "detector_error",
+                "candidate": None,
+                "error": pipeline._short_text(error, 160),
+            }
+            messages.append(
+                "field-rotation coverage crop skipped: "
+                f"{pipeline._short_text(error, 160)}"
+            )
+
+    primary_crop_applied = native_contour_applied or field_rotation_applied
+
+    # 第一方候选没有通过安全门或没有实际裁切时，运行现有边缘检测方案。
+    if not primary_crop_applied:
+        pipeline.log.info("轮廓检测未裁切，自动识别黑边/叠加边缘并裁切...")
+        try:
+            crop_rect, crop_note = _detect_auto_edge_crop(pipeline, is_adaptive=False)
+            messages.append(crop_note)
+            if crop_rect:
+                x, y, crop_w, crop_h = crop_rect
+                applied_rect, protection_note = _stage2_apply_crop(
+                    pipeline,
+                    crop_report,
+                    x,
+                    y,
+                    crop_w,
+                    crop_h,
+                    reason="initial_auto_edge",
+                )
+                if protection_note:
+                    messages.append(protection_note)
+                if applied_rect is None:
+                    pipeline.log.warn("中心面积保护已阻止本次边界裁切")
+                    status = "degraded"
+                else:
+                    crop_report["mode"] = "native_edge"
+                    applied_x, applied_y, applied_w, applied_h = applied_rect
+                    pipeline.log.info(
+                        f"已自动裁切 (x={applied_x}, y={applied_y}, "
+                        f"w={applied_w}, h={applied_h})"
+                    )
+            else:
+                pipeline.log.info(crop_note)
+        except (CommandError, SirilError) as e:
+            pipeline.log.warn(f"裁切失败: {e}")
+            status = "degraded"
+
+    if status == "ok" and not primary_crop_applied:
         target = float(getattr(pipeline.cfg, "stage2_edge_black_target", 0.10))
         max_passes = int(getattr(pipeline.cfg, "stage2_adaptive_edge_crop_max_passes", 3))
         last_edge_black = None
@@ -615,7 +1019,17 @@ def run_stage2_view_correction(pipeline) -> None:
                         f"global_dark={getattr(edge_feat, 'global_dark_ratio', 0.0):.3f}"
                         f"->{getattr(after_feat, 'global_dark_ratio', 0.0):.3f}"
                     )
-                    if after_feat.edge_black_ratio >= edge_feat.edge_black_ratio - 0.003:
+                    improvement_min = float(
+                        getattr(
+                            pipeline.cfg,
+                            "stage2_edge_black_improvement_min",
+                            0.003,
+                        )
+                    )
+                    if (
+                        after_feat.edge_black_ratio
+                        >= edge_feat.edge_black_ratio - improvement_min
+                    ):
                         status = "degraded" if status == "ok" else status
                         messages.append(
                             "adaptive edge crop stopped: degraded_no_improvement "
@@ -652,7 +1066,17 @@ def run_stage2_view_correction(pipeline) -> None:
                     f"edge_black remains above stage2 target: {final_feat.edge_black_ratio:.3f}>{target:.3f}"
                 )
 
-    if status == "ok":
+    if (
+        status == "ok"
+        and not primary_crop_applied
+        and bool(
+            getattr(
+                pipeline.cfg,
+                "stage2_color_edge_cleanup_enabled",
+                True,
+            )
+        )
+    ):
         try:
             color_edge_note = _edge_color_artifact_crop(pipeline, crop_report)
             if color_edge_note:
@@ -667,6 +1091,27 @@ def run_stage2_view_correction(pipeline) -> None:
             pipeline.log.warn(f"彩色边缘检测失败: {e}")
             messages.append(f"adaptive color-edge crop skipped: {pipeline._short_text(e, 160)}")
 
+    if status == "degraded" and failure_action in {"preserve_review", "stop"}:
+        crop_report["failure_action"] = failure_action
+        if failure_action == "preserve_review":
+            try:
+                pipeline.cmd_with_check("load", "stage2_input_checkpoint")
+                pipeline._stage2_view_review_required = True
+                crop_report["execution"] = "safe_passthrough"
+                crop_report["reason_code"] = "failure_policy_preserve_review"
+                messages.append(
+                    "decisive Stage 2 failure restored immutable input for review"
+                )
+            except (CommandError, SirilError) as error:
+                status = "failed"
+                messages.append(
+                    "Stage 2 preserve_review restore failed: "
+                    f"{pipeline._short_text(error, 160)}"
+                )
+        else:
+            status = "failed"
+            messages.append("Stage 2 stop policy requested after diagnostics")
+
     stage_saved = pipeline._save_stage_output("stage2_corrected")
     if not stage_saved and status == "ok":
         status = "degraded"
@@ -677,9 +1122,38 @@ def run_stage2_view_correction(pipeline) -> None:
         crop_report["final_shape"] = crop_report.get("current_shape") or {}
     crop_report["total_crop"] = _stage2_crop_totals(crop_report)
     crop_report["status"] = status
+    crop_report["failure_action"] = failure_action
     crop_report["messages"] = messages
     if hasattr(pipeline, "_write_stage_json"):
         pipeline._write_stage_json("stage2_crop_report.json", crop_report)
 
     elapsed = pipeline.log.stage_end(stage_label)
-    pipeline._record_stage(stage_label, status, elapsed, "；".join(messages))
+    preserved_for_review = bool(
+        crop_report.get("reason_code") == "failure_policy_preserve_review"
+    )
+    pipeline._record_stage(
+        stage_label,
+        status,
+        elapsed,
+        "；".join(messages),
+        execution="safe_passthrough" if preserved_for_review else "completed",
+        fallback_used=status == "degraded",
+        upstream_passthrough=preserved_for_review,
+        reason_code=(
+            "failure_policy_preserve_review"
+            if preserved_for_review
+            else review_reason_code
+        ),
+        details={
+            "crop_detector": crop_report.get("mode", "native_no_crop"),
+            "failure_action": failure_action,
+            "final_source": (
+                "stage2_input_checkpoint"
+                if preserved_for_review
+                else "stage2_processed"
+            ),
+            "requires_review": bool(
+                getattr(pipeline, "_stage2_view_review_required", False)
+            ),
+        },
+    )

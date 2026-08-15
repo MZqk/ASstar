@@ -10,12 +10,12 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEV_LAUNCHER_PATH = REPO_ROOT / "gui" / "seestar_gui_dev.py"
+DEV_LAUNCHER_PATH = REPO_ROOT / "gui" / "starun_gui_dev.py"
 
 
 def _load_dev_launcher():
     spec = importlib.util.spec_from_file_location(
-        "seestar_gui_dev_test_module",
+        "starun_gui_dev_test_module",
         DEV_LAUNCHER_PATH,
     )
     if spec is None or spec.loader is None:
@@ -59,6 +59,10 @@ class GuiDevLauncherTests(unittest.TestCase):
             config.write_text("[core]\n", encoding="utf-8")
             plugin_dir = project_resources / "siril_plugins"
             plugin_dir.mkdir()
+            project_pipeline = project_resources.parent / "pipeline"
+            project_pipeline.mkdir()
+            pipeline_entry = project_pipeline / "starun.py"
+            pipeline_entry.write_text("# development pipeline\n", encoding="utf-8")
             siril_app = self._make_siril_app(root)
             seed = self._make_seed(root)
 
@@ -76,6 +80,10 @@ class GuiDevLauncherTests(unittest.TestCase):
             self.assertEqual(
                 (overlay / "siril_plugins").resolve(),
                 plugin_dir.resolve(),
+            )
+            self.assertEqual(
+                (overlay / "pipeline" / "starun.py").resolve(),
+                pipeline_entry.resolve(),
             )
             self.assertEqual((overlay / "Siril.app").resolve(), siril_app.resolve())
             self.assertEqual(

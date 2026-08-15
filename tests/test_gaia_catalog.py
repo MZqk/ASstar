@@ -29,7 +29,7 @@ class _Response(io.BytesIO):
 
 class GaiaCatalogTests(unittest.TestCase):
     def test_catalogue_path_is_runtime_home_not_project(self):
-        runtime_home = Path("/tmp/seestar-runtime-home")
+        runtime_home = Path("/tmp/starun-runtime-home")
         path = gaia_catalog.gaia_catalog_path(runtime_home)
         self.assertEqual(
             path,

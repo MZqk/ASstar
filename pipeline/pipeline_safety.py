@@ -70,33 +70,6 @@ def clamp_saturation_boost(
     return min(value, remaining)
 
 
-def clamp_ai_color_adjustments(
-    adjustments: Mapping[str, Any],
-    *,
-    already_applied: float,
-    limits: Mapping[str, Any],
-) -> Dict[str, float]:
-    """Apply Stage 4 saturation and channel-gain limits to a Stage 11 plan."""
-    result = {key: float(value) for key, value in adjustments.items()}
-    result["global_saturation_delta"] = clamp_saturation_boost(
-        result.get("global_saturation_delta", 0.0),
-        already_applied=already_applied,
-        limits=limits,
-    )
-
-    red_max_delta = max(0.0, float(limits.get("red_gain_limit", 1.08)) - 1.0)
-    blue_max_delta = max(0.0, float(limits.get("blue_gain_limit", 1.00)) - 1.0)
-    result["red_balance_delta"] = min(
-        result.get("red_balance_delta", 0.0),
-        red_max_delta,
-    )
-    result["blue_balance_delta"] = min(
-        result.get("blue_balance_delta", 0.0),
-        blue_max_delta,
-    )
-    return result
-
-
 def should_skip_final_denoise(
     *,
     stage5_denoise_applied: bool,

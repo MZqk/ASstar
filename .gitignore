@@ -73,14 +73,33 @@ dist/
 .workbuddy/
 .understand-anything/
 
+# Generated video-editor caches
+**/.thumbnails/
+**/.waveform-cache/
+
+# Local research materials
+**/*research*/
+
+# Local-only non-code assets
+*.md
+*.html
+*.png
+*.svg
+*.jpg
+*.jpeg
+*.gif
+*.wav
+*.mp4
+*.onnx
+*.pt
+*.pth
+
 # Build/log temp files
 *.log
 *.tmp
 *.pid
 *.sock
-resources/ai.env
 resources/siril_plugins/downloads/
-.seestar_ai.env
 siril_cat*_healpix*_astro*.dat
 siril_cat*_healpix*_xpsamp*.dat
 gaia_astrometric.dat
@@ -107,4 +126,4 @@ result_processed*.png
 result_processed*.tif
 result_processed*.tiff
 result_final.fit
-stage11_ai_*
+.gstack/

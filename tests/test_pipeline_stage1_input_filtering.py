@@ -15,7 +15,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PIPELINE_DIR = REPO_ROOT / "pipeline"
-PIPELINE_MODULE_PATH = PIPELINE_DIR / "seestar_Superimpose.py"
+PIPELINE_MODULE_PATH = PIPELINE_DIR / "starun.py"
 if str(PIPELINE_DIR) not in sys.path:
     sys.path.insert(0, str(PIPELINE_DIR))
 
@@ -101,7 +101,7 @@ def _load_pipeline_module():
     _ensure_fake_numpy()
     _ensure_fake_sirilpy()
     spec = importlib.util.spec_from_file_location(
-        "seestar_pipeline_stage1_filter_test_module",
+        "starun_pipeline_stage1_filter_test_module",
         PIPELINE_MODULE_PATH,
     )
     if spec is None or spec.loader is None:
@@ -147,19 +147,17 @@ class _Stage1Probe:
         self.source_file = None
         self.linear_intermediate_path = None
         self._stage1_input_mode = "unknown"
+        self._task_resume_checkpoint_path = None
         self.cmd_calls: list[tuple[Any, ...]] = []
 
     def _find_fit_files(self) -> list[Path]:
-        return self.module.SeestarPostProcessor._find_fit_files(self)
+        return self.module.StarunPostProcessor._find_fit_files(self)
 
     def _is_candidate_stacked(self, path: Path) -> bool:
-        return self.module.SeestarPostProcessor._is_candidate_stacked(self, path)
+        return self.module.StarunPostProcessor._is_candidate_stacked(self, path)
 
     def _prepare_process_dir(self) -> None:
-        return self.module.SeestarPostProcessor._prepare_process_dir(self)
-
-    def _stage2_corrected_resume_candidates(self) -> list[Path]:
-        return self.module.SeestarPostProcessor._stage2_corrected_resume_candidates(self)
+        return self.module.StarunPostProcessor._prepare_process_dir(self)
 
     def _load_stacked_file(self, _stacked_files: list[Path]) -> None:
         self.used_stacked = True
@@ -238,7 +236,7 @@ class _LinearResumeProbe(_Stage1Probe):
 
 class _Stage1PreprocessProbe(_Stage1Probe):
     def _prepare_isolated_light_input(self, light_files: list[Path]):
-        return self.module.SeestarPostProcessor._prepare_isolated_light_input(
+        return self.module.StarunPostProcessor._prepare_isolated_light_input(
             self,
             light_files,
         )
@@ -262,7 +260,7 @@ class PipelineStage1InputFilteringTests(unittest.TestCase):
                 path = work_dir / name
                 path.write_bytes(b"")
                 self.assertFalse(
-                    pipeline_module.SeestarPostProcessor._is_candidate_stacked(
+                    pipeline_module.StarunPostProcessor._is_candidate_stacked(
                         probe,
                         path,
                     ),
@@ -272,7 +270,7 @@ class PipelineStage1InputFilteringTests(unittest.TestCase):
             candidate = work_dir / "IC2177_master.fit"
             candidate.write_bytes(b"")
             self.assertTrue(
-                pipeline_module.SeestarPostProcessor._is_candidate_stacked(
+                pipeline_module.StarunPostProcessor._is_candidate_stacked(
                     probe,
                     candidate,
                 )
@@ -288,7 +286,7 @@ class PipelineStage1InputFilteringTests(unittest.TestCase):
 
             probe = _Stage1Probe(pipeline_module, work_dir)
 
-            pipeline_module.SeestarPostProcessor.stage1_preparation(probe)
+            pipeline_module.StarunPostProcessor.stage1_preparation(probe)
 
             self.assertFalse(probe.used_stacked)
             self.assertTrue(probe.used_light)
@@ -306,7 +304,7 @@ class PipelineStage1InputFilteringTests(unittest.TestCase):
                 "fail_ratio": 0.14,
             }
 
-            pipeline_module.SeestarPostProcessor.stage1_preparation(probe)
+            pipeline_module.StarunPostProcessor.stage1_preparation(probe)
 
             _name, status, message = probe.stage_records[-1]
             self.assertEqual(status, "degraded")
@@ -324,7 +322,7 @@ class PipelineStage1InputFilteringTests(unittest.TestCase):
                 "fail_ratio": 0.0875,
             }
 
-            pipeline_module.SeestarPostProcessor.stage1_preparation(probe)
+            pipeline_module.StarunPostProcessor.stage1_preparation(probe)
 
             _name, status, message = probe.stage_records[-1]
             self.assertEqual(status, "ok")
@@ -342,7 +340,7 @@ class PipelineStage1InputFilteringTests(unittest.TestCase):
             probe = _Stage1PreprocessProbe(pipeline_module, work_dir)
             probe.process_dir.mkdir()
 
-            stats = pipeline_module.SeestarPostProcessor._preprocess_light_frames(
+            stats = pipeline_module.StarunPostProcessor._preprocess_light_frames(
                 probe,
                 light_files,
             )
@@ -358,14 +356,16 @@ class PipelineStage1InputFilteringTests(unittest.TestCase):
             self.assertLess(stack_index, mirror_index)
             self.assertLess(mirror_index, load_index)
 
-    def test_prepare_linear_resume_input_uses_result_linear_fit(self):
+    def test_prepare_linear_resume_input_uses_verified_stage5_checkpoint(self):
         with tempfile.TemporaryDirectory() as td:
             work_dir = Path(td)
-            linear_path = work_dir / pipeline_module.LINEAR_RESUME_INPUT_NAME
+            linear_path = work_dir / "checkpoints" / "stage5" / "stage5_linear.fit"
+            linear_path.parent.mkdir(parents=True)
             linear_path.write_bytes(b"linear-fit")
             probe = _LinearResumeProbe(pipeline_module, work_dir)
+            probe._task_resume_checkpoint_path = linear_path
 
-            pipeline_module.SeestarPostProcessor._prepare_linear_resume_input(probe)
+            pipeline_module.StarunPostProcessor._prepare_linear_resume_input(probe)
 
             self.assertEqual(probe.source_file, linear_path)
             self.assertEqual(probe.linear_intermediate_path, linear_path)
@@ -376,20 +376,22 @@ class PipelineStage1InputFilteringTests(unittest.TestCase):
             name, status, message = probe.stage_records[0]
             self.assertEqual(name, "阶段 1: 前期准备")
             self.assertEqual(status, "ok")
-            self.assertIn("loaded verified Stage 5 checkpoint result_linear.fit", message)
+            self.assertIn("loaded verified Stage 5 checkpoint stage5_linear.fit", message)
 
-    def test_prepare_stage2_corrected_resume_uses_existing_process_artifact(self):
+    def test_prepare_stage2_corrected_resume_uses_verified_checkpoint(self):
         with tempfile.TemporaryDirectory() as td:
             work_dir = Path(td)
+            stage2_path = work_dir / "checkpoints" / "stage2" / pipeline_module.STAGE2_CORRECTED_INPUT_NAME
+            stage2_path.parent.mkdir(parents=True)
+            stage2_path.write_bytes(b"stage2-fit")
             old_process = work_dir / "process"
             old_process.mkdir()
-            stage2_path = old_process / pipeline_module.STAGE2_CORRECTED_INPUT_NAME
-            stage2_path.write_bytes(b"stage2-fit")
             stale_path = old_process / "stale.fit"
             stale_path.write_bytes(b"stale")
             probe = _LinearResumeProbe(pipeline_module, work_dir)
+            probe._task_resume_checkpoint_path = stage2_path
 
-            pipeline_module.SeestarPostProcessor._prepare_stage2_corrected_resume_input(probe)
+            pipeline_module.StarunPostProcessor._prepare_stage2_corrected_resume_input(probe)
 
             self.assertEqual(probe.source_file, stage2_path)
             self.assertIsNone(probe.linear_intermediate_path)
@@ -414,6 +416,20 @@ class PipelineStage1InputFilteringTests(unittest.TestCase):
             self.assertEqual(name, "阶段 2: 裁切")
             self.assertEqual(status, "ok")
             self.assertIn("continue from stage3", message)
+
+    def test_resume_preparation_rejects_root_result_without_verified_checkpoint(self):
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td)
+            (work_dir / "result_linear.fit").write_bytes(b"legacy-result")
+            probe = _LinearResumeProbe(pipeline_module, work_dir)
+
+            with self.assertRaisesRegex(
+                pipeline_module.SirilError,
+                "task-run manifest",
+            ):
+                pipeline_module.StarunPostProcessor._prepare_linear_resume_input(
+                    probe
+                )
 
 
 if __name__ == "__main__":

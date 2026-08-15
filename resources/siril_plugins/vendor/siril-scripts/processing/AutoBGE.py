@@ -2,7 +2,7 @@
 # AutoBGE for Siril - Converted to PyQt6
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# Version 2.0.0
+# Version 2.0.2
 # 1.0.0 Initial release
 # 1.0.1 Clear rectangular selection after setting exclusion area
 # 1.0.2 Mono images remain mono after processing
@@ -11,6 +11,7 @@
 # 1.0.4 Fix CLI mode so the script can be used with pyscript
 # 2.0.0 Converted to PyQt6
 # 2.0.1 If no CLI arguments, run in GUI mode by default
+# 2.0.2 Adding psutil in dependencies
 
 """
 Auto Background Extraction script for Siril
@@ -52,7 +53,7 @@ script with pyscript.
 import sys
 import argparse
 import sirilpy as s
-s.ensure_installed("opencv-python", "scipy", "PyQt6")
+s.ensure_installed("opencv-python", "scipy", "PyQt6", "psutil")
 import numpy as np
 import math
 import cv2
@@ -64,7 +65,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 
 if not s.check_module_version(">=0.7.41"):
     print("Error: requires sirilpy version 0.7.41 or higher")
@@ -959,7 +960,8 @@ when drawing exclusion areas.
 
         factor = self.downsample_scale
         scaled_points = [(x * factor, (h - y) * factor) for x, y in points]
-        self.siril.set_image_bgsamples(scaled_points, show_samples = True)
+        with self.siril.image_lock():
+            self.siril.set_image_bgsamples(scaled_points, show_samples = True)
         return np.array(points)
 
     def fit_background(self, image, sample_points, smooth=0.1, patch_size=15):

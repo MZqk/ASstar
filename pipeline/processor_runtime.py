@@ -1,4 +1,4 @@
-"""Service mixins for SeestarPostProcessor."""
+"""Service mixins for StarunPostProcessor."""
 from __future__ import annotations
 
 import copy
@@ -18,7 +18,6 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
-import ai_advisory
 import cosmic_clarity
 import plugin_runner
 import sasp_runner
@@ -30,8 +29,19 @@ import stage7_quality
 import stage7_repair
 import stage8_pixels
 from channel_semantics import channel_shape_dict, classify_channel_semantics
+from dualband_palette import PALETTE_CHANNELS, resolve_palette_selection
 from input_profile import infer_input_profile
 import run_manifest
+import task_plan
+import task_workspace
+from processing_parameters import (
+    SPECS_BY_STAGE,
+    apply_processing_parameters_to_config,
+    default_processing_parameters,
+    gate_profile_requires_review,
+    normalize_processing_parameters,
+    processing_gate_profile_audit,
+)
 from image_metrics import (
     _box_blur_gray,
     _clamp_float,
@@ -45,11 +55,11 @@ from models import (
     InputProfile,
     PipelineStage,
     QualityMetrics,
-    Stage6StretchStrategy,
+    Stage7StretchStrategy,
     StageResult,
     TargetType,
 )
-from save_utils import save_stage_output, write_ai_raw_response, write_stage_json
+from save_utils import save_stage_output, write_stage_json
 
 try:
     from sirilpy.exceptions import CommandError, DataError, SirilError
@@ -61,219 +71,220 @@ except ImportError:
 try:
     from image_feature_analyzer import analyze_image as analyze_adaptive_image
     from policy_selector import DEFAULT_POLICY, policy_for_profile
-    from stretch_candidate_evaluator import (
-        build_candidate_spec,
-        candidate_modes,
-        choose_best as choose_best_stretch_candidate,
-        score_candidate as score_stretch_candidate,
-    )
     from target_profiler import build_target_profile
 except (ImportError, RuntimeError):
     analyze_adaptive_image = None
     DEFAULT_POLICY = {
         "policy_name": "generic_low_snr_safe",
-        "stage6_stretch": {"fallback_candidate": "asinh_core_protect"},
+        "stage7_stretch": {"fallback_candidate": "asinh_core_protect"},
     }
     policy_for_profile = None
-    build_candidate_spec = None
-    candidate_modes = None
-    choose_best_stretch_candidate = None
-    score_stretch_candidate = None
     build_target_profile = None
 
 ENV_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 ENV_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
-ENV_DEBUG_MODE_KEY = "SEESTAR_DEBUG_MODE"
-ENV_INPUT_MODE_KEY = "SEESTAR_INPUT_MODE"
+ENV_DEBUG_MODE_KEY = "STARUN_DEBUG_MODE"
+ENV_INPUT_MODE_KEY = "STARUN_INPUT_MODE"
 PROJECT_DEFAULT_ENV_RESOURCE_REL = Path("resources") / "default.env"
-PROJECT_ENV_RESOURCE_REL = Path("resources") / "ai.env"
-PROJECT_ENV_OVERRIDE_NAME = ".seestar_ai.env"
 PROJECT_ENV_ALLOWED_KEYS = frozenset(
     {
-        "SEESTAR_DEBUG_MODE",
-        "SEESTAR_INPUT_MODE",
-        "SEESTAR_OUTPUT_FORMAT",
-        "SEESTAR_NETWORK_MODE",
-        "SEESTAR_WORKFLOW_PLUGIN_PROBE",
-        "SEESTAR_SPCC_ENABLE",
-        "SEESTAR_GAIA_PHOTO_CATALOG",
-        "SEESTAR_SPCC_DATABASE_DIR",
-        "SEESTAR_STAGE4_PLATESOLVE_ENABLE",
-        "SEESTAR_STAGE4_PLATESOLVE_FOCAL",
-        "SEESTAR_STAGE4_PLATESOLVE_PIXELSIZE",
-        "SEESTAR_STAGE4_PLATESOLVE_ORDER",
-        "SEESTAR_STAGE4_PLATESOLVE_CATALOGS",
-        "SEESTAR_STAGE4_PLATESOLVE_HEADER_RADIUS",
-        "SEESTAR_STAGE4_AUTO_GEOMETRY_ENABLE",
-        "SEESTAR_STAGE4_AUTO_GEOMETRY_CONFIDENCE_MIN",
-        "SEESTAR_STAGE4_AUTO_GEOMETRY_SCALE_RESIDUAL_MAX",
-        "SEESTAR_STAGE4_SPCC_TIMEOUT_SEC",
-        "SEESTAR_STAGE4_SPCC_OSC_SENSOR",
-        "SEESTAR_STAGE4_SPCC_OSC_FILTER",
-        "SEESTAR_STAGE4_SPCC_WHITE_REF",
-        "SEESTAR_STAGE4_SPCC_LIMITMAG",
-        "SEESTAR_STAGE4_SPCC_NB_R_WAVELENGTH_NM",
-        "SEESTAR_STAGE4_SPCC_NB_R_BANDWIDTH_NM",
-        "SEESTAR_STAGE4_SPCC_NB_G_WAVELENGTH_NM",
-        "SEESTAR_STAGE4_SPCC_NB_G_BANDWIDTH_NM",
-        "SEESTAR_STAGE4_SPCC_NB_B_WAVELENGTH_NM",
-        "SEESTAR_STAGE4_SPCC_NB_B_BANDWIDTH_NM",
-        "SEESTAR_STAGE4_NBN_ENABLE",
-        "SEESTAR_STAGE4_NBN_MAPPING_CONFIDENCE_MIN",
-        "SEESTAR_STAGE4_NBN_STRENGTH",
-        "SEESTAR_STAGE4_NBN_GAIN_LIMIT",
-        "SEESTAR_STAGE4_NBN_LINE_RATIO_DRIFT_MAX",
-        "SEESTAR_GAIA_ASTRO_CATALOG",
-        "SEESTAR_STAGE4_FILTER_HINT",
-        "SEESTAR_STAGE4_PCC_TIMEOUT_SEC",
-        "SEESTAR_STAGE4_LOCAL_STAR_WB_ENABLE",
-        "SEESTAR_STAGE4_LOCAL_STAR_WB_MIN_PIXELS",
-        "SEESTAR_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT",
-        "SEESTAR_STAGE4_LOCAL_STAR_MASK_RADIUS",
-        "SEESTAR_STAGE4_LOCAL_STAR_MASK_COVERAGE_MAX",
-        "SEESTAR_ABERRATION_API_ENABLE",
-        "SEESTAR_ABERRATION_PROVIDER",
-        "SEESTAR_OPTIONAL_COLOR_TRANSFORM",
-        "SEESTAR_DENOISE_ENABLE",
-        "SEESTAR_DENOISE_FORCE",
-        "SEESTAR_STAGE5_MULTISCALE_DENOISE_ENABLE",
-        "SEESTAR_STAGE5_MULTISCALE_DENOISE_STRENGTH",
-        "SEESTAR_STAGE5_MULTISCALE_DETAIL_RETENTION_MIN",
-        "SEESTAR_STAGE5_MULTISCALE_NOISE_REDUCTION_MIN",
-        "SEESTAR_STAGE5_BUILTIN_DENOISE_MOD",
-        "SEESTAR_STAGE5_DECONV_ENABLE",
-        "SEESTAR_STAGE5_GRAXPERT_DECONV_ENABLE",
-        "SEESTAR_STAGE5_RL_MAXSTARS",
-        "SEESTAR_STAGE5_RL_PSF_KS",
-        "SEESTAR_STAGE5_RL_ITERS",
-        "SEESTAR_STAGE5_RL_ALPHA",
-        "SEESTAR_STAGE5_RL_GDSTEP",
-        "SEESTAR_STAGE5_RL_STOP",
-        "SEESTAR_STAGE5_GRAXPERT_DECONV_STRENGTH",
-        "SEESTAR_GRAXPERT_OBJECT_MODEL_PATH",
-        "SEESTAR_GRAXPERT_GPU",
-        "SEESTAR_AI_ENABLED",
-        "SEESTAR_AI_ENDPOINT",
-        "SEESTAR_AI_MODEL",
-        "SEESTAR_AI_API_KEY",
-        "SEESTAR_AI_TIMEOUT_SEC",
-        "SEESTAR_AI_STRENGTH",
-        "SEESTAR_AI_PROMPT",
-        "SEESTAR_AI_ADVISOR_MODE",
-        "SEESTAR_AI_STAGE6_ENABLE",
-        "SEESTAR_AI_STAGE7_ENABLE",
-        "SEESTAR_AI_STAGE8_ENABLE",
-        "SEESTAR_AI_ARTISTIC_DERIVATIVE_ENABLED",
-        "SEESTAR_AI_ARTISTIC_ENDPOINT",
-        "SEESTAR_AI_ARTISTIC_MODEL",
-        "SEESTAR_AI_ARTISTIC_API_KEY",
-        "SEESTAR_AI_ARTISTIC_PROMPT",
-        "SEESTAR_AI_ARTISTIC_TIMEOUT_SEC",
-        "SEESTAR_STAGE7_QUALITY_RETRY_MAX",
-        "SEESTAR_STAGE7_SKIP_UNREADY_STARLESS",
-        "SEESTAR_STAR_SEPARATION_MODE",
-        "SEESTAR_STAGE7_SOFT_STARLESS_ASINH_STRETCH",
-        "SEESTAR_STAGE7_BRIGHT_NEBULA_HALO_RESIDUE_SCORE_MAX",
-        "SEESTAR_STAGE7_STARLESS_REPAIR_STRENGTH",
-        "SEESTAR_STAGE7_STARLESS_HALO_REPAIR_STRENGTH",
-        "SEESTAR_STAGE7_STARLESS_CHROMA_DENOISE_STRENGTH",
-        "SEESTAR_STAGE7_STRETCH_CHROMA_NOISE_SCORE_MAX",
-        "SEESTAR_STAGE7_STRETCH_BACKGROUND_MOTTLING_SCORE_MAX",
-        "SEESTAR_STAGE7_STRETCH_CHROMA_LOAD_GROWTH_MAX",
-        "SEESTAR_STAGE7_STRETCH_CHROMA_LOAD_LOW_ABSOLUTE_MAX",
-        "SEESTAR_STAGE7_STRETCH_CHROMA_LOAD_LOW_ABSOLUTE_TOLERANCE",
-        "SEESTAR_STAGE7_CHROMA_RESCUE_ENABLE",
-        "SEESTAR_STAGE7_PREVIEW_TARGET_P50_MIN_RATIO",
-        "SEESTAR_STAGE7_PREVIEW_TARGET_P50_MAX_RATIO",
-        "SEESTAR_STAGE7_STRETCH_FEEDBACK_RETRY_MAX",
-        "SEESTAR_STAGE7_STARLESS_STRUCTURE_GATE_ENABLE",
-        "SEESTAR_STAGE7_STARLESS_MASKED_RANK_DRIFT_P95_MAX",
-        "SEESTAR_STAGE7_STARLESS_HALO_DETAIL_GROWTH_RATIO_MAX",
-        "SEESTAR_STAGE7_STARLESS_HALO_DETAIL_DELTA_MIN",
-        "SEESTAR_STAGE7_QUANTILE_FALLBACK_ENABLE",
-        "SEESTAR_STAGE7_STARLESS_PIXEL_REPAIR_ENABLE",
-        "SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_REDUCTION_MIN",
-        "SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_DELTA_MIN",
-        "SEESTAR_STAGE7_STARMASK_DIFFUSE_RESIDUAL_RATIO_MAX",
-        "SEESTAR_STAGE8_FORCE_CONSERVATIVE_AFTER_STAGE7_REPAIR",
-        "SEESTAR_STAGE8_LOCAL_ADJUSTMENT_ENGINE_ENABLE",
-        "SEESTAR_STAGE8_LOCAL_CURVE_OPACITY",
-        "SEESTAR_STAGE8_LIMITED_SATURATION_MAX",
-        "SEESTAR_STAGE8_LIMITED_CORE_EXCLUSION_EXPAND",
-        "SEESTAR_STAGE8_LIMITED_HALO_TEXTURE_GROWTH_MAX",
-        "SEESTAR_STAGE8_LIMITED_HALO_TEXTURE_DELTA_MAX",
-        "SEESTAR_STAGE9_STARMASK_STRETCH_ENABLE",
-        "SEESTAR_STAGE9_STARMASK_ADAPTIVE_STRETCH_ENABLE",
-        "SEESTAR_STAGE9_STAR_COLOR_REPAIR_ENABLE",
-        "SEESTAR_STAGE9_STAR_COLOR_REPAIR_STRENGTH",
-        "SEESTAR_STAGE9_STAR_COLOR_SUPPORT_RATIO_MAX",
-        "SEESTAR_STAGE9_STAR_COLOR_IMPROVEMENT_MIN",
-        "SEESTAR_STAGE9_STAR_COLOR_POST_CHROMA_ERROR_MAX",
-        "SEESTAR_STAGE9_SOURCE_STAR_DETAIL_PERCENTILE",
-        "SEESTAR_STAGE9_SOURCE_COMPONENT_DENSITY_MAX",
-        "SEESTAR_STAGE9_SOURCE_SINGLE_PIXEL_RATIO_MAX",
-        "SEESTAR_STAGE9_STARMASK_ASINH_STRETCH",
-        "SEESTAR_STAGE9_STARMASK_ASINH_OFFSET",
-        "SEESTAR_STAGE9_STARMASK_ASINH_STRETCH_MAX",
-        "SEESTAR_STAGE9_STARMASK_FAINT_TARGET",
-        "SEESTAR_STAGE9_STARMASK_MID_TARGET",
-        "SEESTAR_STAGE9_STARMASK_BRIGHT_TARGET",
-        "SEESTAR_STAGE9_STARMASK_PEAK_TARGET",
-        "SEESTAR_STAGE9_STARMASK_CHROMA_REGULARIZATION_ENABLE",
-        "SEESTAR_STAGE9_STARMASK_FAINT_CHROMA_MAX",
-        "SEESTAR_STAGE9_STARMASK_BRIGHT_CHROMA_MAX",
-        "SEESTAR_STAGE9_STARMASK_PREDICTED_CHANGE_RATIO_MAX",
-        "SEESTAR_STAGE9_STAR_REFERENCE_SIGMA",
-        "SEESTAR_STAGE9_COMPACT_WEAK_STAR_RETENTION_MIN",
-        "SEESTAR_STAGE9_MIXED_STAR_PEAK_RATIO_MIN",
-        "SEESTAR_STAGE9_MIXED_STAR_WEAK_COUNT_MIN",
-        "SEESTAR_STAGE9_MIXED_STAR_BRIGHT_COUNT_MIN",
-        "SEESTAR_STAGE7_TARGET_LOCAL_METRICS_ENABLE",
-        "SEESTAR_STAGE7_LOCAL_CORE_CLIP_RATIO_MAX",
-        "SEESTAR_STAGE7_LOCAL_FAINT_SNR_MIN",
-        "SEESTAR_STAGE7_LOCAL_DARK_SEPARATION_MIN",
-        "SEESTAR_STAGE9_QUALITY_GATE_ENABLE",
-        "SEESTAR_STAGE9_HIGHLIGHT_CLIP_RATIO_MAX",
-        "SEESTAR_STAGE9_HIGHLIGHT_CLIP_GROWTH_MAX",
-        "SEESTAR_STAGE9_BRIGHT_PIXEL_GROWTH_MAX",
-        "SEESTAR_STAGE9_BACKGROUND_LIFT_MAX",
-        "SEESTAR_STAGE9_BACKGROUND_MOTTLING_GROWTH_MAX",
-        "SEESTAR_STAGE9_MOTTLING_EXEMPTION_CHANGED_PIXEL_RATIO_MAX",
-        "SEESTAR_STAGE9_CHANGED_PIXEL_RATIO_MAX",
-        "SEESTAR_STAGE9_DARKENING_RATIO_MAX",
-        "SEESTAR_STAGE9_WEAK_STAR_RECOVERY_RATIO_MIN",
-        "SEESTAR_STAGE9_STAR_RECOVERY_RATIO_MIN",
-        "SEESTAR_STAGE9_WEAK_STAR_SCREEN_INTENSITY_MIN",
-        "SEESTAR_STAGE9_STAR_SUPPORT_RATIO_MAX",
-        "SEESTAR_STAGE9_UNMATCHED_CHANGED_RATIO_MAX",
-        "SEESTAR_STAGE9_CHROMATIC_ADDITION_PEAK_MIN",
-        "SEESTAR_STAGE9_CHROMATIC_ADDITION_SATURATION_MIN",
-        "SEESTAR_STAGE9_CHROMATIC_ADDITION_RATIO_MAX",
-        "SEESTAR_STAGE9_STAR_APERTURE_RECOVERY_RATIO_MIN",
-        "SEESTAR_STAGE9_STAR_WING_RECOVERY_RATIO_MIN",
-        "SEESTAR_STAGE9_RESIDUAL_DARK_HOLE_RATIO_MAX",
-        "SEESTAR_STAGE9_HOLLOW_STRUCTURE_DELTA_MIN",
-        "SEESTAR_STAGE9_NEW_HOLLOW_STRUCTURE_AREA_MAX",
-        "SEESTAR_FORCE_REVIEW_ONLY_OUTPUT",
-        "SEESTAR_STAGE10_MANAGED_OUTPUT_ENABLE",
-        "SEESTAR_COSMIC_CLASSIC_ENABLE",
-        "SEESTAR_COSMIC_CLARITY_EXECUTABLE",
-        "SEESTAR_COSMIC_CLASSIC_GPU",
-        "SEESTAR_COSMIC_NATIVE_GPU",
-        "SEESTAR_SYQON_GPU",
-        "SEESTAR_SYQON_TIMEOUT_SEC",
-        "SEESTAR_SIRILPY_TIMEOUT_SEC",
-        "SEESTAR_SIRIL_PLUGIN_DIR",
+        "STARUN_DEBUG_MODE",
+        "STARUN_INPUT_MODE",
+        "STARUN_OUTPUT_FORMAT",
+        "STARUN_NETWORK_MODE",
+        "STARUN_WORKFLOW_PLUGIN_PROBE",
+        "STARUN_SPCC_ENABLE",
+        "STARUN_GAIA_PHOTO_CATALOG",
+        "STARUN_SPCC_DATABASE_DIR",
+        "STARUN_STAGE4_PLATESOLVE_ENABLE",
+        "STARUN_STAGE4_PLATESOLVE_FOCAL",
+        "STARUN_STAGE4_PLATESOLVE_PIXELSIZE",
+        "STARUN_STAGE4_PLATESOLVE_ORDER",
+        "STARUN_STAGE4_PLATESOLVE_CATALOGS",
+        "STARUN_STAGE4_PLATESOLVE_HEADER_RADIUS",
+        "STARUN_STAGE4_AUTO_GEOMETRY_ENABLE",
+        "STARUN_STAGE4_AUTO_GEOMETRY_CONFIDENCE_MIN",
+        "STARUN_STAGE4_AUTO_GEOMETRY_SCALE_RESIDUAL_MAX",
+        "STARUN_STAGE4_SPCC_TIMEOUT_SEC",
+        "STARUN_STAGE4_SPCC_ONLINE_UNVERIFIED_TIMEOUT_SEC",
+        "STARUN_STAGE4_SPCC_OSC_SENSOR",
+        "STARUN_STAGE4_SPCC_OSC_FILTER",
+        "STARUN_STAGE4_SPCC_WHITE_REF",
+        "STARUN_STAGE4_SPCC_LIMITMAG",
+        "STARUN_STAGE4_SPCC_NB_R_WAVELENGTH_NM",
+        "STARUN_STAGE4_SPCC_NB_R_BANDWIDTH_NM",
+        "STARUN_STAGE4_SPCC_NB_G_WAVELENGTH_NM",
+        "STARUN_STAGE4_SPCC_NB_G_BANDWIDTH_NM",
+        "STARUN_STAGE4_SPCC_NB_B_WAVELENGTH_NM",
+        "STARUN_STAGE4_SPCC_NB_B_BANDWIDTH_NM",
+        "STARUN_STAGE4_NBN_ENABLE",
+        "STARUN_STAGE4_NBN_MAPPING_CONFIDENCE_MIN",
+        "STARUN_STAGE4_NBN_STRENGTH",
+        "STARUN_STAGE4_NBN_GAIN_LIMIT",
+        "STARUN_STAGE4_NBN_LINE_RATIO_DRIFT_MAX",
+        "STARUN_GAIA_ASTRO_CATALOG",
+        "STARUN_STAGE4_FILTER_HINT",
+        "STARUN_STAGE4_OFFLINE_FALLBACK_MODE",
+        "STARUN_STAGE4_AUTO_REFERENCE_GLOBAL_WHITE_ENABLE",
+        "STARUN_STAGE4_AUTO_REFERENCE_BACKGROUND_SAMPLE_TARGET",
+        "STARUN_STAGE4_AUTO_REFERENCE_BACKGROUND_SAMPLE_MIN",
+        "STARUN_STAGE4_AUTO_REFERENCE_HOLDOUT_RATIO",
+        "STARUN_STAGE4_AUTO_REFERENCE_BACKGROUND_ERROR_MIN",
+        "STARUN_STAGE4_AUTO_REFERENCE_BACKGROUND_IMPROVEMENT_MIN",
+        "STARUN_STAGE4_AUTO_REFERENCE_STAR_MIN_OBJECTS",
+        "STARUN_STAGE4_AUTO_REFERENCE_STAR_RATIO_MAD_MAX",
+        "STARUN_STAGE4_AUTO_REFERENCE_STAR_SATURATION_RATIO_MAX",
+        "STARUN_STAGE4_AUTO_REFERENCE_GAIN_LIMIT",
+        "STARUN_STAGE4_AUTO_REFERENCE_STAR_IMPROVEMENT_MIN",
+        "STARUN_STAGE4_AUTO_REFERENCE_HIGHLIGHT_CLIP_GROWTH_MAX",
+        "STARUN_STAGE4_AUTO_REFERENCE_BLACK_CLIP_GROWTH_MAX",
+        "STARUN_STAGE4_AUTO_REFERENCE_GRADIENT_GROWTH_MAX",
+        "STARUN_STAGE4_AUTO_REFERENCE_TEXTURE_GROWTH_MAX",
+        "STARUN_STAGE4_AUTO_REFERENCE_TARGET_CHROMA_DRIFT_MAX",
+        "STARUN_STAGE4_PCC_TIMEOUT_SEC",
+        "STARUN_STAGE4_LOCAL_STAR_WB_ENABLE",
+        "STARUN_STAGE4_LOCAL_STAR_WB_MIN_PIXELS",
+        "STARUN_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT",
+        "STARUN_STAGE4_LOCAL_STAR_MASK_RADIUS",
+        "STARUN_STAGE4_LOCAL_STAR_MASK_COVERAGE_MAX",
+        "STARUN_ABERRATION_API_ENABLE",
+        "STARUN_ABERRATION_PROVIDER",
+        "STARUN_OPTIONAL_COLOR_TRANSFORM",
+        "STARUN_STAGE8_DUALBAND_PALETTE_ENABLE",
+        "STARUN_STAGE8_DUALBAND_PALETTE_QUALITY_WARNING_TOLERANCE",
+        "STARUN_DENOISE_ENABLE",
+        "STARUN_DENOISE_FORCE",
+        "STARUN_DENOISE_MOD",
+        "STARUN_STAGE5_MULTISCALE_DENOISE_ENABLE",
+        "STARUN_STAGE5_MULTISCALE_DENOISE_STRENGTH",
+        "STARUN_STAGE5_MULTISCALE_DETAIL_RETENTION_MIN",
+        "STARUN_STAGE5_MULTISCALE_NOISE_REDUCTION_MIN",
+        "STARUN_STAGE5_DENOISE_CHROMA_NOISE_GROWTH_MAX",
+        "STARUN_STAGE5_DECONV_ENABLE",
+        "STARUN_STAGE5_GRAXPERT_DECONV_ENABLE",
+        "STARUN_STAGE5_RL_MAXSTARS",
+        "STARUN_STAGE5_RL_PSF_KS",
+        "STARUN_STAGE5_RL_ITERS",
+        "STARUN_STAGE5_RL_ALPHA",
+        "STARUN_STAGE5_RL_GDSTEP",
+        "STARUN_STAGE5_RL_STOP",
+        "STARUN_STAGE5_GRAXPERT_DECONV_STRENGTH",
+        "STARUN_GRAXPERT_OBJECT_MODEL_PATH",
+        "STARUN_GRAXPERT_GPU",
+        "STARUN_STAGE7_QUALITY_RETRY_MAX",
+        "STARUN_STAGE7_LARGE_GALAXY_HALO_RESIDUE_SCORE_MAX",
+        "STARUN_STAGE7_BRIGHT_NEBULA_HALO_RESIDUE_SCORE_MAX",
+        "STARUN_STAGE7_GALAXY_ROI_HALO_GATE_ENABLE",
+        "STARUN_STAGE7_GALAXY_CORE_PRESERVATION_RATIO_MIN",
+        "STARUN_STAGE7_GALAXY_CORE_CONTRAST_RATIO_MIN",
+        "STARUN_STAGE7_STARLESS_REPAIR_STRENGTH",
+        "STARUN_STAGE7_STARLESS_HALO_REPAIR_STRENGTH",
+        "STARUN_STAGE7_STARLESS_CHROMA_DENOISE_STRENGTH",
+        "STARUN_STAGE7_STRETCH_CHROMA_NOISE_SCORE_MAX",
+        "STARUN_STAGE7_STRETCH_BACKGROUND_MOTTLING_SCORE_MAX",
+        "STARUN_STAGE7_STRETCH_CHROMA_LOAD_GROWTH_MAX",
+        "STARUN_STAGE7_STRETCH_CHROMA_LOAD_LOW_ABSOLUTE_MAX",
+        "STARUN_STAGE7_STRETCH_CHROMA_LOAD_LOW_ABSOLUTE_TOLERANCE",
+        "STARUN_STAGE7_UNCALIBRATED_BACKGROUND_CHROMA_LOAD_REVIEW_MAX",
+        "STARUN_STAGE7_CHROMA_RESCUE_ENABLE",
+        "STARUN_STAGE7_PREVIEW_TARGET_P50_MIN_RATIO",
+        "STARUN_STAGE7_PREVIEW_TARGET_P50_MAX_RATIO",
+        "STARUN_STAGE7_STRETCH_FEEDBACK_RETRY_MAX",
+        "STARUN_STAGE7_STARLESS_STRUCTURE_GATE_ENABLE",
+        "STARUN_STAGE7_STARLESS_MASKED_RANK_DRIFT_P95_MAX",
+        "STARUN_STAGE7_STARLESS_HALO_DETAIL_GROWTH_RATIO_MAX",
+        "STARUN_STAGE7_STARLESS_HALO_DETAIL_DELTA_MIN",
+        "STARUN_STAGE7_QUANTILE_FALLBACK_ENABLE",
+        "STARUN_STAGE7_STARLESS_PIXEL_REPAIR_ENABLE",
+        "STARUN_STAGE7_STARLESS_REPAIR_CHROMA_REDUCTION_MIN",
+        "STARUN_STAGE7_STARLESS_REPAIR_CHROMA_DELTA_MIN",
+        "STARUN_STAGE7_STARMASK_DIFFUSE_RESIDUAL_RATIO_MAX",
+        "STARUN_STAGE8_FORCE_CONSERVATIVE_AFTER_STAGE7_REPAIR",
+        "STARUN_STAGE8_LOCAL_ADJUSTMENT_ENGINE_ENABLE",
+        "STARUN_STAGE8_LOCAL_CURVE_OPACITY",
+        "STARUN_STAGE8_LIMITED_SATURATION_MAX",
+        "STARUN_STAGE8_LIMITED_CORE_EXCLUSION_EXPAND",
+        "STARUN_STAGE8_LIMITED_HALO_TEXTURE_GROWTH_MAX",
+        "STARUN_STAGE8_LIMITED_HALO_TEXTURE_DELTA_MAX",
+        "STARUN_STAGE8_DUALBAND_PALETTE_STRENGTH",
+        "STARUN_STAGE8_DUALBAND_PALETTE_LUMA_DRIFT_MAX",
+        "STARUN_STAGE8_DUALBAND_PALETTE_CLIP_GROWTH_MAX",
+        "STARUN_STAGE9_STARMASK_STRETCH_ENABLE",
+        "STARUN_STAGE9_STARMASK_ADAPTIVE_STRETCH_ENABLE",
+        "STARUN_STAGE9_COMPACT_STARMASK_ENABLE",
+        "STARUN_STAGE9_STARMASK_PRE_STRETCH_COMPACT_ENABLE",
+        "STARUN_STAGE9_STAR_COLOR_REPAIR_ENABLE",
+        "STARUN_STAGE9_STAR_COLOR_REPAIR_STRENGTH",
+        "STARUN_STAGE9_STAR_COLOR_SUPPORT_RATIO_MAX",
+        "STARUN_STAGE9_STAR_COLOR_IMPROVEMENT_MIN",
+        "STARUN_STAGE9_STAR_COLOR_POST_CHROMA_ERROR_MAX",
+        "STARUN_STAGE9_STAR_COLOR_POST_VALIDATION_ENABLE",
+        "STARUN_STAGE9_SOURCE_STAR_DETAIL_PERCENTILE",
+        "STARUN_STAGE9_SOURCE_COMPONENT_DENSITY_MAX",
+        "STARUN_STAGE9_SOURCE_SINGLE_PIXEL_RATIO_MAX",
+        "STARUN_STAGE9_STARMASK_ASINH_STRETCH",
+        "STARUN_STAGE9_STARMASK_ASINH_OFFSET",
+        "STARUN_STAGE9_STARMASK_ASINH_STRETCH_MAX",
+        "STARUN_STAGE9_STARMASK_FAINT_TARGET",
+        "STARUN_STAGE9_STARMASK_MID_TARGET",
+        "STARUN_STAGE9_STARMASK_BRIGHT_TARGET",
+        "STARUN_STAGE9_STARMASK_PEAK_TARGET",
+        "STARUN_STAGE9_STARMASK_CHROMA_REGULARIZATION_ENABLE",
+        "STARUN_STAGE9_STARMASK_FAINT_CHROMA_MAX",
+        "STARUN_STAGE9_STARMASK_BRIGHT_CHROMA_MAX",
+        "STARUN_STAGE9_STARMASK_PREDICTED_CHANGE_RATIO_MAX",
+        "STARUN_STAGE9_STAR_REFERENCE_SIGMA",
+        "STARUN_STAGE9_COMPACT_WEAK_STAR_RETENTION_MIN",
+        "STARUN_STAGE9_MIXED_STAR_PEAK_RATIO_MIN",
+        "STARUN_STAGE9_MIXED_STAR_WEAK_COUNT_MIN",
+        "STARUN_STAGE9_MIXED_STAR_BRIGHT_COUNT_MIN",
+        "STARUN_STAGE7_TARGET_LOCAL_METRICS_ENABLE",
+        "STARUN_STAGE7_LOCAL_CORE_CLIP_RATIO_MAX",
+        "STARUN_STAGE7_LOCAL_FAINT_SNR_MIN",
+        "STARUN_STAGE7_LOCAL_DARK_SEPARATION_MIN",
+        "STARUN_STAGE9_QUALITY_GATE_ENABLE",
+        "STARUN_STAGE9_HIGHLIGHT_CLIP_RATIO_MAX",
+        "STARUN_STAGE9_HIGHLIGHT_CLIP_GROWTH_MAX",
+        "STARUN_STAGE9_BRIGHT_PIXEL_GROWTH_MAX",
+        "STARUN_STAGE9_BACKGROUND_LIFT_MAX",
+        "STARUN_STAGE9_BACKGROUND_MOTTLING_GROWTH_MAX",
+        "STARUN_STAGE9_MOTTLING_EXEMPTION_CHANGED_PIXEL_RATIO_MAX",
+        "STARUN_STAGE9_CHANGED_PIXEL_RATIO_MAX",
+        "STARUN_STAGE9_DARKENING_RATIO_MAX",
+        "STARUN_STAGE9_WEAK_STAR_RECOVERY_RATIO_MIN",
+        "STARUN_STAGE9_STAR_RECOVERY_RATIO_MIN",
+        "STARUN_STAGE9_WEAK_STAR_SCREEN_INTENSITY_MIN",
+        "STARUN_STAGE9_STAR_SUPPORT_RATIO_MAX",
+        "STARUN_STAGE9_UNMATCHED_CHANGED_RATIO_MAX",
+        "STARUN_STAGE9_CHROMATIC_ADDITION_PEAK_MIN",
+        "STARUN_STAGE9_CHROMATIC_ADDITION_SATURATION_MIN",
+        "STARUN_STAGE9_CHROMATIC_ADDITION_RATIO_MAX",
+        "STARUN_STAGE9_STAR_POSITIVE_DELTA_WINDOW_RECOVERY_RATIO_MIN",
+        "STARUN_STAGE9_STAR_WING_RECOVERY_RATIO_MIN",
+        "STARUN_STAGE9_RESIDUAL_DARK_HOLE_RATIO_MAX",
+        "STARUN_STAGE9_HOLLOW_STRUCTURE_DELTA_MIN",
+        "STARUN_STAGE9_NEW_HOLLOW_STRUCTURE_AREA_MAX",
+        "STARUN_FORCE_REVIEW_ONLY_OUTPUT",
+        "STARUN_STAGE10_MANAGED_OUTPUT_ENABLE",
+        "STARUN_STAGE10_FINAL_DENOISE_STRENGTH",
+        "STARUN_STAGE10_STAR_PROTECTION_COVERAGE_MAX",
+        "STARUN_COSMIC_CLASSIC_ENABLE",
+        "STARUN_COSMIC_CLARITY_EXECUTABLE",
+        "STARUN_COSMIC_CLASSIC_GPU",
+        "STARUN_COSMIC_NATIVE_GPU",
+        "STARUN_SYQON_TIMEOUT_SEC",
+        "STARUN_SYQON_MODEL_DIR",
+        "STARUN_SIRILPY_TIMEOUT_SEC",
+        "STARUN_SIRIL_PLUGIN_DIR",
         "SIRIL_PYTHON_CLI",
-        "SEESTAR_SIRIL_PYTHON_CLI",
+        "STARUN_SIRIL_PYTHON_CLI",
     }
 )
 INPUT_MODE_AUTO = "auto"
 INPUT_MODE_STAGE1_PREPARED_RESUME = "stage1_prepared_resume"
-INPUT_MODE_LINEAR_RESUME = "result_linear_resume"
+INPUT_MODE_LINEAR_RESUME = "stage5_linear_resume"
 INPUT_MODE_STAGE2_CORRECTED_RESUME = "stage2_corrected_resume"
-ENV_TASK_RUN_MANIFEST_KEY = "SEESTAR_TASK_RUN_MANIFEST"
-ENV_RESUME_CHECKPOINT_PATH_KEY = "SEESTAR_RESUME_CHECKPOINT_PATH"
+ENV_TASK_RUN_MANIFEST_KEY = "STARUN_TASK_RUN_MANIFEST"
 RESULT_BASENAME_TEMPLATE = (
     "$OBJECT:%s$_$STACKCNT:%d$x$EXPTIME:%d$sec"
     "_$DATE-OBS:dm12$_processed"
@@ -323,11 +334,281 @@ def _partial_metadata_output_basename(
 def _clamp_int(value: int, lower: int, upper: int) -> int:
     return max(lower, min(upper, int(value)))
 
+
+_FITS_BLOCK_BYTES = 2880
+_FITS_CARD_BYTES = 80
+_FITS_LAYOUT_KEYS = frozenset(
+    {
+        "XTENSION",
+        "BITPIX",
+        "NAXIS",
+        "PCOUNT",
+        "GCOUNT",
+        "GROUPS",
+        "BSCALE",
+        "BZERO",
+        "BLANK",
+        "THEAP",
+        "TFIELDS",
+        "ZIMAGE",
+        "ZBITPIX",
+        "ZNAXIS",
+        "ZCMPTYPE",
+        "ZSCALE",
+        "ZZERO",
+    }
+)
+_FITS_INDEXED_LAYOUT_KEY = re.compile(
+    r"^(?:NAXIS|ZNAXIS|TFORM|TDIM|TSCAL|TZERO|TNULL|ZNAME|ZVAL)\d+$"
+)
+
+
+def _fits_card_value_text(card: str) -> Optional[str]:
+    if len(card) < _FITS_CARD_BYTES or card[8:10] != "= ":
+        return None
+    value = card[10:_FITS_CARD_BYTES].lstrip()
+    if not value.startswith("'"):
+        return value.split("/", 1)[0].strip()
+
+    chars: List[str] = []
+    index = 1
+    while index < len(value):
+        if value[index] == "'":
+            if index + 1 < len(value) and value[index + 1] == "'":
+                chars.append("'")
+                index += 2
+                continue
+            return "".join(chars).strip()
+        chars.append(value[index])
+        index += 1
+    return "".join(chars).strip()
+
+
+def _read_fits_stage_fingerprint(path: Path) -> Dict[str, Any]:
+    """Hash FITS data/layout separately from mutable header cards."""
+    file_size = path.stat().st_size
+    if file_size <= 0:
+        raise ValueError("empty FITS file")
+
+    data_digest = hashlib.sha256()
+    layout_digest = hashlib.sha256()
+    header_digest = hashlib.sha256()
+    container_digest = hashlib.sha256()
+    hdu_count = 0
+    logical_data_bytes = 0
+
+    with path.open("rb") as handle:
+        while handle.tell() < file_size:
+            header_blocks: List[bytes] = []
+            header_cards: List[str] = []
+            end_found = False
+            for _ in range(4096):
+                block = handle.read(_FITS_BLOCK_BYTES)
+                if len(block) != _FITS_BLOCK_BYTES:
+                    raise ValueError("truncated FITS header block")
+                header_blocks.append(block)
+                container_digest.update(block)
+                for offset in range(0, _FITS_BLOCK_BYTES, _FITS_CARD_BYTES):
+                    raw_card = block[offset : offset + _FITS_CARD_BYTES]
+                    card = raw_card.decode("ascii", errors="replace")
+                    header_cards.append(card)
+                    if card[:8].strip().upper() == "END":
+                        end_found = True
+                        break
+                if end_found:
+                    break
+            if not end_found:
+                raise ValueError("FITS header END card not found")
+
+            first_keyword = header_cards[0][:8].strip().upper()
+            expected_keyword = "SIMPLE" if hdu_count == 0 else "XTENSION"
+            if first_keyword != expected_keyword:
+                raise ValueError(
+                    f"invalid FITS HDU start: expected {expected_keyword}, "
+                    f"got {first_keyword or 'blank'}"
+                )
+
+            header_bytes = b"".join(header_blocks)
+            header_digest.update(hdu_count.to_bytes(4, "big"))
+            header_digest.update(len(header_bytes).to_bytes(8, "big"))
+            header_digest.update(header_bytes)
+
+            values: Dict[str, str] = {}
+            layout: Dict[str, str] = {}
+            for card in header_cards:
+                keyword = card[:8].strip().upper()
+                if keyword == "END":
+                    break
+                value = _fits_card_value_text(card)
+                if value is None or not keyword:
+                    continue
+                values[keyword] = value
+                if (
+                    keyword in _FITS_LAYOUT_KEYS
+                    or _FITS_INDEXED_LAYOUT_KEY.fullmatch(keyword)
+                ):
+                    layout[keyword] = value
+
+            try:
+                bitpix = int(values["BITPIX"])
+                naxis = int(values["NAXIS"])
+                axes = [int(values[f"NAXIS{index}"]) for index in range(1, naxis + 1)]
+                pcount = int(values.get("PCOUNT", "0"))
+                gcount = int(values.get("GCOUNT", "1"))
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(f"invalid FITS data layout: {error}") from error
+            if bitpix not in {8, 16, 32, 64, -32, -64}:
+                raise ValueError(f"unsupported FITS BITPIX={bitpix}")
+            if naxis < 0 or any(axis < 0 for axis in axes) or pcount < 0 or gcount < 1:
+                raise ValueError("negative or invalid FITS data dimensions")
+
+            random_groups = values.get("GROUPS", "F").strip().upper() == "T"
+            if random_groups and axes and axes[0] == 0:
+                axis_elements = math.prod(axes[1:])
+            else:
+                axis_elements = math.prod(axes) if axes else 0
+            data_size = (abs(bitpix) // 8) * gcount * (pcount + axis_elements)
+            if data_size < 0 or handle.tell() + data_size > file_size:
+                raise ValueError("FITS data section exceeds file size")
+
+            layout_payload = json.dumps(
+                {
+                    "hdu": hdu_count,
+                    "data_size": data_size,
+                    "layout": layout,
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii")
+            layout_digest.update(len(layout_payload).to_bytes(8, "big"))
+            layout_digest.update(layout_payload)
+            data_digest.update(hdu_count.to_bytes(4, "big"))
+            data_digest.update(data_size.to_bytes(8, "big"))
+
+            remaining = data_size
+            while remaining:
+                chunk = handle.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise ValueError("truncated FITS data section")
+                data_digest.update(chunk)
+                container_digest.update(chunk)
+                remaining -= len(chunk)
+            logical_data_bytes += data_size
+
+            padding_size = (-data_size) % _FITS_BLOCK_BYTES
+            if padding_size:
+                padding = handle.read(padding_size)
+                if len(padding) != padding_size:
+                    raise ValueError("truncated FITS data padding")
+                container_digest.update(padding)
+            hdu_count += 1
+
+    if hdu_count == 0:
+        raise ValueError("FITS contains no HDU")
+    return {
+        "data_sha256": data_digest.hexdigest(),
+        "layout_sha256": layout_digest.hexdigest(),
+        "header_sha256": header_digest.hexdigest(),
+        "container_sha256": container_digest.hexdigest(),
+        "hdu_count": hdu_count,
+        "logical_data_bytes": logical_data_bytes,
+    }
+
+
 class ProcessorRuntimeMixin:
+    def _stage_failure_action(self, stage_number: int) -> str:
+        value = str(
+            getattr(
+                self.cfg,
+                f"stage{int(stage_number)}_failure_action",
+                "auto_fallback",
+            )
+            or "auto_fallback"
+        ).strip().lower()
+        if value not in {"auto_fallback", "preserve_review", "stop"}:
+            return "auto_fallback"
+        return value
+
+    def _record_stage_policy_event(
+        self,
+        stage_number: int,
+        *,
+        event: str,
+        reason: str,
+        source: str = "runtime",
+    ) -> Dict[str, Any]:
+        record = {
+            "stage": int(stage_number),
+            "failure_action": self._stage_failure_action(stage_number),
+            "event": str(event),
+            "reason": str(reason),
+            "source": str(source),
+        }
+        events = getattr(self, "_stage_policy_events", None)
+        if not isinstance(events, list):
+            events = []
+            self._stage_policy_events = events
+        events.append(record)
+        self.log.info(
+            "[StagePolicy] "
+            f"stage={stage_number} action={record['failure_action']} "
+            f"event={record['event']} reason={record['reason']}"
+        )
+        return record
+
+    def _handle_stage_decisive_failure(
+        self,
+        stage_number: int,
+        reason: str,
+        *,
+        source: str = "quality_gate",
+    ) -> str:
+        """Apply the user-selected fail-closed policy after diagnostics exist."""
+
+        action = self._stage_failure_action(stage_number)
+        self._record_stage_policy_event(
+            stage_number,
+            event="decisive_failure",
+            reason=reason,
+            source=source,
+        )
+        if action == "preserve_review":
+            if int(stage_number) == 2:
+                self._stage2_view_review_required = True
+            else:
+                self._background_review_required = True
+            return action
+        if action == "stop":
+            raise RuntimeError(
+                f"Stage {stage_number} 用户严格停止：{reason}"
+            )
+        return action
+
+    def _enforce_stage_failure_action(self, stage_number: int) -> None:
+        """Terminate after a stage has written its failed result and diagnostics."""
+
+        prefix = f"阶段 {int(stage_number)}:"
+        result = next(
+            (
+                item
+                for item in reversed(getattr(self, "results", []))
+                if str(getattr(item, "name", "")).startswith(prefix)
+            ),
+            None,
+        )
+        if result is None or str(getattr(result, "status", "")) != "failed":
+            return
+        self._handle_stage_decisive_failure(
+            stage_number,
+            str(getattr(result, "reason_code", "") or getattr(result, "message", "") or "stage_failed"),
+            source="stage_result",
+        )
+
     def _processing_software_identity(self) -> Dict[str, Any]:
         """Return a packaged/dev build identity with a Stage 3 source hash."""
         module_path = Path(__file__).resolve()
-        app_version = os.getenv("SEESTAR_APP_VERSION", "").strip() or "dev"
+        app_version = os.getenv("STARUN_APP_VERSION", "").strip() or "dev"
         app_build: Optional[str] = None
         app_identity_source = "environment" if app_version != "dev" else "development"
         info_candidates = [
@@ -378,7 +659,7 @@ class ProcessorRuntimeMixin:
             }
         )
         return {
-            "schema": "seestar.software-identity.v1",
+            "schema": "starun.software-identity.v1",
             "app": {
                 "version": app_version,
                 "build": app_build,
@@ -398,8 +679,6 @@ class ProcessorRuntimeMixin:
         module_project_root = Path(__file__).resolve().parents[1]
         return [
             module_project_root / PROJECT_DEFAULT_ENV_RESOURCE_REL,
-            module_project_root / PROJECT_ENV_RESOURCE_REL,
-            Path.cwd() / PROJECT_ENV_OVERRIDE_NAME,
         ]
 
 
@@ -441,6 +720,10 @@ class ProcessorRuntimeMixin:
             if not path.is_file():
                 continue
             merged.update(self._parse_project_env_file(path))
+        if not hasattr(self, "_project_env_explicit_keys"):
+            self._project_env_explicit_keys = frozenset(
+                key for key in merged if key in os.environ
+            )
         for key, value in merged.items():
             os.environ.setdefault(key, value)
 
@@ -514,7 +797,7 @@ class ProcessorRuntimeMixin:
     ) -> str:
         return (
             "[STAGE_QUALITY_METRICS] "
-            "schema=seestar.stage_quality.v1 "
+            "schema=starun.stage_quality.v1 "
             f"stem={stem} "
             f"bg_median={metrics.bg_median:.6f} "
             f"black_pixel_ratio={metrics.black_pixel_ratio:.6f} "
@@ -551,7 +834,7 @@ class ProcessorRuntimeMixin:
             int(getattr(self, "_debug_quality_metric_index", 0)) + 1
         )
         payload = {
-            "schema": "seestar.stage_quality.v1",
+            "schema": "starun.stage_quality.v1",
             "sequence": self._debug_quality_metric_index,
             "stem": stem,
             "file": f"{stem}.fit",
@@ -598,6 +881,16 @@ class ProcessorRuntimeMixin:
             return None
 
 
+    def _fits_stage_fingerprint(self, path: Path) -> Optional[Dict[str, Any]]:
+        if not path.exists() or not path.is_file():
+            return None
+        try:
+            return _read_fits_stage_fingerprint(path)
+        except (OSError, OverflowError, RuntimeError, TypeError, ValueError) as error:
+            self.log.debug(f"FITS 阶段指纹跳过 ({path.name}): {error}")
+            return None
+
+
     def _stage_diff_note(self, current_stem: str, previous_stem: str) -> Optional[str]:
         if not self.process_dir:
             return None
@@ -606,19 +899,85 @@ class ProcessorRuntimeMixin:
         if not current_path.exists() or not previous_path.exists():
             return None
 
-        current_hash = self._sha256_file(current_path)
-        previous_hash = self._sha256_file(previous_path)
-        if not current_hash or not previous_hash:
-            return None
-
-        if current_hash == previous_hash:
+        current_fingerprint = self._fits_stage_fingerprint(current_path)
+        previous_fingerprint = self._fits_stage_fingerprint(previous_path)
+        if not current_fingerprint or not previous_fingerprint:
+            current_hash = self._sha256_file(current_path)
+            previous_hash = self._sha256_file(previous_path)
+            if not current_hash or not previous_hash:
+                return None
+            if current_hash == previous_hash:
+                return (
+                    f"阶段对比: {current_stem}.fit 与 {previous_stem}.fit "
+                    "FITS 容器完全一致；像素内容指纹不可用 "
+                    f"(container_sha256={current_hash[:12]})"
+                )
             return (
-                f"阶段对比: {current_stem}.fit 与 {previous_stem}.fit 内容一致 "
-                f"(sha256={current_hash[:12]})"
+                f"阶段对比: {current_stem}.fit 与 {previous_stem}.fit "
+                "像素内容无法判定；完整文件 SHA-256 有变化，"
+                "不作为像素变化依据 "
+                f"({previous_hash[:8]} -> {current_hash[:8]})"
+            )
+
+        data_same = bool(
+            current_fingerprint["data_sha256"]
+            == previous_fingerprint["data_sha256"]
+        )
+        layout_same = bool(
+            current_fingerprint["layout_sha256"]
+            == previous_fingerprint["layout_sha256"]
+        )
+        header_same = bool(
+            current_fingerprint["header_sha256"]
+            == previous_fingerprint["header_sha256"]
+        )
+        container_same = bool(
+            current_fingerprint["container_sha256"]
+            == previous_fingerprint["container_sha256"]
+        )
+        data_transition = (
+            f"{previous_fingerprint['data_sha256'][:8]} -> "
+            f"{current_fingerprint['data_sha256'][:8]}"
+        )
+        layout_transition = (
+            f"{previous_fingerprint['layout_sha256'][:8]} -> "
+            f"{current_fingerprint['layout_sha256'][:8]}"
+        )
+        header_transition = (
+            f"{previous_fingerprint['header_sha256'][:8]} -> "
+            f"{current_fingerprint['header_sha256'][:8]}"
+        )
+
+        if data_same and layout_same:
+            content_note = (
+                "像素内容一致 "
+                f"(data_sha256={current_fingerprint['data_sha256'][:12]})"
+            )
+        elif not data_same:
+            content_note = f"像素内容有变化 (data_sha256={data_transition})"
+            if not layout_same:
+                content_note += f"，数据布局/缩放语义也有变化 ({layout_transition})"
+        else:
+            content_note = (
+                "像素数据区一致，但数据布局/缩放语义有变化 "
+                f"({layout_transition})"
+            )
+
+        if header_same:
+            header_note = (
+                "FITS header 一致 "
+                f"(header_sha256={current_fingerprint['header_sha256'][:12]})"
+            )
+            if not container_same and data_same and layout_same:
+                header_note += "；FITS 容器填充有变化，不计为像素内容变化"
+        else:
+            header_note = (
+                "FITS header 有变化，单独报告且不作为像素变化依据 "
+                f"({header_transition})"
             )
         return (
-            f"阶段对比: {current_stem}.fit 与 {previous_stem}.fit 内容有变化 "
-            f"({previous_hash[:8]} -> {current_hash[:8]})"
+            f"阶段对比: {current_stem}.fit 与 {previous_stem}.fit "
+            f"{content_note}；{header_note}"
         )
 
 
@@ -630,8 +989,6 @@ class ProcessorRuntimeMixin:
 
 
     def _apply_runtime_env_overrides(self):
-        self.cfg.ai_post_enabled = False
-        self.cfg.ai_artistic_derivative_enabled = False
         input_mode_raw = os.getenv(ENV_INPUT_MODE_KEY)
         if input_mode_raw is not None:
             normalized = input_mode_raw.strip().lower()
@@ -657,7 +1014,7 @@ class ProcessorRuntimeMixin:
                 )
             self._sync_logger_level()
 
-        output_format_raw = os.getenv("SEESTAR_OUTPUT_FORMAT")
+        output_format_raw = os.getenv("STARUN_OUTPUT_FORMAT")
         if output_format_raw is not None:
             normalized_output = output_format_raw.strip().lower()
             allowed_formats = {"all", "tif", "tiff", "png", "fit", "fits"}
@@ -670,11 +1027,15 @@ class ProcessorRuntimeMixin:
                 self.cfg.output_format = normalized_output
             else:
                 self.log.warn(
-                    f"Invalid SEESTAR_OUTPUT_FORMAT={output_format_raw!r}; using current value"
+                    f"Invalid STARUN_OUTPUT_FORMAT={output_format_raw!r}; using current value"
                 )
 
+        filter_hint_raw = os.getenv("STARUN_STAGE4_FILTER_HINT")
+        if filter_hint_raw is not None:
+            self.cfg.stage4_filter_hint = filter_hint_raw.strip() or "auto"
+
         stage2_center_protect_raw = os.getenv(
-            "SEESTAR_STAGE2_CENTER_PROTECT_AREA_RATIO"
+            "STARUN_STAGE2_CENTER_PROTECT_AREA_RATIO"
         )
         if stage2_center_protect_raw is not None:
             try:
@@ -685,11 +1046,11 @@ class ProcessorRuntimeMixin:
                 )
             except (TypeError, ValueError):
                 self.log.warn(
-                    "SEESTAR_STAGE2_CENTER_PROTECT_AREA_RATIO has invalid value; "
+                    "STARUN_STAGE2_CENTER_PROTECT_AREA_RATIO has invalid value; "
                     "keeping current setting"
                 )
 
-        plugin_probe_raw = os.getenv("SEESTAR_WORKFLOW_PLUGIN_PROBE")
+        plugin_probe_raw = os.getenv("STARUN_WORKFLOW_PLUGIN_PROBE")
         if plugin_probe_raw is not None:
             parsed = self._parse_env_bool(
                 plugin_probe_raw,
@@ -698,11 +1059,11 @@ class ProcessorRuntimeMixin:
             self.cfg.workflow_plugin_probe_enabled = parsed
             if plugin_probe_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
                 self.log.warn(
-                    "SEESTAR_WORKFLOW_PLUGIN_PROBE has invalid value; "
+                    "STARUN_WORKFLOW_PLUGIN_PROBE has invalid value; "
                     "keeping current setting"
                 )
 
-        stage4_platesolve_raw = os.getenv("SEESTAR_STAGE4_PLATESOLVE_ENABLE")
+        stage4_platesolve_raw = os.getenv("STARUN_STAGE4_PLATESOLVE_ENABLE")
         if stage4_platesolve_raw is not None:
             parsed = self._parse_env_bool(
                 stage4_platesolve_raw,
@@ -711,12 +1072,12 @@ class ProcessorRuntimeMixin:
             self.cfg.stage4_platesolve_enabled = parsed
             if stage4_platesolve_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
                 self.log.warn(
-                    "SEESTAR_STAGE4_PLATESOLVE_ENABLE has invalid value; "
+                    "STARUN_STAGE4_PLATESOLVE_ENABLE has invalid value; "
                     "keeping current setting"
                 )
 
         stage4_auto_geometry_raw = os.getenv(
-            "SEESTAR_STAGE4_AUTO_GEOMETRY_ENABLE"
+            "STARUN_STAGE4_AUTO_GEOMETRY_ENABLE"
         )
         if stage4_auto_geometry_raw is not None:
             parsed = self._parse_env_bool(
@@ -728,11 +1089,11 @@ class ProcessorRuntimeMixin:
                 ENV_TRUE_VALUES | ENV_FALSE_VALUES
             ):
                 self.log.warn(
-                    "SEESTAR_STAGE4_AUTO_GEOMETRY_ENABLE has invalid value; "
+                    "STARUN_STAGE4_AUTO_GEOMETRY_ENABLE has invalid value; "
                     "keeping current setting"
                 )
 
-        stage4_nbn_raw = os.getenv("SEESTAR_STAGE4_NBN_ENABLE")
+        stage4_nbn_raw = os.getenv("STARUN_STAGE4_NBN_ENABLE")
         if stage4_nbn_raw is not None:
             parsed = self._parse_env_bool(
                 stage4_nbn_raw,
@@ -747,11 +1108,11 @@ class ProcessorRuntimeMixin:
                 ENV_TRUE_VALUES | ENV_FALSE_VALUES
             ):
                 self.log.warn(
-                    "SEESTAR_STAGE4_NBN_ENABLE has invalid value; "
+                    "STARUN_STAGE4_NBN_ENABLE has invalid value; "
                     "keeping current setting"
                 )
 
-        stage4_spcc_raw = os.getenv("SEESTAR_SPCC_ENABLE")
+        stage4_spcc_raw = os.getenv("STARUN_SPCC_ENABLE")
         if stage4_spcc_raw is not None:
             parsed = self._parse_env_bool(
                 stage4_spcc_raw,
@@ -762,19 +1123,51 @@ class ProcessorRuntimeMixin:
                 ENV_TRUE_VALUES | ENV_FALSE_VALUES
             ):
                 self.log.warn(
-                    "SEESTAR_SPCC_ENABLE has invalid value; keeping current setting"
+                    "STARUN_SPCC_ENABLE has invalid value; keeping current setting"
                 )
 
         for env_key, attr_name in (
-            ("SEESTAR_STAGE4_SPCC_OSC_SENSOR", "stage4_spcc_osc_sensor"),
-            ("SEESTAR_STAGE4_SPCC_OSC_FILTER", "stage4_spcc_osc_filter"),
-            ("SEESTAR_STAGE4_SPCC_WHITE_REF", "stage4_spcc_white_ref"),
+            ("STARUN_STAGE4_SPCC_OSC_SENSOR", "stage4_spcc_osc_sensor"),
+            ("STARUN_STAGE4_SPCC_OSC_FILTER", "stage4_spcc_osc_filter"),
+            ("STARUN_STAGE4_SPCC_WHITE_REF", "stage4_spcc_white_ref"),
         ):
             raw_value = os.getenv(env_key)
             if raw_value is not None:
                 setattr(self.cfg, attr_name, raw_value.strip())
 
-        local_star_wb_raw = os.getenv("SEESTAR_STAGE4_LOCAL_STAR_WB_ENABLE")
+        offline_fallback_raw = os.getenv("STARUN_STAGE4_OFFLINE_FALLBACK_MODE")
+        if offline_fallback_raw is not None:
+            normalized_fallback = offline_fallback_raw.strip().lower()
+            if normalized_fallback in {"auto_local_reference", "preserve"}:
+                self.cfg.stage4_offline_fallback_mode = normalized_fallback
+            else:
+                self.log.warn(
+                    "STARUN_STAGE4_OFFLINE_FALLBACK_MODE has invalid value; "
+                    "keeping current setting"
+                )
+
+        auto_reference_white_raw = os.getenv(
+            "STARUN_STAGE4_AUTO_REFERENCE_GLOBAL_WHITE_ENABLE"
+        )
+        if auto_reference_white_raw is not None:
+            parsed = self._parse_env_bool(
+                auto_reference_white_raw,
+                getattr(
+                    self.cfg,
+                    "stage4_auto_reference_global_white_enabled",
+                    False,
+                ),
+            )
+            self.cfg.stage4_auto_reference_global_white_enabled = parsed
+            if auto_reference_white_raw.strip().lower() not in (
+                ENV_TRUE_VALUES | ENV_FALSE_VALUES
+            ):
+                self.log.warn(
+                    "STARUN_STAGE4_AUTO_REFERENCE_GLOBAL_WHITE_ENABLE has "
+                    "invalid value; keeping current setting"
+                )
+
+        local_star_wb_raw = os.getenv("STARUN_STAGE4_LOCAL_STAR_WB_ENABLE")
         if local_star_wb_raw is not None:
             parsed = self._parse_env_bool(
                 local_star_wb_raw,
@@ -783,70 +1176,150 @@ class ProcessorRuntimeMixin:
             self.cfg.stage4_local_star_wb_enabled = parsed
             if local_star_wb_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
                 self.log.warn(
-                    "SEESTAR_STAGE4_LOCAL_STAR_WB_ENABLE has invalid value; "
+                    "STARUN_STAGE4_LOCAL_STAR_WB_ENABLE has invalid value; "
                     "keeping current setting"
                 )
 
         for env_key, attr_name, caster in (
             (
-                "SEESTAR_STAGE4_AUTO_GEOMETRY_CONFIDENCE_MIN",
+                "STARUN_STAGE4_AUTO_GEOMETRY_CONFIDENCE_MIN",
                 "stage4_auto_geometry_confidence_min",
                 float,
             ),
             (
-                "SEESTAR_STAGE4_AUTO_GEOMETRY_SCALE_RESIDUAL_MAX",
+                "STARUN_STAGE4_AUTO_GEOMETRY_SCALE_RESIDUAL_MAX",
                 "stage4_auto_geometry_scale_residual_max",
                 float,
             ),
             (
-                "SEESTAR_STAGE4_NBN_MAPPING_CONFIDENCE_MIN",
+                "STARUN_STAGE4_NBN_MAPPING_CONFIDENCE_MIN",
                 "stage4_nbn_mapping_confidence_min",
                 float,
             ),
-            ("SEESTAR_STAGE4_NBN_STRENGTH", "stage4_nbn_strength", float),
-            ("SEESTAR_STAGE4_NBN_GAIN_LIMIT", "stage4_nbn_gain_limit", float),
+            ("STARUN_STAGE4_NBN_STRENGTH", "stage4_nbn_strength", float),
+            ("STARUN_STAGE4_NBN_GAIN_LIMIT", "stage4_nbn_gain_limit", float),
             (
-                "SEESTAR_STAGE4_NBN_LINE_RATIO_DRIFT_MAX",
+                "STARUN_STAGE4_NBN_LINE_RATIO_DRIFT_MAX",
                 "stage4_nbn_line_ratio_drift_max",
                 float,
             ),
-            ("SEESTAR_STAGE4_SPCC_TIMEOUT_SEC", "stage4_spcc_timeout_sec", int),
-            ("SEESTAR_STAGE4_SPCC_LIMITMAG", "stage4_spcc_limit_magnitude", float),
+            ("STARUN_STAGE4_SPCC_TIMEOUT_SEC", "stage4_spcc_timeout_sec", int),
             (
-                "SEESTAR_STAGE4_SPCC_NB_R_WAVELENGTH_NM",
+                "STARUN_STAGE4_SPCC_ONLINE_UNVERIFIED_TIMEOUT_SEC",
+                "stage4_spcc_online_unverified_timeout_sec",
+                int,
+            ),
+            ("STARUN_STAGE4_SPCC_LIMITMAG", "stage4_spcc_limit_magnitude", float),
+            (
+                "STARUN_STAGE4_SPCC_NB_R_WAVELENGTH_NM",
                 "stage4_spcc_narrowband_r_wavelength_nm",
                 float,
             ),
             (
-                "SEESTAR_STAGE4_SPCC_NB_R_BANDWIDTH_NM",
+                "STARUN_STAGE4_SPCC_NB_R_BANDWIDTH_NM",
                 "stage4_spcc_narrowband_r_bandwidth_nm",
                 float,
             ),
             (
-                "SEESTAR_STAGE4_SPCC_NB_G_WAVELENGTH_NM",
+                "STARUN_STAGE4_SPCC_NB_G_WAVELENGTH_NM",
                 "stage4_spcc_narrowband_g_wavelength_nm",
                 float,
             ),
             (
-                "SEESTAR_STAGE4_SPCC_NB_G_BANDWIDTH_NM",
+                "STARUN_STAGE4_SPCC_NB_G_BANDWIDTH_NM",
                 "stage4_spcc_narrowband_g_bandwidth_nm",
                 float,
             ),
             (
-                "SEESTAR_STAGE4_SPCC_NB_B_WAVELENGTH_NM",
+                "STARUN_STAGE4_SPCC_NB_B_WAVELENGTH_NM",
                 "stage4_spcc_narrowband_b_wavelength_nm",
                 float,
             ),
             (
-                "SEESTAR_STAGE4_SPCC_NB_B_BANDWIDTH_NM",
+                "STARUN_STAGE4_SPCC_NB_B_BANDWIDTH_NM",
                 "stage4_spcc_narrowband_b_bandwidth_nm",
                 float,
             ),
-            ("SEESTAR_STAGE4_PCC_TIMEOUT_SEC", "stage4_pcc_timeout_sec", int),
-            ("SEESTAR_STAGE4_LOCAL_STAR_WB_MIN_PIXELS", "stage4_local_star_wb_min_pixels", int),
-            ("SEESTAR_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT", "stage4_local_star_wb_gain_limit", float),
-            ("SEESTAR_STAGE4_LOCAL_STAR_MASK_RADIUS", "stage4_local_star_mask_radius", int),
-            ("SEESTAR_STAGE4_LOCAL_STAR_MASK_COVERAGE_MAX", "stage4_local_star_mask_coverage_max", float),
+            ("STARUN_STAGE4_PCC_TIMEOUT_SEC", "stage4_pcc_timeout_sec", int),
+            (
+                "STARUN_STAGE4_AUTO_REFERENCE_BACKGROUND_SAMPLE_TARGET",
+                "stage4_auto_reference_background_sample_target",
+                int,
+            ),
+            (
+                "STARUN_STAGE4_AUTO_REFERENCE_BACKGROUND_SAMPLE_MIN",
+                "stage4_auto_reference_background_sample_min",
+                int,
+            ),
+            (
+                "STARUN_STAGE4_AUTO_REFERENCE_HOLDOUT_RATIO",
+                "stage4_auto_reference_holdout_ratio",
+                float,
+            ),
+            (
+                "STARUN_STAGE4_AUTO_REFERENCE_BACKGROUND_ERROR_MIN",
+                "stage4_auto_reference_background_error_min",
+                float,
+            ),
+            (
+                "STARUN_STAGE4_AUTO_REFERENCE_BACKGROUND_IMPROVEMENT_MIN",
+                "stage4_auto_reference_background_improvement_min",
+                float,
+            ),
+            (
+                "STARUN_STAGE4_AUTO_REFERENCE_STAR_MIN_OBJECTS",
+                "stage4_auto_reference_star_min_objects",
+                int,
+            ),
+            (
+                "STARUN_STAGE4_AUTO_REFERENCE_STAR_RATIO_MAD_MAX",
+                "stage4_auto_reference_star_ratio_mad_max",
+                float,
+            ),
+            (
+                "STARUN_STAGE4_AUTO_REFERENCE_STAR_SATURATION_RATIO_MAX",
+                "stage4_auto_reference_star_saturation_ratio_max",
+                float,
+            ),
+            (
+                "STARUN_STAGE4_AUTO_REFERENCE_GAIN_LIMIT",
+                "stage4_auto_reference_gain_limit",
+                float,
+            ),
+            (
+                "STARUN_STAGE4_AUTO_REFERENCE_STAR_IMPROVEMENT_MIN",
+                "stage4_auto_reference_star_improvement_min",
+                float,
+            ),
+            (
+                "STARUN_STAGE4_AUTO_REFERENCE_HIGHLIGHT_CLIP_GROWTH_MAX",
+                "stage4_auto_reference_highlight_clip_growth_max",
+                float,
+            ),
+            (
+                "STARUN_STAGE4_AUTO_REFERENCE_BLACK_CLIP_GROWTH_MAX",
+                "stage4_auto_reference_black_clip_growth_max",
+                float,
+            ),
+            (
+                "STARUN_STAGE4_AUTO_REFERENCE_GRADIENT_GROWTH_MAX",
+                "stage4_auto_reference_gradient_growth_max",
+                float,
+            ),
+            (
+                "STARUN_STAGE4_AUTO_REFERENCE_TEXTURE_GROWTH_MAX",
+                "stage4_auto_reference_texture_growth_max",
+                float,
+            ),
+            (
+                "STARUN_STAGE4_AUTO_REFERENCE_TARGET_CHROMA_DRIFT_MAX",
+                "stage4_auto_reference_target_chroma_drift_max",
+                float,
+            ),
+            ("STARUN_STAGE4_LOCAL_STAR_WB_MIN_PIXELS", "stage4_local_star_wb_min_pixels", int),
+            ("STARUN_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT", "stage4_local_star_wb_gain_limit", float),
+            ("STARUN_STAGE4_LOCAL_STAR_MASK_RADIUS", "stage4_local_star_mask_radius", int),
+            ("STARUN_STAGE4_LOCAL_STAR_MASK_COVERAGE_MAX", "stage4_local_star_mask_coverage_max", float),
         ):
             raw_value = os.getenv(env_key)
             if raw_value is None:
@@ -856,7 +1329,7 @@ class ProcessorRuntimeMixin:
             except (TypeError, ValueError):
                 self.log.warn(f"{env_key} has invalid value; keeping current setting")
 
-        optional_color_raw = os.getenv("SEESTAR_OPTIONAL_COLOR_TRANSFORM")
+        optional_color_raw = os.getenv("STARUN_OPTIONAL_COLOR_TRANSFORM")
         if optional_color_raw is not None:
             parsed = self._parse_env_bool(
                 optional_color_raw,
@@ -865,10 +1338,25 @@ class ProcessorRuntimeMixin:
             self.cfg.optional_color_transform_enabled = parsed
             if optional_color_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
                 self.log.warn(
-                    "SEESTAR_OPTIONAL_COLOR_TRANSFORM has invalid value; keeping current setting"
+                    "STARUN_OPTIONAL_COLOR_TRANSFORM has invalid value; keeping current setting"
                 )
 
-        aberration_api_raw = os.getenv("SEESTAR_ABERRATION_API_ENABLE")
+        dualband_palette_raw = os.getenv("STARUN_STAGE8_DUALBAND_PALETTE_ENABLE")
+        if dualband_palette_raw is not None:
+            parsed = self._parse_env_bool(
+                dualband_palette_raw,
+                getattr(self.cfg, "stage8_dualband_palette_enabled", True),
+            )
+            self.cfg.stage8_dualband_palette_enabled = parsed
+            if dualband_palette_raw.strip().lower() not in (
+                ENV_TRUE_VALUES | ENV_FALSE_VALUES
+            ):
+                self.log.warn(
+                    "STARUN_STAGE8_DUALBAND_PALETTE_ENABLE has invalid value; "
+                    "keeping current setting"
+                )
+
+        aberration_api_raw = os.getenv("STARUN_ABERRATION_API_ENABLE")
         if aberration_api_raw is not None:
             parsed = self._parse_env_bool(
                 aberration_api_raw,
@@ -877,10 +1365,10 @@ class ProcessorRuntimeMixin:
             self.cfg.aberration_api_enabled = parsed
             if aberration_api_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
                 self.log.warn(
-                    "SEESTAR_ABERRATION_API_ENABLE has invalid value; keeping current setting"
+                    "STARUN_ABERRATION_API_ENABLE has invalid value; keeping current setting"
                 )
 
-        denoise_enable_raw = os.getenv("SEESTAR_DENOISE_ENABLE")
+        denoise_enable_raw = os.getenv("STARUN_DENOISE_ENABLE")
         if denoise_enable_raw is not None:
             parsed = self._parse_env_bool(
                 denoise_enable_raw,
@@ -889,11 +1377,11 @@ class ProcessorRuntimeMixin:
             self.cfg.denoise_enabled = parsed
             if denoise_enable_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
                 self.log.warn(
-                    "SEESTAR_DENOISE_ENABLE has invalid value; keeping current setting"
+                    "STARUN_DENOISE_ENABLE has invalid value; keeping current setting"
                 )
 
         multiscale_denoise_raw = os.getenv(
-            "SEESTAR_STAGE5_MULTISCALE_DENOISE_ENABLE"
+            "STARUN_STAGE5_MULTISCALE_DENOISE_ENABLE"
         )
         if multiscale_denoise_raw is not None:
             parsed = self._parse_env_bool(
@@ -905,11 +1393,11 @@ class ProcessorRuntimeMixin:
                 ENV_TRUE_VALUES | ENV_FALSE_VALUES
             ):
                 self.log.warn(
-                    "SEESTAR_STAGE5_MULTISCALE_DENOISE_ENABLE has invalid value; "
+                    "STARUN_STAGE5_MULTISCALE_DENOISE_ENABLE has invalid value; "
                     "keeping current setting"
                 )
 
-        denoise_force_raw = os.getenv("SEESTAR_DENOISE_FORCE")
+        denoise_force_raw = os.getenv("STARUN_DENOISE_FORCE")
         if denoise_force_raw is not None:
             parsed = self._parse_env_bool(
                 denoise_force_raw,
@@ -918,10 +1406,10 @@ class ProcessorRuntimeMixin:
             self._force_denoise_enabled = parsed
             if denoise_force_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
                 self.log.warn(
-                    "SEESTAR_DENOISE_FORCE has invalid value; keeping current setting"
+                    "STARUN_DENOISE_FORCE has invalid value; keeping current setting"
                 )
 
-        stage5_deconv_raw = os.getenv("SEESTAR_STAGE5_DECONV_ENABLE")
+        stage5_deconv_raw = os.getenv("STARUN_STAGE5_DECONV_ENABLE")
         if stage5_deconv_raw is not None:
             parsed = self._parse_env_bool(
                 stage5_deconv_raw,
@@ -930,11 +1418,11 @@ class ProcessorRuntimeMixin:
             self.cfg.stage5_deconvolution_enabled = parsed
             if stage5_deconv_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
                 self.log.warn(
-                    "SEESTAR_STAGE5_DECONV_ENABLE has invalid value; keeping current setting"
+                    "STARUN_STAGE5_DECONV_ENABLE has invalid value; keeping current setting"
                 )
 
         stage5_graxpert_deconv_raw = os.getenv(
-            "SEESTAR_STAGE5_GRAXPERT_DECONV_ENABLE"
+            "STARUN_STAGE5_GRAXPERT_DECONV_ENABLE"
         )
         if stage5_graxpert_deconv_raw is not None:
             parsed = self._parse_env_bool(
@@ -946,34 +1434,48 @@ class ProcessorRuntimeMixin:
                 ENV_TRUE_VALUES | ENV_FALSE_VALUES
             ):
                 self.log.warn(
-                    "SEESTAR_STAGE5_GRAXPERT_DECONV_ENABLE has invalid value; "
+                    "STARUN_STAGE5_GRAXPERT_DECONV_ENABLE has invalid value; "
                     "keeping current setting"
+                )
+
+        denoise_mod_raw = os.getenv("STARUN_DENOISE_MOD")
+        if denoise_mod_raw is not None:
+            try:
+                self.cfg.denoise_mod = float(denoise_mod_raw.strip())
+            except ValueError:
+                self.log.warn(
+                    "Invalid STARUN_DENOISE_MOD="
+                    f"{denoise_mod_raw!r}; using current value"
                 )
 
         for env_key, attr_name, caster in (
             (
-                "SEESTAR_STAGE5_MULTISCALE_DENOISE_STRENGTH",
+                "STARUN_STAGE5_MULTISCALE_DENOISE_STRENGTH",
                 "stage5_multiscale_denoise_strength",
                 float,
             ),
             (
-                "SEESTAR_STAGE5_MULTISCALE_DETAIL_RETENTION_MIN",
+                "STARUN_STAGE5_MULTISCALE_DETAIL_RETENTION_MIN",
                 "stage5_multiscale_detail_retention_min",
                 float,
             ),
             (
-                "SEESTAR_STAGE5_MULTISCALE_NOISE_REDUCTION_MIN",
+                "STARUN_STAGE5_MULTISCALE_NOISE_REDUCTION_MIN",
                 "stage5_multiscale_noise_reduction_min",
                 float,
             ),
-            ("SEESTAR_STAGE5_BUILTIN_DENOISE_MOD", "stage5_builtin_denoise_mod", float),
-            ("SEESTAR_STAGE5_RL_MAXSTARS", "stage5_rl_maxstars", int),
-            ("SEESTAR_STAGE5_RL_PSF_KS", "stage5_rl_psf_kernel_size", int),
-            ("SEESTAR_STAGE5_RL_ITERS", "stage5_rl_iters", int),
-            ("SEESTAR_STAGE5_RL_ALPHA", "stage5_rl_alpha", float),
-            ("SEESTAR_STAGE5_RL_GDSTEP", "stage5_rl_gdstep", float),
-            ("SEESTAR_STAGE5_RL_STOP", "stage5_rl_stop", float),
-            ("SEESTAR_STAGE5_GRAXPERT_DECONV_STRENGTH", "stage5_graxpert_deconv_strength", float),
+            (
+                "STARUN_STAGE5_DENOISE_CHROMA_NOISE_GROWTH_MAX",
+                "stage5_denoise_chroma_noise_growth_max",
+                float,
+            ),
+            ("STARUN_STAGE5_RL_MAXSTARS", "stage5_rl_maxstars", int),
+            ("STARUN_STAGE5_RL_PSF_KS", "stage5_rl_psf_kernel_size", int),
+            ("STARUN_STAGE5_RL_ITERS", "stage5_rl_iters", int),
+            ("STARUN_STAGE5_RL_ALPHA", "stage5_rl_alpha", float),
+            ("STARUN_STAGE5_RL_GDSTEP", "stage5_rl_gdstep", float),
+            ("STARUN_STAGE5_RL_STOP", "stage5_rl_stop", float),
+            ("STARUN_STAGE5_GRAXPERT_DECONV_STRENGTH", "stage5_graxpert_deconv_strength", float),
         ):
             raw_value = os.getenv(env_key)
             if raw_value is None:
@@ -983,126 +1485,115 @@ class ProcessorRuntimeMixin:
             except ValueError:
                 self.log.warn(f"Invalid {env_key}={raw_value!r}; using current value")
 
-        stage7_retry_raw = os.getenv("SEESTAR_STAGE7_QUALITY_RETRY_MAX")
+        stage7_retry_raw = os.getenv("STARUN_STAGE7_QUALITY_RETRY_MAX")
         if stage7_retry_raw is not None:
             try:
                 self.cfg.stage7_quality_retry_max = int(stage7_retry_raw.strip())
             except ValueError:
                 self.log.warn(
-                    "Invalid SEESTAR_STAGE7_QUALITY_RETRY_MAX="
+                    "Invalid STARUN_STAGE7_QUALITY_RETRY_MAX="
                     f"{stage7_retry_raw!r}; using current value"
                 )
 
-        stage7_skip_raw = os.getenv("SEESTAR_STAGE7_SKIP_UNREADY_STARLESS")
-        if stage7_skip_raw is not None:
-            parsed = self._parse_env_bool(
-                stage7_skip_raw,
-                self.cfg.stage7_skip_unready_starless,
-            )
-            self.cfg.stage7_skip_unready_starless = parsed
-            if stage7_skip_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
-                self.log.warn(
-                    "SEESTAR_STAGE7_SKIP_UNREADY_STARLESS has invalid value; keeping current setting"
-                )
-
-        for retired_key in (
-            "SEESTAR_STAR_SEPARATION_MODE",
-            "SEESTAR_STAR_SEPARATION_FALLBACK_TO_MILD_PRESTRETCH",
-            "SEESTAR_MILD_PRESTRETCH_STRENGTH",
-        ):
-            if os.getenv(retired_key) is not None:
-                self.log.warn(
-                    f"{retired_key} is retired and ignored; "
-                    "Stage 6 always uses the linear input"
-                )
-
         for env_key, attr_name in (
-            ("SEESTAR_STAGE7_SOFT_STARLESS_ASINH_STRETCH", "stage7_soft_starless_asinh_stretch"),
-            ("SEESTAR_STAGE7_BRIGHT_NEBULA_HALO_RESIDUE_SCORE_MAX", "stage7_bright_nebula_halo_residue_score_max"),
-            ("SEESTAR_STAGE7_STARLESS_REPAIR_STRENGTH", "stage7_starless_repair_strength"),
-            ("SEESTAR_STAGE7_STARLESS_HALO_REPAIR_STRENGTH", "stage7_starless_halo_repair_strength"),
-            ("SEESTAR_STAGE7_STARLESS_CHROMA_DENOISE_STRENGTH", "stage7_starless_chroma_denoise_strength"),
-            ("SEESTAR_STAGE7_STRETCH_CHROMA_NOISE_SCORE_MAX", "stage7_stretch_chroma_noise_score_max"),
-            ("SEESTAR_STAGE7_STRETCH_BACKGROUND_MOTTLING_SCORE_MAX", "stage7_stretch_background_mottling_score_max"),
-            ("SEESTAR_STAGE7_STRETCH_CHROMA_LOAD_GROWTH_MAX", "stage7_stretch_chroma_load_growth_max"),
-            ("SEESTAR_STAGE7_STRETCH_CHROMA_LOAD_LOW_ABSOLUTE_MAX", "stage7_stretch_chroma_load_low_absolute_max"),
-            ("SEESTAR_STAGE7_STRETCH_CHROMA_LOAD_LOW_ABSOLUTE_TOLERANCE", "stage7_stretch_chroma_load_low_absolute_tolerance"),
-            ("SEESTAR_STAGE7_PREVIEW_TARGET_P50_MIN_RATIO", "stage7_preview_target_p50_min_ratio"),
-            ("SEESTAR_STAGE7_PREVIEW_TARGET_P50_MAX_RATIO", "stage7_preview_target_p50_max_ratio"),
-            ("SEESTAR_STAGE7_BRIGHT_NEBULA_STAR_MASK_EXPAND", "stage7_bright_nebula_star_mask_expand"),
-            ("SEESTAR_STAGE7_BRIGHT_NEBULA_STAR_FAINT_SUPPRESSION", "stage7_bright_nebula_star_faint_suppression"),
-            ("SEESTAR_STAGE7_BRIGHT_NEBULA_STAR_DETAIL_SUPPRESSION", "stage7_bright_nebula_star_detail_suppression"),
-            ("SEESTAR_STAGE7_STARLESS_MASKED_RANK_DRIFT_P95_MAX", "stage7_starless_masked_rank_drift_p95_max"),
-            ("SEESTAR_STAGE7_STARLESS_HALO_DETAIL_GROWTH_RATIO_MAX", "stage7_starless_halo_detail_growth_ratio_max"),
-            ("SEESTAR_STAGE7_STARLESS_HALO_DETAIL_DELTA_MIN", "stage7_starless_halo_detail_delta_min"),
-            ("SEESTAR_STAGE7_STARLESS_PEAK_BACKGROUND_RATIO_MIN", "stage7_starless_peak_background_ratio_min"),
-            ("SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_REDUCTION_MIN", "stage7_starless_repair_chroma_reduction_min"),
-            ("SEESTAR_STAGE7_STARLESS_REPAIR_CHROMA_DELTA_MIN", "stage7_starless_repair_chroma_delta_min"),
-            ("SEESTAR_STAGE7_STARMASK_DIFFUSE_RESIDUAL_RATIO_MAX", "stage7_starmask_diffuse_residual_ratio_max"),
-            ("SEESTAR_STAGE8_LOCAL_CURVE_OPACITY", "stage8_local_curve_opacity"),
-            ("SEESTAR_STAGE8_LIMITED_SATURATION_MAX", "stage8_limited_saturation_max"),
-            ("SEESTAR_STAGE8_LIMITED_HALO_TEXTURE_GROWTH_MAX", "stage8_limited_halo_texture_growth_max"),
-            ("SEESTAR_STAGE8_LIMITED_HALO_TEXTURE_DELTA_MAX", "stage8_limited_halo_texture_delta_max"),
-            ("SEESTAR_STAGE9_STARMASK_ASINH_STRETCH", "stage9_starmask_asinh_stretch"),
-            ("SEESTAR_STAGE9_STARMASK_ASINH_OFFSET", "stage9_starmask_asinh_offset"),
-            ("SEESTAR_STAGE9_STARMASK_ASINH_STRETCH_MAX", "stage9_starmask_asinh_stretch_max"),
-            ("SEESTAR_STAGE9_STARMASK_FAINT_TARGET", "stage9_starmask_faint_target"),
-            ("SEESTAR_STAGE9_STARMASK_MID_TARGET", "stage9_starmask_mid_target"),
-            ("SEESTAR_STAGE9_STARMASK_BRIGHT_TARGET", "stage9_starmask_bright_target"),
-            ("SEESTAR_STAGE9_STARMASK_PEAK_TARGET", "stage9_starmask_peak_target"),
-            ("SEESTAR_STAGE9_STARMASK_FAINT_CHROMA_MAX", "stage9_starmask_faint_chroma_max"),
-            ("SEESTAR_STAGE9_STARMASK_BRIGHT_CHROMA_MAX", "stage9_starmask_bright_chroma_max"),
-            ("SEESTAR_STAGE9_STARMASK_PREDICTED_CHANGE_RATIO_MAX", "stage9_starmask_predicted_change_ratio_max"),
-            ("SEESTAR_STAGE9_STAR_COLOR_REPAIR_STRENGTH", "stage9_star_color_repair_strength"),
-            ("SEESTAR_STAGE9_STAR_COLOR_SUPPORT_RATIO_MAX", "stage9_star_color_support_ratio_max"),
-            ("SEESTAR_STAGE9_STAR_COLOR_IMPROVEMENT_MIN", "stage9_star_color_improvement_min"),
-            ("SEESTAR_STAGE9_STAR_COLOR_POST_CHROMA_ERROR_MAX", "stage9_star_color_post_chroma_error_max"),
-            ("SEESTAR_STAGE9_STAR_REFERENCE_SIGMA", "stage9_star_reference_sigma"),
-            ("SEESTAR_STAGE9_COMPACT_WEAK_STAR_RETENTION_MIN", "stage9_compact_weak_star_retention_min"),
-            ("SEESTAR_STAGE9_MIXED_STAR_PEAK_RATIO_MIN", "stage9_mixed_star_peak_ratio_min"),
-            ("SEESTAR_STAGE7_LOCAL_CORE_CLIP_RATIO_MAX", "stage7_local_core_clip_ratio_max"),
-            ("SEESTAR_STAGE7_LOCAL_FAINT_SNR_MIN", "stage7_local_faint_snr_min"),
-            ("SEESTAR_STAGE7_LOCAL_DARK_SEPARATION_MIN", "stage7_local_dark_separation_min"),
-            ("SEESTAR_STAGE9_HIGHLIGHT_CLIP_RATIO_MAX", "stage9_highlight_clip_ratio_max"),
-            ("SEESTAR_STAGE9_HIGHLIGHT_CLIP_GROWTH_MAX", "stage9_highlight_clip_growth_max"),
-            ("SEESTAR_STAGE9_BRIGHT_PIXEL_GROWTH_MAX", "stage9_bright_pixel_growth_max"),
-            ("SEESTAR_STAGE9_BACKGROUND_LIFT_MAX", "stage9_background_lift_max"),
-            ("SEESTAR_STAGE9_BACKGROUND_MOTTLING_GROWTH_MAX", "stage9_background_mottling_growth_max"),
-            ("SEESTAR_STAGE9_MOTTLING_EXEMPTION_CHANGED_PIXEL_RATIO_MAX", "stage9_mottling_exemption_changed_pixel_ratio_max"),
-            ("SEESTAR_STAGE9_CHANGED_PIXEL_RATIO_MAX", "stage9_changed_pixel_ratio_max"),
-            ("SEESTAR_STAGE9_DARKENING_RATIO_MAX", "stage9_darkening_ratio_max"),
-            ("SEESTAR_STAGE9_WEAK_STAR_RECOVERY_RATIO_MIN", "stage9_weak_star_recovery_ratio_min"),
-            ("SEESTAR_STAGE9_STAR_RECOVERY_RATIO_MIN", "stage9_star_recovery_ratio_min"),
-            ("SEESTAR_STAGE9_SOURCE_STAR_DETAIL_PERCENTILE", "stage9_source_star_detail_percentile"),
-            ("SEESTAR_STAGE9_SOURCE_COMPONENT_DENSITY_MAX", "stage9_source_component_density_max"),
-            ("SEESTAR_STAGE9_SOURCE_SINGLE_PIXEL_RATIO_MAX", "stage9_source_single_pixel_ratio_max"),
-            ("SEESTAR_STAGE9_WEAK_STAR_SCREEN_INTENSITY_MIN", "stage9_weak_star_screen_intensity_min"),
-            ("SEESTAR_STAGE9_STAR_SUPPORT_RATIO_MAX", "stage9_star_support_ratio_max"),
-            ("SEESTAR_STAGE9_UNMATCHED_CHANGED_RATIO_MAX", "stage9_unmatched_changed_ratio_max"),
-            ("SEESTAR_STAGE9_CHROMATIC_ADDITION_PEAK_MIN", "stage9_chromatic_addition_peak_min"),
-            ("SEESTAR_STAGE9_CHROMATIC_ADDITION_SATURATION_MIN", "stage9_chromatic_addition_saturation_min"),
-            ("SEESTAR_STAGE9_CHROMATIC_ADDITION_RATIO_MAX", "stage9_chromatic_addition_ratio_max"),
-            ("SEESTAR_STAGE9_STAR_APERTURE_RECOVERY_RATIO_MIN", "stage9_star_aperture_recovery_ratio_min"),
-            ("SEESTAR_STAGE9_STAR_WING_RECOVERY_RATIO_MIN", "stage9_star_wing_recovery_ratio_min"),
-            ("SEESTAR_STAGE9_RESIDUAL_DARK_HOLE_RATIO_MAX", "stage9_residual_dark_hole_ratio_max"),
-            ("SEESTAR_STAGE9_HOLLOW_STRUCTURE_DELTA_MIN", "stage9_hollow_structure_delta_min"),
-            ("SEESTAR_STAGE9_NEW_HOLLOW_STRUCTURE_AREA_MAX", "stage9_new_hollow_structure_area_max"),
-            ("SEESTAR_STAGE9_LOCAL_COMPONENT_PEAK_MIN", "stage9_local_component_peak_min"),
-            ("SEESTAR_STAGE9_LOCAL_COMPONENT_AREA_MAX", "stage9_local_component_area_max"),
-            ("SEESTAR_STAGE9_LOCAL_COMPONENT_ASPECT_RATIO_MAX", "stage9_local_component_aspect_ratio_max"),
-            ("SEESTAR_STAGE9_LOCAL_COMPONENT_FILL_RATIO_MIN", "stage9_local_component_fill_ratio_min"),
-            ("SEESTAR_STAGE9_LOCAL_SINGLE_PIXEL_RATIO_MAX", "stage9_local_single_pixel_ratio_max"),
-            ("SEESTAR_STAGE9_LOCAL_CYAN_BLUE_PEAK_MIN", "stage9_local_cyan_blue_peak_min"),
-            ("SEESTAR_STAGE9_LOCAL_CYAN_BLUE_SATURATION_MIN", "stage9_local_cyan_blue_saturation_min"),
-            ("SEESTAR_STAGE9_LOCAL_CYAN_BLUE_COMPONENT_AREA_MAX", "stage9_local_cyan_blue_component_area_max"),
-            ("SEESTAR_STAGE9_CORE_PERCENTILE", "stage9_core_percentile"),
-            ("SEESTAR_STAGE9_CORE_COLOR_JUMP_MIN", "stage9_core_color_jump_min"),
-            ("SEESTAR_STAGE9_CORE_COLOR_JUMP_COMPONENT_AREA_MAX", "stage9_core_color_jump_component_area_max"),
-            ("SEESTAR_STAGE10_CHROMA_FOCUS_SCORE_MIN", "stage10_chroma_focus_score_min"),
-            ("SEESTAR_STAGE10_SEPARATE_CHROMA_SCORE_MIN", "stage10_separate_chroma_score_min"),
-            ("SEESTAR_STAGE10_FULL_BG_STD_MIN", "stage10_full_bg_std_min"),
-            ("SEESTAR_STAGE10_FULL_MOTTLING_SCORE_MIN", "stage10_full_mottling_score_min"),
-            ("SEESTAR_STAGE10_STAGE9_LOCAL_COLOR_RISK_STRENGTH", "stage10_stage9_local_color_risk_strength"),
+            ("STARUN_STAGE7_LARGE_GALAXY_HALO_RESIDUE_SCORE_MAX", "stage7_large_galaxy_halo_residue_score_max"),
+            ("STARUN_STAGE7_BRIGHT_NEBULA_HALO_RESIDUE_SCORE_MAX", "stage7_bright_nebula_halo_residue_score_max"),
+            ("STARUN_STAGE7_GALAXY_CORE_PRESERVATION_RATIO_MIN", "stage7_galaxy_core_preservation_ratio_min"),
+            ("STARUN_STAGE7_GALAXY_CORE_CONTRAST_RATIO_MIN", "stage7_galaxy_core_contrast_ratio_min"),
+            ("STARUN_STAGE7_STARLESS_REPAIR_STRENGTH", "stage7_starless_repair_strength"),
+            ("STARUN_STAGE7_STARLESS_HALO_REPAIR_STRENGTH", "stage7_starless_halo_repair_strength"),
+            ("STARUN_STAGE7_STARLESS_CHROMA_DENOISE_STRENGTH", "stage7_starless_chroma_denoise_strength"),
+            ("STARUN_STAGE7_STRETCH_CHROMA_NOISE_SCORE_MAX", "stage7_stretch_chroma_noise_score_max"),
+            ("STARUN_STAGE7_STRETCH_BACKGROUND_MOTTLING_SCORE_MAX", "stage7_stretch_background_mottling_score_max"),
+            ("STARUN_STAGE7_STRETCH_CHROMA_LOAD_GROWTH_MAX", "stage7_stretch_chroma_load_growth_max"),
+            ("STARUN_STAGE7_STRETCH_CHROMA_LOAD_LOW_ABSOLUTE_MAX", "stage7_stretch_chroma_load_low_absolute_max"),
+            ("STARUN_STAGE7_STRETCH_CHROMA_LOAD_LOW_ABSOLUTE_TOLERANCE", "stage7_stretch_chroma_load_low_absolute_tolerance"),
+            ("STARUN_STAGE7_UNCALIBRATED_BACKGROUND_CHROMA_LOAD_REVIEW_MAX", "stage7_uncalibrated_background_chroma_load_review_max"),
+            ("STARUN_STAGE7_PREVIEW_TARGET_P50_MIN_RATIO", "stage7_preview_target_p50_min_ratio"),
+            ("STARUN_STAGE7_PREVIEW_TARGET_P50_MAX_RATIO", "stage7_preview_target_p50_max_ratio"),
+            ("STARUN_STAGE7_BRIGHT_NEBULA_STAR_MASK_EXPAND", "stage7_bright_nebula_star_mask_expand"),
+            ("STARUN_STAGE7_BRIGHT_NEBULA_STAR_FAINT_SUPPRESSION", "stage7_bright_nebula_star_faint_suppression"),
+            ("STARUN_STAGE7_BRIGHT_NEBULA_STAR_DETAIL_SUPPRESSION", "stage7_bright_nebula_star_detail_suppression"),
+            ("STARUN_STAGE7_STARLESS_MASKED_RANK_DRIFT_P95_MAX", "stage7_starless_masked_rank_drift_p95_max"),
+            ("STARUN_STAGE7_STARLESS_HALO_DETAIL_GROWTH_RATIO_MAX", "stage7_starless_halo_detail_growth_ratio_max"),
+            ("STARUN_STAGE7_STARLESS_HALO_DETAIL_DELTA_MIN", "stage7_starless_halo_detail_delta_min"),
+            ("STARUN_STAGE7_STARLESS_PEAK_BACKGROUND_RATIO_MIN", "stage7_starless_peak_background_ratio_min"),
+            ("STARUN_STAGE7_STARLESS_REPAIR_CHROMA_REDUCTION_MIN", "stage7_starless_repair_chroma_reduction_min"),
+            ("STARUN_STAGE7_STARLESS_REPAIR_CHROMA_DELTA_MIN", "stage7_starless_repair_chroma_delta_min"),
+            ("STARUN_STAGE7_STARMASK_DIFFUSE_RESIDUAL_RATIO_MAX", "stage7_starmask_diffuse_residual_ratio_max"),
+            ("STARUN_STAGE8_LOCAL_CURVE_OPACITY", "stage8_local_curve_opacity"),
+            ("STARUN_STAGE8_LIMITED_SATURATION_MAX", "stage8_limited_saturation_max"),
+            ("STARUN_STAGE8_LIMITED_HALO_TEXTURE_GROWTH_MAX", "stage8_limited_halo_texture_growth_max"),
+            ("STARUN_STAGE8_LIMITED_HALO_TEXTURE_DELTA_MAX", "stage8_limited_halo_texture_delta_max"),
+            ("STARUN_STAGE8_DUALBAND_PALETTE_STRENGTH", "stage8_dualband_palette_strength"),
+            ("STARUN_STAGE8_DUALBAND_PALETTE_LUMA_DRIFT_MAX", "stage8_dualband_palette_luma_drift_max"),
+            ("STARUN_STAGE8_DUALBAND_PALETTE_CLIP_GROWTH_MAX", "stage8_dualband_palette_clip_growth_max"),
+            ("STARUN_STAGE8_DUALBAND_PALETTE_QUALITY_WARNING_TOLERANCE", "stage8_dualband_palette_quality_warning_tolerance"),
+            ("STARUN_STAGE9_SASP_STAR_STRETCH_AMOUNT", "stage9_sasp_star_stretch_amount"),
+            ("STARUN_STAGE9_NB_TO_RGB_STARS_RATIO", "stage9_nb_to_rgb_stars_ratio"),
+            ("STARUN_STAGE9_STARMASK_ASINH_STRETCH", "stage9_starmask_asinh_stretch"),
+            ("STARUN_STAGE9_STARMASK_ASINH_OFFSET", "stage9_starmask_asinh_offset"),
+            ("STARUN_STAGE9_STARMASK_ASINH_STRETCH_MAX", "stage9_starmask_asinh_stretch_max"),
+            ("STARUN_STAGE9_STARMASK_FAINT_TARGET", "stage9_starmask_faint_target"),
+            ("STARUN_STAGE9_STARMASK_MID_TARGET", "stage9_starmask_mid_target"),
+            ("STARUN_STAGE9_STARMASK_BRIGHT_TARGET", "stage9_starmask_bright_target"),
+            ("STARUN_STAGE9_STARMASK_PEAK_TARGET", "stage9_starmask_peak_target"),
+            ("STARUN_STAGE9_STARMASK_FAINT_CHROMA_MAX", "stage9_starmask_faint_chroma_max"),
+            ("STARUN_STAGE9_STARMASK_BRIGHT_CHROMA_MAX", "stage9_starmask_bright_chroma_max"),
+            ("STARUN_STAGE9_STARMASK_PREDICTED_CHANGE_RATIO_MAX", "stage9_starmask_predicted_change_ratio_max"),
+            ("STARUN_STAGE9_STAR_COLOR_REPAIR_STRENGTH", "stage9_star_color_repair_strength"),
+            ("STARUN_STAGE9_STAR_COLOR_SUPPORT_RATIO_MAX", "stage9_star_color_support_ratio_max"),
+            ("STARUN_STAGE9_STAR_COLOR_IMPROVEMENT_MIN", "stage9_star_color_improvement_min"),
+            ("STARUN_STAGE9_STAR_COLOR_POST_CHROMA_ERROR_MAX", "stage9_star_color_post_chroma_error_max"),
+            ("STARUN_STAGE9_STAR_REFERENCE_SIGMA", "stage9_star_reference_sigma"),
+            ("STARUN_STAGE9_COMPACT_WEAK_STAR_RETENTION_MIN", "stage9_compact_weak_star_retention_min"),
+            ("STARUN_STAGE9_MIXED_STAR_PEAK_RATIO_MIN", "stage9_mixed_star_peak_ratio_min"),
+            ("STARUN_STAGE7_LOCAL_CORE_CLIP_RATIO_MAX", "stage7_local_core_clip_ratio_max"),
+            ("STARUN_STAGE7_LOCAL_FAINT_SNR_MIN", "stage7_local_faint_snr_min"),
+            ("STARUN_STAGE7_LOCAL_DARK_SEPARATION_MIN", "stage7_local_dark_separation_min"),
+            ("STARUN_STAGE9_HIGHLIGHT_CLIP_RATIO_MAX", "stage9_highlight_clip_ratio_max"),
+            ("STARUN_STAGE9_HIGHLIGHT_CLIP_GROWTH_MAX", "stage9_highlight_clip_growth_max"),
+            ("STARUN_STAGE9_BRIGHT_PIXEL_GROWTH_MAX", "stage9_bright_pixel_growth_max"),
+            ("STARUN_STAGE9_BACKGROUND_LIFT_MAX", "stage9_background_lift_max"),
+            ("STARUN_STAGE9_BACKGROUND_MOTTLING_GROWTH_MAX", "stage9_background_mottling_growth_max"),
+            ("STARUN_STAGE9_MOTTLING_EXEMPTION_CHANGED_PIXEL_RATIO_MAX", "stage9_mottling_exemption_changed_pixel_ratio_max"),
+            ("STARUN_STAGE9_CHANGED_PIXEL_RATIO_MAX", "stage9_changed_pixel_ratio_max"),
+            ("STARUN_STAGE9_DARKENING_RATIO_MAX", "stage9_darkening_ratio_max"),
+            ("STARUN_STAGE9_WEAK_STAR_RECOVERY_RATIO_MIN", "stage9_weak_star_recovery_ratio_min"),
+            ("STARUN_STAGE9_STAR_RECOVERY_RATIO_MIN", "stage9_star_recovery_ratio_min"),
+            ("STARUN_STAGE9_SOURCE_STAR_DETAIL_PERCENTILE", "stage9_source_star_detail_percentile"),
+            ("STARUN_STAGE9_SOURCE_COMPONENT_DENSITY_MAX", "stage9_source_component_density_max"),
+            ("STARUN_STAGE9_SOURCE_SINGLE_PIXEL_RATIO_MAX", "stage9_source_single_pixel_ratio_max"),
+            ("STARUN_STAGE9_WEAK_STAR_SCREEN_INTENSITY_MIN", "stage9_weak_star_screen_intensity_min"),
+            ("STARUN_STAGE9_STAR_SUPPORT_RATIO_MAX", "stage9_star_support_ratio_max"),
+            ("STARUN_STAGE9_UNMATCHED_CHANGED_RATIO_MAX", "stage9_unmatched_changed_ratio_max"),
+            ("STARUN_STAGE9_CHROMATIC_ADDITION_PEAK_MIN", "stage9_chromatic_addition_peak_min"),
+            ("STARUN_STAGE9_CHROMATIC_ADDITION_SATURATION_MIN", "stage9_chromatic_addition_saturation_min"),
+            ("STARUN_STAGE9_CHROMATIC_ADDITION_RATIO_MAX", "stage9_chromatic_addition_ratio_max"),
+            ("STARUN_STAGE9_STAR_POSITIVE_DELTA_WINDOW_RECOVERY_RATIO_MIN", "stage9_star_positive_delta_window_recovery_ratio_min"),
+            ("STARUN_STAGE9_STAR_WING_RECOVERY_RATIO_MIN", "stage9_star_wing_recovery_ratio_min"),
+            ("STARUN_STAGE9_RESIDUAL_DARK_HOLE_RATIO_MAX", "stage9_residual_dark_hole_ratio_max"),
+            ("STARUN_STAGE9_HOLLOW_STRUCTURE_DELTA_MIN", "stage9_hollow_structure_delta_min"),
+            ("STARUN_STAGE9_NEW_HOLLOW_STRUCTURE_AREA_MAX", "stage9_new_hollow_structure_area_max"),
+            ("STARUN_STAGE9_LOCAL_COMPONENT_PEAK_MIN", "stage9_local_component_peak_min"),
+            ("STARUN_STAGE9_LOCAL_COMPONENT_AREA_MAX", "stage9_local_component_area_max"),
+            ("STARUN_STAGE9_LOCAL_COMPONENT_ASPECT_RATIO_MAX", "stage9_local_component_aspect_ratio_max"),
+            ("STARUN_STAGE9_LOCAL_COMPONENT_FILL_RATIO_MIN", "stage9_local_component_fill_ratio_min"),
+            ("STARUN_STAGE9_LOCAL_SINGLE_PIXEL_RATIO_MAX", "stage9_local_single_pixel_ratio_max"),
+            ("STARUN_STAGE9_LOCAL_CYAN_BLUE_PEAK_MIN", "stage9_local_cyan_blue_peak_min"),
+            ("STARUN_STAGE9_LOCAL_CYAN_BLUE_SATURATION_MIN", "stage9_local_cyan_blue_saturation_min"),
+            ("STARUN_STAGE9_LOCAL_CYAN_BLUE_COMPONENT_AREA_MAX", "stage9_local_cyan_blue_component_area_max"),
+            ("STARUN_STAGE9_CORE_PERCENTILE", "stage9_core_percentile"),
+            ("STARUN_STAGE9_CORE_COLOR_JUMP_MIN", "stage9_core_color_jump_min"),
+            ("STARUN_STAGE9_CORE_COLOR_JUMP_COMPONENT_AREA_MAX", "stage9_core_color_jump_component_area_max"),
+            ("STARUN_STAGE10_CHROMA_FOCUS_SCORE_MIN", "stage10_chroma_focus_score_min"),
+            ("STARUN_STAGE10_SEPARATE_CHROMA_SCORE_MIN", "stage10_separate_chroma_score_min"),
+            ("STARUN_STAGE10_FULL_BG_STD_MIN", "stage10_full_bg_std_min"),
+            ("STARUN_STAGE10_FULL_MOTTLING_SCORE_MIN", "stage10_full_mottling_score_min"),
+            ("STARUN_STAGE10_FINAL_DENOISE_STRENGTH", "stage10_final_denoise_strength"),
+            ("STARUN_STAGE10_STAR_PROTECTION_COVERAGE_MAX", "stage10_star_protection_coverage_max"),
+            ("STARUN_STAGE10_LARGE_GALAXY_LOCAL_PATCH_VARIANCE_MAX", "stage10_large_galaxy_local_patch_variance_max"),
+            ("STARUN_STAGE10_STAGE9_LOCAL_COLOR_RISK_STRENGTH", "stage10_stage9_local_color_risk_strength"),
         ):
             raw_value = os.getenv(env_key)
             if raw_value is None:
@@ -1113,10 +1604,10 @@ class ProcessorRuntimeMixin:
                 self.log.warn(f"Invalid {env_key}={raw_value!r}; using current value")
 
         for env_key, attr_name in (
-            ("SEESTAR_STAGE7_STRETCH_FEEDBACK_RETRY_MAX", "stage7_stretch_feedback_retry_max"),
-            ("SEESTAR_STAGE8_LIMITED_CORE_EXCLUSION_EXPAND", "stage8_limited_core_exclusion_expand"),
-            ("SEESTAR_STAGE9_MIXED_STAR_WEAK_COUNT_MIN", "stage9_mixed_star_weak_count_min"),
-            ("SEESTAR_STAGE9_MIXED_STAR_BRIGHT_COUNT_MIN", "stage9_mixed_star_bright_count_min"),
+            ("STARUN_STAGE7_STRETCH_FEEDBACK_RETRY_MAX", "stage7_stretch_feedback_retry_max"),
+            ("STARUN_STAGE8_LIMITED_CORE_EXCLUSION_EXPAND", "stage8_limited_core_exclusion_expand"),
+            ("STARUN_STAGE9_MIXED_STAR_WEAK_COUNT_MIN", "stage9_mixed_star_weak_count_min"),
+            ("STARUN_STAGE9_MIXED_STAR_BRIGHT_COUNT_MIN", "stage9_mixed_star_bright_count_min"),
         ):
             raw_value = os.getenv(env_key)
             if raw_value is None:
@@ -1127,21 +1618,26 @@ class ProcessorRuntimeMixin:
                 self.log.warn(f"Invalid {env_key}={raw_value!r}; using current value")
 
         for env_key, attr_name in (
-            ("SEESTAR_STAGE7_STARLESS_PIXEL_REPAIR_ENABLE", "stage7_starless_pixel_repair_enabled"),
-            ("SEESTAR_STAGE7_CHROMA_RESCUE_ENABLE", "stage7_chroma_rescue_enabled"),
-            ("SEESTAR_STAGE7_STARLESS_STRUCTURE_GATE_ENABLE", "stage7_starless_structure_gate_enabled"),
-            ("SEESTAR_STAGE7_QUANTILE_FALLBACK_ENABLE", "stage7_quantile_fallback_enabled"),
-            ("SEESTAR_STAGE8_FORCE_CONSERVATIVE_AFTER_STAGE7_REPAIR", "stage8_force_conservative_after_stage7_repair"),
-            ("SEESTAR_STAGE8_LOCAL_ADJUSTMENT_ENGINE_ENABLE", "stage8_local_adjustment_engine_enabled"),
-            ("SEESTAR_STAGE9_STARMASK_STRETCH_ENABLE", "stage9_starmask_stretch_enabled"),
-            ("SEESTAR_STAGE9_STARMASK_ADAPTIVE_STRETCH_ENABLE", "stage9_starmask_adaptive_stretch_enabled"),
-            ("SEESTAR_STAGE9_COMPACT_STARMASK_ENABLE", "stage9_compact_starmask_enabled"),
-            ("SEESTAR_STAGE9_STAR_COLOR_REPAIR_ENABLE", "stage9_star_color_repair_enabled"),
-            ("SEESTAR_STAGE9_STARMASK_CHROMA_REGULARIZATION_ENABLE", "stage9_starmask_chroma_regularization_enabled"),
-            ("SEESTAR_STAGE9_QUALITY_GATE_ENABLE", "stage9_quality_gate_enabled"),
-            ("SEESTAR_STAGE10_MANAGED_OUTPUT_ENABLE", "stage10_managed_output_enabled"),
-            ("SEESTAR_FORCE_REVIEW_ONLY_OUTPUT", "force_review_only_output"),
-            ("SEESTAR_STAGE7_TARGET_LOCAL_METRICS_ENABLE", "stage7_target_local_metrics_enabled"),
+            ("STARUN_STAGE7_STARLESS_PIXEL_REPAIR_ENABLE", "stage7_starless_pixel_repair_enabled"),
+            ("STARUN_STAGE7_GALAXY_ROI_HALO_GATE_ENABLE", "stage7_galaxy_roi_halo_gate_enabled"),
+            ("STARUN_STAGE7_CHROMA_RESCUE_ENABLE", "stage7_chroma_rescue_enabled"),
+            ("STARUN_STAGE7_STARLESS_STRUCTURE_GATE_ENABLE", "stage7_starless_structure_gate_enabled"),
+            ("STARUN_STAGE7_QUANTILE_FALLBACK_ENABLE", "stage7_quantile_fallback_enabled"),
+            ("STARUN_STAGE8_FORCE_CONSERVATIVE_AFTER_STAGE7_REPAIR", "stage8_force_conservative_after_stage7_repair"),
+            ("STARUN_STAGE8_LOCAL_ADJUSTMENT_ENGINE_ENABLE", "stage8_local_adjustment_engine_enabled"),
+            ("STARUN_STAGE9_SASP_STAR_STRETCH_ENABLE", "stage9_sasp_star_stretch_enabled"),
+            ("STARUN_STAGE9_NB_TO_RGB_STARS_ENABLE", "stage9_nb_to_rgb_stars_enabled"),
+            ("STARUN_STAGE9_STARMASK_STRETCH_ENABLE", "stage9_starmask_stretch_enabled"),
+            ("STARUN_STAGE9_STARMASK_ADAPTIVE_STRETCH_ENABLE", "stage9_starmask_adaptive_stretch_enabled"),
+            ("STARUN_STAGE9_COMPACT_STARMASK_ENABLE", "stage9_compact_starmask_enabled"),
+            ("STARUN_STAGE9_STARMASK_PRE_STRETCH_COMPACT_ENABLE", "stage9_starmask_pre_stretch_compact_enabled"),
+            ("STARUN_STAGE9_STAR_COLOR_REPAIR_ENABLE", "stage9_star_color_repair_enabled"),
+            ("STARUN_STAGE9_STAR_COLOR_POST_VALIDATION_ENABLE", "stage9_star_color_post_validation_enabled"),
+            ("STARUN_STAGE9_STARMASK_CHROMA_REGULARIZATION_ENABLE", "stage9_starmask_chroma_regularization_enabled"),
+            ("STARUN_STAGE9_QUALITY_GATE_ENABLE", "stage9_quality_gate_enabled"),
+            ("STARUN_STAGE10_MANAGED_OUTPUT_ENABLE", "stage10_managed_output_enabled"),
+            ("STARUN_FORCE_REVIEW_ONLY_OUTPUT", "force_review_only_output"),
+            ("STARUN_STAGE7_TARGET_LOCAL_METRICS_ENABLE", "stage7_target_local_metrics_enabled"),
         ):
             raw_value = os.getenv(env_key)
             if raw_value is None:
@@ -1151,20 +1647,61 @@ class ProcessorRuntimeMixin:
             if raw_value.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
                 self.log.warn(f"{env_key} has invalid value; keeping current setting")
 
-        old_timeout = self.cfg.ai_timeout_sec
-        old_strength = self.cfg.ai_strength
+        legacy_compact_env_key = "STARUN_STAGE9_COMPACT_STARMASK_ENABLE"
+        pre_stretch_compact_env_key = (
+            "STARUN_STAGE9_STARMASK_PRE_STRETCH_COMPACT_ENABLE"
+        )
+        explicit_env_keys = getattr(
+            self,
+            "_project_env_explicit_keys",
+            frozenset(
+                key
+                for key in (
+                    legacy_compact_env_key,
+                    pre_stretch_compact_env_key,
+                )
+                if os.getenv(key) is not None
+            ),
+        )
+        legacy_compact_raw = os.getenv(legacy_compact_env_key)
+        if (
+            legacy_compact_env_key in explicit_env_keys
+            and pre_stretch_compact_env_key not in explicit_env_keys
+            and legacy_compact_raw is not None
+            and legacy_compact_raw.strip().lower()
+            in (ENV_TRUE_VALUES | ENV_FALSE_VALUES)
+        ):
+            self.cfg.stage9_starmask_pre_stretch_compact_enabled = (
+                self._parse_env_bool(
+                    legacy_compact_raw,
+                    self.cfg.stage9_starmask_pre_stretch_compact_enabled,
+                )
+            )
+            self.log.info(
+                "Legacy STARUN_STAGE9_COMPACT_STARMASK_ENABLE mirrored to "
+                "STARUN_STAGE9_STARMASK_PRE_STRETCH_COMPACT_ENABLE"
+            )
+
         old_stage7_retry = self.cfg.stage7_quality_retry_max
-        old_stage7_soft = self.cfg.stage7_soft_starless_asinh_stretch
+        old_stage7_large_galaxy_halo = self.cfg.stage7_large_galaxy_halo_residue_score_max
         old_stage7_bright_halo = self.cfg.stage7_bright_nebula_halo_residue_score_max
         old_stage7_repair = self.cfg.stage7_starless_repair_strength
         old_stage7_halo = self.cfg.stage7_starless_halo_repair_strength
         old_stage7_chroma = self.cfg.stage7_starless_chroma_denoise_strength
         old_stage9_starmask_stretch = self.cfg.stage9_starmask_asinh_stretch
         old_stage9_starmask_offset = self.cfg.stage9_starmask_asinh_offset
-        self.cfg.ai_timeout_sec = _clamp_int(self.cfg.ai_timeout_sec, 15, 300)
         self.cfg.stage4_spcc_timeout_sec = _clamp_int(
-            getattr(self.cfg, "stage4_spcc_timeout_sec", 180),
+            getattr(self.cfg, "stage4_spcc_timeout_sec", 300),
             5,
+            300,
+        )
+        self.cfg.stage4_spcc_online_unverified_timeout_sec = _clamp_int(
+            getattr(
+                self.cfg,
+                "stage4_spcc_online_unverified_timeout_sec",
+                90,
+            ),
+            30,
             180,
         )
         self.cfg.stage4_spcc_limit_magnitude = _clamp_float(
@@ -1172,7 +1709,67 @@ class ProcessorRuntimeMixin:
             1.0,
             25.0,
         )
-        self.cfg.ai_strength = _clamp_float(self.cfg.ai_strength, 0.05, 0.25)
+        for attr_name, lower, upper in (
+            ("stage4_spcc_narrowband_r_wavelength_nm", 300.0, 900.0),
+            ("stage4_spcc_narrowband_g_wavelength_nm", 300.0, 900.0),
+            ("stage4_spcc_narrowband_b_wavelength_nm", 300.0, 900.0),
+            ("stage4_spcc_narrowband_r_bandwidth_nm", 1.0, 100.0),
+            ("stage4_spcc_narrowband_g_bandwidth_nm", 1.0, 100.0),
+            ("stage4_spcc_narrowband_b_bandwidth_nm", 1.0, 100.0),
+        ):
+            original = float(getattr(self.cfg, attr_name))
+            effective = _clamp_float(original, lower, upper)
+            setattr(self.cfg, attr_name, effective)
+            if effective != original:
+                self.log.warn(
+                    f"{attr_name} outside safe range [{lower:g}, {upper:g}]; "
+                    f"clamped {original:g} -> {effective:g}"
+                )
+        self.cfg.stage4_auto_reference_background_sample_target = _clamp_int(
+            getattr(
+                self.cfg,
+                "stage4_auto_reference_background_sample_target",
+                40,
+            ),
+            16,
+            64,
+        )
+        self.cfg.stage4_auto_reference_background_sample_min = min(
+            self.cfg.stage4_auto_reference_background_sample_target,
+            _clamp_int(
+                getattr(
+                    self.cfg,
+                    "stage4_auto_reference_background_sample_min",
+                    16,
+                ),
+                16,
+                40,
+            ),
+        )
+        self.cfg.stage4_auto_reference_star_min_objects = _clamp_int(
+            getattr(self.cfg, "stage4_auto_reference_star_min_objects", 16),
+            16,
+            256,
+        )
+        for attr_name, lower, upper in (
+            ("stage4_auto_reference_holdout_ratio", 0.20, 0.40),
+            ("stage4_auto_reference_background_error_min", 0.0, 0.25),
+            ("stage4_auto_reference_background_improvement_min", 0.01, 0.90),
+            ("stage4_auto_reference_star_ratio_mad_max", 0.01, 0.50),
+            ("stage4_auto_reference_star_saturation_ratio_max", 0.0, 0.50),
+            ("stage4_auto_reference_gain_limit", 1.01, 1.20),
+            ("stage4_auto_reference_star_improvement_min", 0.01, 0.90),
+            ("stage4_auto_reference_highlight_clip_growth_max", 0.0, 0.05),
+            ("stage4_auto_reference_black_clip_growth_max", 0.0, 0.05),
+            ("stage4_auto_reference_gradient_growth_max", 1.0, 2.0),
+            ("stage4_auto_reference_texture_growth_max", 1.0, 2.0),
+            ("stage4_auto_reference_target_chroma_drift_max", 0.01, 0.50),
+        ):
+            setattr(
+                self.cfg,
+                attr_name,
+                _clamp_float(getattr(self.cfg, attr_name), lower, upper),
+            )
         self.cfg.stage7_quality_retry_max = _clamp_int(
             self.cfg.stage7_quality_retry_max, 0, 3
         )
@@ -1185,15 +1782,15 @@ class ProcessorRuntimeMixin:
         self.cfg.stage8_limited_core_exclusion_expand = _clamp_int(
             self.cfg.stage8_limited_core_exclusion_expand, 2, 16
         )
-        self.cfg.stage7_soft_starless_asinh_stretch = _clamp_float(
-            self.cfg.stage7_soft_starless_asinh_stretch,
-            1.05,
-            self.cfg.stage7_ultra_conservative_asinh_stretch,
-        )
         self.cfg.stage7_bright_nebula_halo_residue_score_max = _clamp_float(
             self.cfg.stage7_bright_nebula_halo_residue_score_max,
             self.cfg.stage7_halo_residue_score_max,
             1.20,
+        )
+        self.cfg.stage7_large_galaxy_halo_residue_score_max = _clamp_float(
+            self.cfg.stage7_large_galaxy_halo_residue_score_max,
+            self.cfg.stage7_halo_residue_score_max,
+            1.0,
         )
         self.cfg.stage7_starless_repair_strength = _clamp_float(
             self.cfg.stage7_starless_repair_strength,
@@ -1215,28 +1812,52 @@ class ProcessorRuntimeMixin:
             1.10,
             3.00,
         )
+        self.cfg.stage9_sasp_star_stretch_amount = _clamp_float(
+            getattr(self.cfg, "stage9_sasp_star_stretch_amount", 3.0),
+            0.50,
+            5.00,
+        )
+        self.cfg.stage9_nb_to_rgb_stars_ratio = _clamp_float(
+            getattr(self.cfg, "stage9_nb_to_rgb_stars_ratio", 0.30),
+            0.0,
+            1.0,
+        )
         self.cfg.stage9_starmask_asinh_offset = _clamp_float(
             self.cfg.stage9_starmask_asinh_offset,
             0.0005,
             0.0060,
         )
         for attr_name, lower, upper in (
+            ("stage7_9_quality_advisory_multiplier", 1.0, 2.0),
             ("stage7_stretch_chroma_noise_score_max", 0.10, 0.80),
             ("stage7_stretch_background_mottling_score_max", 0.10, 1.00),
             ("stage7_stretch_chroma_load_growth_max", 1.00, 3.00),
             ("stage7_stretch_chroma_load_low_absolute_max", 0.01, 0.15),
             ("stage7_stretch_chroma_load_low_absolute_tolerance", 0.0, 0.01),
+            ("stage7_display90_reference_chroma_load_ratio_max", 1.00, 1.20),
+            ("stage7_display90_reference_chroma_load_absolute_max", 0.15, 0.50),
+            ("stage7_uncalibrated_background_chroma_load_review_max", 0.04, 0.50),
             ("stage7_preview_target_p50_min_ratio", 0.25, 0.90),
             ("stage7_preview_target_p50_max_ratio", 1.00, 3.00),
+            ("stage7_mtf_reference_blackpoint_sigma", 0.50, 8.00),
+            ("stage7_mtf_reference_p50_relative_error_max", 0.01, 0.25),
+            ("stage7_mtf_reference_p50_absolute_error_max", 0.0001, 0.03),
             ("stage7_bright_nebula_star_faint_suppression", 0.0, 1.0),
             ("stage7_bright_nebula_star_detail_suppression", 0.0, 0.60),
             ("stage7_starless_masked_rank_drift_p95_max", 0.02, 0.50),
             ("stage7_starless_halo_detail_growth_ratio_max", 1.05, 4.00),
             ("stage7_starless_halo_detail_delta_min", 0.001, 0.10),
             ("stage7_starless_peak_background_ratio_min", 1.5, 12.0),
+            ("stage7_galaxy_core_preservation_ratio_min", 0.30, 0.95),
+            ("stage7_galaxy_core_contrast_ratio_min", 0.30, 0.95),
             ("stage7_starless_repair_chroma_reduction_min", 0.05, 0.80),
             ("stage7_starless_repair_chroma_delta_min", 0.00001, 0.05000),
             ("stage7_starmask_diffuse_residual_ratio_max", 0.01, 0.50),
+            ("stage8_dualband_palette_strength", 0.10, 1.00),
+            ("stage8_dualband_palette_luma_drift_max", 0.001, 0.030),
+            ("stage8_dualband_palette_clip_growth_max", 0.0, 0.020),
+            ("stage8_dualband_palette_quality_warning_tolerance", 0.0, 1.0),
+            ("stage9_psf_review_fwhm_ratio_max", 1.10, 1.65),
             ("stage9_highlight_clip_ratio_max", 0.001, 0.10),
             ("stage9_highlight_clip_growth_max", 0.0, 0.05),
             ("stage9_bright_pixel_growth_max", 0.0, 0.10),
@@ -1265,7 +1886,7 @@ class ProcessorRuntimeMixin:
             ("stage9_chromatic_addition_peak_min", 0.002, 0.25),
             ("stage9_chromatic_addition_saturation_min", 0.30, 0.95),
             ("stage9_chromatic_addition_ratio_max", 0.0, 0.05),
-            ("stage9_star_aperture_recovery_ratio_min", 0.40, 0.98),
+            ("stage9_star_positive_delta_window_recovery_ratio_min", 0.40, 0.98),
             ("stage9_star_wing_recovery_ratio_min", 0.30, 0.95),
             ("stage9_residual_dark_hole_ratio_max", 0.0, 0.50),
             ("stage9_hollow_structure_delta_min", 0.01, 0.25),
@@ -1285,6 +1906,9 @@ class ProcessorRuntimeMixin:
             ("stage10_separate_chroma_score_min", 0.35, 1.50),
             ("stage10_full_bg_std_min", 0.001, 0.10),
             ("stage10_full_mottling_score_min", 0.10, 1.00),
+            ("stage10_final_denoise_strength", 0.05, 0.50),
+            ("stage10_star_protection_coverage_max", 0.05, 0.60),
+            ("stage10_large_galaxy_local_patch_variance_max", 0.00022, 0.00100),
             ("stage10_stage9_local_color_risk_strength", 0.0, 1.0),
         ):
             old_value = float(getattr(self.cfg, attr_name))
@@ -1333,21 +1957,13 @@ class ProcessorRuntimeMixin:
                 self.log.warn(
                     f"{attr_name} clamped: {old_value} -> {new_value}"
                 )
-        if old_timeout != self.cfg.ai_timeout_sec:
-            self.log.warn(
-                f"AI timeout clamped: {old_timeout} -> {self.cfg.ai_timeout_sec}"
-            )
-        if old_strength != self.cfg.ai_strength:
-            self.log.warn(
-                f"AI strength clamped: {old_strength} -> {self.cfg.ai_strength}"
-            )
         if old_stage7_retry != self.cfg.stage7_quality_retry_max:
             self.log.warn(
                 "Stage7 quality retry max clamped: "
                 f"{old_stage7_retry} -> {self.cfg.stage7_quality_retry_max}"
             )
         for label, old_value, new_value in (
-            ("Stage7 soft starless asinh stretch", old_stage7_soft, self.cfg.stage7_soft_starless_asinh_stretch),
+            ("Stage7 large-galaxy halo threshold", old_stage7_large_galaxy_halo, self.cfg.stage7_large_galaxy_halo_residue_score_max),
             ("Stage7 bright-nebula halo threshold", old_stage7_bright_halo, self.cfg.stage7_bright_nebula_halo_residue_score_max),
             ("Stage7 starless repair strength", old_stage7_repair, self.cfg.stage7_starless_repair_strength),
             ("Stage7 starless halo repair strength", old_stage7_halo, self.cfg.stage7_starless_halo_repair_strength),
@@ -1357,12 +1973,6 @@ class ProcessorRuntimeMixin:
         ):
             if old_value != new_value:
                 self.log.warn(f"{label} clamped: {old_value} -> {new_value}")
-
-
-    def _apply_ai_env_overrides(self):
-        """Compatibility wrapper for isolated Stage11 runners."""
-        self._apply_runtime_env_overrides()
-
 
     def _safe_unlink(self, path: Path):
         try:
@@ -1377,7 +1987,7 @@ class ProcessorRuntimeMixin:
             image_data = self.siril.get_image_pixeldata(preview=False)
             return measure_image_features(image_data)
         except (CommandError, DataError, SirilError, OSError, RuntimeError, TypeError, ValueError) as e:
-            self.log.warn(f"[AI] Failed to measure image features: {e}")
+            self.log.warn(f"[AutoTune] Failed to measure image features: {e}")
             return None
 
 
@@ -1386,7 +1996,7 @@ class ProcessorRuntimeMixin:
             image_data = self.siril.get_image_pixeldata(preview=False)
             return measure_quality_metrics(image_data)
         except (CommandError, DataError, SirilError, OSError, RuntimeError, TypeError, ValueError) as e:
-            self.log.warn(f"[AI] Failed to measure image quality metrics: {e}")
+            self.log.warn(f"[AutoTune] Failed to measure image quality metrics: {e}")
             return None
 
 
@@ -1528,6 +2138,8 @@ class ProcessorRuntimeMixin:
 
     def _load_trusted_input_provenance_for_resume(self) -> Dict[str, Any]:
         """Resolve resume trust before the process directory is rebuilt."""
+        self._resume_semantic_context = None
+        self._resume_semantic_context_status = "not_applicable"
         result: Dict[str, Any] = {
             "verified": False,
             "state": "unknown",
@@ -1557,7 +2169,7 @@ class ProcessorRuntimeMixin:
             if manifest_path.parent != self.work_dir.resolve():
                 task_result["detail"] = "task-run manifest is outside current run"
             elif payload is None or str(payload.get("schema") or "") != (
-                "seestar.task-run.v1"
+                "starun.task-run.v1"
             ):
                 task_result["detail"] = "task-run manifest is missing or unsupported"
             else:
@@ -1606,6 +2218,20 @@ class ProcessorRuntimeMixin:
                         path_inside_task = False
                     actual_sha256 = run_manifest.sha256_file(checkpoint_path)
                     expected_sha256 = str(resume.get("sha256") or "")
+                    semantic_context = None
+                    semantic_error = None
+                    if resume_stage == 5:
+                        try:
+                            semantic_context = (
+                                task_workspace._normalize_resume_semantic_context(
+                                    resume.get("semantic_context"),
+                                    stage_number=5,
+                                )
+                            )
+                        except task_workspace.WorkspaceError as error:
+                            semantic_error = str(error)
+                        if semantic_context is None and semantic_error is None:
+                            semantic_error = "Stage 5 semantic context is missing"
                     if resume_stage != expected_stage or contract_record is None:
                         task_result["detail"] = "task-run resume stage does not match mode"
                     elif str(resume.get("artifact") or "") != (
@@ -1618,7 +2244,14 @@ class ProcessorRuntimeMixin:
                         task_result["detail"] = "task-run checkpoint state is not linear"
                     elif not actual_sha256 or actual_sha256 != expected_sha256:
                         task_result["detail"] = "task-run checkpoint SHA-256 mismatch"
+                    elif semantic_error is not None:
+                        task_result["detail"] = (
+                            "task-run Stage 5 semantic context is invalid: "
+                            + semantic_error
+                        )
                     else:
+                        self._task_run_manifest_payload = copy.deepcopy(dict(payload))
+                        self._task_run_manifest_path = manifest_path
                         task_result.update(
                             {
                                 "verified": True,
@@ -1626,7 +2259,9 @@ class ProcessorRuntimeMixin:
                                 "checkpoint": f"stage{resume_stage}",
                                 "input_path": str(checkpoint_path),
                                 "actual_sha256": actual_sha256,
-                                "plan_hash": resume.get("plan_hash"),
+                                "run_manifest_hash": resume.get(
+                                    "run_manifest_hash"
+                                ),
                                 "detail": (
                                     "task-run manifest, stage contract, and "
                                     "checkpoint SHA-256 match"
@@ -1634,6 +2269,15 @@ class ProcessorRuntimeMixin:
                             }
                         )
                         self._task_resume_checkpoint_path = checkpoint_path
+                        if resume_stage == 5:
+                            self._resume_semantic_context = copy.deepcopy(
+                                semantic_context
+                            )
+                            self._resume_semantic_context_status = "verified"
+                            task_result["semantic_context_status"] = "verified"
+                            task_result["semantic_context"] = copy.deepcopy(
+                                semantic_context
+                            )
             self._trusted_input_provenance = task_result
             if task_result.get("verified"):
                 self.log.info(
@@ -1645,54 +2289,117 @@ class ProcessorRuntimeMixin:
                     "[InputProfile] task resume provenance not trusted: "
                     f"{task_result.get('detail')}"
                 )
+            if expected_stage is not None and not task_result.get("verified"):
+                raise RuntimeError(
+                    "正式断点续跑校验失败："
+                    + str(task_result.get("detail") or "unknown error")
+                )
             return task_result
-
-        input_path: Optional[Path] = None
-        checkpoint_name = ""
-        if self.input_mode == INPUT_MODE_STAGE1_PREPARED_RESUME:
-            checkpoint_name = "stage1_prepared"
-            candidates = [
-                self.work_dir / "stage1_prepared.fit",
-                self.work_dir / "process" / "stage1_prepared.fit",
-            ]
-            input_path = next((path for path in candidates if path.is_file()), None)
-        elif self.input_mode == INPUT_MODE_LINEAR_RESUME:
-            input_path = self.work_dir / "result_linear.fit"
-            checkpoint_name = "result_linear"
-        elif self.input_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
-            checkpoint_name = "stage2_corrected"
-            candidates = [
-                self.work_dir / "stage2_corrected.fit",
-                self.work_dir / "process" / "stage2_corrected.fit",
-            ]
-            input_path = next((path for path in candidates if path.is_file()), None)
-
-        if input_path is not None and input_path.is_file() and checkpoint_name:
-            result = run_manifest.verify_resume_provenance(
-                work_dir=self.work_dir,
-                input_path=input_path,
-                checkpoint_name=checkpoint_name,
+        if self.input_mode in {
+            INPUT_MODE_STAGE1_PREPARED_RESUME,
+            INPUT_MODE_STAGE2_CORRECTED_RESUME,
+            INPUT_MODE_LINEAR_RESUME,
+        }:
+            raise RuntimeError(
+                "续跑仅接受已验签 task-run manifest 中的 Stage 1/2/5 正式断点"
             )
-        elif checkpoint_name:
-            result = {
-                "verified": False,
-                "state": "unknown",
-                "checkpoint": checkpoint_name,
-                "detail": "resume checkpoint file is missing",
-            }
-
         self._trusted_input_provenance = result
-        if result.get("verified"):
-            self.log.info(
-                "[InputProfile] verified resume provenance: "
-                f"{result.get('detail')}"
-            )
-        elif checkpoint_name:
-            self.log.warn(
-                "[InputProfile] resume provenance not trusted: "
-                f"{result.get('detail')}"
-            )
         return result
+
+
+    def _apply_trusted_resume_semantics(self) -> bool:
+        """Restore Stage 1-5 meaning after fresh image profiling on resume."""
+        if self.input_mode != INPUT_MODE_LINEAR_RESUME:
+            return False
+        context = getattr(self, "_resume_semantic_context", None)
+        if (
+            isinstance(context, Mapping)
+            and str(context.get("schema") or "")
+            == "starun.resume-semantics.v1"
+            and int(context.get("checkpoint_stage", 0) or 0) == 5
+        ):
+            channel_semantics = str(
+                context.get("channel_semantics") or "unknown"
+            )
+            channel_profile = context.get("channel_profile") or {}
+            mapping_context = context.get("narrowband_channel_mapping")
+            if not isinstance(mapping_context, Mapping) and isinstance(
+                channel_profile,
+                Mapping,
+            ):
+                mapping_context = channel_profile.get("narrowband_mapping")
+            target_profile = context.get("target_profile") or {}
+            pipeline_policy = context.get("pipeline_policy") or {}
+            color_report = context.get("color_calibration_report") or {}
+            stage5_star_reference_report = context.get(
+                "stage5_star_reference_report"
+            ) or {}
+            upstream_review = context.get("upstream_review") or {}
+            if not all(
+                isinstance(value, Mapping)
+                for value in (
+                    channel_profile,
+                    target_profile,
+                    pipeline_policy,
+                    color_report,
+                    upstream_review,
+                )
+            ):
+                raise RuntimeError(
+                    "已验签 Stage 5 语义契约字段不完整"
+                )
+            else:
+                self._channel_semantics = channel_semantics
+                self.channel_profile = copy.deepcopy(dict(channel_profile))
+                mapping_missing = not isinstance(mapping_context, Mapping) or not bool(
+                    mapping_context
+                )
+                if mapping_missing:
+                    raise RuntimeError("已验签 Stage 5 语义缺少通道映射契约")
+                restored_mapping = copy.deepcopy(dict(mapping_context))
+                self.narrowband_channel_mapping = restored_mapping
+                self.channel_profile["narrowband_mapping"] = copy.deepcopy(
+                    restored_mapping
+                )
+                self.target_profile = copy.deepcopy(dict(target_profile))
+                self.pipeline_policy = copy.deepcopy(dict(pipeline_policy))
+                self.color_calibration_report = copy.deepcopy(dict(color_report))
+                self._stage5_star_reference_report = copy.deepcopy(
+                    dict(stage5_star_reference_report)
+                    if isinstance(stage5_star_reference_report, Mapping)
+                    else {}
+                )
+                self.color_calibration_report["channel_mapping"] = copy.deepcopy(
+                    restored_mapping
+                )
+                self._stage2_view_review_required = bool(
+                    upstream_review.get(
+                        "stage2_view_review_required",
+                        False,
+                    )
+                )
+                self._background_review_required = bool(
+                    upstream_review.get("background_review_required", False)
+                )
+                self._stage4_color_review_required = bool(
+                    upstream_review.get("color_review_required", False)
+                )
+                self._resume_semantic_context_status = "restored"
+                physical = self.color_calibration_report.get("physical_color") or {}
+                physical_accepted = bool(
+                    isinstance(physical, Mapping)
+                    and physical.get("accepted", False)
+                )
+                self.log.info(
+                    "[ResumeSemantics] restored Stage 5 upstream contract: "
+                    f"channel={channel_semantics}, "
+                    f"color_method={self.color_calibration_report.get('method')}, "
+                    f"channel_mapping={restored_mapping.get('mapping')}, "
+                    f"physical_color_accepted={str(physical_accepted).lower()}"
+                )
+                return True
+
+        raise RuntimeError("Stage 5 续跑缺少已验签语义契约")
 
 
     def _processing_plan_input_path(self) -> Optional[Path]:
@@ -1705,8 +2412,185 @@ class ProcessorRuntimeMixin:
                 return Path(candidate)
         return None
 
+    def _load_task_processing_parameters(self) -> None:
+        """Load and verify the frozen GUI parameter payload, if present."""
+        self._task_run_manifest_payload = None
+        self._task_run_manifest_path = None
+        self._task_processing_parameters = default_processing_parameters()
+        self._task_processing_parameter_request = copy.deepcopy(
+            self._task_processing_parameters
+        )
+        self._task_processing_parameter_adjustments = []
+        self._task_manual_override_fields = ()
+        self._task_gate_profile_audit = processing_gate_profile_audit(
+            self._task_processing_parameters
+        )
+        configured = str(os.getenv(ENV_TASK_RUN_MANIFEST_KEY, "") or "").strip()
+        if not configured:
+            return
+        manifest_path = Path(configured).expanduser().resolve()
+        try:
+            payload = run_manifest.load_json(manifest_path)
+        except (OSError, TypeError, ValueError) as error:
+            raise RuntimeError(f"任务运行清单无法读取：{error}") from error
+        if not isinstance(payload, Mapping):
+            raise RuntimeError("任务运行清单缺失或不是有效 JSON 映射")
+        if payload.get("schema") != "starun.task-run.v1":
+            raise RuntimeError("任务运行清单 schema 不受支持")
+        claimed_hash = str(payload.get("manifest_hash") or "")
+        unsigned = dict(payload)
+        unsigned.pop("manifest_hash", None)
+        if not claimed_hash or claimed_hash != run_manifest.canonical_payload_hash(
+            unsigned
+        ):
+            raise RuntimeError("任务运行清单签名校验失败")
+        self._task_run_manifest_payload = copy.deepcopy(dict(payload))
+        self._task_run_manifest_path = manifest_path
+        raw_parameters = payload.get("processing_parameters")
+        if raw_parameters is None:
+            raise RuntimeError("任务运行清单缺少 v4 处理参数")
+        self._task_processing_parameter_request = copy.deepcopy(raw_parameters)
+        try:
+            normalized, runtime_adjustments = normalize_processing_parameters(
+                raw_parameters,
+                validate_paths=True,
+            )
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(f"任务处理参数无效：{error}") from error
+        frozen_adjustments = payload.get("processing_parameter_adjustments", [])
+        if not isinstance(frozen_adjustments, list):
+            raise RuntimeError("任务处理参数调整记录格式无效")
+        self._task_processing_parameters = normalized
+        self._task_gate_profile_audit = processing_gate_profile_audit(normalized)
+        frozen_gate_profile = payload.get("processing_gate_profile")
+        if frozen_gate_profile is not None:
+            if not isinstance(frozen_gate_profile, Mapping) or (
+                run_manifest.canonical_payload_hash(dict(frozen_gate_profile))
+                != run_manifest.canonical_payload_hash(
+                    self._task_gate_profile_audit
+                )
+            ):
+                raise RuntimeError("任务门禁档位审计与签名参数不一致")
+        self._task_processing_parameter_adjustments = [
+            *[dict(item) for item in frozen_adjustments if isinstance(item, Mapping)],
+            *runtime_adjustments,
+        ]
+        general = normalized["general"]
+        self.cfg.output_format = ",".join(general["output_formats"])
+        self.cfg.auto_tune_enabled = bool(general["auto_tune_enabled"])
+        self.cfg.max_retries = int(general["max_retries"])
+        self.cfg.retry_delay = float(general["retry_delay"])
+        self.cfg.review_bundle_enabled = bool(general["review_bundle_enabled"])
+        self.cfg.stage10_managed_output_enabled = bool(
+            general["managed_output_enabled"]
+        )
+        self.cfg.checkpoint_mode = bool(general["checkpoint_mode"])
+        self.cfg.force_review_only_output = bool(
+            general["review_only"]
+            or gate_profile_requires_review(normalized["gate_profile"])
+        )
+        accelerated = "0" if general["compute_mode"] == "cpu" else "1"
+        for env_key in (
+            "STARUN_COSMIC_NATIVE_GPU",
+            "STARUN_COSMIC_CLASSIC_GPU",
+            "STARUN_GRAXPERT_GPU",
+        ):
+            os.environ[env_key] = accelerated
+        for record in self._task_processing_parameter_adjustments:
+            self.log.warn(
+                "[ProcessingParameters] safe clamp "
+                f"{record.get('field')}: {record.get('requested')} -> "
+                f"{record.get('effective')} "
+                f"({record.get('reason', 'safe_range')})"
+            )
+        self.log.info(
+            "[ProcessingParameters] verified frozen task parameters "
+            f"manifest={manifest_path.name}; "
+            f"general=output:{self.cfg.output_format},"
+            f"review_only:{self.cfg.force_review_only_output},"
+            f"compute:{general['compute_mode']},"
+            f"auto_tune:{self.cfg.auto_tune_enabled},"
+            f"retries:{self.cfg.max_retries},"
+            f"retry_delay:{self.cfg.retry_delay:g},"
+            f"review_bundle:{self.cfg.review_bundle_enabled},"
+            f"managed_output:{self.cfg.stage10_managed_output_enabled},"
+            f"checkpoint_mode:{self.cfg.checkpoint_mode}"
+        )
+        self.log.info(
+            "[GateProfile] verified "
+            f"profile={self._task_gate_profile_audit['profile']} "
+            f"multiplier={self._task_gate_profile_audit['multiplier']:g} "
+            f"managed={self._task_gate_profile_audit['managed_field_count']} "
+            f"forced_review={self._task_gate_profile_audit['forced_review_only']}"
+        )
+
+    def _apply_task_processing_parameter_overrides(self) -> None:
+        """Apply the signed static gate profile, then expert task overrides."""
+        payload = getattr(self, "_task_processing_parameters", None)
+        if not isinstance(payload, Mapping):
+            return
+        normalized, adjustments, manual_fields = (
+            apply_processing_parameters_to_config(self.cfg, payload)
+        )
+        self._task_processing_parameters = normalized
+        self._task_manual_override_fields = manual_fields
+        self._task_gate_profile_audit = processing_gate_profile_audit(normalized)
+        for record in self._task_gate_profile_audit["fields"]:
+            if record.get("physical_clamped"):
+                self.log.warn(
+                    "[GateProfile] physical clamp "
+                    f"{record.get('field')}: "
+                    f"{record.get('profile_requested')} -> "
+                    f"{record.get('profile_effective')}"
+                )
+        if adjustments:
+            self._task_processing_parameter_adjustments.extend(adjustments)
+        if manual_fields:
+            self.log.info(
+                "[ProcessingParameters] applied after auto tune: "
+                + ", ".join(manual_fields)
+            )
+        for record in adjustments:
+            self.log.warn(
+                "[ProcessingParameters] safe clamp "
+                f"{record.get('field')}: {record.get('requested')} -> "
+                f"{record.get('effective')}"
+            )
+
     def _resolve_channel_profile(self, profile: InputProfile) -> Dict[str, Any]:
         """Resolve physical channel meaning before the processing plan is frozen."""
+        resume_context = getattr(self, "_resume_semantic_context", None)
+        if (
+            self.input_mode == INPUT_MODE_LINEAR_RESUME
+            and getattr(self, "_resume_semantic_context_status", "") == "restored"
+            and isinstance(resume_context, Mapping)
+        ):
+            frozen_profile = resume_context.get("channel_profile") or {}
+            frozen_kind = str(
+                resume_context.get("channel_semantics") or "unknown"
+            )
+            if isinstance(frozen_profile, Mapping) and frozen_kind:
+                channel_profile = copy.deepcopy(dict(frozen_profile))
+                channel_profile["kind"] = frozen_kind
+                channel_profile["source"] = "signed_stage5_resume_semantics"
+                frozen_mapping = resume_context.get("narrowband_channel_mapping")
+                if not isinstance(frozen_mapping, Mapping) or not frozen_mapping:
+                    raise RuntimeError(
+                        "已验签 Stage 5 语义缺少通道映射契约"
+                    )
+                self.narrowband_channel_mapping = copy.deepcopy(
+                    dict(frozen_mapping)
+                )
+                channel_profile["narrowband_mapping"] = copy.deepcopy(
+                    self.narrowband_channel_mapping
+                )
+                self.channel_profile = channel_profile
+                self._channel_semantics = frozen_kind
+                self.log.info(
+                    "[ChannelProfile] restored signed Stage 5 semantics "
+                    f"kind={frozen_kind}"
+                )
+                return channel_profile
         try:
             shape = channel_shape_dict(self.siril.get_image_shape())
         except (
@@ -1729,7 +2613,12 @@ class ProcessorRuntimeMixin:
             channels=int(shape.get("channels", 0) or 0),
             metadata=metadata,
             input_state=profile.state.value,
-            explicit_filter_hint=os.getenv("SEESTAR_STAGE4_FILTER_HINT", ""),
+            explicit_filter_hint=(
+                ""
+                if str(getattr(self.cfg, "stage4_filter_hint", "auto")).strip().lower()
+                == "auto"
+                else str(getattr(self.cfg, "stage4_filter_hint", ""))
+            ),
             target_profile=(
                 self.target_profile
                 if isinstance(getattr(self, "target_profile", None), dict)
@@ -1748,71 +2637,15 @@ class ProcessorRuntimeMixin:
         return channel_profile
 
 
-    def _planned_stage_actions(self, profile: InputProfile) -> List[Dict[str, Any]]:
-        safe = profile.safe_for_linear_steps
-        if self.input_mode == INPUT_MODE_STAGE1_PREPARED_RESUME:
-            early_actions = {
-                1: "load_verified_checkpoint" if safe else "load_untrusted_checkpoint",
-                2: "apply",
-                3: "apply" if safe else "skip_input_state_guard",
-                4: "apply" if safe else "skip_input_state_guard",
-                5: "apply" if safe else "skip_input_state_guard",
-            }
-        elif self.input_mode == INPUT_MODE_LINEAR_RESUME:
-            early_actions = {
-                1: "load_verified_checkpoint" if safe else "load_untrusted_checkpoint",
-                2: "skip_resume",
-                3: "skip_resume" if safe else "skip_input_state_guard",
-                4: "skip_resume" if safe else "skip_input_state_guard",
-                5: "skip_resume" if safe else "skip_input_state_guard",
-            }
-        elif self.input_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
-            early_actions = {
-                1: "skip_resume",
-                2: "load_verified_checkpoint" if safe else "load_untrusted_checkpoint",
-                3: "apply" if safe else "skip_input_state_guard",
-                4: "apply" if safe else "skip_input_state_guard",
-                5: "apply" if safe else "skip_input_state_guard",
-            }
-        else:
-            early_actions = {
-                1: "completed_before_plan",
-                2: "completed_before_plan",
-                3: (
-                    "conditional_background_decision"
-                    if safe
-                    else "skip_input_state_guard"
-                ),
-                4: "apply" if safe else "skip_input_state_guard",
-                5: "apply" if safe else "skip_input_state_guard",
-            }
-        late_actions = {
-            6: "apply" if safe else "skip_input_state_guard",
-            7: "apply" if safe else "skip_input_state_guard",
-            8: "apply" if safe else "skip_input_state_guard",
-            9: "apply" if safe else "skip_input_state_guard",
-            10: "apply" if safe else "review_export_only",
-        }
-        actions = {**early_actions, **late_actions}
-        stages_by_number = {
-            index: stage
-            for index, stage in enumerate(PipelineStage, start=1)
-        }
-        return [
-            {
-                "stage": number,
-                "label": stages_by_number[number].label,
-                "action": actions[number],
-            }
-            for number in range(1, 11)
-        ]
-
-
     def _write_processing_plan(self, profile: InputProfile) -> bool:
         """Freeze this run's resolved route before post-processing transforms."""
         if not self.work_dir:
             return False
-        self._run_id = str(getattr(self, "_run_id", "") or uuid.uuid4())
+        task_manifest = getattr(self, "_task_run_manifest_payload", None)
+        task_manifest = (
+            dict(task_manifest) if isinstance(task_manifest, Mapping) else {}
+        )
+        self._run_id = str(task_manifest.get("run_id") or uuid.uuid4())
         input_path = self._processing_plan_input_path()
         input_record: Dict[str, Any] = {
             "path": str(input_path) if input_path else None,
@@ -1822,14 +2655,32 @@ class ProcessorRuntimeMixin:
         }
         if input_path:
             input_record.update(run_manifest.file_record(input_path))
+        source_fingerprint = str(task_manifest.get("source_fingerprint") or "")
+        input_record["fingerprint"] = source_fingerprint or str(
+            input_record.get("sha256") or ""
+        )
         freeze_primary = getattr(self, "_freeze_primary_target", None)
         if callable(freeze_primary):
             freeze_primary()
         channel_profile = self._resolve_channel_profile(profile)
         target_profile = dict(getattr(self, "target_profile", {}) or {})
+        try:
+            palette_selection = resolve_palette_selection(
+                target_profile.get("primary_target"),
+                getattr(
+                    self.cfg,
+                    "stage8_dualband_palette_selection",
+                    "auto",
+                ),
+            )
+        except ValueError as error:
+            self._stage8_palette_selection = {}
+            self.log.warn(f"Stage 8 哈勃色方案无效，处理计划拒绝冻结: {error}")
+            return False
+        self._stage8_palette_selection = copy.deepcopy(palette_selection)
         resolved_policy = dict(getattr(self, "pipeline_policy", {}) or {})
         stage3_policy = dict(resolved_policy.get("stage3_background") or {})
-        stretch_policy = dict(resolved_policy.get("stage6_stretch") or {})
+        stretch_policy = dict(resolved_policy.get("stage7_stretch") or {})
         configured_remix_levels = getattr(
             self.cfg,
             "stage9_fallback_intensity_levels",
@@ -1843,17 +2694,95 @@ class ProcessorRuntimeMixin:
                 remix_levels.append(float(raw_level))
             except (TypeError, ValueError):
                 continue
-        plan: Dict[str, Any] = {
-            "schema": "seestar.processing-plan.v1",
-            "run_id": self._run_id,
-            "generated_at": run_manifest.utc_timestamp(),
+        frozen_processing_parameters = dict(
+            getattr(
+                self,
+                "_task_processing_parameters",
+                default_processing_parameters(),
+            )
+        )
+        gate_profile_audit = copy.deepcopy(
+            getattr(
+                self,
+                "_task_gate_profile_audit",
+                processing_gate_profile_audit(frozen_processing_parameters),
+            )
+        )
+        gate_profile_records_by_stage: Dict[int, list[Mapping[str, Any]]] = {}
+        for record in gate_profile_audit.get("fields", []):
+            if not isinstance(record, Mapping):
+                continue
+            try:
+                record_stage = int(record.get("stage"))
+            except (TypeError, ValueError):
+                continue
+            gate_profile_records_by_stage.setdefault(record_stage, []).append(record)
+        processing_parameter_states: Dict[str, Any] = {}
+        frozen_stages = frozen_processing_parameters.get("stages", {})
+        for stage, specs in SPECS_BY_STAGE.items():
+            entry = (
+                frozen_stages.get(str(stage), {})
+                if isinstance(frozen_stages, Mapping)
+                else {}
+            )
+            entry = entry if isinstance(entry, Mapping) else {}
+            overrides = entry.get("overrides", {})
+            overrides = overrides if isinstance(overrides, Mapping) else {}
+            mode = str(entry.get("mode", "auto") or "auto")
+            mode_spec = next((spec for spec in specs if spec.stage_mode), None)
+            visible_fields = tuple(
+                spec.field
+                for spec in specs
+                if not spec.stage_mode
+            )
+            processing_parameter_states[str(stage)] = {
+                "mode_field": mode_spec.field if mode_spec is not None else None,
+                "mode": mode,
+                "mode_state": "automatic" if mode == "auto" else "custom",
+                "custom_fields": sorted(str(field) for field in overrides),
+                "gate_profile_fields": sorted(
+                    str(record.get("field"))
+                    for record in gate_profile_records_by_stage.get(stage, [])
+                    if record.get("source") == "gate_profile"
+                ),
+                "expert_gate_override_fields": sorted(
+                    str(record.get("field"))
+                    for record in gate_profile_records_by_stage.get(stage, [])
+                    if record.get("source") == "expert_override"
+                ),
+                "automatic_fields": sorted(
+                    field for field in visible_fields if field not in overrides
+                ),
+            }
+        resume = task_manifest.get("resume")
+        resume_stage = None
+        if isinstance(resume, Mapping):
+            try:
+                resume_stage = int(resume.get("stage"))
+            except (TypeError, ValueError):
+                return False
+        input_trust = (
+            task_plan.InputTrust.VERIFIED
+            if resume_stage is not None
+            else (
+                task_plan.InputTrust.RECOGNIZED
+                if profile.safe_for_linear_steps
+                else task_plan.InputTrust.REVIEW_REQUIRED
+            )
+        )
+        metadata: Dict[str, Any] = {
             "software": self._processing_software_identity(),
-            "pipeline_contract": stage_contracts.pipeline_contract_manifest(),
-            "input": input_record,
+            "task_run_manifest_hash": task_manifest.get("manifest_hash"),
+            "input_profile": profile.to_dict(),
             "channel_semantics": str(
                 getattr(self, "_channel_semantics", "unknown") or "unknown"
             ),
             "channel_profile": dict(channel_profile),
+            "narrowband_channel_mapping": dict(
+                getattr(self, "narrowband_channel_mapping", {}) or {}
+            ),
+            "target_profile": run_manifest.redact_sensitive(target_profile),
+            "pipeline_policy": run_manifest.redact_sensitive(resolved_policy),
             "target": {
                 "primary": target_profile.get("target_type"),
                 "primary_record": target_profile.get("primary_target", {}),
@@ -1862,7 +2791,6 @@ class ProcessorRuntimeMixin:
                 "policy": resolved_policy.get("policy_name"),
                 "star_separation_basis": "primary_target_only",
             },
-            "planned_steps": self._planned_stage_actions(profile),
             "candidate_contracts": {
                 "stage3_background": {
                     "model_priority": list(stage3_policy.get("model_priority") or []),
@@ -1890,18 +2818,15 @@ class ProcessorRuntimeMixin:
                 "stage7_stretch": {
                     "allowed_modes": list(stretch_policy.get("candidate_mode") or []),
                     "fallback_candidate": stretch_policy.get("fallback_candidate"),
-                    "model_output_fields": ["selected_candidate_id"],
                     "parameters_owned_by": "code",
+                    "selector": "deterministic_quality_rank",
                     "selection_after_hard_gates": True,
                 },
                 "stage6_star_separation": {
-                    "candidate_ids": [
-                        "syqon_standard",
-                        "syqon_large_context",
-                        "syqon_axiom_standard_if_available",
-                    ],
-                    "model_output_fields": ["selected_candidate_id"],
+                    "candidate_ids": ["syqon_standard"],
                     "parameters_owned_by": "code",
+                    "selector": "fixed_offline_profile",
+                    "runtime_profile": "zenith_baseline",
                 },
                 "stage8_enhancement": {
                     "candidate_ids": [
@@ -1910,8 +2835,28 @@ class ProcessorRuntimeMixin:
                         "balanced",
                         "detail_preserving",
                     ],
-                    "model_output_fields": ["selected_candidate_id"],
                     "parameters_owned_by": "code",
+                    "selector": "deterministic_local_quality",
+                    "dualband_palette": {
+                        "enabled": bool(
+                            getattr(
+                                self.cfg,
+                                "stage8_dualband_palette_enabled",
+                                True,
+                            )
+                        ),
+                        "role": "artistic_false_color",
+                        "selection": palette_selection,
+                        "available_palette_ids": list(PALETTE_CHANNELS),
+                        "runtime_requirements": [
+                            "confirmed_ha_oiii_mapping",
+                            "stage7_starless_accepted",
+                            "stage8_full_policy",
+                            "stage8_structural_quality_ok",
+                            "no_unverified_external_starless",
+                            "degraded_pcc_parent_allowed",
+                        ],
+                    },
                 },
                 "stage9_star_remix": {
                     "primary_id": "primary",
@@ -1921,27 +2866,79 @@ class ProcessorRuntimeMixin:
             },
             "capabilities": {
                 "offline_first": True,
-                "network_requested": ai_advisory.network_mode_enabled(),
-                "ai_advisory_requested": bool(
-                    getattr(self.cfg, "ai_post_enabled", False)
-                ),
-                "ai_advisory_enabled": bool(
-                    ai_advisory.network_mode_enabled()
-                    and getattr(self.cfg, "ai_post_enabled", False)
-                ),
             },
+            "processing_parameters": run_manifest.redact_sensitive(
+                frozen_processing_parameters
+            ),
+            "processing_gate_profile": run_manifest.redact_sensitive(
+                gate_profile_audit
+            ),
+            "processing_parameter_request": run_manifest.redact_sensitive(
+                copy.deepcopy(
+                    getattr(
+                        self,
+                        "_task_processing_parameter_request",
+                        frozen_processing_parameters,
+                    )
+                )
+            ),
+            "processing_parameter_states": processing_parameter_states,
+            "manual_override_fields": list(
+                getattr(self, "_task_manual_override_fields", ())
+            ),
+            "parameter_adjustments": list(
+                getattr(self, "_task_processing_parameter_adjustments", [])
+            ),
             "config": run_manifest.redact_sensitive(asdict(self.cfg)),
+            "stage_policies": {
+                str(number): {
+                    "failure_action": self._stage_failure_action(number)
+                }
+                for number in range(2, 11)
+            },
         }
-        plan["plan_hash"] = run_manifest.canonical_payload_hash(plan)
+        try:
+            plan = task_plan.build_processing_plan(
+                run_id=self._run_id,
+                generated_at=run_manifest.utc_timestamp(),
+                input_record=input_record,
+                input_state=profile.state.value,
+                input_trust=input_trust,
+                resume_after_stage=resume_stage,
+                checkpoint_fingerprints=(
+                    task_manifest.get("checkpoint_fingerprints")
+                    if task_manifest
+                    else None
+                ),
+                output={
+                    "configured_formats": str(
+                        getattr(self.cfg, "output_format", "") or ""
+                    ),
+                    "review_only": bool(
+                        profile.requires_review
+                        or getattr(self.cfg, "force_review_only_output", False)
+                    ),
+                },
+                metadata=metadata,
+            )
+        except (TypeError, ValueError) as error:
+            self.log.warn(f"processing-plan.v2 构建失败: {error}")
+            return False
+        verification = task_plan.verify_processing_plan(plan)
+        if not verification.get("verified"):
+            self.log.warn(
+                "processing-plan.v2 校验失败: "
+                + str(verification.get("detail") or "unknown error")
+            )
+            return False
         self._processing_plan = plan
         self._processing_plan_hash = str(plan["plan_hash"])
 
-        destinations = [self.work_dir / "processing-plan.json"]
-        if self.process_dir:
-            destinations.append(self.process_dir / "processing-plan.json")
         try:
-            for destination in destinations:
-                run_manifest.atomic_write_json(destination, plan)
+            run_manifest.atomic_write_json(
+                self.work_dir / "processing-plan.json",
+                plan,
+            )
             self.log.info(
                 "[ProcessingPlan] frozen "
                 f"run_id={self._run_id} hash={self._processing_plan_hash[:12]}"
@@ -1958,8 +2955,21 @@ class ProcessorRuntimeMixin:
         review_required = bool(
             getattr(self, "_input_state_review_route", False)
             or getattr(self, "_final_output_review_only", False)
+            or getattr(self, "_stage2_view_review_required", False)
             or getattr(self, "_background_review_required", False)
             or getattr(self, "_stage4_color_review_required", False)
+            or getattr(
+                self,
+                "_stage7_background_color_review_required",
+                False,
+            )
+            or getattr(
+                self,
+                "_stage6_starmask_borderline_review_required",
+                False,
+            )
+            or getattr(self, "_stage9_psf_review_required", False)
+            or getattr(self, "_stage9_review_candidate_selected", False)
             or (
                 bool(getattr(self, "_stage9_stars_required", False))
                 and not bool(getattr(self, "_stage9_stars_applied", False))
@@ -1976,19 +2986,6 @@ class ProcessorRuntimeMixin:
         return "success"
 
 
-    def _result_checkpoint_record(
-        self,
-        path: Path,
-        *,
-        state: str,
-    ) -> Optional[Dict[str, Any]]:
-        if not path.is_file():
-            return None
-        record = run_manifest.file_record(path, base_dir=self.work_dir)
-        record["state"] = state
-        return record
-
-
     def _write_pipeline_result_manifest(
         self,
         *,
@@ -1997,37 +2994,23 @@ class ProcessorRuntimeMixin:
         """Persist actual steps, output hashes, fallbacks, and global status."""
         if not self.work_dir:
             return False
-        input_state = str((getattr(self, "input_profile", {}) or {}).get("state") or "unknown")
-        checkpoint_state = "linear" if input_state == "linear" else "unknown"
-        checkpoints: Dict[str, Any] = {}
-        result_linear = self.work_dir / "result_linear.fit"
-        result_linear_record = self._result_checkpoint_record(
-            result_linear,
-            state=checkpoint_state,
-        )
-        if result_linear_record:
-            checkpoints["result_linear"] = result_linear_record
-
-        stage2_candidates = [
-            self.work_dir / "stage2_corrected.fit",
-            self.process_dir / "stage2_corrected.fit" if self.process_dir else None,
-        ]
-        stage2_path = next(
-            (
-                path
-                for path in stage2_candidates
-                if path is not None and path.is_file()
-            ),
-            None,
-        )
-        if stage2_path is not None:
-            stage2_record = self._result_checkpoint_record(
-                stage2_path,
-                state=checkpoint_state,
+        plan = run_manifest.load_json(self.work_dir / "processing-plan.json")
+        plan_verification = task_plan.verify_processing_plan(plan or {})
+        if not plan_verification.get("verified"):
+            self.log.warn(
+                "pipeline-result.json 拒绝发布：processing plan 校验失败："
+                + str(plan_verification.get("detail") or "unknown error")
             )
-            if stage2_record:
-                checkpoints["stage2_corrected"] = stage2_record
-
+            return False
+        plan_hash = str(plan.get("plan_hash") or "")
+        if not plan_hash or plan_hash != str(
+            getattr(self, "_processing_plan_hash", "") or ""
+        ):
+            self.log.warn("pipeline-result.json 拒绝发布：计划哈希引用不一致")
+            return False
+        if str(plan.get("run_id") or "") != str(getattr(self, "_run_id", "") or ""):
+            self.log.warn("pipeline-result.json 拒绝发布：run_id 与处理计划不一致")
+            return False
         outputs = run_manifest.collect_output_records(
             self.work_dir,
             output_basenames=getattr(self, "_final_output_basenames", ()),
@@ -2036,17 +3019,34 @@ class ProcessorRuntimeMixin:
 
         status = self._pipeline_result_status(failure_reason)
         manifest: Dict[str, Any] = {
-            "schema": "seestar.pipeline-result.v1",
+            "schema": "starun.pipeline-result.v1",
             "run_id": getattr(self, "_run_id", None),
             "generated_at": run_manifest.utc_timestamp(),
             "status": status,
             "failure_reason": failure_reason,
-            "plan_hash": getattr(self, "_processing_plan_hash", None),
+            "plan_hash": plan_hash,
             "input_profile": dict(getattr(self, "input_profile", {}) or {}),
             "channel_semantics": str(
                 getattr(self, "_channel_semantics", "unknown") or "unknown"
             ),
+            "narrowband_channel_mapping": dict(
+                getattr(self, "narrowband_channel_mapping", {}) or {}
+            ),
             "target_profile": dict(getattr(self, "target_profile", {}) or {}),
+            "review_requirements": {
+                "stage2_view_review_required": bool(
+                    getattr(self, "_stage2_view_review_required", False)
+                ),
+                "stage3_background_review_required": bool(
+                    getattr(self, "_background_review_required", False)
+                ),
+                "stage9_psf_review_required": bool(
+                    getattr(self, "_stage9_psf_review_required", False)
+                ),
+                "stage9_review_candidate_selected": bool(
+                    getattr(self, "_stage9_review_candidate_selected", False)
+                ),
+            },
             "color_calibration": {
                 "status": str(
                     (getattr(self, "color_calibration_report", {}) or {}).get(
@@ -2059,10 +3059,37 @@ class ProcessorRuntimeMixin:
                 ),
                 "requires_review": bool(
                     getattr(self, "_stage4_color_review_required", False)
+                    or getattr(
+                        self,
+                        "_stage7_background_color_review_required",
+                        False,
+                    )
+                ),
+                "background_color_review_gate": dict(
+                    getattr(
+                        self,
+                        "_stage7_background_color_review_gate",
+                        {},
+                    )
+                    or {}
                 ),
                 "physical_color": dict(
                     (getattr(self, "color_calibration_report", {}) or {}).get(
                         "physical_color",
+                        {},
+                    )
+                    or {}
+                ),
+                "degraded_color_correction": dict(
+                    (getattr(self, "color_calibration_report", {}) or {}).get(
+                        "degraded_color_correction",
+                        {},
+                    )
+                    or {}
+                ),
+                "auto_local_reference": dict(
+                    (getattr(self, "color_calibration_report", {}) or {}).get(
+                        "auto_local_reference",
                         {},
                     )
                     or {}
@@ -2082,6 +3109,31 @@ class ProcessorRuntimeMixin:
                 ),
                 "stars_applied": bool(
                     getattr(self, "_stage9_stars_applied", False)
+                ),
+                "output_contains_stars": bool(
+                    getattr(self, "_stage9_output_contains_stars", False)
+                ),
+                "output_withheld": bool(
+                    getattr(self, "_stage9_output_withheld", False)
+                ),
+                "starmask_borderline_review_required": bool(
+                    getattr(
+                        self,
+                        "_stage6_starmask_borderline_review_required",
+                        False,
+                    )
+                ),
+                "psf_review_required": bool(
+                    getattr(self, "_stage9_psf_review_required", False)
+                ),
+                "remix_formally_accepted": bool(
+                    getattr(self, "_stage9_remix_formally_accepted", False)
+                ),
+                "review_candidate_selected": bool(
+                    getattr(self, "_stage9_review_candidate_selected", False)
+                ),
+                "final_source": str(
+                    getattr(self, "_stage9_final_source", "") or ""
                 ),
                 "application_mode": getattr(
                     self,
@@ -2105,8 +3157,13 @@ class ProcessorRuntimeMixin:
                 }
                 for result in self.results
             ],
-            "checkpoints": checkpoints,
+            "stage_policy_events": list(
+                getattr(self, "_stage_policy_events", []) or []
+            ),
             "outputs": outputs,
+            "retention": dict(
+                getattr(self, "_checkpoint_retention_report", {}) or {}
+            ),
         }
         manifest["manifest_hash"] = run_manifest.canonical_payload_hash(manifest)
         self._pipeline_result_manifest = manifest
@@ -2130,29 +3187,3 @@ class ProcessorRuntimeMixin:
 
     def _write_stage_json(self, filename: str, payload: Dict[str, Any]) -> None:
         write_stage_json(self.process_dir, self.log, filename, payload)
-
-
-    def _write_ai_raw_response(
-        self,
-        stage_name: str,
-        *,
-        endpoint_url: str,
-        temperature: float,
-        json_mode: bool,
-        response_obj: Optional[Dict[str, Any]] = None,
-        content: Optional[str] = None,
-        error_text: Optional[str] = None,
-    ) -> None:
-        self._ai_raw_response_counter = write_ai_raw_response(
-            self.process_dir,
-            self.log,
-            self._ai_raw_response_counter,
-            self._short_text,
-            stage_name,
-            endpoint_url=endpoint_url,
-            temperature=temperature,
-            json_mode=json_mode,
-            response_obj=response_obj,
-            content=content,
-            error_text=error_text,
-        )

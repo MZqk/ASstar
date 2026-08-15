@@ -11,6 +11,9 @@ import numpy as np
 
 
 DEFAULT_PREVIEW_MAX_SIDE = 1600
+LINKED_DISPLAY_CURVE_SCHEMA = "starun.linked-display-curve.v1"
+LINKED_DISPLAY_SAMPLE_LIMIT = 500_000
+LINKED_DISPLAY_PERCENTILES = (0.2, 50.0, 99.8)
 
 
 def _png_chunk(tag: bytes, payload: bytes) -> bytes:
@@ -101,31 +104,64 @@ def _write_png_rgb16(path: Path, rgb: np.ndarray) -> None:
     path.write_bytes(png_data)
 
 
-def _linked_display_stretch(rgb: np.ndarray) -> np.ndarray:
-    """Apply one bounded linked screen stretch without changing source data."""
-
+def _linked_display_luminance(rgb: np.ndarray) -> np.ndarray:
     arr = np.asarray(rgb, dtype=np.float32)
     if arr.ndim != 3 or arr.shape[0] != 3:
         raise ValueError(f"expected RGB CHW array, got shape={arr.shape}")
-    luminance = (
+    return (
         arr[0] * np.float32(0.2126)
         + arr[1] * np.float32(0.7152)
         + arr[2] * np.float32(0.0722)
     )
+
+
+def _linked_display_curve_contract_from_rgb(rgb: np.ndarray) -> dict[str, Any]:
+    """Measure the serializable curve used by the observer-only preview."""
+
+    arr = np.asarray(rgb, dtype=np.float32)
+    luminance = _linked_display_luminance(arr)
     sample = luminance.ravel()
-    if sample.size > 500_000:
-        step = max(1, sample.size // 500_000)
+    source_sample_count = int(sample.size)
+    step = 1
+    if sample.size > LINKED_DISPLAY_SAMPLE_LIMIT:
+        # Preserve the historical preview stride exactly. In particular, this
+        # deliberately uses integer division rather than ceil division.
+        step = max(1, sample.size // LINKED_DISPLAY_SAMPLE_LIMIT)
         sample = sample[::step]
     sample = sample[np.isfinite(sample)]
     if sample.size < 8:
-        return np.clip(arr, 0.0, 1.0)
+        return {
+            "schema": LINKED_DISPLAY_CURVE_SCHEMA,
+            "status": "unavailable",
+            "accepted": False,
+            "reason": "fewer than 8 finite luminance samples",
+            "sampling": {
+                "source_sample_count": source_sample_count,
+                "finite_sample_count": int(sample.size),
+                "sample_limit": LINKED_DISPLAY_SAMPLE_LIMIT,
+                "stride": int(step),
+            },
+        }
 
-    black, median, white = np.percentile(sample, (0.2, 50.0, 99.8))
+    black, median, white = np.percentile(sample, LINKED_DISPLAY_PERCENTILES)
     span = float(white - black)
     if not np.isfinite(span) or span <= 1e-7:
-        return np.clip(arr, 0.0, 1.0)
-    normalized = np.clip((arr - float(black)) / span, 0.0, 1.0)
-    normalized_luma = np.clip((luminance - float(black)) / span, 0.0, 1.0)
+        return {
+            "schema": LINKED_DISPLAY_CURVE_SCHEMA,
+            "status": "unavailable",
+            "accepted": False,
+            "reason": "display-curve luminance span is degenerate",
+            "black": float(black),
+            "median": float(median),
+            "white": float(white),
+            "span": span,
+            "sampling": {
+                "source_sample_count": source_sample_count,
+                "finite_sample_count": int(sample.size),
+                "sample_limit": LINKED_DISPLAY_SAMPLE_LIMIT,
+                "stride": int(step),
+            },
+        }
     median_normalized = float(np.clip((median - black) / span, 1e-6, 0.999999))
     gamma = float(
         np.clip(
@@ -134,6 +170,66 @@ def _linked_display_stretch(rgb: np.ndarray) -> np.ndarray:
             1.00,
         )
     )
+    return {
+        "schema": LINKED_DISPLAY_CURVE_SCHEMA,
+        "status": "ok",
+        "accepted": True,
+        "method": "rec709_percentile_linked_display",
+        "black": float(black),
+        "median": float(median),
+        "white": float(white),
+        "span": span,
+        "median_normalized": median_normalized,
+        "gamma": gamma,
+        "luminance": "rec709",
+        "percentiles": {
+            "black": LINKED_DISPLAY_PERCENTILES[0],
+            "median": LINKED_DISPLAY_PERCENTILES[1],
+            "white": LINKED_DISPLAY_PERCENTILES[2],
+        },
+        "sampling": {
+            "source_sample_count": source_sample_count,
+            "finite_sample_count": int(sample.size),
+            "sample_limit": LINKED_DISPLAY_SAMPLE_LIMIT,
+            "stride": int(step),
+            "stride_rule": "max(1, sample_count // sample_limit)",
+        },
+    }
+
+
+def build_linked_display_curve_contract(
+    image: Any,
+    *,
+    max_side: int = DEFAULT_PREVIEW_MAX_SIDE,
+) -> dict[str, Any]:
+    """Build the GUI-linked display curve contract from preview-sampled pixels."""
+
+    bounded_max_side = max(64, int(max_side))
+    rgb = _rgb_raw_float(image, max_side=bounded_max_side)
+    contract = _linked_display_curve_contract_from_rgb(rgb)
+    contract["sampling"] = {
+        **dict(contract.get("sampling") or {}),
+        "preview_max_side": bounded_max_side,
+        "sampled_shape_chw": [int(value) for value in rgb.shape],
+    }
+    return contract
+
+
+def _apply_linked_display_curve_contract(
+    rgb: np.ndarray,
+    contract: dict[str, Any],
+) -> np.ndarray:
+    """Apply a measured GUI display contract with the historical luma gain."""
+
+    arr = np.asarray(rgb, dtype=np.float32)
+    if contract.get("status") != "ok" or contract.get("accepted") is not True:
+        return np.clip(arr, 0.0, 1.0)
+    luminance = _linked_display_luminance(arr)
+    black = float(contract["black"])
+    span = float(contract["span"])
+    gamma = float(contract["gamma"])
+    normalized = np.clip((arr - black) / span, 0.0, 1.0)
+    normalized_luma = np.clip((luminance - black) / span, 0.0, 1.0)
     stretched_luma = np.power(normalized_luma, gamma).astype(
         np.float32,
         copy=False,
@@ -145,6 +241,23 @@ def _linked_display_stretch(rgb: np.ndarray) -> np.ndarray:
         where=normalized_luma > 1e-7,
     )
     return np.clip(normalized * gain[np.newaxis, :, :], 0.0, 1.0)
+
+
+def apply_linked_display_curve_contract(
+    rgb: np.ndarray,
+    contract: dict[str, Any],
+) -> np.ndarray:
+    """Apply a serialized GUI display curve to an already sampled RGB array."""
+
+    return _apply_linked_display_curve_contract(rgb, contract)
+
+
+def _linked_display_stretch(rgb: np.ndarray) -> np.ndarray:
+    """Apply one bounded linked screen stretch without changing source data."""
+
+    arr = np.asarray(rgb, dtype=np.float32)
+    contract = _linked_display_curve_contract_from_rgb(arr)
+    return _apply_linked_display_curve_contract(arr, contract)
 
 
 def write_raw_preview(

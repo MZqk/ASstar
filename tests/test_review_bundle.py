@@ -46,7 +46,11 @@ if "sirilpy" not in sys.modules:
     sys.modules["sirilpy.exceptions"] = exceptions
     sys.modules["sirilpy.enums"] = enums
 
-from review_bundle import apply_visual_acceptance, create_image_review_bundle  # noqa: E402
+from review_bundle import (  # noqa: E402
+    apply_visual_acceptance,
+    create_image_review_bundle,
+    prune_review_bundles,
+)
 
 
 class ReviewBundleTests(unittest.TestCase):
@@ -87,6 +91,9 @@ class ReviewBundleTests(unittest.TestCase):
             for preview_path in payload["previews"].values():
                 self.assertTrue(Path(preview_path).is_file())
                 self.assertGreater(Path(preview_path).stat().st_size, 0)
+            compact_path = Path(payload["compact_preview"])
+            self.assertTrue(compact_path.is_file())
+            self.assertEqual(compact_path.read_bytes()[24], 8)
             report_path = Path(payload["report_path"])
             self.assertTrue(report_path.is_file())
             report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -111,6 +118,57 @@ class ReviewBundleTests(unittest.TestCase):
             )
             persisted = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertEqual(persisted["visual_review"]["status"], "accepted")
+
+    def test_final_retention_keeps_only_problem_stage_compact_preview(self) -> None:
+        before = np.zeros((3, 24, 32), dtype=np.float32)
+        after = before.copy()
+        after[:, 8:18, 9:23] = 0.15
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            review_root = Path(tmpdir) / "review_bundles"
+            for stage_key in (
+                "stage4_color_calibration",
+                "stage5_linear_cleanup",
+            ):
+                create_image_review_bundle(
+                    before,
+                    after,
+                    output_dir=review_root / stage_key,
+                    stage_key=stage_key,
+                    source={"before_stem": "before", "after_stem": "after"},
+                )
+
+            result = prune_review_bundles(
+                review_root,
+                pipeline_status="review_required",
+                problem_stage_numbers={4},
+            )
+
+            stage4 = review_root / "stage4_color_calibration"
+            stage5 = review_root / "stage5_linear_cleanup"
+            self.assertEqual(
+                {path.name for path in stage4.glob("*.png")},
+                {"review.png"},
+            )
+            self.assertEqual(list(stage5.glob("*.png")), [])
+            stage4_report = json.loads(
+                (stage4 / "review.json").read_text(encoding="utf-8")
+            )
+            stage5_report = json.loads(
+                (stage5 / "review.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                stage4_report["retention"]["mode"],
+                "compact_problem_evidence",
+            )
+            self.assertEqual(stage5_report["retention"]["mode"], "metrics_only")
+            self.assertNotIn("compact_preview", stage5_report)
+            self.assertNotIn("compact_layout", stage5_report)
+            self.assertEqual(
+                set(stage4_report["previews"]),
+                {"compact_review"},
+            )
+            self.assertGreater(len(result["removed_images"]), 0)
 
     def test_missing_synchronous_visual_verdict_is_not_left_pending(self) -> None:
         payload = {

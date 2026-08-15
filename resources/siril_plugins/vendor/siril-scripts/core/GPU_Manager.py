@@ -614,6 +614,10 @@ except Exception as e:
 
 # AMD-hosted ROCm wheels for Windows (Python 3.12 only, ROCm 7.2)
 _WINDOWS_ROCM_WHEELS = [
+    "https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_core-7.2.0.dev0-py3-none-win_amd64.whl",
+    "https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_devel-7.2.0.dev0-py3-none-win_amd64.whl",
+    "https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_libraries_custom-7.2.0.dev0-py3-none-win_amd64.whl",
+    "https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm-7.2.0.dev0.tar.gz",
     "https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torch-2.9.1+rocmsdk20260116-cp312-cp312-win_amd64.whl",
     "https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torchvision-0.24.1+rocmsdk20260116-cp312-cp312-win_amd64.whl",
 ]
@@ -684,7 +688,7 @@ class TorchTab(FrameworkTab):
 
         # 3. Compatible GPU — RX 7000/9000 series or Ryzen AI 300/Max only
         amd_info = self.report.get('hardware', {}).get('amd') or {}
-        gpu_name = str(amd_info.get('name', ''))
+        gpu_name = str(amd_info.get('gpu_name', ''))
         if not _WINDOWS_ROCM_GPU_PATTERN.search(gpu_name):
             errors.append(
                 f"GPU not supported by AMD's Windows ROCm distribution.\n"

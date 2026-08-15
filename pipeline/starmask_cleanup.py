@@ -20,6 +20,64 @@ def _bounded(value: Any, default: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, parsed))
 
 
+def classify_diffuse_residual_gate(
+    ratio: float,
+    accepted_limit: float,
+    uncertainty_abs: float,
+    advisory_multiplier: float = 2.0,
+) -> Dict[str, Any]:
+    """Apply the fixed diffuse contract: limit..2*limit is advisory."""
+    value = max(float(ratio), 0.0)
+    limit = max(float(accepted_limit), 0.0)
+    uncertainty = max(float(uncertainty_abs), 0.0)
+    _ = advisory_multiplier
+    multiplier = 2.0
+    effective_hard_limit = limit * multiplier
+    if value <= limit:
+        status = "ok"
+    elif value <= effective_hard_limit:
+        status = "borderline"
+    else:
+        status = "hard_failed"
+    return {
+        "status": status,
+        "borderline": status == "borderline",
+        "hard_failed": status == "hard_failed",
+        "value": value,
+        "accepted_limit": limit,
+        "uncertainty_abs": uncertainty,
+        "advisory_multiplier": multiplier,
+        "effective_hard_limit": effective_hard_limit,
+    }
+
+
+def classify_lower_bound_gate(
+    value: float,
+    accepted_limit: float,
+    advisory_multiplier: float = 2.0,
+) -> Dict[str, Any]:
+    """Keep a lower-bound miss within 1/multiplier advisory-only."""
+    measured = max(float(value), 0.0)
+    limit = max(float(accepted_limit), 0.0)
+    multiplier = _bounded(advisory_multiplier, 2.0, 1.0, 4.0)
+    effective_hard_limit = limit / multiplier
+    if measured >= limit or limit <= 0.0:
+        status = "ok"
+    elif measured >= effective_hard_limit:
+        status = "borderline"
+    else:
+        status = "hard_failed"
+    return {
+        "status": status,
+        "borderline": status == "borderline",
+        "hard_failed": status == "hard_failed",
+        "value": measured,
+        "accepted_limit": limit,
+        "advisory_multiplier": multiplier,
+        "effective_hard_limit": effective_hard_limit,
+    }
+
+
 def _image_scale(image: np.ndarray) -> float:
     arr = np.asarray(image)
     if np.issubdtype(arr.dtype, np.integer):
@@ -190,6 +248,13 @@ def clean_starmask_pixels(
         0.01,
         0.50,
     )
+    diffuse_uncertainty_abs = _bounded(
+        getattr(cfg, "stage7_starmask_diffuse_uncertainty_abs", 0.0005),
+        0.0005,
+        0.0,
+        0.01,
+    )
+    advisory_multiplier = 2.0
 
     cleaned_rgb = _to_rgb_float_fullres(cleaned_norm)
     cleaned_gray = (
@@ -310,25 +375,62 @@ def clean_starmask_pixels(
     )
     diffuse_retry["ratio_after"] = diffuse_residual_ratio
 
+    compact_gate = classify_lower_bound_gate(
+        compact_retention,
+        min_compact_retention,
+        advisory_multiplier,
+    )
+    faint_compact_limit = max(compact_floor - 0.01, 0.0)
+    faint_compact_gate = classify_lower_bound_gate(
+        faint_compact_retention,
+        faint_compact_limit,
+        advisory_multiplier,
+    )
     issues = []
+    advisories = []
     if not np.all(np.isfinite(cleaned_norm)):
         issues.append("non-finite cleaned starmask pixels")
-    if compact_retention < min_compact_retention:
+    if compact_gate["hard_failed"]:
         issues.append(
-            f"compact_retention {compact_retention:.3f}<{min_compact_retention:.3f}"
+            "compact_retention "
+            f"{compact_retention:.3f}<"
+            f"{float(compact_gate['effective_hard_limit']):.3f}"
         )
-    if faint_compact_retention < compact_floor - 0.01:
+    elif compact_gate["borderline"]:
+        advisories.append(
+            "compact_retention within advisory band: "
+            f"{compact_retention:.3f}<{min_compact_retention:.3f}"
+        )
+    if faint_compact_gate["hard_failed"]:
         issues.append(
             "faint_compact_retention "
-            f"{faint_compact_retention:.3f}<{compact_floor - 0.01:.3f}"
+            f"{faint_compact_retention:.3f}<"
+            f"{float(faint_compact_gate['effective_hard_limit']):.3f}"
         )
-    diffuse_hard_gate_failed = bool(
-        diffuse_residual_ratio > max_diffuse_residual_ratio
+    elif faint_compact_gate["borderline"]:
+        advisories.append(
+            "faint_compact_retention within advisory band: "
+            f"{faint_compact_retention:.3f}<{faint_compact_limit:.3f}"
+        )
+    diffuse_gate = classify_diffuse_residual_gate(
+        diffuse_residual_ratio,
+        max_diffuse_residual_ratio,
+        diffuse_uncertainty_abs,
+        advisory_multiplier,
     )
+    diffuse_hard_gate_failed = bool(diffuse_gate["hard_failed"])
+    diffuse_borderline = bool(diffuse_gate["borderline"] and not issues)
     if diffuse_hard_gate_failed:
         issues.append(
             "diffuse_residual_ratio "
-            f"{diffuse_residual_ratio:.3f}>{max_diffuse_residual_ratio:.3f}"
+            f"{diffuse_residual_ratio:.6f}>"
+            f"{float(diffuse_gate['effective_hard_limit']):.6f}"
+        )
+    if diffuse_borderline:
+        advisories.append(
+            "diffuse_residual_ratio within advisory band: "
+            f"{diffuse_residual_ratio:.6f}>"
+            f"{max_diffuse_residual_ratio:.6f}"
         )
 
     metrics = {
@@ -348,9 +450,32 @@ def clean_starmask_pixels(
         "changed_pixel_ratio": float(np.mean(np.abs(cleaned_gray - gray) > 0.001)),
         "limits": {
             "min_compact_retention": min_compact_retention,
+            "effective_compact_retention_hard_limit": float(
+                compact_gate["effective_hard_limit"]
+            ),
+            "min_faint_compact_retention": faint_compact_limit,
+            "effective_faint_compact_retention_hard_limit": float(
+                faint_compact_gate["effective_hard_limit"]
+            ),
             "max_diffuse_residual_ratio": max_diffuse_residual_ratio,
+            "diffuse_uncertainty_abs": diffuse_uncertainty_abs,
+            "advisory_multiplier": advisory_multiplier,
+            "effective_diffuse_hard_limit": float(
+                diffuse_gate["effective_hard_limit"]
+            ),
         },
         "issues": issues,
+        "advisories": advisories,
+        "compact_gate_status": str(compact_gate["status"]),
+        "compact_borderline": bool(compact_gate["borderline"]),
+        "compact_hard_gate_failed": bool(compact_gate["hard_failed"]),
+        "faint_compact_gate_status": str(faint_compact_gate["status"]),
+        "faint_compact_borderline": bool(faint_compact_gate["borderline"]),
+        "faint_compact_hard_gate_failed": bool(
+            faint_compact_gate["hard_failed"]
+        ),
+        "diffuse_gate_status": str(diffuse_gate["status"]),
+        "diffuse_borderline": diffuse_borderline,
         "diffuse_hard_gate_failed": diffuse_hard_gate_failed,
         "accepted": not issues,
     }

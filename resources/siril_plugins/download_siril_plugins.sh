@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOWNLOAD_DIR="${ROOT_DIR}/downloads"
 VENDOR_DIR="${ROOT_DIR}/vendor"
 SYQON_DIR="${ROOT_DIR}/syqon_starless"
+GRAXPERT_DIR="${ROOT_DIR}/graxpert"
 WHEEL_LOCK_FILE="${ROOT_DIR}/requirements-macos-arm64.lock"
 ASSET_CHECKSUM_FILE="${ROOT_DIR}/asset-checksums.sha256"
 TARGET_PYTHON_VERSION="312"
@@ -13,8 +14,14 @@ TARGET_PLATFORM="macosx_14_0_arm64"
 
 SIRIL_ARCHIVE="${DOWNLOAD_DIR}/siril-scripts.tar.gz"
 SIRIL_UNPACK_DIR="${VENDOR_DIR}/siril-scripts"
+SIRIL_SCRIPTS_COMMIT="4cc9e204f9ddfd6d03cc4283aac76c82d4d19167"
+SIRIL_STARLESS_SOURCE_RELATIVE="siril-scripts/upstream/SyQon/Starless.py"
+SIRIL_STARLESS_PATCHED_RELATIVE="vendor/siril-scripts/SyQon/Starless.py"
+SIRIL_STARLESS_PATCH_RELATIVE="patches/apply_syqon_offline_model_patch.py"
+GRAXPERT_OBJECT_MODEL_DIR="${GRAXPERT_DIR}/deconvolution-object-ai-models/1.0.1"
+GRAXPERT_OBJECT_MODEL_RELATIVE="graxpert/deconvolution-object-ai-models/1.0.1/model.onnx"
 
-mkdir -p "${DOWNLOAD_DIR}" "${VENDOR_DIR}" "${SYQON_DIR}"
+mkdir -p "${DOWNLOAD_DIR}" "${VENDOR_DIR}" "${SYQON_DIR}" "${GRAXPERT_DIR}"
 
 case "$(uname -m)" in
   arm64|aarch64)
@@ -70,25 +77,47 @@ download_verified() {
   mv "${tmp}" "${destination}"
 }
 
+download_latest() {
+  local url="$1"
+  local destination="$2"
+  local tmp="${destination}.tmp"
+  rm -f "${tmp}"
+  if ! curl -fL "${url}" -o "${tmp}"; then
+    rm -f "${tmp}"
+    echo "Download failed: ${url}" >&2
+    exit 1
+  fi
+  mv "${tmp}" "${destination}"
+}
+
 if [[ ! -f "${ASSET_CHECKSUM_FILE}" || ! -f "${WHEEL_LOCK_FILE}" ]]; then
   echo "Integrity lock files are missing." >&2
   exit 1
 fi
 
-echo "[1/4] Downloading and verifying official siril-scripts archive..."
-download_verified \
-  "https://gitlab.com/free-astro/siril-scripts/-/archive/main/siril-scripts-main.tar.gz" \
-  "${SIRIL_ARCHIVE}" \
-  "downloads/siril-scripts.tar.gz"
+echo "[1/5] Downloading pinned official siril-scripts archive..."
+download_latest \
+  "https://gitlab.com/free-astro/siril-scripts/-/archive/${SIRIL_SCRIPTS_COMMIT}/siril-scripts-${SIRIL_SCRIPTS_COMMIT}.tar.gz" \
+  "${SIRIL_ARCHIVE}"
 
-echo "[2/4] Extracting siril-scripts..."
+echo "[2/5] Extracting siril-scripts..."
 rm -rf "${SIRIL_UNPACK_DIR}.tmp"
 mkdir -p "${SIRIL_UNPACK_DIR}.tmp"
 tar -xzf "${SIRIL_ARCHIVE}" -C "${SIRIL_UNPACK_DIR}.tmp" --strip-components=1
+verify_sha256 \
+  "${SIRIL_UNPACK_DIR}.tmp/SyQon/Starless.py" \
+  "$(expected_sha256 "${SIRIL_STARLESS_SOURCE_RELATIVE}")"
+verify_sha256 \
+  "${ROOT_DIR}/patches/apply_syqon_offline_model_patch.py" \
+  "$(expected_sha256 "${SIRIL_STARLESS_PATCH_RELATIVE}")"
 rm -rf "${SIRIL_UNPACK_DIR}"
 mv "${SIRIL_UNPACK_DIR}.tmp" "${SIRIL_UNPACK_DIR}"
+python3 "${ROOT_DIR}/patches/apply_syqon_offline_model_patch.py" "${ROOT_DIR}"
+verify_sha256 \
+  "${SIRIL_UNPACK_DIR}/SyQon/Starless.py" \
+  "$(expected_sha256 "${SIRIL_STARLESS_PATCHED_RELATIVE}")"
 
-echo "[3/4] Downloading hash-locked Python 3.12 wheels..."
+echo "[3/5] Downloading hash-locked Python 3.12 wheels..."
 python3 -m pip download \
   --no-deps \
   --require-hashes \
@@ -99,6 +128,7 @@ python3 -m pip download \
   --abi abi3 \
   --platform "${TARGET_PLATFORM}" \
   --index-url "https://pypi.org/simple" \
+  --find-links "${DOWNLOAD_DIR}" \
   --dest "${DOWNLOAD_DIR}" \
   -r "${WHEEL_LOCK_FILE}"
 
@@ -115,6 +145,32 @@ target_abi = sys.argv[2]
 target_version = int(target_abi.removeprefix("cp"))
 removed = []
 groups = {}
+
+def wheel_preference(tags):
+    """Prefer an exact CPython/arm64 wheel over a generic fallback."""
+    best = (0, 0, 0)
+    for tag in tags:
+        if tag.interpreter == target_abi:
+            interpreter_score = 3
+        elif (
+            tag.interpreter.startswith("cp")
+            and tag.interpreter[2:].isdigit()
+            and int(tag.interpreter[2:]) <= target_version
+            and tag.abi == "abi3"
+        ):
+            interpreter_score = 2
+        elif tag.interpreter in {"py3", "py2.py3"}:
+            interpreter_score = 1
+        else:
+            continue
+        abi_score = 3 if tag.abi == target_abi else 2 if tag.abi == "abi3" else 1
+        platform_score = (
+            3 if tag.platform.endswith("_arm64") else
+            2 if "universal2" in tag.platform else
+            1
+        )
+        best = max(best, (interpreter_score, abi_score, platform_score))
+    return best
 
 for wheel in sorted(download_dir.glob("*.whl")):
     try:
@@ -135,17 +191,19 @@ for wheel in sorted(download_dir.glob("*.whl")):
         wheel.unlink()
         removed.append(wheel.name)
         continue
-    groups.setdefault(canonicalize_name(name), []).append((version, wheel))
+    groups.setdefault(canonicalize_name(name), []).append(
+        (version, wheel_preference(tags), wheel)
+    )
 
 for name, candidates in sorted(groups.items()):
-    candidates.sort(key=lambda item: (item[0], item[1].name))
+    candidates.sort(key=lambda item: (item[0], item[1], item[2].name))
     if name == "setuptools":
         supported = [item for item in candidates if item[0].major < 82]
         keep = supported[-1] if supported else candidates[-1]
     else:
         keep = candidates[-1]
-    for _version, wheel in candidates:
-        if wheel == keep[1]:
+    for _version, _preference, wheel in candidates:
+        if wheel == keep[2]:
             continue
         wheel.unlink()
         removed.append(wheel.name)
@@ -156,11 +214,23 @@ print(
 )
 PY
 
-echo "[4/4] Downloading and verifying SyQon Starless offline cache..."
-download_verified \
-  "https://siril.syqon.it/syqon_starless_inference.py" \
-  "${SYQON_DIR}/syqon_starless_inference.py" \
-  "syqon_starless/syqon_starless_inference.py"
+echo "[4/5] Downloading GraXpert Object Deconvolution model..."
+graxpert_archive="$(mktemp "${TMPDIR:-/tmp}/graxpert-object-model-1.0.1.XXXXXX.zip")"
+trap 'rm -f "${graxpert_archive}" "${graxpert_archive}.tmp"' EXIT
+download_latest \
+  "https://github.com/Dark-Matters-Astro/graxpert-ai-models/releases/download/tags/object-deconvolution-1.0.1/model-1.0.1.zip" \
+  "${graxpert_archive}"
+rm -rf "${GRAXPERT_OBJECT_MODEL_DIR}.tmp"
+mkdir -p "${GRAXPERT_OBJECT_MODEL_DIR}.tmp"
+unzip -q "${graxpert_archive}" -d "${GRAXPERT_OBJECT_MODEL_DIR}.tmp"
+verify_sha256 \
+  "${GRAXPERT_OBJECT_MODEL_DIR}.tmp/model.onnx" \
+  "$(expected_sha256 "${GRAXPERT_OBJECT_MODEL_RELATIVE}")"
+rm -rf "${GRAXPERT_OBJECT_MODEL_DIR}"
+mv "${GRAXPERT_OBJECT_MODEL_DIR}.tmp" "${GRAXPERT_OBJECT_MODEL_DIR}"
+rm -f "${graxpert_archive}"
+
+echo "[5/5] Downloading and verifying SyQon Starless offline cache..."
 download_verified \
   "https://siril.syqon.it/zenith.pt.sha256" \
   "${SYQON_DIR}/zenith.pt.sha256" \
@@ -205,12 +275,13 @@ echo "  - ${DOWNLOAD_DIR}/lz4-*.whl"
 echo "  - ${DOWNLOAD_DIR}/zstandard-*.whl"
 echo "  - ${DOWNLOAD_DIR}/exifread-*.whl"
 echo "  - ${DOWNLOAD_DIR}/opencv_python_headless-*.whl"
+echo "  - ${DOWNLOAD_DIR}/psutil-*.whl"
 echo "  - ${DOWNLOAD_DIR}/requests-*.whl"
 echo "  - ${DOWNLOAD_DIR}/setuptools-*.whl"
 echo "  - ${DOWNLOAD_DIR}/wheel-*.whl"
 echo "  - ${DOWNLOAD_DIR}/einops-*.whl"
 echo "  - ${DOWNLOAD_DIR}/safetensors-*.whl"
-echo "  - ${SYQON_DIR}/syqon_starless_inference.py"
+echo "  - ${GRAXPERT_OBJECT_MODEL_DIR}/model.onnx"
 echo "  - ${SYQON_DIR}/zenith.pt"
 echo "  - ${DOWNLOAD_DIR}/astropy-*.whl"
 echo "  - ${DOWNLOAD_DIR}/scipy-*.whl"
