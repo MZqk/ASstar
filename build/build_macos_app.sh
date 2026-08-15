@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Build Starun macOS app bundle with:
-# - Embedded Siril extracted from packages/siril-1.4.4-arm64.dmg
-# - Embedded Python 3.13.12 runtime from packages/python-3.13.12-macos11.pkg
+# - Embedded Siril extracted from packages/siril-1.4.4-arm64-3.dmg
+#   (including Siril's CPython 3.12 runtime)
 #
 # Usage:
 #   ./build_macos_app.sh [--app-name NAME] [--output-dir DIR]
@@ -55,8 +55,7 @@ SIRIL_PLUGIN_REQUIREMENTS="$SIRIL_PLUGIN_DIR_SRC/requirements.lock"
 SIRIL_PLUGIN_DOWNLOADS_DIR="$SIRIL_PLUGIN_DIR_SRC/downloads"
 USER_CONFIG="$HOME/Library/Application Support/org.siril.Siril/siril/config.1.4.ini"
 
-PYTHON_PKG="$PACKAGES_DIR/python-3.13.12-macos11.pkg"
-SIRIL_DMG="$PACKAGES_DIR/siril-1.4.4-arm64.dmg"
+SIRIL_DMG="$PACKAGES_DIR/siril-1.4.4-arm64-3.dmg"
 SIRIL_SRC_APP=""
 BUNDLE_PROFILE="full"
 OFFLINE_RESOURCE_PACK_DIR=""
@@ -127,8 +126,7 @@ Usage:
 
 This script requires the following package files in:
   $PACKAGES_DIR
-  - python-3.13.12-macos11.pkg
-  - siril-1.4.4-arm64.dmg
+  - siril-1.4.4-arm64-3.dmg
 EOF
 }
 
@@ -881,82 +879,6 @@ copy_siril_from_app() {
   log "[SIRIL] Embedded Siril from app path: $src_app"
 }
 
-remove_dangling_symlinks() {
-  local root="$1"
-  local link=""
-  local target=""
-  local resolved=""
-  while IFS= read -r -d '' link; do
-    target="$(/usr/bin/readlink "$link" || true)"
-    [[ -z "$target" ]] && continue
-    if [[ "$target" = /* ]]; then
-      resolved="$target"
-    else
-      resolved="$(cd "$(dirname "$link")" && pwd)/$target"
-    fi
-    if [[ ! -e "$resolved" ]]; then
-      /bin/rm -f "$link"
-      log "[PYTHON313] Removed dangling symlink: $link -> $target"
-    fi
-  done < <(/usr/bin/find "$root" -type l -print0)
-}
-
-extract_python_framework() {
-  local python_pkg="$1"
-  local framework_dst="$2"
-  local resources_dir="$3"
-  local expanded_pkg="$BUILD_ROOT/python_pkg_expanded"
-  local payload_dir="$expanded_pkg/Python_Framework.pkg/Payload"
-  local wrapper_dir="$resources_dir/python/bin"
-  local wrapper="$wrapper_dir/python3.13"
-
-  log "[PYTHON313] Expanding package: $python_pkg"
-  rm -rf "$expanded_pkg"
-  /usr/sbin/pkgutil --expand-full "$python_pkg" "$expanded_pkg"
-
-  if [[ ! -d "$payload_dir/Versions/3.13" ]]; then
-    die "[PYTHON313] Python_Framework payload missing expected Versions/3.13."
-  fi
-
-  rm -rf "$framework_dst"
-  mkdir -p "$(dirname "$framework_dst")"
-  /usr/bin/ditto "$payload_dir" "$framework_dst"
-  remove_dangling_symlinks "$framework_dst"
-  log "[PYTHON313] Embedded framework: $framework_dst"
-
-  mkdir -p "$wrapper_dir"
-  cat > "$wrapper" <<'EOS'
-#!/usr/bin/env bash
-set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONTENTS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-FRAMEWORKS_DIR="$CONTENTS_DIR/Frameworks"
-PY_BIN="$FRAMEWORKS_DIR/Python.framework/Versions/3.13/bin/python3.13"
-if [[ ! -x "$PY_BIN" ]]; then
-  echo "Bundled Python binary not found: $PY_BIN" >&2
-  exit 1
-fi
-export DYLD_FRAMEWORK_PATH="$FRAMEWORKS_DIR${DYLD_FRAMEWORK_PATH:+:$DYLD_FRAMEWORK_PATH}"
-exec "$PY_BIN" "$@"
-EOS
-  chmod +x "$wrapper"
-  ln -sfn "python3.13" "$wrapper_dir/python3"
-  ln -sfn "python3.13" "$wrapper_dir/python"
-  log "[PYTHON313] Created runtime wrappers in: $wrapper_dir"
-}
-
-verify_python_wrapper() {
-  local wrapper="$1"
-  local py_ver=""
-  if ! py_ver="$("$wrapper" -V 2>&1)"; then
-    die "[PYTHON313] Bundled python wrapper failed: $wrapper"
-  fi
-  log "[PYTHON313] Wrapper version: $py_ver"
-  if [[ "$py_ver" != *"Python 3.13.12"* ]]; then
-    die "[PYTHON313] Unexpected Python version from wrapper: $py_ver"
-  fi
-}
-
 fix_siril_python_runtime() {
   local siril_app="$1"
   local py_framework="$siril_app/Contents/Frameworks/Python.framework"
@@ -1085,7 +1007,6 @@ require_dir "$SIRIL_SPCC_DATABASE_SEED_SRC" "Siril SPCC database seed source"
 require_file "$SIRIL_SPCC_DATABASE_SEED_SRC/manifest.json" "Siril SPCC seed manifest"
 require_file "$SIRIL_SPCC_DATABASE_SEED_SRC/SHA256SUMS" "Siril SPCC seed checksums"
 require_dir "$PACKAGES_DIR" "Packages directory"
-require_file "$PYTHON_PKG" "Python package"
 require_file "$GUI_BUILD_REQUIREMENTS" "GUI build requirements lock"
 if [[ -n "$SIRIL_SRC_APP" ]]; then
   require_dir "$SIRIL_SRC_APP" "Siril app source"
@@ -1095,7 +1016,6 @@ fi
 
 log "[PATHS] Project root: $PROJECT_ROOT"
 log "[PATHS] Packages dir: $PACKAGES_DIR"
-log "[PATHS] Python pkg: $PYTHON_PKG"
 if [[ -n "$SIRIL_SRC_APP" ]]; then
   log "[PATHS] Siril app source: $SIRIL_SRC_APP"
 else
@@ -1346,17 +1266,10 @@ fi
 
 chmod +x "$APP_RESOURCES/Siril.app/Contents/MacOS/siril-cli" || true
 
-log "[PYTHON313] Embedding Python 3.13.12..."
-rm -rf "$APP_FRAMEWORKS/Python.framework" "$APP_RESOURCES/python"
-extract_python_framework "$PYTHON_PKG" "$APP_FRAMEWORKS/Python.framework" "$APP_RESOURCES"
-verify_python_wrapper "$APP_RESOURCES/python/bin/python3.13"
-
 require_exists "$APP_RESOURCES/Siril.app" "[VERIFY] Embedded Siril"
 require_exists "$APP_RESOURCES/SirilPythonSeed/venv/bin/python3.12" "[VERIFY] Embedded Siril offline venv seed"
 require_exists "$APP_RESOURCES/SirilPythonSeed/.python_module/sirilpy" "[VERIFY] Embedded Siril offline module seed"
 require_file "$APP_RESOURCES/SirilSPCCDatabaseSeed/manifest.json" "[VERIFY] Embedded Siril SPCC database seed"
-require_exists "$APP_FRAMEWORKS/Python.framework/Versions/3.13" "[VERIFY] Embedded Python framework"
-require_executable "$APP_RESOURCES/python/bin/python3.13" "[VERIFY] Embedded Python wrapper"
 GAIA_CATALOG_SCAN_ROOTS=("$APP_PATH")
 if [[ "$BUNDLE_PROFILE" == "core" ]]; then
   GAIA_CATALOG_SCAN_ROOTS+=("$OFFLINE_RESOURCE_PACK_DIR")

@@ -100,6 +100,7 @@ dist/
 *.pid
 *.sock
 resources/siril_plugins/downloads/
+resources/siril_plugins/vendor/siril-scripts/
 siril_cat*_healpix*_astro*.dat
 siril_cat*_healpix*_xpsamp*.dat
 gaia_astrometric.dat

@@ -139,8 +139,8 @@ scipy==1.17.1 \
     --hash=sha256:cc90d2e9c7e5c7f1a482c9875007c095c3194b1cfedca3c2f3291cdc2bc7c086
 sep==1.4.1 \
     --hash=sha256:e3a92bd46657a76b46ce3693820e7917f7b5f1232e3127f6e5ecc8d9ae65ac98
-setiastrosuitepro==1.16.14.post1 \
-    --hash=sha256:3ca7d4d26be27d359023f0070f486a298e167352404581d869786674673fbe56
+setiastrosuitepro==1.20.5.post1 \
+    --hash=sha256:95d68290b314433a427f3217d7fb11159b332c5b8051f61252ca78bc7e2fd1f2
 setuptools==81.0.0 \
     --hash=sha256:fdd925d5c5d9f62e4b74b30d6dd7828ce236fd6ed998a08d81de62ce5a6310d6
 shiboken6==6.11.1 \
