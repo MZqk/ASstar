@@ -1967,6 +1967,8 @@ def run_stage3_background_extraction(pipeline) -> None:
     """
     stage_label = PipelineStage.BACKGROUND_EXTRACTION.label
     pipeline.log.stage_start(stage_label)
+    pipeline._clear_stage_reviews(3)
+    pipeline._background_review_required = False
     bg_ok = False
     selected_source = ""
     preflight_message = ""
@@ -2553,6 +2555,11 @@ def run_stage3_background_extraction(pipeline) -> None:
                     "fallback_used": False,
                 },
             },
+            review_reasons=(
+                ["background_review_required"]
+                if bool(getattr(pipeline, "_background_review_required", False))
+                else []
+            ),
         )
         return
 
@@ -4192,6 +4199,11 @@ def run_stage3_background_extraction(pipeline) -> None:
         or not bg_ok
         or bool(getattr(pipeline, "_background_review_required", False))
     )
+    if background_review_required:
+        pipeline._require_review(
+            3,
+            reason_code if "reason_code" in locals() and reason_code else "background_review_required",
+        )
     report_quality = (
         "review_required"
         if background_review_required
@@ -4420,6 +4432,7 @@ def run_stage3_background_extraction(pipeline) -> None:
             fallback_used=stage_fallback_used,
             reason_code=reason_code,
             components=components,
+            review_reasons=pipeline._stage_review_reasons(3),
         )
         if selected_source == "builtin":
             pipeline.log.info("阶段3按策略使用内置 subsky/RBF 背景提取")
@@ -4450,4 +4463,9 @@ def run_stage3_background_extraction(pipeline) -> None:
                 "candidate_search_stopped": policy_abort_candidate_search,
             },
             components=components,
+            review_reasons=(
+                pipeline._stage_review_reasons(3)
+                if failure_action != "stop"
+                else []
+            ),
         )

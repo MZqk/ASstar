@@ -36,9 +36,9 @@ class ManagedOutputTests(unittest.TestCase):
             y_grid, x_grid = np.mgrid[:80, :120]
             image = np.stack(
                 (
-                    x_grid / 119.0,
-                    y_grid / 79.0,
-                    (x_grid + y_grid) / 198.0,
+                    0.70 * x_grid / 119.0,
+                    0.70 * y_grid / 79.0,
+                    0.70 * (x_grid + y_grid) / 198.0,
                 ),
                 axis=0,
             ).astype(np.float32)
@@ -135,12 +135,16 @@ class ManagedOutputTests(unittest.TestCase):
             )
             self.assertEqual(
                 visibility["transform"]["name"],
-                "linked_review_visibility_stretch",
+                "linked_review_visibility_v2",
             )
             final_png = visibility["final_png"]
             self.assertEqual(final_png["source"], "decoded_final_png")
             self.assertEqual(final_png["status"], "passed")
-            self.assertGreater(final_png["metrics"]["green_median"], 0.70)
+            self.assertAlmostEqual(
+                final_png["metrics"]["luminance_median"],
+                0.18,
+                delta=0.015,
+            )
             self.assertTrue(final_png["checks"]["galaxy_visibility"]["passed"])
             self.assertTrue(final_png["checks"]["star_visibility"]["passed"])
             self.assertTrue(

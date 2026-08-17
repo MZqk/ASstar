@@ -14,7 +14,10 @@ import stage7_stretch_metrics
 import stage9_quality
 import syqon_starless
 import run_manifest
-from stage7_pixel_domain import canonicalize_stage7_pixels_01
+from stage7_pixel_domain import (
+    STAGE7_FLOAT_DOMAIN_TOLERANCE,
+    canonicalize_stage7_pixels_01,
+)
 from star_color_repair import (
     assess_repaired_star_layer,
     public_star_color_report,
@@ -104,6 +107,9 @@ def _stage9_local_fallback(
     normalized_application = str(application_mode or "").strip().lower()
     review_mode_reasons = {
         "best_failed_review_candidate": "best_failed_candidate_review",
+        "stage8_starmask_review_fallback": (
+            "stage8_starmask_review_fallback"
+        ),
         "stage5_review_fallback": "all_remix_candidates_outside_review_range_stage5",
     }
     if normalized_mode in review_mode_reasons:
@@ -207,6 +213,12 @@ def _stage9_preserve_with_stars_review_output(
                 "with_stars_review_fallback"
             )
             pipeline._stage9_bypassed_bad_starless = True
+            if str(reason) != "user_preserve_with_stars":
+                pipeline._require_review(
+                    9,
+                    "with_stars_review_fallback",
+                    {"reason": str(reason), "source": source_stem},
+                )
             messages.append(
                 "required-stars contract preserved via with-stars review "
                 f"source={source_stem}; canonical_saved="
@@ -229,6 +241,539 @@ def _stage9_preserve_with_stars_review_output(
         "required-stars output withheld because no with-stars review source "
         f"could be produced; reason={reason}"
         + (f"; errors={' | '.join(load_errors)}" if load_errors else "")
+    )
+    return False, None
+
+
+def _stage9_existing_fit_path(pipeline, stem: str) -> Optional[Path]:
+    process_dir = getattr(pipeline, "process_dir", None)
+    normalized = str(stem or "").strip()
+    if process_dir is None or not normalized:
+        return None
+    return next(
+        (
+            Path(process_dir) / f"{normalized}{suffix}"
+            for suffix in (".fit", ".fits", ".fts")
+            if (Path(process_dir) / f"{normalized}{suffix}").is_file()
+        ),
+        None,
+    )
+
+
+def _stage9_current_canonical_pixels(
+    pipeline,
+    *,
+    label: str,
+) -> tuple[np.ndarray, Dict[str, Any]]:
+    get_pixels = getattr(pipeline.siril, "get_image_pixeldata", None)
+    if not callable(get_pixels):
+        raise RuntimeError(f"{label} pixel reader unavailable")
+    pixels = get_pixels(preview=False)
+    if pixels is None:
+        raise RuntimeError(f"{label} image buffer is empty")
+    try:
+        return canonicalize_stage7_pixels_01(pixels)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"{label} pixel domain invalid: {error}") from error
+
+
+def _stage9_fallback_starmask_shape_compatible(
+    starmask: np.ndarray,
+    base: np.ndarray,
+) -> bool:
+    """Match the channel-layout compatibility accepted by the Screen composer."""
+    if starmask.shape == base.shape:
+        return True
+    if base.ndim == 3 and starmask.ndim == 2:
+        return starmask.shape == base.shape[1:]
+    if base.ndim == 2 and starmask.ndim == 3:
+        return starmask.shape[1:] == base.shape
+    if base.ndim == 3 and starmask.ndim == 3:
+        return bool(
+            starmask.shape[1:] == base.shape[1:]
+            and (
+                (starmask.shape[0] == 1 and base.shape[0] == 3)
+                or (starmask.shape[0] == 3 and base.shape[0] == 1)
+            )
+        )
+    return False
+
+
+def _stage9_minimal_fallback_safety(
+    pipeline,
+    base: np.ndarray,
+    candidate: np.ndarray,
+    *,
+    base_domain: Mapping[str, Any],
+    candidate_domain: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Apply only fatal pixel checks to a review-only Stage 9 fallback."""
+    tolerance = max(
+        float(STAGE7_FLOAT_DOMAIN_TOLERANCE),
+        float(base_domain.get("float_tolerance", 0.0) or 0.0),
+        float(candidate_domain.get("float_tolerance", 0.0) or 0.0),
+    )
+    report: Dict[str, Any] = {
+        "schema": "starun.stage9-minimal-fallback-safety.v1",
+        "status": "failed",
+        "tolerance": tolerance,
+        "checks": {},
+        "issues": [],
+    }
+    checks = report["checks"]
+    issues = report["issues"]
+    same_shape = base.shape == candidate.shape
+    checks["shape_compatible"] = bool(same_shape)
+    checks["base_shape"] = [int(value) for value in base.shape]
+    checks["candidate_shape"] = [int(value) for value in candidate.shape]
+    if not same_shape:
+        issues.append("candidate shape differs from Stage8 fallback base")
+        return report
+
+    finite = bool(np.all(np.isfinite(base)) and np.all(np.isfinite(candidate)))
+    checks["finite_pixels"] = finite
+    if not finite:
+        issues.append("base or candidate contains non-finite pixels")
+        return report
+
+    candidate_min = float(np.min(candidate))
+    candidate_max = float(np.max(candidate))
+    in_range = bool(
+        candidate_min >= -tolerance and candidate_max <= 1.0 + tolerance
+    )
+    checks.update(
+        normalized_range=in_range,
+        candidate_min=candidate_min,
+        candidate_max=candidate_max,
+    )
+    if not in_range:
+        issues.append("candidate pixels are outside normalized 0..1 range")
+
+    delta = candidate.astype(np.float64) - base.astype(np.float64)
+    min_delta = float(np.min(delta))
+    monotonic_screen = min_delta >= -tolerance
+    checks["screen_non_darkening"] = bool(monotonic_screen)
+    checks["minimum_delta"] = min_delta
+    if not monotonic_screen:
+        issues.append("Screen fallback produced a material negative delta")
+
+    delta_peak = np.max(delta, axis=0) if delta.ndim == 3 else delta
+    positive = delta_peak > tolerance
+    positive_count = int(np.count_nonzero(positive))
+    checks["positive_delta_pixel_count"] = positive_count
+    checks["maximum_positive_delta"] = float(np.max(delta_peak))
+
+    support = getattr(pipeline, "_stage9_last_star_overlay_mask", None)
+    support_available = isinstance(support, np.ndarray) and support.size > 0
+    if support_available:
+        support_mask = np.asarray(support, dtype=bool)
+        if support_mask.ndim == 3:
+            support_mask = np.any(support_mask, axis=0)
+        support_shape_ok = support_mask.shape == delta_peak.shape
+        checks["star_support_shape_compatible"] = bool(support_shape_ok)
+        if support_shape_ok:
+            supported_positive_count = int(
+                np.count_nonzero(positive & support_mask)
+            )
+        else:
+            supported_positive_count = 0
+            issues.append("star support shape differs from fallback candidate")
+        checks["supported_positive_delta_pixel_count"] = (
+            supported_positive_count
+        )
+        real_star_delta = bool(support_shape_ok and supported_positive_count > 0)
+    else:
+        star_layer = getattr(pipeline, "_stage9_last_star_layer", None)
+        star_layer_array = (
+            np.asarray(star_layer)
+            if isinstance(star_layer, np.ndarray) and star_layer.size
+            else None
+        )
+        star_layer_peak = (
+            float(np.max(star_layer_array))
+            if star_layer_array is not None
+            and np.all(np.isfinite(star_layer_array))
+            else 0.0
+        )
+        checks["star_layer_peak"] = star_layer_peak
+        star_layer_support = (
+            np.max(star_layer_array, axis=0) > tolerance
+            if star_layer_array is not None and star_layer_array.ndim == 3
+            else star_layer_array > tolerance
+            if star_layer_array is not None and star_layer_array.ndim == 2
+            else None
+        )
+        star_layer_shape_ok = bool(
+            isinstance(star_layer_support, np.ndarray)
+            and star_layer_support.shape == delta_peak.shape
+        )
+        checks["star_layer_support_shape_compatible"] = star_layer_shape_ok
+        supported_positive_count = int(
+            np.count_nonzero(positive & star_layer_support)
+        ) if star_layer_shape_ok else 0
+        checks["supported_positive_delta_pixel_count"] = (
+            supported_positive_count
+        )
+        real_star_delta = bool(star_layer_shape_ok and supported_positive_count > 0)
+    checks["real_star_delta"] = real_star_delta
+    if not real_star_delta:
+        issues.append("fallback did not add measurable signal on a real star layer")
+
+    if not issues:
+        report["status"] = "passed"
+    return report
+
+
+def _stage9_try_stage8_starmask_review_fallback(
+    pipeline,
+    messages: List[str],
+    remix_attempts: List[Dict[str, Any]],
+    *,
+    trigger_reason: str,
+    stage8_source_stem: str,
+    raw_starmask_stem: str,
+    intensity: float,
+    allow_stretch: bool = True,
+) -> tuple[bool, Optional[Dict[str, Any]]]:
+    """Try Stage8 + stretch-only/raw starmask before any Stage5 fallback."""
+    fallback_report: Dict[str, Any] = {
+        "schema": "starun.stage9-fallback-remix.v1",
+        "status": "failed",
+        "trigger_reason": str(trigger_reason or "stage9_remix_rejected"),
+        "base_source_stem": str(stage8_source_stem or ""),
+        "raw_starmask_source_stem": str(raw_starmask_stem or ""),
+        "candidate_order": ["stretch_only", "raw"],
+        "intensity": float(intensity),
+        "attempts": [],
+        "selected_variant": None,
+    }
+    pipeline._stage9_fallback_remix_report = fallback_report
+    base_path = _stage9_existing_fit_path(pipeline, stage8_source_stem)
+    raw_path = _stage9_existing_fit_path(pipeline, raw_starmask_stem)
+    if base_path is None:
+        fallback_report["issues"] = ["Stage8 fallback base is unavailable"]
+        return False, None
+    if raw_path is None:
+        fallback_report["issues"] = ["raw Stage9 starmask is unavailable"]
+        return False, None
+
+    variants: List[Dict[str, Any]] = []
+    stretch_enabled = bool(
+        getattr(pipeline.cfg, "stage9_starmask_stretch_enabled", True)
+    )
+    if allow_stretch and stretch_enabled:
+        stretched_name = "starmask_fallback_stretched"
+        prepared_name = _prepare_stage9_starmask_for_pixel_remix(
+            pipeline,
+            raw_starmask_stem,
+            star_stretch_used=False,
+            messages=messages,
+            strict_support=False,
+            output_name=stretched_name,
+            precomputed_calibration=None,
+            candidate_local=True,
+            allow_pre_stretch_compact=False,
+        )
+        calibration = copy.deepcopy(
+            getattr(pipeline, "_stage9_starmask_calibration", {}) or {}
+        )
+        prepared = bool(
+            prepared_name == stretched_name
+            and calibration.get("stretch_applied") is True
+            and str(calibration.get("status") or "")
+            not in {"failed", "rejected", "unavailable"}
+        )
+        if prepared:
+            variants.append(
+                {
+                    "variant": "stretch_only",
+                    "starmask": stretched_name,
+                    "calibration": calibration,
+                }
+            )
+        else:
+            fallback_report["attempts"].append(
+                {
+                    "variant": "stretch_only",
+                    "phase": "prepare",
+                    "status": "unavailable",
+                    "starmask": stretched_name,
+                    "reason": str(
+                        calibration.get("reason")
+                        or "controlled stretch was not produced"
+                    ),
+                    "calibration_status": calibration.get("status"),
+                }
+            )
+    else:
+        fallback_report["attempts"].append(
+            {
+                "variant": "stretch_only",
+                "phase": "prepare",
+                "status": "skipped",
+                "reason": (
+                    "prior stretch execution failed"
+                    if not allow_stretch
+                    else "starmask stretch disabled by configuration"
+                ),
+            }
+        )
+    variants.append(
+        {
+            "variant": "raw",
+            "starmask": raw_starmask_stem,
+            "calibration": {
+                "status": "review_only_raw",
+                "support_mode": "normal",
+                "stretch_applied": False,
+                "reason": "unaltered canonical Stage6 starmask fallback",
+            },
+        }
+    )
+
+    previous_remix_base_stem = str(
+        getattr(pipeline, "_stage9_remix_base_stem", "") or ""
+    )
+    pipeline._stage9_remix_base_stem = stage8_source_stem
+    for variant in variants:
+        variant_name = str(variant["variant"])
+        starmask_name = str(variant["starmask"])
+        attempt_name = f"screen_stage8_starmask_{variant_name}_fallback"
+        pipeline._stage9_starmask_calibration = copy.deepcopy(
+            variant.get("calibration") or {}
+        )
+        attempt: Dict[str, Any] = {
+            "attempt": attempt_name,
+            "formula": "screen",
+            "status": "failed",
+            "accepted": False,
+            "delivery_accepted": False,
+            "gate_role": "fatal_safety_only",
+            "review_required": True,
+            "fallback_variant": variant_name,
+            "trigger_reason": str(trigger_reason),
+            "base_source_stem": stage8_source_stem,
+            "starmask": starmask_name,
+            "support_starmask": starmask_name,
+            "support_mode": "normal",
+            "intensity": float(intensity),
+            "recovery_kind": "minimal_stage8_starmask_fallback",
+            "recovery_strength": 0.0,
+            "recovery_target_groups": [],
+            "issues": [],
+            "metrics": {},
+            "reason_codes": ["STAGE9_MINIMAL_STARMASK_REVIEW_FALLBACK"],
+        }
+        try:
+            pipeline.cmd_with_check("load", stage8_source_stem)
+            base_pixels, base_domain = _stage9_current_canonical_pixels(
+                pipeline,
+                label="Stage8 fallback base",
+            )
+            starmask_path = _stage9_existing_fit_path(pipeline, starmask_name)
+            if starmask_path is None:
+                raise RuntimeError(
+                    f"Stage9 {variant_name} fallback starmask file is unavailable"
+                )
+            pipeline.cmd_with_check("load", starmask_name)
+            starmask_pixels, starmask_domain = (
+                _stage9_current_canonical_pixels(
+                    pipeline,
+                    label=f"Stage9 {variant_name} fallback starmask",
+                )
+            )
+            starmask_shape_compatible = (
+                _stage9_fallback_starmask_shape_compatible(
+                    starmask_pixels,
+                    base_pixels,
+                )
+            )
+            attempt["source_safety"] = {
+                "status": (
+                    "passed" if starmask_shape_compatible else "failed"
+                ),
+                "base_file": str(base_path),
+                "starmask_file": str(starmask_path),
+                "base_domain": base_domain,
+                "starmask_domain": starmask_domain,
+                "shape_compatible": bool(starmask_shape_compatible),
+            }
+            if not starmask_shape_compatible:
+                raise RuntimeError(
+                    "Stage8 fallback base and starmask dimensions are incompatible"
+                )
+            pipeline._stage9_minimal_fallback_active = True
+            try:
+                applied = bool(
+                    pipeline._apply_previous_stage_star_remix(
+                        stage8_source_stem,
+                        starmask_name,
+                        intensity,
+                    )
+                )
+            finally:
+                pipeline._stage9_minimal_fallback_active = False
+            if not applied:
+                raise RuntimeError("Stage8 + starmask Screen execution failed")
+            candidate_pixels, candidate_domain = (
+                _stage9_current_canonical_pixels(
+                    pipeline,
+                    label=f"Stage9 {variant_name} fallback",
+                )
+            )
+            safety = _stage9_minimal_fallback_safety(
+                pipeline,
+                base_pixels,
+                candidate_pixels,
+                base_domain=base_domain,
+                candidate_domain=candidate_domain,
+            )
+            attempt["fatal_safety"] = safety
+            if safety.get("status") != "passed":
+                attempt["issues"] = list(safety.get("issues") or [])
+                fallback_report["attempts"].append(copy.deepcopy(attempt))
+                remix_attempts.append(attempt)
+                continue
+
+            try:
+                formal_quality = _assess_stage9_candidate(
+                    pipeline,
+                    stage8_source_stem,
+                    attempt=f"{attempt_name}_diagnostic",
+                    formula="screen",
+                )
+                if not isinstance(formal_quality, dict):
+                    raise TypeError("formal quality diagnostics returned no report")
+            except (
+                AttributeError,
+                CommandError,
+                OSError,
+                RuntimeError,
+                SirilError,
+                TypeError,
+                ValueError,
+            ) as diagnostic_error:
+                formal_quality = {
+                    "status": "unavailable",
+                    "accepted": False,
+                    "issues": [str(diagnostic_error)],
+                    "metrics": {},
+                    "diagnostic_only": True,
+                }
+            attempt["formal_quality"] = formal_quality
+            attempt["metrics"] = copy.deepcopy(
+                formal_quality.get("metrics") or {}
+            )
+            attempt["formal_quality_accepted"] = bool(
+                formal_quality.get("accepted", False)
+            )
+            attempt["formal_quality_issues"] = list(
+                formal_quality.get("issues") or []
+            )
+            pipeline.cmd_with_check("load", stage8_source_stem)
+            safe_pixel_writer = getattr(
+                pipeline,
+                "_set_current_image_pixeldata",
+                None,
+            )
+            if callable(safe_pixel_writer):
+                safe_pixel_writer(
+                    candidate_pixels,
+                    label=f"Stage9 {variant_name} minimal fallback restore",
+                )
+            else:
+                set_pixels = getattr(pipeline.siril, "set_image_pixeldata", None)
+                if not callable(set_pixels):
+                    raise RuntimeError(
+                        "minimal Stage9 fallback pixel writer unavailable"
+                    )
+                lock_factory = getattr(pipeline.siril, "image_lock", None)
+                if callable(lock_factory):
+                    with lock_factory():
+                        set_pixels(candidate_pixels)
+                else:
+                    set_pixels(candidate_pixels)
+            review_saved = bool(
+                pipeline._save_stage_output("stage9_review_with_stars")
+            )
+            canonical_saved = bool(
+                review_saved
+                and pipeline._save_stage_output("stage9_remixed")
+            )
+            attempt["save_status"] = {
+                "review_saved": review_saved,
+                "canonical_saved": canonical_saved,
+            }
+            if not (review_saved and canonical_saved):
+                attempt["issues"] = [
+                    "minimal Stage8 + starmask fallback save failed"
+                ]
+                fallback_report["attempts"].append(copy.deepcopy(attempt))
+                remix_attempts.append(attempt)
+                continue
+        except (
+            AttributeError,
+            CommandError,
+            OSError,
+            RuntimeError,
+            SirilError,
+            TypeError,
+            ValueError,
+        ) as error:
+            attempt["issues"] = [str(error)]
+            fallback_report["attempts"].append(copy.deepcopy(attempt))
+            remix_attempts.append(attempt)
+            continue
+
+        attempt.update(
+            status="selected_review_only",
+            delivery_accepted=True,
+        )
+        remix_attempts.append(attempt)
+        fallback_report["attempts"].append(copy.deepcopy(attempt))
+        fallback_report.update(
+            status="selected",
+            selected_variant=variant_name,
+            selected_starmask=starmask_name,
+            final_source="stage9_review_with_stars",
+        )
+        pipeline._stage9_fallback_remix_report = fallback_report
+        pipeline._stage9_selected_remix_quality = dict(attempt)
+        pipeline._stage9_star_layer_decomposition = (
+            "minimal_stage6_starmask_screen"
+        )
+        pipeline._stage9_stars_applied = True
+        pipeline._stage9_output_contains_stars = True
+        pipeline._stage9_output_withheld = False
+        pipeline._stage9_remix_formally_accepted = False
+        pipeline._stage9_review_candidate_selected = False
+        pipeline._stage9_stars_application_mode = (
+            "screen_minimal_review_fallback"
+        )
+        pipeline._stage9_final_source = "stage9_review_with_stars"
+        pipeline._stage9_bypassed_bad_starless = False
+        pipeline._require_review(
+            9,
+            "stage8_starmask_review_fallback",
+            {
+                "trigger_reason": str(trigger_reason),
+                "base_source": stage8_source_stem,
+                "starmask": starmask_name,
+                "variant": variant_name,
+            },
+        )
+        messages.append(
+            "Stage9 review-only fallback retained the Stage8 Starless base "
+            f"with {variant_name} starmask Screen composition "
+            f"(base={stage8_source_stem}, starmask={starmask_name})"
+        )
+        return True, attempt
+
+    pipeline._stage9_remix_base_stem = previous_remix_base_stem
+    pipeline._stage9_fallback_remix_report = fallback_report
+    messages.append(
+        "Stage9 Stage8 + minimal starmask fallback candidates were unavailable; "
+        "continuing to the terminal with-stars fallback"
     )
     return False, None
 
@@ -1861,6 +2406,8 @@ def _write_stage9_quality_report(
         selection_class = "formal"
     elif review_candidate_selected:
         selection_class = "review_candidate"
+    elif mode == "stage8_starmask_review_fallback":
+        selection_class = "stage8_starmask_fallback"
     elif mode == "stage5_review_fallback":
         selection_class = "stage5_fallback"
     elif bool(getattr(pipeline, "_stage9_output_withheld", False)):
@@ -1911,7 +2458,7 @@ def _write_stage9_quality_report(
         {
             "schema": "starun.stage9-remix-quality.v7",
             "selection_policy": (
-                "failure_directed_support_unscreen_targeted_recovery_v5"
+                "failure_directed_support_unscreen_targeted_recovery_v6"
             ),
             "selection_class": selection_class,
             "formal_accepted": formal_accepted,
@@ -1928,7 +2475,9 @@ def _write_stage9_quality_report(
                 "review_fwhm_ratio_max": _stage9_review_fwhm_ratio_max(
                     pipeline
                 ),
-                "lower_fwhm_failure_action": "stage5_fallback",
+                "lower_fwhm_failure_action": (
+                    "stage8_starmask_minimal_fallback"
+                ),
                 "maximum_numeric_failure_count": 1,
                 "non_psf_hard_failure_allowed": False,
                 "existing_numeric_advisory_multiplier_reused": True,
@@ -2160,10 +2709,31 @@ def _write_stage9_quality_report(
             "stage9_fallback_reason": stage9_fallback_reason,
             "candidate_recovery_used": candidate_recovery_used,
             "delivery_fallback_used": stage9_fallback_used,
+            "fallback_remix": copy.deepcopy(
+                getattr(
+                    pipeline,
+                    "_stage9_fallback_remix_report",
+                    {
+                        "schema": "starun.stage9-fallback-remix.v1",
+                        "status": "not_attempted",
+                        "attempts": [],
+                    },
+                )
+            ),
             "psf_review_required": bool(
                 getattr(pipeline, "_stage9_psf_review_required", False)
             ),
             "remix_formally_accepted": formal_accepted,
+            "star_delivery_contract_accepted": bool(
+                getattr(
+                    pipeline,
+                    "_stage9_star_delivery_contract_accepted",
+                    False,
+                )
+            ),
+            "bright_core_with_stars_fallback": copy.deepcopy(
+                getattr(pipeline, "_bright_core_with_stars_fallback", {}) or {}
+            ),
             "stars_required": stars_required,
             "stars_applied": stars_applied,
             "output_contains_stars": output_contains_stars,
@@ -2584,6 +3154,7 @@ def _prepare_stage9_starmask_for_pixel_remix(
     precomputed_calibration: Dict[str, Any] | None = None,
     candidate_local: bool = False,
     compact_output_name: str | None = None,
+    allow_pre_stretch_compact: bool = True,
 ) -> str:
     stretch_execution_started = False
     stretch_enabled = bool(
@@ -2629,7 +3200,8 @@ def _prepare_stage9_starmask_for_pixel_remix(
                 )
             ),
             "pre_stretch_compact_enabled": bool(
-                getattr(
+                allow_pre_stretch_compact
+                and getattr(
                     pipeline.cfg,
                     "stage9_starmask_pre_stretch_compact_enabled",
                     False,
@@ -2708,7 +3280,8 @@ def _prepare_stage9_starmask_for_pixel_remix(
             )
         )
         pre_stretch_compact_enabled = bool(
-            getattr(
+            allow_pre_stretch_compact
+            and getattr(
                 pipeline.cfg,
                 "stage9_starmask_pre_stretch_compact_enabled",
                 False,
@@ -2997,7 +3570,8 @@ def _prepare_stage9_starmask_for_pixel_remix(
                 )
             ),
             "pre_stretch_compact_enabled": bool(
-                getattr(
+                allow_pre_stretch_compact
+                and getattr(
                     pipeline.cfg,
                     "stage9_starmask_pre_stretch_compact_enabled",
                     False,
@@ -6504,6 +7078,7 @@ def run_stage9_star_remixing(pipeline) -> None:
     """
     stage_label = PipelineStage.STAR_REMIXING.label
     pipeline.log.stage_start(stage_label)
+    pipeline._clear_stage_reviews(9)
     messages: List[str] = []
     processing_mode = str(
         getattr(pipeline.cfg, "stage9_processing_mode", "auto") or "auto"
@@ -6522,6 +7097,7 @@ def run_stage9_star_remixing(pipeline) -> None:
     pipeline._stage9_output_withheld = False
     pipeline._stage9_psf_review_required = False
     pipeline._stage9_remix_formally_accepted = False
+    pipeline._stage9_star_delivery_contract_accepted = False
     pipeline._stage9_review_candidate_selected = False
     pipeline._stage9_spatial_scale_review_required = False
     pipeline._stage9_spatial_scale = {
@@ -6579,6 +7155,14 @@ def run_stage9_star_remixing(pipeline) -> None:
     pipeline._stage9_fallback_reason = None
     pipeline._stage9_candidate_recovery_used = False
     pipeline._stage9_delivery_fallback_used = False
+    pipeline._stage9_minimal_fallback_active = False
+    pipeline._stage9_fallback_remix_report = {
+        "schema": "starun.stage9-fallback-remix.v1",
+        "status": "not_attempted",
+        "attempts": [],
+    }
+    pipeline._stage9_raw_starmask_stem = ""
+    pipeline._stage9_stage8_fallback_base_stem = ""
     pipeline._stage9_remix_base_identity = None
     pipeline._stage9_star_layer_decomposition = "not_applicable"
     pipeline._stage9_matched_domain_context = None
@@ -6589,6 +7173,7 @@ def run_stage9_star_remixing(pipeline) -> None:
     source_stem = getattr(pipeline, "_stage8_final_source", "stage8_enhanced") or "stage8_enhanced"
     pipeline._stage9_remix_base_stem = source_stem
     pipeline._stage9_upstream_source_stem = source_stem
+    pipeline._stage9_stage8_fallback_base_stem = source_stem
     upstream_handoff = _stage9_upstream_handoff(pipeline, source_stem)
     upstream_passthrough = bool(upstream_handoff.get("passthrough", False))
     upstream_restricted = bool(
@@ -6621,6 +7206,7 @@ def run_stage9_star_remixing(pipeline) -> None:
         )
         pipeline._stage9_psf_review_required = required
         if required:
+            pipeline._require_review(9, "stage9_psf_subgroup_evidence_insufficient")
             note = (
                 "Stage9 PSF subgroup evidence is incomplete; accepted stars "
                 "are retained but normal delivery is routed to review-only output"
@@ -6683,6 +7269,7 @@ def run_stage9_star_remixing(pipeline) -> None:
                 "processing_mode": processing_mode,
                 "failure_action": failure_action,
             },
+            "review_reasons": pipeline._stage_review_reasons(9),
         }
 
     def decisive_failure_status(
@@ -6700,7 +7287,7 @@ def run_stage9_star_remixing(pipeline) -> None:
                     source=source,
                 )
             if failure_action == "preserve_review":
-                pipeline._background_review_required = True
+                pipeline._require_review(9, str(reason or "stage9_review_required"))
         if failure_action == "stop":
             return "failed"
         return "degraded" if saved else "failed"
@@ -6711,7 +7298,7 @@ def run_stage9_star_remixing(pipeline) -> None:
             messages,
             reason="user_preserve_with_stars",
         )
-        pipeline._background_review_required = True
+        pipeline._require_review(9, "user_preserve_with_stars")
         report_mode = (
             "user_preserve_with_stars"
             if stage_saved
@@ -6741,9 +7328,10 @@ def run_stage9_star_remixing(pipeline) -> None:
         elapsed = pipeline.log.stage_end(stage_label)
         pipeline._record_stage(
             stage_label,
-            "degraded" if stage_saved else "failed",
+            "ok" if stage_saved else "failed",
             elapsed,
             "；".join(messages),
+            execution="safe_passthrough" if stage_saved else "completed",
             **result_metadata(),
         )
         return
@@ -6813,6 +7401,12 @@ def run_stage9_star_remixing(pipeline) -> None:
             or str(upstream_handoff.get("reason_code") or "")
             == "stage7_stretch_not_accepted_target_bypass"
         )
+        if target_bypass_review_only:
+            pipeline._require_review(
+                9,
+                "target_bypass_review_only",
+                {"upstream_handoff": upstream_handoff},
+            )
         try:
             pipeline.cmd_with_check("load", source_stem)
             stage_saved = pipeline._save_stage_output("stage9_remixed")
@@ -6996,6 +7590,9 @@ def run_stage9_star_remixing(pipeline) -> None:
                 pipeline.log.info(f"已导入外部 Starmask: {external_starmask.name}")
         except (OSError, CommandError, SirilError) as e:
             pipeline.log.warn(f"导入外部 Starmask 失败，继续使用本地 starmask: {e}")
+
+    if pipeline.starmask_file and pipeline.starmask_file.exists():
+        pipeline._stage9_raw_starmask_stem = pipeline.starmask_file.stem
 
     star_stretch_used = False
     if pipeline.starmask_file and pipeline.starmask_file.exists():
@@ -7247,6 +7844,11 @@ def run_stage9_star_remixing(pipeline) -> None:
         messages.append("Stage8 restricted source active; using controlled pixel remix")
         remix_scale = min(remix_scale, 0.95 / max(float(pipeline.cfg.star_intensity), 1e-6))
         messages.append("Stage8 restricted-source star remix intensity capped at 0.950")
+    minimal_fallback_intensity = _clamp_float(
+        pipeline.cfg.star_intensity * remix_scale,
+        0.10,
+        1.05,
+    )
     messages.append(
         "Stage9 bypassed StarComposer; formal remix uses explicit "
         "starmask-top/starless-bottom Alpha+Screen composition"
@@ -7298,21 +7900,60 @@ def run_stage9_star_remixing(pipeline) -> None:
         )
         report_source = source_stem
         report_mode = "starcomposer"
+        report_selected = selected_remix
         if not remix_saved:
-            fallback_saved, fallback_source = (
-                _stage9_preserve_with_stars_review_output(
+            fallback_saved = False
+            fallback_source = None
+            minimal_selected = None
+            stage8_fallback_base = str(
+                getattr(
                     pipeline,
-                    messages,
-                    reason="starcomposer_save_failed",
+                    "_stage9_stage8_fallback_base_stem",
+                    source_stem,
                 )
+                or source_stem
             )
-            stage_saved = fallback_saved
-            report_source = str(fallback_source or source_stem)
-            report_mode = _stage9_required_stars_output_mode(fallback_saved)
+            if failure_action in {"auto_fallback", "preserve_review"}:
+                fallback_saved, minimal_selected = (
+                    _stage9_try_stage8_starmask_review_fallback(
+                        pipeline,
+                        messages,
+                        remix_attempts,
+                        trigger_reason="starcomposer_save_failed",
+                        stage8_source_stem=stage8_fallback_base,
+                        raw_starmask_stem=str(
+                            getattr(
+                                pipeline,
+                                "_stage9_raw_starmask_stem",
+                                "",
+                            )
+                            or ""
+                        ),
+                        intensity=minimal_fallback_intensity,
+                    )
+                )
+            if fallback_saved:
+                stage_saved = True
+                report_source = stage8_fallback_base
+                report_mode = "stage8_starmask_review_fallback"
+                report_selected = minimal_selected
+            else:
+                fallback_saved, fallback_source = (
+                    _stage9_preserve_with_stars_review_output(
+                        pipeline,
+                        messages,
+                        reason="starcomposer_save_failed",
+                    )
+                )
+                stage_saved = fallback_saved
+                report_source = str(fallback_source or source_stem)
+                report_mode = _stage9_required_stars_output_mode(
+                    fallback_saved
+                )
         _write_stage9_quality_report(
             pipeline,
             remix_attempts,
-            selected_remix,
+            report_selected,
             source_stem=report_source,
             mode=report_mode,
         )
@@ -7320,7 +7961,7 @@ def run_stage9_star_remixing(pipeline) -> None:
             pipeline,
             messages,
             remix_attempts,
-            selected_remix,
+            report_selected,
             source_stem=report_source,
             mode=report_mode,
             stage_saved=stage_saved,
@@ -7391,7 +8032,7 @@ def run_stage9_star_remixing(pipeline) -> None:
         )
         return
 
-    intensity = _clamp_float(pipeline.cfg.star_intensity * remix_scale, 0.10, 1.05)
+    intensity = minimal_fallback_intensity
     if remix_scale < 0.999:
         reason = getattr(pipeline, "_stage9_star_intensity_reason", "")
         if not reason:
@@ -7596,6 +8237,66 @@ def run_stage9_star_remixing(pipeline) -> None:
             if stretch_failed
             else "starmask_preparation_failed"
         )
+        minimal_saved = False
+        minimal_selected = None
+        stage8_fallback_base = str(
+            getattr(
+                pipeline,
+                "_stage9_stage8_fallback_base_stem",
+                source_stem,
+            )
+            or source_stem
+        )
+        if failure_action in {"auto_fallback", "preserve_review"}:
+            minimal_saved, minimal_selected = (
+                _stage9_try_stage8_starmask_review_fallback(
+                    pipeline,
+                    messages,
+                    remix_attempts,
+                    trigger_reason=failure_mode,
+                    stage8_source_stem=stage8_fallback_base,
+                    raw_starmask_stem=str(
+                        getattr(pipeline, "_stage9_raw_starmask_stem", "")
+                        or ""
+                    ),
+                    intensity=intensity,
+                    allow_stretch=not stretch_failed,
+                )
+            )
+        if minimal_saved:
+            _write_stage9_quality_report(
+                pipeline,
+                remix_attempts,
+                minimal_selected,
+                source_stem=stage8_fallback_base,
+                mode="stage8_starmask_review_fallback",
+            )
+            _append_stage9_review_bundle(
+                pipeline,
+                messages,
+                remix_attempts,
+                minimal_selected,
+                source_stem=stage8_fallback_base,
+                mode="stage8_starmask_review_fallback",
+                stage_saved=True,
+            )
+            messages.append(
+                "Stage9 starmask preparation failed, but review delivery "
+                "retained the Stage8 Starless base"
+            )
+            elapsed = pipeline.log.stage_end(stage_label)
+            pipeline._record_stage(
+                stage_label,
+                decisive_failure_status(
+                    True,
+                    reason=failure_mode,
+                    source="starmask_preparation",
+                ),
+                elapsed,
+                "；".join(messages),
+                **result_metadata(),
+            )
+            return
         stage_saved, fallback_source = _stage9_preserve_with_stars_review_output(
             pipeline,
             messages,
@@ -8683,7 +9384,7 @@ def run_stage9_star_remixing(pipeline) -> None:
             review_eligibility["restore_error"] = str(error)
             messages.append(
                 "Stage9 bounded review candidate restore failed; "
-                f"falling back to Stage5: {error}"
+                f"trying the minimal Stage8 + starmask fallback: {error}"
             )
 
         if review_restored:
@@ -8736,6 +9437,7 @@ def run_stage9_star_remixing(pipeline) -> None:
                 pipeline._stage9_remix_formally_accepted = False
                 pipeline._stage9_review_candidate_selected = True
                 pipeline._stage9_psf_review_required = True
+                pipeline._require_review(9, "best_failed_candidate_review")
                 pipeline._stage9_stars_application_mode = (
                     "screen_review_candidate"
                 )
@@ -8780,7 +9482,7 @@ def run_stage9_star_remixing(pipeline) -> None:
                 return
             messages.append(
                 "Stage9 bounded review candidate final save failed; "
-                "falling back to Stage5"
+                "trying the minimal Stage8 + starmask fallback"
             )
 
     if selected_remix is None:
@@ -8789,6 +9491,65 @@ def run_stage9_star_remixing(pipeline) -> None:
             if review_candidate_registry
             else "all_remix_candidates_outside_review_range"
         )
+        minimal_saved = False
+        minimal_selected = None
+        stage8_fallback_base = str(
+            getattr(
+                pipeline,
+                "_stage9_stage8_fallback_base_stem",
+                source_stem,
+            )
+            or source_stem
+        )
+        if failure_action in {"auto_fallback", "preserve_review"}:
+            minimal_saved, minimal_selected = (
+                _stage9_try_stage8_starmask_review_fallback(
+                    pipeline,
+                    messages,
+                    remix_attempts,
+                    trigger_reason=fallback_reason,
+                    stage8_source_stem=stage8_fallback_base,
+                    raw_starmask_stem=str(
+                        getattr(pipeline, "_stage9_raw_starmask_stem", "")
+                        or ""
+                    ),
+                    intensity=intensity,
+                )
+            )
+        if minimal_saved:
+            _write_stage9_quality_report(
+                pipeline,
+                remix_attempts,
+                minimal_selected,
+                source_stem=stage8_fallback_base,
+                mode="stage8_starmask_review_fallback",
+            )
+            _append_stage9_review_bundle(
+                pipeline,
+                messages,
+                remix_attempts,
+                minimal_selected,
+                source_stem=stage8_fallback_base,
+                mode="stage8_starmask_review_fallback",
+                stage_saved=True,
+            )
+            elapsed = pipeline.log.stage_end(stage_label)
+            messages.append(
+                "Stage9 gate rejected all formal remix candidates; retained "
+                "Stage8 + minimal starmask as a review-only output"
+            )
+            pipeline._record_stage(
+                stage_label,
+                decisive_failure_status(
+                    True,
+                    reason="all_remix_candidates_rejected",
+                    source="quality_gate",
+                ),
+                elapsed,
+                "；".join(messages),
+                **result_metadata(),
+            )
+            return
         stage_saved, fallback_source = _stage9_preserve_with_stars_review_output(
             pipeline,
             messages,
@@ -8854,19 +9615,54 @@ def run_stage9_star_remixing(pipeline) -> None:
     )
     report_source = source_stem
     report_mode = "screen"
+    report_selected = selected_remix
     if not remix_saved:
-        fallback_saved, fallback_source = _stage9_preserve_with_stars_review_output(
-            pipeline,
-            messages,
-            reason="screen_save_failed",
+        fallback_saved = False
+        fallback_source = None
+        minimal_selected = None
+        stage8_fallback_base = str(
+            getattr(
+                pipeline,
+                "_stage9_stage8_fallback_base_stem",
+                source_stem,
+            )
+            or source_stem
         )
-        stage_saved = fallback_saved
-        report_source = str(fallback_source or source_stem)
-        report_mode = _stage9_required_stars_output_mode(fallback_saved)
+        if failure_action in {"auto_fallback", "preserve_review"}:
+            fallback_saved, minimal_selected = (
+                _stage9_try_stage8_starmask_review_fallback(
+                    pipeline,
+                    messages,
+                    remix_attempts,
+                    trigger_reason="screen_save_failed",
+                    stage8_source_stem=stage8_fallback_base,
+                    raw_starmask_stem=str(
+                        getattr(pipeline, "_stage9_raw_starmask_stem", "")
+                        or ""
+                    ),
+                    intensity=intensity,
+                )
+            )
+        if fallback_saved:
+            stage_saved = True
+            report_source = stage8_fallback_base
+            report_mode = "stage8_starmask_review_fallback"
+            report_selected = minimal_selected
+        else:
+            fallback_saved, fallback_source = (
+                _stage9_preserve_with_stars_review_output(
+                    pipeline,
+                    messages,
+                    reason="screen_save_failed",
+                )
+            )
+            stage_saved = fallback_saved
+            report_source = str(fallback_source or source_stem)
+            report_mode = _stage9_required_stars_output_mode(fallback_saved)
     _write_stage9_quality_report(
         pipeline,
         remix_attempts,
-        selected_remix,
+        report_selected,
         source_stem=report_source,
         mode=report_mode,
     )
@@ -8874,7 +9670,7 @@ def run_stage9_star_remixing(pipeline) -> None:
         pipeline,
         messages,
         remix_attempts,
-        selected_remix,
+        report_selected,
         source_stem=report_source,
         mode=report_mode,
         stage_saved=stage_saved,

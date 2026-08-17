@@ -159,7 +159,7 @@ class PipelinePluginFallbackRuntimeContractTests(PipelinePluginFallbackTestBase)
         self.assertEqual(detail_events[0]["display_status"], "ok")
         self.assertEqual(detail_events[1]["display_status"], "ok")
         self.assertTrue(detail_events[2]["fallback_used"])
-        self.assertEqual(detail_events[2]["display_status"], "ok_with_fallback")
+        self.assertEqual(detail_events[2]["display_status"], "degraded")
         self.assertEqual(detail_events[3]["execution"], "safe_passthrough")
         self.assertEqual(
             detail_events[3]["display_status"],
@@ -167,6 +167,33 @@ class PipelinePluginFallbackRuntimeContractTests(PipelinePluginFallbackTestBase)
         )
         self.assertEqual(processor.results[0].status, "ok")
         self.assertEqual(processor.results[1].status, "ok")
+
+    def test_recovered_plugin_error_is_not_fatal(self):
+        processor = pipeline_module.StarunPostProcessor()
+        processor.results = []
+        processor.log = FakeLogger()
+        processor._publish_stage_preview = lambda *_args: None
+
+        processor._record_stage(
+            "阶段 5: 线性整理",
+            "ok",
+            fallback_used=True,
+            reason_code="component_fallback_used",
+            components={
+                "denoise": {
+                    "status": "failed",
+                    "reason_code": "plugin_execution_failed",
+                    "fallback_used": True,
+                }
+            },
+        )
+        summary = processor._pipeline_outcome()
+
+        self.assertEqual(summary["status"], "partial_success")
+        self.assertTrue(summary["had_errors"])
+        self.assertFalse(summary["had_fatal_errors"])
+        self.assertTrue(summary["had_fallbacks"])
+        self.assertTrue(summary["issues"][0]["recovered"])
 
     def test_stage_outputs_write_only_the_requested_canonical_name(self):
         calls: list[tuple[str, str]] = []
@@ -377,45 +404,29 @@ class PipelinePluginFallbackRuntimeContractTests(PipelinePluginFallbackTestBase)
         self.assertIn("--cpu", native_calls[-1][2])
 
     def test_pipeline_status_stage2_view_review_is_review_required(self):
-        probe = SimpleNamespace(
-            results=[],
-            _stage2_view_review_required=True,
-            _stage9_stars_required=False,
-            _stage9_stars_applied=False,
-        )
+        probe = pipeline_module.ProcessorRuntimeMixin()
+        probe.results = []
+        probe._require_review(2, "stage2_view_review_required")
 
-        status = pipeline_module.StarunPostProcessor._pipeline_result_status(
-            probe
-        )
+        status = probe._pipeline_result_status()
 
         self.assertEqual(status, "review_required")
 
     def test_pipeline_status_color_review_is_review_required(self):
-        probe = SimpleNamespace(
-            results=[],
-            _stage4_color_review_required=True,
-            _stage9_stars_required=False,
-            _stage9_stars_applied=False,
-        )
+        probe = pipeline_module.ProcessorRuntimeMixin()
+        probe.results = []
+        probe._require_review(4, "color_calibration_review_required")
 
-        status = pipeline_module.StarunPostProcessor._pipeline_result_status(
-            probe
-        )
+        status = probe._pipeline_result_status()
 
         self.assertEqual(status, "review_required")
 
     def test_pipeline_status_stage9_review_candidate_is_review_required(self):
-        probe = SimpleNamespace(
-            results=[],
-            _stage9_stars_required=True,
-            _stage9_stars_applied=True,
-            _stage9_review_candidate_selected=True,
-            _stage9_remix_formally_accepted=False,
-        )
+        probe = pipeline_module.ProcessorRuntimeMixin()
+        probe.results = []
+        probe._require_review(9, "stage9_review_candidate_selected")
 
-        status = pipeline_module.StarunPostProcessor._pipeline_result_status(
-            probe
-        )
+        status = probe._pipeline_result_status()
 
         self.assertEqual(status, "review_required")
 
@@ -1716,7 +1727,7 @@ class PipelinePluginFallbackRuntimeContractTests(PipelinePluginFallbackTestBase)
 
         self.assertEqual(message_only_result.display_status, "ok")
         self.assertEqual(skipped_message_result.display_status, "ok")
-        self.assertEqual(fallback_result.display_status, "ok_with_fallback")
+        self.assertEqual(fallback_result.display_status, "degraded")
         self.assertEqual(skipped_result.display_status, "ok_skipped_optional")
         self.assertEqual(passthrough_result.display_status, "ok_safe_passthrough")
         self.assertEqual(degraded_result.display_status, "degraded")

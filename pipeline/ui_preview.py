@@ -9,6 +9,10 @@ from typing import Any, Iterable
 
 import numpy as np
 
+if __package__:
+    from . import display_rendition
+else:
+    import display_rendition
 
 DEFAULT_PREVIEW_MAX_SIDE = 1600
 LINKED_DISPLAY_CURVE_SCHEMA = "starun.linked-display-curve.v1"
@@ -285,6 +289,7 @@ def write_display_preview(
     *,
     apply_stretch: bool = True,
     max_side: int = DEFAULT_PREVIEW_MAX_SIDE,
+    display_contract: dict[str, Any] | None = None,
 ) -> Path:
     """Write a display preview; optional stretch is linked and observer-only."""
 
@@ -293,7 +298,12 @@ def write_display_preview(
     temporary = target.with_name(target.name + ".tmp")
     try:
         rgb = _rgb_raw_float(image, max_side=max(64, int(max_side)))
-        if apply_stretch:
+        if display_contract is not None:
+            rgb = display_rendition.apply_linked_review_contract(
+                rgb,
+                display_contract,
+            )
+        elif apply_stretch:
             rgb = _linked_display_stretch(rgb)
         _write_png_rgb16(temporary, rgb)
         temporary.replace(target)
@@ -335,6 +345,7 @@ def write_display_fits_preview(
     *,
     apply_stretch: bool = True,
     max_side: int = DEFAULT_PREVIEW_MAX_SIDE,
+    display_contract: dict[str, Any] | None = None,
 ) -> Path:
     """Write the first readable FITS as a labeled display-only preview."""
 
@@ -355,6 +366,7 @@ def write_display_fits_preview(
                 path,
                 apply_stretch=apply_stretch,
                 max_side=max_side,
+                display_contract=display_contract,
             )
             return source
         except (OSError, RuntimeError, TypeError, ValueError) as exc:

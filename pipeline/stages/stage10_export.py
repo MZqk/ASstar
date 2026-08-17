@@ -1,6 +1,8 @@
 """Stage 10 final denoise and export."""
 import math
+import shutil
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -9,8 +11,13 @@ from sirilpy.exceptions import CommandError, SirilError
 
 from channel_semantics import BROADBAND_RGB_OSC
 from color_quality_metrics import build_color_quality_report, resolve_color_contract
+import display_rendition
 from local_adjustments import dilate_mask, feather_mask
-from managed_output import export_managed_outputs
+from managed_output import (
+    audit_display_visibility,
+    export_managed_outputs,
+    write_managed_display_png,
+)
 from models import PipelineStage
 from output_color import build_output_color_manifest
 from pipeline_safety import (
@@ -1273,6 +1280,7 @@ def run_stage10_export(pipeline) -> None:
     """
     stage_label = PipelineStage.EXPORT.label
     pipeline.log.stage_start(stage_label)
+    pipeline._clear_stage_reviews(10)
     status = "ok"
     messages: List[str] = []
     pipeline._stage10_color_rebalance_report = {}
@@ -1302,6 +1310,10 @@ def run_stage10_export(pipeline) -> None:
         ("auto_chain", "cosmic_only", "scunet_only"),
     )
     preserve_mode = processing_mode == "preserve"
+    bright_core_fallback = dict(
+        getattr(pipeline, "_bright_core_with_stars_fallback", {}) or {}
+    )
+    preserve_pixels = preserve_mode
     final_denoise_enabled = bool(
         getattr(pipeline.cfg, "stage10_final_denoise_enabled", True)
     )
@@ -1347,30 +1359,44 @@ def run_stage10_export(pipeline) -> None:
     stage9_starmask_stretch_failed = bool(
         getattr(pipeline, "_stage9_starmask_stretch_failed", False)
     )
+    stage9_review_reasons = set(pipeline._stage_review_reasons(9))
     stage9_psf_review_required = bool(
-        getattr(pipeline, "_stage9_psf_review_required", False)
+        "stage9_psf_subgroup_evidence_insufficient" in stage9_review_reasons
     )
     stage9_review_candidate_selected = bool(
-        getattr(pipeline, "_stage9_review_candidate_selected", False)
+        "best_failed_candidate_review" in stage9_review_reasons
+    )
+    stage9_minimal_remix_fallback = bool(
+        "stage8_starmask_review_fallback" in stage9_review_reasons
     )
     stage9_remix_formally_accepted = bool(
         getattr(pipeline, "_stage9_remix_formally_accepted", False)
     )
-    stage4_color_review_required = bool(
-        getattr(pipeline, "_stage4_color_review_required", False)
+    stage4_core_color = dict(
+        (getattr(pipeline, "color_calibration_report", {}) or {}).get(
+            "bright_core_color_integrity"
+        )
+        or {}
     )
-    stage2_view_review_required = bool(
-        getattr(pipeline, "_stage2_view_review_required", False)
-    )
-    stage3_background_review_required = bool(
-        getattr(pipeline, "_background_review_required", False)
-    )
+    if bool(stage4_core_color.get("applicable", False)) and str(
+        stage4_core_color.get("status") or ""
+    ) not in {"ok", "repaired"}:
+        pipeline._require_review(
+            4,
+            "stage4_bright_core_color_integrity_unresolved",
+        )
+    stage4_color_review_required = bool(pipeline._stage_review_reasons(4))
+    stage2_view_review_required = bool(pipeline._stage_review_reasons(2))
+    stage3_background_review_required = bool(pipeline._stage_review_reasons(3))
+    stage7_review_reasons = set(pipeline._stage_review_reasons(7))
     stage7_background_color_review_required = bool(
         getattr(
             pipeline,
             "_stage7_background_color_review_required",
             False,
         )
+        or "uncalibrated_background_color_review_required"
+        in stage7_review_reasons
     )
     stage7_forced_delivery = bool(
         getattr(pipeline, "_stage7_stretch_forced_delivery", False)
@@ -1380,11 +1406,7 @@ def run_stage10_export(pipeline) -> None:
         and not stage7_forced_delivery
     )
     stage6_starmask_borderline_review_required = bool(
-        getattr(
-            pipeline,
-            "_stage6_starmask_borderline_review_required",
-            False,
-        )
+        "starmask_cleanup_borderline" in pipeline._stage_review_reasons(6)
     )
     stage6_quality_hard_failed_retained = bool(
         getattr(
@@ -1396,20 +1418,15 @@ def run_stage10_export(pipeline) -> None:
     forced_review_only = bool(
         getattr(pipeline.cfg, "force_review_only_output", False)
     )
-    review_only_output = forced_review_only or bool(
-        getattr(pipeline, "_stage9_bypassed_bad_starless", False)
-    ) or (
-        stage2_view_review_required
-        or stage3_background_review_required
-        or stage4_color_review_required
-        or stage7_background_color_blocks_normal
-        or stage6_quality_hard_failed_retained
-        or stage6_starmask_borderline_review_required
-        or stage9_missing_required_stars
-        or stage9_starmask_stretch_failed
-        or stage9_psf_review_required
-        or stage9_review_candidate_selected
-    )
+    if stage9_missing_required_stars:
+        pipeline._require_review(9, "stage9_required_stars_not_applied")
+    if stage9_starmask_stretch_failed:
+        pipeline._require_review(9, "stage9_starmask_stretch_failed")
+    if stage6_quality_hard_failed_retained:
+        pipeline._require_review(6, "stage6_quality_hard_failed_retained")
+    if forced_review_only:
+        pipeline._require_review(10, "forced_review_only_output")
+    review_only_output = bool(pipeline._review_requirements_payload())
     final_source_review_reason = ""
     final_quality_gate_status = "pending"
     final_quality_gate_error = ""
@@ -1436,6 +1453,11 @@ def run_stage10_export(pipeline) -> None:
         messages.append(
             "stage9_psf_review_required=true; PSF subgroup evidence is partial "
             "and normal delivery is not allowed"
+        )
+    elif stage9_review_reasons:
+        messages.append(
+            "stage9 review requirements disable normal delivery: "
+            + ",".join(sorted(stage9_review_reasons))
         )
     if stage4_color_review_required:
         messages.append(
@@ -1525,9 +1547,9 @@ def run_stage10_export(pipeline) -> None:
     )
     final_candidates = (
         [preferred_final_source]
-        if preserve_mode and verified_preserve_source
+        if preserve_pixels and verified_preserve_source
         else []
-        if preserve_mode
+        if preserve_pixels
         else [
             preferred_final_source,
             final_file,
@@ -1552,9 +1574,9 @@ def run_stage10_export(pipeline) -> None:
         except (CommandError, SirilError):
             messages.append(f"final_candidate_load_failed={candidate}")
             continue
-    if preserve_mode and not final_loaded:
+    if preserve_pixels and not final_loaded:
         reason = (
-            "verified Stage9 with-stars source unavailable for preserve mode"
+            "verified Stage9 with-stars source unavailable for pixel-preserve mode"
         )
         _stage10_terminal_failure(
             pipeline,
@@ -1702,6 +1724,7 @@ def run_stage10_export(pipeline) -> None:
                 getattr(pipeline, "_skip_stage10_color_adjustments", False)
             )
             or stage9_review_candidate_selected
+            or stage9_minimal_remix_fallback
             or not channel_color_adjustments_allowed
         )
         else _config_value(
@@ -1724,6 +1747,11 @@ def run_stage10_export(pipeline) -> None:
         messages.append(
             "Stage10 color adjustment skipped because the Stage9 remix is a "
             "bounded review candidate rather than a formally accepted candidate"
+        )
+    elif stage9_minimal_remix_fallback:
+        messages.append(
+            "Stage10 color adjustment skipped because the Stage9 remix uses "
+            "the minimal Stage8 + starmask review fallback"
         )
     elif not channel_color_adjustments_allowed:
         messages.append(
@@ -1806,16 +1834,18 @@ def run_stage10_export(pipeline) -> None:
     denoise_effective_status = "skipped"
     denoise_fallback_used = False
     denoise_fallback_reason = ""
-    duplicate_denoise_skip = should_skip_final_denoise(
-        stage5_denoise_applied=bool(
-            getattr(pipeline, "_stage5_denoise_applied", False)
-        ),
-        stage8_final_quality=str(
-            getattr(pipeline, "_stage8_final_quality", "unknown")
-        ),
-        stage8_fallback_used=bool(
-            getattr(pipeline, "_stage8_fallback_used", False)
-        ),
+    duplicate_denoise_skip = bool(
+        should_skip_final_denoise(
+            stage5_denoise_applied=bool(
+                getattr(pipeline, "_stage5_denoise_applied", False)
+            ),
+            stage8_final_quality=str(
+                getattr(pipeline, "_stage8_final_quality", "unknown")
+            ),
+            stage8_fallback_used=bool(
+                getattr(pipeline, "_stage8_fallback_used", False)
+            ),
+        )
     )
     review_only_denoise_skip = bool(review_only_output)
     low_noise_denoise_skip = selected_denoise_mode == "skip"
@@ -2536,7 +2566,7 @@ def run_stage10_export(pipeline) -> None:
                 )
                 if (
                     quality_repair_enabled
-                    and not preserve_mode
+                    and not preserve_pixels
                     and not preserve_review_triggered
                 ):
                     final_quality = _attempt_stage10_quality_repair(
@@ -2717,7 +2747,7 @@ def run_stage10_export(pipeline) -> None:
     )
     managed_pixels: Optional[np.ndarray] = None
     managed_export_report: Optional[Dict[str, Any]] = None
-    if managed_export_enabled:
+    if managed_export_enabled or review_only_output:
         try:
             if stage_saved:
                 pipeline.cmd_with_check("load", "stage10_final")
@@ -2744,6 +2774,50 @@ def run_stage10_export(pipeline) -> None:
                 "managed output source unavailable; independent derivatives skipped"
             )
 
+    review_display_contract: Optional[Dict[str, Any]] = None
+    if review_only_output:
+        pipeline._review_display_route = True
+        frozen_contract = dict(
+            getattr(pipeline, "_display_rendition_contract", {}) or {}
+        )
+        contract_reason = str(
+            frozen_contract.get("reason") or "stage10_review_only_output"
+        )
+        if managed_pixels is not None:
+            try:
+                input_visibility = audit_display_visibility(
+                    managed_pixels,
+                    target_type=active_target_type,
+                    stars_required=stage9_stars_required,
+                )
+                frozen_contract = display_rendition.build_review_contract(
+                    managed_pixels,
+                    reason=contract_reason,
+                    source_stem="stage10_final",
+                    input_visibility=input_visibility,
+                )
+            except (RuntimeError, TypeError, ValueError) as error:
+                frozen_contract = display_rendition.unavailable_contract(
+                    reason=contract_reason,
+                    error=str(error),
+                )
+        else:
+            frozen_contract = display_rendition.unavailable_contract(
+                reason=contract_reason,
+                error="review display source pixels unavailable",
+            )
+        pipeline._display_rendition_contract = dict(frozen_contract)
+        pipeline._write_stage_json(
+            "display_rendition_contract.json",
+            frozen_contract,
+        )
+        if display_rendition.validate_review_contract(frozen_contract):
+            review_display_contract = frozen_contract
+        else:
+            messages.append(
+                "review display contract unavailable; PNG publication will fail closed"
+            )
+
     # 切换回原工作目录导出
     pipeline.cmd_with_check("cd", f'"{pipeline.work_dir}"')
 
@@ -2755,7 +2829,6 @@ def run_stage10_export(pipeline) -> None:
         pipeline.main_output_basename_template = base_filename
         pipeline.main_output_fit_basename_template = fallback_fit_base
         pipeline._final_output_review_only = True
-        status = "degraded" if status == "ok" else status
         messages.append(
             "review_only_output=true; normal result_processed/result_final names withheld"
         )
@@ -2797,8 +2870,9 @@ def run_stage10_export(pipeline) -> None:
         fallback_base=fallback_base,
         fallback_fit_base=fallback_fit_base,
         output_format=getattr(pipeline.cfg, "output_format", "all"),
-        png_preview_stretch=not bool(
-            getattr(pipeline, "_stage7_stretch_accepted", False)
+        png_preview_stretch=(
+            not review_only_output
+            and not bool(getattr(pipeline, "_stage7_stretch_accepted", False))
         ),
         status=status,
         messages=messages,
@@ -2839,6 +2913,9 @@ def run_stage10_export(pipeline) -> None:
                 scientific_paths=scientific_paths,
                 target_type=active_target_type,
                 stars_required=stage9_stars_required,
+                display_contract=(
+                    review_display_contract if review_only_output else None
+                ),
             )
             pipeline._write_stage_json(
                 "managed_output_report.json",
@@ -2874,6 +2951,120 @@ def run_stage10_export(pipeline) -> None:
     elif not managed_export_enabled:
         messages.append("managed output disabled by configuration")
 
+    review_png_report: Dict[str, Any] = {
+        "applicable": bool(review_only_output),
+        "status": "not_requested",
+        "contract": (
+            dict(getattr(pipeline, "_display_rendition_contract", {}) or {})
+            if review_only_output
+            else None
+        ),
+    }
+    png_export = (export_report.get("outputs") or {}).get("png")
+    if review_only_output and isinstance(png_export, dict):
+        selected_png_name = str(png_export.get("selected") or "")
+        selected_png_path = (
+            pipeline.work_dir / selected_png_name
+            if selected_png_name
+            else pipeline.work_dir / f"{base_filename}.png"
+        )
+        review_png_published = False
+        review_png_error = ""
+        if review_display_contract is None:
+            review_png_error = "required Review contract unavailable"
+        elif managed_export_enabled:
+            display_artifact = next(
+                (
+                    artifact
+                    for artifact in (
+                        (managed_export_report or {}).get("artifacts") or []
+                    )
+                    if artifact.get("role") == "display"
+                    and artifact.get("status") == "written"
+                    and Path(str(artifact.get("path") or "")).is_file()
+                ),
+                None,
+            )
+            if display_artifact is None:
+                review_png_error = (
+                    "managed Review PNG missing or visibility audit failed"
+                )
+            else:
+                try:
+                    managed_display_path = Path(str(display_artifact["path"]))
+                    shutil.copyfile(managed_display_path, selected_png_path)
+                    review_png_published = True
+                    review_png_report.update(
+                        managed_display=str(managed_display_path),
+                        primary=str(selected_png_path),
+                        pixel_identity="byte_identical_copy",
+                        visibility=display_artifact.get("visibility"),
+                    )
+                except OSError as error:
+                    review_png_error = str(error)
+        elif managed_pixels is not None:
+            try:
+                review_pixels = display_rendition.apply_review_contract(
+                    managed_pixels,
+                    review_display_contract,
+                )
+                visibility = audit_display_visibility(
+                    review_pixels,
+                    target_type=active_target_type,
+                    stars_required=stage9_stars_required,
+                )
+                if not bool(visibility.get("passed", False)):
+                    raise ValueError(
+                        "review PNG visibility audit failed: "
+                        + ",".join(visibility.get("failed_checks") or [])
+                    )
+                write_managed_display_png(selected_png_path, review_pixels)
+                review_png_published = True
+                review_png_report.update(
+                    primary=str(selected_png_path),
+                    visibility=visibility,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                review_png_error = str(error)
+        else:
+            review_png_error = "review display source pixels unavailable"
+
+        if review_png_published:
+            review_png_report["status"] = "written"
+            if str(png_export.get("status") or "") not in {
+                "primary",
+                "fallback",
+            }:
+                png_export["status"] = "managed_review"
+            png_export["selected"] = selected_png_path.name
+            png_export["review_display_status"] = "written"
+            png_export["display_rendition_contract"] = (
+                "display_rendition_contract.json"
+            )
+            messages.append(
+                "review PNG uses the frozen audited Review rendition"
+            )
+        else:
+            selected_png_path.unlink(missing_ok=True)
+            review_png_report.update(
+                status="rejected_not_published",
+                error=review_png_error,
+            )
+            png_export.update(
+                status="rejected_not_published",
+                selected=None,
+                review_display_status="failed_closed",
+                review_display_error=review_png_error,
+            )
+            export_report["overall_status"] = "partial"
+            status = "degraded" if status == "ok" else status
+            messages.append(
+                "review PNG withheld because the rendition contract or "
+                "visibility audit failed"
+            )
+    export_report["review_display"] = review_png_report
+    pipeline._write_stage_json("stage10_export_report.json", export_report)
+
     try:
         output_color_manifest = build_output_color_manifest(
             work_dir=pipeline.work_dir,
@@ -2887,6 +3078,12 @@ def run_stage10_export(pipeline) -> None:
             exported_after=export_started_at,
             managed_export_report=managed_export_report,
             source_color_contract=stage10_color_report.get("contract"),
+            display_rendition_contract=(
+                dict(getattr(pipeline, "_display_rendition_contract", {}) or {})
+                if review_only_output
+                else None
+            ),
+            export_report=export_report,
         )
         pipeline._output_color_manifest = output_color_manifest
         pipeline._write_stage_json(
@@ -3034,8 +3231,6 @@ def run_stage10_export(pipeline) -> None:
         input_source_fallback_used
         or stage_denoise_fallback_used
         or export_fallback_used
-        or preserve_review_triggered
-        or stage7_forced_delivery
     )
     stage_reason_code = (
         "stage2_view_review_required"
@@ -3067,6 +3262,16 @@ def run_stage10_export(pipeline) -> None:
         else ""
     )
 
+    if preserve_review_triggered or failure_policy_reason:
+        pipeline._require_review(
+            10,
+            failure_policy_reason or "stage10_failure_policy_preserve_review",
+        )
+    if final_source_review_reason:
+        pipeline._require_review(10, final_source_review_reason)
+    if final_quality_reason_code:
+        pipeline._require_review(10, final_quality_reason_code)
+
     elapsed = pipeline.log.stage_end(stage_label)
     pipeline._record_stage(
         stage_label,
@@ -3077,6 +3282,7 @@ def run_stage10_export(pipeline) -> None:
         reason_code=stage_reason_code,
         details={
             "processing_mode": processing_mode,
+            "bright_core_with_stars_fallback": bright_core_fallback,
             "failure_action": failure_action,
             "denoise_backend_policy": denoise_backend_policy,
             "preserve_review_triggered": preserve_review_triggered,
@@ -3151,4 +3357,5 @@ def run_stage10_export(pipeline) -> None:
             "color_rebalance": color_component,
             "export": export_component,
         },
+        review_reasons=pipeline._stage_review_reasons(10),
     )

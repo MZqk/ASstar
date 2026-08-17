@@ -72,6 +72,20 @@ class ProcessingParameterPassthroughTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
+    def test_project_default_env_enables_stage5_denoise(self) -> None:
+        runtime = ProcessorRuntimeMixin()
+        runtime.cfg = PipelineConfig(denoise_enabled=False)
+        runtime._force_denoise_enabled = None
+        runtime.log = self.pipeline.log
+        runtime._sync_logger_level = lambda: None
+
+        with patch.dict(os.environ, {}, clear=True):
+            runtime._load_project_env_defaults()
+            runtime._apply_runtime_env_overrides()
+
+            self.assertEqual(os.environ["STARUN_DENOISE_ENABLE"], "1")
+            self.assertTrue(runtime.cfg.denoise_enabled)
+
     def test_stage2_user_preserve_writes_canonical_artifact(self) -> None:
         self.pipeline.cfg.stage2_processing_mode = "preserve"
 
@@ -317,7 +331,11 @@ class ProcessingParameterPassthroughTests(unittest.TestCase):
 
         runtime._enforce_stage_failure_action(8)
 
-        self.assertTrue(runtime._background_review_required)
+        self.assertEqual(
+            runtime._stage_review_reasons(8),
+            ["failure_policy_preserve_review"],
+        )
+        self.assertEqual(runtime._stage_review_reasons(3), [])
         self.assertEqual(runtime._stage_policy_events[-1]["event"], "decisive_failure")
 
         runtime.cfg.stage8_failure_action = "stop"

@@ -191,6 +191,45 @@ class AutoTuneConfigTests(unittest.TestCase):
         )
         self.assertEqual(reasons["final_saturation"], "feature_formula:final_saturation")
 
+    def test_low_noise_auto_tune_keeps_stage5_denoise_eligible(self) -> None:
+        cfg = pipeline.PipelineConfig()
+
+        tuned, result = pipeline.auto_tune_config(
+            cfg,
+            pipeline.TargetType.UNKNOWN,
+            pipeline.ImageFeatures(
+                bg_std=0.0001,
+                core_brightness_ratio=0.0,
+            ),
+        )
+
+        self.assertTrue(cfg.denoise_enabled)
+        self.assertTrue(tuned.denoise_enabled)
+        self.assertAlmostEqual(tuned.denoise_mod, 0.24)
+        self.assertNotIn(
+            "denoise_enabled",
+            {name for name, _old, _new, _reason in result.changed_params},
+        )
+
+    def test_auto_tune_preserves_explicit_denoise_disable(self) -> None:
+        cfg = pipeline.PipelineConfig(denoise_enabled=False)
+
+        tuned, result = pipeline.auto_tune_config(
+            cfg,
+            pipeline.TargetType.UNKNOWN,
+            pipeline.ImageFeatures(
+                bg_std=0.10,
+                core_brightness_ratio=0.0,
+            ),
+        )
+
+        self.assertFalse(tuned.denoise_enabled)
+        self.assertAlmostEqual(tuned.denoise_mod, 0.46)
+        self.assertNotIn(
+            "denoise_enabled",
+            {name for name, _old, _new, _reason in result.changed_params},
+        )
+
     def test_extreme_features_are_safely_clamped(self) -> None:
         tuned, result = pipeline.auto_tune_config(
             pipeline.PipelineConfig(),

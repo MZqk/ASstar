@@ -150,6 +150,9 @@ class _Stage1Probe:
         self._task_resume_checkpoint_path = None
         self.cmd_calls: list[tuple[Any, ...]] = []
 
+    def _clear_stage_reviews(self, _stage: int) -> None:
+        return None
+
     def _find_fit_files(self) -> list[Path]:
         return self.module.StarunPostProcessor._find_fit_files(self)
 

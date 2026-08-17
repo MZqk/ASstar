@@ -41,6 +41,7 @@ import sasp_runner
 import stage7_quality
 import stage7_repair
 import stage8_pixels
+import outcome
 from logging_utils import PipelineLogger
 from stage_support import (
     PluginServiceMixin,
@@ -702,11 +703,6 @@ def auto_tune_config(
         "feature_formula:bg_smooth"
     )
     set_param(
-        "denoise_enabled",
-        noise_score > 0.35,
-        "feature_formula:denoise_enabled"
-    )
-    set_param(
         "denoise_mod",
         0.24 + 0.22 * noise_score - 0.06 * core_score,
         "feature_formula:denoise_mod"
@@ -897,6 +893,7 @@ class StarunPostProcessor(
         self.log = PipelineLogger('DEBUG' if self.cfg.debug_mode else 'INFO')
         self.siril = _FatalSirilInterfaceProxy(self, s.SirilInterface())
         self.results = []
+        self._review_requirements: Dict[Tuple[int, str], Dict[str, Any]] = {}
         self.work_dir = None
         self.process_dir = None
         self.source_file = None
@@ -946,6 +943,14 @@ class StarunPostProcessor(
         self._star_separation_state: str = StarSeparationState.PENDING.value
         self._stage6_passthrough_source: Optional[str] = None
         self._stage6_starmask_borderline_review_required: bool = False
+        self._bright_core_with_stars_fallback: Dict[str, Any] = {
+            "schema": "starun.bright-core-with-stars-fallback.v1",
+            "eligible": False,
+            "accepted": False,
+            "status": "not_evaluated",
+        }
+        self._review_display_route: bool = False
+        self._display_rendition_contract: Dict[str, Any] = {}
         self._stage9_star_intensity_scale: float = 1.0
         self._stage9_star_intensity_reason: str = ""
         self._stage9_bypassed_bad_starless: bool = False
@@ -956,6 +961,7 @@ class StarunPostProcessor(
         self._stage9_output_withheld: bool = False
         self._stage9_psf_review_required: bool = False
         self._stage9_remix_formally_accepted: bool = False
+        self._stage9_star_delivery_contract_accepted: bool = False
         self._stage9_review_candidate_selected: bool = False
         self._stage9_fallback_used: bool = False
         self._stage9_fallback_reason: Optional[str] = None
@@ -1183,6 +1189,78 @@ class StarunPostProcessor(
             if self.process_dir:
                 self.cmd_with_check("cd", f'"{self.process_dir}"')
 
+    def _require_review(
+        self,
+        stage: int,
+        code: str,
+        details: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Register one review requirement under its actual owning stage."""
+
+        requirement = outcome.normalize_review_requirement(
+            {
+                "stage": int(stage),
+                "code": str(code or "").strip(),
+                "details": dict(details or {}),
+            }
+        )
+        key = (int(requirement["stage"]), str(requirement["code"]))
+        registry = getattr(self, "_review_requirements", None)
+        if not isinstance(registry, dict):
+            registry = {}
+            self._review_requirements = registry
+        registry[key] = requirement
+        # Ownership may only become known after the stage detail was emitted
+        # (for example input-state routing and final cross-stage gates).
+        for result in reversed(getattr(self, "results", []) or []):
+            match = re.match(
+                r"^阶段\s+(\d+)\s*:",
+                str(getattr(result, "name", "")).strip(),
+            )
+            if match and int(match.group(1)) == int(requirement["stage"]):
+                reasons = getattr(result, "review_reasons", None)
+                if isinstance(reasons, list) and requirement["code"] not in reasons:
+                    reasons.append(str(requirement["code"]))
+                break
+        return copy.deepcopy(requirement)
+
+    def _clear_stage_reviews(self, stage: int) -> None:
+        stage_number = int(stage)
+        registry = getattr(self, "_review_requirements", None)
+        if not isinstance(registry, dict):
+            registry = {}
+        self._review_requirements = {
+            key: value
+            for key, value in registry.items()
+            if key[0] != stage_number
+        }
+
+    def _stage_review_reasons(self, stage: int) -> List[str]:
+        stage_number = int(stage)
+        registry = getattr(self, "_review_requirements", None)
+        if not isinstance(registry, dict):
+            return []
+        return [
+            str(value["code"])
+            for key, value in registry.items()
+            if key[0] == stage_number
+        ]
+
+    def _review_requirements_payload(
+        self,
+        *,
+        through_stage: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        limit = int(through_stage) if through_stage is not None else 10
+        registry = getattr(self, "_review_requirements", None)
+        if not isinstance(registry, dict):
+            return []
+        return [
+            copy.deepcopy(value)
+            for key, value in sorted(registry.items())
+            if key[0] <= limit
+        ]
+
     def _record_stage(
         self,
         name,
@@ -1196,12 +1274,118 @@ class StarunPostProcessor(
         reason_code='',
         details=None,
         components=None,
+        review_reasons=None,
+        issues=None,
     ):
         normalized_status = str(status).strip().lower()
+        if bool(fallback_used) and normalized_status == "ok":
+            normalized_status = "degraded"
+        if normalized_status not in outcome.STAGE_STATUSES:
+            raise ValueError(f"unsupported stage status: {status!r}")
         normalized_execution = str(
             execution
             or ("skipped" if normalized_status == "skipped" else "completed")
         ).strip().lower()
+        if normalized_execution not in outcome.STAGE_EXECUTIONS:
+            raise ValueError(f"unsupported stage execution: {execution!r}")
+        stage_match = re.match(r"^阶段\s+(\d+)\s*:\s*(.*)$", str(name).strip())
+        stage_number = int(stage_match.group(1)) if stage_match else 0
+        normalized_review_reasons: List[str] = (
+            list(self._stage_review_reasons(stage_number))
+            if stage_number in range(1, 11)
+            else []
+        )
+        for raw_reason in list(review_reasons or []):
+            if isinstance(raw_reason, Mapping):
+                code = str(raw_reason.get("code") or "").strip()
+                reason_details = raw_reason.get("details")
+            else:
+                code = str(raw_reason or "").strip()
+                reason_details = None
+            if not code:
+                continue
+            if stage_number <= 0:
+                raise ValueError("review reasons require a formal Stage 1-10 label")
+            self._require_review(
+                stage_number,
+                code,
+                reason_details if isinstance(reason_details, Mapping) else None,
+            )
+            if code not in normalized_review_reasons:
+                normalized_review_reasons.append(code)
+        normalized_components = dict(components or {})
+        normalized_issues = [
+            outcome.normalize_issue(raw_issue, default_stage=stage_number)
+            for raw_issue in list(issues or [])
+            if isinstance(raw_issue, Mapping)
+        ]
+        execution_failure_components = {
+            "platesolve",
+            "deconvolution",
+            "denoise",
+            "export",
+            "input_source",
+        }
+        for component_name, raw_component in normalized_components.items():
+            if not isinstance(raw_component, Mapping) or str(
+                raw_component.get("status") or ""
+            ).strip().lower() != "failed":
+                continue
+            component_code = str(
+                raw_component.get("reason_code") or "component_failed"
+            ).strip()
+            lowered_code = component_code.lower()
+            is_execution_error = bool(
+                str(component_name) in execution_failure_components
+                or any(
+                    marker in lowered_code
+                    for marker in (
+                        "failed",
+                        "error",
+                        "exception",
+                        "execution",
+                    )
+                )
+            )
+            if not is_execution_error or any(
+                issue["component"] == str(component_name)
+                and issue["code"] == component_code
+                for issue in normalized_issues
+            ):
+                continue
+            normalized_issues.append(
+                outcome.normalize_issue(
+                    {
+                        "component": str(component_name),
+                        "severity": (
+                            "fatal" if normalized_status == "failed" else "error"
+                        ),
+                        "code": component_code,
+                        "recovered": normalized_status != "failed",
+                        "message": str(
+                            raw_component.get("message")
+                            or raw_component.get("error")
+                            or f"{component_name}: {component_code}"
+                        ),
+                    },
+                    default_stage=stage_number,
+                )
+            )
+        if normalized_status == "failed" and not any(
+            issue["severity"] == "fatal" for issue in normalized_issues
+        ):
+            normalized_issues.append(
+                outcome.normalize_issue(
+                    {
+                        "component": "stage",
+                        "severity": "fatal",
+                        "code": str(reason_code or "stage_failed"),
+                        "recovered": False,
+                        "message": str(message or reason_code or "stage failed"),
+                    },
+                    default_stage=stage_number,
+                )
+            )
         result = StageResult(
             name,
             normalized_status,
@@ -1212,19 +1396,18 @@ class StarunPostProcessor(
             upstream_passthrough=bool(upstream_passthrough),
             reason_code=str(reason_code or ""),
             details=dict(details or {}),
-            components=dict(components or {}),
+            components=normalized_components,
+            review_reasons=normalized_review_reasons,
+            issues=normalized_issues,
         )
         self.results.append(result)
-        stage_match = re.match(r"^阶段\s+(\d+)\s*:\s*(.*)$", str(name).strip())
         if stage_match:
-            stage_number = int(stage_match.group(1))
             stage_title = stage_match.group(2).strip()
             try:
                 duration_seconds = max(0.0, float(duration))
             except (TypeError, ValueError):
                 duration_seconds = 0.0
             event_status = {
-                "ok_with_fallback": "degraded",
                 "ok_skipped_optional": "skipped",
                 # Legacy GUI versions do not know the neutral passthrough state.
                 "ok_safe_passthrough": "ok",
@@ -1237,7 +1420,7 @@ class StarunPostProcessor(
                 f"title={stage_title}"
             )
             stage_detail = {
-                "schema": "starun.pipeline-stage-detail.v1",
+                "schema": outcome.PIPELINE_STAGE_DETAIL_SCHEMA_V2,
                 "stage": stage_number,
                 "title": stage_title,
                 "status": result.status,
@@ -1246,6 +1429,9 @@ class StarunPostProcessor(
                 "fallback_used": result.fallback_used,
                 "upstream_passthrough": result.upstream_passthrough,
                 "reason_code": result.reason_code or None,
+                "review_required": bool(result.review_reasons),
+                "review_reasons": list(result.review_reasons),
+                "issues": list(result.issues),
                 "duration_seconds": duration_seconds,
                 "details": result.details,
                 "components": result.components,
@@ -1263,7 +1449,7 @@ class StarunPostProcessor(
                 self._publish_stage_preview(
                     stage_number,
                     stage_title,
-                    str(status).strip().lower(),
+                    result.status,
                 )
             except Exception as exc:
                 # Preview is an observer-only UI feature. No unexpected decode,
@@ -1325,11 +1511,87 @@ class StarunPostProcessor(
         stage_number: int,
     ) -> Optional[Dict[str, Any]]:
         """Freeze upstream meaning that pixel hashes alone cannot recover."""
+        if stage_number == 2:
+            crop_report = copy.deepcopy(
+                getattr(self, "stage2_crop_report", {}) or {}
+            )
+            original = crop_report.get("original_shape") or {}
+            final = (
+                crop_report.get("final_shape")
+                or crop_report.get("current_shape")
+                or {}
+            )
+            cumulative_crop = crop_report.get("total_crop") or {}
+            field_rotation = crop_report.get("field_rotation") or {}
+            passes = field_rotation.get("passes") or []
+            if isinstance(passes, list) and passes:
+                actual_passes = sum(
+                    1
+                    for item in passes
+                    if isinstance(item, Mapping)
+                    and isinstance(item.get("applied_crop"), Mapping)
+                    and not bool(item.get("rolled_back", False))
+                )
+            else:
+                actual_passes = int(
+                    field_rotation.get("actual_passes", 0)
+                    if isinstance(field_rotation, Mapping)
+                    else 0
+                )
+            residual = field_rotation.get("residual")
+            if not isinstance(residual, Mapping):
+                residual = (
+                    field_rotation
+                    if isinstance(field_rotation, Mapping)
+                    else {"accepted": False, "reason": "not_run"}
+                )
+            original_area = int(original.get("width", 0) or 0) * int(
+                original.get("height", 0) or 0
+            )
+            final_area = int(final.get("width", 0) or 0) * int(
+                final.get("height", 0) or 0
+            )
+            return {
+                "schema": task_workspace.RESUME_SEMANTIC_SCHEMA,
+                "checkpoint_stage": 2,
+                "review_requirements": self._review_requirements_payload(
+                    through_stage=2
+                ),
+                "stage2_crop": {
+                    "original_dimensions": copy.deepcopy(dict(original)),
+                    "final_dimensions": copy.deepcopy(dict(final)),
+                    "cumulative_crop": copy.deepcopy(dict(cumulative_crop)),
+                    "retained_area_ratio": (
+                        float(final_area / original_area)
+                        if original_area > 0
+                        else None
+                    ),
+                    "field_rotation_passes": min(
+                        2,
+                        actual_passes,
+                    ),
+                    "field_rotation_max_passes": min(
+                        2,
+                        max(
+                            1,
+                            int(
+                                field_rotation.get("max_passes", 2)
+                                if isinstance(field_rotation, Mapping)
+                                else 2
+                            ),
+                        ),
+                    ),
+                    "final_residual_detection": copy.deepcopy(dict(residual)),
+                },
+            }
         if stage_number != 5:
             return None
         return {
             "schema": task_workspace.RESUME_SEMANTIC_SCHEMA,
             "checkpoint_stage": 5,
+            "review_requirements": self._review_requirements_payload(
+                through_stage=5
+            ),
             "channel_semantics": str(
                 getattr(self, "_channel_semantics", "unknown") or "unknown"
             ),
@@ -1351,17 +1613,6 @@ class StarunPostProcessor(
             "stage5_star_reference_report": copy.deepcopy(
                 getattr(self, "_stage5_star_reference_report", {}) or {}
             ),
-            "upstream_review": {
-                "stage2_view_review_required": bool(
-                    getattr(self, "_stage2_view_review_required", False)
-                ),
-                "background_review_required": bool(
-                    getattr(self, "_background_review_required", False)
-                ),
-                "color_review_required": bool(
-                    getattr(self, "_stage4_color_review_required", False)
-                ),
-            },
         }
 
     def _stage_preview_candidates(self, stage: int) -> List[Path]:
@@ -1429,6 +1680,13 @@ class StarunPostProcessor(
                 image_data,
                 preview_path,
                 apply_stretch=stage <= 6,
+                display_contract=(
+                    dict(self._display_rendition_contract)
+                    if stage >= 7
+                    and bool(self._review_display_route)
+                    and isinstance(self._display_rendition_contract, dict)
+                    else None
+                ),
             )
             self._emit_preview_event(stage, title, "ready", str(preview_path))
         except (
@@ -1597,6 +1855,14 @@ class StarunPostProcessor(
     ) -> None:
         """Keep an unsafe/unknown input intact and prepare Stage 10 review export."""
         self._input_state_review_route = True
+        self._require_review(
+            1,
+            "input_state_review_required",
+            {
+                "state": str(profile.state.value),
+                "confidence": float(profile.confidence),
+            },
+        )
         self._skip_stage10_color_adjustments = True
         self.cfg.force_review_only_output = True
         self._star_separation_state = StarSeparationState.REJECTED.value
@@ -1933,28 +2199,10 @@ class StarunPostProcessor(
             if stage_match:
                 problem_stages.add(int(stage_match.group(1)))
 
-        if bool(getattr(self, "_stage2_view_review_required", False)):
-            problem_stages.add(2)
-        if bool(getattr(self, "_background_review_required", False)):
-            problem_stages.add(3)
-        if bool(getattr(self, "_stage4_color_review_required", False)):
-            problem_stages.add(4)
-        if bool(getattr(self, "_stage7_background_color_review_required", False)):
-            problem_stages.add(7)
-        if (
-            bool(getattr(self, "_stage9_stars_required", False))
-            and not bool(getattr(self, "_stage9_stars_applied", False))
-        ):
-            problem_stages.add(9)
-        if bool(getattr(self, "_stage9_psf_review_required", False)):
-            problem_stages.add(9)
-        if bool(getattr(self, "_stage9_review_candidate_selected", False)):
-            problem_stages.add(9)
-        if bool(
-            getattr(self, "_final_output_review_only", False)
-            or getattr(self, "_input_state_review_route", False)
-        ):
-            problem_stages.add(10)
+        problem_stages.update(
+            int(requirement["stage"])
+            for requirement in self._review_requirements_payload()
+        )
 
         if pipeline_status == "success":
             return set()
@@ -2378,6 +2626,14 @@ class StarunPostProcessor(
             self._star_separation_state = StarSeparationState.PENDING.value
             self._stage6_passthrough_source = None
             self._stage6_starmask_borderline_review_required = False
+            self._bright_core_with_stars_fallback = {
+                "schema": "starun.bright-core-with-stars-fallback.v1",
+                "eligible": False,
+                "accepted": False,
+                "status": "not_evaluated",
+            }
+            self._review_display_route = False
+            self._display_rendition_contract = {}
             self._stage7_before_stage6 = True
             self._stage7_starless_first_source = ""
             self._stage9_star_intensity_scale = 1.0
@@ -2390,6 +2646,7 @@ class StarunPostProcessor(
             self._stage9_output_withheld = False
             self._stage9_psf_review_required = False
             self._stage9_remix_formally_accepted = False
+            self._stage9_star_delivery_contract_accepted = False
             self._stage9_review_candidate_selected = False
             self._stage9_final_source = ""
             self._last_syqon_exchange_report = {}
@@ -2398,6 +2655,7 @@ class StarunPostProcessor(
             self._saturation_boost_applied = 0.0
             self._color_adjustment_ledger = []
             self.results = []
+            self._review_requirements = {}
             self._stage_policy_events = []
             self.input_profile = {}
             self._trusted_input_provenance = None
@@ -2503,6 +2761,7 @@ class StarunPostProcessor(
                         ),
                     )
             elif self.input_mode == INPUT_MODE_STAGE2_CORRECTED_RESUME:
+                self._apply_trusted_resume_semantics()
                 self._prepare_stage2_corrected_resume_input()
                 input_profile = self._resolve_input_profile()
                 self._auto_tune_for_current_input()
@@ -2641,44 +2900,34 @@ class StarunPostProcessor(
 
             self.log.info(f"输出目录: {self.work_dir}")
             self.log.info("生成文件:")
-            base_name = (self.main_output_basename_template or RESULT_BASENAME_TEMPLATE)
-            fit_base_name = getattr(
-                self,
-                "main_output_fit_basename_template",
-                base_name + "_final",
-            )
-            self.log.info(f"  - {base_name}.tif  (16-bit Astro-TIFF)")
-            self.log.info(f"  - {base_name}.png  (Preview PNG)")
-            self.log.info(f"  - {fit_base_name}.fit (FITS archive)")
-            managed_report = getattr(self, "_output_color_manifest", {}) or {}
-            if bool(
-                (managed_report.get("summary") or {}).get(
-                    "managed_export_ready",
-                    False,
-                )
+            output_manifest = getattr(self, "_output_color_manifest", {}) or {}
+            actual_outputs = [
+                item
+                for item in (output_manifest.get("artifacts") or [])
+                if bool(item.get("exists", False))
+                and Path(str(item.get("path") or "")).is_file()
+            ]
+            logged_paths = set()
+            for artifact in actual_outputs:
+                path = Path(str(artifact["path"]))
+                if path in logged_paths:
+                    continue
+                logged_paths.add(path)
+                self.log.info(f"  - {path.name} ({artifact.get('format', 'file')})")
+            if (
+                self.linear_intermediate_path
+                and Path(self.linear_intermediate_path).is_file()
+                and Path(self.linear_intermediate_path) not in logged_paths
             ):
                 self.log.info(
-                    f"  - {base_name}_display_srgb.png "
-                    "(16-bit sRGB managed display)"
+                    f"  - {Path(self.linear_intermediate_path).name} "
+                    "(拉伸前线性中间文件)"
                 )
-                self.log.info(
-                    f"  - {base_name}_edit_srgb.tif "
-                    "(16-bit ICC managed editable)"
-                )
-            fallback_line = "result_processed.tif / result_processed.png / result_final.fit"
-            if bool(getattr(self, "_final_output_review_only", False)):
-                fallback_line = (
-                    f"{base_name}.tif / {base_name}.png / {fit_base_name}.fit "
-                    "(review-only)"
-                )
-            elif self._stage1_input_mode == "linear_resume":
-                fallback_line = (
-                    "result_processed_linear.tif / result_processed_linear.png / "
-                    "result_final_linear.fit"
-                )
-            self.log.info(f"  - 导出失败时回退名: {fallback_line}")
-            if self.linear_intermediate_path:
-                self.log.info("  - result_linear.fit (拉伸前线性中间文件)")
+            if not actual_outputs and not (
+                self.linear_intermediate_path
+                and Path(self.linear_intermediate_path).is_file()
+            ):
+                self.log.warn("  - 本轮没有成功发布可列出的输出文件")
         except SirilNativeProcessTerminated as e:
             self._preserve_checkpoint_evidence(
                 f"Siril native process terminated: {e}"

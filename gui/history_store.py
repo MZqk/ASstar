@@ -10,10 +10,10 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Collection, Mapping
 
 try:
-    from pipeline import run_manifest
+    from pipeline import outcome, run_manifest
     from pipeline.task_workspace import (
         RUN_MANIFEST_NAME,
         RUN_MANIFEST_SCHEMA,
@@ -28,7 +28,7 @@ except ImportError:  # Support direct execution from the gui directory.
     repo_root = Path(__file__).resolve().parent.parent
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
-    from pipeline import run_manifest  # type: ignore[no-redef]
+    from pipeline import outcome, run_manifest  # type: ignore[no-redef]
     from pipeline.task_workspace import (  # type: ignore[no-redef]
         RUN_MANIFEST_NAME,
         RUN_MANIFEST_SCHEMA,
@@ -68,8 +68,8 @@ STATUS_LABELS = {
     STATUS_PREPARING: "正在准备",
     STATUS_RUNNING: "运行中",
     STATUS_SUCCESS: "成功",
-    STATUS_PARTIAL_SUCCESS: "部分成功",
-    STATUS_REVIEW_REQUIRED: "需复核",
+    STATUS_PARTIAL_SUCCESS: "降级完成",
+    STATUS_REVIEW_REQUIRED: "需要复核",
     STATUS_FAILED: "失败",
     STATUS_STOPPED: "已中止",
     STATUS_INTERRUPTED: "异常中断",
@@ -166,9 +166,13 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
-def _verified_signed_payload(path: Path, schema: str) -> dict[str, Any]:
+def _verified_signed_payload(
+    path: Path,
+    schema: str | Collection[str],
+) -> dict[str, Any]:
     payload = run_manifest.load_json(path)
-    if payload is None or str(payload.get("schema") or "") != schema:
+    supported = {schema} if isinstance(schema, str) else set(schema)
+    if payload is None or str(payload.get("schema") or "") not in supported:
         raise HistoryStoreError(f"清单缺失或 schema 不受支持：{path}")
     claimed_hash = str(payload.get("manifest_hash") or "")
     unsigned = dict(payload)
@@ -212,7 +216,43 @@ def load_verified_pipeline_result(run_root: Path) -> dict[str, Any] | None:
     path = run_root.resolve() / "pipeline-result.json"
     if not path.is_file():
         return None
-    return _verified_signed_payload(path, "starun.pipeline-result.v1")
+    payload = _verified_signed_payload(
+        path,
+        outcome.SUPPORTED_PIPELINE_RESULT_SCHEMAS,
+    )
+    try:
+        return outcome.normalize_pipeline_result(payload)
+    except ValueError as error:
+        raise HistoryStoreError(f"流水线结果无法归一化：{error}") from error
+
+
+def load_normalized_run_state(run_root: Path) -> dict[str, Any] | None:
+    """Load v1/v2 run state; v2 and signed v1 records fail closed on hash."""
+
+    path = run_root.resolve() / "run-state.json"
+    if not path.is_file():
+        return None
+    payload = run_manifest.load_json(path)
+    if payload is None or str(payload.get("schema") or "") not in (
+        outcome.SUPPORTED_RUN_STATE_SCHEMAS
+    ):
+        raise HistoryStoreError(f"运行状态缺失或 schema 不受支持：{path}")
+    claimed_hash = str(payload.get("manifest_hash") or "")
+    if claimed_hash:
+        unsigned = dict(payload)
+        unsigned.pop("manifest_hash", None)
+        if claimed_hash != run_manifest.canonical_payload_hash(unsigned):
+            raise HistoryStoreError(f"运行状态哈希无效：{path}")
+    elif str(payload.get("schema") or "") == outcome.RUN_STATE_SCHEMA_V2:
+        raise HistoryStoreError(f"v2 运行状态缺少哈希：{path}")
+    try:
+        normalized = outcome.normalize_run_state(payload)
+    except ValueError as error:
+        raise HistoryStoreError(f"运行状态无法归一化：{error}") from error
+    normalized["integrity_status"] = (
+        "verified" if claimed_hash else "legacy_unsigned"
+    )
+    return normalized
 
 
 def verified_result_files(
@@ -599,6 +639,7 @@ __all__ = [
     "default_history_path",
     "display_name_from_source",
     "history_task_key",
+    "load_normalized_run_state",
     "load_verified_pipeline_result",
     "utc_timestamp",
     "validate_deletable_task_root",

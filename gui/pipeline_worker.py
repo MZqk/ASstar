@@ -232,7 +232,7 @@ class PipelineWorker(QThread):
         self._proc: subprocess.Popen[str] | None = None
         self._proc_pgid: int | None = None
         self._active_mode = "python"
-        self._run_had_errors = False
+        self._run_had_fatal_errors = False
         self._last_output_ts = 0.0
         self._pyscript_seen_at: float | None = None
         self._pipeline_output_seen = False
@@ -583,7 +583,7 @@ class PipelineWorker(QThread):
             "failed to execute python script",
         )
         if any(marker in lowered for marker in error_markers):
-            self._run_had_errors = True
+            self._run_had_fatal_errors = True
         if (
             "[siril_native_process_terminated]" in lowered
             or "sirilnativeprocessterminated" in lowered
@@ -596,7 +596,7 @@ class PipelineWorker(QThread):
             self._python_env_issue = True
             # Treat Python environment problems as hard pipeline errors even when
             # siril-cli exits 0, so caller can retry/reset/fallback correctly.
-            self._run_had_errors = True
+            self._run_had_fatal_errors = True
         if (
             ("running command: pyscript" in lowered or "running command pyscript" in lowered)
             and self._pyscript_seen_at is None
@@ -1503,7 +1503,7 @@ class PipelineWorker(QThread):
         return "Completed"
 
     def _run_once(self, siril_cli: Path, run_ssf: Path, run_ini: Path) -> tuple[bool, int]:
-        self._run_had_errors = False
+        self._run_had_fatal_errors = False
         self._python_env_issue = False
         self._pyscript_seen_at = None
         self._pipeline_output_seen = False
@@ -1593,12 +1593,12 @@ class PipelineWorker(QThread):
             self._proc_pgid = self._proc.pid
         except Exception as e:
             self._append_event(f"启动进程失败：{e}")
-            self._run_had_errors = True
+            self._run_had_fatal_errors = True
             return False, -1
 
         if self._proc.stdout is None:
             self._append_event("无法捕获进程输出。")
-            self._run_had_errors = True
+            self._run_had_fatal_errors = True
             return False, -1
 
         out_queue: queue.Queue[str | None] = queue.Queue()
@@ -1642,7 +1642,7 @@ class PipelineWorker(QThread):
                 and now - self._pyscript_seen_at > bootstrap_timeout_sec
             ):
                 bootstrap_timeout = True
-                self._run_had_errors = True
+                self._run_had_fatal_errors = True
                 self._python_env_issue = True
                 self._append_event(
                     "pyscript 启动超时"
@@ -1668,9 +1668,10 @@ class PipelineWorker(QThread):
                 and watchdog_reason is not None
             ):
                 watchdog_timeout, idle_sec = watchdog_reason
-                self._run_had_errors = True
                 if watchdog_timeout == "export_tail":
                     self._export_tail_timeout_recovered = True
+                else:
+                    self._run_had_fatal_errors = True
                 self._append_watchdog_diagnostics(
                     reason=watchdog_timeout,
                     idle_sec=idle_sec,
@@ -1722,13 +1723,17 @@ class PipelineWorker(QThread):
             and not self._pipeline_output_seen
             and not self._stop_event.is_set()
         ):
-            if not self._run_had_errors:
+            if not self._run_had_fatal_errors:
                 self._append_event(
                     "pyscript 启动后未检测到流水线阶段输出，本次运行按失败处理。"
                 )
-            self._run_had_errors = True
+            self._run_had_fatal_errors = True
 
-        success = exit_code == 0 and not self._run_had_errors and not self._stop_event.is_set()
+        success = (
+            exit_code == 0
+            and not self._run_had_fatal_errors
+            and not self._stop_event.is_set()
+        )
         return success, exit_code
 
     def run(self) -> None:
@@ -1785,7 +1790,7 @@ class PipelineWorker(QThread):
 
         except Exception as e:
             self._append_event(f"Worker 内部错误：{e}")
-            self._run_had_errors = True
+            self._run_had_fatal_errors = True
             run_status = "Failed"
             exit_code = -1
         finally:
@@ -1793,5 +1798,12 @@ class PipelineWorker(QThread):
 
         if self._stop_event.is_set() and run_status != "Stopped":
             run_status = "Stopped"
+        if run_status == "Failed":
+            self._run_had_fatal_errors = True
 
-        self.done.emit(run_status, exit_code, self._run_had_errors, cli_used)
+        self.done.emit(
+            run_status,
+            exit_code,
+            self._run_had_fatal_errors,
+            cli_used,
+        )

@@ -341,6 +341,56 @@ class FakeLogger:
         self.events.append(("debug", msg))
 
 
+class ReviewRegistryTestDouble:
+    def _review_registry(self) -> dict[tuple[int, str], dict[str, Any]]:
+        registry = getattr(self, "_review_requirements", None)
+        if not isinstance(registry, dict):
+            registry = {}
+            self._review_requirements = registry
+        return registry
+
+    def _clear_stage_reviews(self, stage: int) -> None:
+        stage = int(stage)
+        self._review_requirements = {
+            key: value
+            for key, value in self._review_registry().items()
+            if key[0] != stage
+        }
+
+    def _require_review(
+        self,
+        stage: int,
+        code: str,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        requirement = {
+            "stage": int(stage),
+            "code": str(code),
+            "details": dict(details or {}),
+        }
+        self._review_registry()[(int(stage), str(code))] = requirement
+        return requirement
+
+    def _stage_review_reasons(self, stage: int) -> list[str]:
+        return [
+            value["code"]
+            for key, value in self._review_registry().items()
+            if key[0] == int(stage)
+        ]
+
+    def _review_requirements_payload(
+        self,
+        *,
+        through_stage: int | None = None,
+    ) -> list[dict[str, Any]]:
+        limit = int(through_stage) if through_stage is not None else 10
+        return [
+            dict(value)
+            for key, value in sorted(self._review_registry().items())
+            if key[0] <= limit
+        ]
+
+
 class Stage3SampleSiril:
     """Small Siril API double with auditable background-sample state."""
 
@@ -385,7 +435,7 @@ class Stage3SampleSiril:
         return list(self.samples)
 
 
-class Stage3TransactionFake:
+class Stage3TransactionFake(ReviewRegistryTestDouble):
     """Minimal buffer model for Stage 3 rollback regression tests."""
 
     def __init__(
@@ -504,7 +554,7 @@ class Stage3CompoundSiril:
         return list(self.samples)
 
 
-class Stage3CompoundFake:
+class Stage3CompoundFake(ReviewRegistryTestDouble):
     """Image-aware Stage 3 double for Polynomial→residual-RBF transactions."""
 
     def __init__(
@@ -709,7 +759,7 @@ class Stage3CompoundFake:
         self.result_metadata.append(dict(metadata))
 
 
-class FakeProcessor:
+class FakeProcessor(ReviewRegistryTestDouble):
     def __init__(self, module: Any, work_dir: Path) -> None:
         self.module = module
         self.log = FakeLogger()
@@ -1280,7 +1330,31 @@ class FakeProcessor:
 
     def _apply_previous_stage_star_remix(self, source_stem: str, starmask_name: str, intensity: float):
         self.previous_stage_remix_calls.append((source_stem, starmask_name, intensity))
-        return not self.fail_previous_stage_remix
+        if self.fail_previous_stage_remix:
+            return False
+        if bool(getattr(self, "_stage9_minimal_fallback_active", False)):
+            base = self.saved_image_pixels.get(source_stem)
+            if base is None:
+                base = self.image_pixels.copy()
+            support = np.zeros(base.shape[-2:], dtype=bool)
+            center_y = base.shape[-2] // 2
+            center_x = base.shape[-1] // 2
+            support[
+                max(0, center_y - 2) : center_y + 3,
+                max(0, center_x - 2) : center_x + 3,
+            ] = True
+            star_layer = np.zeros_like(base, dtype=np.float32)
+            star_layer[..., support] = 0.04
+            self.image_pixels = np.clip(
+                base + (1.0 - base) * star_layer * float(intensity),
+                0.0,
+                1.0,
+            ).astype(np.float32)
+            self._stage9_last_star_layer = star_layer
+            self._stage9_last_star_overlay_mask = support
+            self._stage9_last_weak_overlay_mask = support.copy()
+            self._stage9_last_bright_overlay_mask = np.zeros_like(support)
+        return True
 
     def _stage9_bad_starless_reason(self) -> str:
         return ""

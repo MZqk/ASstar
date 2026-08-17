@@ -623,6 +623,145 @@ class PipelinePluginFallbackStage6SeparationTests(PipelinePluginFallbackTestBase
         self.assertEqual(handoff["attempt_id"], "attempt-1")
         self.assertEqual(handoff["pair_id"], "pair-1")
 
+    def test_stage6_bright_core_hard_failure_is_never_retained(self):
+        processor = pipeline_module.StarunPostProcessor()
+        quality = {
+            "status": "poor",
+            "derived": {
+                "residual_star_score": 0.1,
+                "halo_residue_score": 0.1,
+                "starless_noise_gain": 1.0,
+            },
+            "bright_core_integrity": {
+                "applicable": True,
+                "status": "hard_failed",
+                "hard_failed": True,
+                "trigger_reasons": ["closure_abs_error_p99"],
+            },
+        }
+
+        failure = (
+            stage6_star_separation_module._stage6_quality_hard_failure_summary(
+                processor,
+                quality,
+            )
+        )
+
+        self.assertTrue(failure["destructive_core_failure"])
+        self.assertIn("BRIGHT_CORE_INTEGRITY", failure["failure_codes"])
+        self.assertFalse(
+            stage6_star_separation_module._stage6_can_retain_hard_failed_pair(
+                failure,
+                pair_valid=True,
+            )
+        )
+
+    def test_stage6_failed_bright_core_retry_disables_legacy_retention(self):
+        failure = {
+            "hard_failed": True,
+            "destructive_core_failure": False,
+        }
+
+        self.assertFalse(
+            stage6_star_separation_module._stage6_can_retain_hard_failed_pair(
+                failure,
+                pair_valid=True,
+                bright_core_retry_terminal_failure=True,
+            )
+        )
+
+    def test_stage6_bright_core_retry_budget_is_exactly_one(self):
+        quality = {
+            "status": "poor",
+            "bright_core_integrity": {
+                "applicable": True,
+                "hard_failed": True,
+                "gates": {
+                    "closure_abs_error_p99": {"hard_failed": True},
+                },
+            },
+        }
+
+        plan = stage6_star_separation_module._stage6_bright_core_retry_plan(
+            quality,
+            retry_max=5,
+            syqon_available=True,
+        )
+
+        self.assertTrue(plan["should_attempt"])
+        self.assertEqual(plan["attempt_limit"], 1)
+        self.assertEqual(plan["configured_retry_max"], 5)
+
+    def test_stage6_bright_core_retry_max_zero_disables_recovery(self):
+        quality = {
+            "status": "poor",
+            "bright_core_integrity": {
+                "applicable": True,
+                "hard_failed": True,
+                "gates": {
+                    "closure_abs_error_p99": {"hard_failed": True},
+                },
+            },
+        }
+
+        plan = stage6_star_separation_module._stage6_bright_core_retry_plan(
+            quality,
+            retry_max=0,
+            syqon_available=True,
+        )
+
+        self.assertFalse(plan["should_attempt"])
+        self.assertEqual(plan["attempt_limit"], 0)
+        self.assertEqual(plan["status"], "disabled")
+
+    def test_stage6_bright_core_missing_roi_is_rejected_without_retry(self):
+        quality = {
+            "status": "poor",
+            "bright_core_integrity": {
+                "applicable": True,
+                "hard_failed": True,
+                "trigger_reasons": ["roi_support_insufficient"],
+                "gates": {},
+            },
+        }
+
+        plan = stage6_star_separation_module._stage6_bright_core_retry_plan(
+            quality,
+            retry_max=1,
+            syqon_available=True,
+        )
+
+        self.assertFalse(plan["should_attempt"])
+        self.assertFalse(plan["recoverable_artifact"])
+        self.assertEqual(plan["status"], "direct_reject")
+
+    def test_stage6_bright_core_recovery_requires_all_gates_to_pass(self):
+        safe = {
+            "status": "ok",
+            "bright_core_integrity": {
+                "applicable": True,
+                "hard_failed": False,
+            },
+        }
+        ordinary_gate_failed = copy.deepcopy(safe)
+        ordinary_gate_failed["status"] = "poor"
+        core_gate_failed = copy.deepcopy(safe)
+        core_gate_failed["bright_core_integrity"]["hard_failed"] = True
+
+        self.assertTrue(
+            stage6_star_separation_module._stage6_bright_core_retry_passed(safe)
+        )
+        self.assertFalse(
+            stage6_star_separation_module._stage6_bright_core_retry_passed(
+                ordinary_gate_failed
+            )
+        )
+        self.assertFalse(
+            stage6_star_separation_module._stage6_bright_core_retry_passed(
+                core_gate_failed
+            )
+        )
+
     def test_stage6_quality_over_two_x_is_retained_limited_when_contract_valid(self):
         processor = pipeline_module.StarunPostProcessor()
         processor._active_target_type = lambda: "generic_low_snr_safe"
@@ -1031,6 +1170,7 @@ class PipelinePluginFallbackStage6SeparationTests(PipelinePluginFallbackTestBase
         )
         processor._selected_syqon_pair_id = "invalid-pair"
         processor._selected_syqon_attempt_id = "raw-attempt"
+        processor._stage6_pair_handoff = {"pair_id": "invalid-pair"}
         for name in ("sasp_starless_input.fit", "sasp_starmask_input.fit"):
             (processor.work_dir / name).write_bytes(name.encode("utf-8"))
 
@@ -1045,6 +1185,7 @@ class PipelinePluginFallbackStage6SeparationTests(PipelinePluginFallbackTestBase
         self.assertFalse((processor.process_dir / "stage6_syqon_selected.json").exists())
         self.assertIsNone(processor._selected_syqon_pair_id)
         self.assertIsNone(processor._selected_syqon_attempt_id)
+        self.assertIsNone(processor._stage6_pair_handoff)
         self.assertFalse((processor.work_dir / "sasp_starless_input.fit").exists())
         self.assertFalse((processor.work_dir / "sasp_starmask_input.fit").exists())
 

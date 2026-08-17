@@ -521,6 +521,7 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
     """
     stage_label = PipelineStage.NEBULA_ENHANCEMENT.label
     pipeline.log.stage_start(stage_label)
+    pipeline._clear_stage_reviews(8)
     status = 'ok'
     messages: List[str] = []
     failure_action = str(
@@ -664,7 +665,7 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                 source="input_contract",
             )
         if failure_action == "preserve_review" and not target_bypass_stage7_rejected:
-            pipeline._background_review_required = True
+            pipeline._require_review(8, review_reason_code)
         pipeline._record_stage(
             stage_label,
             decisive_status,
@@ -673,6 +674,7 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
             execution="safe_passthrough",
             reason_code=review_reason_code,
             details={"stage8_handoff": handoff},
+            review_reasons=pipeline._stage_review_reasons(8),
         )
         return
 
@@ -1113,7 +1115,10 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                             source="input_guard",
                         )
                     if failure_action == "preserve_review":
-                        pipeline._background_review_required = True
+                        pipeline._require_review(
+                            8,
+                            str(handoff.get("reason_code") or "stage8_input_guard_skip"),
+                        )
                 pipeline._record_stage(
                     stage_label,
                     record_status,
@@ -1125,6 +1130,7 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                         "reason_text": str(handoff.get("reason_text") or ""),
                         "stage8_handoff": handoff,
                     },
+                    review_reasons=pipeline._stage_review_reasons(8),
                 )
                 return
             stage8_limited_mode = (
@@ -1547,7 +1553,7 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                                 source="quality_gate",
                             )
                         if failure_action == "preserve_review":
-                            pipeline._background_review_required = True
+                            pipeline._require_review(8, "stage8_quality_gate_failed")
                             status = "degraded"
                         elif failure_action == "stop":
                             status = "failed"
@@ -1622,7 +1628,9 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                                 source="quality_gate",
                             )
                         if failure_action == "preserve_review":
-                            pipeline._background_review_required = True
+                            pipeline._require_review(
+                                8, "stage8_limited_quality_gate_failed"
+                            )
                             status = "degraded"
                         elif failure_action == "stop":
                             status = "failed"
@@ -1706,7 +1714,9 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                                 source="quality_gate",
                             )
                         if failure_action == "preserve_review":
-                            pipeline._background_review_required = True
+                            pipeline._require_review(
+                                8, "stage8_enhancement_quality_gate_failed"
+                            )
                             status = "degraded"
                         elif failure_action == "stop":
                             status = "failed"
@@ -2001,4 +2011,5 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
             "failure_action": failure_action,
             "dualband_palette": stage8_palette_report or None,
         },
+        review_reasons=pipeline._stage_review_reasons(8),
     )

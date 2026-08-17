@@ -27,17 +27,14 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
         self.assertGreater(metrics["chroma_noise_score"], 0.34)
 
     def test_pipeline_status_uncalibrated_background_cast_is_review_required(self):
-        probe = SimpleNamespace(
-            results=[],
-            _stage4_color_review_required=False,
-            _stage7_background_color_review_required=True,
-            _stage9_stars_required=False,
-            _stage9_stars_applied=False,
+        probe = pipeline_module.StarunPostProcessor()
+        probe.results = []
+        probe._require_review(
+            7,
+            "uncalibrated_background_color_review_required",
         )
 
-        status = pipeline_module.StarunPostProcessor._pipeline_result_status(
-            probe
-        )
+        status = probe._pipeline_result_status()
 
         self.assertEqual(status, "review_required")
 
@@ -436,7 +433,7 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
     def test_stage3_theoretical_chain_falls_back_until_candidate_is_sufficient(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
 
-        class Stage3Fake:
+        class Stage3Fake(ReviewRegistryTestDouble):
             def __init__(self) -> None:
                 self.log = FakeLogger()
                 self.cfg = SimpleNamespace(
@@ -1247,7 +1244,7 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
     def test_stage3_autobge_success_without_image_change_is_rejected(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
 
-        class Stage3Fake:
+        class Stage3Fake(ReviewRegistryTestDouble):
             def __init__(self) -> None:
                 self.log = FakeLogger()
                 self.fingerprints = iter(("unchanged", "unchanged"))
@@ -1292,7 +1289,7 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
     def test_stage3_evaluates_all_builtin_candidates_before_selecting(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
 
-        class Stage3Fake:
+        class Stage3Fake(ReviewRegistryTestDouble):
             def __init__(self) -> None:
                 self.log = FakeLogger()
                 self.cfg = SimpleNamespace(workflow_plugin_probe_enabled=False)
@@ -1407,7 +1404,7 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
     def test_stage3_large_emission_nebula_tries_poly_before_rbf(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
 
-        class Stage3Fake:
+        class Stage3Fake(ReviewRegistryTestDouble):
             def __init__(self) -> None:
                 self.log = FakeLogger()
                 self.cfg = SimpleNamespace(

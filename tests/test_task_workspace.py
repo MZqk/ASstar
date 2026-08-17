@@ -91,6 +91,36 @@ class TaskWorkspaceTests(unittest.TestCase):
             "upstream_review": {},
         }
 
+    @staticmethod
+    def _stage2_semantic_context() -> dict[str, object]:
+        return {
+            "schema": "starun.resume-semantics.v2",
+            "checkpoint_stage": 2,
+            "review_requirements": [],
+            "stage2_crop": {
+                "original_dimensions": {"width": 1920, "height": 1080},
+                "final_dimensions": {"width": 1920, "height": 1080},
+                "cumulative_crop": {
+                    "left": 0,
+                    "top": 0,
+                    "right": 0,
+                    "bottom": 0,
+                },
+                "field_rotation_passes": 0,
+                "final_residual_detection": {
+                    "accepted": False,
+                    "reason": "not_run",
+                },
+            },
+        }
+
+    def _semantic_context_for_stage(self, stage_number: int):
+        if stage_number == 2:
+            return self._stage2_semantic_context()
+        if stage_number == 5:
+            return self._semantic_context()
+        return None
+
     def _write_checkpoints(self, workspace, fingerprints) -> dict[str, object]:
         records = {}
         for stage_number in FORMAL_RESUME_STAGES:
@@ -106,11 +136,9 @@ class TaskWorkspaceTests(unittest.TestCase):
                 "state": "linear",
                 "run_manifest_hash": "run-manifest-hash",
                 "config_fingerprint": fingerprints[key]["fingerprint"],
-                "semantic_context": (
-                    self._semantic_context() if stage_number == 5 else None
-                ),
+                "semantic_context": self._semantic_context_for_stage(stage_number),
                 "semantic_context_status": (
-                    "verified" if stage_number == 5 else "not_applicable"
+                    "verified" if stage_number in {2, 5} else "not_applicable"
                 ),
             }
         manifest = build_checkpoint_manifest(
@@ -220,9 +248,7 @@ class TaskWorkspaceTests(unittest.TestCase):
                     run_manifest_path=run.manifest_path,
                     stage_number=stage_number,
                     artifact_path=artifact,
-                    semantic_context=(
-                        self._semantic_context() if stage_number == 5 else None
-                    ),
+                    semantic_context=self._semantic_context_for_stage(stage_number),
                 )
 
             inspection = inspect_task_workspace(
@@ -256,9 +282,7 @@ class TaskWorkspaceTests(unittest.TestCase):
                     run_manifest_path=first_run.manifest_path,
                     stage_number=stage_number,
                     artifact_path=artifact,
-                    semantic_context=(
-                        self._semantic_context() if stage_number == 5 else None
-                    ),
+                    semantic_context=self._semantic_context_for_stage(stage_number),
                 )
 
             changed = task_plan.build_resume_fingerprints(
@@ -285,6 +309,7 @@ class TaskWorkspaceTests(unittest.TestCase):
                 run_manifest_path=second_run.manifest_path,
                 stage_number=2,
                 artifact_path=stage2,
+                semantic_context=self._stage2_semantic_context(),
             )
             manifest = run_manifest.load_json(
                 workspace.root / CHECKPOINT_MANIFEST_REL
@@ -306,9 +331,11 @@ class TaskWorkspaceTests(unittest.TestCase):
             stale = run.root / "result_final.fit"
             stale.write_bytes(b"stale")
             result = {
-                "schema": "starun.pipeline-result.v1",
+                "schema": "starun.pipeline-result.v2",
                 "run_id": run.run_id,
                 "status": "success",
+                "review_requirements": [],
+                "actual_steps": [],
                 "outputs": {
                     preview.name: run_manifest.file_record(
                         preview,
@@ -363,6 +390,7 @@ class TaskWorkspaceTests(unittest.TestCase):
                 run_manifest_path=first_run.manifest_path,
                 stage_number=2,
                 artifact_path=first_artifact,
+                semantic_context=self._stage2_semantic_context(),
             )
             manifest_path = workspace.root / CHECKPOINT_MANIFEST_REL
             previous_manifest = manifest_path.read_bytes()
@@ -394,6 +422,7 @@ class TaskWorkspaceTests(unittest.TestCase):
                         run_manifest_path=second_run.manifest_path,
                         stage_number=2,
                         artifact_path=second_artifact,
+                        semantic_context=self._stage2_semantic_context(),
                     )
 
             checkpoint = workspace.checkpoints_dir / "stage2_corrected.fit"
@@ -578,6 +607,41 @@ class TaskWorkspaceTests(unittest.TestCase):
             )
 
         self.assertEqual(inspection["resume_after_stage"], 2)
+
+    def test_native_crop_v4_stage2_and_stage5_fall_back_to_stage1(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            _, source_record, workspace = self._workspace(Path(td))
+            legacy = task_plan.build_resume_fingerprints(
+                input_fingerprint=source_record["fingerprint"],
+                stage_config={
+                    1: {"source_import": "read_only"},
+                    2: {"boundary_correction": "native_crop_v4"},
+                    3: {"background": "safe"},
+                    4: {"color": "physical"},
+                    5: {"denoise": "safe"},
+                },
+            )
+            current = task_plan.build_resume_fingerprints(
+                input_fingerprint=source_record["fingerprint"],
+                stage_config={
+                    1: {"source_import": "read_only"},
+                    2: {"boundary_correction": "native_crop_v5"},
+                    3: {"background": "safe"},
+                    4: {"color": "physical"},
+                    5: {"denoise": "safe"},
+                },
+            )
+            self._write_checkpoints(workspace, legacy)
+
+            inspection = inspect_task_workspace(
+                workspace.root,
+                current_resume_fingerprints=current,
+            )
+
+        self.assertTrue(inspection["verified"])
+        self.assertEqual(inspection["resume_after_stage"], 1)
+        self.assertIn("incompatible", inspection["rejections"]["stage5"])
+        self.assertIn("incompatible", inspection["rejections"]["stage2"])
         self.assertIn("incompatible", inspection["rejections"]["stage5"])
 
     def test_nonformal_checkpoint_record_is_rejected(self) -> None:

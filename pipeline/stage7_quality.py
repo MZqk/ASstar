@@ -17,6 +17,7 @@ import numpy as np
 from image_metrics import (
     _box_blur_gray,
     _clamp_float,
+    _component_areas,
     _to_rgb_float_fullres,
     _to_rgb_float_image,
     measure_image_features,
@@ -46,6 +47,353 @@ STARLESS_RANGE_EXCLUSION_RADIUS = 3
 STARLESS_RANGE_SUPPORT_MIN = 0.05
 STARLESS_RANGE_CORRELATION_MIN = 0.85
 STARLESS_RANGE_SOURCE_FRACTION_MIN = 0.10
+
+BRIGHT_CORE_STRICT_TARGET_TYPE = "bright_emission_reflection_nebula"
+BRIGHT_CORE_ROI_QUANTILE = 0.99
+BRIGHT_CORE_ROI_SMOOTH_PASSES = 4
+BRIGHT_CORE_STARMASK_THRESHOLD = 0.02
+BRIGHT_CORE_STARMASK_EXPANSION = 3
+BRIGHT_CORE_ROI_SUPPORT_MIN = 64
+BRIGHT_CORE_CAP_THRESHOLD = 0.995
+BRIGHT_CORE_OVERSHOOT_DELTA = 0.01
+BRIGHT_CORE_INTEGRITY_LIMITS = {
+    "new_channel_cap_ratio_max": {"accepted": 0.01, "hard": 0.02},
+    "largest_cap_component_ratio": {"accepted": 0.01, "hard": 0.02},
+    "closure_abs_error_p99": {"accepted": 0.05, "hard": 0.10},
+    "starless_overshoot_ratio_max": {"accepted": 0.10, "hard": 0.20},
+    "parity_phase_span_max": {"accepted": 0.01, "hard": 0.02},
+}
+
+
+def strict_bright_core_target_evidence(
+    target_type: str,
+    target_profile: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Return the frozen evidence that enables strict bright-core protection."""
+    normalized_type = str(target_type or "").strip().lower()
+    profile = target_profile if isinstance(target_profile, dict) else {}
+    raw_labels = profile.get("secondary_labels", [])
+    labels = {
+        str(item).strip().lower()
+        for item in raw_labels
+        if str(item).strip()
+    } if isinstance(raw_labels, (list, tuple, set)) else set()
+    raw_features = profile.get("features", {})
+    features = raw_features if isinstance(raw_features, dict) else {}
+    risks = profile.get("risks", {})
+    risks = risks if isinstance(risks, dict) else {}
+    bright_core_label = "bright_core" in labels or bool(
+        features.get("bright_core", False)
+    )
+    core_blowout = str(risks.get("core_blowout") or "").strip().lower()
+    strict = (
+        normalized_type == BRIGHT_CORE_STRICT_TARGET_TYPE
+        and core_blowout == "high"
+    )
+    return {
+        "strict": strict,
+        "target_type": normalized_type,
+        "target_type_matched": normalized_type == BRIGHT_CORE_STRICT_TARGET_TYPE,
+        "bright_core_label": bright_core_label,
+        "core_blowout": core_blowout or "unknown",
+        "routing_rule": (
+            "bright_emission_reflection_nebula AND "
+            "core_blowout=high; bright_core label is diagnostic-only"
+        ),
+    }
+
+
+def is_strict_bright_core_target(
+    target_type: str,
+    target_profile: Optional[Dict[str, Any]],
+) -> bool:
+    return bool(
+        strict_bright_core_target_evidence(target_type, target_profile).get(
+            "strict", False
+        )
+    )
+
+
+def _fixed_upper_gate(
+    value: float,
+    *,
+    accepted_limit: float,
+    hard_limit: float,
+) -> Dict[str, Any]:
+    measured = max(float(value), 0.0)
+    if measured <= accepted_limit:
+        status = "ok"
+    elif measured <= hard_limit:
+        status = "advisory"
+    else:
+        status = "hard_failed"
+    return {
+        "status": status,
+        "advisory": status == "advisory",
+        "hard_failed": status == "hard_failed",
+        "value": measured,
+        "accepted_limit": float(accepted_limit),
+        "hard_limit": float(hard_limit),
+        "severity_ratio": measured / max(float(accepted_limit), 1e-12),
+        "fixed_limit": True,
+    }
+
+
+def _dilate_binary_mask(mask: np.ndarray, iterations: int) -> np.ndarray:
+    expanded = np.asarray(mask, dtype=bool)
+    for _ in range(max(int(iterations), 0)):
+        padded = np.pad(expanded, 1, mode="constant", constant_values=False)
+        expanded = np.logical_or.reduce(
+            [
+                padded[dy : dy + expanded.shape[0], dx : dx + expanded.shape[1]]
+                for dy in range(3)
+                for dx in range(3)
+            ]
+        )
+    return expanded
+
+
+def build_bright_core_roi(
+    source_data: Any,
+    starmask_data: Any,
+) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+    """Build the fixed Stage 5 bright-core ROI shared by Stage 6 and Stage 7."""
+    evidence: Dict[str, Any] = {
+        "method": "rec709_box3x3_x4_top1pct_excluding_starmask_dilate3",
+        "source_quantile": BRIGHT_CORE_ROI_QUANTILE,
+        "smooth_passes": BRIGHT_CORE_ROI_SMOOTH_PASSES,
+        "starmask_threshold": BRIGHT_CORE_STARMASK_THRESHOLD,
+        "starmask_expansion_pixels": BRIGHT_CORE_STARMASK_EXPANSION,
+        "support_min": BRIGHT_CORE_ROI_SUPPORT_MIN,
+        "available": False,
+        "support": 0,
+    }
+    if source_data is None or starmask_data is None:
+        evidence["reason"] = (
+            "source_missing" if source_data is None else "starmask_missing"
+        )
+        return None, evidence
+    try:
+        source_rgb = _to_rgb_float_fullres(source_data)
+        starmask_rgb = _to_rgb_float_fullres(starmask_data)
+    except (TypeError, ValueError, IndexError, FloatingPointError) as error:
+        evidence["reason"] = f"invalid_reference:{error}"
+        return None, evidence
+    if source_rgb.shape != starmask_rgb.shape:
+        evidence["reason"] = "reference_shape_mismatch"
+        evidence["source_shape"] = list(source_rgb.shape)
+        evidence["starmask_shape"] = list(starmask_rgb.shape)
+        return None, evidence
+
+    luminance = (
+        0.2126 * source_rgb[0]
+        + 0.7152 * source_rgb[1]
+        + 0.0722 * source_rgb[2]
+    ).astype(np.float32)
+    broad = luminance
+    for _ in range(BRIGHT_CORE_ROI_SMOOTH_PASSES):
+        broad = _box_blur_gray(broad)
+    try:
+        threshold = float(np.quantile(broad, BRIGHT_CORE_ROI_QUANTILE))
+    except (TypeError, ValueError, FloatingPointError) as error:
+        evidence["reason"] = f"roi_quantile_failed:{error}"
+        return None, evidence
+    roi = broad >= threshold
+    star_pixels = np.max(starmask_rgb, axis=0) > BRIGHT_CORE_STARMASK_THRESHOLD
+    excluded = _dilate_binary_mask(star_pixels, BRIGHT_CORE_STARMASK_EXPANSION)
+    roi &= ~excluded
+    support = int(np.count_nonzero(roi))
+    evidence.update(
+        {
+            "threshold": threshold,
+            "support": support,
+            "support_ratio": support / float(max(roi.size, 1)),
+            "excluded_starmask_pixels": int(np.count_nonzero(excluded)),
+            "available": support >= BRIGHT_CORE_ROI_SUPPORT_MIN,
+            "reason": (
+                "ok" if support >= BRIGHT_CORE_ROI_SUPPORT_MIN else "roi_support_insufficient"
+            ),
+        }
+    )
+    return roi, evidence
+
+
+def assess_bright_core_integrity(
+    source_data: Any,
+    starless_data: Any,
+    starmask_data: Any,
+    *,
+    target_type: str,
+    target_profile: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Detect destructive Stage 6 artifacts inside a frozen bright-core ROI."""
+    strict_evidence = strict_bright_core_target_evidence(
+        target_type,
+        target_profile,
+    )
+    result: Dict[str, Any] = {
+        "schema": "starun.bright-core-integrity.v1",
+        "applicable": bool(strict_evidence["strict"]),
+        "strict_target_evidence": strict_evidence,
+        "limits": {
+            name: dict(values)
+            for name, values in BRIGHT_CORE_INTEGRITY_LIMITS.items()
+        },
+        "cap_threshold": BRIGHT_CORE_CAP_THRESHOLD,
+        "overshoot_delta": BRIGHT_CORE_OVERSHOOT_DELTA,
+        "status": "not_applicable",
+        "hard_failed": False,
+        "advisory": False,
+        "trigger_reasons": [],
+        "metrics": {},
+        "gates": {},
+    }
+    if not strict_evidence["strict"]:
+        return result
+
+    roi, roi_evidence = build_bright_core_roi(source_data, starmask_data)
+    result["roi"] = roi_evidence
+    if roi is None or not bool(roi_evidence.get("available", False)):
+        reason = str(roi_evidence.get("reason") or "roi_unavailable")
+        result.update(
+            {
+                "status": "hard_failed",
+                "hard_failed": True,
+                "trigger_reasons": [reason],
+            }
+        )
+        return result
+    if starless_data is None:
+        result.update(
+            {
+                "status": "hard_failed",
+                "hard_failed": True,
+                "trigger_reasons": ["starless_missing"],
+            }
+        )
+        return result
+
+    try:
+        source_rgb = _to_rgb_float_fullres(source_data)
+        starless_rgb = _to_rgb_float_fullres(starless_data)
+        starmask_rgb = _to_rgb_float_fullres(starmask_data)
+    except (TypeError, ValueError, IndexError, FloatingPointError) as error:
+        result.update(
+            {
+                "status": "hard_failed",
+                "hard_failed": True,
+                "trigger_reasons": [f"invalid_pair:{error}"],
+            }
+        )
+        return result
+    if source_rgb.shape != starless_rgb.shape or source_rgb.shape != starmask_rgb.shape:
+        result.update(
+            {
+                "status": "hard_failed",
+                "hard_failed": True,
+                "trigger_reasons": ["pair_shape_mismatch"],
+            }
+        )
+        return result
+
+    support = max(int(np.count_nonzero(roi)), 1)
+    newly_capped = (starless_rgb >= BRIGHT_CORE_CAP_THRESHOLD) & (
+        source_rgb < BRIGHT_CORE_CAP_THRESHOLD
+    )
+    cap_ratios = [
+        float(np.count_nonzero(newly_capped[channel] & roi)) / float(support)
+        for channel in range(3)
+    ]
+    component_ratios: List[float] = []
+    for channel in range(3):
+        areas = _component_areas(newly_capped[channel] & roi)
+        component_ratios.append(
+            float(max(areas, default=0)) / float(support)
+        )
+    closure = np.abs(source_rgb - (starless_rgb + starmask_rgb))
+    closure_values = closure[:, roi]
+    closure_p99 = (
+        float(np.quantile(closure_values, 0.99))
+        if closure_values.size
+        else float("inf")
+    )
+    delta = starless_rgb - source_rgb
+    overshoot_ratios = [
+        float(np.count_nonzero((delta[channel] > BRIGHT_CORE_OVERSHOOT_DELTA) & roi))
+        / float(support)
+        for channel in range(3)
+    ]
+    parity_spans: List[float] = []
+    parity_means: List[List[Optional[float]]] = []
+    parity_complete = True
+    for channel in range(3):
+        channel_means: List[Optional[float]] = []
+        for phase_y in range(2):
+            for phase_x in range(2):
+                phase_roi = roi[phase_y::2, phase_x::2]
+                phase_values = delta[channel, phase_y::2, phase_x::2][phase_roi]
+                if phase_values.size:
+                    channel_means.append(float(np.mean(phase_values)))
+                else:
+                    channel_means.append(None)
+                    parity_complete = False
+        available_means = [value for value in channel_means if value is not None]
+        parity_spans.append(
+            float(max(available_means) - min(available_means))
+            if available_means
+            else float("inf")
+        )
+        parity_means.append(channel_means)
+
+    metrics = {
+        "new_channel_cap_ratios": cap_ratios,
+        "new_channel_cap_ratio_max": max(cap_ratios),
+        "cap_component_ratios": component_ratios,
+        "largest_cap_component_ratio": max(component_ratios),
+        "closure_abs_error_p99": closure_p99,
+        "starless_overshoot_ratios": overshoot_ratios,
+        "starless_overshoot_ratio_max": max(overshoot_ratios),
+        "parity_phase_means": parity_means,
+        "parity_phase_spans": parity_spans,
+        "parity_phase_span_max": max(parity_spans),
+        "parity_complete": parity_complete,
+    }
+    result["metrics"] = metrics
+    for name, limits in BRIGHT_CORE_INTEGRITY_LIMITS.items():
+        result["gates"][name] = _fixed_upper_gate(
+            float(metrics[name]),
+            accepted_limit=float(limits["accepted"]),
+            hard_limit=float(limits["hard"]),
+        )
+    if not parity_complete:
+        result["gates"]["parity_phase_span_max"].update(
+            {"status": "hard_failed", "hard_failed": True, "advisory": False}
+        )
+        result["trigger_reasons"].append("parity_support_incomplete")
+
+    hard_reasons = [
+        name
+        for name, gate in result["gates"].items()
+        if bool(gate.get("hard_failed", False))
+    ]
+    advisory_reasons = [
+        name
+        for name, gate in result["gates"].items()
+        if bool(gate.get("advisory", False))
+    ]
+    result["trigger_reasons"] = list(
+        dict.fromkeys(result["trigger_reasons"] + hard_reasons)
+    )
+    result["hard_failed"] = bool(hard_reasons or not parity_complete)
+    result["advisory"] = bool(advisory_reasons) and not result["hard_failed"]
+    result["status"] = (
+        "hard_failed"
+        if result["hard_failed"]
+        else "advisory"
+        if result["advisory"]
+        else "ok"
+    )
+    return result
 
 
 def stage7_quality_advisory_multiplier(cfg) -> float:
@@ -1416,6 +1764,13 @@ def stage7_quality_assessment(
         if hasattr(pipeline, "_active_target_type")
         else ""
     )
+    bright_core_integrity = assess_bright_core_integrity(
+        source_data,
+        starless_data,
+        starmask_data,
+        target_type=target_type,
+        target_profile=getattr(pipeline, "target_profile", None),
+    )
     if target_type in GALAXY_TARGET_TYPES and galaxy_roi_available:
         # Global star-density metrics see the bulge, arms and dust lanes as
         # point-like energy. Use only compact evidence outside the fitted disk;
@@ -1474,6 +1829,32 @@ def stage7_quality_assessment(
             issues.append(message)
         elif bool(gate.get("advisory", False)):
             advisories.append(message)
+
+    if bool(bright_core_integrity.get("applicable", False)):
+        bright_core_status = str(
+            bright_core_integrity.get("status") or "hard_failed"
+        )
+        bright_core_gate = {
+            "status": bright_core_status,
+            "advisory": bright_core_status == "advisory",
+            "hard_failed": bright_core_status == "hard_failed",
+            "fixed_limit": True,
+            "trigger_reasons": list(
+                bright_core_integrity.get("trigger_reasons") or []
+            ),
+        }
+        quality_gates["bright_core_integrity"] = bright_core_gate
+        for metric_name, metric_gate in (
+            bright_core_integrity.get("gates") or {}
+        ).items():
+            quality_gates[f"bright_core_{metric_name}"] = dict(metric_gate)
+        bright_core_message = "bright_core_integrity " + ",".join(
+            bright_core_gate["trigger_reasons"] or [bright_core_status]
+        )
+        if bright_core_gate["hard_failed"]:
+            issues.append(bright_core_message)
+        elif bright_core_gate["advisory"]:
+            advisories.append(bright_core_message)
 
     residual_gate = stage7_upper_quality_gate(
         pipeline.cfg,
@@ -1764,6 +2145,14 @@ def stage7_quality_assessment(
             "starmask_coverage_ratio": starmask_coverage_ratio,
             "starmask_width_ratio": starmask_width_ratio,
             "halo_threshold": halo_threshold,
+            "bright_core_integrity_status": bright_core_integrity.get("status"),
+            **{
+                f"bright_core_{name}": value
+                for name, value in (
+                    bright_core_integrity.get("metrics") or {}
+                ).items()
+                if isinstance(value, (int, float, bool))
+            },
             **{
                 name: value
                 for name, value in artifact_scores.items()
@@ -1773,6 +2162,7 @@ def stage7_quality_assessment(
         "local_issues": issues,
         "local_advisories": advisories,
         "quality_gates": quality_gates,
+        "bright_core_integrity": bright_core_integrity,
     }
     all_issues = issues
     return {
@@ -1785,6 +2175,7 @@ def stage7_quality_assessment(
         "advisories": advisories,
         "local_advisories": advisories,
         "quality_gates": quality_gates,
+        "bright_core_integrity": bright_core_integrity,
         "source_metrics": asdict(source_metrics),
         "starless_metrics": asdict(starless_metrics),
         "starmask_metrics": asdict(starmask_metrics) if starmask_data is not None else None,
@@ -1885,6 +2276,13 @@ def stage7_repair_triggers(pipeline, quality: Optional[Dict[str, Any]]) -> List[
     if not isinstance(derived, dict):
         return []
     triggers: List[str] = []
+    bright_core_integrity = quality.get("bright_core_integrity")
+    if (
+        isinstance(bright_core_integrity, dict)
+        and bool(bright_core_integrity.get("applicable", False))
+        and bool(bright_core_integrity.get("hard_failed", False))
+    ):
+        triggers.append("bright_core_integrity")
     try:
         residual = float(derived.get("residual_star_score", 0.0))
     except (TypeError, ValueError):

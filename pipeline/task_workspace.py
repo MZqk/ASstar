@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence
 
 try:
-    from . import run_manifest, task_plan
+    from . import outcome, run_manifest, task_plan
     from .processing_parameters import (
         default_processing_parameters,
         normalize_processing_parameters,
@@ -24,6 +24,7 @@ try:
         stage_contract,
     )
 except ImportError:
+    import outcome
     import run_manifest
     import task_plan
     from processing_parameters import (
@@ -43,7 +44,12 @@ except ImportError:
 TASK_MANIFEST_SCHEMA = "starun.task-manifest.v1"
 CHECKPOINT_MANIFEST_SCHEMA = "starun.checkpoint-manifest.v1"
 RUN_MANIFEST_SCHEMA = "starun.task-run.v1"
-RESUME_SEMANTIC_SCHEMA = "starun.resume-semantics.v1"
+RESUME_SEMANTIC_SCHEMA_V1 = "starun.resume-semantics.v1"
+RESUME_SEMANTIC_SCHEMA_V2 = "starun.resume-semantics.v2"
+RESUME_SEMANTIC_SCHEMA = RESUME_SEMANTIC_SCHEMA_V2
+SUPPORTED_RESUME_SEMANTIC_SCHEMAS = frozenset(
+    {RESUME_SEMANTIC_SCHEMA_V1, RESUME_SEMANTIC_SCHEMA_V2}
+)
 TASK_MANIFEST_NAME = "task-manifest.json"
 RUN_MANIFEST_NAME = "run-manifest.json"
 CHECKPOINT_MANIFEST_REL = Path("checkpoints") / "checkpoint-manifest.json"
@@ -93,7 +99,8 @@ def _normalize_resume_semantic_context(
     )
     if not isinstance(normalized, dict):
         raise WorkspaceError("续跑语义契约无法规范化")
-    if str(normalized.get("schema") or "") != RESUME_SEMANTIC_SCHEMA:
+    source_schema = str(normalized.get("schema") or "")
+    if source_schema not in SUPPORTED_RESUME_SEMANTIC_SCHEMAS:
         raise WorkspaceError("续跑语义契约 schema 不受支持")
     try:
         semantic_stage = int(normalized.get("checkpoint_stage"))
@@ -101,6 +108,74 @@ def _normalize_resume_semantic_context(
         raise WorkspaceError("续跑语义契约缺少 checkpoint_stage") from error
     if semantic_stage != stage_number:
         raise WorkspaceError("续跑语义契约与断点阶段不匹配")
+    if source_schema == RESUME_SEMANTIC_SCHEMA_V1:
+        if stage_number != 5:
+            raise WorkspaceError("旧版续跑语义仅支持 Stage 5")
+        legacy_review = normalized.get("upstream_review")
+        if not isinstance(legacy_review, Mapping):
+            raise WorkspaceError("Stage 5 旧版续跑语义缺少 upstream_review")
+        legacy_mapping = (
+            (
+                "stage2_view_review_required",
+                2,
+                "legacy_stage2_view_review_required",
+            ),
+            (
+                "background_review_required",
+                3,
+                "legacy_stage3_background_review_required",
+            ),
+            (
+                "color_review_required",
+                4,
+                "legacy_stage4_color_review_required",
+            ),
+        )
+        normalized["review_requirements"] = [
+            outcome.normalize_review_requirement(
+                {"stage": stage, "code": code, "details": {}},
+                legacy_inferred=True,
+            )
+            for field, stage, code in legacy_mapping
+            if bool(legacy_review.get(field, False))
+        ]
+        normalized["source_schema"] = source_schema
+        normalized["legacy_inferred"] = True
+        normalized["schema"] = RESUME_SEMANTIC_SCHEMA_V2
+    else:
+        raw_reviews = normalized.get("review_requirements")
+        if not isinstance(raw_reviews, list):
+            raise WorkspaceError("续跑语义缺少结构化 review_requirements")
+        try:
+            normalized["review_requirements"] = (
+                outcome.deduplicate_review_requirements(
+                    item for item in raw_reviews if isinstance(item, Mapping)
+                )
+            )
+        except ValueError as error:
+            raise WorkspaceError(f"续跑复核语义无效：{error}") from error
+
+    if stage_number == 2:
+        stage2_crop = normalized.get("stage2_crop")
+        if not isinstance(stage2_crop, Mapping):
+            raise WorkspaceError("Stage 2 续跑语义缺少裁切语义")
+        for key in (
+            "original_dimensions",
+            "final_dimensions",
+            "cumulative_crop",
+            "final_residual_detection",
+        ):
+            if not isinstance(stage2_crop.get(key), Mapping):
+                raise WorkspaceError(f"Stage 2 续跑裁切语义缺少 {key}")
+        try:
+            field_rotation_passes = int(
+                stage2_crop.get("field_rotation_passes", 0)
+            )
+        except (TypeError, ValueError) as error:
+            raise WorkspaceError("Stage 2 场旋裁切轮次无效") from error
+        if field_rotation_passes not in range(0, 3):
+            raise WorkspaceError("Stage 2 场旋裁切轮次超出 0-2")
+        normalized["stage2_crop"] = dict(stage2_crop)
     if stage_number == 5:
         if not str(normalized.get("channel_semantics") or "").strip():
             raise WorkspaceError("Stage 5 续跑语义缺少通道语义")
@@ -109,7 +184,6 @@ def _normalize_resume_semantic_context(
             "target_profile",
             "pipeline_policy",
             "color_calibration_report",
-            "upstream_review",
         )
         for key in required_mappings:
             if not isinstance(normalized.get(key), Mapping):
@@ -482,8 +556,8 @@ def begin_task_run(
             normalized_resume.get("semantic_context"),
             stage_number=resume_stage,
         )
-        if resume_stage == 5 and normalized_resume["semantic_context"] is None:
-            raise WorkspaceError("Stage 5 续跑记录缺少语义契约")
+        if resume_stage in {2, 5} and normalized_resume["semantic_context"] is None:
+            raise WorkspaceError(f"Stage {resume_stage} 续跑记录缺少语义契约")
         normalized_resume["semantic_context_status"] = (
             "verified"
             if normalized_resume["semantic_context"] is not None
@@ -588,8 +662,8 @@ def publish_formal_checkpoint(
         semantic_context,
         stage_number=stage_number,
     )
-    if stage_number == 5 and normalized_semantic_context is None:
-        raise WorkspaceError("Stage 5 正式断点必须包含语义契约")
+    if stage_number in {2, 5} and normalized_semantic_context is None:
+        raise WorkspaceError(f"Stage {stage_number} 正式断点必须包含语义契约")
 
     task_root = Path(str(run_payload.get("task_directory") or "")).resolve()
     workspace, source = open_task_workspace(task_root)
@@ -729,8 +803,8 @@ def publish_latest_result_index(*, run_manifest_path: Path) -> Dict[str, Any]:
 
     result_path = run_root / "pipeline-result.json"
     result = run_manifest.load_json(result_path)
-    if result is None or str(result.get("schema") or "") != (
-        "starun.pipeline-result.v1"
+    if result is None or str(result.get("schema") or "") not in (
+        outcome.SUPPORTED_PIPELINE_RESULT_SCHEMAS
     ):
         raise WorkspaceError("pipeline-result.json 缺失或 schema 不受支持")
     expected_hash = str(result.get("manifest_hash") or "")
@@ -740,6 +814,10 @@ def publish_latest_result_index(*, run_manifest_path: Path) -> Dict[str, Any]:
         unsigned
     ):
         raise WorkspaceError("pipeline-result.json 哈希无效")
+    try:
+        result = outcome.normalize_pipeline_result(result)
+    except ValueError as error:
+        raise WorkspaceError(f"pipeline-result.json 无法归一化：{error}") from error
     plan = run_manifest.load_json(run_root / "processing-plan.json")
     plan_verification = task_plan.verify_processing_plan(plan or {})
     if not plan_verification.get("verified"):
@@ -954,8 +1032,8 @@ def apply_task_retention(
             continue
         result_path = run_root / "pipeline-result.json"
         result = run_manifest.load_json(result_path)
-        if result is None or str(result.get("schema") or "") != (
-            "starun.pipeline-result.v1"
+        if result is None or str(result.get("schema") or "") not in (
+            outcome.SUPPORTED_PIPELINE_RESULT_SCHEMAS
         ):
             skipped.append(f"{run_root.name}: pipeline result is unavailable")
             continue
@@ -1079,7 +1157,7 @@ def _checkpoint_compatible(
         )
     except WorkspaceError as error:
         return False, f"{key} semantic context is invalid: {error}", None
-    if stage_number == 5 and semantic_context is None:
+    if stage_number in {2, 5} and semantic_context is None:
         return False, f"{key} semantic context is missing", None
     config_fingerprint = str(record.get("config_fingerprint") or "").strip()
     if not config_fingerprint:
@@ -1209,6 +1287,9 @@ __all__ = [
     "RUN_MANIFEST_NAME",
     "RUN_MANIFEST_SCHEMA",
     "RESUME_SEMANTIC_SCHEMA",
+    "RESUME_SEMANTIC_SCHEMA_V1",
+    "RESUME_SEMANTIC_SCHEMA_V2",
+    "SUPPORTED_RESUME_SEMANTIC_SCHEMAS",
     "LATEST_RESULT_MANIFEST_REL",
     "RETENTION_MANIFEST_REL",
     "TASK_CONTAINER_NAME",

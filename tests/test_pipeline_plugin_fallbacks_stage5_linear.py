@@ -4,6 +4,46 @@ from tests.pipeline_plugin_fallbacks_support import *  # noqa: F401,F403
 
 
 class PipelinePluginFallbackStage5LinearTests(PipelinePluginFallbackTestBase):
+    def test_stage5_low_noise_guard_skips_enabled_denoise_candidates(self):
+        processor = self._new_processor()
+        processor.cfg.stage5_deconvolution_enabled = False
+        processor.image_pixels = np.full_like(processor.image_pixels, 0.1)
+
+        stage5_linear_denoise(processor)
+
+        report = processor.stage_json_reports["stage5_linear_report.json"]
+        self.assertEqual(report["denoise"]["reason_code"], "auto_low_noise")
+        self.assertEqual(report["components"]["denoise"]["status"], "skipped")
+        self.assertFalse(any(call[0] == "denoise" for call in processor.cmd_calls))
+
+    def test_stage5_manual_denoise_disable_is_not_auto_low_noise(self):
+        processor = self._new_processor()
+        processor.cfg.denoise_enabled = False
+        processor.cfg.stage5_deconvolution_enabled = False
+        processor.cfg.auto_tune_enabled = True
+        processor.auto_tune_result = object()
+        processor._task_manual_override_fields = ("denoise_enabled",)
+
+        stage5_linear_denoise(processor)
+
+        report = processor.stage_json_reports["stage5_linear_report.json"]
+        self.assertEqual(report["denoise"]["reason_code"], "user_disabled")
+        self.assertEqual(report["components"]["denoise"]["status"], "skipped")
+
+    def test_stage5_forced_denoise_disable_is_user_disabled(self):
+        processor = self._new_processor()
+        processor.cfg.denoise_enabled = False
+        processor.cfg.stage5_deconvolution_enabled = False
+        processor.cfg.auto_tune_enabled = True
+        processor.auto_tune_result = object()
+        processor._force_denoise_enabled = False
+
+        stage5_linear_denoise(processor)
+
+        report = processor.stage_json_reports["stage5_linear_report.json"]
+        self.assertEqual(report["denoise"]["reason_code"], "user_disabled")
+        self.assertEqual(report["components"]["denoise"]["status"], "skipped")
+
     def test_stage5_keeps_builtin_denoise_primary_with_legacy_plugins_available(self):
         processor = self._new_processor()
         processor.cfg.aberration_api_enabled = True
@@ -809,7 +849,7 @@ class PipelinePluginFallbackStage5LinearTests(PipelinePluginFallbackTestBase):
     def test_stage3_graxpert_runtime_error_uses_normal_background_backup(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
 
-        class Stage3Fake:
+        class Stage3Fake(ReviewRegistryTestDouble):
             def __init__(self) -> None:
                 self.log = FakeLogger()
                 self.cfg = SimpleNamespace(workflow_plugin_probe_enabled=False)

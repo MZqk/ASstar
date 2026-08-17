@@ -94,6 +94,7 @@ class PipelineConfig:
     stage2_base_crop_enabled: bool = False  # 显式启用后先做受中心保护约束的对称基础裁边
     stage2_base_crop_margin: float = 0.02  # 每边基础裁切比例；仅在 stage2_base_crop_enabled 时生效
     stage2_field_rotation_detection_enabled: bool = True  # 检测经纬仪场旋形成的边缘连通低覆盖噪声区
+    stage2_field_rotation_max_passes: int = 2  # 场旋覆盖自动裁切总轮次；最多两轮，第二轮必须复检
     stage2_field_rotation_noise_ratio_min: float = 1.35  # 场旋低覆盖区相对中心的亮度噪声硬门槛
     stage2_field_rotation_chroma_ratio_min: float = 1.20  # 场旋低覆盖区相对中心的色噪硬门槛
     stage2_color_edge_cleanup_enabled: bool = True  # 自动裁切后允许执行保尺寸的边缘色偏清理
@@ -154,7 +155,7 @@ class PipelineConfig:
     stage5_failure_action: str = "auto_fallback"  # 决定性失败：auto_fallback/preserve_review/stop
     stage5_denoise_backend_policy: str = "auto_chain"  # auto_chain/multiscale_only/siril_only/cosmic_clarity_only
     stage5_low_noise_auto_skip_enabled: bool = True  # 低噪声输入自动跳过额外降噪候选
-    denoise_enabled: bool = False   # 是否启用线性阶段降噪
+    denoise_enabled: bool = True  # 自动模式允许 Stage 5 自行通过低噪声/质量门决定是否实际降噪
     denoise_mod: float = 0.35       # 降噪强度参数（0~1），越大降噪越强
     denoise_safety_max: float = 0.55  # 降噪强度安全上限，防止细节被抹平
     stage5_multiscale_denoise_enabled: bool = True  # 启用噪声模型驱动的亮度/对立色度多尺度确定性候选
@@ -625,7 +626,7 @@ class Stage7StretchStrategy:
 class StageResult:
     """单个阶段的执行结果"""
     name: str
-    status: str = 'pending'     # ok / degraded / failed / skipped
+    status: str = 'skipped'     # ok / degraded / failed / skipped
     duration: float = 0.0
     message: str = ''
     execution: str = "completed"  # completed / safe_passthrough / skipped
@@ -634,14 +635,26 @@ class StageResult:
     reason_code: str = ''
     details: Dict[str, Any] = field(default_factory=dict)
     components: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    review_reasons: List[str] = field(default_factory=list)
+    issues: List[Dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.status = str(self.status).strip().lower()
+        if self.fallback_used and self.status == "ok":
+            self.status = "degraded"
+        if self.status not in {"ok", "degraded", "failed", "skipped"}:
+            raise ValueError(f"unsupported stage status: {self.status!r}")
+        self.execution = str(self.execution).strip().lower()
+        if self.status == "skipped":
+            self.execution = "skipped"
+        if self.execution not in {"completed", "safe_passthrough", "skipped"}:
+            raise ValueError(f"unsupported stage execution: {self.execution!r}")
 
     @property
     def display_status(self) -> str:
         """Return a structured summary status without inspecting human text."""
         if self.status != "ok":
             return self.status
-        if self.fallback_used:
-            return "ok_with_fallback"
         if self.execution == "safe_passthrough":
             return "ok_safe_passthrough"
         if self.execution == "skipped":

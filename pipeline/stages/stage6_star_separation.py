@@ -408,6 +408,24 @@ def _stage6_quality_hard_failure_summary(
             accepted_limit=float(pipeline._stage7_effective_halo_threshold()),
         ),
     }
+    bright_core_integrity = quality.get("bright_core_integrity")
+    destructive_core_failure = bool(
+        isinstance(bright_core_integrity, dict)
+        and bright_core_integrity.get("applicable", False)
+        and bright_core_integrity.get("hard_failed", False)
+    )
+    if isinstance(bright_core_integrity, dict) and bool(
+        bright_core_integrity.get("applicable", False)
+    ):
+        gates["bright_core_integrity"] = {
+            "status": bright_core_integrity.get("status", "hard_failed"),
+            "hard_failed": destructive_core_failure,
+            "advisory": bool(bright_core_integrity.get("advisory", False)),
+            "fixed_limit": True,
+            "trigger_reasons": list(
+                bright_core_integrity.get("trigger_reasons") or []
+            ),
+        }
     hard_metrics = [
         name for name, gate in gates.items() if bool(gate.get("hard_failed"))
     ]
@@ -418,8 +436,11 @@ def _stage6_quality_hard_failure_summary(
         codes.append("RESIDUAL_GLOBAL")
     if "halo" in hard_metrics and "HALO" not in codes:
         codes.append("HALO")
+    if destructive_core_failure and "BRIGHT_CORE_INTEGRITY" not in codes:
+        codes.append("BRIGHT_CORE_INTEGRITY")
     return {
         "hard_failed": status != "ok" or bool(hard_metrics),
+        "destructive_core_failure": destructive_core_failure,
         "quality_status": status,
         "hard_metrics": hard_metrics,
         "failure_codes": list(dict.fromkeys(codes)),
@@ -850,6 +871,7 @@ _QUALITY_FAILURE_CODES = {
     "black_hole": "BLACK_HOLE",
     "dynamic_range_collapse": "DYNAMIC_RANGE_COLLAPSE",
     "galaxy_core_damage": "GALAXY_CORE_DAMAGE",
+    "bright_core_integrity": "BRIGHT_CORE_INTEGRITY",
 }
 
 
@@ -866,6 +888,195 @@ def _stage7_quality_selection_key(pipeline, quality: Optional[Dict[str, Any]]) -
     """Prefer a hard-gate-passing candidate before comparing soft quality scores."""
     status = str((quality or {}).get("status") or "").strip().lower()
     return (0 if status == "ok" else 1, pipeline._stage7_quality_score(quality))
+
+
+def _stage6_can_retain_hard_failed_pair(
+    final_quality_failure: Dict[str, Any],
+    *,
+    pair_valid: bool,
+    bright_core_retry_terminal_failure: bool = False,
+) -> bool:
+    """Keep legacy review retention except for destructive bright-core failures."""
+    return bool(
+        final_quality_failure.get("hard_failed", False)
+        and pair_valid
+        and not final_quality_failure.get("destructive_core_failure", False)
+        and not bright_core_retry_terminal_failure
+    )
+
+
+def _stage6_bright_core_retry_plan(
+    quality: Optional[Dict[str, Any]],
+    *,
+    retry_max: int,
+    syqon_available: bool,
+) -> Dict[str, Any]:
+    """Freeze the strict bright-core retry budget at zero or one attempt."""
+    bright_core = (
+        quality.get("bright_core_integrity")
+        if isinstance(quality, dict)
+        else None
+    )
+    triggered = bool(
+        isinstance(bright_core, dict)
+        and bright_core.get("applicable", False)
+        and bright_core.get("hard_failed", False)
+    )
+    bright_core_gates = (
+        bright_core.get("gates")
+        if isinstance(bright_core, dict)
+        and isinstance(bright_core.get("gates"), dict)
+        else {}
+    )
+    recoverable_artifact = bool(
+        triggered
+        and any(
+            bool((gate or {}).get("hard_failed", False))
+            for gate in bright_core_gates.values()
+        )
+    )
+    configured_retry_max = max(int(retry_max or 0), 0)
+    should_attempt = bool(
+        recoverable_artifact
+        and configured_retry_max > 0
+        and syqon_available
+    )
+    status = (
+        "ready"
+        if should_attempt
+        else "direct_reject"
+        if triggered and not recoverable_artifact
+        else "disabled"
+        if triggered and configured_retry_max <= 0
+        else "unavailable"
+        if triggered and not syqon_available
+        else "not_triggered"
+    )
+    return {
+        "triggered": triggered,
+        "recoverable_artifact": recoverable_artifact,
+        "should_attempt": should_attempt,
+        "attempt_limit": 1 if should_attempt else 0,
+        "configured_retry_max": configured_retry_max,
+        "status": status,
+    }
+
+
+def _stage6_bright_core_retry_passed(
+    quality: Optional[Dict[str, Any]],
+) -> bool:
+    """Require the recovery pair to pass all ordinary and strict gates."""
+    if not isinstance(quality, dict) or quality.get("status") != "ok":
+        return False
+    bright_core = quality.get("bright_core_integrity") or {}
+    return bool(
+        isinstance(bright_core, dict)
+        and bright_core.get("applicable", False)
+        and not bright_core.get("hard_failed", True)
+    )
+
+
+def _stage6_bright_core_with_stars_fallback_contract(
+    pipeline,
+    quality: Optional[Dict[str, Any]],
+    retry: Optional[Dict[str, Any]],
+    *,
+    separation_accepted: bool,
+) -> Dict[str, Any]:
+    """Record the terminal with-stars review route after pair rejection.
+
+    The field name is retained for compatibility with existing diagnostics,
+    but a rejected strict bright-core pair may no longer authorize formal HDR
+    delivery.  Stage 7 must consume this record as review-only evidence.
+    """
+    target_type = (
+        pipeline._active_target_type()
+        if hasattr(pipeline, "_active_target_type")
+        else "generic_low_snr_safe"
+    )
+    strict_evidence = stage7_quality.strict_bright_core_target_evidence(
+        target_type,
+        getattr(pipeline, "target_profile", None),
+    )
+    selected = quality if isinstance(quality, dict) else {}
+    bright_core = selected.get("bright_core_integrity") or {}
+    bright_core = bright_core if isinstance(bright_core, dict) else {}
+    roi = bright_core.get("roi") or {}
+    roi = roi if isinstance(roi, dict) else {}
+    gates = bright_core.get("gates") or {}
+    gates = gates if isinstance(gates, dict) else {}
+    destructive_gate_names = [
+        str(name)
+        for name, gate in gates.items()
+        if isinstance(gate, dict) and bool(gate.get("hard_failed", False))
+    ]
+    retry_record = retry if isinstance(retry, dict) else {}
+    retry_trigger_reasons = list(retry_record.get("trigger_reasons") or [])
+    recovery_terminal_failure = bool(
+        retry_trigger_reasons
+        and not bool(retry_record.get("accepted", False))
+        and str(retry_record.get("status") or "")
+        not in {"not_triggered", "accepted"}
+    )
+    rejected_to_review = bool(
+        not separation_accepted
+        and strict_evidence.get("strict", False)
+        and (
+            (
+                bright_core.get("applicable", False)
+                and bright_core.get("hard_failed", False)
+            )
+            or recovery_terminal_failure
+        )
+    )
+    blocked_reasons: List[str] = []
+    if separation_accepted:
+        blocked_reasons.append("star_separation_accepted")
+    if not strict_evidence.get("strict", False):
+        blocked_reasons.append("strict_target_evidence_missing")
+    if not bright_core.get("hard_failed", False) and not recovery_terminal_failure:
+        blocked_reasons.append("bright_core_integrity_not_hard_failed")
+    if not roi.get("available", False):
+        blocked_reasons.append(str(roi.get("reason") or "bright_core_roi_unavailable"))
+    if not destructive_gate_names:
+        blocked_reasons.append("destructive_bright_core_gate_evidence_missing")
+    return {
+        "schema": "starun.bright-core-with-stars-fallback.v1",
+        "eligible": False,
+        "accepted": False,
+        "status": (
+            "rejected_to_review" if rejected_to_review else "not_eligible"
+        ),
+        "source_stem": "stage6_input",
+        "delivery_mode": "with_stars_review_only",
+        "review_only": rejected_to_review,
+        "review_output": (
+            "stage7_review_with_stars" if rejected_to_review else None
+        ),
+        "strict_target_evidence": strict_evidence,
+        "trigger_reasons": list(
+            dict.fromkeys(
+                [
+                    *list(bright_core.get("trigger_reasons") or []),
+                    *retry_trigger_reasons,
+                ]
+            )
+        ),
+        "destructive_gate_names": destructive_gate_names,
+        "bright_core_roi": dict(roi),
+        "rejected_pair_id": (
+            selected.get("pair_id")
+            or getattr(pipeline, "_selected_syqon_pair_id", None)
+        ),
+        "rejected_attempt": selected.get("attempt"),
+        "retry": {
+            "profile": retry_record.get("profile"),
+            "attempted": bool(retry_record.get("attempted", False)),
+            "accepted": bool(retry_record.get("accepted", False)),
+            "status": retry_record.get("status", "not_triggered"),
+        },
+        "blocked_reasons": list(dict.fromkeys(blocked_reasons)),
+    }
 
 
 def _stage7_linear_source(pipeline) -> str:
@@ -910,6 +1121,7 @@ def run_stage6_star_separation(pipeline) -> None:
     - 生成并导出 starless/starmask 交换文件供外部工具使用
     """
     stage_label = PipelineStage.STAR_SEPARATION.label
+    pipeline._clear_stage_reviews(6)
     pipeline.log.stage_start(stage_label)
     pipeline._stage7_starless_skipped = False
     pipeline._stage8_conservative_mode = False
@@ -936,6 +1148,12 @@ def run_stage6_star_separation(pipeline) -> None:
     pipeline._star_separation_state = StarSeparationState.PENDING.value
     pipeline._stage6_passthrough_source = None
     pipeline._stage6_starmask_borderline_review_required = False
+    pipeline._bright_core_with_stars_fallback = {
+        "schema": "starun.bright-core-with-stars-fallback.v1",
+        "eligible": False,
+        "accepted": False,
+        "status": "not_evaluated",
+    }
     selected_source_stem, star_separation_mode, mode_input_records = (
         _prepare_star_separation_source(pipeline)
     )
@@ -1043,6 +1261,9 @@ def run_stage6_star_separation(pipeline) -> None:
                     },
                     "stage8_handoff": pipeline._stage8_handoff,
                     "retry_max": 0,
+                    "bright_core_with_stars_fallback": (
+                        pipeline._bright_core_with_stars_fallback
+                    ),
                 },
             )
             if stage_saved and hasattr(pipeline, "_create_stage_review_bundle"):
@@ -1111,6 +1332,9 @@ def run_stage6_star_separation(pipeline) -> None:
                         "input_domain": "linear",
                         "selected_source_stem": selected_source_stem,
                         "stage8_handoff": pipeline._stage8_handoff,
+                        "bright_core_with_stars_fallback": (
+                            pipeline._bright_core_with_stars_fallback
+                        ),
                         "error": str(error),
                     },
                 )
@@ -1152,6 +1376,15 @@ def run_stage6_star_separation(pipeline) -> None:
         starmask_cleanup_records: List[Dict[str, Any]] = []
         repair_records: List[Dict[str, Any]] = []
         starless_pixel_repair_records: List[Dict[str, Any]] = []
+        bright_core_retry: Dict[str, Any] = {
+            "profile": syqon_starless.SYQON_BRIGHT_CORE_RECOVERY_PROFILE.manifest(),
+            "eligible": False,
+            "attempted": False,
+            "accepted": False,
+            "status": "not_triggered",
+            "trigger_reasons": [],
+        }
+        bright_core_retry_terminal_failure = False
         conservative_input_records: List[Dict[str, Any]] = list(mode_input_records)
         selected_source_stem = pipeline.stretched_name or selected_source_stem
         stage_messages.append(
@@ -1172,14 +1405,13 @@ def run_stage6_star_separation(pipeline) -> None:
         if stage7_preflight.get("risk_level") != "ok":
             stage_messages.append(preflight_summary)
 
+        syqon_profile = syqon_starless.SYQON_BASELINE_PROFILE
         syqon_script = (
             pipeline._find_plugin_script(SYQON_SCRIPT_CANDIDATES)
             if backend_policy != "sasp_only"
             else None
         )
         if syqon_script is not None:
-            syqon_profile = syqon_starless.SYQON_BASELINE_PROFILE
-
             _syqon_args, _syqon_timeout, syqon_device_note = pipeline._syqon_starless_cli_options(
                 profile=syqon_profile,
             )
@@ -1301,7 +1533,155 @@ def run_stage6_star_separation(pipeline) -> None:
             selected_quality,
             starmask_cleanup,
         )
+        selected_quality["retry_profile"] = syqon_profile.manifest()
         quality_records.append(selected_quality)
+        parameter_retries_done = 0
+
+        initial_bright_core = selected_quality.get("bright_core_integrity") or {}
+        bright_core_retry_plan = _stage6_bright_core_retry_plan(
+            selected_quality,
+            retry_max=getattr(pipeline.cfg, "stage7_quality_retry_max", 0),
+            syqon_available=syqon_script is not None,
+        )
+        if bool(bright_core_retry_plan["triggered"]):
+            bright_core_retry.update(
+                {
+                    "eligible": bright_core_retry_plan[
+                        "recoverable_artifact"
+                    ],
+                    "status": "blocked_by_retry_limit",
+                    "trigger_reasons": list(
+                        initial_bright_core.get("trigger_reasons") or []
+                    ),
+                    "initial_attempt": selected_quality.get("attempt"),
+                    "attempt_limit": bright_core_retry_plan["attempt_limit"],
+                    "configured_retry_max": bright_core_retry_plan[
+                        "configured_retry_max"
+                    ],
+                }
+            )
+            selected_quality["final_selection_state"] = (
+                "rejected_bright_core_integrity"
+            )
+            retry_max = bright_core_retry_plan["configured_retry_max"]
+            if bool(bright_core_retry_plan["should_attempt"]):
+                recovery_profile = (
+                    syqon_starless.SYQON_BRIGHT_CORE_RECOVERY_PROFILE
+                )
+                bright_core_retry.update(
+                    {
+                        "attempted": True,
+                        "status": "running",
+                    }
+                )
+                parameter_retries_done = 1
+                stage_messages.append(
+                    "BRIGHT_CORE_INTEGRITY hard rejection; retrying once with "
+                    "zenith_bright_core_ihs_recovery (IHS 0.15, FP32)"
+                )
+                retry_used = pipeline._stage7_try_syqon_variant(
+                    syqon_script,
+                    attempt_name="bright_core_ihs_recovery",
+                    profile=recovery_profile,
+                )
+                if retry_used:
+                    starless_used = retry_used
+                    syqon_profile = recovery_profile
+                    if not pipeline.starless_file:
+                        pipeline.cmd_with_check("save", "starless")
+                        pipeline.starless_file = pipeline.process_dir / "starless.fit"
+                    pipeline._stage7_prepare_starmask()
+                    retry_cleanup = pipeline._stage7_clean_starmask(
+                        label="bright_core_ihs_recovery"
+                    )
+                    starmask_cleanup_records.append(retry_cleanup)
+                    if retry_cleanup.get("status") == "applied":
+                        syqon_starless.record_syqon_derived_generation(
+                            pipeline,
+                            generation="clean",
+                            details={
+                                "starmask_cleanup": retry_cleanup.get("metrics") or {},
+                                "profile_id": recovery_profile.profile_id,
+                            },
+                        )
+                    retry_quality = pipeline._stage7_quality_assessment(
+                        "bright_core_ihs_recovery",
+                        tool_label=str(retry_used),
+                        source_stem=selected_source_stem,
+                    )
+                    retry_quality = _apply_starmask_cleanup_hard_gate(
+                        retry_quality,
+                        retry_cleanup,
+                    )
+                    retry_quality["retry_profile"] = recovery_profile.manifest()
+                    quality_records.append(retry_quality)
+                    retry_bright_core = (
+                        retry_quality.get("bright_core_integrity") or {}
+                    )
+                    retry_safe = _stage6_bright_core_retry_passed(
+                        retry_quality
+                    )
+                    bright_core_retry.update(
+                        {
+                            "accepted": retry_safe,
+                            "status": "accepted" if retry_safe else "rejected",
+                            "quality_status": retry_quality.get("status"),
+                            "bright_core_integrity": retry_bright_core,
+                        }
+                    )
+                    selected_quality = retry_quality
+                    starmask_cleanup = retry_cleanup
+                    if retry_safe:
+                        quality_records[0]["final_selection_state"] = (
+                            "superseded_by_bright_core_recovery"
+                        )
+                        retry_quality["final_selection_state"] = "selected"
+                        stage_messages.append(
+                            "zenith_bright_core_ihs_recovery passed all Stage 6 "
+                            "quality and bright-core gates"
+                        )
+                    else:
+                        retry_quality["final_selection_state"] = (
+                            "rejected_bright_core_integrity"
+                        )
+                        bright_core_retry_terminal_failure = True
+                        stage_messages.append(
+                            "zenith_bright_core_ihs_recovery rejected; bad pair "
+                            "will be purged without restoring the baseline"
+                        )
+                else:
+                    bright_core_retry_terminal_failure = True
+                    bright_core_retry.update(
+                        {
+                            "status": "failed",
+                            "failure_reason": (
+                                getattr(pipeline, "_last_plugin_script_error", None)
+                                or "SyQon recovery unavailable"
+                            ),
+                        }
+                    )
+                    stage_messages.append(
+                        "zenith_bright_core_ihs_recovery failed or timed out; "
+                        "baseline pair remains rejected"
+                    )
+            else:
+                bright_core_retry_terminal_failure = True
+                bright_core_retry["status"] = bright_core_retry_plan["status"]
+                if bright_core_retry_plan["status"] == "direct_reject":
+                    stage_messages.append(
+                        "BRIGHT_CORE_INTEGRITY reference/ROI is unavailable; "
+                        "strict target is rejected without an IHS retry"
+                    )
+                else:
+                    stage_messages.append(
+                        "BRIGHT_CORE_INTEGRITY rejection cannot recover: "
+                        + (
+                            "stage7_quality_retry_max=0"
+                            if retry_max <= 0
+                            else "SyQon recovery profile unavailable"
+                        )
+                    )
+
         best_quality = selected_quality
         best_cleanup = starmask_cleanup
         best_snapshot = (
@@ -1325,9 +1705,14 @@ def run_stage6_star_separation(pipeline) -> None:
 
         repair_triggers = pipeline._stage7_repair_triggers(selected_quality)
         quality_failure_codes = _syqon_quality_failure_codes(repair_triggers)
-        parameter_retries_done = 0
+        if (
+            bright_core_retry.get("eligible")
+            and "BRIGHT_CORE_INTEGRITY" not in quality_failure_codes
+        ):
+            quality_failure_codes.append("BRIGHT_CORE_INTEGRITY")
         if (
             selected_quality["status"] != "ok"
+            and not bright_core_retry_terminal_failure
             and bool(pipeline.cfg.stage7_conservative_repair_enabled)
             and failure_action == "auto_fallback"
         ):
@@ -1350,6 +1735,7 @@ def run_stage6_star_separation(pipeline) -> None:
         if (
             selected_quality
             and pixel_repair_trigger.get("triggered")
+            and not bright_core_retry_terminal_failure
             and bool(getattr(pipeline.cfg, "stage7_starless_pixel_repair_enabled", True))
             and failure_action == "auto_fallback"
         ):
@@ -1514,6 +1900,8 @@ def run_stage6_star_separation(pipeline) -> None:
         pipeline._stage6_starmask_borderline_review_required = (
             cleanup_borderline and not cleanup_hard_failed
         )
+        if pipeline._stage6_starmask_borderline_review_required:
+            pipeline._require_review(6, "starmask_cleanup_borderline")
         if cleanup_hard_failed:
             pipeline.starmask_file = None
             stage_messages.append(
@@ -1561,6 +1949,7 @@ def run_stage6_star_separation(pipeline) -> None:
             selected_quality
             and selected_quality.get("status") == "ok"
             and not final_quality_failure["hard_failed"]
+            and not bright_core_retry_terminal_failure
             and pipeline.starless_file
             and not cleanup_hard_failed
         )
@@ -1569,11 +1958,22 @@ def run_stage6_star_separation(pipeline) -> None:
             and pipeline.starless_file
             and pipeline.starless_file.is_file()
         )
-        poor_candidate_retained = bool(
-            final_quality_failure["hard_failed"]
-            and syqon_pair_valid
+        poor_candidate_retained = _stage6_can_retain_hard_failed_pair(
+            final_quality_failure,
+            pair_valid=syqon_pair_valid,
+            bright_core_retry_terminal_failure=(
+                bright_core_retry_terminal_failure
+            ),
         )
         separation_accepted = quality_gate_passed or poor_candidate_retained
+        pipeline._bright_core_with_stars_fallback = (
+            _stage6_bright_core_with_stars_fallback_contract(
+                pipeline,
+                selected_quality,
+                bright_core_retry,
+                separation_accepted=separation_accepted,
+            )
+        )
         pipeline._stage6_quality_hard_failed_retained = poor_candidate_retained
         pipeline._stage6_quality_failure_codes = quality_failure_codes
         pipeline._star_separation_state = (
@@ -1584,7 +1984,7 @@ def run_stage6_star_separation(pipeline) -> None:
             else StarSeparationState.REJECTED.value
         )
         if poor_candidate_retained:
-            pipeline._background_review_required = True
+            pipeline._require_review(6, "stage6_quality_hard_failed_retained")
             pipeline._stage8_conservative_mode = True
             stage_messages.append(
                 "stage6_quality_hard_failed_retained: keeping the best "
@@ -1593,7 +1993,7 @@ def run_stage6_star_separation(pipeline) -> None:
         if not separation_accepted:
             pipeline._stage7_starless_skipped = True
             if failure_action != "auto_fallback":
-                pipeline._background_review_required = True
+                pipeline._require_review(6, "star_separation_candidate_rejected")
                 if hasattr(pipeline, "_record_stage_policy_event"):
                     pipeline._record_stage_policy_event(
                         6,
@@ -1656,6 +2056,20 @@ def run_stage6_star_separation(pipeline) -> None:
                 }
             )
 
+        for quality_record in quality_records:
+            if "final_selection_state" in quality_record:
+                continue
+            if quality_record is selected_quality and separation_accepted:
+                quality_record["final_selection_state"] = (
+                    "retained_for_review"
+                    if poor_candidate_retained
+                    else "selected"
+                )
+            elif quality_record is selected_quality:
+                quality_record["final_selection_state"] = "rejected"
+            else:
+                quality_record["final_selection_state"] = "not_selected"
+
         pipeline._write_stage_json(
             "stage6_starless_quality.json",
             {
@@ -1680,6 +2094,13 @@ def run_stage6_star_separation(pipeline) -> None:
                 "automatic_quality_retries": parameter_retries_done,
                 "quality_failure_codes": quality_failure_codes,
                 "quality_hard_failed_retained": poor_candidate_retained,
+                "bright_core_integrity": (
+                    (selected_quality or {}).get("bright_core_integrity")
+                ),
+                "bright_core_retry": bright_core_retry,
+                "bright_core_with_stars_fallback": (
+                    pipeline._bright_core_with_stars_fallback
+                ),
                 "pair_verification": pair_verification,
             },
         )
@@ -1784,6 +2205,7 @@ def run_stage6_star_separation(pipeline) -> None:
                     "backend_policy": backend_policy,
                     "failure_action": failure_action,
                 },
+                review_reasons=pipeline._stage_review_reasons(6),
             )
         else:
             if stage_message_text:
@@ -1803,7 +2225,7 @@ def run_stage6_star_separation(pipeline) -> None:
         pipeline._stage8_conservative_mode = True
         pipeline._star_separation_state = StarSeparationState.TOOL_FAILED.value
         if failure_action != "auto_fallback":
-            pipeline._background_review_required = True
+            pipeline._require_review(6, "star_separation_tool_failed")
             if hasattr(pipeline, "_record_stage_policy_event"):
                 pipeline._record_stage_policy_event(
                     6,
@@ -1859,6 +2281,9 @@ def run_stage6_star_separation(pipeline) -> None:
                 "conservative_inputs": locals().get("conservative_input_records", []),
                 "stage8_handoff": pipeline._stage8_handoff,
                 "retry_max": pipeline.cfg.stage7_quality_retry_max,
+                "bright_core_with_stars_fallback": (
+                    pipeline._bright_core_with_stars_fallback
+                ),
             },
         )
         pipeline._export_sasp_exchange_files()
@@ -1887,4 +2312,18 @@ def run_stage6_star_separation(pipeline) -> None:
                 "failure_action": failure_action,
                 "output": "stage6_passthrough" if stage_saved else None,
             },
+            review_reasons=(
+                pipeline._stage_review_reasons(6)
+                if failure_action != "stop"
+                else []
+            ),
+            issues=[
+                {
+                    "component": "star_separation",
+                    "severity": "fatal" if failure_action == "stop" else "error",
+                    "code": "star_separation_tool_failed",
+                    "recovered": bool(stage_saved and failure_action != "stop"),
+                    "message": pipeline._short_text(e, 180),
+                }
+            ],
         )

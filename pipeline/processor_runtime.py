@@ -28,6 +28,7 @@ import stage3_contract
 import stage7_quality
 import stage7_repair
 import stage8_pixels
+import outcome
 from channel_semantics import channel_shape_dict, classify_channel_semantics
 from dualband_palette import PALETTE_CHANNELS, resolve_palette_selection
 from input_profile import infer_input_profile
@@ -517,6 +518,64 @@ def _read_fits_stage_fingerprint(path: Path) -> Dict[str, Any]:
 
 
 class ProcessorRuntimeMixin:
+    def _ensure_review_registry(self) -> Dict[Tuple[int, str], Dict[str, Any]]:
+        registry = getattr(self, "_review_requirements", None)
+        if not isinstance(registry, dict):
+            registry = {}
+            self._review_requirements = registry
+        return registry
+
+    def _require_review(
+        self,
+        stage: int,
+        code: str,
+        details: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        requirement = outcome.normalize_review_requirement(
+            {"stage": stage, "code": code, "details": dict(details or {})}
+        )
+        self._ensure_review_registry()[
+            (requirement["stage"], requirement["code"])
+        ] = requirement
+        for result in reversed(getattr(self, "results", []) or []):
+            match = re.match(
+                r"^阶段\s+(\d+)\s*:",
+                str(getattr(result, "name", "")).strip(),
+            )
+            if match and int(match.group(1)) == int(requirement["stage"]):
+                reasons = getattr(result, "review_reasons", None)
+                if isinstance(reasons, list) and requirement["code"] not in reasons:
+                    reasons.append(str(requirement["code"]))
+                break
+        return copy.deepcopy(requirement)
+
+    def _clear_stage_reviews(self, stage: int) -> None:
+        stage_number = int(stage)
+        registry = self._ensure_review_registry()
+        self._review_requirements = {
+            key: value for key, value in registry.items() if key[0] != stage_number
+        }
+
+    def _stage_review_reasons(self, stage: int) -> List[str]:
+        stage_number = int(stage)
+        return [
+            str(value["code"])
+            for key, value in self._ensure_review_registry().items()
+            if key[0] == stage_number
+        ]
+
+    def _review_requirements_payload(
+        self,
+        *,
+        through_stage: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        limit = int(through_stage) if through_stage is not None else 10
+        return [
+            copy.deepcopy(value)
+            for key, value in sorted(self._ensure_review_registry().items())
+            if key[0] <= limit
+        ]
+
     def _stage_failure_action(self, stage_number: int) -> str:
         value = str(
             getattr(
@@ -574,9 +633,14 @@ class ProcessorRuntimeMixin:
             source=source,
         )
         if action == "preserve_review":
+            self._require_review(
+                int(stage_number),
+                "failure_policy_preserve_review",
+                {"reason": str(reason), "source": str(source)},
+            )
             if int(stage_number) == 2:
                 self._stage2_view_review_required = True
-            else:
+            elif int(stage_number) == 3:
                 self._background_review_required = True
             return action
         if action == "stop":
@@ -2220,18 +2284,20 @@ class ProcessorRuntimeMixin:
                     expected_sha256 = str(resume.get("sha256") or "")
                     semantic_context = None
                     semantic_error = None
-                    if resume_stage == 5:
+                    if resume_stage in {2, 5}:
                         try:
                             semantic_context = (
                                 task_workspace._normalize_resume_semantic_context(
                                     resume.get("semantic_context"),
-                                    stage_number=5,
+                                    stage_number=resume_stage,
                                 )
                             )
                         except task_workspace.WorkspaceError as error:
                             semantic_error = str(error)
                         if semantic_context is None and semantic_error is None:
-                            semantic_error = "Stage 5 semantic context is missing"
+                            semantic_error = (
+                                f"Stage {resume_stage} semantic context is missing"
+                            )
                     if resume_stage != expected_stage or contract_record is None:
                         task_result["detail"] = "task-run resume stage does not match mode"
                     elif str(resume.get("artifact") or "") != (
@@ -2246,7 +2312,7 @@ class ProcessorRuntimeMixin:
                         task_result["detail"] = "task-run checkpoint SHA-256 mismatch"
                     elif semantic_error is not None:
                         task_result["detail"] = (
-                            "task-run Stage 5 semantic context is invalid: "
+                            f"task-run Stage {resume_stage} semantic context is invalid: "
                             + semantic_error
                         )
                     else:
@@ -2269,7 +2335,7 @@ class ProcessorRuntimeMixin:
                             }
                         )
                         self._task_resume_checkpoint_path = checkpoint_path
-                        if resume_stage == 5:
+                        if resume_stage in {2, 5}:
                             self._resume_semantic_context = copy.deepcopy(
                                 semantic_context
                             )
@@ -2309,15 +2375,91 @@ class ProcessorRuntimeMixin:
 
     def _apply_trusted_resume_semantics(self) -> bool:
         """Restore Stage 1-5 meaning after fresh image profiling on resume."""
-        if self.input_mode != INPUT_MODE_LINEAR_RESUME:
+        expected_stage = {
+            INPUT_MODE_STAGE2_CORRECTED_RESUME: 2,
+            INPUT_MODE_LINEAR_RESUME: 5,
+        }.get(self.input_mode)
+        if expected_stage is None:
             return False
         context = getattr(self, "_resume_semantic_context", None)
         if (
             isinstance(context, Mapping)
             and str(context.get("schema") or "")
-            == "starun.resume-semantics.v1"
-            and int(context.get("checkpoint_stage", 0) or 0) == 5
+            == task_workspace.RESUME_SEMANTIC_SCHEMA
+            and int(context.get("checkpoint_stage", 0) or 0) == expected_stage
         ):
+            review_requirements = context.get("review_requirements") or []
+            if not isinstance(review_requirements, list):
+                raise RuntimeError(
+                    f"已验签 Stage {expected_stage} 复核语义无效"
+                )
+            for requirement in review_requirements:
+                if not isinstance(requirement, Mapping):
+                    continue
+                self._require_review(
+                    int(requirement.get("stage", 0) or 0),
+                    str(requirement.get("code") or ""),
+                    requirement.get("details")
+                    if isinstance(requirement.get("details"), Mapping)
+                    else {},
+                )
+            self._stage2_view_review_required = bool(
+                self._stage_review_reasons(2)
+            )
+            self._background_review_required = bool(
+                self._stage_review_reasons(3)
+            )
+            self._stage4_color_review_required = bool(
+                self._stage_review_reasons(4)
+            )
+
+            if expected_stage == 2:
+                stage2_crop = context.get("stage2_crop")
+                if not isinstance(stage2_crop, Mapping):
+                    raise RuntimeError("已验签 Stage 2 语义缺少裁切契约")
+                restored_crop = copy.deepcopy(dict(stage2_crop))
+                restored_crop.update(
+                    {
+                        "mode": "verified_stage2_checkpoint_resume",
+                        "original_shape": copy.deepcopy(
+                            dict(stage2_crop.get("original_dimensions") or {})
+                        ),
+                        "current_shape": copy.deepcopy(
+                            dict(stage2_crop.get("final_dimensions") or {})
+                        ),
+                        "final_shape": copy.deepcopy(
+                            dict(stage2_crop.get("final_dimensions") or {})
+                        ),
+                        "total_crop": copy.deepcopy(
+                            dict(stage2_crop.get("cumulative_crop") or {})
+                        ),
+                        "requires_review": bool(self._stage_review_reasons(2)),
+                        "field_rotation": {
+                            "actual_passes": int(
+                                stage2_crop.get("field_rotation_passes", 0) or 0
+                            ),
+                            "max_passes": int(
+                                stage2_crop.get("field_rotation_max_passes", 2)
+                                or 2
+                            ),
+                            "residual": copy.deepcopy(
+                                dict(
+                                    stage2_crop.get("final_residual_detection")
+                                    or {}
+                                )
+                            ),
+                        },
+                    }
+                )
+                self.stage2_crop_report = restored_crop
+                self._resume_semantic_context_status = "restored"
+                self.log.info(
+                    "[ResumeSemantics] restored Stage 2 crop contract: "
+                    f"passes={stage2_crop.get('field_rotation_passes', 0)}, "
+                    f"reviews={len(self._stage_review_reasons(2))}"
+                )
+                return True
+
             channel_semantics = str(
                 context.get("channel_semantics") or "unknown"
             )
@@ -2334,7 +2476,6 @@ class ProcessorRuntimeMixin:
             stage5_star_reference_report = context.get(
                 "stage5_star_reference_report"
             ) or {}
-            upstream_review = context.get("upstream_review") or {}
             if not all(
                 isinstance(value, Mapping)
                 for value in (
@@ -2342,7 +2483,6 @@ class ProcessorRuntimeMixin:
                     target_profile,
                     pipeline_policy,
                     color_report,
-                    upstream_review,
                 )
             ):
                 raise RuntimeError(
@@ -2372,18 +2512,6 @@ class ProcessorRuntimeMixin:
                 self.color_calibration_report["channel_mapping"] = copy.deepcopy(
                     restored_mapping
                 )
-                self._stage2_view_review_required = bool(
-                    upstream_review.get(
-                        "stage2_view_review_required",
-                        False,
-                    )
-                )
-                self._background_review_required = bool(
-                    upstream_review.get("background_review_required", False)
-                )
-                self._stage4_color_review_required = bool(
-                    upstream_review.get("color_review_required", False)
-                )
                 self._resume_semantic_context_status = "restored"
                 physical = self.color_calibration_report.get("physical_color") or {}
                 physical_accepted = bool(
@@ -2399,7 +2527,9 @@ class ProcessorRuntimeMixin:
                 )
                 return True
 
-        raise RuntimeError("Stage 5 续跑缺少已验签语义契约")
+        raise RuntimeError(
+            f"Stage {expected_stage} 续跑缺少已验签语义契约"
+        )
 
 
     def _processing_plan_input_path(self) -> Optional[Path]:
@@ -2949,48 +3079,42 @@ class ProcessorRuntimeMixin:
             return False
 
 
-    def _pipeline_result_status(self, failure_reason: Optional[str] = None) -> str:
-        if failure_reason or any(result.status == "failed" for result in self.results):
-            return "failed"
-        review_required = bool(
-            getattr(self, "_input_state_review_route", False)
-            or getattr(self, "_final_output_review_only", False)
-            or getattr(self, "_stage2_view_review_required", False)
-            or getattr(self, "_background_review_required", False)
-            or getattr(self, "_stage4_color_review_required", False)
-            or (
-                getattr(
-                    self,
-                    "_stage7_background_color_review_required",
-                    False,
-                )
-                and not getattr(
-                    self,
-                    "_stage7_stretch_forced_delivery",
-                    False,
-                )
-            )
-            or getattr(
-                self,
-                "_stage6_starmask_borderline_review_required",
-                False,
-            )
-            or getattr(self, "_stage9_psf_review_required", False)
-            or getattr(self, "_stage9_review_candidate_selected", False)
-            or (
-                bool(getattr(self, "_stage9_stars_required", False))
-                and not bool(getattr(self, "_stage9_stars_applied", False))
-            )
-        )
-        if review_required:
-            return "review_required"
-        if any(
-            result.status == "degraded"
-            or result.fallback_used
+    @staticmethod
+    def _result_stage_number(result: StageResult) -> int:
+        match = re.match(r"^阶段\s+(\d+)\s*:", str(result.name).strip())
+        return int(match.group(1)) if match else 0
+
+    def _actual_steps_payload(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "stage": self._result_stage_number(result),
+                "name": result.name,
+                "status": result.status,
+                "display_status": result.display_status,
+                "execution": result.execution,
+                "fallback_used": result.fallback_used,
+                "upstream_passthrough": result.upstream_passthrough,
+                "reason_code": result.reason_code or None,
+                "review_required": bool(result.review_reasons),
+                "review_reasons": list(result.review_reasons),
+                "issues": list(result.issues),
+                "duration_seconds": float(result.duration),
+                "message": result.message,
+                "details": result.details,
+                "components": result.components,
+            }
             for result in self.results
-        ):
-            return "partial_success"
-        return "success"
+        ]
+
+    def _pipeline_outcome(self, failure_reason: Optional[str] = None) -> Dict[str, Any]:
+        return outcome.summarize_outcome(
+            self._actual_steps_payload(),
+            self._review_requirements_payload(),
+            failure_reason=failure_reason,
+        )
+
+    def _pipeline_result_status(self, failure_reason: Optional[str] = None) -> str:
+        return str(self._pipeline_outcome(failure_reason)["status"])
 
 
     def _write_pipeline_result_manifest(
@@ -3024,9 +3148,16 @@ class ProcessorRuntimeMixin:
             exported_after=getattr(self, "_final_export_started_at", None),
         )
 
-        status = self._pipeline_result_status(failure_reason)
+        actual_steps = self._actual_steps_payload()
+        review_requirements = self._review_requirements_payload()
+        outcome_summary = outcome.summarize_outcome(
+            actual_steps,
+            review_requirements,
+            failure_reason=failure_reason,
+        )
+        status = str(outcome_summary["status"])
         manifest: Dict[str, Any] = {
-            "schema": "starun.pipeline-result.v1",
+            "schema": outcome.PIPELINE_RESULT_SCHEMA_V2,
             "run_id": getattr(self, "_run_id", None),
             "generated_at": run_manifest.utc_timestamp(),
             "status": status,
@@ -3040,20 +3171,7 @@ class ProcessorRuntimeMixin:
                 getattr(self, "narrowband_channel_mapping", {}) or {}
             ),
             "target_profile": dict(getattr(self, "target_profile", {}) or {}),
-            "review_requirements": {
-                "stage2_view_review_required": bool(
-                    getattr(self, "_stage2_view_review_required", False)
-                ),
-                "stage3_background_review_required": bool(
-                    getattr(self, "_background_review_required", False)
-                ),
-                "stage9_psf_review_required": bool(
-                    getattr(self, "_stage9_psf_review_required", False)
-                ),
-                "stage9_review_candidate_selected": bool(
-                    getattr(self, "_stage9_review_candidate_selected", False)
-                ),
-            },
+            "review_requirements": review_requirements,
             "color_calibration": {
                 "status": str(
                     (getattr(self, "color_calibration_report", {}) or {}).get(
@@ -3065,19 +3183,8 @@ class ProcessorRuntimeMixin:
                     "method"
                 ),
                 "requires_review": bool(
-                    getattr(self, "_stage4_color_review_required", False)
-                    or (
-                        getattr(
-                            self,
-                            "_stage7_background_color_review_required",
-                            False,
-                        )
-                        and not getattr(
-                            self,
-                            "_stage7_stretch_forced_delivery",
-                            False,
-                        )
-                    )
+                    self._stage_review_reasons(4)
+                    or self._stage_review_reasons(7)
                 ),
                 "stage7_forced_delivery": bool(
                     getattr(
@@ -3158,6 +3265,16 @@ class ProcessorRuntimeMixin:
                 "remix_formally_accepted": bool(
                     getattr(self, "_stage9_remix_formally_accepted", False)
                 ),
+                "delivery_contract_accepted": bool(
+                    getattr(
+                        self,
+                        "_stage9_star_delivery_contract_accepted",
+                        False,
+                    )
+                ),
+                "with_stars_hdr_fallback": copy.deepcopy(
+                    getattr(self, "_bright_core_with_stars_fallback", {}) or {}
+                ),
                 "review_candidate_selected": bool(
                     getattr(self, "_stage9_review_candidate_selected", False)
                 ),
@@ -3170,22 +3287,7 @@ class ProcessorRuntimeMixin:
                     "pending",
                 ),
             },
-            "actual_steps": [
-                {
-                    "name": result.name,
-                    "status": result.status,
-                    "display_status": result.display_status,
-                    "execution": result.execution,
-                    "fallback_used": result.fallback_used,
-                    "upstream_passthrough": result.upstream_passthrough,
-                    "reason_code": result.reason_code or None,
-                    "duration_seconds": float(result.duration),
-                    "message": result.message,
-                    "details": result.details,
-                    "components": result.components,
-                }
-                for result in self.results
-            ],
+            "actual_steps": actual_steps,
             "stage_policy_events": list(
                 getattr(self, "_stage_policy_events", []) or []
             ),
@@ -3194,6 +3296,21 @@ class ProcessorRuntimeMixin:
                 getattr(self, "_checkpoint_retention_report", {}) or {}
             ),
         }
+        manifest.update(
+            {
+                key: outcome_summary[key]
+                for key in (
+                    "had_errors",
+                    "had_fatal_errors",
+                    "had_degradations",
+                    "had_fallbacks",
+                    "review_required",
+                    "issues",
+                    "errors",
+                    "outcome_counts",
+                )
+            }
+        )
         manifest["manifest_hash"] = run_manifest.canonical_payload_hash(manifest)
         self._pipeline_result_manifest = manifest
         self._pipeline_result_global_status = status

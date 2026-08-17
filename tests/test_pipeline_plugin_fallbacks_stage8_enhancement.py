@@ -4,6 +4,37 @@ from tests.pipeline_plugin_fallbacks_support import *  # noqa: F401,F403
 
 
 class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBase):
+    def test_stage8_legacy_accepted_hdr_state_is_review_passthrough(self):
+        processor = self._new_processor()
+        processor._star_separation_state = (
+            pipeline_module.StarSeparationState.REJECTED.value
+        )
+        processor._stage7_stretch_accepted = True
+        processor._stage7_stretch_output = "stage7_with_stars_hdr"
+        processor._bright_core_with_stars_fallback = {
+            "eligible": True,
+            "accepted": True,
+            "status": "accepted",
+            "output_stem": "stage7_with_stars_hdr",
+        }
+
+        stage8_nebula_enhancement(processor)
+
+        self.assertEqual(
+            processor._stage8_final_source,
+            "stage8_review_with_stars",
+        )
+        self.assertEqual(
+            processor._stage8_final_quality,
+            "star_separation_unavailable",
+        )
+        self.assertTrue(processor._stage8_fallback_used)
+        self.assertTrue(processor._stage8_handoff["restricted_downstream"])
+        self.assertEqual(processor.results[-1][1], "degraded")
+        report = processor.stage_json_reports["stage8_enhancement_report.json"]
+        self.assertEqual(report["mode"], "with_stars_review_passthrough")
+        self.assertFalse(report["starless_enhancement_applied"])
+
     def test_stage8_applies_blue_guard_when_starless_layer_is_too_blue(self):
         processor = self._new_processor()
         processor._channel_semantics = "broadband_rgb_osc"

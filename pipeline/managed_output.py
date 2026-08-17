@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, Optional
 
 import numpy as np
 
+import display_rendition
 
 MANAGED_OUTPUT_SCHEMA = "starun.managed-output.v1"
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -321,6 +322,10 @@ def audit_display_visibility(
         max(broad_contrast_p95, broad_contrast_p99) >= 0.04
         and broad_signal_coverage >= 0.003
     )
+    latent_extended_subject_mappable = bool(
+        max(broad_contrast_p95, broad_contrast_p99) >= 0.005
+        and broad_signal_coverage >= 0.003
+    )
     star_passed = bool(
         peak_count >= 3
         and peak_luminance_median >= 0.20
@@ -331,11 +336,39 @@ def audit_display_visibility(
         or extended_passed
         or star_passed
     )
+    required_subject_mappable = bool(
+        not extended_required
+        or extended_passed
+        or latent_extended_subject_mappable
+    )
+    underexposed = bool(
+        median < 0.10
+        or p90 < 0.18
+        or black_ratio > 0.80
+    )
+    overexposed = bool(
+        p10 > 0.35
+        or median > 0.45
+        or white_ratio > 0.20
+    )
+    if overexposed:
+        exposure_state = "overexposed"
+    elif not scene_content_visible or not required_subject_mappable:
+        exposure_state = "unmappable"
+    elif underexposed:
+        exposure_state = "underexposed"
+    else:
+        exposure_state = "acceptable"
     brightness_passed = bool(
         median >= 0.10
         and p90 >= 0.18
         and scene_content_visible
         and black_ratio <= 0.80
+        and white_ratio <= 0.20
+    )
+    upper_bounds_passed = bool(
+        p10 <= 0.35
+        and median <= 0.45
         and white_ratio <= 0.20
     )
     checks: Dict[str, Dict[str, Any]] = {
@@ -348,6 +381,15 @@ def audit_display_visibility(
                 "visible_scene_required": True,
                 "sparse_signal_p999_minus_p10_min": 0.08,
                 "black_pixel_ratio_max": 0.80,
+                "white_clip_ratio_max": 0.20,
+            },
+        },
+        "exposure_upper_bounds": {
+            "required": True,
+            "passed": upper_bounds_passed,
+            "thresholds": {
+                "luminance_p10_max": 0.35,
+                "luminance_median_max": 0.45,
                 "white_clip_ratio_max": 0.20,
             },
         },
@@ -391,6 +433,7 @@ def audit_display_visibility(
         "schema": "starun.display-visibility.v1",
         "status": "passed" if not failed_checks else "failed",
         "passed": not failed_checks,
+        "exposure_state": exposure_state,
         "target_type": target or "unknown",
         "stars_required": bool(stars_required),
         "metrics": {
@@ -406,8 +449,14 @@ def audit_display_visibility(
             "p99_minus_p10": _rounded(display_range),
             "p999_minus_p10": _rounded(sparse_signal_range),
             "scene_content_visible": scene_content_visible,
+            "required_subject_mappable": required_subject_mappable,
+            "latent_extended_subject_mappable": (
+                latent_extended_subject_mappable
+            ),
             "black_pixel_ratio": _rounded(black_ratio),
             "white_clip_ratio": _rounded(white_ratio),
+            "underexposed": underexposed,
+            "overexposed": overexposed,
             "broad_signal_contrast_p95": _rounded(broad_contrast_p95),
             "broad_signal_contrast_p99": _rounded(broad_contrast_p99),
             "broad_signal_coverage": _rounded(broad_signal_coverage),
@@ -422,38 +471,14 @@ def audit_display_visibility(
 
 
 def _linked_visibility_stretch(rgb: np.ndarray) -> tuple[np.ndarray, Dict[str, Any]]:
-    """Apply a linked observer-only mapping comparable to review previews."""
+    """Build and replay the single bounded v2 mapping for a dark source."""
     arr = np.asarray(rgb, dtype=np.float32)
-    luminance = _display_luminance(arr)
-    median = float(np.median(luminance))
-    luminance_mad = float(np.median(np.abs(luminance - median)))
-    percentile_high = float(np.quantile(luminance, 0.995))
-    high_floor = median + max(6.0 * luminance_mad, 0.05)
-    high = max(percentile_high, high_floor, 1e-6)
-    normalized = np.clip(arr / high, 0.0, 1.0)
-    normalized_luminance = np.clip(luminance / high, 0.0, 1.0)
-    stretched_luminance = np.sqrt(normalized_luminance).astype(
-        np.float32,
-        copy=False,
+    contract = display_rendition.build_linked_review_contract(
+        arr,
+        reason="managed_output_underexposed_source",
+        source_stem="stage10_final",
     )
-    gain = np.divide(
-        stretched_luminance,
-        normalized_luminance,
-        out=np.zeros_like(stretched_luminance),
-        where=normalized_luminance > 1e-7,
-    )
-    stretched = np.clip(normalized * gain[None, :, :], 0.0, 1.0)
-    return stretched, {
-        "name": "linked_review_visibility_stretch",
-        "observer_only": True,
-        "high_percentile": 0.995,
-        "high_point": _rounded(high),
-        "percentile_high_point": _rounded(percentile_high),
-        "minimum_high_point": _rounded(high_floor),
-        "luminance_gamma": 0.5,
-        "source_pixels_changed": False,
-        "derivative_pixels_changed": True,
-    }
+    return display_rendition.apply_review_contract(arr, contract), contract
 
 
 def _valid_icc_profile(data: bytes) -> bool:
@@ -605,6 +630,7 @@ def export_managed_outputs(
     icc_profile_bytes: Optional[bytes] = None,
     target_type: str = "",
     stars_required: bool = False,
+    display_contract: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Export independently audited display/edit assets without touching FITS."""
     root = Path(work_dir)
@@ -634,16 +660,40 @@ def export_managed_outputs(
                 stars_required=stars_required,
             )
             display_rgb = source_rgb
-            display_transform = {
-                "name": "preserve_accepted_nonlinear_rendering",
-                "observer_only": True,
-                "source_pixels_changed": False,
-                "derivative_pixels_changed": False,
-            }
-            if not bool(input_visibility.get("passed", False)):
-                display_rgb, display_transform = _linked_visibility_stretch(
-                    source_rgb
+            if display_contract is not None:
+                if not display_rendition.validate_review_contract(
+                    display_contract
+                ):
+                    raise ValueError("required Review display contract is invalid")
+                display_rgb = display_rendition.apply_review_contract(
+                    source_rgb,
+                    display_contract,
                 )
+                display_transform = dict(display_contract)
+            else:
+                display_transform = {
+                    "name": "preserve_accepted_nonlinear_rendering",
+                    "observer_only": True,
+                    "source_pixels_changed": False,
+                    "derivative_pixels_changed": False,
+                }
+                if (
+                    not bool(input_visibility.get("passed", False))
+                    and input_visibility.get("exposure_state") == "underexposed"
+                ):
+                    display_rgb, display_transform = _linked_visibility_stretch(
+                        source_rgb
+                    )
+                elif not bool(input_visibility.get("passed", False)):
+                    display_transform = {
+                        "name": "preserve_unmappable_or_overexposed_source",
+                        "observer_only": True,
+                        "source_pixels_changed": False,
+                        "derivative_pixels_changed": False,
+                        "reason": str(
+                            input_visibility.get("exposure_state") or "unknown"
+                        ),
+                    }
             _write_display_rgb_png(display_path, display_rgb)
             wrote_display = True
             final_visibility = audit_display_visibility(
@@ -659,6 +709,41 @@ def export_managed_outputs(
                 "input_pixels": input_visibility,
                 "final_png": final_visibility,
                 "transform": display_transform,
+                "brightening_decision": {
+                    "allowed": bool(
+                        input_visibility.get("exposure_state")
+                        == "underexposed"
+                    ),
+                    "input_exposure_state": str(
+                        input_visibility.get("exposure_state") or "unmappable"
+                    ),
+                    "refused_reason": (
+                        None
+                        if input_visibility.get("exposure_state")
+                        == "underexposed"
+                        else "brightening_requires_underexposed_input"
+                    ),
+                    "lower_bounds": dict(
+                        (
+                            input_visibility.get("checks", {}).get(
+                                "pixel_brightness",
+                                {},
+                            )
+                            or {}
+                        ).get("thresholds")
+                        or {}
+                    ),
+                    "upper_bounds": dict(
+                        (
+                            input_visibility.get("checks", {}).get(
+                                "exposure_upper_bounds",
+                                {},
+                            )
+                            or {}
+                        ).get("thresholds")
+                        or {}
+                    ),
+                },
             }
             if not bool(final_visibility["passed"]):
                 display_path.unlink(missing_ok=True)
@@ -773,6 +858,11 @@ def export_managed_outputs(
             "working_primaries_assumption": "sRGB",
         },
         "display_visibility": display_visibility,
+        "display_rendition_contract": (
+            dict(display_contract)
+            if isinstance(display_contract, dict)
+            else None
+        ),
         "scientific_archive": {
             "policy": "never_rewrite",
             "hashes_before": hashes_before,

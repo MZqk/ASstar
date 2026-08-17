@@ -137,6 +137,31 @@ def _stage4_integration_fixture(
     pipeline.work_dir = REPO_ROOT
     pipeline.source_file = REPO_ROOT / "M42.fit"
     pipeline.pipeline_policy = {}
+    pipeline._review_requirements = {}
+    pipeline._clear_stage_reviews = lambda stage: setattr(
+        pipeline,
+        "_review_requirements",
+        {
+            key: value
+            for key, value in pipeline._review_requirements.items()
+            if key[0] != int(stage)
+        },
+    )
+    pipeline._require_review = lambda stage, code, details=None: (
+        pipeline._review_requirements.setdefault(
+            (int(stage), str(code)),
+            {
+                "stage": int(stage),
+                "code": str(code),
+                "details": dict(details or {}),
+            },
+        )
+    )
+    pipeline._stage_review_reasons = lambda stage: [
+        value["code"]
+        for key, value in pipeline._review_requirements.items()
+        if key[0] == int(stage)
+    ]
     pipeline.target_profile = {
         "target_name_guess": "M42",
         "target_type": "bright_emission_reflection_nebula",
@@ -206,6 +231,51 @@ def _auto_reference_image() -> np.ndarray:
             )
             image += np.stack([star * 1.08, star, star * 0.92])
     return image
+
+
+def _strict_bright_core_image(size: int = 256) -> np.ndarray:
+    yy, xx = np.mgrid[:size, :size]
+    background = (
+        0.02
+        + 0.002 * xx / float(size)
+        + 0.001 * yy / float(size)
+    )
+    core = 0.50 * np.exp(
+        -(
+            (yy - size / 2.0) ** 2
+            + (xx - size / 2.0) ** 2
+        )
+        / (2.0 * (size * 0.09) ** 2)
+    )
+    return np.stack(
+        (
+            background + core,
+            background + 0.45 * core,
+            background + 0.28 * core,
+        )
+    ).astype(np.float32)
+
+
+def _strict_profile() -> dict:
+    return {
+        "target_name_guess": "M42",
+        "target_type": "bright_emission_reflection_nebula",
+        "secondary_labels": ["bright_core"],
+        "features": {"bright_core": True},
+        "risks": {"core_blowout": "high"},
+    }
+
+
+def _blue_flip_candidate(before: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    rec709 = np.asarray((0.2126, 0.7152, 0.0722), dtype=np.float64)
+    luminance = np.tensordot(rec709, before, axes=(0, 0))
+    direction = np.asarray((0.05, 0.15, 0.80), dtype=np.float64)
+    replacement = direction[:, None, None] * (
+        luminance / float(direction @ rec709)
+    )[None, :, :]
+    candidate = before.copy()
+    candidate[:, mask] = replacement[:, mask]
+    return candidate.astype(np.float32)
 
 
 class Stage4PccPolicyTests(unittest.TestCase):
@@ -1977,6 +2047,182 @@ class Stage4PccPolicyTests(unittest.TestCase):
             events.index("stage4_color_saved"),
             events.index("auto_reference_report_written"),
         )
+
+    def test_strict_m42_spcc_core_flip_is_repaired_without_forcing_review(self):
+        source = _strict_bright_core_image()
+        pipeline, saved, _commands, results = _stage4_integration_fixture(
+            image=source
+        )
+        pipeline.target_profile = _strict_profile()
+        mask = np.zeros(source.shape[1:], dtype=bool)
+        mask[126:129, 126:129] = True
+        bad_spcc = _blue_flip_candidate(source, mask)
+        pcc_calls = []
+
+        def spcc_success(**_kwargs):
+            saved[stage4.SPCC_CANDIDATE_STEM] = bad_spcc.copy()
+            return True, "spcc imprecise candidate"
+
+        pipeline._run_stage4_spcc_once = spcc_success
+        pipeline._run_stage4_pcc_once = lambda **kwargs: (
+            pcc_calls.append(kwargs) or True,
+            "pcc must not run after a valid local repair",
+        )
+
+        with patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False):
+            stage4.run_stage4_color_calibration(pipeline)
+
+        report = pipeline.color_calibration_report
+        integrity = report["bright_core_color_integrity"]
+        self.assertEqual(report["method"], "SPCC_LOCAL_CORE_CHROMA_ROLLBACK")
+        self.assertEqual(integrity["status"], "repaired")
+        self.assertTrue(integrity["repair"]["passed"])
+        self.assertFalse(report["requires_review"])
+        self.assertFalse(pcc_calls)
+        self.assertEqual(results[-1][0][1], "degraded")
+        self.assertTrue(results[-1][1]["fallback_used"])
+
+    def test_failed_strict_core_repair_rolls_back_before_pcc(self):
+        source = _strict_bright_core_image(80)
+        pipeline, saved, _commands, _results = _stage4_integration_fixture(
+            image=source
+        )
+        pipeline.target_profile = _strict_profile()
+        base_report, context = (
+            stage4.bright_core_color.assess_spcc_bright_core_color(
+                source,
+                source,
+                target_type="bright_emission_reflection_nebula",
+                target_profile=pipeline.target_profile,
+            )
+        )
+        self.assertEqual(base_report["roi"]["support_pixels"], 64)
+        bad_spcc = _blue_flip_candidate(source, context["roi"])
+        calibration_order = []
+
+        def spcc_success(**_kwargs):
+            calibration_order.append("spcc")
+            saved[stage4.SPCC_CANDIDATE_STEM] = bad_spcc.copy()
+            return True, "spcc bad core"
+
+        def pcc_success(**_kwargs):
+            calibration_order.append("pcc")
+            saved[stage4.PCC_CANDIDATE_STEM] = source.copy()
+            return True, "pcc ok"
+
+        pipeline._run_stage4_spcc_once = spcc_success
+        pipeline._run_stage4_pcc_once = pcc_success
+
+        with patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False):
+            stage4.run_stage4_color_calibration(pipeline)
+
+        report = pipeline.color_calibration_report
+        integrity = report["bright_core_color_integrity"]
+        self.assertEqual(calibration_order, ["spcc", "pcc"])
+        self.assertEqual(report["method"], "PCC")
+        self.assertEqual(integrity["status"], "ok")
+        self.assertEqual(
+            integrity["final_action"],
+            "bad_spcc_rejected_and_safe_fallback_selected",
+        )
+        self.assertEqual(integrity["resolved_by"], "PCC")
+        self.assertEqual(integrity["spcc_assessment_status"], "hard_failed")
+        self.assertEqual(
+            integrity["spcc_assessment_final_action"],
+            "reject_spcc_to_pcc",
+        )
+        self.assertIn(
+            "broad_core_chroma_platform",
+            integrity["trigger_reasons"],
+        )
+        self.assertIn(
+            "broad_core_chroma_platform",
+            integrity["spcc_rejection_reasons"],
+        )
+        self.assertGreater(
+            integrity["measurements"]["anomaly_ratio_of_roi"],
+            0.02,
+        )
+        self.assertGreater(
+            integrity["measurements"][
+                "broad_platform_largest_component_ratio_of_roi"
+            ],
+            0.05,
+        )
+        np.testing.assert_array_equal(saved["stage4_color"], source)
+
+    def test_strict_broad_platform_in_pcc_preserves_precolor_input(self):
+        source = _strict_bright_core_image(80)
+        pipeline, saved, _commands, results = _stage4_integration_fixture(
+            image=source
+        )
+        pipeline.target_profile = _strict_profile()
+        _base_report, context = (
+            stage4.bright_core_color.assess_spcc_bright_core_color(
+                source,
+                source,
+                target_type="bright_emission_reflection_nebula",
+                target_profile=pipeline.target_profile,
+            )
+        )
+        broad_platform = _blue_flip_candidate(source, context["roi"])
+        calibration_order = []
+
+        def spcc_success(**_kwargs):
+            calibration_order.append("spcc")
+            saved[stage4.SPCC_CANDIDATE_STEM] = broad_platform.copy()
+            return True, "spcc bad core"
+
+        def pcc_success(**_kwargs):
+            calibration_order.append("pcc")
+            saved[stage4.PCC_CANDIDATE_STEM] = broad_platform.copy()
+            return True, "pcc bad core"
+
+        pipeline._run_stage4_spcc_once = spcc_success
+        pipeline._run_stage4_pcc_once = pcc_success
+
+        with (
+            patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False),
+            patch.object(
+                stage4,
+                "evaluate_auto_local_reference",
+                side_effect=AssertionError(
+                    "unsafe PCC must preserve the exact pre-color source"
+                ),
+            ),
+        ):
+            stage4.run_stage4_color_calibration(pipeline)
+
+        report = pipeline.color_calibration_report
+        integrity = report["bright_core_color_integrity"]
+        pcc_integrity = report["pcc"]["quality_gate"][
+            "bright_core_color_integrity"
+        ]
+        self.assertEqual(calibration_order, ["spcc", "pcc"])
+        self.assertEqual(report["method"], "PRESERVE_INPUT")
+        self.assertEqual(
+            report["warning"],
+            "pcc_bright_core_color_integrity_rejected_preserve_input",
+        )
+        self.assertFalse(report["pcc"]["quality_gate"]["accepted"])
+        self.assertIn(
+            "bright_core_color_integrity_rejected",
+            report["pcc"]["quality_gate"]["rejection_reasons"],
+        )
+        self.assertEqual(pcc_integrity["status"], "hard_failed")
+        self.assertIn(
+            "broad_core_chroma_platform",
+            pcc_integrity["trigger_reasons"],
+        )
+        self.assertEqual(integrity["status"], "ok")
+        self.assertEqual(integrity["resolved_by"], "PRESERVE_INPUT")
+        self.assertEqual(
+            integrity["pcc_fallback_assessment"]["status"],
+            "hard_failed",
+        )
+        np.testing.assert_array_equal(saved["stage4_color"], source)
+        self.assertEqual(results[-1][0][1], "degraded")
+        self.assertTrue(results[-1][1]["fallback_used"])
 
     def test_spcc_failure_then_pcc_success_is_exception_fallback_without_review(self):
         pipeline, saved, _commands, results = _stage4_integration_fixture()

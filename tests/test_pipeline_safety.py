@@ -84,6 +84,41 @@ class _StarPreservePipeline:
         self._stage8_final_quality = "unknown"
         self._stage8_fallback_used = False
         self._stage9_final_source = ""
+        self._review_requirements: dict[tuple[int, str], dict[str, object]] = {}
+
+    def _clear_stage_reviews(self, stage: int) -> None:
+        self._review_requirements = {
+            key: value
+            for key, value in self._review_requirements.items()
+            if key[0] != int(stage)
+        }
+
+    def _require_review(
+        self,
+        stage: int,
+        code: str,
+        details: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        requirement = {
+            "stage": int(stage),
+            "code": str(code),
+            "details": dict(details or {}),
+        }
+        self._review_requirements[(int(stage), str(code))] = requirement
+        return requirement
+
+    def _stage_review_reasons(self, stage: int) -> list[str]:
+        return [
+            str(value["code"])
+            for key, value in self._review_requirements.items()
+            if key[0] == int(stage)
+        ]
+
+    def _review_requirements_payload(self) -> list[dict[str, object]]:
+        return [
+            dict(value)
+            for _key, value in sorted(self._review_requirements.items())
+        ]
 
     def cmd_with_check(self, *args: object) -> None:
         self.commands.append(args)

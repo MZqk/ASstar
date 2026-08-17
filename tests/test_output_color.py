@@ -180,6 +180,38 @@ class OutputColorAuditTests(unittest.TestCase):
         )
         self.assertIn("does not prove", disclosure["limitation"])
 
+    def test_export_report_excludes_stale_unselected_formats(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            selected = root / "result_review.png"
+            stale_tif = root / "result_review.tif"
+            _write_png(selected, srgb=True)
+            _write_tiff_with_icc(stale_tif)
+
+            manifest = build_output_color_manifest(
+                work_dir=root,
+                base_filename="result_review",
+                fit_filename="result_review_final",
+                fallback_base="result_review",
+                fallback_fit_base="result_review_final",
+                output_format="png",
+                channel_semantics="broadband_rgb_osc",
+                review_only=True,
+                export_report={
+                    "outputs": {
+                        "png": {
+                            "status": "managed_review",
+                            "selected": selected.name,
+                        }
+                    }
+                },
+            )
+
+        self.assertEqual(
+            [item["name"] for item in manifest["artifacts"]],
+            ["result_review.png"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

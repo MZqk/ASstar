@@ -246,6 +246,8 @@ def build_output_color_manifest(
     exported_after: Optional[float] = None,
     managed_export_report: Optional[Dict[str, Any]] = None,
     source_color_contract: Optional[Dict[str, Any]] = None,
+    display_rendition_contract: Optional[Dict[str, Any]] = None,
+    export_report: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Inspect current exports without converting, tagging, or rewriting them."""
     requested = _requested_formats(output_format)
@@ -260,12 +262,34 @@ def build_output_color_manifest(
             names.add(base + "_display_srgb")
             names.add(base + "_edit_srgb")
     extensions = sorted(requested)
-    paths = _recent_outputs(
-        Path(work_dir),
-        names=names,
-        extensions=extensions,
-        exported_after=exported_after,
-    )
+    if isinstance(export_report, dict):
+        actual_paths: set[Path] = set()
+        for output in (export_report.get("outputs") or {}).values():
+            if not isinstance(output, dict):
+                continue
+            selected = str(output.get("selected") or "")
+            if selected and str(output.get("status") or "") in {
+                "primary",
+                "fallback",
+                "managed_review",
+            }:
+                candidate = Path(work_dir) / selected
+                if candidate.is_file():
+                    actual_paths.add(candidate)
+        for artifact in (managed_export_report or {}).get("artifacts") or []:
+            if not isinstance(artifact, dict) or artifact.get("status") != "written":
+                continue
+            candidate = Path(str(artifact.get("path") or ""))
+            if candidate.is_file():
+                actual_paths.add(candidate)
+        paths = sorted(actual_paths, key=lambda path: path.name)
+    else:
+        paths = _recent_outputs(
+            Path(work_dir),
+            names=names,
+            extensions=extensions,
+            exported_after=exported_after,
+        )
     artifacts = [inspect_output_artifact(path) for path in paths]
     png_artifacts = [item for item in artifacts if item.get("format") == "png"]
     tiff_artifacts = [item for item in artifacts if item.get("format") == "tiff"]
@@ -348,6 +372,11 @@ def build_output_color_manifest(
         "managed_export": managed_export_report,
         "channel_semantics": str(channel_semantics or "unknown"),
         "source_color_contract": color_contract or None,
+        "display_rendition_contract": (
+            dict(display_rendition_contract)
+            if isinstance(display_rendition_contract, dict)
+            else None
+        ),
         "color_state_disclosure": {
             "source_profile_verified": source_profile_verified,
             "source_to_target_conversion_lineage_verified": (

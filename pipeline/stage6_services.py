@@ -81,6 +81,7 @@ STAGE7_CANDIDATE_RANKING_FIELDS = (
     "status",
     "hard_gate_eligibility",
     "technical_safety",
+    "stretch_saturated_penalty",
     "bounded_presentation_score",
     "preview_visibility_retention_capped_at_goal",
     "preview_subject_span_retention_capped_at_goal",
@@ -677,6 +678,38 @@ def stage7_effective_bg_median_min(configured_min: float) -> float:
     configured = max(float(configured_min), 1e-4)
     tolerance = min(0.0005, configured * 0.025)
     return max(1e-4, configured - tolerance)
+
+
+def _stage7_core_gate_failures(attempt: Dict[str, Any]) -> List[str]:
+    local_gates = (
+        (attempt.get("target_local_quality") or {}).get("quality_gates") or {}
+    )
+    return [
+        str(name)
+        for name, gate in local_gates.items()
+        if str(name).startswith("local_core_")
+        and bool((gate or {}).get("hard_failed", False))
+    ]
+
+
+def _stage7_all_saved_candidates_fail_core_gates(
+    saved_attempts: List[Dict[str, Any]],
+    *,
+    strict_target: bool,
+) -> Tuple[bool, List[str]]:
+    """Return the non-overridable Stage 7 core rejection decision."""
+    if not strict_target or not saved_attempts:
+        return False, []
+    failures = [_stage7_core_gate_failures(attempt) for attempt in saved_attempts]
+    if any(not attempt_failures for attempt_failures in failures):
+        return False, []
+    return True, list(
+        dict.fromkeys(
+            failure
+            for attempt_failures in failures
+            for failure in attempt_failures
+        )
+    )
 
 class Stage6ServiceMixin:
     def _apply_adaptive_edge_crop(
@@ -1432,6 +1465,8 @@ class Stage6ServiceMixin:
         preview_pixel_stats: Dict[str, Any],
         preview_quality_metrics: Dict[str, Any],
         preview_rendition_metrics: Optional[Dict[str, Any]] = None,
+        target_local_reference_data: Optional[np.ndarray] = None,
+        target_local_reference_available: bool = True,
     ) -> Dict[str, Any]:
         """Run one Stage 7 candidate from the immutable source and evaluate all gates."""
         name = str(candidate.get("name") or "candidate")
@@ -1533,13 +1568,20 @@ class Stage6ServiceMixin:
                     ),
                 )
                 local_quality = stage7_stretch_metrics.assess_target_local_stretch(
-                    baseline_image_data,
+                    (
+                        target_local_reference_data
+                        if target_local_reference_data is not None
+                        else baseline_image_data
+                    ),
                     candidate_image_data,
                     str(
                         target_stretch.get("target_type")
                         or "generic_low_snr_safe"
                     ),
                     self.cfg,
+                    target_profile=getattr(self, "target_profile", None),
+                    starmask=starmask_image_data,
+                    frozen_reference_available=target_local_reference_available,
                 )
                 color_vector_reference = (
                     stage7_stretch_metrics.assess_rec709_vector_color_reference(
@@ -3414,13 +3456,39 @@ class Stage6ServiceMixin:
                 "newly_hard_clipped_ratio_max"
             ),
         )
-        safety_weights = {
-            "background_chroma_load": 0.30,
-            "chroma_noise": 0.15,
-            "mottling": 0.15,
-            "color_vector": 0.25,
-            "new_hard_clip": 0.15,
-        }
+        local_quality = attempt.get("target_local_quality") or {}
+        local_gates = local_quality.get("quality_gates") or {}
+        core_headrooms = []
+        for gate_name in (
+            "local_core_clip_ratio",
+            "local_core_colored_plateau_component_ratio",
+            "local_core_parity_phase_span",
+        ):
+            gate = local_gates.get(gate_name) or {}
+            if "value" in gate and "hard_limit" in gate:
+                core_headrooms.append(
+                    headroom(gate.get("value"), gate.get("hard_limit"))
+                )
+        safety_values["target_core_safety"] = (
+            min(core_headrooms) if core_headrooms else 0.50
+        )
+        if profile == "nebula":
+            safety_weights = {
+                "background_chroma_load": 0.25,
+                "chroma_noise": 0.10,
+                "mottling": 0.10,
+                "color_vector": 0.15,
+                "new_hard_clip": 0.15,
+                "target_core_safety": 0.25,
+            }
+        else:
+            safety_weights = {
+                "background_chroma_load": 0.30,
+                "chroma_noise": 0.15,
+                "mottling": 0.15,
+                "color_vector": 0.25,
+                "new_hard_clip": 0.15,
+            }
         safety = sum(
             safety_values[name] * safety_weights[name]
             for name in safety_weights
@@ -3450,6 +3518,20 @@ class Stage6ServiceMixin:
         status_penalty = 0 if attempt.get("status") == "ok" and attempt.get("stem") else 1
         final_penalty = 0 if bool(attempt.get("allowed_as_final", False)) else 1
         technical_penalty = 0 if bool(attempt.get("technical_safe", True)) else 1
+        local_quality = attempt.get("target_local_quality") or {}
+        strict_target = bool(
+            (local_quality.get("strict_target_evidence") or {}).get(
+                "strict", False
+            )
+        )
+        stretch_saturated_penalty = int(
+            strict_target
+            and bool(
+                (attempt.get("preview_target_attainment") or {}).get(
+                    "stretch_saturated", False
+                )
+            )
+        )
         report = attempt.get("presentation_score") or cls._stage7_presentation_score(
             attempt
         )
@@ -3476,6 +3558,7 @@ class Stage6ServiceMixin:
             status_penalty,
             final_penalty,
             technical_penalty,
+            stretch_saturated_penalty,
             -score,
             advisory_count,
             risk_score,
@@ -3489,6 +3572,21 @@ class Stage6ServiceMixin:
         attempt: Dict[str, Any],
     ) -> Tuple[Any, ...]:
         """For forced output, minimise appearance-gate excess before vividness."""
+
+        local_quality = attempt.get("target_local_quality") or {}
+        strict_target = bool(
+            (local_quality.get("strict_target_evidence") or {}).get(
+                "strict", False
+            )
+        )
+        stretch_saturated_penalty = int(
+            strict_target
+            and bool(
+                (attempt.get("preview_target_attainment") or {}).get(
+                    "stretch_saturated", False
+                )
+            )
+        )
 
         excesses: List[float] = []
         background = attempt.get("background_quality_gate") or {}
@@ -3551,6 +3649,7 @@ class Stage6ServiceMixin:
         if not math.isfinite(score):
             score = 0.0
         return (
+            stretch_saturated_penalty,
             max(excesses, default=0.0),
             sum(excesses),
             -score,
@@ -3616,11 +3715,10 @@ class Stage6ServiceMixin:
         local_gates = (
             (attempt.get("target_local_quality") or {}).get("quality_gates") or {}
         )
-        if bool(
-            (local_gates.get("local_core_clip_ratio") or {}).get(
-                "hard_failed",
-                False,
-            )
+        if any(
+            str(name).startswith("local_core_")
+            and bool((gate or {}).get("hard_failed", False))
+            for name, gate in local_gates.items()
         ):
             return False
         if not bool(
@@ -5263,6 +5361,9 @@ class Stage6ServiceMixin:
         self._stage7_stretch_validated_rescue = False
         self._stage7_stretch_forced_delivery = False
         self._stage7_forced_delivery_reasons = []
+        self._stage7_destructive_core_rejected = False
+        self._stage7_bright_core_integrity_rejected_reasons = []
+        self._stage7_revoked_pair_id = None
         self._stage7_last_vivid_chroma_execution = {}
         self._stage7_stretch_fallback_reason = None
         self._stage7_review_source = None
@@ -5429,6 +5530,42 @@ class Stage6ServiceMixin:
                     f"{self._short_text(error, 160)}"
                 )
                 return False, False, messages, ""
+        active_target_type = str(
+            self._active_target_type() or "generic_low_snr_safe"
+            if hasattr(self, "_active_target_type")
+            else "generic_low_snr_safe"
+        ).strip().lower()
+        strict_core_evidence = stage7_quality.strict_bright_core_target_evidence(
+            active_target_type,
+            getattr(self, "target_profile", None),
+        )
+        target_local_reference_data: Optional[np.ndarray] = baseline_image_data
+        target_local_reference_available = True
+        if bool(strict_core_evidence.get("strict", False)):
+            frozen_stage6_input = self._read_image_by_stem("stage6_input")
+            if frozen_stage6_input is None:
+                target_local_reference_data = None
+                target_local_reference_available = False
+                messages.append(
+                    "strict bright-core target is missing frozen stage6_input; "
+                    "formal Starless delivery will be rejected"
+                )
+            else:
+                try:
+                    target_local_reference_data, _reference_domain = (
+                        canonicalize_stage7_pixels_01(frozen_stage6_input)
+                    )
+                    messages.append(
+                        "strict bright-core target-local masks frozen from "
+                        "stage6_input with Stage6 starmask exclusion"
+                    )
+                except (TypeError, ValueError) as error:
+                    target_local_reference_data = None
+                    target_local_reference_available = False
+                    messages.append(
+                        "strict bright-core frozen reference validation failed: "
+                        f"{self._short_text(error, 160)}"
+                    )
         messages.append(
             "stage7 primary stretch candidates: stage7_cand_a, stage7_cand_b, "
             "optional stage7_cand_display70/82/90; "
@@ -5442,6 +5579,7 @@ class Stage6ServiceMixin:
             for pattern in (
                 "stage7_candidate_*.fit",
                 "stage7_cand_*.fit",
+                "stage7_with_stars_hdr*.fit",
                 "stage7_preview_ref.fit",
                 "stage7_selected*.fit",
                 "stage7_stretched.fit",
@@ -5737,6 +5875,7 @@ class Stage6ServiceMixin:
                 ]
         stretch_adaptation["candidate_policy"] = candidate_policy
         stretch_adaptation["rendition_intent"] = rendition_intent
+        stretch_adaptation["delivery_mode"] = "starless"
         stretch_adaptation["enabled_candidates"] = [
             str(candidate.get("name")) for candidate in candidate_list
         ]
@@ -5759,6 +5898,8 @@ class Stage6ServiceMixin:
                 preview_pixel_stats=preview_pixel_stats,
                 preview_quality_metrics=preview_quality_metrics,
                 preview_rendition_metrics=preview_rendition_metrics,
+                target_local_reference_data=target_local_reference_data,
+                target_local_reference_available=target_local_reference_available,
             )
             attempts.append(attempt)
             retry_source = candidate
@@ -5792,6 +5933,8 @@ class Stage6ServiceMixin:
                     preview_pixel_stats=preview_pixel_stats,
                     preview_quality_metrics=preview_quality_metrics,
                     preview_rendition_metrics=preview_rendition_metrics,
+                    target_local_reference_data=target_local_reference_data,
+                    target_local_reference_available=target_local_reference_available,
                 )
                 attempts.append(retry_attempt)
                 retry_source = feedback_candidate
@@ -5887,6 +6030,8 @@ class Stage6ServiceMixin:
                     preview_pixel_stats=preview_pixel_stats,
                     preview_quality_metrics=preview_quality_metrics,
                     preview_rendition_metrics=preview_rendition_metrics,
+                    target_local_reference_data=target_local_reference_data,
+                    target_local_reference_available=target_local_reference_available,
                 )
                 vivid_attempt["tone_parent"] = str(
                     vivid_parent.get("name") or ""
@@ -5919,7 +6064,10 @@ class Stage6ServiceMixin:
             else None
         )
 
-        if best_attempt is None and failure_action == "auto_fallback":
+        if (
+            best_attempt is None
+            and failure_action == "auto_fallback"
+        ):
             quantile_candidate, quantile_calibration = (
                 self._stage7_quantile_fallback_candidate(
                     baseline_image_data,
@@ -5940,6 +6088,8 @@ class Stage6ServiceMixin:
                     preview_pixel_stats=preview_pixel_stats,
                     preview_quality_metrics=preview_quality_metrics,
                     preview_rendition_metrics=preview_rendition_metrics,
+                    target_local_reference_data=target_local_reference_data,
+                    target_local_reference_available=target_local_reference_available,
                 )
                 attempts.append(quantile_attempt)
                 if bool(quantile_attempt.get("allowed_as_final", False)):
@@ -5954,7 +6104,10 @@ class Stage6ServiceMixin:
                     f"{self._short_text(quantile_calibration.get('reason'), 160)}"
                 )
 
-        if best_attempt is None and failure_action == "auto_fallback":
+        if (
+            best_attempt is None
+            and failure_action == "auto_fallback"
+        ):
             rejected_attempts = [
                 attempt
                 for attempt in attempts
@@ -6179,13 +6332,24 @@ class Stage6ServiceMixin:
                             if baseline_image_data is not None:
                                 local_quality = (
                                     stage7_stretch_metrics.assess_target_local_stretch(
-                                        baseline_image_data,
+                                        (
+                                            target_local_reference_data
+                                            if target_local_reference_data is not None
+                                            else baseline_image_data
+                                        ),
                                         rescued_image_data,
                                         str(
                                             target_stretch.get("target_type")
                                             or "generic_low_snr_safe"
                                         ),
                                         self.cfg,
+                                        target_profile=getattr(
+                                            self, "target_profile", None
+                                        ),
+                                        starmask=starmask_image_data,
+                                        frozen_reference_available=(
+                                            target_local_reference_available
+                                        ),
                                     )
                                 )
                             color_vector_reference: Dict[str, Any] = {
@@ -6557,6 +6721,27 @@ class Stage6ServiceMixin:
             for attempt in attempts
             if attempt.get("status") == "ok" and attempt.get("stem")
         ]
+        destructive_core_rejected, core_rejection_reasons = (
+            _stage7_all_saved_candidates_fail_core_gates(
+                saved_attempts,
+                strict_target=bool(strict_core_evidence.get("strict", False)),
+            )
+        )
+        if destructive_core_rejected:
+            self._stage7_destructive_core_rejected = True
+            self._stage7_bright_core_integrity_rejected_reasons = list(
+                dict.fromkeys(core_rejection_reasons)
+            ) or ["local_core_integrity_unavailable"]
+            self._stage7_revoked_pair_id = getattr(
+                self,
+                "_selected_syqon_pair_id",
+                None,
+            )
+            messages.append(
+                "stage7_bright_core_integrity_rejected: every saved candidate "
+                "failed a non-overridable local_core_* gate; formal output "
+                "will be rejected"
+            )
         accepted_attempts = [
             attempt
             for attempt in saved_attempts
@@ -6795,6 +6980,15 @@ class Stage6ServiceMixin:
             ),
             "review_source": self._stage7_review_source,
             "background_color_review_gate": background_color_review_gate,
+            "strict_bright_core_evidence": strict_core_evidence,
+            "delivery_mode": "starless",
+            "stage7_bright_core_integrity_rejected": bool(
+                self._stage7_destructive_core_rejected
+            ),
+            "stage7_bright_core_integrity_rejected_reasons": list(
+                self._stage7_bright_core_integrity_rejected_reasons
+            ),
+            "revoked_pair_id": self._stage7_revoked_pair_id,
             "quality_advisory_multiplier": (
                 stage7_quality.stage7_9_quality_advisory_multiplier(self.cfg)
             ),
@@ -6821,6 +7015,15 @@ class Stage6ServiceMixin:
                 "baseline_background_quality": baseline_background_quality,
                 "background_sampling": frozen_background_sampling,
                 "background_color_review_gate": background_color_review_gate,
+                "strict_bright_core_evidence": strict_core_evidence,
+                "delivery_mode": "starless",
+                "stage7_bright_core_integrity_rejected": bool(
+                    self._stage7_destructive_core_rejected
+                ),
+                "stage7_bright_core_integrity_rejected_reasons": list(
+                    self._stage7_bright_core_integrity_rejected_reasons
+                ),
+                "revoked_pair_id": self._stage7_revoked_pair_id,
                 "baseline_pixel_stats": baseline_pixel_stats,
                 "stretch_adaptation": stretch_adaptation,
                 "closed_form_mtf_reference": closed_form_mtf_reference,

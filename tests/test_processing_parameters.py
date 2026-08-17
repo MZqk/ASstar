@@ -97,6 +97,26 @@ class ProcessingParameterContractTests(unittest.TestCase):
             ].default
         )
 
+    def test_stage5_auto_denoise_is_enabled_by_default(self) -> None:
+        payload = default_processing_parameters()
+
+        self.assertTrue(PipelineConfig().denoise_enabled)
+        self.assertTrue(SPECS_BY_FIELD["denoise_enabled"].default)
+        self.assertTrue(effective_parameter_value(payload, "denoise_enabled"))
+
+    def test_explicit_stage5_denoise_disable_is_a_manual_override(self) -> None:
+        cfg = PipelineConfig()
+        payload = default_processing_parameters()
+        payload["stages"]["5"]["overrides"]["denoise_enabled"] = False
+
+        _normalized, _adjustments, fields = apply_processing_parameters_to_config(
+            cfg,
+            payload,
+        )
+
+        self.assertFalse(cfg.denoise_enabled)
+        self.assertIn("denoise_enabled", fields)
+
     def test_v1_through_v3_are_rejected_without_migration(self) -> None:
         for schema in (
             "starun.processing-parameters.v1",
@@ -749,7 +769,7 @@ class ProcessingParameterContractTests(unittest.TestCase):
 
         self.assertEqual(
             stage_config_from_processing_settings(base)[2]["boundary_correction"],
-            "native_crop_v4",
+            "native_crop_v5",
         )
         self.assertEqual(
             stage_config_from_processing_settings(base)[2]["gate_profile"],

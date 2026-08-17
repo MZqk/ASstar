@@ -101,6 +101,7 @@ dist/
 *.sock
 resources/siril_plugins/downloads/
 resources/siril_plugins/vendor/siril-scripts/
+resources/siril_plugins/cosmic_clarity_runtime/
 siril_cat*_healpix*_astro*.dat
 siril_cat*_healpix*_xpsamp*.dat
 gaia_astrometric.dat

@@ -1,11 +1,20 @@
 """Stretch selection and execution."""
 from typing import List
 
+import display_rendition
+from managed_output import audit_display_visibility
 from models import PipelineStage, StarSeparationState
 from sirilpy.exceptions import CommandError, SirilError
+import syqon_starless
 
 
-def _run_with_stars_review_stretch(pipeline, separation_state: str) -> None:
+def _run_with_stars_review_stretch(
+    pipeline,
+    separation_state: str,
+    *,
+    source_stem: str | None = None,
+    reason_code: str | None = None,
+) -> None:
     """Create a conservative review image without invoking starless-only logic."""
     stage_label = PipelineStage.STRETCHING.label
     messages: List[str] = [
@@ -13,8 +22,21 @@ def _run_with_stars_review_stretch(pipeline, separation_state: str) -> None:
         "starless-only stretch candidates skipped",
     ]
     source_stem = str(
-        getattr(pipeline, "_stage6_passthrough_source", None)
+        source_stem
+        or getattr(pipeline, "_stage6_passthrough_source", None)
         or "stage6_passthrough"
+    )
+    review_reason = str(
+        reason_code or f"star_separation_{separation_state}"
+    )
+    preserve_frozen_bright_core_source = bool(
+        source_stem == "stage6_input"
+        and review_reason
+        in {
+            "bright_core_starless_rejected_after_recovery",
+            "stage4_bright_core_color_integrity_unresolved",
+            "stage7_bright_core_integrity_rejected",
+        }
     )
     pipeline._stage7_stretch_accepted = False
     pipeline._stage7_stretch_output = None
@@ -26,22 +48,94 @@ def _run_with_stars_review_stretch(pipeline, separation_state: str) -> None:
         "requires_review": False,
     }
     pipeline._stage7_review_source = None
+    display_contract = {}
+    pipeline._require_review(7, review_reason)
+    process_dir = getattr(pipeline, "process_dir", None)
+    if process_dir is not None:
+        for pattern in ("stage7_with_stars_hdr*.fit", "stage7_with_stars_hdr*.fits"):
+            for stale_path in process_dir.glob(pattern):
+                try:
+                    stale_path.unlink()
+                except OSError as error:
+                    messages.append(
+                        "stale formal HDR artifact cleanup failed: "
+                        f"{pipeline._short_text(error, 120)}"
+                    )
     saved = False
     try:
         pipeline.cmd_with_check("load", source_stem)
-        try:
-            pipeline.cmd_with_check("autostretch", "-linked")
-            messages.append("linked autostretch applied for review preview only")
-        except (CommandError, SirilError) as error:
-            pipeline.cmd_with_check("load", source_stem)
+        if preserve_frozen_bright_core_source:
             messages.append(
-                "review autostretch failed; retained linear passthrough: "
-                f"{pipeline._short_text(error, 160)}"
+                "strict bright-core review source preserved without Siril "
+                "autostretch; observer mapping is frozen separately"
             )
+        else:
+            try:
+                pipeline.cmd_with_check("autostretch", "-linked")
+                messages.append(
+                    "linked autostretch applied for non-strict review preview"
+                )
+            except (CommandError, SirilError) as error:
+                pipeline.cmd_with_check("load", source_stem)
+                messages.append(
+                    "review autostretch failed; retained linear passthrough: "
+                    f"{pipeline._short_text(error, 160)}"
+                )
         saved = pipeline._save_stage_output("stage7_review_with_stars")
         if saved:
             pipeline.stretched_name = "stage7_review_with_stars"
             pipeline._stage7_review_source = pipeline.stretched_name
+            pipeline._review_display_route = True
+            try:
+                review_pixels = pipeline.siril.get_image_pixeldata(
+                    preview=False
+                )
+                visibility = audit_display_visibility(
+                    review_pixels,
+                    target_type=str(
+                        pipeline._active_target_type()
+                        if hasattr(pipeline, "_active_target_type")
+                        else ""
+                    ),
+                    stars_required=True,
+                )
+                display_contract = display_rendition.build_review_contract(
+                    review_pixels,
+                    reason=review_reason,
+                    source_stem="stage7_review_with_stars",
+                    input_visibility=visibility,
+                )
+            except (
+                AttributeError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as error:
+                display_contract = display_rendition.unavailable_contract(
+                    reason=review_reason,
+                    error=str(error),
+                )
+                messages.append(
+                    "linked Review display contract unavailable: "
+                    f"{pipeline._short_text(error, 160)}"
+                )
+            pipeline._display_rendition_contract = display_contract
+            pipeline._write_stage_json(
+                "display_rendition_contract.json",
+                display_contract,
+            )
+            if hasattr(pipeline, "_create_stage_review_bundle"):
+                review = pipeline._create_stage_review_bundle(
+                    "stage7_stretching",
+                    source_stem,
+                    "stage7_review_with_stars",
+                    context={
+                        "delivery_mode": "with_stars_review_only",
+                        "reason_code": review_reason,
+                    },
+                )
+                if review.get("report_path"):
+                    messages.append(f"review_bundle={review['report_path']}")
     except (CommandError, SirilError) as error:
         messages.append(
             "with-stars review source unavailable: "
@@ -50,6 +144,57 @@ def _run_with_stars_review_stretch(pipeline, separation_state: str) -> None:
 
     background_color_review_gate = dict(
         getattr(pipeline, "_stage7_background_color_review_gate", {}) or {}
+    )
+    bright_core_fallback = dict(
+        getattr(pipeline, "_bright_core_with_stars_fallback", {}) or {}
+    )
+    stage4_core_color = dict(
+        (
+            getattr(pipeline, "color_calibration_report", {}) or {}
+        ).get("bright_core_color_integrity")
+        or {}
+    )
+    review_quality_report = {
+            "stage": "stage7_stretch",
+            "status": "review_only" if saved else "failed",
+            "delivery_mode": "with_stars_review_only",
+            "reason_code": review_reason,
+            "review_required": True,
+            "input": f"{source_stem}.fit",
+            "source_stem": source_stem,
+            "review_output": "stage7_review_with_stars" if saved else None,
+            "attempts": [],
+            "candidates": [],
+            "selected": None,
+            "strict_bright_core_evidence": dict(
+                bright_core_fallback.get("strict_target_evidence") or {}
+            ),
+            "bright_core_with_stars_fallback": bright_core_fallback,
+            "stage4_bright_core_color_integrity": stage4_core_color,
+            "stage7_bright_core_integrity_rejected": bool(
+                review_reason == "stage7_bright_core_integrity_rejected"
+            ),
+            "stage7_bright_core_integrity_rejected_reasons": list(
+                getattr(
+                    pipeline,
+                    "_stage7_bright_core_integrity_rejected_reasons",
+                    [],
+                )
+                or []
+            ),
+            "revoked_pair_id": getattr(
+                pipeline, "_stage7_revoked_pair_id", None
+            ),
+            "background_color_review_gate": background_color_review_gate,
+            "display_rendition_contract": display_contract,
+        }
+    pipeline._write_stage_json(
+        "stage7_stretch_quality.json",
+        review_quality_report,
+    )
+    pipeline._write_stage_json(
+        "stretch_candidates_report.json",
+        review_quality_report,
     )
     elapsed = pipeline.log.stage_end(stage_label)
     if not saved:
@@ -60,12 +205,13 @@ def _run_with_stars_review_stretch(pipeline, separation_state: str) -> None:
         elapsed,
         "；".join(messages),
         execution="safe_passthrough" if saved else "completed",
-        reason_code=f"star_separation_{separation_state}",
+        reason_code=review_reason,
         details={
             "source_stem": source_stem,
             "review_output": "stage7_review_with_stars" if saved else None,
             "background_color_review_gate": background_color_review_gate,
         },
+        review_reasons=pipeline._stage_review_reasons(7),
     )
 
 
@@ -83,6 +229,7 @@ def run_stage7_stretching(pipeline) -> None:
     """
     stage_label = PipelineStage.STRETCHING.label
     pipeline.log.stage_start(stage_label)
+    pipeline._clear_stage_reviews(7)
     pipeline._stage7_stretch_accepted = False
     pipeline._stage7_stretch_output = None
     pipeline._stage7_stretch_forced_delivery = False
@@ -106,11 +253,71 @@ def run_stage7_stretching(pipeline) -> None:
             StarSeparationState.ACCEPTED.value,
         )
     )
+    bright_core_fallback = dict(
+        getattr(pipeline, "_bright_core_with_stars_fallback", {}) or {}
+    )
+    if (
+        separation_state == StarSeparationState.REJECTED.value
+        and str(bright_core_fallback.get("status") or "")
+        in {"eligible", "accepted", "rejected"}
+    ):
+        bright_core_fallback.update(
+            eligible=False,
+            accepted=False,
+            status="rejected_to_review",
+            delivery_mode="with_stars_review_only",
+            review_only=True,
+            review_output="stage7_review_with_stars",
+        )
+        pipeline._bright_core_with_stars_fallback = bright_core_fallback
+    bright_core_review_only = bool(
+        separation_state == StarSeparationState.REJECTED.value
+        and bright_core_fallback.get("status") == "rejected_to_review"
+    )
+    color_report = dict(
+        getattr(pipeline, "color_calibration_report", {}) or {}
+    )
+    stage4_core_color = dict(
+        color_report.get("bright_core_color_integrity") or {}
+    )
+    unresolved_stage4_core_color = bool(
+        stage4_core_color.get("applicable", False)
+        and str(stage4_core_color.get("status") or "")
+        not in {"ok", "repaired"}
+    )
+    if unresolved_stage4_core_color:
+        syqon_starless.purge_unaccepted_star_separation_outputs(pipeline)
+        pipeline._star_separation_state = StarSeparationState.REJECTED.value
+        pipeline.starless_file = None
+        pipeline.starmask_file = None
+        pipeline._selected_syqon_pair_id = None
+        pipeline._selected_syqon_attempt_id = None
+        pipeline._stage7_starless_skipped = True
+        pipeline._stage6_passthrough_source = "stage6_input"
+        pipeline._stage6_pair_handoff = None
+        _run_with_stars_review_stretch(
+            pipeline,
+            StarSeparationState.REJECTED.value,
+            source_stem="stage6_input",
+            reason_code="stage4_bright_core_color_integrity_unresolved",
+        )
+        return
     if separation_state in {
         StarSeparationState.REJECTED.value,
         StarSeparationState.TOOL_FAILED.value,
     }:
-        _run_with_stars_review_stretch(pipeline, separation_state)
+        _run_with_stars_review_stretch(
+            pipeline,
+            separation_state,
+            source_stem=(
+                "stage6_input" if bright_core_review_only else None
+            ),
+            reason_code=(
+                "bright_core_starless_rejected_after_recovery"
+                if bright_core_review_only
+                else None
+            ),
+        )
         return
     pipeline._stage7_stretch_source = (
         "stage6_passthrough"
@@ -124,12 +331,68 @@ def run_stage7_stretching(pipeline) -> None:
     if stretch_method:
         messages.append(f"拉伸使用 {stretch_method}")
 
+    if bool(getattr(pipeline, "_stage7_destructive_core_rejected", False)):
+        revoked_pair_id = getattr(pipeline, "_stage7_revoked_pair_id", None)
+        removed_artifacts = syqon_starless.purge_unaccepted_star_separation_outputs(
+            pipeline
+        )
+        pipeline._star_separation_state = StarSeparationState.REJECTED.value
+        pipeline._stage7_starless_skipped = True
+        pipeline._stage6_passthrough_source = "stage6_input"
+        pipeline._stage6_pair_handoff = None
+        pipeline._stage7_matched_domain_transfer = None
+        handoff = dict(getattr(pipeline, "_stage8_handoff", {}) or {})
+        handoff.update(
+            {
+                "requested_policy": "skip",
+                "processing_policy": "skip",
+                "source_stage": 7,
+                "source_stem": "stage7_review_with_stars",
+                "passthrough": True,
+                "restricted_downstream": True,
+                "reason_code": "stage7_bright_core_integrity_rejected",
+                "reason_text": (
+                    "all Stage7 candidates failed non-overridable "
+                    "bright-core integrity gates"
+                ),
+                "reasons": [
+                    {
+                        "code": "stage7_bright_core_integrity_rejected",
+                        "source_stage": 7,
+                        "revoked_pair_id": revoked_pair_id,
+                        "gates": list(
+                            getattr(
+                                pipeline,
+                                "_stage7_bright_core_integrity_rejected_reasons",
+                                [],
+                            )
+                            or []
+                        ),
+                    }
+                ],
+                "quality_status": "rejected",
+            }
+        )
+        pipeline._stage8_handoff = handoff
+        if removed_artifacts:
+            pipeline.log.info(
+                "Stage7 bright-core rejection purged Starless pair artifacts: "
+                + ", ".join(sorted(removed_artifacts))
+            )
+        _run_with_stars_review_stretch(
+            pipeline,
+            StarSeparationState.REJECTED.value,
+            source_stem="stage6_input",
+            reason_code="stage7_bright_core_integrity_rejected",
+        )
+        return
+
     compare_stem = pipeline._stage7_stretch_source
     failure_policy_triggered = bool(
         not stretched and failure_action != "auto_fallback"
     )
     if failure_policy_triggered:
-        pipeline._background_review_required = True
+        pipeline._require_review(7, "no_stretch_candidate_passed_quality_gate")
         if hasattr(pipeline, "_record_stage_policy_event"):
             pipeline._record_stage_policy_event(
                 7,
@@ -190,14 +453,14 @@ def run_stage7_stretching(pipeline) -> None:
         )
         pipeline._stage8_handoff = handoff
     if stage_saved:
-        diff_note = pipeline._stage_diff_note("stage7_stretched", compare_stem)
+        diff_note = pipeline._stage_diff_note(pipeline.stretched_name, compare_stem)
         if diff_note:
             messages.append(diff_note)
         if hasattr(pipeline, "_create_stage_review_bundle"):
             review = pipeline._create_stage_review_bundle(
                 "stage7_stretching",
                 compare_stem,
-                "stage7_stretched",
+                pipeline.stretched_name,
                 context={"stretch_method": stretch_method},
                 candidates=getattr(pipeline, "_stage7_stretch_candidates", []),
                 selected_candidate=getattr(pipeline, "_stage7_stretch_selected", None),
@@ -271,7 +534,16 @@ def run_stage7_stretching(pipeline) -> None:
                     )
                     or []
                 ),
+                "bright_core_with_stars_fallback": dict(
+                    getattr(
+                        pipeline,
+                        "_bright_core_with_stars_fallback",
+                        {},
+                    )
+                    or {}
+                ),
             },
+            review_reasons=pipeline._stage_review_reasons(7),
         )
     elif stretched and not stage_saved:
         if message_text:
@@ -318,6 +590,11 @@ def run_stage7_stretching(pipeline) -> None:
                 ),
                 "failure_action": failure_action,
             },
+            review_reasons=(
+                pipeline._stage_review_reasons(7)
+                if failure_action != "stop"
+                else []
+            ),
         )
     else:
         if message_text:

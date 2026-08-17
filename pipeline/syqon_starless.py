@@ -115,6 +115,16 @@ SYQON_CPU_RECOVERY_PROFILE = replace(
     profile_id="zenith_cpu_recovery",
     use_gpu=False,
 )
+SYQON_BRIGHT_CORE_RECOVERY_PROFILE = replace(
+    SYQON_BASELINE_PROFILE,
+    profile_id="zenith_bright_core_ihs_recovery",
+    tile_size=512,
+    overlap=64,
+    use_amp=False,
+    stretch_method="ihs",
+    target_median=0.15,
+    mask_method="subtraction",
+)
 
 
 @lru_cache(maxsize=8)
@@ -384,6 +394,8 @@ def purge_unaccepted_star_separation_outputs(pipeline: object) -> List[str]:
         pipeline._selected_syqon_pair_id = None
     if hasattr(pipeline, "_selected_syqon_attempt_id"):
         pipeline._selected_syqon_attempt_id = None
+    if hasattr(pipeline, "_stage6_pair_handoff"):
+        pipeline._stage6_pair_handoff = None
     if hasattr(pipeline, "sasp_starless_exchange"):
         pipeline.sasp_starless_exchange = None
     if hasattr(pipeline, "sasp_starmask_exchange"):

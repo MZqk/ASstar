@@ -116,6 +116,29 @@ class TaskResumeRuntimeTests(unittest.TestCase):
             },
         }
 
+    @staticmethod
+    def _stage2_semantic_context() -> dict[str, object]:
+        return {
+            "schema": "starun.resume-semantics.v2",
+            "checkpoint_stage": 2,
+            "review_requirements": [],
+            "stage2_crop": {
+                "original_dimensions": {"width": 1920, "height": 1080},
+                "final_dimensions": {"width": 1600, "height": 960},
+                "cumulative_crop": {
+                    "left": 160,
+                    "top": 60,
+                    "right": 160,
+                    "bottom": 60,
+                },
+                "field_rotation_passes": 1,
+                "final_residual_detection": {
+                    "accepted": False,
+                    "reason": "no_significant_edge_connected_coverage_anomaly",
+                },
+            },
+        }
+
     def _resume_run(
         self,
         root: Path,
@@ -160,6 +183,8 @@ class TaskResumeRuntimeTests(unittest.TestCase):
                 if semantic_context is not None
                 else self._semantic_context()
                 if with_semantics and stage_number == 5
+                else self._stage2_semantic_context()
+                if with_semantics and stage_number == 2
                 else None
             ),
         )
@@ -229,6 +254,43 @@ class TaskResumeRuntimeTests(unittest.TestCase):
         self.assertTrue(result["verified"])
         self.assertEqual(result["state"], "linear")
         self.assertEqual(runtime._task_resume_checkpoint_path.name, "stage5_linear.fit")
+
+    def test_stage2_resume_restores_crop_and_review_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            context = self._stage2_semantic_context()
+            context["review_requirements"] = [
+                {
+                    "stage": 2,
+                    "code": "field_rotation_residual_review",
+                    "details": {"retained_area_ratio": 0.70},
+                }
+            ]
+            _workspace, run = self._resume_run(
+                Path(td),
+                stage_number=2,
+                semantic_context=context,
+            )
+            runtime = processor_runtime.ProcessorRuntimeMixin()
+            runtime.work_dir = run.root
+            runtime.input_mode = processor_runtime.INPUT_MODE_STAGE2_CORRECTED_RESUME
+            runtime.log = _Log()
+
+            with patch.dict(
+                os.environ,
+                {processor_runtime.ENV_TASK_RUN_MANIFEST_KEY: str(run.manifest_path)},
+                clear=False,
+            ):
+                provenance = runtime._load_trusted_input_provenance_for_resume()
+                restored = runtime._apply_trusted_resume_semantics()
+
+        self.assertTrue(provenance["verified"])
+        self.assertTrue(restored)
+        self.assertEqual(runtime.stage2_crop_report["field_rotation_passes"], 1)
+        self.assertEqual(
+            runtime._stage_review_reasons(2),
+            ["field_rotation_residual_review"],
+        )
+        self.assertEqual(runtime._stage_review_reasons(3), [])
 
     def test_pipeline_rejects_checkpoint_changed_after_run_freeze(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -378,6 +440,11 @@ class TaskResumeRuntimeTests(unittest.TestCase):
             )
             runtime._run_id = plan["run_id"]
             runtime._processing_plan_hash = plan["plan_hash"]
+            runtime._require_review(9, "stage9_review_candidate_selected")
+            runtime._require_review(
+                9,
+                "stage9_psf_subgroup_evidence_insufficient",
+            )
 
             written = runtime._write_pipeline_result_manifest()
             payload = json.loads(
@@ -387,6 +454,9 @@ class TaskResumeRuntimeTests(unittest.TestCase):
             )
 
         self.assertTrue(written)
+        self.assertEqual(payload["schema"], "starun.pipeline-result.v2")
+        self.assertTrue(payload["review_required"])
+        self.assertFalse(payload["had_fatal_errors"])
         self.assertEqual(
             payload["narrowband_channel_mapping"],
             runtime.narrowband_channel_mapping,
@@ -397,8 +467,9 @@ class TaskResumeRuntimeTests(unittest.TestCase):
         self.assertTrue(
             payload["star_separation"]["review_candidate_selected"]
         )
-        self.assertTrue(
-            payload["review_requirements"]["stage9_review_candidate_selected"]
+        self.assertIn(
+            {"stage": 9, "code": "stage9_review_candidate_selected", "details": {}},
+            payload["review_requirements"],
         )
 
 

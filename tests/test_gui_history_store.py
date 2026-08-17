@@ -21,6 +21,7 @@ from gui.history_store import (
     STATUS_SUCCESS,
     HistoryStore,
     UnsafeTaskDeletionError,
+    load_normalized_run_state,
     load_verified_pipeline_result,
     validate_deletable_task_root,
     verified_result_files,
@@ -263,6 +264,56 @@ class GuiHistoryStoreTests(unittest.TestCase):
             run_manifest.atomic_write_json(run.root / "pipeline-result.json", tampered)
             with self.assertRaisesRegex(Exception, "哈希无效"):
                 load_verified_pipeline_result(run.root)
+
+    def test_v2_result_and_v1_run_state_are_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _source_record, _workspace, run = self._task(root)
+            result = {
+                "schema": "starun.pipeline-result.v2",
+                "run_id": run.run_id,
+                "status": "review_required",
+                "review_requirements": [
+                    {
+                        "stage": 9,
+                        "code": "user_preserve_with_stars",
+                        "details": {},
+                    }
+                ],
+                "actual_steps": [
+                    {
+                        "stage": 9,
+                        "name": "阶段 9: 星点处理与合成",
+                        "status": "ok",
+                        "execution": "safe_passthrough",
+                        "fallback_used": False,
+                        "issues": [],
+                    }
+                ],
+                "outputs": {},
+            }
+            result["manifest_hash"] = run_manifest.canonical_payload_hash(result)
+            run_manifest.atomic_write_json(run.root / "pipeline-result.json", result)
+            run_manifest.atomic_write_json(
+                run.root / "run-state.json",
+                {
+                    "schema": "starun.run-state.v1",
+                    "status": "CompletedWithWarning",
+                    "had_errors": True,
+                    "errors": ["recovered legacy error"],
+                },
+            )
+
+            loaded_result = load_verified_pipeline_result(run.root)
+            loaded_state = load_normalized_run_state(run.root)
+
+        self.assertEqual(loaded_result["status"], STATUS_REVIEW_REQUIRED)
+        self.assertFalse(loaded_result["had_fallbacks"])
+        self.assertEqual(loaded_result["review_requirements"][0]["stage"], 9)
+        self.assertEqual(loaded_state["status"], STATUS_PARTIAL_SUCCESS)
+        self.assertEqual(loaded_state["integrity_status"], "legacy_unsigned")
+        self.assertTrue(loaded_state["had_errors"])
+        self.assertFalse(loaded_state["had_fatal_errors"])
 
     def test_verified_result_files_reject_missing_hashes_and_path_escape(self) -> None:
         with tempfile.TemporaryDirectory() as td:

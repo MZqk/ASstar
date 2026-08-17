@@ -189,6 +189,40 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
             0.001,
         )
 
+    def test_stage7_bright_nebula_hdr_has_no_obsolete_formal_headroom_knee(self):
+        height = width = 96
+        image = np.full((3, height, width), 0.20, dtype=np.float32)
+        image[:, 42:54, 42:54] = np.asarray(
+            [0.995, 0.82, 0.61], dtype=np.float32
+        )[:, None, None]
+        outputs: dict[str, np.ndarray] = {}
+        processor = SimpleNamespace(
+            siril=SimpleNamespace(
+                get_image_pixeldata=lambda preview=False: image.copy()
+            ),
+            _stage8_restore_rgb_like=lambda source, rgb: rgb,
+            _set_current_image_pixeldata=lambda data, label: outputs.__setitem__(
+                label,
+                np.asarray(data).copy(),
+            ),
+        )
+        params = {
+            "bg_pedestal": 0.024,
+            "faint_boost": 0.012,
+            "core_protection": 0.90,
+            "shadow_chroma_damping": 0.28,
+            "faint_saturation_boost": 0.012,
+        }
+
+        pipeline_module.StarunPostProcessor._apply_stage7_bright_nebula_hdr_masked(
+            processor,
+            params,
+            None,
+        )
+
+        candidate = outputs["stage6 bright-nebula HDR masked"]
+        self.assertGreater(float(np.max(candidate)), 0.9921)
+
     def test_stage7_starless_structure_gate_is_invariant_to_monotonic_stretch(self):
         height = width = 160
         yy, xx = np.mgrid[:height, :width]
@@ -1473,6 +1507,103 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
         self.assertTrue(processor._stage7_stretch_accepted)
         self.assertEqual(processor._stage7_stretch_output, "stage7_stretched")
 
+    def test_stage7_legacy_hdr_eligibility_is_forced_to_review_only(self):
+        processor = self._new_processor()
+        source_pixels = processor.image_pixels.copy()
+        processor._star_separation_state = (
+            pipeline_module.StarSeparationState.REJECTED.value
+        )
+        processor._bright_core_with_stars_fallback = {
+            "schema": "starun.bright-core-with-stars-fallback.v1",
+            "eligible": True,
+            "accepted": False,
+            "status": "eligible",
+            "source_stem": "stage6_input",
+            "rejected_pair_id": "m42-pair",
+        }
+
+        processor._run_stage7_stretching_candidates = lambda: self.fail(
+            "formal with-stars HDR candidates must be unreachable"
+        )
+
+        pipeline_module.run_stage7_stretching(processor)
+
+        self.assertFalse(processor._stage7_stretch_accepted)
+        self.assertEqual(
+            processor._stage7_review_source,
+            "stage7_review_with_stars",
+        )
+        self.assertFalse(processor._bright_core_with_stars_fallback["eligible"])
+        self.assertFalse(processor._bright_core_with_stars_fallback["accepted"])
+        self.assertEqual(
+            processor._bright_core_with_stars_fallback["status"],
+            "rejected_to_review",
+        )
+        self.assertEqual(processor.results[-1][1], "degraded")
+        self.assertEqual(
+            processor.result_metadata[-1]["reason_code"],
+            "bright_core_starless_rejected_after_recovery",
+        )
+        report = processor.stage_json_reports["stage7_stretch_quality.json"]
+        self.assertEqual(report["status"], "review_only")
+        self.assertEqual(
+            report["reason_code"],
+            "bright_core_starless_rejected_after_recovery",
+        )
+        self.assertEqual(report["source_stem"], "stage6_input")
+        self.assertEqual(report["review_output"], "stage7_review_with_stars")
+        self.assertEqual(report["attempts"], [])
+        self.assertIsNone(report["selected"])
+        self.assertEqual(
+            report["display_rendition_contract"]["name"],
+            "linked_review_visibility_v2",
+        )
+        self.assertNotIn(("autostretch", "-linked"), processor.cmd_calls)
+        np.testing.assert_array_equal(
+            processor.saved_image_pixels["stage7_review_with_stars"],
+            source_pixels,
+        )
+        candidates_report = processor.stage_json_reports[
+            "stretch_candidates_report.json"
+        ]
+        self.assertEqual(candidates_report["delivery_mode"], "with_stars_review_only")
+        self.assertEqual(candidates_report["candidates"], [])
+
+    def test_stage7_legacy_hdr_status_stays_review_only(self):
+        processor = self._new_processor()
+        processor._star_separation_state = (
+            pipeline_module.StarSeparationState.REJECTED.value
+        )
+        processor._bright_core_with_stars_fallback = {
+            "schema": "starun.bright-core-with-stars-fallback.v1",
+            "eligible": True,
+            "accepted": False,
+            "status": "eligible",
+            "source_stem": "stage6_input",
+        }
+        processor._run_stage7_stretching_candidates = lambda: (
+            False,
+            True,
+            ["obsolete formal candidate path should not run"],
+            "",
+        )
+
+        pipeline_module.run_stage7_stretching(processor)
+
+        self.assertFalse(processor._bright_core_with_stars_fallback["accepted"])
+        self.assertEqual(
+            processor._bright_core_with_stars_fallback["status"],
+            "rejected_to_review",
+        )
+        self.assertEqual(
+            processor._stage7_review_source,
+            "stage7_review_with_stars",
+        )
+        self.assertEqual(
+            processor.result_metadata[-1]["reason_code"],
+            "bright_core_starless_rejected_after_recovery",
+        )
+
     def test_stage7_marks_validated_rescue_as_accepted_and_ok(self):
         processor = self._new_processor()
         processor._stage7_stretch_validated_rescue = True
@@ -1527,6 +1658,43 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
         metadata = processor.result_metadata[-1]
         self.assertEqual(metadata["reason_code"], "forced_quality_delivery")
         self.assertTrue(metadata["details"]["forced_delivery"])
+
+    def test_stage7_all_core_unsafe_candidates_revoke_pair_and_use_with_stars_review(self):
+        processor = self._new_processor()
+        processor.saved_image_pixels["stage6_input"] = processor.image_pixels.copy()
+        processor._selected_syqon_pair_id = "unsafe-pair"
+        processor._selected_syqon_attempt_id = "unsafe-attempt"
+        processor._stage6_pair_handoff = {"pair_id": "unsafe-pair"}
+        processor.starless_file = processor.process_dir / "starless.fit"
+        processor.starmask_file = processor.process_dir / "starmask.fit"
+        processor.starless_file.write_bytes(b"unsafe")
+        processor.starmask_file.write_bytes(b"unsafe")
+
+        def reject_core_candidates():
+            processor._stage7_destructive_core_rejected = True
+            processor._stage7_revoked_pair_id = "unsafe-pair"
+            processor._stage7_bright_core_integrity_rejected_reasons = [
+                "local_core_colored_plateau_component_ratio"
+            ]
+            return False, True, ["all candidates core-unsafe"], ""
+
+        processor._run_stage7_stretching_candidates = reject_core_candidates
+
+        pipeline_module.run_stage7_stretching(processor)
+
+        self.assertEqual(
+            processor._star_separation_state,
+            pipeline_module.StarSeparationState.REJECTED.value,
+        )
+        self.assertEqual(processor._stage6_passthrough_source, "stage6_input")
+        self.assertEqual(processor._stage7_review_source, "stage7_review_with_stars")
+        self.assertIsNone(processor.starless_file)
+        self.assertIsNone(processor.starmask_file)
+        self.assertIsNone(processor._stage6_pair_handoff)
+        self.assertEqual(
+            processor.result_metadata[-1]["reason_code"],
+            "stage7_bright_core_integrity_rejected",
+        )
 
     def test_stage7_validated_fallback_reason_distinguishes_rescue_modes(self):
         processor = pipeline_module.StarunPostProcessor()
@@ -1710,6 +1878,102 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
             stage6_services_module.STAGE7_CANDIDATE_RANKING_POLICY,
             "hard_gate_bounded_presentation_score_v4",
         )
+
+    def test_stage7_strict_target_prefers_unsaturated_safe_candidate(self):
+        processor = pipeline_module.StarunPostProcessor()
+
+        def attempt(name: str, saturated: bool) -> dict[str, Any]:
+            return {
+                "name": name,
+                "stem": f"stage7_{name}",
+                "status": "ok",
+                "allowed_as_final": True,
+                "technical_safe": True,
+                "diagnostics": [],
+                "advisories": [],
+                "risk_score": 0.1,
+                "presentation_score": {"score": 0.8},
+                "preview_target_attainment": {
+                    "stretch_saturated": saturated,
+                },
+                "target_local_quality": {
+                    "strict_target_evidence": {"strict": True},
+                    "quality_gates": {},
+                },
+            }
+
+        selected = min(
+            [attempt("saturated", True), attempt("unsaturated", False)],
+            key=processor._stage7_candidate_selection_key,
+        )
+
+        self.assertEqual(selected["name"], "unsaturated")
+
+    def test_stage7_strict_forced_delivery_prefers_unsaturated_safe_candidate(self):
+        def attempt(name: str, saturated: bool) -> dict[str, Any]:
+            return {
+                "name": name,
+                "status": "ok",
+                "stem": f"stage7_{name}",
+                "target_local_quality": {
+                    "strict_target_evidence": {"strict": True},
+                },
+                "preview_target_attainment": {
+                    "stretch_saturated": saturated,
+                },
+                "presentation_score": {"score": 0.5},
+                "background_quality_gate": {"metrics": {}, "limits": {}},
+                "color_vector_gate": {"metrics": {}, "limits": {}},
+                "diagnostics": ["background_chroma_noise_score"],
+            }
+
+        selected = min(
+            [attempt("saturated", True), attempt("unsaturated", False)],
+            key=pipeline_module.StarunPostProcessor._stage7_forced_candidate_selection_key,
+        )
+
+        self.assertEqual(selected["name"], "unsaturated")
+
+    def test_stage7_all_core_unsafe_candidates_trigger_pair_rejection(self):
+        candidates = [
+            {
+                "target_local_quality": {
+                    "quality_gates": {
+                        "local_core_clip_ratio": {"hard_failed": True}
+                    }
+                }
+            },
+            {
+                "target_local_quality": {
+                    "quality_gates": {
+                        "local_core_parity_phase_span": {"hard_failed": True}
+                    }
+                }
+            },
+        ]
+
+        rejected, reasons = (
+            stage6_services_module._stage7_all_saved_candidates_fail_core_gates(
+                candidates,
+                strict_target=True,
+            )
+        )
+
+        self.assertTrue(rejected)
+        self.assertEqual(
+            reasons,
+            ["local_core_clip_ratio", "local_core_parity_phase_span"],
+        )
+        candidates.append(
+            {"target_local_quality": {"quality_gates": {}}}
+        )
+        rejected, _reasons = (
+            stage6_services_module._stage7_all_saved_candidates_fail_core_gates(
+                candidates,
+                strict_target=True,
+            )
+        )
+        self.assertFalse(rejected)
 
     def test_stage7_candidate_selection_uses_preview_perceptual_retention(self):
         processor = pipeline_module.StarunPostProcessor()
@@ -3455,6 +3719,20 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
         self.assertFalse(
             processor._stage7_candidate_is_technically_safe(core_overflow)
         )
+
+        for gate_name in (
+            "local_core_colored_plateau_component_ratio",
+            "local_core_parity_phase_span",
+            "local_core_reference_available",
+        ):
+            with self.subTest(gate=gate_name):
+                damaged = copy.deepcopy(appearance_only)
+                damaged["target_local_quality"]["quality_gates"] = {
+                    gate_name: {"hard_failed": True}
+                }
+                self.assertFalse(
+                    processor._stage7_candidate_is_technically_safe(damaged)
+                )
 
         corrupt = copy.deepcopy(appearance_only)
         corrupt["starless_structure_quality"] = {"accepted": False}

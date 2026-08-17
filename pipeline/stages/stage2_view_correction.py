@@ -1,4 +1,5 @@
 """Stage 2 view correction and crop."""
+import copy
 import math
 from typing import List, Optional, Tuple
 
@@ -517,6 +518,26 @@ def _detect_field_rotation_candidate(
     return result.rect, note, report
 
 
+def _field_rotation_verification_cleared(report: dict) -> bool:
+    """Only a positive no-anomaly result clears a prior field-rotation hit."""
+
+    return bool(
+        not report.get("accepted", False)
+        and str(report.get("reason") or "")
+        == "no_significant_edge_connected_coverage_anomaly"
+    )
+
+
+def _field_rotation_connected_ratio(report: dict) -> Optional[float]:
+    evidence = report.get("evidence") if isinstance(report, dict) else None
+    if not isinstance(evidence, dict):
+        return None
+    try:
+        return float(evidence.get("edge_connected_ratio"))
+    except (TypeError, ValueError):
+        return None
+
+
 def _stage2_apply_crop(
     pipeline,
     crop_report: dict,
@@ -556,10 +577,26 @@ def _stage2_apply_crop(
         "height": int(crop_h),
         "width": int(crop_w),
     }
+    crop_report["total_crop"] = _stage2_crop_totals(crop_report)
+    original_shape = crop_report.get("original_shape") or before
+    original_area = int(original_shape.get("width", 0) or 0) * int(
+        original_shape.get("height", 0) or 0
+    )
+    retained_area_ratio = (
+        float(int(crop_w) * int(crop_h) / original_area)
+        if original_area > 0
+        else None
+    )
     crop_report.setdefault("crops", []).append(
         {
             "reason": reason,
             "requested_crop": requested_crop,
+            "constrained_crop": {
+                "x": int(x),
+                "y": int(y),
+                "width": int(crop_w),
+                "height": int(crop_h),
+            },
             "center_protection_limited": bool(protection_note),
             "x": int(x),
             "y": int(y),
@@ -569,11 +606,12 @@ def _stage2_apply_crop(
             "removed_top": int(y),
             "removed_right": max(0, before_width - int(x) - int(crop_w)),
             "removed_bottom": max(0, before_height - int(y) - int(crop_h)),
+            "cumulative_crop": copy.deepcopy(crop_report["total_crop"]),
+            "retained_area_ratio": retained_area_ratio,
             "before_shape": before,
             "after_shape": crop_report["current_shape"],
         }
     )
-    crop_report["total_crop"] = _stage2_crop_totals(crop_report)
     return applied_rect, protection_note
 
 
@@ -677,6 +715,7 @@ def run_stage2_view_correction(pipeline) -> None:
     """
     stage_label = PipelineStage.VIEW_CORRECTION.label
     pipeline.log.stage_start(stage_label)
+    pipeline._clear_stage_reviews(2)
     status = "ok"
     review_reason_code = ""
     messages: List[str] = []
@@ -725,6 +764,11 @@ def run_stage2_view_correction(pipeline) -> None:
         )
         if requires_review:
             pipeline._stage2_view_review_required = True
+            pipeline._require_review(
+                2,
+                "user_preserve_edge_black_review",
+                {"edge_black_ratio": edge_black_ratio},
+            )
         stage_saved = pipeline._save_stage_output("stage2_corrected")
         crop_report.update(
             {
@@ -859,10 +903,30 @@ def run_stage2_view_correction(pipeline) -> None:
             field_rect, field_note, field_report = (
                 _detect_field_rotation_candidate(pipeline)
             )
-            crop_report["field_rotation"] = field_report
+            # Keep the mutable aggregate separate from immutable per-pass
+            # detector snapshots.  Reusing ``field_report`` here would make
+            # passes[0].detector point back to its owning field_rotation
+            # mapping once the passes list is attached, which is not JSON
+            # serializable.
+            crop_report["field_rotation"] = copy.deepcopy(field_report)
             messages.append(field_note)
             if field_rect is not None:
                 x, y, crop_w, crop_h = field_rect
+                configured_protection = float(
+                    getattr(
+                        pipeline.cfg,
+                        "stage2_center_protect_area_ratio",
+                        0.70,
+                    )
+                )
+                effective_protection = max(0.70, configured_protection)
+                crop_report["center_protection"] = _stage2_center_protection(
+                    crop_report.get("original_shape") or initial_shape,
+                    effective_protection,
+                )
+                crop_report["field_rotation"][
+                    "effective_center_protect_area_ratio"
+                ] = effective_protection
                 applied_rect, protection_note = _stage2_apply_crop(
                     pipeline,
                     crop_report,
@@ -891,24 +955,184 @@ def run_stage2_view_correction(pipeline) -> None:
                     _residual_rect, residual_note, residual_report = (
                         _detect_field_rotation_candidate(pipeline)
                     )
-                    crop_report["field_rotation"]["residual"] = residual_report
+                    crop_report["field_rotation"]["residual"] = copy.deepcopy(
+                        residual_report
+                    )
                     messages.append(f"post-crop {residual_note}")
-                    if bool(residual_report.get("accepted")):
-                        crop_report["requires_review"] = True
-                        crop_report["reason_code"] = (
-                            "field_rotation_residual_review"
+                    crop_report["field_rotation"]["passes"] = [
+                        {
+                            "pass": 1,
+                            "detector": copy.deepcopy(field_report),
+                            "applied_crop": copy.deepcopy(
+                                crop_report["field_rotation"].get(
+                                    "applied_crop"
+                                )
+                            ),
+                            "verification": copy.deepcopy(residual_report),
+                        }
+                    ]
+                    max_passes = max(
+                        1,
+                        min(
+                            2,
+                            int(
+                                getattr(
+                                    pipeline.cfg,
+                                    "stage2_field_rotation_max_passes",
+                                    2,
+                                )
+                                or 2
+                            ),
+                        ),
+                    )
+                    crop_report["field_rotation"]["max_passes"] = max_passes
+                    if bool(residual_report.get("accepted")) and max_passes >= 2:
+                        rollback_saved = pipeline._save_stage_output(
+                            "stage2_field_rotation_pass1"
                         )
+                        before_second = copy.deepcopy(
+                            {
+                                "current_shape": crop_report.get("current_shape"),
+                                "total_left": crop_report.get("total_left", 0),
+                                "total_top": crop_report.get("total_top", 0),
+                                "total_crop": crop_report.get("total_crop"),
+                                "crops": crop_report.get("crops", []),
+                                "crop_limit_hits": crop_report.get(
+                                    "crop_limit_hits", []
+                                ),
+                            }
+                        )
+                        second_record = {
+                            "pass": 2,
+                            "detector": copy.deepcopy(residual_report),
+                            "rollback_checkpoint_saved": bool(rollback_saved),
+                            "applied_crop": None,
+                            "verification": None,
+                            "accepted": False,
+                            "rolled_back": False,
+                        }
+                        if rollback_saved and _residual_rect is not None:
+                            second_applied, second_note = _stage2_apply_crop(
+                                pipeline,
+                                crop_report,
+                                *_residual_rect,
+                                reason="native_field_rotation_residual",
+                            )
+                            if second_note:
+                                messages.append(second_note)
+                            second_record["applied_crop"] = (
+                                {
+                                    "x": int(second_applied[0]),
+                                    "y": int(second_applied[1]),
+                                    "width": int(second_applied[2]),
+                                    "height": int(second_applied[3]),
+                                }
+                                if second_applied is not None
+                                else None
+                            )
+                            if second_applied is not None:
+                                _verify_rect, verify_note, verify_report = (
+                                    _detect_field_rotation_candidate(pipeline)
+                                )
+                                second_record["verification"] = copy.deepcopy(
+                                    verify_report
+                                )
+                                messages.append(f"second-pass {verify_note}")
+                                before_ratio = _field_rotation_connected_ratio(
+                                    residual_report
+                                )
+                                after_ratio = _field_rotation_connected_ratio(
+                                    verify_report
+                                )
+                                improved = bool(
+                                    _field_rotation_verification_cleared(
+                                        verify_report
+                                    )
+                                    or (
+                                        before_ratio is not None
+                                        and after_ratio is not None
+                                        and after_ratio < before_ratio - 1.0e-9
+                                    )
+                                )
+                                second_record["improved"] = improved
+                                second_record["edge_connected_ratio_before"] = (
+                                    before_ratio
+                                )
+                                second_record["edge_connected_ratio_after"] = (
+                                    after_ratio
+                                )
+                                if improved:
+                                    second_record["accepted"] = True
+                                    residual_report = verify_report
+                                    crop_report["field_rotation"][
+                                        "residual"
+                                    ] = copy.deepcopy(verify_report)
+                                else:
+                                    pipeline.cmd_with_check(
+                                        "load", "stage2_field_rotation_pass1"
+                                    )
+                                    crop_report.update(before_second)
+                                    second_record["rolled_back"] = True
+                                    second_record["rollback_reason"] = (
+                                        "field_rotation_residual_not_improved"
+                                    )
+                                    messages.append(
+                                        "second field-rotation crop did not improve "
+                                        "edge-connected coverage; pass 1 restored"
+                                    )
+                            else:
+                                second_record["rollback_reason"] = (
+                                    "candidate_not_smaller_or_center_protected"
+                                )
+                        elif not rollback_saved:
+                            second_record["rollback_reason"] = (
+                                "temporary_rollback_checkpoint_unavailable"
+                            )
+                        else:
+                            second_record["rollback_reason"] = (
+                                "residual_candidate_rectangle_unavailable"
+                            )
+                        crop_report["field_rotation"]["passes"].append(
+                            second_record
+                        )
+
+                    if not _field_rotation_verification_cleared(residual_report):
+                        review_reason_code = (
+                            "field_rotation_residual_review"
+                            if bool(residual_report.get("accepted"))
+                            else "field_rotation_verification_unavailable"
+                        )
+                        crop_report["requires_review"] = True
+                        crop_report["reason_code"] = review_reason_code
                         pipeline._stage2_view_review_required = True
+                        pipeline._require_review(
+                            2,
+                            review_reason_code,
+                            {"residual": residual_report},
+                        )
                         status = "degraded"
-                        review_reason_code = "field_rotation_residual_review"
                         messages.append(
-                            "field-rotation coverage anomaly remains after "
-                            "70% center protection; manual review required"
+                            "field-rotation coverage remains unresolved within "
+                            "the 70% retained-area safety boundary"
                         )
                 else:
                     crop_report["field_rotation"]["accepted"] = False
                     crop_report["field_rotation"]["reason"] = (
                         "center_protection_blocked"
+                    )
+                    review_reason_code = "field_rotation_center_protection_residual"
+                    crop_report["requires_review"] = True
+                    crop_report["reason_code"] = review_reason_code
+                    pipeline._stage2_view_review_required = True
+                    pipeline._require_review(
+                        2,
+                        review_reason_code,
+                        {"detector": field_report, "constraint": protection_note},
+                    )
+                    status = "degraded"
+                    messages.append(
+                        "field-rotation crop was blocked by the 70% retained-area "
+                        "safety boundary; residual coverage requires review"
                     )
         except (CommandError, SirilError) as error:
             status = "degraded"
@@ -1097,6 +1321,7 @@ def run_stage2_view_correction(pipeline) -> None:
             try:
                 pipeline.cmd_with_check("load", "stage2_input_checkpoint")
                 pipeline._stage2_view_review_required = True
+                pipeline._require_review(2, "failure_policy_preserve_review")
                 crop_report["execution"] = "safe_passthrough"
                 crop_report["reason_code"] = "failure_policy_preserve_review"
                 messages.append(
@@ -1121,6 +1346,20 @@ def run_stage2_view_correction(pipeline) -> None:
     except (CommandError, SirilError, OSError, RuntimeError, TypeError, ValueError):
         crop_report["final_shape"] = crop_report.get("current_shape") or {}
     crop_report["total_crop"] = _stage2_crop_totals(crop_report)
+    field_rotation_report = crop_report.get("field_rotation") or {}
+    field_rotation_passes = (
+        field_rotation_report.get("passes") or []
+        if isinstance(field_rotation_report, dict)
+        else []
+    )
+    if isinstance(field_rotation_report, dict):
+        field_rotation_report["actual_passes"] = sum(
+            1
+            for item in field_rotation_passes
+            if isinstance(item, dict)
+            and isinstance(item.get("applied_crop"), dict)
+            and not bool(item.get("rolled_back", False))
+        )
     crop_report["status"] = status
     crop_report["failure_action"] = failure_action
     crop_report["messages"] = messages
@@ -1137,7 +1376,7 @@ def run_stage2_view_correction(pipeline) -> None:
         elapsed,
         "；".join(messages),
         execution="safe_passthrough" if preserved_for_review else "completed",
-        fallback_used=status == "degraded",
+        fallback_used=preserved_for_review,
         upstream_passthrough=preserved_for_review,
         reason_code=(
             "failure_policy_preserve_review"
@@ -1156,4 +1395,5 @@ def run_stage2_view_correction(pipeline) -> None:
                 getattr(pipeline, "_stage2_view_review_required", False)
             ),
         },
+        review_reasons=pipeline._stage_review_reasons(2),
     )

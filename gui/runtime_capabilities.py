@@ -23,7 +23,7 @@ from typing import Callable, Mapping, MutableMapping, Sequence
 RUNTIME_CAPABILITIES_SCHEMA = "starun.runtime-capabilities.v1"
 RUNTIME_CAPABILITIES_NAME = "runtime-capabilities.json"
 RUNTIME_CAPABILITIES_ENV = "STARUN_RUNTIME_CAPABILITIES_MANIFEST"
-RUN_STATE_SCHEMA = "starun.run-state.v1"
+RUN_STATE_SCHEMA = "starun.run-state.v2"
 RUN_STATE_NAME = "run-state.json"
 
 GAIA_ASTRO_FILENAME = "siril_cat_healpix8_astro.dat"

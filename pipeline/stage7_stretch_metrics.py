@@ -10,6 +10,7 @@ import ui_preview
 
 from image_metrics import (
     _box_blur_gray,
+    _component_areas,
     _to_rgb_float_fullres,
     _to_rgb_float_image,
 )
@@ -3519,15 +3520,62 @@ def assess_target_local_stretch(
     candidate: np.ndarray,
     target_type: str,
     cfg: Any,
+    *,
+    target_profile: Optional[Dict[str, Any]] = None,
+    starmask: Optional[np.ndarray] = None,
+    frozen_reference_available: bool = True,
 ) -> Dict[str, Any]:
     """Measure core, faint-structure and dark-lane regions derived from linear data."""
+    normalized_target = str(target_type or "generic_low_snr_safe").strip().lower()
+    strict_evidence = stage7_quality.strict_bright_core_target_evidence(
+        normalized_target,
+        target_profile,
+    )
+    strict_target = bool(strict_evidence.get("strict", False))
     if not bool(getattr(cfg, "stage7_target_local_metrics_enabled", True)):
+        if strict_target:
+            return {
+                "status": "rejected",
+                "accepted": False,
+                "issues": ["local_core_reference_gate_disabled"],
+                "advisories": [],
+                "quality_gates": {
+                    "local_core_reference_available": {
+                        "status": "hard_failed",
+                        "hard_failed": True,
+                        "advisory": False,
+                        "fixed_limit": True,
+                    }
+                },
+                "risk_score": 1.0,
+                "metrics": {},
+                "strict_target_evidence": strict_evidence,
+            }
         return {
             "status": "disabled",
             "accepted": True,
             "issues": [],
             "risk_score": 0.0,
             "metrics": {},
+        }
+    if strict_target and not frozen_reference_available:
+        return {
+            "status": "rejected",
+            "accepted": False,
+            "issues": ["local_core_frozen_reference_missing"],
+            "advisories": [],
+            "quality_gates": {
+                "local_core_reference_available": {
+                    "status": "hard_failed",
+                    "hard_failed": True,
+                    "advisory": False,
+                    "fixed_limit": True,
+                }
+            },
+            "risk_score": 1.0,
+            "metrics": {},
+            "target_type": normalized_target,
+            "strict_target_evidence": strict_evidence,
         }
     try:
         source_rgb = _stage7_rgb_float_fullres(np.asarray(baseline))
@@ -3555,6 +3603,35 @@ def assess_target_local_stretch(
         dark_mask = (broad > q35) & (broad <= q55)
         faint_mask = (broad > q55) & (broad <= q90)
         core_mask = broad > q99
+        core_roi_evidence: Dict[str, Any] = {
+            "available": True,
+            "method": "target_local_top1pct",
+            "support": int(np.count_nonzero(core_mask)),
+        }
+        if strict_target:
+            strict_core_mask, core_roi_evidence = (
+                stage7_quality.build_bright_core_roi(baseline, starmask)
+            )
+            if strict_core_mask is None or not bool(
+                core_roi_evidence.get("available", False)
+            ):
+                raise ValueError(
+                    "strict bright-core ROI unavailable: "
+                    f"{core_roi_evidence.get('reason', 'unknown')}"
+                )
+            core_mask = strict_core_mask
+            starmask_rgb = _stage7_rgb_float_fullres(np.asarray(starmask))
+            star_pixels = (
+                np.max(starmask_rgb, axis=0)
+                > stage7_quality.BRIGHT_CORE_STARMASK_THRESHOLD
+            )
+            star_exclusion = stage7_quality._dilate_binary_mask(
+                star_pixels,
+                stage7_quality.BRIGHT_CORE_STARMASK_EXPANSION,
+            )
+            background_mask &= ~star_exclusion
+            dark_mask &= ~star_exclusion
+            faint_mask &= ~star_exclusion
         if min(
             int(np.count_nonzero(background_mask)),
             int(np.count_nonzero(dark_mask)),
@@ -3591,23 +3668,37 @@ def assess_target_local_stretch(
             "core_coverage": float(np.mean(core_mask)),
         }
 
-        normalized_target = str(target_type or "generic_low_snr_safe").strip().lower()
         issues = []
         advisories = []
         quality_gates: Dict[str, Dict[str, Any]] = {}
         risk_score = 0.0
         if normalized_target in CORE_PROTECT_TARGETS:
-            core_clip_max = _bounded(
-                getattr(cfg, "stage7_local_core_clip_ratio_max", 0.12),
-                0.12,
-                0.01,
-                0.30,
-            )
-            core_clip_gate = stage7_quality.stage7_9_upper_quality_gate(
-                cfg,
-                value=core_clip_ratio,
-                accepted_limit=core_clip_max,
-            )
+            if strict_target:
+                channel_clip_ratios = [
+                    float(np.mean(candidate_rgb[channel][core_mask] >= 0.995))
+                    for channel in range(3)
+                ]
+                core_clip_ratio = max(channel_clip_ratios)
+                metrics["core_clip_ratio"] = core_clip_ratio
+                metrics["core_channel_clip_ratios"] = channel_clip_ratios
+                core_clip_max = 0.01
+                core_clip_gate = stage7_quality._fixed_upper_gate(
+                    core_clip_ratio,
+                    accepted_limit=core_clip_max,
+                    hard_limit=0.015,
+                )
+            else:
+                core_clip_max = _bounded(
+                    getattr(cfg, "stage7_local_core_clip_ratio_max", 0.12),
+                    0.12,
+                    0.01,
+                    0.30,
+                )
+                core_clip_gate = stage7_quality.stage7_9_upper_quality_gate(
+                    cfg,
+                    value=core_clip_ratio,
+                    accepted_limit=core_clip_max,
+                )
             quality_gates["local_core_clip_ratio"] = core_clip_gate
             if core_clip_gate["hard_failed"]:
                 issues.append(
@@ -3620,6 +3711,105 @@ def assess_target_local_stretch(
                 )
             risk_score += core_clip_ratio * 8.0
             risk_score += max(0.0, core_p99 - 0.985) * 30.0
+
+            if strict_target:
+                capped_channels = candidate_rgb >= 0.995
+                colored_plateau = (
+                    np.any(capped_channels, axis=0)
+                    & ~np.all(capped_channels, axis=0)
+                    & core_mask
+                )
+                component_areas = _component_areas(colored_plateau)
+                colored_component_ratio = float(
+                    max(component_areas, default=0)
+                ) / float(max(int(np.count_nonzero(core_mask)), 1))
+                plateau_gate = stage7_quality._fixed_upper_gate(
+                    colored_component_ratio,
+                    accepted_limit=0.005,
+                    hard_limit=0.01,
+                )
+                quality_gates[
+                    "local_core_colored_plateau_component_ratio"
+                ] = plateau_gate
+                metrics[
+                    "core_colored_plateau_component_ratio"
+                ] = colored_component_ratio
+                metrics["core_colored_plateau_pixels"] = int(
+                    np.count_nonzero(colored_plateau)
+                )
+                if plateau_gate["hard_failed"]:
+                    issues.append(
+                        "local_core_colored_plateau_component_ratio "
+                        f"{colored_component_ratio:.4f}>0.0100"
+                    )
+                elif plateau_gate["advisory"]:
+                    advisories.append(
+                        "local_core_colored_plateau_component_ratio "
+                        f"{colored_component_ratio:.4f}>0.0050 advisory"
+                    )
+
+                parity_means = []
+                parity_spans = []
+                parity_complete = True
+                for channel in range(3):
+                    channel_means = []
+                    for phase_y in range(2):
+                        for phase_x in range(2):
+                            phase_mask = core_mask[phase_y::2, phase_x::2]
+                            values = candidate_rgb[
+                                channel, phase_y::2, phase_x::2
+                            ][phase_mask]
+                            if values.size:
+                                channel_means.append(float(np.mean(values)))
+                            else:
+                                channel_means.append(None)
+                                parity_complete = False
+                    available = [
+                        value for value in channel_means if value is not None
+                    ]
+                    parity_means.append(channel_means)
+                    parity_spans.append(
+                        float(max(available) - min(available))
+                        if available
+                        else float("inf")
+                    )
+                parity_span = max(parity_spans)
+                parity_gate = stage7_quality._fixed_upper_gate(
+                    parity_span,
+                    accepted_limit=0.01,
+                    hard_limit=0.015,
+                )
+                if not parity_complete:
+                    parity_gate.update(
+                        {
+                            "status": "hard_failed",
+                            "hard_failed": True,
+                            "advisory": False,
+                        }
+                    )
+                quality_gates["local_core_parity_phase_span"] = parity_gate
+                metrics["core_parity_phase_means"] = parity_means
+                metrics["core_parity_phase_spans"] = parity_spans
+                metrics["core_parity_phase_span"] = parity_span
+                if parity_gate["hard_failed"]:
+                    issues.append(
+                        "local_core_parity_phase_span "
+                        f"{parity_span:.4f}>0.0150"
+                    )
+                elif parity_gate["advisory"]:
+                    advisories.append(
+                        "local_core_parity_phase_span "
+                        f"{parity_span:.4f}>0.0100 advisory"
+                    )
+                quality_gates["local_core_reference_available"] = {
+                    "status": "ok",
+                    "hard_failed": False,
+                    "advisory": False,
+                    "fixed_limit": True,
+                }
+                metrics["core_roi"] = core_roi_evidence
+                risk_score += colored_component_ratio * 20.0
+                risk_score += parity_span * 20.0
 
         if normalized_target in FAINT_SIGNAL_TARGETS:
             faint_snr_min = _bounded(
@@ -3678,8 +3868,29 @@ def assess_target_local_stretch(
             "risk_score": float(risk_score),
             "metrics": metrics,
             "target_type": normalized_target,
+            "strict_target_evidence": strict_evidence,
         }
     except (IndexError, TypeError, ValueError, FloatingPointError) as error:
+        if strict_target:
+            return {
+                "status": "rejected",
+                "accepted": False,
+                "issues": [f"local_core_frozen_reference_unavailable: {error}"],
+                "advisories": [],
+                "quality_gates": {
+                    "local_core_reference_available": {
+                        "status": "hard_failed",
+                        "hard_failed": True,
+                        "advisory": False,
+                        "fixed_limit": True,
+                    }
+                },
+                "risk_score": 1.0,
+                "metrics": {},
+                "target_type": normalized_target,
+                "strict_target_evidence": strict_evidence,
+                "reason": str(error),
+            }
         return {
             "status": "unavailable",
             "accepted": True,

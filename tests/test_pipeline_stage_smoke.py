@@ -2269,6 +2269,39 @@ class _Pipeline:
         self._last_sasp_stage8_api_error = None
         self._last_aberration_api_error = None
         self._last_scunet_fallback_error = None
+        self._review_requirements: dict[tuple[int, str], dict[str, object]] = {}
+
+    def _clear_stage_reviews(self, stage: int) -> None:
+        self._review_requirements = {
+            key: value
+            for key, value in self._review_requirements.items()
+            if key[0] != int(stage)
+        }
+
+    def _require_review(
+        self,
+        stage: int,
+        code: str,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        self._review_requirements[(int(stage), str(code))] = {
+            "stage": int(stage),
+            "code": str(code),
+            "details": dict(details or {}),
+        }
+
+    def _stage_review_reasons(self, stage: int) -> list[str]:
+        return [
+            value["code"]
+            for key, value in self._review_requirements.items()
+            if key[0] == int(stage)
+        ]
+
+    def _review_requirements_payload(self) -> list[dict[str, object]]:
+        return [
+            dict(value)
+            for _key, value in sorted(self._review_requirements.items())
+        ]
 
     def _record_stage(
         self,
@@ -2287,8 +2320,10 @@ class _Pipeline:
         (self.process_dir / f"{stem}.fit").touch()
         return True
 
-    def _write_stage_json(self, *_args, **_kwargs) -> None:
-        return
+    def _write_stage_json(self, _name: str, payload: dict) -> None:
+        # Match the production writer's JSON boundary so recursive report
+        # structures cannot pass the stage smoke suite unnoticed.
+        json.loads(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
     def _short_text(self, value, _limit: int = 160) -> str:
         return str(value)
@@ -2476,6 +2511,63 @@ class PipelineStageSmokeTests(unittest.TestCase):
                 "accepted"
             ]
         )
+        self.assertEqual(
+            self.pipeline.stage2_crop_report["field_rotation"]["actual_passes"],
+            1,
+        )
+        field_rotation = self.pipeline.stage2_crop_report["field_rotation"]
+        first_pass = field_rotation["passes"][0]
+        self.assertIsNot(first_pass["detector"], field_rotation)
+        self.assertIsNot(first_pass["verification"], field_rotation["residual"])
+        json.loads(json.dumps(self.pipeline.stage2_crop_report))
+
+    def test_stage2_field_rotation_area_limit_marks_stage2_review(self) -> None:
+        self.pipeline.cfg.stage2_center_protect_area_ratio = 1.0
+        no_contour = (
+            None,
+            "no contour",
+            {"method": "native_contour", "accepted": False},
+        )
+        field_candidate = (
+            (10, 10, 80, 80),
+            "field rotation",
+            {
+                "method": "native_field_rotation",
+                "accepted": True,
+                "reason": "edge_connected_field_rotation_confirmed",
+                "evidence": {"edge_connected_ratio": 0.25},
+            },
+        )
+        with (
+            patch.object(
+                stage2_view_correction,
+                "_detect_native_contour_candidate",
+                return_value=no_contour,
+            ),
+            patch.object(
+                stage2_view_correction,
+                "_detect_field_rotation_candidate",
+                return_value=field_candidate,
+            ),
+            patch.object(
+                stage2_view_correction,
+                "_detect_auto_edge_crop",
+                return_value=(None, "no generic crop"),
+            ),
+        ):
+            stage2_view_correction.run_stage2_view_correction(self.pipeline)
+
+        self.assertEqual(
+            self.pipeline._stage_review_reasons(2),
+            ["field_rotation_residual_review"],
+        )
+        self.assertEqual(self.pipeline._stage_review_reasons(3), [])
+        self.assertEqual(self.pipeline.results[-1][1], "degraded")
+        self.assertEqual(
+            self.pipeline.stage2_crop_report["field_rotation"]["actual_passes"],
+            1,
+        )
+        json.loads(json.dumps(self.pipeline.stage2_crop_report))
 
     def test_stage2_field_rotation_residual_marks_review_without_second_crop(self) -> None:
         no_contour = (
@@ -2525,6 +2617,157 @@ class PipelineStageSmokeTests(unittest.TestCase):
             self.pipeline.stage2_crop_report["reason_code"],
             "field_rotation_residual_review",
         )
+        json.loads(json.dumps(self.pipeline.stage2_crop_report))
+
+    def test_stage2_second_field_rotation_crop_clears_residual(self) -> None:
+        no_contour = (
+            None,
+            "no contour",
+            {"method": "native_contour", "accepted": False},
+        )
+        first = (
+            (4, 4, 92, 92),
+            "first field crop",
+            {
+                "method": "native_field_rotation",
+                "accepted": True,
+                "reason": "edge_connected_field_rotation_confirmed",
+                "evidence": {"edge_connected_ratio": 0.24},
+            },
+        )
+        residual = (
+            (4, 4, 84, 84),
+            "residual field crop",
+            {
+                "method": "native_field_rotation",
+                "accepted": True,
+                "reason": "edge_connected_field_rotation_confirmed",
+                "evidence": {"edge_connected_ratio": 0.12},
+            },
+        )
+        clear = (
+            None,
+            "clear",
+            {
+                "method": "native_field_rotation",
+                "accepted": False,
+                "reason": "no_significant_edge_connected_coverage_anomaly",
+                "evidence": {"edge_connected_ratio": 0.0},
+            },
+        )
+        with (
+            patch.object(
+                stage2_view_correction,
+                "_detect_native_contour_candidate",
+                return_value=no_contour,
+            ),
+            patch.object(
+                stage2_view_correction,
+                "_detect_field_rotation_candidate",
+                side_effect=(first, residual, clear),
+            ) as detect,
+            patch.object(stage2_view_correction, "_detect_auto_edge_crop") as edge,
+        ):
+            stage2_view_correction.run_stage2_view_correction(self.pipeline)
+
+        self.assertEqual(detect.call_count, 3)
+        edge.assert_not_called()
+        self.assertEqual(
+            self.pipeline.commands,
+            [
+                ("crop", "4", "4", "92", "92"),
+                ("crop", "4", "4", "84", "84"),
+            ],
+        )
+        report = self.pipeline.stage2_crop_report
+        self.assertFalse(report["requires_review"])
+        self.assertEqual(report["total_crop"], {"left": 8, "top": 8, "right": 8, "bottom": 8})
+        self.assertEqual(len(report["field_rotation"]["passes"]), 2)
+        self.assertTrue(report["field_rotation"]["passes"][1]["accepted"])
+        self.assertEqual(report["field_rotation"]["actual_passes"], 2)
+        self.assertGreaterEqual(report["crops"][-1]["retained_area_ratio"], 0.70)
+        first_pass, second_pass = report["field_rotation"]["passes"]
+        self.assertIsNot(first_pass["detector"], report["field_rotation"])
+        self.assertIsNot(
+            first_pass["verification"],
+            second_pass["detector"],
+        )
+        self.assertIsNot(
+            second_pass["verification"],
+            report["field_rotation"]["residual"],
+        )
+        json.loads(json.dumps(report))
+
+    def test_stage2_second_field_rotation_crop_rolls_back_without_improvement(self) -> None:
+        no_contour = (
+            None,
+            "no contour",
+            {"method": "native_contour", "accepted": False},
+        )
+        first = (
+            (2, 2, 96, 96),
+            "first field crop",
+            {
+                "method": "native_field_rotation",
+                "accepted": True,
+                "reason": "edge_connected_field_rotation_confirmed",
+                "evidence": {"edge_connected_ratio": 0.20},
+            },
+        )
+        residual = (
+            (2, 2, 92, 92),
+            "residual field crop",
+            {
+                "method": "native_field_rotation",
+                "accepted": True,
+                "reason": "edge_connected_field_rotation_confirmed",
+                "evidence": {"edge_connected_ratio": 0.18},
+            },
+        )
+        worse = (
+            (2, 2, 88, 88),
+            "still residual",
+            {
+                "method": "native_field_rotation",
+                "accepted": True,
+                "reason": "edge_connected_field_rotation_confirmed",
+                "evidence": {"edge_connected_ratio": 0.19},
+            },
+        )
+        with (
+            patch.object(
+                stage2_view_correction,
+                "_detect_native_contour_candidate",
+                return_value=no_contour,
+            ),
+            patch.object(
+                stage2_view_correction,
+                "_detect_field_rotation_candidate",
+                side_effect=(first, residual, worse),
+            ),
+            patch.object(stage2_view_correction, "_detect_auto_edge_crop"),
+        ):
+            stage2_view_correction.run_stage2_view_correction(self.pipeline)
+
+        report = self.pipeline.stage2_crop_report
+        second = report["field_rotation"]["passes"][1]
+        self.assertTrue(second["rolled_back"])
+        self.assertEqual(
+            second["rollback_reason"],
+            "field_rotation_residual_not_improved",
+        )
+        self.assertEqual(report["total_crop"], {"left": 2, "top": 2, "right": 2, "bottom": 2})
+        self.assertEqual(report["field_rotation"]["actual_passes"], 1)
+        self.assertTrue(report["requires_review"])
+        self.assertEqual(self.pipeline._stage_review_reasons(2), ["field_rotation_residual_review"])
+        self.assertIn(("load", "stage2_field_rotation_pass1"), self.pipeline.commands)
+        first_pass, second_pass = report["field_rotation"]["passes"]
+        self.assertIsNot(first_pass["detector"], report["field_rotation"])
+        self.assertIsNot(
+            first_pass["verification"],
+            second_pass["detector"],
+        )
+        json.loads(json.dumps(report))
 
     def test_stage2_center_area_protection_constrains_aggressive_crop(self) -> None:
         shape = {"channels": 3, "height": 100, "width": 100}

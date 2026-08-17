@@ -15,6 +15,8 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
+import bright_core_color
+import stage7_quality
 from channel_semantics import (
     channel_shape_dict,
     classify_channel_semantics,
@@ -3043,6 +3045,7 @@ def run_stage4_color_calibration(pipeline) -> None:
     """Stage 4: plate solve, SPCC-first physical color, then bounded fallbacks."""
     stage_label = PipelineStage.COLOR_CALIBRATION.label
     pipeline.log.stage_start(stage_label)
+    pipeline._clear_stage_reviews(4)
     status = "ok"
     hard_degraded = False
     requires_review = False
@@ -3057,6 +3060,7 @@ def run_stage4_color_calibration(pipeline) -> None:
         "SPCC_LOCAL_GAIA",
         "SPCC_NARROWBAND",
         "SPCC_NARROWBAND_LOCAL_GAIA",
+        "SPCC_LOCAL_CORE_CHROMA_ROLLBACK",
     }
     accepted_pcc_methods = {
         "PCC",
@@ -3083,6 +3087,23 @@ def run_stage4_color_calibration(pipeline) -> None:
         "accepted": False,
         "status": "not_run",
     }
+    bright_core_color_integrity: Dict[str, Any] = {
+        "schema": bright_core_color.SCHEMA,
+        "applicable": False,
+        "status": "not_evaluated",
+        "accepted": True,
+        "repaired": False,
+        "final_action": "not_evaluated",
+        "trigger_reasons": [],
+    }
+    pcc_bright_core_color_integrity: Dict[str, Any] = {
+        "schema": bright_core_color.SCHEMA,
+        "applicable": False,
+        "status": "not_evaluated",
+        "accepted": True,
+        "final_action": "not_evaluated",
+        "trigger_reasons": [],
+    }
     spcc_parameters: Dict[str, Any] = {}
     spcc_runtime_capabilities: Dict[str, Any] = {
         "schema": SPCC_CAPABILITY_SCHEMA,
@@ -3099,6 +3120,8 @@ def run_stage4_color_calibration(pipeline) -> None:
         "restored": False,
     }
     pcc_fallback_used = False
+    pcc_bright_core_rejected = False
+    bright_core_preserve_fallback_used = False
     artistic_hoo_report: Dict[str, Any] = {
         "role": "artistic_derivative",
         "status": "not_applicable",
@@ -3258,6 +3281,7 @@ def run_stage4_color_calibration(pipeline) -> None:
             "input": stage4_input_stem,
             "output": "stage4_color" if color_saved else None,
             "method": "PRESERVE_INPUT",
+            "bright_core_color_integrity": bright_core_color_integrity,
             "requires_review": requires_review,
             "runtime_capability_decision": runtime_color_decision,
             "auto_local_reference": auto_reference_report,
@@ -3656,8 +3680,101 @@ def run_stage4_color_calibration(pipeline) -> None:
                             candidate_chw,
                             pipeline,
                         )
+                        pre_repair_quality_report = dict(spcc_quality_report)
+                        (
+                            guarded_candidate,
+                            bright_core_color_integrity,
+                        ) = bright_core_color.evaluate_and_repair_spcc_bright_core(
+                            (
+                                before_pixels_native
+                                if before_pixels_native is not None
+                                else before_chw
+                            ),
+                            candidate_pixels,
+                            target_type=_stage4_active_target_type(pipeline),
+                            target_profile=getattr(
+                                pipeline,
+                                "target_profile",
+                                None,
+                            ),
+                        )
+                        pipeline._stage4_bright_core_color_integrity = dict(
+                            bright_core_color_integrity
+                        )
+                        if guarded_candidate is None:
+                            accepted = False
+                            spcc_quality_report.setdefault(
+                                "rejection_reasons",
+                                [],
+                            ).append("bright_core_color_integrity_rejected")
+                        elif bool(
+                            bright_core_color_integrity.get("repaired", False)
+                        ):
+                            repaired_native = _restore_candidate(guarded_candidate)
+                            _stage4_write_image_pixels(pipeline, repaired_native)
+                            repaired_pixels = pipeline.siril.get_image_pixeldata(
+                                preview=False
+                            )
+                            repaired_chw, _restore_repaired = _stage4_image_as_chw(
+                                repaired_pixels
+                            )
+                            accepted, repaired_quality_report = (
+                                _stage4_pcc_quality_gate(
+                                    before_chw,
+                                    repaired_chw,
+                                    pipeline,
+                                )
+                            )
+                            repaired_quality_report[
+                                "pre_repair_quality_gate"
+                            ] = pre_repair_quality_report
+                            spcc_quality_report = repaired_quality_report
+                            repair_saved = bool(
+                                accepted
+                                and pipeline._save_stage_output(
+                                    SPCC_CANDIDATE_STEM
+                                )
+                            )
+                            if not repair_saved:
+                                accepted = False
+                                spcc_quality_report.setdefault(
+                                    "rejection_reasons",
+                                    [],
+                                ).append(
+                                    "bright_core_repaired_candidate_save_failed"
+                                )
+                            repair_validation = bright_core_color_integrity.setdefault(
+                                "repair",
+                                {},
+                            )
+                            repair_validation["stage4_quality_gate"] = {
+                                "accepted": bool(accepted),
+                                "rejection_reasons": list(
+                                    spcc_quality_report.get(
+                                        "rejection_reasons",
+                                        [],
+                                    )
+                                ),
+                                "candidate_saved": repair_saved,
+                            }
+                            if not accepted:
+                                bright_core_color_integrity.update(
+                                    status="hard_failed",
+                                    accepted=False,
+                                    repaired=False,
+                                    final_action="reject_spcc_to_pcc",
+                                )
+                                bright_core_color_integrity.setdefault(
+                                    "trigger_reasons",
+                                    [],
+                                ).append(
+                                    "repaired_candidate_stage4_quality_gate_failed"
+                                )
                         spcc_quality_report["calibration"] = "SPCC"
                         spcc_quality_report["physical_color"] = True
+                        spcc_quality_report[
+                            "bright_core_color_integrity"
+                        ] = bright_core_color_integrity
                         precision_warnings = [
                             str(attempt.get("precision_warning"))
                             for attempt in spcc_attempts
@@ -3673,7 +3790,25 @@ def run_stage4_color_calibration(pipeline) -> None:
                             ),
                         }
                         if accepted:
-                            if narrowband_physical:
+                            if bool(
+                                bright_core_color_integrity.get(
+                                    "repaired",
+                                    False,
+                                )
+                            ):
+                                color_method = (
+                                    "SPCC_LOCAL_CORE_CHROMA_ROLLBACK"
+                                )
+                                status = "degraded"
+                                color_warning = (
+                                    "spcc_local_core_chroma_rollback"
+                                )
+                                policy_status = "accepted_degraded_fallback"
+                                messages.append(
+                                    "SPCC bright-core chroma anomaly repaired by "
+                                    "local luminance-preserving feather rollback"
+                                )
+                            elif narrowband_physical:
                                 color_method = (
                                     "SPCC_NARROWBAND_LOCAL_GAIA"
                                     if selected_spcc_catalog == SPCC_LOCAL_CATALOG
@@ -3690,8 +3825,9 @@ def run_stage4_color_calibration(pipeline) -> None:
                                 if selected_spcc_catalog == SPCC_LOCAL_CATALOG
                                 else 0.88
                             )
-                            color_warning = ""
-                            policy_status = "accepted"
+                            if color_method != "SPCC_LOCAL_CORE_CHROMA_ROLLBACK":
+                                color_warning = ""
+                                policy_status = "accepted"
                             messages.append(
                                 f"{spcc_result} accepted by physical-color quality gate"
                             )
@@ -3809,6 +3945,68 @@ def run_stage4_color_calibration(pipeline) -> None:
                             candidate_chw,
                             pipeline,
                         )
+                        (
+                            pcc_bright_core_color_integrity,
+                            _unused_pcc_core_context,
+                        ) = bright_core_color.assess_spcc_bright_core_color(
+                            (
+                                before_pixels_native
+                                if before_pixels_native is not None
+                                else before_chw
+                            ),
+                            candidate_pixels,
+                            target_type=_stage4_active_target_type(pipeline),
+                            target_profile=getattr(
+                                pipeline,
+                                "target_profile",
+                                None,
+                            ),
+                        )
+                        pcc_bright_core_color_integrity.update(
+                            candidate_method=(
+                                "PCC_LOCAL_GAIA"
+                                if selected_pcc_catalog == PCC_LOCAL_CATALOG
+                                else "PCC"
+                            ),
+                            assessment_role="physical_fallback_validation",
+                        )
+                        pcc_quality_report["bright_core_color_integrity"] = (
+                            pcc_bright_core_color_integrity
+                        )
+                        pcc_core_applicable = bool(
+                            pcc_bright_core_color_integrity.get(
+                                "applicable",
+                                False,
+                            )
+                        )
+                        pcc_core_failed = bool(
+                            pcc_core_applicable
+                            and not bool(
+                                pcc_bright_core_color_integrity.get(
+                                    "accepted",
+                                    False,
+                                )
+                            )
+                        )
+                        if pcc_core_applicable:
+                            bright_core_color_integrity[
+                                "pcc_fallback_assessment"
+                            ] = pcc_bright_core_color_integrity
+                        if pcc_core_failed:
+                            pcc_bright_core_rejected = True
+                            accepted = False
+                            pcc_quality_report["accepted"] = False
+                            rejection_reasons = pcc_quality_report.setdefault(
+                                "rejection_reasons",
+                                [],
+                            )
+                            if (
+                                "bright_core_color_integrity_rejected"
+                                not in rejection_reasons
+                            ):
+                                rejection_reasons.append(
+                                    "bright_core_color_integrity_rejected"
+                                )
                         pcc_quality_report.update(
                             calibration=(
                                 "PCC_NARROWBAND_DEGRADED"
@@ -3934,7 +4132,20 @@ def run_stage4_color_calibration(pipeline) -> None:
                         "heuristic fallbacks prohibited"
                     )
 
-                if narrowband_physical:
+                if pcc_bright_core_rejected and exact_restored:
+                    color_method = "PRESERVE_INPUT"
+                    color_confidence = 0.55
+                    color_warning = (
+                        "pcc_bright_core_color_integrity_rejected_preserve_input"
+                    )
+                    policy_status = "accepted_degraded_fallback"
+                    status = "degraded"
+                    bright_core_preserve_fallback_used = True
+                    messages.append(
+                        "PCC bright-core color fallback was unsafe; preserved "
+                        "the immutable pre-color input"
+                    )
+                elif narrowband_physical:
                     color_method = "PRESERVE_INPUT"
                     color_confidence = 0.55 if rollback_report.get("restored") else 0.15
                     color_warning = color_warning or "narrowband_pcc_degraded_failed"
@@ -4367,11 +4578,103 @@ def run_stage4_color_calibration(pipeline) -> None:
                                 "pre-color source could be restored"
                             )
 
+    strict_core_evidence = stage7_quality.strict_bright_core_target_evidence(
+        _stage4_active_target_type(pipeline),
+        getattr(pipeline, "target_profile", None),
+    )
+    if bool(strict_core_evidence.get("strict", False)):
+        if not bool(bright_core_color_integrity.get("applicable", False)):
+            if before_chw is not None:
+                bright_core_color_integrity, _unused_context = (
+                    bright_core_color.assess_spcc_bright_core_color(
+                        (
+                            before_pixels_native
+                            if before_pixels_native is not None
+                            else before_chw
+                        ),
+                        (
+                            before_pixels_native
+                            if before_pixels_native is not None
+                            else before_chw
+                        ),
+                        target_type=_stage4_active_target_type(pipeline),
+                        target_profile=getattr(pipeline, "target_profile", None),
+                    )
+                )
+                bright_core_color_integrity.update(
+                    evaluated_spcc_candidate=False,
+                    final_action="no_spcc_candidate_retained",
+                )
+            else:
+                bright_core_color_integrity.update(
+                    applicable=True,
+                    strict_target_evidence=strict_core_evidence,
+                    status="hard_failed",
+                    accepted=False,
+                    final_action="unresolved",
+                    trigger_reasons=["pre_color_reference_unavailable"],
+                )
+        elif bright_core_color_integrity.get("status") == "advisory":
+            bright_core_color_integrity.update(
+                assessment_status="advisory",
+                status="ok",
+                accepted=True,
+                final_action="accept_spcc_with_advisory",
+            )
+        elif (
+            not bool(bright_core_color_integrity.get("accepted", False))
+            and color_method not in accepted_spcc_methods
+            and bool(spcc_rollback_report.get("restored", False))
+            and not main_output_blocked
+            and (
+                (
+                    color_method in accepted_pcc_methods
+                    and bool(
+                        pcc_bright_core_color_integrity.get(
+                            "accepted",
+                            False,
+                        )
+                    )
+                )
+                or bright_core_preserve_fallback_used
+            )
+        ):
+            bright_core_color_integrity.update(
+                spcc_assessment_status=str(
+                    bright_core_color_integrity.get("status") or "hard_failed"
+                ),
+                spcc_assessment_final_action=str(
+                    bright_core_color_integrity.get("final_action")
+                    or "reject_spcc_to_pcc"
+                ),
+                spcc_rejection_reasons=list(
+                    bright_core_color_integrity.get("trigger_reasons") or []
+                ),
+                status="ok",
+                accepted=True,
+                repaired=False,
+                final_action="bad_spcc_rejected_and_safe_fallback_selected",
+                resolved_by=color_method,
+            )
+        elif str(bright_core_color_integrity.get("status")) not in {
+            "ok",
+            "repaired",
+        }:
+            bright_core_color_integrity.update(
+                status="hard_failed",
+                accepted=False,
+                final_action="unresolved",
+            )
+    pipeline._stage4_bright_core_color_integrity = dict(
+        bright_core_color_integrity
+    )
+
     physical_calibration_methods = {
         "SPCC",
         "SPCC_LOCAL_GAIA",
         "SPCC_NARROWBAND",
         "SPCC_NARROWBAND_LOCAL_GAIA",
+        "SPCC_LOCAL_CORE_CHROMA_ROLLBACK",
         "PCC",
         "PCC_LOCAL_GAIA",
     }
@@ -4498,6 +4801,8 @@ def run_stage4_color_calibration(pipeline) -> None:
         or auto_reference_applied
         or broadband_local_fallback_used
         or physical_main_restore_report.get("fallback_used")
+        or color_method == "SPCC_LOCAL_CORE_CHROMA_ROLLBACK"
+        or bright_core_preserve_fallback_used
     )
     platesolve_diagnostics = _stage4_platesolve_diagnostics(
         platesolve_attempts,
@@ -4567,6 +4872,8 @@ def run_stage4_color_calibration(pipeline) -> None:
                 or auto_reference_applied
                 or broadband_local_fallback_used
                 or physical_main_restore_report.get("fallback_used")
+                or color_method == "SPCC_LOCAL_CORE_CHROMA_ROLLBACK"
+                or bright_core_preserve_fallback_used
             ),
         },
         "artistic_hoo": {
@@ -4610,6 +4917,7 @@ def run_stage4_color_calibration(pipeline) -> None:
             "input_metadata": stage4_metadata,
         },
         "method": color_method,
+        "bright_core_color_integrity": bright_core_color_integrity,
         "channel_mapping": channel_mapping,
         "target_aware_color_mapping": bool(target_aware_color),
         "channel_policy": channel_policy,
@@ -4867,6 +5175,11 @@ def run_stage4_color_calibration(pipeline) -> None:
         fallback_used=stage_fallback_used,
         reason_code=reason_code,
         components=components,
+        review_reasons=(
+            [reason_code or "color_calibration_review_required"]
+            if requires_review
+            else []
+        ),
     )
     if main_output_blocked:
         raise RuntimeError(

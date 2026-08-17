@@ -220,7 +220,7 @@ def stage_config_from_processing_settings(
             ),
         },
         2: {
-            "boundary_correction": "native_crop_v4",
+            "boundary_correction": "native_crop_v5",
             "auto_tune_enabled": bool(
                 normalized["general"]["auto_tune_enabled"]
             ),

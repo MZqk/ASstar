@@ -10,13 +10,23 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 
 import numpy as np
 
+import display_rendition
 from image_metrics import _to_rgb_float_image, measure_image_features, measure_quality_metrics
 from save_utils import write_png_rgb16, write_png_rgb8
 from sirilpy.exceptions import CommandError, DataError, SirilError
 
 
-def _safe_preview(rgb: np.ndarray) -> np.ndarray:
+def _safe_preview(
+    rgb: np.ndarray,
+    display_contract: Optional[Dict[str, Any]] = None,
+) -> np.ndarray:
     """Create a display preview without clipping shadow percentiles."""
+    if display_contract is not None:
+        rendered = display_rendition.apply_linked_review_contract(
+            rgb,
+            display_contract,
+        )
+        return np.flip(rendered, axis=1)
     gray = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
     high = max(float(np.quantile(gray, 0.995)), 1e-6)
     preview = np.sqrt(np.clip(rgb / high, 0.0, 1.0))
@@ -42,7 +52,12 @@ def _metric_delta(before: Mapping[str, Any], after: Mapping[str, Any]) -> Dict[s
     return delta
 
 
-def _compact_review_canvas(before_rgb: np.ndarray, after_rgb: np.ndarray) -> np.ndarray:
+def _compact_review_canvas(
+    before_rgb: np.ndarray,
+    after_rgb: np.ndarray,
+    *,
+    display_contract: Optional[Dict[str, Any]] = None,
+) -> np.ndarray:
     """Build one bounded 2x2, 8-bit-friendly review image."""
     before = _to_rgb_float_image(before_rgb, max_side=512)
     after = _to_rgb_float_image(after_rgb, max_side=512)
@@ -66,7 +81,7 @@ def _compact_review_canvas(before_rgb: np.ndarray, after_rgb: np.ndarray) -> np.
 
     canvas = np.zeros((3, height * 2, width * 2), dtype=np.float32)
     canvas[:, :height, :width] = _safe_preview(before)
-    canvas[:, :height, width:] = _safe_preview(after)
+    canvas[:, :height, width:] = _safe_preview(after, display_contract)
     canvas[:, height:, :width] = absolute_preview
     canvas[:, height:, width:] = signed
     return canvas
@@ -167,6 +182,7 @@ def create_image_review_bundle(
     context: Optional[Mapping[str, Any]] = None,
     candidates: Optional[list[Mapping[str, Any]]] = None,
     selected_candidate: Optional[str] = None,
+    display_contract: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Write a review bundle from two already-loaded pixel arrays."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -193,10 +209,20 @@ def create_image_review_bundle(
     }
     compact_path = output_dir / "review.png"
     write_png_rgb16(paths["before_preview"], _safe_preview(before_rgb))
-    write_png_rgb16(paths["after_preview"], _safe_preview(after_rgb))
+    write_png_rgb16(
+        paths["after_preview"],
+        _safe_preview(after_rgb, display_contract),
+    )
     write_png_rgb16(paths["absolute_difference"], absolute_preview)
     write_png_rgb16(paths["signed_luminance_difference"], signed)
-    write_png_rgb8(compact_path, _compact_review_canvas(before_rgb, after_rgb))
+    write_png_rgb8(
+        compact_path,
+        _compact_review_canvas(
+            before_rgb,
+            after_rgb,
+            display_contract=display_contract,
+        ),
+    )
 
     before_features = asdict(measure_image_features(np.asarray(before_data)))
     after_features = asdict(measure_image_features(np.asarray(after_data)))
@@ -224,6 +250,11 @@ def create_image_review_bundle(
             },
         },
         "context": dict(context or {}),
+        "display_rendition_contract": (
+            dict(display_contract)
+            if isinstance(display_contract, dict)
+            else None
+        ),
         "candidates": _candidate_records(
             candidates,
             selected_candidate,
@@ -432,6 +463,11 @@ def create_stage_review_bundle(
             context=context,
             candidates=candidates,
             selected_candidate=selected_candidate,
+            display_contract=(
+                dict(getattr(pipeline, "_display_rendition_contract", {}) or {})
+                if bool(getattr(pipeline, "_review_display_route", False))
+                else None
+            ),
         )
     finally:
         try:

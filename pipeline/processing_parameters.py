@@ -320,7 +320,7 @@ PROCESSING_PARAMETER_SPECS: Tuple[ParameterSpec, ...] = (
     ParameterSpec("stage4_nbn_strength", 4, "窄带归一化强度", "expert", "float", 0.0, 1.0, 0.05, 2),
     ParameterSpec("stage4_local_star_wb_enabled", 4, "本地恒星白平衡", "expert", "bool"),
     ParameterSpec("stage4_local_star_wb_gain_limit", 4, "白平衡增益上限", "expert", "float", 1.01, 1.50, 0.01, 2, suffix="×"),
-    ParameterSpec("denoise_enabled", 5, "线性降噪", "recommended", "bool", help="自动状态下由 Stage 1 噪声分析决定。", depends_on=(("stage5_processing_mode", ("auto",)),)),
+    ParameterSpec("denoise_enabled", 5, "线性降噪", "recommended", "bool", help="自动状态下允许 Stage 5 基于冻结基线低噪声门和候选质量门自行决定是否实际降噪。", depends_on=(("stage5_processing_mode", ("auto",)),)),
     ParameterSpec("denoise_mod", 5, "降噪强度", "recommended", "float", 0.20, 0.55, 0.05, 2, depends_on=(("stage5_processing_mode", ("auto",)), ("denoise_enabled", (True,)))),
     ParameterSpec(
         "stage5_deconvolution_mode", 5, "反卷积方式", "recommended", "choice",
@@ -785,6 +785,12 @@ PROCESSING_PARAMETER_SPECS += (
     _spec(
         "stage2_field_rotation_detection_enabled", 2, "场旋覆盖裁切", "bool",
         level="recommended", section="execution",
+    ),
+    _spec(
+        "stage2_field_rotation_max_passes", 2, "场旋自动裁切轮次", "int",
+        1, 2, 1, 0, level="expert", section="algorithm",
+        depends_on=(("stage2_field_rotation_detection_enabled", (True,)),),
+        help="总计最多两次；第二次裁切后必须重新验证残余场旋。",
     ),
     _spec(
         "stage2_field_rotation_noise_ratio_min", 2, "场旋亮度噪声倍率", "float",

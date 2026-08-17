@@ -6242,6 +6242,28 @@ class StarunGui(QMainWindow):
                     payload["errors"] = [str(error) for error in errors]
                 if extra:
                     payload.update({str(key): value for key, value in extra.items()})
+                if (
+                    errors
+                    and str(status) == STATUS_FAILED
+                    and not payload.get("issues")
+                ):
+                    payload["issues"] = [
+                        {
+                            "stage": 0,
+                            "component": "gui_preflight",
+                            "severity": "fatal",
+                            "code": f"{str(phase)}_failed",
+                            "recovered": False,
+                            "message": str(error),
+                        }
+                        for error in errors
+                    ]
+                    payload["had_errors"] = True
+                    payload["had_fatal_errors"] = True
+                payload.pop("manifest_hash", None)
+                payload["manifest_hash"] = (
+                    pipeline_run_manifest.canonical_payload_hash(payload)
+                )
                 atomic_write_runtime_json(state_path, payload)
                 self._run_state_payload = payload
         except (OSError, TypeError, ValueError) as error:
@@ -6304,6 +6326,12 @@ class StarunGui(QMainWindow):
             "resources_root": str(self.resources.resolve()),
             "runtime_home": str(self.runtime_home.resolve()),
             "created_at": created_at,
+            "had_errors": False,
+            "had_fatal_errors": False,
+            "had_degradations": False,
+            "had_fallbacks": False,
+            "review_required": False,
+            "issues": [],
         }
         try:
             self._update_run_state(
@@ -7156,11 +7184,31 @@ class StarunGui(QMainWindow):
         )
         return next((path for path in candidates if path.is_file()), candidates[0])
 
-    def _show_completion_warning(self, work_dir: Path | None) -> None:
+    def _show_completion_warning(
+        self,
+        work_dir: Path | None,
+        *,
+        outcome_status: str,
+        had_errors: bool,
+        had_degradations: bool,
+        had_fallbacks: bool,
+    ) -> None:
         self._last_quality_report_path = self._quality_report_path(work_dir)
+        if outcome_status == STATUS_REVIEW_REQUIRED:
+            message = (
+                "处理已完成，但需要人工复核。请检查阶段复核原因与最终质量报告。"
+            )
+        elif had_fallbacks and had_degradations:
+            message = "降级完成，已使用回退产物或算法。请检查阶段详情与最终质量报告。"
+        elif had_fallbacks:
+            message = "处理已完成并使用了回退路径。请检查阶段详情与最终质量报告。"
+        elif had_errors:
+            message = "处理已完成，执行错误已恢复。请检查 issues 与最终质量报告。"
+        else:
+            message = "降级完成。请检查阶段详情与最终质量报告。"
         self._show_run_banner(
             "warning",
-            "处理已完成，但存在降级或需要复核的阶段。请先检查阶段状态与最终质量报告。",
+            message,
             quality_report=True,
         )
 
@@ -9476,8 +9524,20 @@ class StarunGui(QMainWindow):
             f"Stage {stage} 预览生成失败，不影响处理结果：{reason}"
         )
 
-    def _on_worker_done(self, status: str, exit_code: int, had_errors: bool, cli_used: str) -> None:
+    def _on_worker_done(
+        self,
+        status: str,
+        exit_code: int,
+        had_fatal_errors: bool,
+        cli_used: str,
+    ) -> None:
         work_dir = self._current_work_dir
+        pipeline_result: Mapping[str, object] | None = None
+        if work_dir is not None:
+            try:
+                pipeline_result = load_verified_pipeline_result(work_dir)
+            except HistoryStoreError as error:
+                self._append_event(f"终态未采用无效结果清单：{error}")
         history_status = self._terminal_history_status(status, work_dir)
         history_failure_reason: str | None = None
         if history_status in {STATUS_FAILED, STATUS_STOPPED}:
@@ -9486,17 +9546,76 @@ class StarunGui(QMainWindow):
                 if history_status == STATUS_STOPPED
                 else f"处理失败（GUI 状态：{self._display_status(status)}）"
             )
-            if work_dir is not None:
-                try:
-                    result = load_verified_pipeline_result(work_dir)
-                except HistoryStoreError:
-                    result = None
-                if result is not None and result.get("failure_reason"):
-                    history_failure_reason = str(result["failure_reason"])
-        terminal_errors = (
-            [history_failure_reason]
-            if history_failure_reason
+            if pipeline_result is not None and pipeline_result.get("failure_reason"):
+                history_failure_reason = str(pipeline_result["failure_reason"])
+
+        raw_issues = (
+            pipeline_result.get("issues", [])
+            if pipeline_result is not None
             else []
+        )
+        terminal_issues = [
+            dict(issue)
+            for issue in raw_issues
+            if isinstance(issue, Mapping)
+        ]
+        manifest_had_fatal = bool(
+            pipeline_result is not None
+            and pipeline_result.get("had_fatal_errors", False)
+        )
+        effective_had_fatal = bool(
+            had_fatal_errors
+            or manifest_had_fatal
+            or history_status == STATUS_FAILED
+        )
+        if effective_had_fatal and not any(
+            str(issue.get("severity") or "") == "fatal"
+            for issue in terminal_issues
+        ):
+            current_stage = int(
+                getattr(getattr(self, "worker", None), "_current_pipeline_stage", 0)
+                or 0
+            )
+            terminal_issues.append(
+                {
+                    "stage": current_stage,
+                    "component": "worker",
+                    "severity": "fatal",
+                    "code": "worker_execution_failed",
+                    "recovered": False,
+                    "message": history_failure_reason
+                    or "worker execution failed before a trusted pipeline result was available",
+                }
+            )
+        terminal_errors = [
+            str(issue.get("message") or issue.get("code") or "execution error")
+            for issue in terminal_issues
+            if str(issue.get("severity") or "") in {"error", "fatal"}
+        ]
+        if (
+            history_status == STATUS_FAILED
+            and history_failure_reason
+            and history_failure_reason not in terminal_errors
+        ):
+            terminal_errors.append(history_failure_reason)
+        had_degradations = bool(
+            pipeline_result is not None
+            and pipeline_result.get("had_degradations", False)
+        )
+        had_fallbacks = bool(
+            pipeline_result is not None
+            and pipeline_result.get("had_fallbacks", False)
+        )
+        review_required = bool(
+            pipeline_result is not None
+            and pipeline_result.get("review_required", False)
+        )
+        effective_had_errors = bool(
+            effective_had_fatal
+            or (
+                pipeline_result is not None
+                and pipeline_result.get("had_errors", False)
+            )
         )
         self._update_run_state(
             phase="terminal",
@@ -9506,7 +9625,12 @@ class StarunGui(QMainWindow):
             extra={
                 "exit_code": int(exit_code),
                 "cli_used": str(cli_used),
-                "had_errors": bool(had_errors),
+                "had_errors": effective_had_errors,
+                "had_fatal_errors": effective_had_fatal,
+                "had_degradations": had_degradations,
+                "had_fallbacks": had_fallbacks,
+                "review_required": review_required,
+                "issues": terminal_issues,
             },
         )
         self._update_active_history_run(
@@ -9521,11 +9645,15 @@ class StarunGui(QMainWindow):
         self._finish_stage_progress(status)
         self.progress_bar.hide()
         self._run_terminal_status = status
-        self._set_status_text(status)
+        terminal_label = STATUS_LABELS.get(
+            history_status,
+            self._display_status(status),
+        )
+        self._set_status_message(terminal_label)
         if status not in {"Completed", "CompletedWithWarning", "Stopped"}:
             self.toggle_log_action.setChecked(True)
         self._append_event(
-            f"处理结束：状态={self._display_status(status)}，退出码={exit_code}，CLI={cli_used}"
+            f"处理结束：状态={terminal_label}，退出码={exit_code}，CLI={cli_used}"
         )
         if (
             status in {"Completed", "CompletedWithWarning"}
@@ -9549,14 +9677,17 @@ class StarunGui(QMainWindow):
                 )
             except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 self._append_event(f"最新结果或保留策略未更新：{exc}")
-        if status == "Failed" and had_errors:
+        if status == "Failed" and effective_had_errors:
             self._append_event("在输出中检测到 Siril/脚本错误。")
         if status == "CompletedWithWarning":
-            self._show_completion_warning(work_dir)
-            self._append_event(
-                "最终产物已生成，但流水线存在失败阶段、降级回退或收尾异常；"
-                "请查看阶段汇总和 final_quality_report.json 后再使用。"
+            self._show_completion_warning(
+                work_dir,
+                outcome_status=history_status,
+                had_errors=effective_had_errors,
+                had_degradations=had_degradations,
+                had_fallbacks=had_fallbacks,
             )
+            self._append_event(f"最终产物已生成；终态={terminal_label}。")
         elif status == "Completed" and has_next_task:
             self._show_run_banner(
                 "info",
@@ -9580,19 +9711,20 @@ class StarunGui(QMainWindow):
                 show_log=True,
             )
         terminal_activity = {
-            "Completed": "处理已完成 · 当前为最终可靠预览",
-            "CompletedWithWarning": "处理已完成（需复核）· 保留最终可靠预览",
-            "Stopped": "任务已停止 · 保留最新可靠预览",
-            "Failed": "处理失败 · 保留最新可靠预览",
-        }.get(status, f"任务结束：{self._display_status(status)}")
+            STATUS_SUCCESS: "处理已完成 · 当前为最终可靠预览",
+            STATUS_PARTIAL_SUCCESS: "降级完成 · 保留最终可靠预览",
+            STATUS_REVIEW_REQUIRED: "处理已完成，需要复核 · 保留最终可靠预览",
+            STATUS_STOPPED: "任务已停止 · 保留最新可靠预览",
+            STATUS_FAILED: "处理失败 · 保留最新可靠预览",
+        }.get(history_status, f"任务结束：{terminal_label}")
         self.preview_activity_label.setText(terminal_activity)
-        self.run_phase_label.setText(self._display_status(status))
+        self.run_phase_label.setText(terminal_label)
         self._append_divider(
             "本次任务结束",
             [
                 f"时间: {self._timestamp()}",
                 f"工作目录: {self._display_path(work_dir)}",
-                f"最终状态: {self._display_status(status)}",
+                f"最终状态: {terminal_label}",
             ],
         )
 

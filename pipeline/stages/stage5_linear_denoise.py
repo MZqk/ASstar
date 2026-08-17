@@ -106,12 +106,9 @@ def _stage5_disabled_denoise_reason(pipeline) -> str:
     """Explain why the optional denoise component did not run."""
     if getattr(pipeline, "_force_denoise_enabled", None) is False:
         return "user_disabled"
-    if bool(getattr(pipeline.cfg, "auto_tune_enabled", False)) and getattr(
-        pipeline,
-        "auto_tune_result",
-        None,
-    ) is not None:
-        return "auto_low_noise"
+    manual_fields = getattr(pipeline, "_task_manual_override_fields", ()) or ()
+    if "denoise_enabled" in manual_fields:
+        return "user_disabled"
     return "config_disabled"
 
 
@@ -1105,6 +1102,7 @@ def run_stage5_linear_denoise(pipeline) -> None:
     - 不再默认执行全局锐化，避免在线性暗背景中放大彩噪和星环。
     """
     stage_name = PipelineStage.LINEAR_DENOISE.label
+    pipeline._clear_stage_reviews(5)
     pipeline.log.stage_start(stage_name)
     status = "ok"
     messages: List[str] = []
@@ -1455,7 +1453,7 @@ def run_stage5_linear_denoise(pipeline) -> None:
         policy_abort_reason = (
             "deconvolution background gate rejected candidate: " + guard_reason
         )
-        pipeline._background_review_required = True
+        pipeline._require_review(5, "deconvolution_background_gate_rejected")
         messages.append(
             "Stage5 candidate search stopped by failure policy after background rollback"
         )
@@ -1473,7 +1471,6 @@ def run_stage5_linear_denoise(pipeline) -> None:
         denoise_reason_code = _stage5_disabled_denoise_reason(pipeline)
         denoise_reason_text = {
             "user_disabled": "linear denoise disabled by user",
-            "auto_low_noise": "linear denoise skipped by automatic low-noise policy",
             "config_disabled": "linear denoise skipped by configuration",
         }[denoise_reason_code]
         messages.append(denoise_reason_text)
@@ -1673,7 +1670,7 @@ def run_stage5_linear_denoise(pipeline) -> None:
         }
     ):
         policy_abort_reason = denoise_reason_code
-        pipeline._background_review_required = True
+        pipeline._require_review(5, str(denoise_reason_code))
 
     if policy_abort_reason:
         policy_restore_failed = False
@@ -2004,4 +2001,5 @@ def run_stage5_linear_denoise(pipeline) -> None:
             "failure_policy_reason": policy_abort_reason or None,
         },
         components=components,
+        review_reasons=pipeline._stage_review_reasons(5),
     )

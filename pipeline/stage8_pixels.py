@@ -48,6 +48,7 @@ _FINAL_NOISE_GROWTH_RATIO_HARD_MAX = 1.50
 _FINAL_NOISE_ABSOLUTE_GROWTH_HARD_MIN = 0.10
 _FINAL_TEXTURE_P90_GROWTH_HARD_MIN = 0.0015
 
+
 # These are conservative target routes, not copies of AstroColorMixer's stronger
 # interactive presets. Their amounts are derived from the already-capped Stage8
 # saturation request in ``stage8_broadband_hue_saturation_bands`` below.
@@ -896,6 +897,16 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
     image_data = pipeline._read_image_by_stem(stem)
     issues: List[str] = []
     advisories: List[str] = []
+    stage4_core_color_integrity = dict(
+        (getattr(pipeline, "color_calibration_report", {}) or {}).get(
+            "bright_core_color_integrity"
+        )
+        or {}
+    )
+    if bool(stage4_core_color_integrity.get("applicable", False)) and str(
+        stage4_core_color_integrity.get("status") or ""
+    ) not in {"ok", "repaired"}:
+        issues.append("stage4_bright_core_color_integrity_unresolved")
     try:
         image_array = np.asarray(image_data)
         opaque_test_double = bool(
@@ -1751,6 +1762,7 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
             getattr(pipeline, "_stage9_stars_application_mode", "unknown")
         ),
         "stage8_conservative_skipped": conservative_stage8_skip,
+        "stage4_bright_core_color_integrity": stage4_core_color_integrity,
     }
     hard_issues = list(dict.fromkeys(issues))
     warnings = list(dict.fromkeys(advisories))
@@ -1790,6 +1802,7 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
         "final_quality": "poor" if hard_issues else "ok",
         "needs_conservative_rerun": bool(hard_issues),
         "strict_gate": strict_gate,
+        "stage4_bright_core_color_integrity": stage4_core_color_integrity,
         "metrics": normalized_metrics,
         "warnings": warnings,
         "hard_issues": hard_issues,

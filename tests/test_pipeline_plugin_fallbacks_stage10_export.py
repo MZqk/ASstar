@@ -1,9 +1,176 @@
 """Pipeline/plugin fallback tests for stage10 export."""
 
 from tests.pipeline_plugin_fallbacks_support import *  # noqa: F401,F403
+from managed_output import _read_managed_display_png
 
 
 class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
+    def test_stage10_legacy_accepted_hdr_state_has_no_preserve_exception(self):
+        processor = self._new_processor()
+        self._stage10_final_input(processor)
+        processor._stage9_stars_required = False
+        processor._stage9_stars_applied = False
+        processor._stage9_output_contains_stars = True
+        processor._stage9_star_delivery_contract_accepted = True
+        processor._bright_core_with_stars_fallback = {
+            "eligible": True,
+            "accepted": True,
+            "status": "accepted",
+            "output_stem": "stage7_with_stars_hdr",
+        }
+        processor._final_quality_report = lambda _stem: {
+            "schema": "starun.final-quality.v2",
+            "severity": "normal",
+            "final_quality": "ok",
+            "status": "ok",
+            "needs_conservative_rerun": False,
+            "issues": [],
+        }
+
+        stage10_export(processor)
+
+        self.assertTrue(any(call[0] == "satu" for call in processor.cmd_calls))
+        self.assertFalse(processor.script_calls)
+        self.assertIn(("savetif", "result_processed", "-astro"), processor.cmd_calls)
+        self.assertFalse(processor._final_output_review_only)
+        denoise = processor.stage_json_reports["stage10_denoise_plan.json"]
+        self.assertNotIn("bright_core_with_stars_hdr_preserve", denoise)
+        self.assertNotIn("skipped_by_bright_core_with_stars_hdr", denoise)
+        self.assertEqual(
+            processor._stage10_quality_repair_report["reason"],
+            "final_quality_is_not_hard_reject",
+        )
+
+    def test_stage10_review_primary_png_matches_managed_display(self):
+        processor = self._new_processor()
+        self._stage10_final_input(processor)
+        processor.cfg.output_format = "png"
+        processor.cfg.force_review_only_output = True
+        processor.cfg.stage10_managed_output_enabled = True
+        yy, xx = np.mgrid[:96, :128]
+        nebula = np.exp(
+            -0.5
+            * (
+                ((xx - 66.0) / 23.0) ** 2
+                + ((yy - 46.0) / 18.0) ** 2
+            )
+        )
+        processor.image_pixels = np.stack(
+            (
+                0.02 + 0.36 * nebula,
+                0.018 + 0.22 * nebula,
+                0.021 + 0.30 * nebula,
+            )
+        ).astype(np.float32)
+        for y_pos, x_pos in ((8, 11), (20, 70), (44, 21), (72, 99), (86, 48)):
+            processor.image_pixels[:, y_pos, x_pos] = (0.95, 0.88, 0.82)
+        processor.siril.get_image_pixeldata = (
+            lambda preview=False: processor.image_pixels.copy()
+        )
+        processor._set_current_image_pixeldata = (
+            lambda image, **_kwargs: setattr(
+                processor,
+                "image_pixels",
+                np.array(image, copy=True),
+            )
+        )
+
+        stage10_export(processor)
+
+        primary = processor.work_dir / "result_review.png"
+        managed = processor.work_dir / "result_review_display_srgb.png"
+        self.assertTrue(primary.is_file())
+        self.assertTrue(managed.is_file())
+        self.assertEqual(primary.read_bytes(), managed.read_bytes())
+        export_report = processor.stage_json_reports["stage10_export_report.json"]
+        self.assertEqual(
+            export_report["review_display"]["pixel_identity"],
+            "byte_identical_copy",
+        )
+
+    def test_stage2_review_preserves_already_visible_stage10_pixels(self):
+        processor = self._new_processor()
+        self._stage10_final_input(processor)
+        processor.cfg.output_format = "png"
+        processor.cfg.stage10_managed_output_enabled = True
+        processor._require_review(2, "stage2_view_review_required")
+        processor._display_rendition_contract = {
+            "schema": "starun.display-rendition-contract.v1",
+            "status": "ready",
+            "applicable": True,
+            "observer_only": True,
+            "name": "linked_review_bright_v1",
+            "reason": "stage2_view_review_required",
+            "luminance": {
+                "white_percentile": 0.995,
+                "white_point": 0.50,
+                "gamma": 0.50,
+            },
+            "rgb_mapping": {
+                "linked_channels": True,
+                "gamut_policy": "shared_per_pixel_scale",
+            },
+        }
+        processor._stage9_stars_required = True
+        processor._stage9_stars_applied = True
+        yy, xx = np.mgrid[:96, :128]
+        nebula = np.exp(
+            -0.5
+            * (
+                ((xx - 66.0) / 24.0) ** 2
+                + ((yy - 47.0) / 19.0) ** 2
+            )
+        )
+        source = np.stack(
+            (
+                0.14 + 0.28 * nebula,
+                0.13 + 0.20 * nebula,
+                0.12 + 0.24 * nebula,
+            )
+        ).astype(np.float32)
+        for y_pos, x_pos in (
+            (8, 11),
+            (20, 70),
+            (44, 21),
+            (72, 99),
+            (86, 48),
+        ):
+            source[:, y_pos, x_pos] = (0.95, 0.88, 0.82)
+        processor.image_pixels = source.copy()
+        processor.siril.get_image_pixeldata = (
+            lambda preview=False: processor.image_pixels.copy()
+        )
+        processor._set_current_image_pixeldata = (
+            lambda image, **_kwargs: setattr(
+                processor,
+                "image_pixels",
+                np.array(image, copy=True),
+            )
+        )
+
+        stage10_export(processor)
+
+        contract = processor.stage_json_reports[
+            "display_rendition_contract.json"
+        ]
+        self.assertEqual(contract["mode"], "preserve")
+        self.assertEqual(contract["source_visibility"]["exposure_state"], "acceptable")
+        self.assertFalse(contract["rgb_mapping"]["derivative_pixels_changed"])
+        self.assertNotIn(("autostretch", "-linked"), processor.cmd_calls)
+        managed = _read_managed_display_png(
+            processor.work_dir / "result_review_display_srgb.png"
+        )
+        np.testing.assert_allclose(
+            managed,
+            np.flip(source, axis=1),
+            atol=1.0 / 65535.0,
+            rtol=0.0,
+        )
+        self.assertEqual(
+            (processor.work_dir / "result_review.png").read_bytes(),
+            (processor.work_dir / "result_review_display_srgb.png").read_bytes(),
+        )
+
     def test_stage10_script_failure_with_aberration_fallback_is_ok(self):
         processor = self._new_processor()
         self._stage10_final_input(processor)
@@ -437,7 +604,7 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
             _ = quiet
             command_calls.append(args)
             if args[:2] == ("savetif", "primary_result"):
-                raise pipeline_module.CommandError("mock primary TIFF failure")
+                raise RuntimeError("mock primary TIFF failure")
             return True
 
         processor.cmd_with_check = command
@@ -1924,6 +2091,7 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
         self._stage10_final_input(processor)
         processor._stage1_input_mode = "linear_resume"
         processor._stage9_bypassed_bad_starless = True
+        processor._require_review(9, "with_stars_review_fallback")
         processor.available_scripts.add("processing/CosmicClarity_Denoise.py")
 
         stage10_export(processor)
@@ -1973,6 +2141,10 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
         processor._stage9_stars_applied = True
         processor._stage9_output_contains_stars = True
         processor._stage9_psf_review_required = True
+        processor._require_review(
+            9,
+            "stage9_psf_subgroup_evidence_insufficient",
+        )
 
         stage10_export(processor)
 
@@ -1997,6 +2169,7 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
         processor._stage9_psf_review_required = True
         processor._stage9_review_candidate_selected = True
         processor._stage9_remix_formally_accepted = False
+        processor._require_review(9, "best_failed_candidate_review")
         processor.cfg.final_saturation = 0.15
 
         stage10_export(processor)
@@ -2017,6 +2190,49 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
         self.assertTrue(processor._final_output_review_only)
         self.assertIn(
             "stage9_review_candidate_selected=true",
+            processor.results[-1][3],
+        )
+
+    def test_stage10_stage8_starmask_fallback_is_review_only(self):
+        processor = self._new_processor()
+        self._stage10_final_input(processor)
+        (processor.process_dir / "stage9_review_with_stars.fit").write_bytes(
+            b"mock"
+        )
+        processor._stage9_final_source = "stage9_review_with_stars"
+        processor._stage9_stars_required = True
+        processor._stage9_stars_applied = True
+        processor._stage9_output_contains_stars = True
+        processor._stage9_psf_review_required = False
+        processor._stage9_review_candidate_selected = False
+        processor._stage9_remix_formally_accepted = False
+        processor._stage9_stars_application_mode = (
+            "screen_minimal_review_fallback"
+        )
+        processor._require_review(9, "stage8_starmask_review_fallback")
+        processor.cfg.final_saturation = 0.15
+
+        stage10_export(processor)
+
+        self.assertIn(("savetif", "result_review", "-astro"), processor.cmd_calls)
+        self.assertIn(("save", "result_review_final"), processor.cmd_calls)
+        self.assertNotIn(
+            ("savetif", "result_processed", "-astro"),
+            processor.cmd_calls,
+        )
+        self.assertNotIn(("save", "result_final"), processor.cmd_calls)
+        self.assertFalse(
+            any(call and call[0] == "satu" for call in processor.cmd_calls)
+        )
+        self.assertFalse(
+            any(
+                step == "最终降噪"
+                for step, _name, _args in processor.script_calls
+            )
+        )
+        self.assertTrue(processor._final_output_review_only)
+        self.assertIn(
+            "stage8_starmask_review_fallback",
             processor.results[-1][3],
         )
         self.assertNotIn(
@@ -2056,6 +2272,7 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
         processor = self._new_processor()
         self._stage10_final_input(processor)
         processor._stage6_starmask_borderline_review_required = True
+        processor._require_review(6, "starmask_cleanup_borderline")
 
         stage10_export(processor)
 
@@ -2099,6 +2316,7 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
         processor = self._new_processor()
         self._stage10_final_input(processor)
         processor._stage4_color_review_required = True
+        processor._require_review(4, "color_calibration_review_required")
         processor._stage9_stars_required = True
         processor._stage9_stars_applied = True
 
@@ -2114,22 +2332,22 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
             "stage4_color_review_required",
         )
 
-    def test_stage10_stage2_and_stage3_review_flags_force_review_only_names(self):
+    def test_stage10_stage2_and_stage3_registry_reviews_force_review_only_names(self):
         cases = (
             (
-                "_stage2_view_review_required",
+                2,
                 "stage2_view_review_required",
             ),
             (
-                "_background_review_required",
+                3,
                 "stage3_background_review_required",
             ),
         )
-        for attribute, reason_code in cases:
-            with self.subTest(attribute=attribute):
+        for stage, reason_code in cases:
+            with self.subTest(stage=stage):
                 processor = self._new_processor()
                 self._stage10_final_input(processor)
-                setattr(processor, attribute, True)
+                processor._require_review(stage, reason_code)
                 processor._stage9_stars_required = True
                 processor._stage9_stars_applied = True
 
@@ -2149,11 +2367,30 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
                     reason_code,
                 )
 
+    def test_stage10_ignores_unregistered_legacy_background_flag(self):
+        processor = self._new_processor()
+        self._stage10_final_input(processor)
+        processor._background_review_required = True
+        processor._stage9_stars_required = True
+        processor._stage9_stars_applied = True
+
+        stage10_export(processor)
+
+        self.assertIn(
+            ("savetif", "result_processed", "-astro"),
+            processor.cmd_calls,
+        )
+        self.assertEqual(processor._stage_review_reasons(3), [])
+
     def test_stage10_uncalibrated_background_cast_forces_review_only_names(self):
         processor = self._new_processor()
         self._stage10_final_input(processor)
         processor._stage4_color_review_required = False
         processor._stage7_background_color_review_required = True
+        processor._require_review(
+            7,
+            "uncalibrated_background_color_review_required",
+        )
         processor._stage7_background_color_review_gate = {
             "status": "review_required",
             "requires_review": True,

@@ -4,6 +4,45 @@ from tests.pipeline_plugin_fallbacks_support import *  # noqa: F401,F403
 
 
 class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
+    def test_stage9_legacy_accepted_hdr_state_cannot_bypass_review_contract(self):
+        processor = self._new_processor()
+        processor._star_separation_state = (
+            pipeline_module.StarSeparationState.REJECTED.value
+        )
+        processor._stage8_final_source = "stage8_enhanced"
+        processor._stage8_final_quality = "bright_core_with_stars_hdr"
+        processor._stage8_handoff.update(
+            source_stem="stage8_enhanced",
+            passthrough=True,
+            restricted_downstream=False,
+            reason_code="bright_core_with_stars_hdr_passthrough",
+        )
+        processor._bright_core_with_stars_fallback = {
+            "eligible": True,
+            "accepted": True,
+            "status": "accepted",
+            "output_stem": "stage7_with_stars_hdr",
+        }
+
+        stage9_star_remixing(processor)
+
+        self.assertTrue(processor._stage9_stars_required)
+        self.assertFalse(processor._stage9_stars_applied)
+        self.assertFalse(processor._stage9_output_contains_stars)
+        self.assertFalse(processor._stage9_star_delivery_contract_accepted)
+        self.assertEqual(processor._stage9_final_source, "")
+        self.assertEqual(
+            processor._stage9_stars_application_mode,
+            "withheld_no_with_stars_review_source",
+        )
+        self.assertFalse(any(call[0] == "pm" for call in processor.cmd_calls))
+        report = processor.stage_json_reports["stage9_remix_quality.json"]
+        self.assertFalse(report["star_delivery_contract_accepted"])
+        self.assertTrue(report["stars_required"])
+        self.assertFalse(report["output_contains_stars"])
+        self.assertTrue(report["output_withheld"])
+        self.assertEqual(processor.results[-1][1], "failed")
+
     @staticmethod
     def _psf_quality(
         attempt,
@@ -115,7 +154,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         self.assertEqual(report["schema"], "starun.stage9-remix-quality.v7")
         self.assertEqual(
             report["selection_policy"],
-            "failure_directed_support_unscreen_targeted_recovery_v5",
+            "failure_directed_support_unscreen_targeted_recovery_v6",
         )
         self.assertEqual(report["selection_class"], "formal")
         self.assertTrue(report["formal_accepted"])
@@ -1720,6 +1759,13 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
                 "best_failed_candidate_review",
             ),
             (
+                "stage8_starmask_review_fallback",
+                {"attempt": "screen_stage8_starmask_raw_fallback"},
+                "screen_minimal_review_fallback",
+                True,
+                "stage8_starmask_review_fallback",
+            ),
+            (
                 "stage5_review_fallback",
                 None,
                 "with_stars_review_fallback",
@@ -2951,7 +2997,16 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         processor.cfg.stage9_psf_review_fwhm_ratio_max = 1.65
         processor.starmask_file = processor.process_dir / "starmask.fit"
         processor.starmask_file.write_bytes(b"mock")
+        (processor.process_dir / "stage8_enhanced.fit").write_bytes(
+            b"stage8-starless"
+        )
         (processor.process_dir / "stage5_linear.fit").write_bytes(b"with-stars")
+        processor.saved_image_pixels["stage8_enhanced"] = (
+            processor.image_pixels.copy()
+        )
+        processor.saved_image_pixels["starmask"] = np.zeros_like(
+            processor.image_pixels
+        )
 
         def assess(_source_stem, *, attempt, formula):
             if attempt.startswith("screen_unscreen_"):
@@ -3041,6 +3096,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
             report["stage9_fallback_reason"],
             "best_failed_candidate_review",
         )
+        self.assertEqual(report["fallback_remix"]["status"], "not_attempted")
         self.assertEqual(processor.results[-1][1], "degraded")
         self.assertEqual(
             processor.result_metadata[-1]["reason_code"],
@@ -3150,12 +3206,23 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
             )
         )
 
-    def test_stage9_all_rejected_records_required_stars_not_applied(self):
+    def test_stage9_all_rejected_uses_stage8_stretched_starmask_fallback(self):
         processor = self._new_processor()
         processor.cfg.workflow_plugin_probe_enabled = False
         processor.starmask_file = processor.process_dir / "starmask.fit"
         processor.starmask_file.write_bytes(b"mock")
+        (processor.process_dir / "stage8_enhanced.fit").write_bytes(
+            b"stage8-starless"
+        )
+        (processor.process_dir / "starmask_fallback_stretched.fit").write_bytes(
+            b"fallback-stretched"
+        )
         (processor.process_dir / "stage5_linear.fit").write_bytes(b"with-stars")
+        stage8_pixels = processor.image_pixels.copy()
+        raw_starmask = np.zeros_like(stage8_pixels)
+        raw_starmask[:, 42:47, 61:66] = 0.08
+        processor.saved_image_pixels["stage8_enhanced"] = stage8_pixels
+        processor.saved_image_pixels["starmask"] = raw_starmask
         processor._stage9_assess_current_remix = lambda *_args, **_kwargs: {
             "attempt": "rejected",
             "formula": "screen",
@@ -3165,26 +3232,307 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
             "metrics": {},
         }
 
-        stage9_star_remixing(processor)
+        stage9_module = sys.modules["stages.stage9_star_remixing"]
+        calibration = {
+            "status": "ok",
+            "support_mode": "normal",
+            "stretch": 2.0,
+            "offset": 0.001,
+            "star_sample_count": 25,
+            "compact_component_count": 1,
+            "stretch_applied": False,
+        }
+        with patch.object(
+            stage9_module.stage9_quality,
+            "calibrate_starmask_asinh",
+            return_value=calibration,
+        ):
+            stage9_star_remixing(processor)
 
         report = processor.stage_json_reports["stage9_remix_quality.json"]
-        self.assertEqual(report["mode"], "stage5_review_fallback")
-        self.assertEqual(report["selection_class"], "stage5_fallback")
+        self.assertEqual(report["mode"], "stage8_starmask_review_fallback")
+        self.assertEqual(
+            report["selection_class"],
+            "stage8_starmask_fallback",
+        )
         self.assertTrue(report["stars_required"])
-        self.assertFalse(report["stars_applied"])
+        self.assertTrue(report["stars_applied"])
         self.assertTrue(report["output_contains_stars"])
         self.assertEqual(
             report["stars_application_mode"],
-            "with_stars_review_fallback",
+            "screen_minimal_review_fallback",
         )
+        self.assertEqual(
+            report["fallback_remix"]["selected_variant"],
+            "stretch_only",
+        )
+        self.assertEqual(
+            report["fallback_remix"]["base_source_stem"],
+            "stage8_enhanced",
+        )
+        self.assertFalse(report["remix_formally_accepted"])
+        self.assertNotIn(("load", "stage5_linear"), processor.cmd_calls)
+        self.assertNotIn(("autostretch", "-linked"), processor.cmd_calls)
+        self.assertIn("base=stage8_enhanced", processor.results[-1][3])
         self.assertEqual(processor.results[-1][1], "degraded")
+
+    def test_stage9_minimal_fallback_uses_raw_starmask_when_stretch_fails(self):
+        processor = self._new_processor()
+        processor.cfg.workflow_plugin_probe_enabled = False
+        processor.starmask_file = processor.process_dir / "starmask.fit"
+        processor.starmask_file.write_bytes(b"mock")
+        (processor.process_dir / "stage8_enhanced.fit").write_bytes(
+            b"stage8-starless"
+        )
+        (processor.process_dir / "stage5_linear.fit").write_bytes(b"with-stars")
+        processor.saved_image_pixels["stage8_enhanced"] = (
+            processor.image_pixels.copy()
+        )
+        raw_starmask = np.zeros_like(processor.image_pixels)
+        raw_starmask[:, 42:47, 61:66] = 0.08
+        processor.saved_image_pixels["starmask"] = raw_starmask
+        processor._stage9_assess_current_remix = lambda *_args, **_kwargs: {
+            "attempt": "rejected",
+            "formula": "screen",
+            "status": "rejected",
+            "accepted": False,
+            "issues": ["mock rejection"],
+            "metrics": {},
+        }
+        stage9_module = sys.modules["stages.stage9_star_remixing"]
+        real_prepare = stage9_module._prepare_stage9_starmask_for_pixel_remix
+
+        def prepare(pipeline, starmask_name, **kwargs):
+            if kwargs.get("output_name") == "starmask_fallback_stretched":
+                pipeline._stage9_starmask_calibration = {
+                    "status": "failed",
+                    "reason": "mock fallback stretch failure",
+                    "stretch_applied": False,
+                }
+                return starmask_name
+            return real_prepare(pipeline, starmask_name, **kwargs)
+
+        with patch.object(
+            stage9_module,
+            "_prepare_stage9_starmask_for_pixel_remix",
+            side_effect=prepare,
+        ):
+            stage9_star_remixing(processor)
+
+        report = processor.stage_json_reports["stage9_remix_quality.json"]
+        self.assertEqual(report["mode"], "stage8_starmask_review_fallback")
+        self.assertEqual(report["fallback_remix"]["selected_variant"], "raw")
+        self.assertTrue(report["stars_applied"])
+        self.assertFalse(report["remix_formally_accepted"])
+        self.assertNotIn(("load", "stage5_linear"), processor.cmd_calls)
+        self.assertTrue(
+            any(
+                call[:3]
+                == (
+                    "stage8_enhanced",
+                    "starmask",
+                    processor.cfg.star_intensity,
+                )
+                for call in processor.previous_stage_remix_calls
+            )
+        )
+
+    def test_stage9_minimal_fallback_fatal_pixel_checks(self):
+        processor = self._new_processor()
+        stage9_module = sys.modules["stages.stage9_star_remixing"]
+        domain = {"float_tolerance": 2e-6}
+        base = np.full((3, 4, 4), 0.2, dtype=np.float32)
+        processor._stage9_last_star_layer = np.full_like(base, 0.05)
+        processor._stage9_last_star_overlay_mask = np.ones(
+            (4, 4),
+            dtype=bool,
+        )
+
+        nonfinite = base.copy()
+        nonfinite[0, 0, 0] = np.nan
+        shape_mismatch = np.full((3, 3, 4), 0.2, dtype=np.float32)
+        unchanged = base.copy()
+        darkened = base.copy()
+        darkened[:, 1, 1] -= 0.01
+
+        for label, candidate, expected_issue in (
+            ("nonfinite", nonfinite, "non-finite"),
+            ("shape", shape_mismatch, "shape differs"),
+            ("unchanged", unchanged, "did not add measurable signal"),
+            ("darkened", darkened, "material negative delta"),
+        ):
+            with self.subTest(label=label):
+                report = stage9_module._stage9_minimal_fallback_safety(
+                    processor,
+                    base,
+                    candidate,
+                    base_domain=domain,
+                    candidate_domain=domain,
+                )
+                self.assertEqual(report["status"], "failed")
+                self.assertTrue(
+                    any(
+                        expected_issue in issue
+                        for issue in report["issues"]
+                    )
+                )
+
+        processor._stage9_last_star_overlay_mask = None
+        processor._stage9_last_star_layer = np.zeros_like(base)
+        processor._stage9_last_star_layer[:, 2, 2] = 0.05
+        outside_support = base.copy()
+        outside_support[:, 0, 0] += 0.01
+        outside_report = stage9_module._stage9_minimal_fallback_safety(
+            processor,
+            base,
+            outside_support,
+            base_domain=domain,
+            candidate_domain=domain,
+        )
+        self.assertEqual(outside_report["status"], "failed")
+        self.assertEqual(
+            outside_report["checks"]["supported_positive_delta_pixel_count"],
+            0,
+        )
+
+        inside_support = base.copy()
+        inside_support[:, 2, 2] += 0.01
+        inside_report = stage9_module._stage9_minimal_fallback_safety(
+            processor,
+            base,
+            inside_support,
+            base_domain=domain,
+            candidate_domain=domain,
+        )
+        self.assertEqual(inside_report["status"], "passed")
+
+    def test_stage9_minimal_fallback_rejects_invalid_starmask_source(self):
+        stage9_module = sys.modules["stages.stage9_star_remixing"]
+        for label, starmask_pixels, expected_issue in (
+            (
+                "nonfinite",
+                np.full((3, 96, 128), np.nan, dtype=np.float32),
+                "pixel domain invalid",
+            ),
+            (
+                "shape",
+                np.zeros((3, 95, 128), dtype=np.float32),
+                "dimensions are incompatible",
+            ),
+        ):
+            with self.subTest(label=label):
+                processor = self._new_processor()
+                (processor.process_dir / "stage8_enhanced.fit").write_bytes(
+                    b"stage8-starless"
+                )
+                (processor.process_dir / "starmask.fit").write_bytes(b"starmask")
+                processor.saved_image_pixels["stage8_enhanced"] = (
+                    processor.image_pixels.copy()
+                )
+                processor.saved_image_pixels["starmask"] = starmask_pixels
+                processor.siril.get_image_pixeldata = (
+                    lambda preview=False: processor.image_pixels.copy()
+                )
+                processor._stage9_remix_base_stem = "stage9_starless_base"
+                attempts = []
+
+                selected, _ = (
+                    stage9_module._stage9_try_stage8_starmask_review_fallback(
+                        processor,
+                        [],
+                        attempts,
+                        trigger_reason="test_invalid_starmask",
+                        stage8_source_stem="stage8_enhanced",
+                        raw_starmask_stem="starmask",
+                        intensity=processor.cfg.star_intensity,
+                        allow_stretch=False,
+                    )
+                )
+
+                self.assertFalse(selected)
+                self.assertEqual(
+                    processor._stage9_remix_base_stem,
+                    "stage9_starless_base",
+                )
+                self.assertTrue(
+                    any(
+                        expected_issue in issue
+                        for attempt in attempts
+                        for issue in attempt.get("issues", [])
+                    )
+                )
+
+    def test_stage9_minimal_fallback_diagnostic_failure_is_non_blocking(self):
+        stage9_module = sys.modules["stages.stage9_star_remixing"]
+        processor = self._new_processor()
+        (processor.process_dir / "stage8_enhanced.fit").write_bytes(
+            b"stage8-starless"
+        )
+        (processor.process_dir / "starmask.fit").write_bytes(b"starmask")
+        base = processor.image_pixels.copy()
+        starmask = np.zeros_like(base)
+        starmask[:, 42:47, 61:66] = 0.08
+        processor.saved_image_pixels["stage8_enhanced"] = base
+        processor.saved_image_pixels["starmask"] = starmask
+        processor.siril.get_image_pixeldata = (
+            lambda preview=False: processor.image_pixels.copy()
+        )
+        processor.siril.set_image_pixeldata = lambda image: setattr(
+            processor,
+            "image_pixels",
+            np.array(image, copy=True),
+        )
+        attempts = []
+
+        with patch.object(
+            stage9_module,
+            "_assess_stage9_candidate",
+            side_effect=RuntimeError("mock formal diagnostic failure"),
+        ):
+            selected, selected_attempt = (
+                stage9_module._stage9_try_stage8_starmask_review_fallback(
+                    processor,
+                    [],
+                    attempts,
+                    trigger_reason="test_diagnostic_failure",
+                    stage8_source_stem="stage8_enhanced",
+                    raw_starmask_stem="starmask",
+                    intensity=processor.cfg.star_intensity,
+                    allow_stretch=False,
+                )
+            )
+
+        self.assertTrue(selected)
+        self.assertEqual(selected_attempt["fallback_variant"], "raw")
+        self.assertEqual(
+            selected_attempt["formal_quality"]["status"],
+            "unavailable",
+        )
+        self.assertGreater(
+            float(
+                np.max(
+                    processor.saved_image_pixels["stage9_remixed"] - base
+                )
+            ),
+            0.0,
+        )
 
     def test_stage9_accepted_screen_save_failure_does_not_claim_stars_applied(self):
         processor = self._new_processor()
         processor.cfg.workflow_plugin_probe_enabled = False
         processor.starmask_file = processor.process_dir / "starmask.fit"
         processor.starmask_file.write_bytes(b"mock")
+        (processor.process_dir / "stage8_enhanced.fit").write_bytes(
+            b"stage8-starless"
+        )
         (processor.process_dir / "stage5_linear.fit").write_bytes(b"with-stars")
+        processor.saved_image_pixels["stage8_enhanced"] = (
+            processor.image_pixels.copy()
+        )
+        processor.saved_image_pixels["starmask"] = np.full_like(
+            processor.image_pixels,
+            0.02,
+        )
         processor._save_stage_output = lambda stem: stem != "stage9_remixed"
 
         stage9_star_remixing(processor)
@@ -3198,6 +3546,8 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
             report["stars_application_mode"],
             "with_stars_review_fallback",
         )
+        self.assertEqual(report["fallback_remix"]["status"], "failed")
+        self.assertIn(("load", "stage5_linear"), processor.cmd_calls)
         self.assertEqual(processor.results[-1][1], "degraded")
 
     def test_stage9_withholds_required_stars_output_when_no_safe_source_exists(self):
@@ -3341,7 +3691,8 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         stage9_star_remixing(processor)
 
         self.assertEqual(len(processor.previous_stage_remix_calls), 1)
-        self.assertTrue(processor._background_review_required)
+        self.assertTrue(processor._stage_review_reasons(9))
+        self.assertEqual(processor._stage_review_reasons(3), [])
         self.assertEqual(processor.results[-1][1], "degraded")
         self.assertFalse(
             any(
@@ -3365,8 +3716,12 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         self.assertEqual(processor.previous_stage_remix_calls, [])
         self.assertTrue(processor._stage9_output_contains_stars)
         self.assertFalse(processor._stage9_output_withheld)
-        self.assertTrue(processor._background_review_required)
-        self.assertEqual(processor.results[-1][1], "degraded")
+        self.assertEqual(
+            processor._stage_review_reasons(9),
+            ["user_preserve_with_stars"],
+        )
+        self.assertEqual(processor._stage_review_reasons(3), [])
+        self.assertEqual(processor.results[-1][1], "ok")
         report = processor.stage_json_reports["stage9_remix_quality.json"]
         self.assertEqual(report["mode"], "user_preserve_with_stars")
 
@@ -3629,15 +3984,10 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         )
 
     def test_pipeline_status_stage9_psf_review_is_review_required(self):
-        probe = SimpleNamespace(
-            results=[],
-            _stage9_psf_review_required=True,
-            _stage9_stars_required=True,
-            _stage9_stars_applied=True,
-        )
+        probe = pipeline_module.ProcessorRuntimeMixin()
+        probe.results = []
+        probe._require_review(9, "stage9_psf_subgroup_evidence_insufficient")
 
-        status = pipeline_module.StarunPostProcessor._pipeline_result_status(
-            probe
-        )
+        status = probe._pipeline_result_status()
 
         self.assertEqual(status, "review_required")

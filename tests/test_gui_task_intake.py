@@ -69,6 +69,32 @@ def _stage5_resume_semantics() -> dict[str, object]:
     }
 
 
+def _stage2_resume_semantics() -> dict[str, object]:
+    return {
+        "schema": "starun.resume-semantics.v2",
+        "checkpoint_stage": 2,
+        "review_requirements": [],
+        "stage2_crop": {
+            "original_dimensions": {"width": 1920, "height": 1080},
+            "final_dimensions": {"width": 1920, "height": 1080},
+            "cumulative_crop": {"left": 0, "top": 0, "right": 0, "bottom": 0},
+            "field_rotation_passes": 0,
+            "final_residual_detection": {
+                "accepted": False,
+                "reason": "not_run",
+            },
+        },
+    }
+
+
+def _resume_semantics(stage_number: int):
+    if stage_number == 2:
+        return _stage2_resume_semantics()
+    if stage_number == 5:
+        return _stage5_resume_semantics()
+    return None
+
+
 class GuiTaskIntakeTests(unittest.TestCase):
     def test_plan_copy_explains_review_and_verified_resume_without_mode_choice(self) -> None:
         review = InputDiscovery(
@@ -259,11 +285,9 @@ class GuiTaskIntakeTests(unittest.TestCase):
                     "state": "linear",
                     "run_manifest_hash": "previous-run-manifest",
                     "config_fingerprint": fingerprints[key]["fingerprint"],
-                    "semantic_context": (
-                        _stage5_resume_semantics() if stage_number == 5 else None
-                    ),
+                    "semantic_context": _resume_semantics(stage_number),
                     "semantic_context_status": (
-                        "verified" if stage_number == 5 else "not_applicable"
+                        "verified" if stage_number in {2, 5} else "not_applicable"
                     ),
                 }
             checkpoint_manifest = build_checkpoint_manifest(
@@ -326,6 +350,10 @@ class GuiTaskIntakeTests(unittest.TestCase):
                     "state": "linear",
                     "run_manifest_hash": "previous-run-manifest",
                     "config_fingerprint": fingerprints[key]["fingerprint"],
+                    "semantic_context": _resume_semantics(stage_number),
+                    "semantic_context_status": (
+                        "verified" if stage_number in {2, 5} else "not_applicable"
+                    ),
                 }
             run_manifest.atomic_write_json(
                 workspace.root / CHECKPOINT_MANIFEST_REL,

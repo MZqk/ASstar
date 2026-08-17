@@ -218,6 +218,49 @@ log() {
   echo "$*"
 }
 
+prune_generated_plugin_runtime() {
+  local plugin_root="$1"
+  local generated_runtime="$plugin_root/cosmic_clarity_runtime"
+
+  case "$plugin_root" in
+    "$APP_PATH/Contents/Resources/siril_plugins") ;;
+    "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins")
+      [[ -n "$OFFLINE_RESOURCE_PACK_DIR" ]] \
+        || die "Refusing to prune plugin runtime from an empty resource-pack path"
+      ;;
+    *)
+      die "Refusing to prune generated plugin runtime outside a staging bundle: $plugin_root"
+      ;;
+  esac
+
+  if [[ -e "$generated_runtime" || -L "$generated_runtime" ]]; then
+    rm -rf -- "$generated_runtime"
+    log "[BUILD] Excluded generated CosmicClarity runtime cache: $generated_runtime"
+  fi
+}
+
+verify_bundle_symlinks() {
+  local bundle_root="$1"
+  local link_path=""
+  local link_target=""
+  local invalid=0
+
+  while IFS= read -r -d '' link_path; do
+    link_target="$(readlink "$link_path")"
+    if [[ "$link_target" == /* ]]; then
+      echo "[VERIFY] Absolute symlink is not allowed in the app bundle: $link_path -> $link_target" >&2
+      invalid=1
+      continue
+    fi
+    if [[ ! -e "$link_path" ]]; then
+      echo "[VERIFY] Broken symlink in the app bundle: $link_path -> $link_target" >&2
+      invalid=1
+    fi
+  done < <(find "$bundle_root" -type l -print0)
+
+  [[ "$invalid" -eq 0 ]] || die "App bundle contains invalid symbolic links"
+}
+
 remove_old_build_outputs() {
   local app_path="$1"
   local onedir_path="$2"
@@ -1261,6 +1304,7 @@ if [[ -d "$SIRIL_PLUGIN_DIR_SRC" ]]; then
   rm -rf "$APP_RESOURCES/siril_plugins"
   if [[ "$BUNDLE_PROFILE" == "full" ]]; then
     ditto "$SIRIL_PLUGIN_DIR_SRC" "$APP_RESOURCES/siril_plugins"
+    prune_generated_plugin_runtime "$APP_RESOURCES/siril_plugins"
     "$BUILD_PYTHON" "$APP_RESOURCES/siril_plugins/patches/apply_graxpert_ai_runtime_patch.py" \
       "$APP_RESOURCES/siril_plugins"
     "$BUILD_PYTHON" "$APP_RESOURCES/siril_plugins/patches/apply_syqon_offline_model_patch.py" \
@@ -1273,6 +1317,7 @@ if [[ -d "$SIRIL_PLUGIN_DIR_SRC" ]]; then
     mkdir -p "$OFFLINE_RESOURCE_PACK_DIR"
     embed_project_legal_notices "$OFFLINE_RESOURCE_PACK_DIR"
     ditto "$SIRIL_PLUGIN_DIR_SRC" "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins"
+    prune_generated_plugin_runtime "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins"
     "$BUILD_PYTHON" \
       "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/patches/apply_graxpert_ai_runtime_patch.py" \
       "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins"
@@ -1327,6 +1372,7 @@ fi
 
 log "[BUILD] Applying deep signing with identity: $CODESIGN_IDENTITY"
 /usr/bin/xattr -cr "$APP_PATH" >/dev/null 2>&1 || true
+verify_bundle_symlinks "$APP_PATH"
 codesign --force --deep --sign "$CODESIGN_IDENTITY" "$APP_PATH"
 codesign --verify --deep --strict "$APP_PATH"
 

@@ -107,6 +107,7 @@ def run_stage1_preparation(pipeline) -> None:
       B) Light_ 单帧文件 → 执行预处理
     """
     stage_label = PipelineStage.PREPARATION.label
+    pipeline._clear_stage_reviews(1)
     pipeline.log.stage_start(stage_label)
     pipeline._prepare_process_dir()
 

@@ -2112,7 +2112,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 "[SIRIL_NATIVE_PROCESS_TERMINATED] connection closed"
             )
 
-            self.assertTrue(worker._run_had_errors)
+            self.assertTrue(worker._run_had_fatal_errors)
             self.assertTrue(worker._native_process_terminated_detected)
 
     def test_pipeline_worker_marks_degraded_pipeline_summary_as_warning(self):
