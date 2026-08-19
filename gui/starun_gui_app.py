@@ -56,6 +56,16 @@ def main() -> int:
     app.setOrganizationName("Starun")
     app.setQuitOnLastWindowClosed(True)
     try:
+        from .accessibility_safety import (
+            install_macos_accessibility_selection_guard,
+        )
+    except ImportError:  # Support direct execution from the gui directory.
+        from accessibility_safety import (  # type: ignore[no-redef]
+            install_macos_accessibility_selection_guard,
+        )
+
+    install_macos_accessibility_selection_guard()
+    try:
         from .ui_theme import install_application_theme
     except ImportError:
         from ui_theme import install_application_theme  # type: ignore[no-redef]

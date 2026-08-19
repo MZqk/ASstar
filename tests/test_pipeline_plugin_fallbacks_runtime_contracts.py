@@ -475,6 +475,46 @@ class PipelinePluginFallbackRuntimeContractTests(PipelinePluginFallbackTestBase)
             )
         )
 
+    def test_result_output_basename_rejects_unresolved_header_templates(self):
+        processor = self._new_processor()
+        processor.header_metadata.update(
+            {
+                "OBJECT": "$OBJECT:%s$",
+                "STACKCNT": "$STACKCNT:%d$",
+                "EXPTIME": "$EXPTIME:%f$",
+                "DATE-OBS": "$DATE-OBS:dm12$",
+            }
+        )
+        processor.target_profile = {
+            "target_confidence": 0.98,
+            "target_name_guess": "Rosette Nebula",
+            "primary_target": {
+                "name": "Rosette Nebula",
+                "confidence": 0.98,
+            },
+        }
+
+        base_name = processor._result_output_basename()
+
+        self.assertEqual(base_name, "Rosette_Nebula_processed")
+        self.assertNotIn("$", base_name)
+        self.assertNotIn("%", base_name)
+
+    def test_result_output_basename_rejects_nonpositive_numeric_metadata(self):
+        processor = self._new_processor()
+        processor.header_metadata.update(
+            {
+                "OBJECT": "NGC 2237",
+                "STACKCNT": 0,
+                "EXPTIME": float("nan"),
+                "DATE-OBS": "2026-07-15T12:00:00",
+            }
+        )
+
+        base_name = processor._result_output_basename()
+
+        self.assertEqual(base_name, "NGC_2237_20260715_120000_processed")
+
     def test_result_output_basename_keeps_generic_fallback_without_identity(self):
         processor = self._new_processor()
 

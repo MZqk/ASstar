@@ -375,43 +375,116 @@ def _stage8_run_dualband_palette(
         if image_data is None:
             raise RuntimeError("Stage8 dual-band palette image buffer is empty")
         masks = pipeline._stage8_generate_starless_masks(image_data)
-        candidate, candidate_report = build_dualband_palette_candidate(
-            image_data,
-            palette=str(selection["palette"]),
-            core_mask=masks["core_mask"],
-            nebula_mask=masks["nebula_mask"],
-            faint_nebula_mask=masks["faint_nebula_mask"],
-            background_mask=masks["background_mask"],
-            strength=float(
-                getattr(pipeline.cfg, "stage8_dualband_palette_strength", 0.85)
-            ),
-            luma_drift_p95_max=float(
-                getattr(
-                    pipeline.cfg,
-                    "stage8_dualband_palette_luma_drift_max",
-                    0.005,
+        manual_override = bool(selection.get("manual_override", False))
+        primary_palette = str(selection["palette"]).upper()
+        palette_order: List[str] = []
+        for palette_id in (
+            (primary_palette,)
+            if manual_override
+            else (primary_palette, "HOO", *PALETTE_CHANNELS.keys())
+        ):
+            normalized = str(palette_id).upper()
+            if normalized not in palette_order:
+                palette_order.append(normalized)
+
+        candidate_records: List[Dict[str, Any]] = []
+        best_candidate: Optional[np.ndarray] = None
+        best_candidate_report: Optional[Dict[str, Any]] = None
+        best_score: Optional[tuple[float, float, float, float, int]] = None
+        for candidate_index, palette_id in enumerate(palette_order):
+            candidate_pixels, candidate_report = (
+                build_dualband_palette_candidate(
+                    image_data,
+                    palette=palette_id,
+                    core_mask=masks["core_mask"],
+                    nebula_mask=masks["nebula_mask"],
+                    faint_nebula_mask=masks["faint_nebula_mask"],
+                    background_mask=masks["background_mask"],
+                    strength=float(
+                        getattr(
+                            pipeline.cfg,
+                            "stage8_dualband_palette_strength",
+                            0.85,
+                        )
+                    ),
+                    luma_drift_p95_max=float(
+                        getattr(
+                            pipeline.cfg,
+                            "stage8_dualband_palette_luma_drift_max",
+                            0.005,
+                        )
+                    ),
+                    clip_growth_max=float(
+                        getattr(
+                            pipeline.cfg,
+                            "stage8_dualband_palette_clip_growth_max",
+                            0.002,
+                        )
+                    ),
+                    quality_warning_tolerance=float(
+                        getattr(
+                            pipeline.cfg,
+                            "stage8_dualband_palette_quality_warning_tolerance",
+                            0.50,
+                        )
+                    ),
                 )
-            ),
-            clip_growth_max=float(
-                getattr(
-                    pipeline.cfg,
-                    "stage8_dualband_palette_clip_growth_max",
-                    0.002,
+            )
+            metrics = candidate_report.get("metrics") or {}
+            separation_gain = float(
+                metrics.get(
+                    "subject_background_chroma_separation_gain",
+                    0.0,
                 )
-            ),
-            quality_warning_tolerance=float(
-                getattr(
-                    pipeline.cfg,
-                    "stage8_dualband_palette_quality_warning_tolerance",
-                    0.50,
-                )
-            ),
+                or 0.0
+            )
+            subject_gain = float(
+                metrics.get("subject_saturation_p50_gain", 0.0) or 0.0
+            )
+            luma_drift = float(metrics.get("luminance_drift_p95", 1.0) or 0.0)
+            clip_growth = float(metrics.get("clip_growth", 1.0) or 0.0)
+            chroma_gain_passed = bool(
+                manual_override or separation_gain > 1.0e-4
+            )
+            selection_score = (
+                -separation_gain,
+                -subject_gain,
+                luma_drift,
+                clip_growth,
+                candidate_index,
+            )
+            candidate_report["automatic_selection"] = {
+                "eligible": bool(
+                    candidate_report.get("accepted", False)
+                    and chroma_gain_passed
+                ),
+                "subject_chroma_gain_required": not manual_override,
+                "subject_chroma_gain_min_exclusive": (
+                    1.0e-4 if not manual_override else None
+                ),
+                "subject_chroma_gain_passed": chroma_gain_passed,
+                "selection_score": [float(value) for value in selection_score],
+                "candidate_order": candidate_index,
+            }
+            candidate_records.append(candidate_report)
+            if not bool(candidate_report["automatic_selection"]["eligible"]):
+                continue
+            if best_score is None or selection_score < best_score:
+                best_score = selection_score
+                best_candidate = np.array(candidate_pixels, copy=True)
+                best_candidate_report = candidate_report
+
+        report["candidates"] = candidate_records
+        report["candidate_count"] = len(candidate_records)
+        report["selection_execution_mode"] = (
+            "explicit_single_candidate"
+            if manual_override
+            else "automatic_candidate_competition"
         )
-        report["candidate"] = candidate_report
-        if not bool(candidate_report.get("accepted", False)):
+        if best_candidate is None or best_candidate_report is None:
             report.update(
                 status="rejected_by_palette_quality_gate",
-                issues=list(candidate_report.get("issues") or []),
+                issues=["auto_palette_subject_chroma_gain_unmet"],
             )
             pipeline.cmd_with_check("load", "stage8_pre_palette")
             report["transaction"].update(
@@ -419,14 +492,23 @@ def _stage8_run_dualband_palette(
                 rollback_ok=True,
             )
             messages.append(
-                "Stage8 dual-band palette rejected; retained pre-palette enhancement"
+                "Stage8 dual-band palette candidates rejected; retained "
+                "pre-palette enhancement"
             )
             return finish()
+
+        candidate = best_candidate
+        candidate_report = best_candidate_report
+        selected_palette = str(candidate_report.get("palette") or primary_palette)
+        report["candidate"] = candidate_report
+        report["selection_score"] = [
+            float(value) for value in (best_score or ())
+        ]
 
         _stage8_set_image_pixels(
             pipeline,
             candidate,
-            label=f"Stage8 dual-band {selection['palette']} palette",
+            label=f"Stage8 dual-band {selected_palette} palette",
         )
         candidate_saved = pipeline._save_stage_output("stage8_palette_selected")
         report["transaction"]["candidate_saved"] = bool(candidate_saved)
@@ -446,7 +528,7 @@ def _stage8_run_dualband_palette(
             ),
             accepted=True,
             feeds_main_pipeline=True,
-            palette=selection["palette"],
+            palette=selected_palette,
             synthetic_sii=bool(candidate_report.get("synthetic_sii", False)),
             output="stage8_palette_selected.fit",
             final_source="stage8_enhanced.fit",
@@ -457,13 +539,14 @@ def _stage8_run_dualband_palette(
         if candidate_warnings:
             messages.append(
                 "Stage8 dual-band artistic palette accepted with quality reminder "
-                f"(target={selection['category']}, palette={selection['palette']}, "
+                f"(target={selection['category']}, palette={selected_palette}, "
                 f"warnings={','.join(candidate_warnings)})"
             )
         else:
             messages.append(
                 "Stage8 dual-band artistic palette accepted "
-                f"(target={selection['category']}, palette={selection['palette']})"
+                f"(target={selection['category']}, palette={selected_palette}, "
+                f"candidates={len(candidate_records)})"
             )
         return finish()
     except (
@@ -558,14 +641,24 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
         StarSeparationState.REJECTED.value,
         StarSeparationState.TOOL_FAILED.value,
     } or target_bypass_stage7_rejected:
+        upstream_handoff = dict(
+            getattr(pipeline, "_stage8_handoff", {}) or {}
+        )
+        upstream_reason_code = str(
+            upstream_handoff.get("reason_code") or ""
+        )
         review_reason_code = (
             "stage7_stretch_not_accepted_target_bypass"
             if target_bypass_stage7_rejected
+            else upstream_reason_code
+            if upstream_reason_code == "stage7_stretch_not_accepted"
             else "star_separation_unavailable"
         )
         final_quality = (
             "stage7_stretch_review_target_bypass"
             if target_bypass_stage7_rejected
+            else "stage7_stretch_review_only"
+            if review_reason_code == "stage7_stretch_not_accepted"
             else "star_separation_unavailable"
         )
         source_candidates = [

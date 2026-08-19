@@ -94,6 +94,7 @@ def repair_star_layer_colors(
     strength: float = 0.72,
     support_coverage_max: float = 0.12,
     chroma_improvement_min: float = 0.01,
+    validation_support_mask: Any | None = None,
 ) -> tuple[np.ndarray, Dict[str, Any]]:
     """Repair star-layer chroma from an immutable linear with-stars reference."""
     source, stars, layout = _as_rgb_float(star_layer)
@@ -138,6 +139,21 @@ def repair_star_layer_colors(
     )
     if np.count_nonzero(valid) < 8:
         raise ValueError("reference-confirmed star color samples unavailable")
+
+    validation_valid = valid
+    validation_support_applied = validation_support_mask is not None
+    if validation_support_applied:
+        supplied_support = np.asarray(validation_support_mask, dtype=bool)
+        if supplied_support.shape != luma.shape:
+            raise ValueError(
+                "star color validation support shape differs: "
+                f"{supplied_support.shape} != {luma.shape}"
+            )
+        validation_valid = valid & supplied_support
+        if np.count_nonzero(validation_valid) < 8:
+            raise ValueError(
+                "support-confirmed star color validation samples unavailable"
+            )
 
     before_chroma = _chroma(stars)
     reference_chroma = _chroma(reference_detail)
@@ -200,6 +216,10 @@ def repair_star_layer_colors(
     metrics = {
         "support_coverage": support_coverage,
         "reference_sample_count": int(np.count_nonzero(valid)),
+        "post_validation_reference_sample_count": int(
+            np.count_nonzero(validation_valid)
+        ),
+        "post_validation_support_scoped": bool(validation_support_applied),
         "star_chroma_error_before": error_before,
         "star_chroma_error_after": error_after,
         "star_chroma_improvement": improvement,
@@ -238,7 +258,7 @@ def repair_star_layer_colors(
         issues.append("no_effect")
     accepted = not issues
 
-    sample_indices = np.flatnonzero(valid)
+    sample_indices = np.flatnonzero(validation_valid)
     if sample_indices.size > 2048:
         selection = np.linspace(
             0,
@@ -268,6 +288,8 @@ def repair_star_layer_colors(
                 np.float32
             ),
             "accepted_error": error_after,
+            "coordinate_domain": "siril_pixel_buffer_bottom_up",
+            "support_scoped": bool(validation_support_applied),
         },
     }
     return _restore(source, candidate, layout), report

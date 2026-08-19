@@ -125,18 +125,65 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
             report,
         )
 
-    def test_stage8_auto_palette_keeps_frozen_target_mapping(self):
+    def test_stage8_auto_palette_rolls_back_when_all_candidates_lose_chroma(self):
         processor = self._dualband_palette_processor(requested_palette="auto")
 
         stage8_nebula_enhancement(processor)
 
         report = processor.stage_json_reports["stage8_palette_report.json"]
-        self.assertTrue(report["accepted"], report)
+        self.assertFalse(report["accepted"], report)
         self.assertEqual(report["requested_palette"], "auto")
         self.assertEqual(report["automatic_palette"], "SHO")
-        self.assertEqual(report["palette"], "SHO")
         self.assertEqual(report["selection_mode"], "automatic_target_mapping")
         self.assertFalse(report["manual_override"])
+        self.assertEqual(report["candidate_count"], 6)
+        self.assertEqual(report["status"], "rejected_by_palette_quality_gate")
+        self.assertTrue(report["transaction"]["rollback_performed"])
+
+    def test_stage8_auto_palette_selects_largest_positive_chroma_gain(self):
+        processor = self._dualband_palette_processor(requested_palette="auto")
+        gains = {
+            "SHO": 0.01,
+            "HOO": 0.02,
+            "HSO": 0.03,
+            "OSH": 0.06,
+            "OHS": 0.04,
+            "HOS": 0.05,
+        }
+
+        def build_candidate(image, *, palette, **_kwargs):
+            gain = gains[palette]
+            return np.array(image, copy=True), {
+                "schema": "starun.stage8-dualband-palette.v2",
+                "accepted": True,
+                "status": "accepted",
+                "palette": palette,
+                "synthetic_sii": True,
+                "metrics": {
+                    "subject_background_chroma_separation_gain": gain,
+                    "subject_saturation_p50_gain": gain * 0.8,
+                    "luminance_drift_p95": 0.001,
+                    "clip_growth": 0.0,
+                },
+                "issues": [],
+                "warnings": [],
+            }
+
+        with patch(
+            "stages.stage8_nebula_enhancement.build_dualband_palette_candidate",
+            side_effect=build_candidate,
+        ) as builder:
+            stage8_nebula_enhancement(processor)
+
+        report = processor.stage_json_reports["stage8_palette_report.json"]
+        self.assertTrue(report["accepted"], report)
+        self.assertEqual(report["palette"], "OSH")
+        self.assertEqual(report["candidate_count"], 6)
+        self.assertEqual(
+            report["selection_execution_mode"],
+            "automatic_candidate_competition",
+        )
+        self.assertEqual(builder.call_count, 6)
 
     def test_stage8_manual_palette_rejection_rolls_back_without_auto_fallback(self):
         processor = self._dualband_palette_processor(requested_palette="OHS")
@@ -1036,7 +1083,38 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
         )
         self.assertEqual(masks["limited_core_exclusion_expand"], 8)
 
-    def test_stage8_limited_pixels_are_core_excluded_and_weak_signal_only(self):
+    def test_stage8_narrowband_zero_saturation_keeps_structure_steps(self):
+        processor = pipeline_module.StarunPostProcessor()
+        processor._stage8_handoff = {"processing_policy": "full"}
+        processor._channel_semantics = "narrowband_composite"
+        processor._active_target_type = lambda: "emission_nebula_widefield"
+        processor._stage7_halo_residue_score = lambda: 0.0
+        processor._stage7_effective_halo_threshold = lambda: 0.35
+        image = np.full((3, 96, 96), 0.04, dtype=np.float32)
+        yy, xx = np.indices((96, 96))
+        signal = np.exp(
+            -(((xx - 48) / 23.0) ** 2 + ((yy - 48) / 17.0) ** 2)
+        ).astype(np.float32)
+        image += np.asarray([0.18, 0.11, 0.09], dtype=np.float32)[
+            :, None, None
+        ] * signal[None]
+
+        enhanced, diagnostics, _messages = (
+            processor._apply_stage8_masked_pixel_enhancement(
+                image,
+                {"saturation": 0.0, "unsharp_amount": 0.0},
+                label="test",
+            )
+        )
+
+        structure = diagnostics["structure_execution"]
+        self.assertGreater(structure["faint_nebula_boost"], 0.0)
+        self.assertGreater(structure["nebula_contrast"], 0.0)
+        self.assertTrue(structure["independent_from_saturation"])
+        self.assertEqual(diagnostics["saturation_execution"]["passes"], 0)
+        self.assertGreater(float(np.max(np.abs(enhanced - image))), 0.0)
+
+    def test_stage8_limited_pixels_are_core_excluded_and_structure_disabled(self):
         processor = pipeline_module.StarunPostProcessor()
         processor._stage8_handoff = {"processing_policy": "limited"}
         processor._active_target_type = (
@@ -1074,7 +1152,16 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
 
         self.assertTrue(np.array_equal(enhanced[:, hard_core], image[:, hard_core]))
         self.assertEqual(float(np.max(delta[weak_signal <= 0.0])), 0.0)
-        self.assertGreater(float(np.max(delta[weak_signal > 0.0])), 0.0)
+        self.assertEqual(float(np.max(delta[weak_signal > 0.0])), 0.0)
+        self.assertEqual(diagnostics["structure_execution"]["scale"], 0.0)
+        self.assertEqual(
+            diagnostics["structure_execution"]["faint_nebula_boost"],
+            0.0,
+        )
+        self.assertEqual(
+            diagnostics["structure_execution"]["nebula_contrast"],
+            0.0,
+        )
         self.assertEqual(
             diagnostics["processing_scope"]["mode"],
             "limited_weak_signal_only",

@@ -1,5 +1,6 @@
 """Stage 9 star processing and remixing."""
 import copy
+import hashlib
 import json
 import math
 import os
@@ -969,6 +970,130 @@ def _assess_stage9_candidate(
     return report
 
 
+def _stage9_pixel_hash(pixels: np.ndarray) -> str:
+    """Return a stable hash over the exact persisted pixel representation."""
+    array = np.ascontiguousarray(np.asarray(pixels))
+    digest = hashlib.sha256()
+    digest.update(str(tuple(int(value) for value in array.shape)).encode("ascii"))
+    digest.update(str(array.dtype).encode("ascii"))
+    digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _validate_stage9_persisted_output(
+    pipeline,
+    source_stem: str,
+    selected_quality: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Reload the canonical FITS and repeat every formal Stage9 gate."""
+    report: Dict[str, Any] = {
+        "schema": "starun.stage9-persisted-output-validation.v1",
+        "status": "rejected",
+        "accepted": False,
+        "output_stem": "stage9_remixed",
+        "selected_attempt": str(selected_quality.get("attempt") or "unknown"),
+        "selected_formula": str(selected_quality.get("formula") or "screen"),
+        "reason_code": "stage9_persisted_output_validation_failed",
+    }
+    try:
+        getter = getattr(pipeline.siril, "get_image_pixeldata", None)
+        if not callable(getter):
+            raise RuntimeError("Siril pixel reader is unavailable")
+        active_pixels = getter(preview=False)
+        if active_pixels is None:
+            raise RuntimeError("active Stage9 candidate pixels are unavailable")
+        active = np.asarray(active_pixels)
+        active_hash = _stage9_pixel_hash(active)
+
+        pipeline.cmd_with_check("load", "stage9_remixed")
+        persisted_pixels = getter(preview=False)
+        if persisted_pixels is None:
+            raise RuntimeError("persisted stage9_remixed pixels are unavailable")
+        persisted = np.asarray(persisted_pixels)
+        persisted_hash = _stage9_pixel_hash(persisted)
+        shape_matches = bool(active.shape == persisted.shape)
+        max_abs_error = None
+        pixels_match = False
+        if shape_matches:
+            active_float = active.astype(np.float64, copy=False)
+            persisted_float = persisted.astype(np.float64, copy=False)
+            max_abs_error = float(np.max(np.abs(active_float - persisted_float)))
+            pixels_match = bool(
+                np.isfinite(max_abs_error) and max_abs_error <= 1e-6
+            )
+
+        reloaded_quality = _assess_stage9_candidate(
+            pipeline,
+            source_stem,
+            attempt=f"{report['selected_attempt']}_persisted_reload",
+            formula=report["selected_formula"],
+        )
+        catalog_visibility = dict(
+            reloaded_quality.get("catalog_visibility") or {}
+        )
+        group_reports = dict(catalog_visibility.get("groups") or {})
+        visibility_groups_passed = bool(
+            catalog_visibility.get("available", False)
+            and all(
+                (group_reports.get(name) or {}).get("passed") is True
+                for name in ("all", "weak", "bright")
+            )
+        )
+        quality_accepted = bool(reloaded_quality.get("accepted", False))
+        accepted = bool(
+            shape_matches
+            and pixels_match
+            and quality_accepted
+            and visibility_groups_passed
+        )
+        report.update(
+            status="ok" if accepted else "rejected",
+            accepted=accepted,
+            reason_code=(
+                "stage9_persisted_output_validation_ok"
+                if accepted
+                else "stage9_persisted_output_validation_failed"
+            ),
+            active_pixel_hash=active_hash,
+            persisted_pixel_hash=persisted_hash,
+            active_shape=list(active.shape),
+            persisted_shape=list(persisted.shape),
+            active_dtype=str(active.dtype),
+            persisted_dtype=str(persisted.dtype),
+            shape_matches=shape_matches,
+            pixels_match=pixels_match,
+            maximum_absolute_pixel_error=max_abs_error,
+            quality_accepted=quality_accepted,
+            catalog_visibility_groups_passed=visibility_groups_passed,
+            coordinate_contract=catalog_visibility.get("coordinate_contract"),
+            reloaded_quality=reloaded_quality,
+        )
+        if not accepted:
+            failures = []
+            if not shape_matches:
+                failures.append("persisted_frame_shape_mismatch")
+            if not pixels_match:
+                failures.append("persisted_frame_pixels_mismatch")
+            if not quality_accepted:
+                failures.append("persisted_quality_gate_failed")
+            if not visibility_groups_passed:
+                failures.append("persisted_catalog_visibility_failed")
+            report["failures"] = failures
+    except (
+        AttributeError,
+        CommandError,
+        RuntimeError,
+        SirilError,
+        TypeError,
+        ValueError,
+        FloatingPointError,
+    ) as error:
+        report["reason"] = str(error)
+        report["failures"] = ["persisted_output_validation_unavailable"]
+    pipeline._stage9_persisted_output_validation = report
+    return report
+
+
 def _record_stage9_quality_advisories(
     pipeline,
     messages: List[str],
@@ -1069,6 +1194,20 @@ def _stage9_psf_group_ratios(quality: Dict[str, Any]) -> Dict[str, float]:
         if np.isfinite(ratio) and ratio > 0.0:
             ratios[group_name] = ratio
     return ratios
+
+
+def _stage9_psf_uncertainty_exemption_used(
+    quality: Dict[str, Any],
+) -> bool:
+    """Return whether formal PSF acceptance crossed a limit by uncertainty."""
+    closure = quality.get("psf_closure") or {}
+    if bool(closure.get("uncertainty_exemption_used", False)):
+        return True
+    return any(
+        isinstance(group, dict)
+        and bool(group.get("accepted_within_uncertainty", False))
+        for group in (closure.get("groups") or {}).values()
+    )
 
 
 def _stage9_review_fwhm_ratio_max(pipeline) -> float:
@@ -1743,13 +1882,13 @@ def _stage9_psf_candidate_score(
     quality: Dict[str, Any],
     *,
     recovery_pixels: int,
-) -> tuple[float, float, int, float, float]:
+) -> tuple[float, float, float, int, float, float]:
     """Rank safe candidates by worst PSF error, then expansion and highlights."""
     if not bool(quality.get("accepted", False)):
-        return (float("inf"), float("inf"), int(recovery_pixels), float("inf"), float("inf"))
+        return (float("inf"),) * 6
     ratios = tuple(_stage9_psf_group_ratios(quality).values())
     if not ratios:
-        return (float("inf"), float("inf"), int(recovery_pixels), float("inf"), float("inf"))
+        return (float("inf"),) * 6
     deviations = tuple(abs(value - 1.0) for value in ratios)
     metrics = quality.get("metrics") or {}
 
@@ -1761,6 +1900,7 @@ def _stage9_psf_candidate_score(
         return value if np.isfinite(value) else float("inf")
 
     return (
+        1.0 if _stage9_psf_uncertainty_exemption_used(quality) else 0.0,
         float(max(deviations)),
         float(sum(deviations) / len(deviations)),
         max(0, int(recovery_pixels)),
@@ -1904,80 +2044,9 @@ def _prepare_stage9_star_reference(
                     stage5_stars=stage5_reference.get("stars") or [],
                     raw_starmask=starmask_pixels,
                 )
-                if spatial_scale.get("status") == "ready" and catalog.get(
-                    "status"
-                ) == "ok":
-                    # The first catalog is bootstrap evidence only. Once the
-                    # scale is known, rebuild formal membership with scaled
-                    # component bounds and freeze that result for every route.
-                    if bool(catalog.get("source_matched", False)) and (
-                        matched_context.get("available") is True
-                    ):
-                        rebuilt_catalog = (
-                            stage9_quality.build_display_confirmed_starmask_catalog(
-                                starmask_pixels,
-                                matched_context["original_display"],
-                                pipeline.cfg,
-                                spatial_scale=spatial_scale,
-                            )
-                        )
-                    else:
-                        rebuilt_catalog = stage9_quality.build_star_reference_catalog(
-                            starmask_pixels,
-                            pipeline.cfg,
-                            source_image=(
-                                None
-                                if bool(catalog.get("reference_degraded", False))
-                                else source_pixels
-                            ),
-                            spatial_scale=spatial_scale,
-                        )
-                    if rebuilt_catalog.get("status") != "ok":
-                        raise RuntimeError(
-                            "scaled Stage9 star-catalog validation failed: "
-                            f"{rebuilt_catalog.get('reason') or 'unknown reason'}"
-                        )
-                    rebuilt_catalog.update(
-                        reference_source=catalog.get(
-                            "reference_source",
-                            reference_source,
-                        ),
-                        reference_degraded=bool(
-                            catalog.get("reference_degraded", False)
-                        ),
-                        reference_degraded_reason=str(
-                            catalog.get("reference_degraded_reason") or ""
-                        ),
-                        stage9_spatial_scale=dict(spatial_scale),
-                    )
-                    per_star_fwhm = np.asarray(
-                        rebuilt_catalog.get(
-                            "_display_source_fwhm_px",
-                            rebuilt_catalog.get("_source_fwhm_px", ()),
-                        ),
-                        dtype=np.float32,
-                    )
-                    star_count = np.asarray(
-                        rebuilt_catalog.get("_peak_y", ())
-                    ).size
-                    if per_star_fwhm.size != star_count:
-                        per_star_fwhm = np.full(
-                            star_count,
-                            float(spatial_scale["fwhm_median_px"]),
-                            dtype=np.float32,
-                        )
-                    invalid_fwhm = ~np.isfinite(per_star_fwhm) | (
-                        per_star_fwhm <= 0.0
-                    )
-                    per_star_fwhm[invalid_fwhm] = float(
-                        spatial_scale["fwhm_median_px"]
-                    )
-                    rebuilt_catalog["_stage9_spatial_fwhm_px"] = per_star_fwhm
-                    catalog = rebuilt_catalog
-                    stage9_quality.freeze_stage9_spatial_geometry(
-                        catalog,
-                        starmask_pixels,
-                    )
+                # Scale is independent evidence. Freeze it before rebuilding
+                # the catalog so a contaminated/invalid scaled catalog cannot
+                # erase a valid FWHM measurement.
                 pipeline._stage9_spatial_scale = dict(spatial_scale)
                 scale_review = bool(
                     spatial_scale.get("stage9_psf_review_required", False)
@@ -1986,6 +2055,198 @@ def _prepare_stage9_star_reference(
                 pipeline._stage9_psf_review_required = bool(
                     getattr(pipeline, "_stage9_psf_review_required", False)
                     or scale_review
+                )
+                scaled_catalog_validation: Dict[str, Any] = {
+                    "schema": "starun.stage9-scaled-catalog-validation.v1",
+                    "status": "not_run",
+                    "scale_status": str(
+                        spatial_scale.get("status") or "unavailable"
+                    ),
+                    "bootstrap_catalog": stage9_quality.star_reference_summary(
+                        catalog
+                    ),
+                    "selected_route": None,
+                    "source_confirmed": None,
+                    "strict_starmask_only": None,
+                }
+                pipeline._stage9_scaled_catalog_validation = (
+                    scaled_catalog_validation
+                )
+                if spatial_scale.get("status") == "ready":
+                    # The first catalog is bootstrap evidence only. Once the
+                    # scale is known, rebuild formal membership with scaled
+                    # component bounds and freeze that result for every route.
+                    if matched_context.get("available") is True:
+                        rebuilt_catalog = (
+                            stage9_quality.build_display_confirmed_starmask_catalog(
+                                starmask_pixels,
+                                matched_context["original_display"],
+                                pipeline.cfg,
+                                spatial_scale=spatial_scale,
+                            )
+                        )
+                    elif source_pixels is not None:
+                        rebuilt_catalog = stage9_quality.build_star_reference_catalog(
+                            starmask_pixels,
+                            pipeline.cfg,
+                            source_image=source_pixels,
+                            spatial_scale=spatial_scale,
+                        )
+                    else:
+                        rebuilt_catalog = {
+                            "status": "unavailable",
+                            "reason": (
+                                "scaled source-confirmed reference image "
+                                "unavailable"
+                            ),
+                        }
+                    scaled_catalog_validation["source_confirmed"] = (
+                        stage9_quality.star_reference_summary(rebuilt_catalog)
+                    )
+                    if rebuilt_catalog.get("status") == "ok":
+                        scaled_catalog_validation.update(
+                            status="ok",
+                            selected_route="source_confirmed",
+                        )
+                    else:
+                        strict_catalog = (
+                            stage9_quality.build_star_reference_catalog(
+                                starmask_pixels,
+                                pipeline.cfg,
+                                spatial_scale=spatial_scale,
+                            )
+                        )
+                        scaled_catalog_validation["strict_starmask_only"] = (
+                            stage9_quality.star_reference_summary(
+                                strict_catalog
+                            )
+                        )
+                        if strict_catalog.get("status") == "ok":
+                            strict_catalog.update(
+                                reference_source="starmask_only",
+                                reference_degraded=True,
+                                reference_degraded_reason=(
+                                    "scaled source-confirmed catalog rejected: "
+                                    + str(
+                                        rebuilt_catalog.get("reason")
+                                        or "unknown reason"
+                                    )
+                                ),
+                                source_reference=(
+                                    scaled_catalog_validation[
+                                        "source_confirmed"
+                                    ]
+                                ),
+                                psf_reference_status="unavailable",
+                                psf_reference_reason=(
+                                    "strict scaled starmask-only catalog"
+                                ),
+                            )
+                            rebuilt_catalog = strict_catalog
+                            scaled_catalog_validation.update(
+                                status="degraded",
+                                selected_route="strict_starmask_only",
+                                reason=(
+                                    "source-confirmed scaled catalog failed; "
+                                    "strict starmask-only catalog accepted"
+                                ),
+                            )
+                        else:
+                            scaled_catalog_validation.update(
+                                status="unavailable",
+                                selected_route="none",
+                                reason=(
+                                    "both scaled catalog validations failed"
+                                ),
+                            )
+                            catalog = {
+                                "status": "unavailable",
+                                "reason": (
+                                    "scaled Stage9 star-catalog validation "
+                                    "failed for source-confirmed and strict "
+                                    "starmask-only routes"
+                                ),
+                                "bootstrap_reference": (
+                                    scaled_catalog_validation[
+                                        "bootstrap_catalog"
+                                    ]
+                                ),
+                                "scaled_catalog_validation": dict(
+                                    scaled_catalog_validation
+                                ),
+                            }
+                            rebuilt_catalog = None
+                    if rebuilt_catalog is None:
+                        pipeline._stage9_scaled_catalog_validation = dict(
+                            scaled_catalog_validation
+                        )
+                    else:
+                        rebuilt_catalog.update(
+                            reference_source=rebuilt_catalog.get(
+                                "reference_source",
+                                catalog.get(
+                                    "reference_source",
+                                    reference_source,
+                                ),
+                            ),
+                            reference_degraded=bool(
+                                rebuilt_catalog.get(
+                                    "reference_degraded",
+                                    catalog.get("reference_degraded", False),
+                                )
+                            ),
+                            reference_degraded_reason=str(
+                                rebuilt_catalog.get(
+                                    "reference_degraded_reason",
+                                    catalog.get(
+                                        "reference_degraded_reason"
+                                    )
+                                    or "",
+                                )
+                            ),
+                            stage9_spatial_scale=dict(spatial_scale),
+                        )
+                    if rebuilt_catalog is not None:
+                        per_star_fwhm = np.asarray(
+                            rebuilt_catalog.get(
+                                "_display_source_fwhm_px",
+                                rebuilt_catalog.get("_source_fwhm_px", ()),
+                            ),
+                            dtype=np.float32,
+                        )
+                        star_count = np.asarray(
+                            rebuilt_catalog.get("_peak_y", ())
+                        ).size
+                        if per_star_fwhm.size != star_count:
+                            per_star_fwhm = np.full(
+                                star_count,
+                                float(spatial_scale["fwhm_median_px"]),
+                                dtype=np.float32,
+                            )
+                        invalid_fwhm = ~np.isfinite(per_star_fwhm) | (
+                            per_star_fwhm <= 0.0
+                        )
+                        per_star_fwhm[invalid_fwhm] = float(
+                            spatial_scale["fwhm_median_px"]
+                        )
+                        rebuilt_catalog["_stage9_spatial_fwhm_px"] = (
+                            per_star_fwhm
+                        )
+                        catalog = rebuilt_catalog
+                        stage9_quality.freeze_stage9_spatial_geometry(
+                            catalog,
+                            starmask_pixels,
+                        )
+                else:
+                    scaled_catalog_validation.update(
+                        status="not_run",
+                        reason=(
+                            str(spatial_scale.get("reason_code"))
+                            or "spatial scale unavailable"
+                        ),
+                    )
+                pipeline._stage9_scaled_catalog_validation = dict(
+                    scaled_catalog_validation
                 )
                 pipeline.cmd_with_check("load", starmask_name)
     except (
@@ -1998,6 +2259,15 @@ def _prepare_stage9_star_reference(
         IndexError,
     ) as error:
         catalog = {"status": "unavailable", "reason": str(error)}
+        validation = dict(
+            getattr(pipeline, "_stage9_scaled_catalog_validation", {}) or {}
+        )
+        validation.update(
+            status="unavailable",
+            selected_route="none",
+            reason=f"Stage9 catalog preparation failed: {error}",
+        )
+        pipeline._stage9_scaled_catalog_validation = validation
 
     try:
         pipeline.cmd_with_check("load", starmask_name)
@@ -2125,6 +2395,16 @@ def _prepare_stage9_star_color_repair(
         if reference_pixels is None:
             raise RuntimeError("immutable linear with-stars reference unavailable")
 
+        validation_support_mask = None
+        catalog = getattr(pipeline, "_stage9_star_reference_catalog", None)
+        if isinstance(catalog, dict) and catalog.get("status") == "ok":
+            _weak_support, _bright_support, validation_support_mask = (
+                stage9_quality.build_star_overlay_masks(
+                    catalog,
+                    strict=False,
+                    cfg=pipeline.cfg,
+                )
+            )
         candidate, report = repair_star_layer_colors(
             star_pixels,
             reference_pixels,
@@ -2145,6 +2425,7 @@ def _prepare_stage9_star_color_repair(
                     0.01,
                 )
             ),
+            validation_support_mask=validation_support_mask,
         )
         report["reference_source"] = reference_source
         report["transaction"]["baseline_saved"] = True
@@ -2228,6 +2509,25 @@ def _prepare_stage9_star_color_repair(
         return starmask_name
 
 
+def _update_stage9_star_delivery_contract(pipeline) -> bool:
+    """Freeze the final Stage9 delivery truth after every route decision."""
+    stars_required = bool(getattr(pipeline, "_stage9_stars_required", True))
+    stars_applied = bool(getattr(pipeline, "_stage9_stars_applied", False))
+    output_contains_stars = bool(
+        getattr(pipeline, "_stage9_output_contains_stars", False)
+    )
+    accepted = bool(
+        getattr(pipeline, "_stage9_remix_formally_accepted", False)
+        and str(getattr(pipeline, "_stage9_final_source", "") or "")
+        == "stage9_remixed"
+        and not bool(getattr(pipeline, "_stage9_output_withheld", False))
+        and output_contains_stars
+        and (not stars_required or stars_applied)
+    )
+    pipeline._stage9_star_delivery_contract_accepted = accepted
+    return accepted
+
+
 def _write_stage9_quality_report(
     pipeline,
     attempts: List[Dict[str, Any]],
@@ -2244,6 +2544,7 @@ def _write_stage9_quality_report(
     output_contains_stars = bool(
         getattr(pipeline, "_stage9_output_contains_stars", stars_applied)
     )
+    _update_stage9_star_delivery_contract(pipeline)
     upstream_handoff = _stage9_upstream_handoff(pipeline, source_stem)
     stage9_fallback_used, stage9_fallback_reason = _stage9_local_fallback(
         mode,
@@ -2453,12 +2754,62 @@ def _write_stage9_quality_report(
         "status": "unavailable",
         "reason": "selected candidate matched-domain fidelity is unavailable",
     }
+    attempt_history_reason_codes = list(
+        dict.fromkeys(
+            [
+                *(
+                    [str((unscreen_report or {}).get("reason_code"))]
+                    if isinstance(unscreen_report, dict)
+                    and (unscreen_report or {}).get("reason_code")
+                    else []
+                ),
+                *[
+                    str(code)
+                    for attempt_report in attempts
+                    if isinstance(attempt_report, dict)
+                    for code in (
+                        [attempt_report.get("reason_code")]
+                        + list(attempt_report.get("reason_codes") or [])
+                    )
+                    if str(code or "").strip()
+                ],
+            ]
+        )
+    )
+    final_reason_codes = list(
+        dict.fromkeys(
+            [
+                *(
+                    [str(selected.get("reason_code"))]
+                    if isinstance(selected, dict) and selected.get("reason_code")
+                    else []
+                ),
+                *(
+                    [
+                        str(code)
+                        for code in (selected.get("reason_codes") or [])
+                        if str(code)
+                    ]
+                    if isinstance(selected, dict)
+                    else []
+                ),
+                *([stage9_fallback_reason] if stage9_fallback_reason else []),
+                *(
+                    ["stage9_output_withheld"]
+                    if bool(getattr(pipeline, "_stage9_output_withheld", False))
+                    else []
+                ),
+            ]
+        )
+    )
+    if formal_accepted and not final_reason_codes:
+        final_reason_codes = ["accepted"]
     writer(
         "stage9_remix_quality.json",
         {
-            "schema": "starun.stage9-remix-quality.v7",
+            "schema": "starun.stage9-remix-quality.v9",
             "selection_policy": (
-                "failure_directed_support_unscreen_targeted_recovery_v6"
+                "catalog_visibility_psf_fidelity_recovery_v7"
             ),
             "selection_class": selection_class,
             "formal_accepted": formal_accepted,
@@ -2499,6 +2850,17 @@ def _write_stage9_quality_report(
                     "schema": "starun.stage9-fwhm-spatial-scale.v1",
                     "status": "unavailable",
                     "reason_code": "stage9_spatial_scale_unavailable",
+                },
+            ),
+            "scaled_catalog_validation": getattr(
+                pipeline,
+                "_stage9_scaled_catalog_validation",
+                {
+                    "schema": (
+                        "starun.stage9-scaled-catalog-validation.v1"
+                    ),
+                    "status": "not_run",
+                    "reason": "Stage9 star reference was not prepared",
                 },
             ),
             "objective": {
@@ -2585,7 +2947,7 @@ def _write_stage9_quality_report(
             ),
             "psf_size_recovery_policy": {
                 "mode": (
-                    "group_fractional_source_wing_with_bounded_binary_search"
+                    "bidirectional_group_psf_recovery_with_bounded_binary_search"
                     if bool(
                         getattr(
                             pipeline.cfg,
@@ -2612,6 +2974,20 @@ def _write_stage9_quality_report(
                     pipeline,
                     selected_quality or {},
                 ),
+                "oversize_contraction": {
+                    "trigger": "pure_fwhm_upper_limit_failure_only",
+                    "target_groups": "failed_weak_bright_or_all_only",
+                    "operator": "component_local_rgb_shared_u_power",
+                    "operator_formula": "gain=u^(gamma-1)",
+                    "gamma_bounds": [1.0, 2.5],
+                    "retry_budget_shared_with_targeted_recovery": True,
+                    "candidate_rebuild_source": "immutable_parent_star_layer",
+                    "peak_preserved": True,
+                    "centroid_guard_max_px": 0.05,
+                    "channel_ratio_preserved_by_construction": True,
+                    "all_existing_formal_gates_reapplied": True,
+                    "rollback": "exact_immutable_parent",
+                },
                 "selective_low_tail_enabled": bool(
                     getattr(
                         pipeline.cfg,
@@ -2792,7 +3168,7 @@ def _write_stage9_quality_report(
                 pipeline,
                 "_stage9_starmask_support_preflight",
                 {
-                    "schema": "starun.stage9-starmask_support_preflight.v1",
+            "schema": "starun.stage9-starmask-support-preflight.v2",
                     "status": "unavailable",
                     "reason": "support preflight was not recorded",
                 },
@@ -2855,42 +3231,10 @@ def _write_stage9_quality_report(
                 "final_composition": "screen",
             },
             "unscreen_reference": unscreen_report,
-            "reason_codes": list(
-                dict.fromkeys(
-                    [
-                        *(
-                            [
-                                str(
-                                    (
-                                        getattr(
-                                            pipeline,
-                                            "_stage9_unscreen_reference",
-                                            {},
-                                        )
-                                        or {}
-                                    ).get("reason_code")
-                                )
-                            ]
-                            if (
-                                getattr(
-                                    pipeline,
-                                    "_stage9_unscreen_reference",
-                                    {},
-                                )
-                                or {}
-                            ).get("reason_code")
-                            else []
-                        ),
-                        *[
-                            str(code)
-                            for attempt_report in attempts
-                            if isinstance(attempt_report, dict)
-                            for code in (attempt_report.get("reason_codes") or [])
-                            if str(code)
-                        ],
-                    ]
-                )
-            ),
+            "reason_codes": attempt_history_reason_codes,
+            "reason_codes_scope": "attempt_history_legacy",
+            "attempt_history_reason_codes": attempt_history_reason_codes,
+            "final_reason_codes": final_reason_codes,
             "shadow_metrics": (
                 (selected or {}).get("shadow_metrics")
                 if isinstance(selected, dict)
@@ -2900,6 +3244,28 @@ def _write_stage9_quality_report(
                 (selected or {}).get("psf_closure")
                 if isinstance(selected, dict)
                 else (attempts[-1].get("psf_closure") if attempts else None)
+            ),
+            "catalog_visibility": (
+                (selected or {}).get("catalog_visibility")
+                if isinstance(selected, dict)
+                else (
+                    attempts[-1].get("catalog_visibility")
+                    if attempts
+                    else None
+                )
+            ),
+            "persisted_output_validation": copy.deepcopy(
+                getattr(
+                    pipeline,
+                    "_stage9_persisted_output_validation",
+                    {
+                        "schema": (
+                            "starun.stage9-persisted-output-validation.v1"
+                        ),
+                        "status": "not_run",
+                        "accepted": False,
+                    },
+                )
             ),
             "visible_wing_closure": (
                 (selected or {}).get("visible_wing_closure")
@@ -3073,6 +3439,35 @@ def _stage9_starmask_support_preflight(
         )
         public = stage9_quality.public_starmask_support_preflight(preflight)
         pipeline._stage9_starmask_support_preflight = public
+        if star_stretch_used:
+            plugin_eligibility = dict(
+                public.get("plugin_formal_eligibility") or {}
+            )
+            preprocessing = dict(
+                getattr(pipeline, "_stage9_star_plugin_preprocessing", {}) or {}
+            )
+            preprocessing.update(
+                formal_eligible=bool(plugin_eligibility.get("eligible", False)),
+                output_adequacy=plugin_eligibility,
+                selected_stretch_source=public.get("selected_stretch_source"),
+            )
+            if not bool(plugin_eligibility.get("eligible", False)):
+                preprocessing.update(
+                    status="plugin_stretch_rejected_output_inadequate",
+                    builtin_stretch_required=True,
+                    fallback_reason=public.get("fallback_reason"),
+                )
+                messages.append(
+                    "Stage9 rejected the plugin-stretched star layer because "
+                    "its measured four-anchor output was inadequate; rebuilt "
+                    "the normal candidate from the raw starmask"
+                )
+            else:
+                preprocessing.update(
+                    status="plugin_stretched_formally_qualified",
+                    builtin_stretch_required=False,
+                )
+            pipeline._stage9_star_plugin_preprocessing = preprocessing
         normal = ((public.get("candidates") or {}).get("normal") or {})
         strict = ((public.get("candidates") or {}).get("strict_compact") or {})
         messages.append(
@@ -3093,7 +3488,7 @@ def _stage9_starmask_support_preflight(
         ValueError,
     ) as error:
         report = {
-            "schema": "starun.stage9-starmask_support_preflight.v1",
+            "schema": "starun.stage9-starmask-support-preflight.v2",
             "status": "rejected",
             "strategy": "adaptive_dual_route",
             "compact_enabled": bool(
@@ -3672,22 +4067,38 @@ def _stage9_resolve_matched_domain_transfer(pipeline) -> Dict[str, Any]:
             or selected_candidate_id
             or ""
         )
-        if (
-            transfer.get("schema")
-            != stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA
-        ):
+        transfer_schema = str(transfer.get("schema") or "")
+        if transfer_schema not in {
+            stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V1,
+            stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V2,
+        }:
             return {
                 "status": "unavailable",
                 "reason_code": (
                     "stage9_display90_transfer_invalid"
-                    if method == "display90_linked_lut"
+                    if method in stage7_stretch_metrics.DISPLAY_LUT_METHODS
                     or selected_candidate_id.startswith("cand_display")
                     else "stage9_matched_domain_transfer_invalid"
                 ),
                 "reason": "Stage7 matched-domain transfer schema is invalid",
                 "selected_candidate_id": selected_candidate_id,
             }
-        if method == "display90_linked_lut":
+        if method in stage7_stretch_metrics.DISPLAY_LUT_METHODS:
+            expected_method = (
+                stage7_stretch_metrics.DISPLAY90_LEGACY_METHOD
+                if transfer_schema
+                == stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V1
+                else stage7_stretch_metrics.DISPLAY_LUMINANCE_VECTOR_METHOD
+            )
+            if method != expected_method:
+                return {
+                    "status": "unavailable",
+                    "reason_code": "stage9_display90_transfer_invalid",
+                    "reason": (
+                        "Stage7 matched-domain schema/method semantics do not match"
+                    ),
+                    "selected_candidate_id": selected_candidate_id,
+                }
             tone_candidate_id = str(
                 transfer.get("tone_candidate_id")
                 or selected_candidate_id
@@ -3813,7 +4224,7 @@ def _stage9_apply_matched_domain_transfer(
     method = str(transfer.get("method") or "")
     if transfer.get("status") != "ready":
         raise ValueError("Stage7 matched-domain transfer is not ready")
-    if method == "display90_linked_lut":
+    if method in stage7_stretch_metrics.DISPLAY_LUT_METHODS:
         return stage7_stretch_metrics.apply_display90_linked_rgb_stretch(
             image,
             dict(transfer.get("calibration") or {}),
@@ -4381,15 +4792,45 @@ def _prepare_stage9_source_presence_candidate(
 ) -> Dict[str, Any]:
     """Add bounded source wings and independently frozen bright-star support."""
     if not bool(context.get("available", False)):
-        return context
+        return {
+            **context,
+            "source_presence_report": {
+                "schema": "starun.stage9-source-presence.v1",
+                "status": "unavailable",
+                "available": False,
+                "changed": False,
+                "reason_code": "stage9_source_presence_context_unavailable",
+                "reason": "accepted Unscreen context is unavailable",
+            },
+        }
     catalog = getattr(pipeline, "_stage9_star_reference_catalog", None)
     if not isinstance(catalog, dict) or catalog.get("status") != "ok":
-        return context
+        return {
+            **context,
+            "source_presence_report": {
+                "schema": "starun.stage9-source-presence.v1",
+                "status": "unavailable",
+                "available": False,
+                "changed": False,
+                "reason_code": "stage9_source_presence_catalog_unavailable",
+                "reason": "frozen Stage9 star reference catalog is unavailable",
+            },
+        }
     baseline_stars = context.get("unscreen_stars")
     baseline_support = context.get("support_mask")
     trusted = context.get("trusted_stars")
-    if baseline_stars is None or baseline_support is None or trusted is None:
-        return context
+    if baseline_stars is None or baseline_support is None:
+        return {
+            **context,
+            "source_presence_report": {
+                "schema": "starun.stage9-source-presence.v1",
+                "status": "unavailable",
+                "available": False,
+                "changed": False,
+                "reason_code": "stage9_source_presence_arrays_unavailable",
+                "reason": "accepted Unscreen stars or support mask is unavailable",
+            },
+        }
 
     candidate = np.asarray(baseline_stars, dtype=np.float32)
     support = np.asarray(baseline_support, dtype=bool)
@@ -4410,8 +4851,18 @@ def _prepare_stage9_source_presence_candidate(
             "reason": "ordinary source support not available",
         },
         "stage5_bright_star_completion": {
+            "schema": "starun.stage9-stage5-bright-star-completion.v2",
             "status": "not_run",
+            "available": False,
+            "reason_code": "stage9_stage5_bright_star_completion_not_run",
             "reason": "disabled or frozen Stage5 reference unavailable",
+            "coordinate_contract": {
+                "schema": "starun.pixel-coordinate-contract.v1",
+                "source_coordinate_domain": "siril_star_catalog_bottom_up",
+                "array_coordinate_domain": "siril_pixel_buffer_bottom_up",
+                "conversion": "y_array = y_siril",
+                "validated": True,
+            },
         },
     }
 
@@ -4465,29 +4916,40 @@ def _prepare_stage9_source_presence_candidate(
         )
         if completion_evidence is None:
             completion_evidence = trusted
-        completion = stage9_quality.build_stage5_bright_star_completion(
-            stage5_report.get("stars"),
-            catalog,
-            context["original_display"],
-            completion_evidence,
-            pipeline.cfg,
-        )
-        completed, completion_support, completion_report = (
-            stage9_quality.apply_stage5_bright_star_completion(
+        if completion_evidence is None:
+            completion_report = {
+                **presence_report["stage5_bright_star_completion"],
+                "status": "unavailable",
+                "reason_code": (
+                    "stage9_stage5_bright_star_completion_evidence_unavailable"
+                ),
+                "reason": "immutable trusted starmask evidence is unavailable",
+            }
+        else:
+            completion = stage9_quality.build_stage5_bright_star_completion(
+                stage5_report.get("stars"),
+                catalog,
                 context["original_display"],
-                context["starless_display"],
-                candidate,
-                completion,
+                completion_evidence,
                 pipeline.cfg,
-                remix_base=context.get("remix_base"),
-                screen_intensity=screen_intensity,
+                coordinate_domain="siril_pixel_buffer_bottom_up",
             )
-        )
+            completed, completion_support, completion_report = (
+                stage9_quality.apply_stage5_bright_star_completion(
+                    context["original_display"],
+                    context["starless_display"],
+                    candidate,
+                    completion,
+                    pipeline.cfg,
+                    remix_base=context.get("remix_base"),
+                    screen_intensity=screen_intensity,
+                )
+            )
+            if completed is not None and completion_support is not None:
+                candidate = completed
+                bright_mask |= np.asarray(completion_support, dtype=bool)
+                support |= np.asarray(completion_support, dtype=bool)
         presence_report["stage5_bright_star_completion"] = completion_report
-        if completed is not None and completion_support is not None:
-            candidate = completed
-            bright_mask |= np.asarray(completion_support, dtype=bool)
-            support |= np.asarray(completion_support, dtype=bool)
 
     changed = bool(np.any(np.abs(candidate - baseline_stars) > 1e-7))
     presence_report.update(
@@ -4813,11 +5275,15 @@ def _stage9_extend_rescue_with_source_presence(
         if not bool(source_report.get("changed", False)):
             break
 
+        source_layer_name = str(
+            source_context.get("starmask") or "starmask_unscreen_stabilized"
+        )
+
         applied = bool(
             _save_stage9_unscreen_context_layer(pipeline, source_context)
             and pipeline._apply_previous_stage_star_remix(
                 source_stem,
-                "starmask_unscreen_stabilized",
+                source_layer_name,
                 intensity,
             )
         )
@@ -4841,7 +5307,26 @@ def _stage9_extend_rescue_with_source_presence(
         )
         quality.update(
             intensity=intensity,
-            starmask="starmask_unscreen_stabilized",
+            starmask=source_layer_name,
+            support_mode=str(
+                accepted_quality.get("support_mode")
+                or accepted_context.get("support_mode")
+                or "unknown"
+            ),
+            support_starmask=str(
+                accepted_quality.get("support_starmask")
+                or accepted_context.get("support_starmask")
+                or source_layer_name
+            ),
+            parent_attempt=accepted_quality.get("attempt"),
+            base_source_stem=str(
+                accepted_quality.get("base_source_stem") or source_stem
+            ),
+            recovery_kind="source_presence_extension",
+            recovery_strength=feather_strength,
+            recovery_target_groups=list(
+                accepted_quality.get("recovery_target_groups") or []
+            ),
             decomposition_method="matched_mtf_unscreen_source_presence",
             source_presence=source_report,
             source_wing_feather_strength=feather_strength,
@@ -4849,7 +5334,7 @@ def _stage9_extend_rescue_with_source_presence(
         quality["bright_star_presence"] = _stage9_observe_bright_star_presence(
             pipeline,
             source_stem=source_stem,
-            star_layer_name="starmask_unscreen_stabilized",
+            star_layer_name=source_layer_name,
             intensity=intensity,
             completion_report=source_report.get("stage5_bright_star_completion"),
         )
@@ -4912,9 +5397,12 @@ def _stage9_extend_rescue_with_source_presence(
         candidate_summaries
     )
     _save_stage9_unscreen_context_layer(pipeline, accepted_context)
+    accepted_layer_name = str(
+        accepted_context.get("starmask") or "starmask_unscreen_stabilized"
+    )
     pipeline._apply_previous_stage_star_remix(
         source_stem,
-        "starmask_unscreen_stabilized",
+        accepted_layer_name,
         intensity,
     )
     messages.append(
@@ -5233,7 +5721,7 @@ def _stage9_support_candidate_score(
 ) -> tuple[float, ...]:
     """Rank accepted normal/compact primary candidates deterministically."""
     if not bool(quality.get("accepted", False)):
-        return (float("inf"),) * 8
+        return (float("inf"),) * 10
     gates = quality.get("quality_gates") or {}
     advisories = list(quality.get("advisories") or [])
     advisory_present = bool(
@@ -5258,6 +5746,25 @@ def _stage9_support_candidate_score(
     )
     metrics = quality.get("metrics") or {}
     limits = quality.get("limits") or {}
+    visibility_names = (
+        "catalog_star_visibility_ratio_all",
+        "catalog_star_visibility_ratio_weak",
+        "catalog_star_visibility_ratio_bright",
+    )
+    if any(name in metrics for name in visibility_names):
+        visibility_deficit = 0.0
+        for name in visibility_names:
+            try:
+                ratio = float(metrics[name])
+            except (KeyError, TypeError, ValueError):
+                visibility_deficit = float("inf")
+                break
+            if not np.isfinite(ratio):
+                visibility_deficit = float("inf")
+                break
+            visibility_deficit += max(0.0, 1.0 - ratio)
+    else:
+        visibility_deficit = 0.0
     recovery_margins: List[float] = []
     for metric_name in (
         "weak_star_recovery_ratio",
@@ -5289,6 +5796,8 @@ def _stage9_support_candidate_score(
         bright_growth = float("inf")
     normal_tie_break = 0.0 if support_mode == "normal" else 1.0
     return (
+        1.0 if _stage9_psf_uncertainty_exemption_used(quality) else 0.0,
+        visibility_deficit,
         1.0 if advisory_present else 0.0,
         worst_psf_error,
         mean_psf_error,
@@ -5463,6 +5972,51 @@ def _stage9_is_psf_small_only_failure(
     return bool(issues) and all("star_psf_fwhm" in issue for issue in issues)
 
 
+def _stage9_psf_contraction_target_groups(
+    pipeline,
+    quality: Dict[str, Any],
+) -> tuple[str, ...]:
+    """Return only the frozen ordinary-star groups above the hard PSF limit."""
+    ratios = _stage9_psf_group_ratios(quality)
+    if not ratios:
+        return ()
+    closure = quality.get("psf_closure") or {}
+    limits = closure.get("limits") or {}
+    try:
+        hard_max = float(
+            limits.get(
+                "stage9_psf_fwhm_ratio_max",
+                getattr(pipeline.cfg, "stage9_psf_fwhm_ratio_max", 1.10),
+            )
+        )
+    except (TypeError, ValueError):
+        hard_max = 1.10
+    groups = tuple(
+        group
+        for group in ("weak", "bright")
+        if group in ratios and ratios[group] > hard_max
+    )
+    if groups:
+        return groups
+    if ratios.get("all", 0.0) > hard_max:
+        return ("all",)
+    return ()
+
+
+def _stage9_is_psf_large_only_failure(
+    pipeline,
+    quality: Dict[str, Any],
+) -> bool:
+    if bool(quality.get("accepted", False)):
+        return False
+    if _stage9_psf_size_direction(quality) != "large":
+        return False
+    if not _stage9_psf_contraction_target_groups(pipeline, quality):
+        return False
+    issues = [str(item).lower() for item in quality.get("issues", [])]
+    return bool(issues) and all("star_psf_fwhm" in issue for issue in issues)
+
+
 def _stage9_is_chroma_only_failure(quality: Dict[str, Any]) -> bool:
     if bool(quality.get("accepted", False)):
         return False
@@ -5540,7 +6094,7 @@ def _stage9_formal_candidate_score(
 ) -> tuple[float, ...]:
     """Rank every formally accepted Screen/Unscreen candidate uniformly."""
     if not bool(quality.get("accepted", False)):
-        return (float("inf"),) * 8
+        return (float("inf"),) * 9
     ratios = tuple(_stage9_psf_group_ratios(quality).values())
     worst_psf = (
         max(abs(value - 1.0) for value in ratios) if ratios else float("inf")
@@ -5568,9 +6122,28 @@ def _stage9_formal_candidate_score(
         )
     ]
     wing = finite_metric("star_wing_recovery_ratio", 0.0)
+    visibility_metric_names = (
+        ("catalog_star_visibility_ratio_all", 1.0),
+        ("catalog_star_visibility_ratio_weak", 1.0),
+        ("catalog_star_visibility_ratio_bright", 1.0),
+    )
+    visibility_metrics_present = any(
+        name in metrics for name, _target in visibility_metric_names
+    )
+    if visibility_metrics_present:
+        visibility_deficit = sum(
+            max(0.0, target - finite_metric(name, float("-inf")))
+            for name, target in visibility_metric_names
+        )
+    else:
+        # Legacy test doubles and v8 resume reports predate the absolute
+        # visibility metrics. They remain rankable, but a new production
+        # assessment cannot be formally accepted without the hard gate.
+        visibility_deficit = 0.0
     return (
+        1.0 if _stage9_psf_uncertainty_exemption_used(quality) else 0.0,
+        visibility_deficit,
         worst_psf,
-        finite_metric("chromatic_star_addition_ratio", float("inf")),
         fidelity_mae,
         -min(recoveries),
         -wing,
@@ -6037,6 +6610,312 @@ def _stage9_targeted_soft_psf_recovery(
     return selected_quality, best["context"]
 
 
+def _stage9_targeted_psf_contraction(
+    pipeline,
+    *,
+    source_stem: str,
+    parent_quality: Dict[str, Any],
+    parent_context: Dict[str, Any],
+    intensity: float,
+    support_mode: str,
+    messages: List[str],
+    remix_attempts: List[Dict[str, Any]],
+    review_candidate_registry: List[Dict[str, Any]],
+    retry_budget: int | None = None,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Search bounded component-local contraction for a pure large-PSF failure."""
+    if not _stage9_is_psf_large_only_failure(pipeline, parent_quality):
+        return parent_quality, parent_context
+    retry_max = _stage9_targeted_recovery_retry_max(pipeline)
+    if retry_budget is not None:
+        retry_max = min(retry_max, max(0, int(retry_budget)))
+    target_groups = _stage9_psf_contraction_target_groups(
+        pipeline,
+        parent_quality,
+    )
+    stars = parent_context.get("stars", parent_context.get("unscreen_stars"))
+    support = parent_context.get("support_mask")
+    weak_mask = parent_context.get("weak_mask")
+    bright_mask = parent_context.get("bright_mask")
+    parent_starmask = str(parent_context.get("starmask") or "")
+    catalog = getattr(pipeline, "_stage9_star_reference_catalog", None)
+    if (
+        retry_max <= 0
+        or not target_groups
+        or stars is None
+        or support is None
+        or not parent_starmask
+        or not isinstance(catalog, dict)
+        or catalog.get("status") != "ok"
+    ):
+        return parent_quality, parent_context
+
+    parent_checkpoint = (
+        f"stage9_candidate_{support_mode}_"
+        f"{len(remix_attempts):03d}_psf_contraction_parent"
+    )
+    if not pipeline._save_stage_output(parent_checkpoint):
+        messages.append(
+            "Stage9 skipped PSF contraction because the immutable parent "
+            "checkpoint could not be saved"
+        )
+        return parent_quality, parent_context
+    parent_state = _capture_stage9_candidate_state(pipeline)
+    immutable_parent_stars = np.array(stars, copy=True)
+    low_gamma = 1.0
+    high_gamma = 2.5
+    best: Dict[str, Any] | None = None
+    comparisons: List[Dict[str, Any]] = []
+    parent_attempt = str(parent_quality.get("attempt") or "unknown")
+
+    for _retry in range(retry_max):
+        gamma = 0.5 * (low_gamma + high_gamma)
+        contracted, contraction_report = (
+            stage9_quality.contract_star_layer_components(
+                immutable_parent_stars,
+                catalog,
+                support_mask=np.asarray(support),
+                weak_mask=(
+                    None if weak_mask is None else np.asarray(weak_mask)
+                ),
+                bright_mask=(
+                    None if bright_mask is None else np.asarray(bright_mask)
+                ),
+                target_groups=target_groups,
+                gamma=gamma,
+            )
+        )
+        suffix = int(round(gamma * 1000.0))
+        attempt_name = f"{parent_attempt}_psf_contract_{suffix:04d}"
+        output_name = f"starmask_{support_mode}_psf_contract_{suffix:04d}"
+        if contracted is None or not bool(
+            contraction_report.get("changed", False)
+        ):
+            comparisons.append(
+                {
+                    "attempt": attempt_name,
+                    "gamma": gamma,
+                    "target_groups": list(target_groups),
+                    "accepted": False,
+                    "status": str(
+                        contraction_report.get("status") or "unavailable"
+                    ),
+                    "issues": [
+                        str(
+                            contraction_report.get("reason")
+                            or "component contraction made no safe change"
+                        )
+                    ],
+                    "fwhm_ratios": {},
+                    "contraction": contraction_report,
+                }
+            )
+            break
+        saved = _save_stage9_candidate_star_layer(
+            pipeline,
+            source_starmask=parent_starmask,
+            output_name=output_name,
+            stars=np.asarray(contracted),
+            support_mask=np.asarray(support),
+            weak_mask=(None if weak_mask is None else np.asarray(weak_mask)),
+            bright_mask=(
+                None if bright_mask is None else np.asarray(bright_mask)
+            ),
+            label="Stage9 component-local PSF contraction star layer",
+        )
+        applied = bool(
+            saved
+            and pipeline._apply_previous_stage_star_remix(
+                source_stem,
+                output_name,
+                intensity,
+            )
+        )
+        quality = (
+            _assess_stage9_candidate(
+                pipeline,
+                source_stem,
+                attempt=attempt_name,
+                formula="screen",
+            )
+            if applied
+            else {
+                "attempt": attempt_name,
+                "formula": "screen",
+                "status": "failed",
+                "accepted": False,
+                "issues": ["component PSF contraction remix execution failed"],
+                "metrics": {},
+            }
+        )
+        quality.update(
+            intensity=intensity,
+            starmask=output_name,
+            support_mode=support_mode,
+            support_starmask=parent_context.get(
+                "support_starmask",
+                parent_starmask,
+            ),
+            parent_attempt=parent_attempt,
+            base_source_stem=source_stem,
+            recovery_kind="group_component_psf_contraction",
+            recovery_strength=gamma,
+            recovery_target_groups=list(target_groups),
+            psf_contraction=contraction_report,
+            decomposition_method=(
+                str(parent_quality.get("decomposition_method") or "screen")
+                + "_component_psf_contraction"
+            ),
+        )
+        candidate_context = {
+            **parent_context,
+            "stars": contracted,
+            "unscreen_stars": contracted,
+            "starmask": output_name,
+            "psf_contraction": contraction_report,
+        }
+        if all(
+            key in parent_context
+            for key in ("original_display", "starless_display")
+        ):
+            quality["reference_fidelity"] = _stage9_reference_fidelity(
+                pipeline,
+                candidate_context,
+                np.asarray(contracted),
+                intensity,
+                {
+                    "alpha_mask": support,
+                    "weak_mask": weak_mask,
+                    "bright_mask": bright_mask,
+                },
+            )
+        _stage9_consider_review_candidate(
+            pipeline,
+            quality,
+            attempt_order=len(remix_attempts),
+            registry=review_candidate_registry,
+            messages=messages,
+        )
+        remix_attempts.append(copy.deepcopy(quality))
+        ratios = _stage9_psf_group_ratios(quality)
+        comparison = {
+            "attempt": attempt_name,
+            "gamma": gamma,
+            "target_groups": list(target_groups),
+            "accepted": bool(quality.get("accepted", False)),
+            "status": str(quality.get("status") or "unknown"),
+            "issues": list(quality.get("issues") or []),
+            "fwhm_ratios": ratios,
+            "contraction": contraction_report,
+        }
+        comparisons.append(comparison)
+        quality["psf_contraction_candidate_comparison"] = copy.deepcopy(
+            comparisons
+        )
+        if bool(quality.get("accepted", False)):
+            checkpoint = (
+                f"stage9_candidate_{support_mode}_psf_contract_{suffix:04d}"
+            )
+            target_values = [
+                ratios[group]
+                for group in target_groups
+                if group in ratios
+            ]
+            if not target_values and "all" in ratios:
+                target_values = [ratios["all"]]
+            psf_error = (
+                max(abs(value - 1.0) for value in target_values)
+                if target_values
+                else float("inf")
+            )
+            mean_error = (
+                float(np.mean([abs(value - 1.0) for value in target_values]))
+                if target_values
+                else float("inf")
+            )
+            if pipeline._save_stage_output(checkpoint):
+                record = {
+                    "quality": quality,
+                    "context": candidate_context,
+                    "checkpoint": checkpoint,
+                    "state": _capture_stage9_candidate_state(pipeline),
+                    "score": (
+                        psf_error,
+                        mean_error,
+                        *_stage9_formal_candidate_score(
+                            quality,
+                            support_mode=support_mode,
+                        ),
+                        gamma,
+                    ),
+                }
+                if best is None or record["score"] < best["score"]:
+                    best = record
+
+        target_values = [
+            ratios[group] for group in target_groups if group in ratios
+        ]
+        if not target_values and "all" in ratios:
+            target_values = [ratios["all"]]
+        if target_values:
+            if float(np.median(target_values)) > 1.0:
+                low_gamma = gamma
+            else:
+                high_gamma = gamma
+        else:
+            direction = _stage9_psf_size_direction(quality)
+            if direction == "large":
+                low_gamma = gamma
+            elif direction == "small":
+                high_gamma = gamma
+            else:
+                break
+        if not bool(quality.get("accepted", False)) and (
+            _stage9_psf_size_direction(quality) not in {"large", "small"}
+        ):
+            break
+
+    if best is None:
+        _restore_stage9_candidate_state(
+            pipeline,
+            parent_state,
+            checkpoint_stem=parent_checkpoint,
+        )
+        parent_quality["psf_contraction_candidate_comparison"] = comparisons
+        parent_quality["psf_contraction_rollback"] = {
+            "performed": True,
+            "restored": "immutable_parent",
+            "selected": False,
+        }
+        messages.append(
+            "Stage9 PSF contraction candidates were rejected; restored the "
+            f"exact immutable parent attempt={parent_attempt}"
+        )
+        return parent_quality, parent_context
+
+    _restore_stage9_candidate_state(
+        pipeline,
+        best["state"],
+        checkpoint_stem=str(best["checkpoint"]),
+    )
+    selected_quality = best["quality"]
+    selected_quality["psf_contraction_candidate_comparison"] = comparisons
+    selected_quality["psf_contraction_rollback"] = {
+        "performed": False,
+        "restored": "selected_candidate_checkpoint",
+        "selected": True,
+    }
+    selected_quality.setdefault("reason_codes", []).append(
+        "stage9_component_psf_contraction_selected"
+    )
+    messages.append(
+        "Stage9 selected component-local PSF contraction after all formal "
+        f"gates (groups={','.join(target_groups)}, gamma="
+        f"{float(selected_quality.get('recovery_strength', 1.0)):.4f})"
+    )
+    return selected_quality, best["context"]
+
+
 def _stage9_targeted_unscreen_competition(
     pipeline,
     *,
@@ -6165,6 +7044,24 @@ def _stage9_targeted_unscreen_competition(
             targeted_attempt_budget
             - (len(remix_attempts) - targeted_attempt_start),
         )
+        contraction_attempt_start = len(remix_attempts)
+        quality, context = _stage9_targeted_psf_contraction(
+            pipeline,
+            source_stem=source_stem,
+            parent_quality=quality,
+            parent_context=context,
+            intensity=intensity,
+            support_mode=support_mode,
+            messages=messages,
+            remix_attempts=remix_attempts,
+            review_candidate_registry=review_candidate_registry,
+            retry_budget=targeted_attempt_budget,
+        )
+        targeted_attempt_budget = max(
+            0,
+            targeted_attempt_budget
+            - (len(remix_attempts) - contraction_attempt_start),
+        )
         quality, context = _stage9_targeted_local_chroma_recovery(
             pipeline,
             source_stem=source_stem,
@@ -6258,6 +7155,7 @@ def _stage9_targeted_unscreen_competition(
         or (primary_support_results[0].get("starmask") if primary_support_results else "")
     )
     selected_family = "screen"
+    selected_context: Dict[str, Any] | None = None
     selected_context_report: Dict[str, Any] | None = None
     if selected_record is not None:
         checkpoint = str(selected_record.get("checkpoint") or "")
@@ -6275,7 +7173,44 @@ def _stage9_targeted_unscreen_competition(
             )
             context = selected_record.get("context")
             if isinstance(context, dict):
-                selected_context_report = _stage9_unscreen_context_report(context)
+                selected_context = context
+                selected_context_report = _stage9_unscreen_context_report(
+                    selected_context
+                )
+
+    if (
+        selected_family == "unscreen"
+        and isinstance(selected_quality, dict)
+        and isinstance(selected_context, dict)
+        and bool(selected_quality.get("accepted", False))
+    ):
+        support_comparison = selected_quality.get(
+            "comparison_to_support_screen"
+        )
+        selected_quality, selected_context = (
+            _stage9_extend_rescue_with_source_presence(
+                pipeline,
+                source_stem=source_stem,
+                accepted_context=selected_context,
+                accepted_quality=selected_quality,
+                intensity=float(selected_quality.get("intensity", 1.0) or 1.0),
+                messages=messages,
+                remix_attempts=remix_attempts,
+            )
+        )
+        if support_comparison is not None:
+            selected_quality.setdefault(
+                "comparison_to_support_screen",
+                support_comparison,
+            )
+        selected_starmask = str(
+            selected_quality.get("starmask")
+            or selected_context.get("starmask")
+            or selected_starmask
+        )
+        selected_context_report = _stage9_unscreen_context_report(
+            selected_context
+        )
 
     aggregate_report = dict(
         selected_context_report
@@ -7099,12 +8034,25 @@ def run_stage9_star_remixing(pipeline) -> None:
     pipeline._stage9_remix_formally_accepted = False
     pipeline._stage9_star_delivery_contract_accepted = False
     pipeline._stage9_review_candidate_selected = False
+    pipeline._stage9_persisted_output_validation = {
+        "schema": "starun.stage9-persisted-output-validation.v1",
+        "status": "not_run",
+        "accepted": False,
+        "reason_code": "stage9_persisted_output_validation_not_run",
+    }
     pipeline._stage9_spatial_scale_review_required = False
     pipeline._stage9_spatial_scale = {
         "schema": "starun.stage9-fwhm-spatial-scale.v1",
         "status": "not_run",
         "reason_code": "stage9_spatial_scale_not_run",
         "anchor_fwhm_px": 4.0,
+    }
+    pipeline._stage9_scaled_catalog_validation = {
+        "schema": "starun.stage9-scaled-catalog-validation.v1",
+        "status": "not_run",
+        "scale_status": "not_run",
+        "selected_route": None,
+        "reason": "Stage9 star reference was not prepared",
     }
     pipeline._stage9_starmask_stretch_failed = False
     pipeline._stage9_starmask_preparation_failed = False
@@ -7115,7 +8063,7 @@ def run_stage9_star_remixing(pipeline) -> None:
     pipeline._stage9_last_star_layer = None
     pipeline._stage9_candidate_overlay_masks = {}
     pipeline._stage9_starmask_support_preflight = {
-        "schema": "starun.stage9-starmask_support_preflight.v1",
+        "schema": "starun.stage9-starmask-support-preflight.v2",
         "status": "not_run",
         "strategy": "adaptive_dual_route",
         "route": "unavailable",
@@ -7888,6 +8836,22 @@ def run_stage9_star_remixing(pipeline) -> None:
     if composer_used and selected_remix is not None:
         psf_review_required = update_psf_review_requirement(selected_remix)
         remix_saved = pipeline._save_stage_output("stage9_remixed")
+        composer_failure_reason = "starcomposer_save_failed"
+        if remix_saved:
+            persisted_validation = _validate_stage9_persisted_output(
+                pipeline,
+                source_stem,
+                selected_remix,
+            )
+            remix_saved = bool(persisted_validation.get("accepted", False))
+            if not remix_saved:
+                composer_failure_reason = (
+                    "stage9_persisted_output_validation_failed"
+                )
+                messages.append(
+                    "Stage9 rejected persisted StarComposer output after reload; "
+                    "routing to the existing with-stars review fallback"
+                )
         stage_saved = remix_saved
         pipeline._stage9_stars_applied = bool(remix_saved)
         pipeline._stage9_output_contains_stars = bool(remix_saved)
@@ -7898,6 +8862,7 @@ def run_stage9_star_remixing(pipeline) -> None:
         pipeline._stage9_final_source = (
             "stage9_remixed" if remix_saved else source_stem
         )
+        _update_stage9_star_delivery_contract(pipeline)
         report_source = source_stem
         report_mode = "starcomposer"
         report_selected = selected_remix
@@ -7919,7 +8884,7 @@ def run_stage9_star_remixing(pipeline) -> None:
                         pipeline,
                         messages,
                         remix_attempts,
-                        trigger_reason="starcomposer_save_failed",
+                        trigger_reason=composer_failure_reason,
                         stage8_source_stem=stage8_fallback_base,
                         raw_starmask_stem=str(
                             getattr(
@@ -7940,9 +8905,9 @@ def run_stage9_star_remixing(pipeline) -> None:
             else:
                 fallback_saved, fallback_source = (
                     _stage9_preserve_with_stars_review_output(
-                        pipeline,
-                        messages,
-                        reason="starcomposer_save_failed",
+                    pipeline,
+                    messages,
+                    reason=composer_failure_reason,
                     )
                 )
                 stage_saved = fallback_saved
@@ -8118,6 +9083,14 @@ def run_stage9_star_remixing(pipeline) -> None:
         and getattr(pipeline.cfg, "stage9_targeted_recovery_enabled", True)
     )
     calibrations = dict(support_preflight.get("_calibrations") or {})
+    normal_summary = (
+        ((support_preflight.get("candidates") or {}).get("normal") or {})
+    )
+    normal_stretch_source = str(
+        normal_summary.get("stretch_source")
+        or support_preflight.get("selected_stretch_source")
+        or "builtin_calibrated"
+    )
     planned_support_modes = {
         "normal_only": ("normal",),
         "strict_only": ("strict_compact",),
@@ -8163,6 +9136,7 @@ def run_stage9_star_remixing(pipeline) -> None:
                 support_mode == "normal"
                 and star_stretch_used
                 and not reference_degraded
+                and normal_stretch_source == "plugin_stretched"
             ),
             messages=messages,
             strict_support=strict_support,
@@ -8182,6 +9156,11 @@ def run_stage9_star_remixing(pipeline) -> None:
         )
         preparation_record = {
             "support_mode": support_mode,
+            "stretch_source": (
+                normal_stretch_source
+                if support_mode == "normal"
+                else "builtin_calibrated"
+            ),
             "output_stem": output_name,
             "status": "ready" if prepared else "failed",
             "calibration_status": preparation_status,
@@ -8487,6 +9466,27 @@ def run_stage9_star_remixing(pipeline) -> None:
                 "support_mode": support_mode,
                 "support_starmask": candidate_starmask,
             }
+            targeted_attempt_start = len(remix_attempts)
+            targeted_attempt_budget = _stage9_targeted_recovery_retry_max(
+                pipeline
+            )
+            quality, parent_context = _stage9_targeted_psf_contraction(
+                pipeline,
+                source_stem=source_stem,
+                parent_quality=quality,
+                parent_context=parent_context,
+                intensity=primary_intensity,
+                support_mode=support_mode,
+                messages=messages,
+                remix_attempts=remix_attempts,
+                review_candidate_registry=review_candidate_registry,
+                retry_budget=targeted_attempt_budget,
+            )
+            targeted_attempt_budget = max(
+                0,
+                targeted_attempt_budget
+                - (len(remix_attempts) - targeted_attempt_start),
+            )
             quality, parent_context = _stage9_targeted_local_chroma_recovery(
                 pipeline,
                 source_stem=source_stem,
@@ -8497,6 +9497,7 @@ def run_stage9_star_remixing(pipeline) -> None:
                 messages=messages,
                 remix_attempts=remix_attempts,
                 review_candidate_registry=review_candidate_registry,
+                retry_budget=targeted_attempt_budget,
             )
             candidate_starmask = str(
                 parent_context.get("starmask")
@@ -9603,6 +10604,22 @@ def run_stage9_star_remixing(pipeline) -> None:
 
     psf_review_required = update_psf_review_requirement(selected_remix)
     remix_saved = pipeline._save_stage_output("stage9_remixed")
+    screen_failure_reason = "screen_save_failed"
+    if remix_saved:
+        persisted_validation = _validate_stage9_persisted_output(
+            pipeline,
+            source_stem,
+            selected_remix,
+        )
+        remix_saved = bool(persisted_validation.get("accepted", False))
+        if not remix_saved:
+            screen_failure_reason = (
+                "stage9_persisted_output_validation_failed"
+            )
+            messages.append(
+                "Stage9 rejected stage9_remixed after persisted reload quality "
+                "and catalog-star validation; using the with-stars review path"
+            )
     stage_saved = remix_saved
     pipeline._stage9_stars_applied = bool(remix_saved)
     pipeline._stage9_output_contains_stars = bool(remix_saved)
@@ -9613,6 +10630,7 @@ def run_stage9_star_remixing(pipeline) -> None:
     pipeline._stage9_final_source = (
         "stage9_remixed" if remix_saved else source_stem
     )
+    _update_stage9_star_delivery_contract(pipeline)
     report_source = source_stem
     report_mode = "screen"
     report_selected = selected_remix
@@ -9634,7 +10652,7 @@ def run_stage9_star_remixing(pipeline) -> None:
                     pipeline,
                     messages,
                     remix_attempts,
-                    trigger_reason="screen_save_failed",
+                    trigger_reason=screen_failure_reason,
                     stage8_source_stem=stage8_fallback_base,
                     raw_starmask_stem=str(
                         getattr(pipeline, "_stage9_raw_starmask_stem", "")
@@ -9653,7 +10671,7 @@ def run_stage9_star_remixing(pipeline) -> None:
                 _stage9_preserve_with_stars_review_output(
                     pipeline,
                     messages,
-                    reason="screen_save_failed",
+                    reason=screen_failure_reason,
                 )
             )
             stage_saved = fallback_saved

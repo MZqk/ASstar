@@ -108,6 +108,7 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "STARUN_STAGE4_AUTO_GEOMETRY_SCALE_RESIDUAL_MAX",
         "STARUN_STAGE4_SPCC_TIMEOUT_SEC",
         "STARUN_STAGE4_SPCC_ONLINE_UNVERIFIED_TIMEOUT_SEC",
+        "STARUN_STAGE4_SPCC_ONLINE_CIRCUIT_OPEN",
         "STARUN_STAGE4_SPCC_OSC_SENSOR",
         "STARUN_STAGE4_SPCC_OSC_FILTER",
         "STARUN_STAGE4_SPCC_WHITE_REF",
@@ -297,15 +298,66 @@ def _safe_output_token(value: Any, *, fallback: str = "") -> str:
     return token or fallback
 
 
+_UNRESOLVED_METADATA_TOKEN = re.compile(
+    r"\$[^$]*\$|%(?:[-+0-9.# ]*)[sdf]",
+    flags=re.IGNORECASE,
+)
+_PLACEHOLDER_METADATA_VALUES = frozenset(
+    {"unknown", "null", "none", "n/a", "na", "unset", "undefined"}
+)
+
+
+def _resolved_metadata_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if (
+        not text
+        or text.lower() in _PLACEHOLDER_METADATA_VALUES
+        or _UNRESOLVED_METADATA_TOKEN.search(text)
+    ):
+        return ""
+    return text
+
+
+def _validated_output_metadata(
+    metadata: Dict[str, Any],
+) -> Tuple[Dict[str, Any], List[str]]:
+    validated: Dict[str, Any] = {}
+    invalid: List[str] = []
+    object_text = _resolved_metadata_text(metadata.get("OBJECT"))
+    if object_text:
+        validated["OBJECT"] = object_text
+    else:
+        invalid.append("OBJECT")
+    for key, integer_only in (("STACKCNT", True), ("EXPTIME", False)):
+        try:
+            numeric = float(metadata.get(key))
+        except (TypeError, ValueError):
+            numeric = float("nan")
+        if math.isfinite(numeric) and numeric > 0.0:
+            validated[key] = int(numeric) if integer_only else numeric
+        else:
+            invalid.append(key)
+    date_text = _resolved_metadata_text(metadata.get("DATE-OBS"))
+    date_digits = re.sub(r"[^0-9]+", "", date_text)
+    if len(date_digits) >= 8:
+        validated["DATE-OBS"] = date_text
+    else:
+        invalid.append("DATE-OBS")
+    return validated, invalid
+
+
 def _partial_metadata_output_basename(
     metadata: Dict[str, Any],
     *,
     linear_resume: bool,
+    identity_fallback: str = "",
 ) -> str:
     """Build a useful literal filename when Siril's full template cannot resolve."""
-    object_token = _safe_output_token(metadata.get("OBJECT"))
+    object_token = _safe_output_token(
+        metadata.get("OBJECT") or identity_fallback
+    )
     date_digits = re.sub(r"[^0-9]+", "", str(metadata.get("DATE-OBS") or ""))
-    if not object_token or len(date_digits) < 8:
+    if not object_token:
         return ""
 
     parts = [object_token]
@@ -324,10 +376,12 @@ def _partial_metadata_output_basename(
         exposure_token = f"{exposure:g}".replace(".", "p")
         parts.append(f"{exposure_token}sec")
 
-    date_token = date_digits[:8]
-    if len(date_digits) >= 14:
-        date_token += f"_{date_digits[8:14]}"
-    parts.extend((date_token, "processed"))
+    if len(date_digits) >= 8:
+        date_token = date_digits[:8]
+        if len(date_digits) >= 14:
+            date_token += f"_{date_digits[8:14]}"
+        parts.append(date_token)
+    parts.append("processed")
     base = "_".join(parts)
     return f"{base}_linear" if linear_resume else base
 
@@ -802,14 +856,42 @@ class ProcessorRuntimeMixin:
             "stage2_corrected",
             getattr(self, "source_file", None),
         )
-        required_keys = ("OBJECT", "STACKCNT", "EXPTIME", "DATE-OBS")
-        missing_keys = [
-            key for key in required_keys if not str(metadata.get(key, "")).strip()
-        ]
-        if missing_keys:
+        validated_metadata, invalid_keys = _validated_output_metadata(metadata)
+        identity_fallback = ""
+        profile = getattr(self, "target_profile", {}) or {}
+        if isinstance(profile, dict):
+            primary = profile.get("primary_target")
+            primary = primary if isinstance(primary, dict) else {}
+            try:
+                primary_confidence = float(
+                    primary.get("confidence", profile.get("target_confidence", 0.0))
+                    or 0.0
+                )
+            except (TypeError, ValueError):
+                primary_confidence = 0.0
+            if primary_confidence >= 0.90:
+                identity_fallback = _resolved_metadata_text(primary.get("name"))
+            if not identity_fallback:
+                try:
+                    profile_confidence = float(
+                        profile.get("target_confidence", 0.0) or 0.0
+                    )
+                except (TypeError, ValueError):
+                    profile_confidence = 0.0
+                if profile_confidence >= 0.90:
+                    identity_fallback = _resolved_metadata_text(
+                        profile.get("target_name_guess")
+                    )
+        if not identity_fallback:
+            source_file = getattr(self, "source_file", None)
+            if source_file:
+                identity_fallback = _resolved_metadata_text(Path(source_file).stem)
+
+        if invalid_keys:
             partial_base = _partial_metadata_output_basename(
-                metadata,
+                validated_metadata,
                 linear_resume=linear_resume,
+                identity_fallback=identity_fallback,
             )
             if partial_base:
                 base_filename = partial_base
@@ -817,7 +899,7 @@ class ProcessorRuntimeMixin:
                 self.log.warn(
                     "输出命名所需 FITS 头不完整，使用已有目标元数据生成安全名称，"
                     "避免未解析占位符和通用结果名覆盖: "
-                    + ", ".join(missing_keys)
+                    + ", ".join(invalid_keys)
                 )
             else:
                 base_filename = fallback_base
@@ -825,7 +907,7 @@ class ProcessorRuntimeMixin:
                 self.log.warn(
                     "输出命名所需 FITS 头缺失，使用安全回退名，避免输出 "
                     "$OBJECT/$STACKCNT 等未解析占位符: "
-                    + ", ".join(missing_keys)
+                    + ", ".join(invalid_keys)
                 )
         else:
             base_filename = RESULT_BASENAME_TEMPLATE

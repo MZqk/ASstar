@@ -19,6 +19,7 @@ from gui.task_intake import (  # noqa: E402
     describe_input_plan,
     discover_input_for_processing_settings,
     prepare_task_queue,
+    stage4_online_spcc_timeout_detected,
     stage_config_from_processing_settings,
 )
 from pipeline import run_manifest, task_plan  # noqa: E402
@@ -251,6 +252,75 @@ class GuiTaskIntakeTests(unittest.TestCase):
             frozen_parameters[0]["stages"]["5"]["overrides"]["stage5_rl_maxstars"],
             1000,
         )
+
+    def test_exact_duplicate_source_and_processing_is_skipped_in_new_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "capture"
+            source = root / "Light.fit"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"same-light")
+            duplicate_group = LightGroup(
+                key="same",
+                target="M45",
+                filter_name="Seestar LP",
+                camera="Seestar S50",
+                geometry="1080x1920@1x1",
+                files=(source,),
+                total_bytes=source.stat().st_size,
+            )
+            groups = (duplicate_group, duplicate_group)
+            discovery = InputDiscovery(
+                selected_path=root.resolve(),
+                source_root=root.resolve(),
+                kind=InputKind.LIGHT_DIRECTORY,
+                trust=DiscoveryTrust.RECOGNIZED,
+                summary="duplicate groups",
+                light_groups=groups,
+            )
+
+            queue = prepare_task_queue(
+                discovery,
+                processing_settings=SETTINGS,
+                now=datetime(2026, 8, 4, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual(len(queue.tasks), 1)
+        self.assertEqual(len(queue.skipped_duplicates), 1)
+        self.assertEqual(
+            queue.skipped_duplicates[0]["reason_code"],
+            "exact_source_and_processing_duplicate",
+        )
+
+    def test_online_spcc_timeout_detection_ignores_localgaia_and_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_root = Path(td)
+            report = run_root / "process" / "color_calibration_report.json"
+            report.parent.mkdir()
+            cases = (
+                ("timeout", "catalog:gaia", "online_unverified", True),
+                ("failed", "catalog:gaia", "online_unverified", False),
+                ("timeout", "catalog:localgaia", "local_verified", False),
+            )
+            for status, label, readiness, expected in cases:
+                with self.subTest(status=status, label=label):
+                    run_manifest.atomic_write_json(
+                        report,
+                        {
+                            "spcc": {
+                                "attempts": [
+                                    {
+                                        "status": status,
+                                        "label": label,
+                                        "spcc_readiness": readiness,
+                                    }
+                                ]
+                            }
+                        },
+                    )
+                    self.assertEqual(
+                        stage4_online_spcc_timeout_detected(run_root),
+                        expected,
+                    )
 
     def test_product_task_selects_latest_checkpoint_compatible_with_settings(self) -> None:
         with tempfile.TemporaryDirectory() as td:

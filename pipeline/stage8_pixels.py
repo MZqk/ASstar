@@ -495,6 +495,7 @@ def build_signal_excluded_background_masks(
             np.asarray(masks["gray"], dtype=np.float32),
             float(masks.get("bg_median", 0.0) or 0.0),
             float(masks.get("bg_std", 0.0) or 0.0),
+            pipeline.cfg,
         )
         galaxy_report.update(
             {
@@ -2206,6 +2207,7 @@ def apply_stage8_masked_pixel_enhancement(
         )
 
     saturation = _clamp_float(plan.get("saturation", pipeline.cfg.nebula_saturation), 0.0, 0.65)
+    structure_scale = 1.0
     unsharp_amount = min(
         _clamp_float(plan.get("unsharp_amount", 0.35), 0.0, 0.60),
         float(pipeline.cfg.stage8_masked_unsharp_amount_max),
@@ -2217,18 +2219,21 @@ def apply_stage8_masked_pixel_enhancement(
     if masks["bg_std"] > pipeline.cfg.stage7_bg_std_high:
         unsharp_amount *= 0.40
         saturation *= 0.72
+        structure_scale *= 0.72
         messages.append(f"{label} stage8 high-bg-noise guard reduced saturation/detail")
 
     if object_mask_only:
         if high_halo_risk:
             saturation = min(saturation, 0.05)
         saturation *= 0.82
+        structure_scale *= 0.82
         unsharp_amount *= 0.70
         mask_quality_scale = 0.85
         messages.append(f"{label} stage8 bright-nebula object-mask-only mode")
         if mask_signal_coverage < 0.015:
             mask_quality_scale = 0.45
             saturation *= 0.55
+            structure_scale *= 0.55
             unsharp_amount *= 0.40
             messages.append(
                 f"{label} stage8 low mask coverage reduced enhancement "
@@ -2240,6 +2245,7 @@ def apply_stage8_masked_pixel_enhancement(
             saturation,
             float(getattr(pipeline.cfg, "stage8_limited_saturation_max", 0.05)),
         )
+        structure_scale = 0.0
         unsharp_amount = 0.0
         messages.append(
             f"{label} stage8 limited weak-signal-only mode "
@@ -2260,8 +2266,16 @@ def apply_stage8_masked_pixel_enhancement(
     )
     if not bool(getattr(pipeline.cfg, "stage8_background_denoise_enabled", True)):
         denoise_strength = 0.0
-    faint_boost = min(float(pipeline.cfg.stage8_faint_nebula_boost_max), 0.20 * saturation) * mask_quality_scale
-    contrast_strength = min(float(pipeline.cfg.stage8_nebula_contrast_max), 0.28 * saturation) * mask_quality_scale
+    faint_boost = (
+        float(pipeline.cfg.stage8_faint_nebula_boost_max)
+        * structure_scale
+        * mask_quality_scale
+    )
+    contrast_strength = (
+        float(pipeline.cfg.stage8_nebula_contrast_max)
+        * structure_scale
+        * mask_quality_scale
+    )
     if not bool(getattr(pipeline.cfg, "stage8_faint_nebula_boost_enabled", True)):
         faint_boost = 0.0
     if not bool(getattr(pipeline.cfg, "stage8_nebula_contrast_enabled", True)):
@@ -2631,11 +2645,19 @@ def apply_stage8_masked_pixel_enhancement(
                 else "none"
             ),
         },
+        "structure_execution": {
+            "source": "independent_stage8_limits",
+            "scale": float(structure_scale),
+            "faint_nebula_boost": float(faint_boost),
+            "nebula_contrast": float(contrast_strength),
+            "independent_from_saturation": True,
+        },
         "processing_scope": processing_scope,
     }
     messages.append(
         f"{label} masked Starless enhancement "
-        f"(sat={saturation:.3f}, faint={faint_boost:.3f}, "
+        f"(sat={saturation:.3f}, structure_scale={structure_scale:.3f}, "
+        f"faint={faint_boost:.3f}, "
         f"contrast={contrast_strength:.3f}, unsharp={unsharp_amount:.3f})"
     )
     return restored, diagnostics, messages

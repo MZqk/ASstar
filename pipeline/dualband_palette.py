@@ -14,7 +14,7 @@ from typing import Any, Dict, Mapping, Optional
 import numpy as np
 
 
-DUALBAND_PALETTE_SCHEMA = "starun.stage8-dualband-palette.v1"
+DUALBAND_PALETTE_SCHEMA = "starun.stage8-dualband-palette.v2"
 DUALBAND_PALETTE_SOURCE = {
     "script": "Hubble_Palette_from_Dual-Band_OSC.py",
     "upstream_version": "2.0.4",
@@ -305,6 +305,12 @@ def _luminance(rgb: np.ndarray) -> np.ndarray:
     ).astype(np.float32)
 
 
+def _saturation_proxy(rgb: np.ndarray) -> np.ndarray:
+    maximum = np.max(rgb, axis=0)
+    minimum = np.min(rgb, axis=0)
+    return (maximum - minimum) / np.maximum(maximum, 1e-6)
+
+
 def _luminance_preserving_gamut_map(
     mapped: np.ndarray,
     base: np.ndarray,
@@ -471,10 +477,30 @@ def build_dualband_palette_candidate(
         else 0.0
     )
     subject_delta_p95 = float(np.quantile(delta[subject_support], 0.95))
-    subject_saturation = (
-        np.max(candidate[:, subject_support], axis=0)
-        - np.min(candidate[:, subject_support], axis=0)
-    ) / np.maximum(np.max(candidate[:, subject_support], axis=0), 1e-6)
+    base_saturation = _saturation_proxy(base)
+    candidate_saturation_map = _saturation_proxy(candidate)
+    subject_saturation_before = base_saturation[subject_support]
+    subject_saturation = candidate_saturation_map[subject_support]
+    if np.count_nonzero(background_support) >= 64:
+        background_saturation_before = base_saturation[background_support]
+        background_saturation_after = candidate_saturation_map[
+            background_support
+        ]
+        background_p50_before = float(
+            np.quantile(background_saturation_before, 0.50)
+        )
+        background_p50_after = float(
+            np.quantile(background_saturation_after, 0.50)
+        )
+    else:
+        background_p50_before = 0.0
+        background_p50_after = 0.0
+    subject_p50_before = float(
+        np.quantile(subject_saturation_before, 0.50)
+    )
+    subject_p50_after = float(np.quantile(subject_saturation, 0.50))
+    separation_before = subject_p50_before - background_p50_before
+    separation_after = subject_p50_after - background_p50_after
     metrics = {
         "subject_mask_coverage": float(np.mean(subject_support)),
         "background_mask_coverage": float(np.mean(background_support)),
@@ -484,6 +510,18 @@ def build_dualband_palette_candidate(
         "background_change_p95": background_delta_p95,
         "subject_change_p95": subject_delta_p95,
         "subject_saturation_p95": float(np.quantile(subject_saturation, 0.95)),
+        "subject_saturation_p50_before": subject_p50_before,
+        "subject_saturation_p50_after": subject_p50_after,
+        "subject_saturation_p50_gain": (
+            subject_p50_after - subject_p50_before
+        ),
+        "background_saturation_p50_before": background_p50_before,
+        "background_saturation_p50_after": background_p50_after,
+        "subject_background_chroma_separation_before": separation_before,
+        "subject_background_chroma_separation_after": separation_after,
+        "subject_background_chroma_separation_gain": (
+            separation_after - separation_before
+        ),
     }
     quality = evaluate_palette_quality_metrics(
         metrics,

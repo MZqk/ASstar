@@ -53,6 +53,18 @@ class PipelineImportContractTests(unittest.TestCase):
         )
 
 
+_REVIEW_STAR_COORDINATES = (
+    (8, 11),
+    (14, 104),
+    (20, 70),
+    (32, 116),
+    (44, 21),
+    (61, 42),
+    (72, 99),
+    (86, 48),
+)
+
+
 def _review_scene(height: int = 96, width: int = 128) -> np.ndarray:
     yy, xx = np.mgrid[:height, :width]
     nebula = np.exp(
@@ -69,9 +81,41 @@ def _review_scene(height: int = 96, width: int = 128) -> np.ndarray:
             0.021 + 0.30 * nebula,
         )
     ).astype(np.float32)
-    for y, x in ((8, 11), (20, 70), (44, 21), (72, 99), (86, 48)):
+    for y, x in _REVIEW_STAR_COORDINATES:
         image[:, y, x] = (0.95, 0.88, 0.82)
     return image
+
+
+def _review_star_visibility_contract() -> tuple[dict, object]:
+    count = len(_REVIEW_STAR_COORDINATES)
+    reference = {
+        "status": "ok",
+        "_source_peak_y": np.asarray(
+            [position[0] for position in _REVIEW_STAR_COORDINATES],
+            dtype=np.int32,
+        ),
+        "_source_peak_x": np.asarray(
+            [position[1] for position in _REVIEW_STAR_COORDINATES],
+            dtype=np.int32,
+        ),
+        "_weak_flags": np.asarray(
+            [True, True, True, True, False, False, False, False],
+            dtype=bool,
+        ),
+        "_reference_local_contrast": np.full(count, 0.50, dtype=np.float32),
+        "_stage9_visibility_inner_window_size_px": np.full(
+            count,
+            3,
+            dtype=np.int32,
+        ),
+        "_stage9_visibility_outer_window_size_px": np.full(
+            count,
+            7,
+            dtype=np.int32,
+        ),
+    }
+    config = types.SimpleNamespace(stage9_psf_min_sample_count=4)
+    return reference, config
 
 
 class LinkedReviewRenditionTests(unittest.TestCase):
@@ -118,10 +162,14 @@ class LinkedReviewRenditionTests(unittest.TestCase):
 
     def test_visible_source_selects_identity_contract(self):
         source = np.clip(_review_scene() * 0.72 + 0.14, 0.0, 1.0)
+        star_reference, star_config = _review_star_visibility_contract()
         visibility = audit_display_visibility(
             source,
             target_type="bright_emission_reflection_nebula",
             stars_required=True,
+            star_reference=star_reference,
+            pixel_coordinate_domain="siril_pixel_buffer_bottom_up",
+            star_visibility_config=star_config,
         )
         self.assertTrue(visibility["passed"], visibility)
         self.assertEqual(visibility["exposure_state"], "acceptable")
@@ -145,10 +193,14 @@ class LinkedReviewRenditionTests(unittest.TestCase):
 
     def test_underexposed_source_maps_once_to_target_median(self):
         source = _review_scene()
+        star_reference, star_config = _review_star_visibility_contract()
         visibility = audit_display_visibility(
             source,
             target_type="bright_emission_reflection_nebula",
             stars_required=True,
+            star_reference=star_reference,
+            pixel_coordinate_domain="siril_pixel_buffer_bottom_up",
+            star_visibility_config=star_config,
         )
         self.assertEqual(visibility["exposure_state"], "underexposed")
 
@@ -163,6 +215,9 @@ class LinkedReviewRenditionTests(unittest.TestCase):
             rendered,
             target_type="bright_emission_reflection_nebula",
             stars_required=True,
+            star_reference=star_reference,
+            pixel_coordinate_domain="siril_pixel_buffer_bottom_up",
+            star_visibility_config=star_config,
         )
 
         self.assertEqual(contract["mode"], "linked_visibility_v2")
@@ -291,6 +346,7 @@ class LinkedReviewRenditionTests(unittest.TestCase):
 
     def test_ui_and_managed_review_png_use_same_frozen_pixels(self):
         source = _review_scene()
+        star_reference, star_config = _review_star_visibility_contract()
         contract = display_rendition.build_linked_review_contract(
             source,
             reason="bright_core_starless_rejected_after_recovery",
@@ -312,6 +368,8 @@ class LinkedReviewRenditionTests(unittest.TestCase):
                 output_format="png",
                 target_type="bright_emission_reflection_nebula",
                 stars_required=True,
+                star_reference=star_reference,
+                star_visibility_config=star_config,
                 display_contract=contract,
             )
             review = create_image_review_bundle(

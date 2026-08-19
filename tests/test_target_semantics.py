@@ -52,6 +52,26 @@ class _Runtime(TargetRuntimeMixin):
 
 
 class TargetSemanticsTests(unittest.TestCase):
+    def test_signed_task_source_names_are_preserved_in_profile_context(self):
+        runtime = _Runtime()
+        runtime.source_file = Path("/tmp/task/process/working.fit")
+        runtime.work_dir = Path("/tmp/task")
+        runtime.process_dir = Path("/tmp/task/process")
+        runtime.input_dir = Path("/tmp/task/input")
+        runtime._task_run_manifest_payload = {
+            "source": {
+                "selected_path": "/captures/NGC-1579.xisf",
+                "files": [
+                    {"display_path": "NGC_1579/session1/Light_001.fit"}
+                ],
+            }
+        }
+
+        context = runtime._target_profile_context_text()
+
+        self.assertIn("/captures/NGC-1579.xisf", context)
+        self.assertIn("NGC_1579/session1/Light_001.fit", context)
+
     def test_frozen_cluster_primary_survives_later_nebula_observation(self):
         runtime = _Runtime()
         initial = {

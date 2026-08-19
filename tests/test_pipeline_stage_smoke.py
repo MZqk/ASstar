@@ -767,16 +767,21 @@ class PipelineStageTests(unittest.TestCase):
 
     def test_stage9_mottling_gate_ignores_low_absolute_compact_star_growth(self):
         cfg = PipelineConfig()
+        cfg.stage9_psf_min_sample_count = 4
         rng = np.random.default_rng(42)
         yy, xx = np.mgrid[:128, :128]
         base_gray = 0.04 + rng.normal(0.0, 0.0005, (128, 128))
         base = np.stack([base_gray, base_gray, base_gray]).astype(np.float32)
         stars = np.zeros_like(base)
         for center_y, center_x, amplitude in (
-            (24, 31, 0.25),
-            (45, 90, 0.40),
-            (76, 54, 0.18),
-            (102, 109, 0.30),
+            (16, 17, 0.12),
+            (24, 54, 0.16),
+            (38, 96, 0.20),
+            (55, 27, 0.24),
+            (68, 73, 0.30),
+            (84, 111, 0.34),
+            (102, 45, 0.38),
+            (112, 91, 0.42),
         ):
             profile = amplitude * np.exp(
                 -((xx - center_x) ** 2 + (yy - center_y) ** 2) / (2.0 * 1.2**2)
@@ -786,16 +791,23 @@ class PipelineStageTests(unittest.TestCase):
             )
         candidate = stage9_quality.screen_blend(base, stars, 1.0)
 
+        catalog = stage9_quality.build_star_reference_catalog(stars, cfg)
+        catalog["_weak_flags"] = np.asarray(
+            [True, True, True, True, False, False, False, False],
+            dtype=bool,
+        )
+        stage9_quality.enrich_star_reference_with_display_psf(
+            catalog,
+            candidate,
+            cfg,
+        )
         report = stage9_quality.assess_remix(
             base,
             candidate,
             cfg,
             attempt="compact_stars",
             formula="screen",
-            star_reference=stage9_quality.build_star_reference_catalog(
-                stars,
-                cfg,
-            ),
+            star_reference=catalog,
         )
 
         self.assertTrue(report["accepted"])
@@ -885,6 +897,18 @@ class PipelineStageTests(unittest.TestCase):
             stars,
             cfg,
             source_image=source,
+        )
+        component_peaks = np.asarray(
+            catalog["_component_peaks"],
+            dtype=np.float32,
+        )
+        bright_indices = np.argsort(component_peaks)[-4:]
+        catalog["_weak_flags"] = np.ones(component_peaks.size, dtype=bool)
+        catalog["_weak_flags"][bright_indices] = False
+        catalog["_reference_local_contrast"] = np.full(
+            component_peaks.size,
+            0.01,
+            dtype=np.float32,
         )
         plan = stage9_quality.calibrate_starmask_asinh(
             stars,
@@ -1184,9 +1208,13 @@ class PipelineStageTests(unittest.TestCase):
             formula="screen",
             star_reference=catalog,
         )
-        self.assertTrue(disabled_gate["accepted"])
+        self.assertFalse(disabled_gate["accepted"])
         self.assertFalse(disabled_gate["gate_enabled"])
         self.assertEqual(disabled_gate["metrics"]["star_recovery_ratio"], 0.0)
+        self.assertIn(
+            "catalog_star_visibility_unavailable",
+            " ".join(disabled_gate["issues"]),
+        )
 
     def test_stage9_gate_rejects_new_closed_hollow_structure(self):
         cfg = PipelineConfig()
@@ -1740,19 +1768,30 @@ class PipelineStageTests(unittest.TestCase):
             )
 
         normal_summary = measured["candidates"]["normal"]
+        plugin_summary = measured["candidates"]["plugin_normal"]
         self.assertEqual(measured["route"], "dual_competition")
         self.assertEqual(
             measured["reason_code"],
-            "stage9_support_preflight_output_adequacy_dual",
+            "stage9_plugin_starmask_output_inadequate_builtin_dual_fallback",
         )
         self.assertEqual(
             normal_summary["predicted_change_source"],
-            "actual_plugin_stretched_pixels",
+            "calibrated_builtin_stretch",
         )
         self.assertAlmostEqual(
             normal_summary["predicted_change_ratio"],
+            0.01,
+        )
+        self.assertEqual(
+            plugin_summary["predicted_change_source"],
+            "actual_plugin_stretched_pixels",
+        )
+        self.assertAlmostEqual(
+            plugin_summary["predicted_change_ratio"],
             0.10,
         )
+        self.assertFalse(plugin_summary["formal_eligible"])
+        self.assertEqual(measured["selected_stretch_source"], "builtin_calibrated")
         self.assertTrue(normal_summary["output_profile"]["accepted"])
 
         over_target_plugin = np.zeros_like(stars)
@@ -1767,8 +1806,8 @@ class PipelineStageTests(unittest.TestCase):
                 cfg,
                 plugin_stretched_stars=over_target_plugin,
             )
-        rejected_normal = output_rejected["candidates"]["normal"]
-        self.assertEqual(output_rejected["route"], "strict_only")
+        rejected_normal = output_rejected["candidates"]["plugin_normal"]
+        self.assertEqual(output_rejected["route"], "dual_competition")
         self.assertTrue(
             rejected_normal["gates"]["starmask_output_targets"]["hard_failed"]
         )
@@ -1804,7 +1843,7 @@ class PipelineStageTests(unittest.TestCase):
             )
         self.assertEqual(plugin_advisory["route"], "dual_competition")
         self.assertEqual(
-            plugin_advisory["candidates"]["normal"]["gates"][
+            plugin_advisory["candidates"]["plugin_normal"]["gates"][
                 "predicted_change_ratio"
             ]["status"],
             "advisory",
@@ -1831,7 +1870,7 @@ class PipelineStageTests(unittest.TestCase):
             )
         self.assertEqual(plugin_strict["route"], "strict_only")
         self.assertEqual(
-            plugin_strict["candidates"]["normal"][
+            plugin_strict["candidates"]["plugin_normal"][
                 "predicted_change_source"
             ],
             "actual_plugin_stretched_pixels",
@@ -1851,19 +1890,19 @@ class PipelineStageTests(unittest.TestCase):
                     ),
                 )
             )
-        unavailable_normal = unavailable_measurement["candidates"]["normal"]
+        unavailable_normal = unavailable_measurement["candidates"]["plugin_normal"]
         self.assertEqual(
             unavailable_normal["predicted_change_source"],
             "plugin_measurement_unavailable",
         )
         self.assertIsNone(unavailable_normal["predicted_change_ratio"])
         self.assertTrue(unavailable_normal["hard_failed"])
-        self.assertEqual(unavailable_measurement["route"], "strict_only")
+        self.assertEqual(unavailable_measurement["route"], "dual_competition")
 
     def test_stage9_support_preflight_public_report_strips_private_masks(self):
         public = stage9_quality.public_starmask_support_preflight(
             {
-                "schema": "starun.stage9-starmask_support_preflight.v1",
+                "schema": "starun.stage9-starmask-support-preflight.v2",
                 "status": "ready",
                 "route": "normal_only",
                 "_calibrations": {"normal": {"_compact_support_mask": np.ones((2, 2))}},
@@ -1874,16 +1913,25 @@ class PipelineStageTests(unittest.TestCase):
         json.dumps(public)
 
     def test_stage9_support_candidate_order_prefers_clean_psf_then_normal_tie(self):
-        def quality(*, ratio: float, advisory: bool = False) -> dict:
+        def quality(
+            *,
+            ratio: float,
+            advisory: bool = False,
+            uncertainty_exemption: bool = False,
+        ) -> dict:
             return {
                 "accepted": True,
                 "advisories": ["boundary"] if advisory else [],
                 "quality_gates": {},
                 "psf_closure": {
+                    "uncertainty_exemption_used": uncertainty_exemption,
                     "groups": {
                         "all": {
                             "status": "ok",
                             "fwhm_ratio_median": ratio,
+                            "accepted_within_uncertainty": (
+                                uncertainty_exemption
+                            ),
                         }
                     }
                 },
@@ -1917,6 +1965,21 @@ class PipelineStageTests(unittest.TestCase):
             support_mode="strict_compact",
         )
         self.assertLess(normal_tie, compact_advisory)
+
+        strict_farther = stage9_star_remixing._stage9_support_candidate_score(
+            quality(ratio=0.98),
+            support_mode="normal",
+        )
+        uncertainty_closer = (
+            stage9_star_remixing._stage9_support_candidate_score(
+                quality(
+                    ratio=1.001,
+                    uncertainty_exemption=True,
+                ),
+                support_mode="normal",
+            )
+        )
+        self.assertLess(strict_farther, uncertainty_closer)
 
     def test_stage9_adaptive_starmask_caps_predicted_change_coverage(self):
         peak_map = np.geomspace(1e-7, 0.02, 20000, dtype=np.float32).reshape(100, 200)
@@ -2422,6 +2485,109 @@ class PipelineStageSmokeTests(unittest.TestCase):
             {"left": 4, "top": 4, "right": 4, "bottom": 4},
         )
 
+    def test_stage2_primary_safe_consensus_suppresses_legacy_crop(self) -> None:
+        with (
+            patch.object(
+                stage2_view_correction,
+                "_detect_native_contour_candidate",
+                return_value=(
+                    None,
+                    "native contour crop skipped: full frame valid",
+                    {
+                        "method": "native_contour",
+                        "accepted": False,
+                        "reason": "full_frame_is_valid",
+                        "candidate": None,
+                    },
+                ),
+            ),
+            patch.object(
+                stage2_view_correction,
+                "_detect_field_rotation_candidate",
+                return_value=(
+                    None,
+                    "field rotation clear",
+                    {
+                        "method": "native_field_rotation",
+                        "accepted": False,
+                        "reason": "no_significant_edge_connected_coverage_anomaly",
+                        "candidate": None,
+                    },
+                ),
+            ),
+            patch.object(stage2_view_correction, "_detect_auto_edge_crop") as legacy,
+            patch.object(stage2_view_correction, "_edge_color_artifact_crop") as color,
+        ):
+            stage2_view_correction.run_stage2_view_correction(self.pipeline)
+
+        legacy.assert_not_called()
+        color.assert_not_called()
+        self.assertEqual(self.pipeline.commands, [])
+        self.assertEqual(self.pipeline.results[-1][1], "ok")
+        self.assertEqual(
+            self.pipeline.stage2_crop_report["detector_consensus"]["decision"],
+            "preserve_full_frame",
+        )
+        self.assertEqual(
+            self.pipeline.stage2_crop_report["reason_code"],
+            "primary_detectors_preserve_full_frame",
+        )
+
+    def test_stage2_legacy_crop_intruding_center_is_rejected_not_clamped(self) -> None:
+        with (
+            patch.object(
+                stage2_view_correction,
+                "_detect_native_contour_candidate",
+                return_value=(
+                    None,
+                    "native detector inconclusive",
+                    {
+                        "method": "native_contour",
+                        "accepted": False,
+                        "reason": "no_candidate",
+                        "candidate": None,
+                    },
+                ),
+            ),
+            patch.object(
+                stage2_view_correction,
+                "_detect_field_rotation_candidate",
+                return_value=(
+                    None,
+                    "field detector unavailable",
+                    {
+                        "method": "native_field_rotation",
+                        "accepted": False,
+                        "reason": "insufficient_valid_samples",
+                        "candidate": None,
+                    },
+                ),
+            ),
+            patch.object(
+                stage2_view_correction,
+                "_detect_auto_edge_crop",
+                return_value=((15, 15, 70, 70), "legacy crop candidate"),
+            ),
+            patch.object(stage2_view_correction, "_edge_color_artifact_crop") as color,
+        ):
+            stage2_view_correction.run_stage2_view_correction(self.pipeline)
+
+        color.assert_not_called()
+        self.assertEqual(self.pipeline.commands, [])
+        self.assertEqual(self.pipeline.results[-1][1], "degraded")
+        self.assertEqual(
+            self.pipeline.stage2_crop_report["reason_code"],
+            "crop_detector_conflict",
+        )
+        self.assertEqual(
+            self.pipeline.stage2_crop_report["crop_limit_hits"][-1]["applied"],
+            None,
+        )
+        self.assertIn(
+            "crop_detector_conflict",
+            self.pipeline._stage_review_reasons(2),
+        )
+
     def test_stage2_real_native_detector_applies_one_siril_crop(self) -> None:
         pixels = np.full((3, 100, 120), 0.02, dtype=np.float32)
         pixels[:, :8, :] = 0.0
@@ -2453,11 +2619,11 @@ class PipelineStageSmokeTests(unittest.TestCase):
     def test_stage2_field_rotation_crop_runs_once_and_skips_edge_chain(self) -> None:
         no_contour = (
             None,
-            "native contour crop skipped: full frame valid",
+            "native contour detector was inconclusive",
             {
                 "method": "native_contour",
                 "accepted": False,
-                "reason": "full_frame_is_valid",
+                "reason": "no_candidate",
                 "candidate": None,
             },
         )
@@ -2569,7 +2735,7 @@ class PipelineStageSmokeTests(unittest.TestCase):
         )
         json.loads(json.dumps(self.pipeline.stage2_crop_report))
 
-    def test_stage2_field_rotation_residual_marks_review_without_second_crop(self) -> None:
+    def test_stage2_full_frame_and_field_rotation_conflict_preserves_frame(self) -> None:
         no_contour = (
             None,
             "native contour crop skipped: full frame valid",
@@ -2599,14 +2765,14 @@ class PipelineStageSmokeTests(unittest.TestCase):
             patch.object(
                 stage2_view_correction,
                 "_detect_field_rotation_candidate",
-                side_effect=(field_candidate, field_candidate),
+                return_value=field_candidate,
             ),
             patch.object(stage2_view_correction, "_detect_auto_edge_crop") as edge_detect,
         ):
             stage2_view_correction.run_stage2_view_correction(self.pipeline)
 
         edge_detect.assert_not_called()
-        self.assertEqual(len(self.pipeline.commands), 1)
+        self.assertEqual(self.pipeline.commands, [])
         self.assertTrue(self.pipeline.stage2_crop_report["requires_review"])
         self.assertTrue(self.pipeline._stage2_view_review_required)
         self.assertFalse(
@@ -2615,7 +2781,17 @@ class PipelineStageSmokeTests(unittest.TestCase):
         self.assertEqual(self.pipeline.results[-1][1], "degraded")
         self.assertEqual(
             self.pipeline.stage2_crop_report["reason_code"],
-            "field_rotation_residual_review",
+            "crop_detector_conflict",
+        )
+        self.assertEqual(
+            self.pipeline.stage2_crop_report["field_rotation"][
+                "application_status"
+            ],
+            "rejected_detector_conflict",
+        )
+        self.assertEqual(
+            self.pipeline.stage2_crop_report["detector_consensus"]["decision"],
+            "crop_detector_conflict",
         )
         json.loads(json.dumps(self.pipeline.stage2_crop_report))
 

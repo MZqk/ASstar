@@ -361,7 +361,7 @@ class ProcessingParameterContractTests(unittest.TestCase):
                 )
                 for stage in range(2, 10)
             },
-            {2: 4, 3: 22, 4: 32, 5: 4, 6: 29, 7: 51, 8: 14, 9: 79},
+            {2: 4, 3: 22, 4: 32, 5: 4, 6: 32, 7: 51, 8: 14, 9: 84},
         )
         gate_fields = {spec.field for spec in PROCESSING_GATE_PARAMETER_SPECS}
         self.assertTrue(

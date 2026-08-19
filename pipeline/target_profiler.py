@@ -64,6 +64,26 @@ BUILTIN_CATALOG: List[Dict[str, Any]] = [
         "features": ["dense_stars", "bright_stars"],
         "default_policy": "open_cluster_color_preserve",
     },
+    {
+        "name": "NGC 1579",
+        "aliases": [
+            "NGC1579",
+            "Northern Trifid Nebula",
+            "Trifid of the North",
+        ],
+        "type": "bright_emission_reflection_nebula",
+        "ra_deg": 67.5142,
+        "dec_deg": 35.325,
+        "size_arcmin": [13.4, 13.4],
+        "features": [
+            "bright_core",
+            "large_nebulosity",
+            "reflection_blue",
+            "emission_red",
+            "dense_stars",
+        ],
+        "default_policy": "bright_nebula_hdr_conservative",
+    },
 ]
 
 
@@ -230,16 +250,32 @@ def _catalog_name_match(catalog: Iterable[Dict[str, Any]], text: str) -> Optiona
                 continue
             score = 0.0
             name_lower = name.strip().lower()
-            if re.fullmatch(r"m\d+", name_lower):
-                # Messier IDs are short and often appear in folder names such as M42_test.
-                if re.search(rf"(?<![a-z0-9]){re.escape(name_lower)}(?!\d)", raw_lower):
-                    score = 0.93
+            identifier = re.fullmatch(
+                r"(m|ngc|ic|caldwell|barnard)[\s_-]*(\d+)",
+                name_lower,
+            )
+            if identifier:
+                prefix, number = identifier.groups()
+                pattern = (
+                    rf"(?<![a-z0-9]){re.escape(prefix)}"
+                    rf"[\s_-]*{re.escape(number)}(?![a-z0-9])"
+                )
+                if re.search(pattern, raw_lower):
+                    score = 0.94
             elif name_lower and name_lower in raw_lower:
                 score = 0.90
-            if candidate == normalized:
-                score = max(score, 0.95)
-            elif candidate in normalized:
-                score = max(score, min(0.88, 0.55 + len(candidate) / max(len(normalized), 1)))
+            if not identifier:
+                if candidate == normalized:
+                    score = max(score, 0.95)
+                elif candidate in normalized:
+                    score = max(
+                        score,
+                        min(
+                            0.88,
+                            0.55
+                            + len(candidate) / max(len(normalized), 1),
+                        ),
+                    )
             if best is None or score > best[1]:
                 best = (item, score)
     return best if best and best[1] > 0.0 else None
@@ -399,13 +435,58 @@ def build_target_profile(
     match = None
     match_method = "catalog_name_match"
     match_distance: Optional[float] = None
+    identity_status = "unresolved"
+    identity_conflict = False
+    identity_evidence: Dict[str, Any] = {
+        "name": None,
+        "coordinate": None,
+    }
+    if name_match:
+        name_item, name_score = name_match
+        identity_evidence["name"] = {
+            "target": str(name_item.get("name") or ""),
+            "type": str(name_item.get("type") or ""),
+            "score": round(float(name_score), 4),
+        }
     if coord_match:
+        coord_item, coord_score, coord_distance = coord_match
+        identity_evidence["coordinate"] = {
+            "target": str(coord_item.get("name") or ""),
+            "type": str(coord_item.get("type") or ""),
+            "score": round(float(coord_score), 4),
+            "distance_deg": round(float(coord_distance), 6),
+        }
+    if name_match and coord_match:
+        name_item, name_score = name_match
+        coord_item, coord_score, coord_distance = coord_match
+        same_target = _norm(str(name_item.get("name") or "")) == _norm(
+            str(coord_item.get("name") or "")
+        )
+        if same_target:
+            match = (
+                name_item,
+                min(0.99, max(float(name_score), float(coord_score)) + 0.01),
+            )
+            match_method = "catalog_name_coordinate_match"
+            match_distance = coord_distance
+            identity_status = "corroborated"
+        elif float(name_score) >= 0.90:
+            identity_conflict = True
+            identity_status = "conflict"
+        else:
+            match = (coord_item, coord_score)
+            match_method = "catalog_coordinate_match"
+            match_distance = coord_distance
+            identity_status = "coordinate_resolved"
+    elif name_match:
+        match = name_match
+        identity_status = "name_resolved"
+    elif coord_match:
         item, score, distance = coord_match
         match = (item, score)
         match_method = "catalog_coordinate_match"
         match_distance = distance
-    elif name_match:
-        match = name_match
+        identity_status = "coordinate_resolved"
 
     target_name: Optional[str] = None
     target_confidence = visual_confidence
@@ -413,6 +494,7 @@ def build_target_profile(
     method = visual_method
     diagnostics: List[str] = []
     warnings: List[str] = []
+    visual_hypothesis: Optional[Dict[str, Any]] = None
     if auto_hint:
         diagnostics.append(f"auto_target_hint={auto_hint}")
         if (
@@ -429,7 +511,7 @@ def build_target_profile(
             visual_confidence = max(visual_confidence, 0.66)
             visual_method = "auto_target_hint_plus_visual_features"
 
-    if match:
+    if match and not identity_conflict:
         item, catalog_score = match
         catalog_type = str(item.get("type") or visual_type)
         feature_overlap = 0
@@ -448,7 +530,14 @@ def build_target_profile(
             diagnostics.append(
                 f"catalog_visual_type_resolution: catalog={catalog_type}, visual={visual_type}"
             )
-        if coord_match or catalog_score >= visual_confidence:
+        if (
+            match_method in {
+                "catalog_coordinate_match",
+                "catalog_name_coordinate_match",
+            }
+            or catalog_score >= 0.90
+            or catalog_score >= visual_confidence
+        ):
             target_name = str(item.get("name") or "")
             target_type = catalog_type
             target_confidence = catalog_score
@@ -460,8 +549,31 @@ def build_target_profile(
             if match_distance is not None:
                 diagnostics.append(f"catalog_coordinate_distance_deg={match_distance:.4f}")
 
+    if identity_conflict:
+        visual_hypothesis = {
+            "target_type": visual_type,
+            "confidence": round(float(visual_confidence), 4),
+            "method": visual_method,
+        }
+        target_name = None
+        target_type = "generic_low_snr_safe"
+        target_confidence = min(0.69, max(0.0, float(visual_confidence)))
+        method = "target_identity_conflict_safe_fallback"
+        name_target = (identity_evidence.get("name") or {}).get("target")
+        coordinate_target = (
+            identity_evidence.get("coordinate") or {}
+        ).get("target")
+        diagnostics.append(
+            "target_identity_conflict: "
+            f"name={name_target}, coordinate={coordinate_target}"
+        )
+        warnings.append(
+            "target_identity_conflict_requires_review"
+        )
+
     if (
         auto_hint
+        and not identity_conflict
         and auto_hint != target_type
         and not target_name
         and target_type
@@ -477,9 +589,34 @@ def build_target_profile(
         target_confidence = max(target_confidence, 0.66)
         method = "auto_target_hint_plus_visual_features"
 
+    if (
+        not identity_conflict
+        and target_name is None
+        and auto_hint is None
+        and visual_type in {"small_galaxy", "large_galaxy"}
+        and float(visual_confidence) < 0.70
+    ):
+        visual_hypothesis = {
+            "target_type": visual_type,
+            "confidence": round(float(visual_confidence), 4),
+            "method": visual_method,
+        }
+        target_type = "generic_low_snr_safe"
+        target_confidence = min(0.69, float(visual_confidence))
+        method = "visual_galaxy_hypothesis_demoted_low_confidence"
+        diagnostics.append(
+            "visual galaxy hypothesis retained for diagnosis; "
+            "generic low-SNR policy selected"
+        )
+
     if target_confidence < 0.55:
         target_name = None
-        target_type = visual_type if visual_type != "generic_low_snr_safe" else "generic_low_snr_safe"
+        if not identity_conflict and visual_hypothesis is None:
+            target_type = (
+                visual_type
+                if visual_type != "generic_low_snr_safe"
+                else "generic_low_snr_safe"
+            )
 
     policy_name = TYPE_TO_POLICY.get(target_type, DEFAULT_POLICY_NAME)
     secondary_labels, secondary_evidence = _secondary_context(features, flags)
@@ -489,6 +626,11 @@ def build_target_profile(
         "target_type": target_type,
         "pipeline": policy_name,
         "classification_method": method,
+        "identity_status": identity_status,
+        "identity_evidence": identity_evidence,
+        "target_identity_conflict": identity_conflict,
+        "requires_review": identity_conflict,
+        "visual_hypothesis": visual_hypothesis,
         "secondary_labels": secondary_labels,
         "secondary_label_evidence": secondary_evidence,
         "features": flags,

@@ -1509,6 +1509,11 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
 
     def test_stage7_legacy_hdr_eligibility_is_forced_to_review_only(self):
         processor = self._new_processor()
+        processor._stage6_galaxy_roi_diagnostics = {
+            "status": "ready",
+            "available": True,
+            "seed_position_px": {"x": 31, "y": 47},
+        }
         source_pixels = processor.image_pixels.copy()
         processor._star_separation_state = (
             pipeline_module.StarSeparationState.REJECTED.value
@@ -1554,6 +1559,11 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
         self.assertEqual(report["review_output"], "stage7_review_with_stars")
         self.assertEqual(report["attempts"], [])
         self.assertIsNone(report["selected"])
+        self.assertEqual(report["galaxy_roi"]["status"], "ready")
+        self.assertEqual(
+            report["galaxy_roi"]["seed_position_px"],
+            {"x": 31, "y": 47},
+        )
         self.assertEqual(
             report["display_rendition_contract"]["name"],
             "linked_review_visibility_v2",
@@ -1626,7 +1636,7 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
             "validated_chroma_rescue",
         )
 
-    def test_stage7_forced_delivery_is_accepted_but_limits_stage8(self):
+    def test_stage7_forced_delivery_is_reclassified_to_with_stars_review(self):
         processor = self._new_processor()
 
         def forced_delivery():
@@ -1648,16 +1658,21 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
 
         pipeline_module.run_stage7_stretching(processor)
 
-        self.assertTrue(processor._stage7_stretch_accepted)
-        self.assertEqual(processor._stage7_stretch_output, "stage7_stretched")
+        self.assertFalse(processor._stage7_stretch_accepted)
+        self.assertIsNone(processor._stage7_stretch_output)
+        self.assertEqual(processor._stage7_review_source, "stage7_review_with_stars")
         self.assertEqual(processor.results[-1][1], "degraded")
         self.assertEqual(
             processor._stage8_handoff["processing_policy"],
-            "background_only",
+            "skip",
         )
+        self.assertTrue(processor._stage8_handoff["restricted_downstream"])
         metadata = processor.result_metadata[-1]
-        self.assertEqual(metadata["reason_code"], "forced_quality_delivery")
-        self.assertTrue(metadata["details"]["forced_delivery"])
+        self.assertEqual(metadata["reason_code"], "stage7_stretch_not_accepted")
+        self.assertIn(
+            "stage7_stretch_not_accepted",
+            processor._stage_review_reasons(7),
+        )
 
     def test_stage7_all_core_unsafe_candidates_revoke_pair_and_use_with_stars_review(self):
         processor = self._new_processor()
@@ -1739,7 +1754,11 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
         self.assertFalse(processor._stage7_stretch_accepted)
         self.assertIsNone(processor._stage7_stretch_output)
         self.assertEqual(processor.results[-1][1], "degraded")
-        self.assertIn("仅保留 Stage7 复核候选", processor.results[-1][3])
+        self.assertEqual(
+            processor._stage7_review_source,
+            "stage7_review_with_stars",
+        )
+        self.assertIn("starless-only stretch candidates skipped", processor.results[-1][3])
 
     def test_stage7_chroma_rescue_only_allows_exclusive_chroma_rejection(self):
         processor = pipeline_module.StarunPostProcessor()
@@ -1876,7 +1895,7 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
         self.assertEqual(key_before, key_after)
         self.assertEqual(
             stage6_services_module.STAGE7_CANDIDATE_RANKING_POLICY,
-            "hard_gate_bounded_presentation_score_v4",
+            "hard_gate_bounded_subject_brightness_v6",
         )
 
     def test_stage7_strict_target_prefers_unsaturated_safe_candidate(self):

@@ -272,12 +272,103 @@ class Stage9PsfClosureTests(unittest.TestCase):
             self.cfg,
         )
 
-        self.assertEqual(result["schema"], "starun.stage9-psf-closure.v2")
+        self.assertEqual(result["schema"], "starun.stage9-psf-closure.v3")
         self.assertEqual(result["status"], "partial")
         self.assertTrue(result["accepted"])
         self.assertTrue(result["review_required"])
         self.assertEqual(result["groups"]["bright"]["status"], "not_assessed")
         self.assertEqual(result["groups"]["bright"]["reference_sample_count"], 3)
+
+    def _closure_with_measured_ratio(
+        self,
+        ratio: float,
+        *,
+        source_area_available: bool = True,
+    ) -> dict:
+        source = _gaussian_field(
+            (128, 128),
+            self.coordinates,
+            sigma=1.35,
+        )
+        reference = self._reference(source)
+        source_fwhm = np.asarray(
+            reference["_display_source_fwhm_px"],
+            dtype=np.float64,
+        )
+        source_area = np.asarray(
+            reference["_display_source_halfmax_area_px"],
+            dtype=np.float64,
+        )
+        if not source_area_available:
+            reference["_display_source_halfmax_area_px"] = np.full(
+                source_area.shape,
+                np.nan,
+                dtype=np.float32,
+            )
+        measurements = [
+            {
+                "status": "ok",
+                "fwhm_px": float(value * ratio),
+                "half_max_area": float(area * ratio * ratio),
+                "saturated": False,
+                "offset_y": 0,
+                "offset_x": 0,
+            }
+            for value, area in zip(source_fwhm, source_area)
+        ]
+        with patch.object(
+            stage9_quality,
+            "_measure_connected_halfmax_fwhm",
+            side_effect=measurements,
+        ):
+            return stage9_quality.assess_stage9_psf_closure(
+                source,
+                reference,
+                self.cfg,
+            )
+
+    def test_upper_boundary_can_be_accepted_within_measurement_uncertainty(self):
+        result = self._closure_with_measured_ratio(1.101946)
+
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(result["status"], "advisory")
+        self.assertFalse(result["review_required"])
+        self.assertTrue(result["uncertainty_exemption_used"])
+        group = result["groups"]["all"]
+        self.assertFalse(group["strict_accepted"])
+        self.assertTrue(group["accepted_within_uncertainty"])
+        self.assertEqual(group["decision"], "accepted_within_uncertainty")
+
+    def test_ratio_beyond_maximum_uncertainty_is_rejected(self):
+        result = self._closure_with_measured_ratio(1.13)
+
+        self.assertFalse(result["accepted"])
+        group = result["groups"]["all"]
+        self.assertEqual(group["decision"], "rejected")
+        self.assertLessEqual(
+            group["measurement_uncertainty"]["u95_effective"],
+            0.020,
+        )
+
+    def test_lower_boundary_uses_same_uncertainty_rule(self):
+        result = self._closure_with_measured_ratio(0.9281)
+
+        self.assertTrue(result["accepted"], result)
+        self.assertTrue(
+            result["groups"]["all"]["accepted_within_uncertainty"]
+        )
+
+    def test_missing_halfmax_area_keeps_auditable_floor_only_tolerance(self):
+        result = self._closure_with_measured_ratio(
+            1.1019,
+            source_area_available=False,
+        )
+
+        uncertainty = result["groups"]["all"]["measurement_uncertainty"]
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(uncertainty["pixel_area_sample_count"], 0)
+        self.assertEqual(uncertainty["pixel_se"], 0.0)
+        self.assertAlmostEqual(uncertainty["u95_effective"], 0.002)
 
     def test_candidate_losing_measurable_bright_group_is_rejected(self):
         source = _gaussian_field((128, 128), self.coordinates, sigma=1.35)
@@ -1166,36 +1257,45 @@ class Stage9PsfClosureTests(unittest.TestCase):
         self.assertGreater(after_5, before_5)
         self.assertLessEqual(after_5, source_5 * 1.05)
 
-    def test_stage5_saturated_star_completes_outside_ordinary_catalog(self):
-        shape = (41, 41)
+    def _assert_stage5_completion_coordinate_domain(
+        self,
+        coordinate_domain,
+        *,
+        target_array_y,
+        target_siril_y,
+        existing_array_y,
+        existing_siril_y,
+    ):
+        shape = (47, 53)
+        target_x = 37
+        existing_x_value = 11
         original = _gaussian_field(
             shape,
-            [(10, 10), (30, 30)],
+            [(existing_array_y, existing_x_value), (target_array_y, target_x)],
             sigma=2.0,
             amplitude=0.70,
         )
         trusted = original.copy()
-        existing_y = np.asarray([10], dtype=np.int32)
-        existing_x = np.asarray([10], dtype=np.int32)
+        existing_y = np.asarray([existing_array_y], dtype=np.int32)
+        existing_x = np.asarray([existing_x_value], dtype=np.int32)
         catalog = {
             "status": "ok",
             "reference_threshold": 1e-4,
             "_display_source_peak_y": existing_y,
             "_display_source_peak_x": existing_x,
         }
-        # Siril y is bottom-up: numpy y=30 maps to y=10 in a 41 px image.
         stage5_stars = [
             {
                 "index": 1,
-                "x": 30.0,
-                "y": 10.0,
+                "x": float(target_x),
+                "y": float(target_siril_y),
                 "fwhm_geometry": 10.0,
                 "saturated": True,
             },
             {
                 "index": 2,
-                "x": 10.0,
-                "y": 30.0,
+                "x": float(existing_x_value),
+                "y": float(existing_siril_y),
                 "fwhm_geometry": 10.0,
                 "saturated": True,
             },
@@ -1207,14 +1307,83 @@ class Stage9PsfClosureTests(unittest.TestCase):
             original,
             trusted,
             self.cfg,
+            coordinate_domain=coordinate_domain,
         )
 
         self.assertEqual(completion["status"], "ready", completion)
+        self.assertEqual(
+            completion["schema"],
+            "starun.stage9-stage5-bright-star-completion.v2",
+        )
+        self.assertTrue(completion["coordinate_contract"]["validated"])
+        self.assertEqual(
+            completion["coordinate_contract"]["array_coordinate_domain"],
+            coordinate_domain,
+        )
         self.assertEqual(completion["selected_star_count"], 1)
         self.assertEqual(completion["selected_saturated_count"], 1)
+        self.assertEqual(
+            completion["source_star_layer_counts"],
+            {"ordinary": 0, "bright": 0, "saturated": 2},
+        )
+        self.assertEqual(
+            completion["selected_star_layer_counts"],
+            {"ordinary": 0, "bright": 0, "saturated": 1},
+        )
         self.assertFalse(completion["ordinary_fwhm_gate_member"])
-        self.assertTrue(completion["_support_mask"][30, 30])
-        self.assertFalse(completion["_support_mask"][10, 10])
+        mirror_y = shape[0] - 1 - target_array_y
+        self.assertTrue(completion["_support_mask"][target_array_y, target_x])
+        self.assertFalse(completion["_support_mask"][mirror_y, target_x])
+
+        base = np.full_like(original, 0.05)
+        completed, support, applied_report = (
+            stage9_quality.apply_stage5_bright_star_completion(
+                original,
+                base,
+                np.zeros_like(original),
+                completion,
+                self.cfg,
+                remix_base=base,
+                screen_intensity=1.0,
+            )
+        )
+        self.assertEqual(applied_report["status"], "ready", applied_report)
+        self.assertTrue(support[target_array_y, target_x])
+        self.assertFalse(support[mirror_y, target_x])
+        self.assertGreater(float(np.max(completed[:, target_array_y, target_x])), 0.0)
+        self.assertEqual(float(np.max(completed[:, mirror_y, target_x])), 0.0)
+        delivered = stage9_quality.screen_blend(
+            base,
+            completed,
+            1.0,
+            alpha_mask=support,
+        )
+        self.assertGreater(
+            float(np.max(delivered[:, target_array_y, target_x] - base[:, target_array_y, target_x])),
+            0.0,
+        )
+        self.assertEqual(
+            float(np.max(delivered[:, mirror_y, target_x] - base[:, mirror_y, target_x])),
+            0.0,
+        )
+
+    def test_stage5_saturated_star_uses_siril_pixel_buffer_coordinates_directly(self):
+        self._assert_stage5_completion_coordinate_domain(
+            "siril_pixel_buffer_bottom_up",
+            target_array_y=8,
+            target_siril_y=8,
+            existing_array_y=31,
+            existing_siril_y=31,
+        )
+
+    def test_stage5_saturated_star_converts_only_explicit_top_down_fits_array(self):
+        self._assert_stage5_completion_coordinate_domain(
+            "fits_array_top_down",
+            target_array_y=38,
+            target_siril_y=8,
+            existing_array_y=15,
+            existing_siril_y=31,
+        )
 
     def test_bright_star_presence_observation_detects_restoration(self):
         base = np.full((3, 21, 21), 0.10, dtype=np.float32)
@@ -1251,9 +1420,16 @@ class Stage9PsfClosureTests(unittest.TestCase):
         support = np.zeros((9, 9), dtype=bool)
         support[4, 4] = True
         completion = {
-            "schema": "starun.stage9-stage5-bright-star-completion.v1",
+            "schema": "starun.stage9-stage5-bright-star-completion.v2",
             "status": "ready",
             "available": True,
+            "coordinate_contract": {
+                "schema": "starun.pixel-coordinate-contract.v1",
+                "source_coordinate_domain": "siril_star_catalog_bottom_up",
+                "array_coordinate_domain": "siril_pixel_buffer_bottom_up",
+                "conversion": "y_array = y_siril",
+                "validated": True,
+            },
             "stars": [
                 {"x": 4, "y": 4, "saturated": True},
             ],
@@ -1385,6 +1561,186 @@ class Stage9PsfClosureTests(unittest.TestCase):
         self.assertFalse(
             report["candidates"]["normal"]["output_adequacy"]["formal_gate"]
         )
+
+    def test_plugin_output_adequacy_uses_inclusive_fifty_percent_boundary(self):
+        shape = (12, 14)
+        support = np.zeros(shape, dtype=bool)
+        support[5:7, 6:8] = True
+
+        def calibration(mode: str) -> dict:
+            return {
+                "status": "ok",
+                "support_status": "ok",
+                "support_mode": mode,
+                "_compact_support_mask": support.copy(),
+                "compact_support_coverage": 0.05,
+                "predicted_change_ratio": 0.05,
+                "predicted_change_ratio_limit": 0.30,
+                "weak_star_retention": 1.0,
+                "weak_star_retention_min": 0.80,
+                "star_retention": 1.0,
+                "output_profile": {
+                    "status": "ok",
+                    "accepted": True,
+                    "hard_failed": False,
+                    "actual": {
+                        anchor: 0.80
+                        for anchor in ("faint", "mid", "bright", "peak")
+                    },
+                    "targets": {
+                        anchor: 1.0
+                        for anchor in ("faint", "mid", "bright", "peak")
+                    },
+                    "exceeded_anchors": [],
+                },
+            }
+
+        for actual, eligible in ((0.50, True), (0.499, False)):
+            with self.subTest(actual=actual):
+                measured_profile = {
+                    "status": "ok",
+                    "accepted": True,
+                    "hard_failed": False,
+                    "actual": {
+                        anchor: actual
+                        for anchor in ("faint", "mid", "bright", "peak")
+                    },
+                    "targets": {
+                        anchor: 1.0
+                        for anchor in ("faint", "mid", "bright", "peak")
+                    },
+                    "exceeded_anchors": [],
+                }
+                with (
+                    patch.object(
+                        stage9_quality,
+                        "calibrate_starmask_asinh",
+                        side_effect=[
+                            calibration("normal"),
+                            calibration("strict_compact"),
+                        ],
+                    ),
+                    patch.object(
+                        stage9_quality,
+                        "measure_starmask_output_profile",
+                        return_value=measured_profile,
+                    ),
+                ):
+                    report = stage9_quality.assess_starmask_support_preflight(
+                        np.zeros((3, *shape), dtype=np.float32),
+                        self.cfg,
+                        failure_action="auto_fallback",
+                        plugin_stretched_stars=np.full(
+                            (3, *shape),
+                            0.2,
+                            dtype=np.float32,
+                        ),
+                    )
+                plugin = report["plugin_formal_eligibility"]
+                self.assertEqual(plugin["eligible"], eligible)
+                self.assertEqual(
+                    report["selected_stretch_source"],
+                    "plugin_stretched" if eligible else "builtin_calibrated",
+                )
+                if not eligible:
+                    self.assertIn(
+                        "stage9_plugin_starmask_output_inadequate",
+                        str(report["fallback_reason"]),
+                    )
+
+    def test_catalog_visibility_accepts_both_explicit_coordinate_domains(self):
+        shape = (72, 96)
+        coordinates = [
+            (y, x)
+            for y in (8, 22, 39, 58)
+            for x in (9, 31, 55, 82)
+        ]
+        image = _gaussian_field(
+            shape,
+            coordinates,
+            sigma=0.75,
+            amplitude=0.55,
+        )
+        count = len(coordinates)
+        reference = {
+            "status": "ok",
+            "source_matched": True,
+            "_source_peak_y": np.asarray(
+                [item[0] for item in coordinates],
+                dtype=np.int32,
+            ),
+            "_source_peak_x": np.asarray(
+                [item[1] for item in coordinates],
+                dtype=np.int32,
+            ),
+            "_weak_flags": np.asarray(
+                [index < count // 2 for index in range(count)],
+                dtype=bool,
+            ),
+            "_reference_local_contrast": np.full(
+                count,
+                0.30,
+                dtype=np.float32,
+            ),
+            "_stage9_visibility_inner_window_size_px": np.full(
+                count,
+                3,
+                dtype=np.int32,
+            ),
+            "_stage9_visibility_outer_window_size_px": np.full(
+                count,
+                7,
+                dtype=np.int32,
+            ),
+        }
+        bottom_up = stage9_quality.assess_catalog_star_visibility(
+            image,
+            reference,
+            self.cfg,
+            coordinate_domain="siril_pixel_buffer_bottom_up",
+        )
+        top_down = stage9_quality.assess_catalog_star_visibility(
+            np.flip(image, axis=1),
+            reference,
+            self.cfg,
+            coordinate_domain="display_array_top_down",
+        )
+        mirrored_wrong_domain = stage9_quality.assess_catalog_star_visibility(
+            image,
+            reference,
+            self.cfg,
+            coordinate_domain="display_array_top_down",
+        )
+
+        self.assertTrue(bottom_up["passed"], bottom_up)
+        self.assertTrue(top_down["passed"], top_down)
+        self.assertFalse(mirrored_wrong_domain["passed"])
+        self.assertIn(
+            "stage9_catalog_visibility_failed",
+            mirrored_wrong_domain["reason_code"],
+        )
+
+    def test_legacy_v8_report_cannot_be_promoted_without_persisted_audit(self):
+        legacy = stage9_quality.interpret_stage9_remix_quality_report(
+            {
+                "schema": "starun.stage9-remix-quality.v8",
+                "formal_accepted": True,
+            }
+        )
+        current = stage9_quality.interpret_stage9_remix_quality_report(
+            {
+                "schema": "starun.stage9-remix-quality.v9",
+                "formal_accepted": True,
+                "persisted_output_validation": {
+                    "accepted": True,
+                },
+            }
+        )
+
+        self.assertTrue(legacy["supported"])
+        self.assertFalse(legacy["formal_accepted"])
+        self.assertTrue(legacy["requires_review"])
+        self.assertTrue(current["formal_accepted"])
 
 
 if __name__ == "__main__":

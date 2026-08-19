@@ -10,8 +10,9 @@ from typing import Any, Dict, Iterable, Optional
 import numpy as np
 
 import display_rendition
+import stage9_quality
 
-MANAGED_OUTPUT_SCHEMA = "starun.managed-output.v1"
+MANAGED_OUTPUT_SCHEMA = "starun.managed-output.v2"
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _DISPLAY_LUMA_WEIGHTS = np.asarray((0.2126, 0.7152, 0.0722), dtype=np.float32)
 _GALAXY_TARGET_TYPES = frozenset({"galaxy", "large_galaxy", "small_galaxy"})
@@ -190,6 +191,11 @@ def _read_managed_display_png(path: Path) -> np.ndarray:
     return np.transpose(pixels.astype(np.float32) / 65535.0, (2, 0, 1))
 
 
+def read_managed_display_png(path: Path) -> np.ndarray:
+    """Decode display RGB from a PNG written by this managed exporter."""
+    return _read_managed_display_png(Path(path))
+
+
 def _box_blur_gray(gray: np.ndarray) -> np.ndarray:
     arr = np.asarray(gray, dtype=np.float32)
     height, width = arr.shape
@@ -246,6 +252,9 @@ def audit_display_visibility(
     *,
     target_type: str = "",
     stars_required: bool = False,
+    star_reference: Optional[Dict[str, Any]] = None,
+    pixel_coordinate_domain: str = "display_array_top_down",
+    star_visibility_config: Any = None,
 ) -> Dict[str, Any]:
     """Measure whether encoded display pixels are bright and astronomically legible."""
     arr = np.asarray(rgb, dtype=np.float32)
@@ -326,14 +335,25 @@ def audit_display_visibility(
         max(broad_contrast_p95, broad_contrast_p99) >= 0.005
         and broad_signal_coverage >= 0.003
     )
-    star_passed = bool(
+    generic_peak_passed = bool(
         peak_count >= 3
         and peak_luminance_median >= 0.20
         and peak_contrast_median >= 0.015
     )
+    catalog_visibility = stage9_quality.assess_catalog_star_visibility(
+        arr,
+        star_reference,
+        star_visibility_config,
+        coordinate_domain=pixel_coordinate_domain,
+    )
+    star_passed = bool(
+        catalog_visibility.get("available", False)
+        and catalog_visibility.get("passed", False)
+    )
     scene_content_visible = bool(
         sparse_signal_range >= 0.08
         or extended_passed
+        or generic_peak_passed
         or star_passed
     )
     required_subject_mappable = bool(
@@ -416,11 +436,27 @@ def audit_display_visibility(
         "star_visibility": {
             "required": bool(stars_required),
             "passed": star_passed if stars_required else None,
-            "detected": star_passed,
+            "detected": (
+                star_passed if stars_required else generic_peak_passed
+            ),
+            "method": (
+                "source_catalog_absolute_visibility"
+                if stars_required
+                else "not_required"
+            ),
+            "catalog_visibility": catalog_visibility,
+            "compact_peak_diagnostic": {
+                "formal_gate": False,
+                "passed": generic_peak_passed,
+                "reason": (
+                    "generic compact peaks cannot satisfy stars_required"
+                ),
+            },
             "thresholds": {
-                "compact_peak_count_min": 3,
-                "peak_luminance_median_min": 0.20,
-                "peak_contrast_median_min": 0.015,
+                "catalog_all_visibility_ratio_min": 0.75,
+                "catalog_weak_visibility_ratio_min": 0.70,
+                "catalog_bright_visibility_ratio_min": 0.90,
+                "source_and_candidate_local_contrast_min": 0.002,
             },
         },
     }
@@ -430,7 +466,7 @@ def audit_display_visibility(
         if bool(check.get("required")) and check.get("passed") is not True
     ]
     return {
-        "schema": "starun.display-visibility.v1",
+        "schema": "starun.display-visibility.v2",
         "status": "passed" if not failed_checks else "failed",
         "passed": not failed_checks,
         "exposure_state": exposure_state,
@@ -461,6 +497,7 @@ def audit_display_visibility(
             "broad_signal_contrast_p99": _rounded(broad_contrast_p99),
             "broad_signal_coverage": _rounded(broad_signal_coverage),
             "compact_peak_count": peak_count,
+            "compact_peak_diagnostic_passed": generic_peak_passed,
             "peak_luminance_median": _rounded(peak_luminance_median),
             "peak_contrast_median": _rounded(peak_contrast_median),
             "peak_contrast_floor": _rounded(peak_contrast_floor),
@@ -630,6 +667,8 @@ def export_managed_outputs(
     icc_profile_bytes: Optional[bytes] = None,
     target_type: str = "",
     stars_required: bool = False,
+    star_reference: Optional[Dict[str, Any]] = None,
+    star_visibility_config: Any = None,
     display_contract: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Export independently audited display/edit assets without touching FITS."""
@@ -658,6 +697,9 @@ def export_managed_outputs(
                 source_rgb,
                 target_type=target_type,
                 stars_required=stars_required,
+                star_reference=star_reference,
+                pixel_coordinate_domain="display_array_top_down",
+                star_visibility_config=star_visibility_config,
             )
             display_rgb = source_rgb
             if display_contract is not None:
@@ -700,6 +742,9 @@ def export_managed_outputs(
                 _read_managed_display_png(display_path),
                 target_type=target_type,
                 stars_required=stars_required,
+                star_reference=star_reference,
+                pixel_coordinate_domain="display_array_top_down",
+                star_visibility_config=star_visibility_config,
             )
             final_visibility["source"] = "decoded_final_png"
             final_visibility["path"] = str(display_path)
@@ -879,6 +924,7 @@ __all__ = [
     "audit_display_visibility",
     "export_managed_outputs",
     "find_srgb_icc_profile",
+    "read_managed_display_png",
     "write_managed_display_png",
     "write_managed_edit_tiff",
 ]

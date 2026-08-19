@@ -200,7 +200,7 @@ class BrightCoreColorIntegrityTests(unittest.TestCase):
         self.assertFalse(checks["modified_support_ratio"]["passed"])
         self.assertFalse(checks["new_clip_ratio"]["passed"])
 
-    def test_broad_core_chroma_platform_rejects_spcc_without_local_repair(self):
+    def test_broad_core_chroma_platform_attempts_once_then_fails_closed(self):
         before = _strict_core_image()
         base_report, context = self._assess(before, before)
         self.assertGreaterEqual(base_report["roi"]["support_pixels"], 64)
@@ -228,7 +228,59 @@ class BrightCoreColorIntegrityTests(unittest.TestCase):
             measurements["broad_platform_largest_component_ratio_of_roi"],
             0.05,
         )
-        self.assertNotIn("repair", report)
+        self.assertEqual(
+            report["repair"]["method"],
+            "SPCC_BROAD_CORE_CHROMA_ROLLBACK",
+        )
+        self.assertFalse(report["repair"]["passed"])
+        self.assertFalse(
+            report["repair"]["checks"]["modified_support_ratio"]["passed"]
+        )
+
+    def test_bounded_broad_core_chroma_platform_is_repaired_for_review(self):
+        before = np.clip(_strict_core_image(), 0.0, 0.90)
+        base_report, context = self._assess(before, before)
+        self.assertGreaterEqual(base_report["roi"]["support_pixels"], 64)
+        platform = np.zeros(before.shape[1:], dtype=bool)
+        platform[124:133, 124:133] = True
+        platform &= context["roi"]
+        after = _flip_to_blue(before, platform)
+
+        candidate, report = (
+            bright_core_color.evaluate_and_repair_spcc_bright_core(
+                before,
+                after,
+                target_type="bright_emission_reflection_nebula",
+                target_profile=STRICT_PROFILE,
+            )
+        )
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(report["status"], "repaired")
+        self.assertTrue(report["accepted"])
+        self.assertTrue(report["repaired"])
+        self.assertTrue(report["requires_review"])
+        self.assertEqual(
+            report["final_action"],
+            "accept_bounded_broad_core_chroma_rollback_for_review",
+        )
+        repair = report["repair"]
+        self.assertEqual(
+            repair["method"],
+            "SPCC_BROAD_CORE_CHROMA_ROLLBACK",
+        )
+        self.assertLessEqual(repair["support_ratio_of_image"], 0.015)
+        self.assertLessEqual(
+            repair["checks"]["luma_abs_error_p99"]["value"],
+            0.002,
+        )
+        self.assertLessEqual(
+            repair["checks"]["new_clip_ratio"]["value"],
+            0.001,
+        )
+        self.assertTrue(
+            repair["checks"]["post_repair_full_assessment"]["passed"]
+        )
 
     def test_luminance_revalidation_failure_rejects_repair(self):
         before = _strict_core_image()

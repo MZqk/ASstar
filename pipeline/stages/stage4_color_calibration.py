@@ -121,6 +121,7 @@ SPCC_TIMEOUT_MAX_SEC = 300
 SPCC_ONLINE_UNVERIFIED_TIMEOUT_DEFAULT_SEC = 90
 SPCC_ONLINE_UNVERIFIED_TIMEOUT_MIN_SEC = 30
 SPCC_ONLINE_UNVERIFIED_TIMEOUT_MAX_SEC = 180
+SPCC_ONLINE_CIRCUIT_ENV = "STARUN_STAGE4_SPCC_ONLINE_CIRCUIT_OPEN"
 PCC_CHECKPOINT_STEM = "stage4_pre_pcc"
 PCC_CANDIDATE_STEM = "stage4_pcc_candidate"
 SPCC_CANDIDATE_STEM = "stage4_spcc_candidate"
@@ -1442,6 +1443,23 @@ def _stage4_run_spcc(
         "max_attempts": 1,
         "narrowband": bool(narrowband),
     }
+
+    if (
+        catalog == SPCC_CATALOG
+        and str(os.getenv(SPCC_ONLINE_CIRCUIT_ENV, "")).strip().lower()
+        in {"1", "true", "yes", "on"}
+    ):
+        attempt.update(
+            status="skipped",
+            error="batch online SPCC timeout circuit is open",
+            reason_code="batch_online_timeout_circuit_open",
+            circuit_open=True,
+        )
+        return (
+            False,
+            "SPCC skipped: batch online timeout circuit is open",
+            [attempt],
+        )
 
     if catalog == SPCC_LOCAL_CATALOG:
         catalog_status = _stage4_local_spcc_catalog_status(pipeline)
@@ -3055,12 +3073,20 @@ def run_stage4_color_calibration(pipeline) -> None:
         "PCC_NARROWBAND_DEGRADED",
         "PCC_NARROWBAND_DEGRADED_LOCAL_GAIA",
     }
+    degraded_broad_core_methods = {
+        "SPCC_BROAD_CORE_CHROMA_ROLLBACK",
+    }
+    spcc_repair_methods = {
+        "SPCC_LOCAL_CORE_CHROMA_ROLLBACK",
+        *degraded_broad_core_methods,
+    }
     accepted_spcc_methods = {
         "SPCC",
         "SPCC_LOCAL_GAIA",
         "SPCC_NARROWBAND",
         "SPCC_NARROWBAND_LOCAL_GAIA",
         "SPCC_LOCAL_CORE_CHROMA_ROLLBACK",
+        *degraded_broad_core_methods,
     }
     accepted_pcc_methods = {
         "PCC",
@@ -3796,18 +3822,44 @@ def run_stage4_color_calibration(pipeline) -> None:
                                     False,
                                 )
                             ):
-                                color_method = (
-                                    "SPCC_LOCAL_CORE_CHROMA_ROLLBACK"
+                                repair_method = str(
+                                    (
+                                        bright_core_color_integrity.get(
+                                            "repair"
+                                        )
+                                        or {}
+                                    ).get("method")
+                                    or "SPCC_LOCAL_CORE_CHROMA_ROLLBACK"
                                 )
+                                color_method = repair_method
                                 status = "degraded"
-                                color_warning = (
-                                    "spcc_local_core_chroma_rollback"
-                                )
-                                policy_status = "accepted_degraded_fallback"
-                                messages.append(
-                                    "SPCC bright-core chroma anomaly repaired by "
-                                    "local luminance-preserving feather rollback"
-                                )
+                                if color_method in degraded_broad_core_methods:
+                                    color_warning = (
+                                        "spcc_broad_core_chroma_rollback_review_required"
+                                    )
+                                    policy_status = (
+                                        "accepted_degraded_review_required"
+                                    )
+                                    requires_review = True
+                                    pipeline._stage4_color_review_required = True
+                                    spcc_quality_report["physical_color"] = False
+                                    spcc_quality_report[
+                                        "degraded_color_correction"
+                                    ] = True
+                                    messages.append(
+                                        "SPCC broad bright-core chroma platform "
+                                        "repaired by bounded luminance-preserving "
+                                        "RGB-direction rollback; review required"
+                                    )
+                                else:
+                                    color_warning = (
+                                        "spcc_local_core_chroma_rollback"
+                                    )
+                                    policy_status = "accepted_degraded_fallback"
+                                    messages.append(
+                                        "SPCC bright-core chroma anomaly repaired by "
+                                        "local luminance-preserving feather rollback"
+                                    )
                             elif narrowband_physical:
                                 color_method = (
                                     "SPCC_NARROWBAND_LOCAL_GAIA"
@@ -3821,11 +3873,13 @@ def run_stage4_color_calibration(pipeline) -> None:
                                     else "SPCC"
                                 )
                             color_confidence = (
-                                0.92
+                                0.55
+                                if color_method in degraded_broad_core_methods
+                                else 0.92
                                 if selected_spcc_catalog == SPCC_LOCAL_CATALOG
                                 else 0.88
                             )
-                            if color_method != "SPCC_LOCAL_CORE_CHROMA_ROLLBACK":
+                            if color_method not in spcc_repair_methods:
                                 color_warning = ""
                                 policy_status = "accepted"
                             messages.append(
@@ -4678,17 +4732,34 @@ def run_stage4_color_calibration(pipeline) -> None:
         "PCC",
         "PCC_LOCAL_GAIA",
     }
+    shadow_preserved_color_methods = {
+        *physical_calibration_methods,
+        *degraded_broad_core_methods,
+    }
     if (
         auto_reference_report.get("status") == "not_run"
-        and color_method in physical_calibration_methods
+        and color_method in shadow_preserved_color_methods
     ):
+        shadow_physical = color_method in physical_calibration_methods
         auto_reference_report = _stage4_empty_auto_reference_report(
-            status="shadow_skipped_physical_color_accepted",
-            reason="physical_color_accepted_shadow_disabled",
+            status=(
+                "shadow_skipped_physical_color_accepted"
+                if shadow_physical
+                else "shadow_skipped_degraded_color_accepted"
+            ),
+            reason=(
+                "physical_color_accepted_shadow_disabled"
+                if shadow_physical
+                else "degraded_broad_core_color_accepted_shadow_disabled"
+            ),
         )
         auto_reference_report["shadow_comparison"] = {
             "enabled": False,
-            "reason": "physical_color_accepted_shadow_disabled",
+            "reason": (
+                "physical_color_accepted_shadow_disabled"
+                if shadow_physical
+                else "degraded_broad_core_color_accepted_shadow_disabled"
+            ),
             "would_select": None,
             "physical_method_preserved": color_method,
             "pixels_written": False,
@@ -4699,8 +4770,8 @@ def run_stage4_color_calibration(pipeline) -> None:
             physical_method_preserved=color_method,
         )
         auto_reference_report["degraded_color_correction"].update(
-            applied=False,
-            method=None,
+            applied=not shadow_physical,
+            method=color_method if not shadow_physical else None,
         )
     elif auto_reference_report.get("status") == "not_run":
         auto_reference_report = _stage4_empty_auto_reference_report(
@@ -4801,7 +4872,7 @@ def run_stage4_color_calibration(pipeline) -> None:
         or auto_reference_applied
         or broadband_local_fallback_used
         or physical_main_restore_report.get("fallback_used")
-        or color_method == "SPCC_LOCAL_CORE_CHROMA_ROLLBACK"
+        or color_method in spcc_repair_methods
         or bright_core_preserve_fallback_used
     )
     platesolve_diagnostics = _stage4_platesolve_diagnostics(
@@ -4815,6 +4886,7 @@ def run_stage4_color_calibration(pipeline) -> None:
     color_applied_methods = {
         *physical_calibration_methods,
         *degraded_narrowband_pcc_methods,
+        *degraded_broad_core_methods,
         *auto_reference_methods,
         "LOCAL_STAR_COLOR_RESTORE",
     }
@@ -4872,7 +4944,7 @@ def run_stage4_color_calibration(pipeline) -> None:
                 or auto_reference_applied
                 or broadband_local_fallback_used
                 or physical_main_restore_report.get("fallback_used")
-                or color_method == "SPCC_LOCAL_CORE_CHROMA_ROLLBACK"
+                or color_method in spcc_repair_methods
                 or bright_core_preserve_fallback_used
             ),
         },
@@ -4937,6 +5009,8 @@ def run_stage4_color_calibration(pipeline) -> None:
             )
         ),
         "degraded_color_correction_allowed": bool(
+            color_method in degraded_broad_core_methods
+            or
             (
                 pcc_allowed
                 and channel_policy.get("kind") == "narrowband_composite"
@@ -5044,21 +5118,37 @@ def run_stage4_color_calibration(pipeline) -> None:
         },
         "degraded_color_correction": {
             "applied": color_method
-            in (degraded_narrowband_pcc_methods | auto_reference_methods),
+            in (
+                degraded_narrowband_pcc_methods
+                | auto_reference_methods
+                | degraded_broad_core_methods
+            ),
             "method": (
                 color_method
                 if color_method
-                in (degraded_narrowband_pcc_methods | auto_reference_methods)
+                in (
+                    degraded_narrowband_pcc_methods
+                    | auto_reference_methods
+                    | degraded_broad_core_methods
+                )
                 else None
             ),
             "physical_color": False,
             "requires_review": color_method
-            in (degraded_narrowband_pcc_methods | auto_reference_methods),
+            in (
+                degraded_narrowband_pcc_methods
+                | auto_reference_methods
+                | degraded_broad_core_methods
+            ),
             "output": (
                 "stage4_color.fit"
                 if color_saved
                 and color_method
-                in (degraded_narrowband_pcc_methods | auto_reference_methods)
+                in (
+                    degraded_narrowband_pcc_methods
+                    | auto_reference_methods
+                    | degraded_broad_core_methods
+                )
                 else None
             ),
         },
@@ -5149,6 +5239,8 @@ def run_stage4_color_calibration(pipeline) -> None:
         if color_method == AUTO_STAR_ENSEMBLE_METHOD
         else "auto_background_neutralization_non_physical"
         if color_method == AUTO_BACKGROUND_METHOD
+        else "spcc_broad_core_chroma_rollback_review_required"
+        if color_method in degraded_broad_core_methods
         else "color_calibration_review_required"
         if requires_review
         else "stage4_platesolve_disabled"

@@ -1,6 +1,8 @@
 """GUI-facing preparation of deterministic, serial product-task queues."""
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -73,6 +75,7 @@ INPUT_MODE_STAGE1_PREPARED_RESUME = "stage1_prepared_resume"
 INPUT_MODE_STAGE2_CORRECTED_RESUME = "stage2_corrected_resume"
 INPUT_MODE_STAGE5_LINEAR_RESUME = "stage5_linear_resume"
 TASK_RUN_MANIFEST_ENV = "STARUN_TASK_RUN_MANIFEST"
+SPCC_ONLINE_CIRCUIT_ENV = "STARUN_STAGE4_SPCC_ONLINE_CIRCUIT_OPEN"
 
 
 @dataclass(frozen=True)
@@ -92,6 +95,7 @@ class PreparedTask:
 @dataclass(frozen=True)
 class PreparedTaskQueue:
     tasks: Tuple[PreparedTask, ...]
+    skipped_duplicates: Tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.tasks:
@@ -352,6 +356,7 @@ def prepare_task_queue(
         raise WorkspaceError(f"处理参数无效：{error}") from error
     stage_config = stage_config_from_processing_settings(normalized_processing)
     prepared: list[PreparedTask] = []
+    skipped_duplicates: list[Mapping[str, Any]] = []
 
     if discovery.kind == InputKind.PRODUCT_TASK:
         if cancel_check is not None and cancel_check():
@@ -409,6 +414,33 @@ def prepare_task_queue(
             discovery,
             cancel_check=cancel_check,
         )
+        processing_hash = hashlib.sha256(
+            json.dumps(
+                normalized_processing,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        unique_records: list[tuple[Mapping[str, Any], str]] = []
+        seen_records: dict[tuple[str, str], int] = {}
+        for source, label in records:
+            key = (str(source.get("fingerprint") or ""), processing_hash)
+            if key in seen_records:
+                skipped_duplicates.append(
+                    {
+                        "display_label": label,
+                        "source_fingerprint": key[0],
+                        "processing_hash": processing_hash,
+                        "duplicate_of_queue_index": seen_records[key],
+                        "reason_code": "exact_source_and_processing_duplicate",
+                    }
+                )
+                continue
+            seen_records[key] = len(unique_records) + 1
+            unique_records.append((source, label))
+        records = unique_records
         total = len(records)
         for index, (source, label) in enumerate(records, start=1):
             if cancel_check is not None and cancel_check():
@@ -445,16 +477,42 @@ def prepare_task_queue(
                     display_label=label or workspace.task_id,
                 )
             )
-    return PreparedTaskQueue(tasks=tuple(prepared))
+    return PreparedTaskQueue(
+        tasks=tuple(prepared),
+        skipped_duplicates=tuple(skipped_duplicates),
+    )
+
+
+def stage4_online_spcc_timeout_detected(run_root: Path) -> bool:
+    """Return true only for a timed-out online-unverified Gaia SPCC attempt."""
+    report_path = Path(run_root) / "process" / "color_calibration_report.json"
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, TypeError):
+        return False
+    spcc = payload.get("spcc") if isinstance(payload, dict) else None
+    attempts = spcc.get("attempts") if isinstance(spcc, dict) else None
+    if not isinstance(attempts, list):
+        return False
+    return any(
+        isinstance(attempt, dict)
+        and str(attempt.get("status") or "").lower() == "timeout"
+        and str(attempt.get("label") or "").lower() == "catalog:gaia"
+        and str(attempt.get("spcc_readiness") or "").lower()
+        == "online_unverified"
+        for attempt in attempts
+    )
 
 
 __all__ = [
     "PreparedTask",
     "PreparedTaskQueue",
+    "SPCC_ONLINE_CIRCUIT_ENV",
     "TASK_RUN_MANIFEST_ENV",
     "TaskPlanPresentation",
     "describe_input_plan",
     "discover_input_for_processing_settings",
     "prepare_task_queue",
+    "stage4_online_spcc_timeout_detected",
     "stage_config_from_processing_settings",
 ]

@@ -5,6 +5,65 @@ from managed_output import _read_managed_display_png
 
 
 class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
+    def test_stage10_catalog_failure_withholds_review_even_with_generic_peaks(self):
+        processor = self._new_processor()
+        self._stage10_final_input(processor)
+        processor._stage10_test_use_real_catalog_visibility = True
+        processor.cfg.stage10_final_denoise_enabled = False
+        processor.cfg.stage10_final_saturation_enabled = False
+        processor.cfg.stage10_managed_output_enabled = False
+        processor._require_review(3, "stage3_background_review_required")
+        image = np.full((3, 32, 32), 0.14, dtype=np.float32)
+        for y, x in (
+            (3, 15),
+            (4, 24),
+            (8, 2),
+            (10, 29),
+            (15, 8),
+            (16, 24),
+            (21, 3),
+            (23, 29),
+            (28, 9),
+            (29, 20),
+        ):
+            image[:, y, x] = 0.95
+        processor.image_pixels = image
+        processor.siril.get_image_pixeldata = (
+            lambda preview=False: processor.image_pixels.copy()
+        )
+        processor._set_current_image_pixeldata = (
+            lambda pixels, **_kwargs: setattr(
+                processor,
+                "image_pixels",
+                np.array(pixels, copy=True),
+            )
+        )
+
+        stage10_export(processor)
+
+        self.assertEqual(
+            processor.result_metadata[-1]["reason_code"],
+            "required_stars_catalog_visibility_failed",
+        )
+        self.assertEqual(processor.results[-1][1], "failed")
+        self.assertFalse(
+            any(
+                call[0] in {"savetif", "savepng"}
+                for call in processor.cmd_calls
+            )
+        )
+        audit = processor.stage_json_reports[
+            "stage10_pre_export_visibility.json"
+        ]["audit"]
+        self.assertTrue(
+            audit["checks"]["star_visibility"][
+                "compact_peak_diagnostic"
+            ]["passed"]
+        )
+        self.assertFalse(
+            audit["checks"]["star_visibility"]["passed"]
+        )
+
     def test_stage10_legacy_accepted_hdr_state_has_no_preserve_exception(self):
         processor = self._new_processor()
         self._stage10_final_input(processor)
@@ -1971,7 +2030,7 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
             1,
         )
 
-    def test_stage10_stage7_appearance_forced_delivery_keeps_normal_names(self):
+    def test_stage10_stage7_appearance_forced_delivery_is_review_only(self):
         processor = self._new_processor()
         self._stage10_final_input(processor)
         processor.cfg.stage10_quality_repair_enabled = False
@@ -1986,13 +2045,13 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
 
         stage10_export(processor)
 
-        self.assertIn(("savetif", "result_processed", "-astro"), processor.cmd_calls)
-        self.assertIn(("save", "result_final"), processor.cmd_calls)
-        self.assertFalse(processor._final_output_review_only)
+        self.assertIn(("savetif", "result_review", "-astro"), processor.cmd_calls)
+        self.assertIn(("save", "result_review_final"), processor.cmd_calls)
+        self.assertTrue(processor._final_output_review_only)
         metadata = processor.result_metadata[-1]
         self.assertEqual(
             metadata["details"]["final_quality_gate_status"],
-            "forced_appearance_delivery",
+            "review_required",
         )
         self.assertTrue(metadata["details"]["stage7_forced_delivery"])
 

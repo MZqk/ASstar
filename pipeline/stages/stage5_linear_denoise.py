@@ -362,11 +362,14 @@ def _stage5_restore_denoise_baseline(
     pipeline,
     *,
     baseline_stem: str,
-    baseline_pixels: np.ndarray,
+    baseline_pixels: Optional[np.ndarray],
+    rollback_label: str = "Stage5 denoise baseline rollback",
 ) -> Dict[str, Any]:
     """优先回载不可变检查点，失败时用冻结内存像素进行第二重恢复。"""
 
     def verify_restored_pixels() -> None:
+        if baseline_pixels is None:
+            return
         restored = _stage5_current_pixels(pipeline)
         if restored.shape != baseline_pixels.shape or not np.allclose(
             restored,
@@ -386,6 +389,7 @@ def _stage5_restore_denoise_baseline(
             "required": True,
             "completed": True,
             "method": "checkpoint_reload",
+            "pixel_verified": baseline_pixels is not None,
         }
     except (
         AttributeError,
@@ -399,11 +403,13 @@ def _stage5_restore_denoise_baseline(
         checkpoint_error_text = str(checkpoint_error)
 
     try:
+        if baseline_pixels is None:
+            raise RuntimeError("frozen Stage5 baseline pixels unavailable")
         safe_writer = getattr(pipeline, "_set_current_image_pixeldata", None)
         if callable(safe_writer):
             safe_writer(
                 np.array(baseline_pixels, copy=True),
-                label="Stage5 denoise baseline rollback",
+                label=rollback_label,
             )
         else:
             set_pixels = getattr(pipeline.siril, "set_image_pixeldata", None)
@@ -996,7 +1002,13 @@ def _stage5_graxpert_object_model(cfg=None) -> tuple[Optional[Path], dict]:
 def _run_stage5_graxpert_deconvolution(
     pipeline,
     messages: List[str],
+    *,
+    strength_override: Optional[float] = None,
+    checkpoint_stem: str = "stage5_graxpert_deconv",
 ) -> tuple[bool, dict]:
+    configured_strength = float(
+        getattr(pipeline.cfg, "stage5_graxpert_deconv_strength", 0.30)
+    )
     details = {
         "attempted": False,
         "available": False,
@@ -1005,7 +1017,9 @@ def _run_stage5_graxpert_deconvolution(
             0.20,
             min(
                 0.40,
-                float(getattr(pipeline.cfg, "stage5_graxpert_deconv_strength", 0.30)),
+                configured_strength
+                if strength_override is None
+                else float(strength_override),
             ),
         ),
         "psf_size": 5.0,
@@ -1013,6 +1027,8 @@ def _run_stage5_graxpert_deconvolution(
         "configured_path": "",
         "source": "",
         "resolved_model_path": "",
+        "checkpoint": checkpoint_stem,
+        "strength_override": strength_override is not None,
     }
     if not bool(getattr(pipeline.cfg, "stage5_deconvolution_enabled", True)):
         details["reason"] = "deconvolution_disabled"
@@ -1085,7 +1101,7 @@ def _run_stage5_graxpert_deconvolution(
             )
         return False, details
 
-    pipeline._save_stage_output("stage5_graxpert_deconv")
+    pipeline._save_stage_output(checkpoint_stem)
     messages.append(
         "Stage5 GraXpert object deconvolution applied "
         f"(model={model.parent.name}, strength={details['strength']:.2f}, psf=5.0, "
@@ -1114,8 +1130,11 @@ def run_stage5_linear_denoise(pipeline) -> None:
     before_adaptive = {}
     after_deconv_adaptive = {}
     after_linear_adaptive = {}
-    guard_triggered = False
-    guard_reason = ""
+    background_guard_triggered = False
+    background_guard_reason = ""
+    local_guard_triggered = False
+    local_guard_reason = ""
+    deconv_integrity_ok = True
     denoise_used = "none"
     denoise_reason_code = ""
     denoise_fallback_used = False
@@ -1125,6 +1144,7 @@ def run_stage5_linear_denoise(pipeline) -> None:
     deconv_fallback_used = False
     deconv_rollback_used = False
     graxpert_details = {}
+    graxpert_attempts: List[Dict[str, Any]] = []
     stage5_input_linear_pixels: Optional[np.ndarray] = None
     target_structure_report: Dict[str, Any] = {
         "status": "unavailable",
@@ -1139,15 +1159,10 @@ def run_stage5_linear_denoise(pipeline) -> None:
     }
     star_reference_catalog: List[Dict[str, Any]] = []
     psf_quality_report = stage5_deconvolution_quality.not_run_psf_quality_report()
-    local_star_guard: Dict[str, Any] = {
-        "schema": stage5_deconvolution_quality.LOCAL_STAR_GUARD_SCHEMA,
-        "status": "not_run",
-        "mode": "shadow",
-        "enforced": False,
-        "participates_in_acceptance": False,
-        "would_rollback": False,
-        "reason_code": "deconvolution_not_applied",
-    }
+    local_star_guard = (
+        stage5_deconvolution_quality.not_run_local_star_guard_report()
+    )
+    local_star_guard_attempts: List[Dict[str, Any]] = []
     multiscale_report: Dict[str, Any] = {
         "status": "not_requested",
         "accepted": False,
@@ -1298,6 +1313,21 @@ def run_stage5_linear_denoise(pipeline) -> None:
         messages.append(
             "用户选择保留 Stage4 线性结果；反卷积与降噪候选未执行"
         )
+        preserve_deconvolution_component = {
+            "status": "skipped",
+            "reason_code": "user_preserve",
+            "fallback_used": False,
+        }
+        pipeline._stage5_deconvolution_acceptance = {
+            "schema": "starun.stage5-deconvolution-acceptance.v1",
+            "accepted": False,
+            "method": "none",
+            "accepted_checkpoint": None,
+            "component": dict(preserve_deconvolution_component),
+            "local_star_guard": local_star_guard,
+            "attempts": [],
+            "integrity_ok": True,
+        }
         report = {
             "stage": "stage5_linear",
             "processing_mode": processing_mode,
@@ -1310,7 +1340,12 @@ def run_stage5_linear_denoise(pipeline) -> None:
             "noise_model_report": noise_model_report,
             "target_structure_mask": target_structure_report,
             "star_reference": star_reference_report,
-            "deconvolution": {"status": "skipped", "reason_code": "user_preserve"},
+            "deconvolution": {
+                **preserve_deconvolution_component,
+                "local_star_guard": local_star_guard,
+                "local_star_guard_attempts": [],
+                "integrity_ok": True,
+            },
             "denoise": {"status": "skipped", "reason_code": "user_preserve"},
             "status": status,
             "messages": messages,
@@ -1330,11 +1365,7 @@ def run_stage5_linear_denoise(pipeline) -> None:
                 "diagnostics_complete": True,
             },
             components={
-                "deconvolution": {
-                    "status": "skipped",
-                    "reason_code": "user_preserve",
-                    "fallback_used": False,
-                },
+                "deconvolution": preserve_deconvolution_component,
                 "denoise": {
                     "status": "skipped",
                     "reason_code": "user_preserve",
@@ -1344,14 +1375,169 @@ def run_stage5_linear_denoise(pipeline) -> None:
         )
         return
 
-    deconv_applied, graxpert_details = _run_stage5_graxpert_deconvolution(
-        pipeline,
-        messages,
+    def assess_deconvolution_candidate(
+        method: str,
+        *,
+        attempt: str,
+    ) -> Dict[str, Any]:
+        try:
+            if stage5_input_linear_pixels is None:
+                raise RuntimeError(
+                    "immutable stage5_input_linear pixels unavailable"
+                )
+            candidate_pixels = _stage5_current_pixels(pipeline)
+            local_catalog = (
+                list(getattr(pipeline, "_stage5_rl_star_catalog", []) or [])
+                if method == "siril_rl"
+                else star_reference_catalog
+            )
+            report = stage5_deconvolution_quality.assess_local_star_guard(
+                stage5_input_linear_pixels,
+                candidate_pixels,
+                local_catalog,
+                method=method,
+            )
+        except (
+            AttributeError,
+            CommandError,
+            RuntimeError,
+            SirilError,
+            TypeError,
+            ValueError,
+        ) as error:
+            report = (
+                stage5_deconvolution_quality.unavailable_local_star_guard_report(
+                    str(error),
+                    method=method,
+                )
+            )
+        report = {**report, "attempt": attempt}
+        local_star_guard_attempts.append(report)
+        return report
+
+    def restore_deconvolution_baseline(reason: str) -> Dict[str, Any]:
+        restored = _stage5_restore_denoise_baseline(
+            pipeline,
+            baseline_stem="stage5_input_linear",
+            baseline_pixels=stage5_input_linear_pixels,
+            rollback_label="Stage5 deconvolution baseline rollback",
+        )
+        restored["trigger"] = reason
+        return restored
+
+    primary_graxpert_applied, primary_graxpert_details = (
+        _run_stage5_graxpert_deconvolution(
+            pipeline,
+            messages,
+        )
     )
+    graxpert_attempts.append(dict(primary_graxpert_details))
+    graxpert_details = dict(primary_graxpert_details)
+    deconv_applied = primary_graxpert_applied
     if deconv_applied:
         deconv_method = "graxpert_object"
         deconv_attempted_method = "graxpert_object"
-        denoise_input = "stage5_graxpert_deconv"
+        denoise_input = str(
+            primary_graxpert_details.get("checkpoint")
+            or "stage5_graxpert_deconv"
+        )
+        local_star_guard = assess_deconvolution_candidate(
+            deconv_method,
+            attempt="graxpert_primary",
+        )
+        if not bool(local_star_guard.get("accepted", False)):
+            local_guard_triggered = True
+            local_guard_reason = str(
+                local_star_guard.get("reason_code")
+                or "local_star_guard_rejected"
+            )
+            rollback = restore_deconvolution_baseline(local_guard_reason)
+            local_star_guard["rollback"] = rollback
+            deconv_rollback_used = True
+            deconv_integrity_ok = bool(rollback.get("completed", False))
+            deconv_applied = False
+            deconv_method = "none"
+            denoise_input = "stage5_input_linear"
+            messages.append(
+                "Stage5 enforced local-star guard rolled back GraXpert "
+                f"primary candidate ({local_guard_reason})"
+            )
+
+            retry_strength = max(
+                0.20,
+                min(
+                    float(
+                        getattr(
+                            pipeline.cfg,
+                            "stage5_graxpert_guard_retry_strength",
+                            0.25,
+                        )
+                    ),
+                    float(primary_graxpert_details.get("strength", 0.30))
+                    - 0.05,
+                ),
+            )
+            retry_eligible = bool(
+                deconv_integrity_ok
+                and failure_action == "auto_fallback"
+                and local_star_guard.get("status") == "available"
+                and retry_strength
+                < float(primary_graxpert_details.get("strength", 0.30)) - 1e-9
+            )
+            if retry_eligible:
+                retry_applied, retry_details = (
+                    _run_stage5_graxpert_deconvolution(
+                        pipeline,
+                        messages,
+                        strength_override=retry_strength,
+                        checkpoint_stem=(
+                            "stage5_graxpert_deconv_guard_retry"
+                        ),
+                    )
+                )
+                retry_details["guard_retry"] = True
+                graxpert_attempts.append(dict(retry_details))
+                if retry_applied:
+                    retry_guard = assess_deconvolution_candidate(
+                        "graxpert_object",
+                        attempt="graxpert_guard_retry",
+                    )
+                    local_star_guard = retry_guard
+                    if bool(retry_guard.get("accepted", False)):
+                        deconv_applied = True
+                        deconv_method = "graxpert_object"
+                        denoise_input = str(
+                            retry_details.get("checkpoint")
+                            or "stage5_graxpert_deconv_guard_retry"
+                        )
+                        deconv_fallback_used = True
+                        messages.append(
+                            "Stage5 lower-strength GraXpert retry passed "
+                            "the enforced local-star guard"
+                        )
+                    else:
+                        local_guard_reason = str(
+                            retry_guard.get("reason_code")
+                            or "local_star_guard_rejected"
+                        )
+                        retry_rollback = restore_deconvolution_baseline(
+                            local_guard_reason
+                        )
+                        retry_guard["rollback"] = retry_rollback
+                        deconv_integrity_ok = bool(
+                            retry_rollback.get("completed", False)
+                        )
+                        messages.append(
+                            "Stage5 enforced local-star guard rejected the "
+                            "lower-strength GraXpert retry"
+                        )
+                else:
+                    retry_rollback = restore_deconvolution_baseline(
+                        "graxpert_guard_retry_execution_failed"
+                    )
+                    deconv_integrity_ok = bool(
+                        retry_rollback.get("completed", False)
+                    )
     else:
         if bool(getattr(pipeline.cfg, "stage5_deconvolution_enabled", True)):
             deconv_attempted_method = "siril_rl"
@@ -1370,97 +1556,134 @@ def run_stage5_linear_denoise(pipeline) -> None:
         )
         if deconv_applied:
             deconv_method = "siril_rl"
+            denoise_input = "stage5_deconv"
             deconv_fallback_used = bool(
                 getattr(
                     pipeline.cfg,
                     "stage5_graxpert_deconvolution_enabled",
                     True,
                 )
-                and graxpert_details.get("reason")
+                and primary_graxpert_details.get("reason")
                 not in {
                     "deconvolution_disabled",
                     "graxpert_deconvolution_disabled",
                 }
             )
-    if deconv_applied:
-        if deconv_method == "siril_rl":
-            denoise_input = "stage5_deconv"
-        try:
-            deconv_pixels = _stage5_current_pixels(pipeline)
-            local_catalog = (
-                list(getattr(pipeline, "_stage5_rl_star_catalog", []) or [])
-                if deconv_method == "siril_rl"
-                else star_reference_catalog
+            local_star_guard = assess_deconvolution_candidate(
+                deconv_method,
+                attempt="siril_rl",
             )
-            if stage5_input_linear_pixels is None:
-                raise RuntimeError("immutable stage5_input_linear pixels unavailable")
-            local_star_guard = (
-                stage5_deconvolution_quality.assess_local_star_guard(
-                    stage5_input_linear_pixels,
-                    deconv_pixels,
-                    local_catalog,
-                    method=deconv_method,
+            if not bool(local_star_guard.get("accepted", False)):
+                local_guard_triggered = True
+                local_guard_reason = str(
+                    local_star_guard.get("reason_code")
+                    or "local_star_guard_rejected"
                 )
-            )
-            if bool(local_star_guard.get("would_rollback")):
+                rollback = restore_deconvolution_baseline(local_guard_reason)
+                local_star_guard["rollback"] = rollback
+                deconv_rollback_used = True
+                deconv_integrity_ok = bool(rollback.get("completed", False))
+                deconv_applied = False
+                deconv_method = "none"
+                denoise_input = "stage5_input_linear"
                 messages.append(
-                    "Stage5 local-star shadow guard would rollback "
-                    f"{deconv_method}; enforcement remains disabled"
+                    "Stage5 enforced local-star guard rolled back Siril RL "
+                    f"candidate ({local_guard_reason})"
                 )
-        except (
-            AttributeError,
-            CommandError,
-            RuntimeError,
-            SirilError,
-            TypeError,
-            ValueError,
-        ) as error:
-            local_star_guard = {
-                **local_star_guard,
-                "status": "unavailable",
-                "reason_code": "measurement_failed",
-                "reason": str(error),
-            }
+
+    graxpert_details["attempts"] = graxpert_attempts
+    graxpert_details["accepted_checkpoint"] = (
+        denoise_input if deconv_method == "graxpert_object" else None
+    )
+    graxpert_details["accepted_strength"] = (
+        next(
+            (
+                float(attempt.get("strength"))
+                for attempt in reversed(graxpert_attempts)
+                if str(attempt.get("checkpoint") or "") == denoise_input
+            ),
+            None,
+        )
+        if deconv_method == "graxpert_object"
+        else None
+    )
+
+    if deconv_applied:
         after_deconv_adaptive = (
             pipeline._adaptive_features_current()
             if hasattr(pipeline, "_adaptive_features_current")
             else {}
         )
-        guard_triggered, guard_reason = _stage5_background_worsened(
-            before_adaptive,
-            after_deconv_adaptive,
-            pipeline,
+        background_guard_triggered, background_guard_reason = (
+            _stage5_background_worsened(
+                before_adaptive,
+                after_deconv_adaptive,
+                pipeline,
+            )
         )
-        if guard_triggered:
+        if background_guard_triggered:
             pipeline.log.warn(
-                f"[Stage5] background guard dropped {deconv_method} result: {guard_reason}"
+                "[Stage5] background guard dropped "
+                f"{deconv_method} result: {background_guard_reason}"
             )
             messages.append(
-                f"Stage5 background guard dropped {deconv_method} result: {guard_reason}"
+                "Stage5 background guard dropped "
+                f"{deconv_method} result: {background_guard_reason}"
             )
-            try:
-                pipeline.cmd_with_check("load", "stage5_input_linear")
-                denoise_input = "stage5_input_linear"
-                deconv_applied = False
-                deconv_method = "none"
-                deconv_rollback_used = True
-            except (CommandError, SirilError) as e:
+            rollback = restore_deconvolution_baseline(
+                "background_guard_rejected"
+            )
+            deconv_integrity_ok = bool(rollback.get("completed", False))
+            denoise_input = "stage5_input_linear"
+            deconv_applied = False
+            deconv_method = "none"
+            deconv_rollback_used = True
+            if not deconv_integrity_ok:
                 status = "degraded"
-                messages.append(f"Stage5 background guard reload failed: {pipeline._short_text(e, 160)}")
+                messages.append(
+                    "Stage5 background guard rollback failed: "
+                    f"{pipeline._short_text(rollback, 160)}"
+                )
 
     policy_abort_reason = ""
-    if guard_triggered and failure_action != "auto_fallback":
-        policy_abort_reason = (
-            "deconvolution background gate rejected candidate: " + guard_reason
-        )
-        pipeline._require_review(5, "deconvolution_background_gate_rejected")
+    if (
+        (local_guard_triggered and not deconv_applied)
+        or background_guard_triggered
+    ) and failure_action != "auto_fallback":
+        if local_guard_triggered and not deconv_applied:
+            policy_abort_reason = (
+                "deconvolution local-star gate rejected candidate: "
+                + local_guard_reason
+            )
+            pipeline._require_review(
+                5,
+                "deconvolution_local_star_gate_rejected",
+            )
+        else:
+            policy_abort_reason = (
+                "deconvolution background gate rejected candidate: "
+                + background_guard_reason
+            )
+            pipeline._require_review(
+                5,
+                "deconvolution_background_gate_rejected",
+            )
         messages.append(
-            "Stage5 candidate search stopped by failure policy after background rollback"
+            "Stage5 candidate search stopped by failure policy after "
+            "deconvolution rollback"
         )
+
+    if not deconv_integrity_ok and not policy_abort_reason:
+        policy_abort_reason = "deconvolution_rollback_failed"
+        pipeline._require_review(5, "deconvolution_rollback_failed")
 
     if not deconv_applied and pipeline.process_dir:
         try:
-            for stale_name in ("stage5_deconv.fit", "stage5_graxpert_deconv.fit"):
+            for stale_name in (
+                "stage5_deconv.fit",
+                "stage5_graxpert_deconv.fit",
+                "stage5_graxpert_deconv_guard_retry.fit",
+            ):
                 (pipeline.process_dir / stale_name).unlink(missing_ok=True)
         except OSError as e:
             pipeline.log.warn(f"[Stage5] stale deconvolution output cleanup failed: {e}")
@@ -1737,9 +1960,18 @@ def run_stage5_linear_denoise(pipeline) -> None:
     if deconv_applied:
         deconv_component_status = "applied"
         deconv_reason_code = "accepted"
-    elif guard_triggered:
+    elif background_guard_triggered:
         deconv_component_status = "rolled_back"
         deconv_reason_code = "background_guard_rollback"
+    elif local_guard_triggered:
+        deconv_component_status = (
+            "rolled_back" if deconv_integrity_ok else "failed"
+        )
+        deconv_reason_code = (
+            "local_star_guard_rollback"
+            if deconv_integrity_ok
+            else "deconvolution_rollback_failed"
+        )
     elif not bool(getattr(pipeline.cfg, "stage5_deconvolution_enabled", True)):
         deconv_component_status = "skipped"
         deconv_reason_code = (
@@ -1792,6 +2024,16 @@ def run_stage5_linear_denoise(pipeline) -> None:
             "output": "stage5_linear" if linear_saved else None,
             "fallback_used": denoise_fallback_used,
         },
+    }
+    pipeline._stage5_deconvolution_acceptance = {
+        "schema": "starun.stage5-deconvolution-acceptance.v1",
+        "accepted": bool(deconv_applied),
+        "method": deconv_method,
+        "accepted_checkpoint": denoise_input if deconv_applied else None,
+        "component": dict(components["deconvolution"]),
+        "local_star_guard": local_star_guard,
+        "attempts": local_star_guard_attempts,
+        "integrity_ok": bool(deconv_integrity_ok),
     }
     stage_fallback_used = (
         deconv_fallback_used
@@ -1936,11 +2178,13 @@ def run_stage5_linear_denoise(pipeline) -> None:
                 "psf_quality": psf_quality_report,
                 "target_structure_mask": target_structure_report,
                 "local_star_guard": local_star_guard,
+                "local_star_guard_attempts": local_star_guard_attempts,
+                "integrity_ok": deconv_integrity_ok,
             },
             "background_guard": {
                 "risk": background_risk,
-                "rollback": guard_triggered and not deconv_applied,
-                "reason": guard_reason,
+                "rollback": background_guard_triggered and not deconv_applied,
+                "reason": background_guard_reason,
                 "before": before_adaptive,
                 "after_deconvolution": after_deconv_adaptive,
                 "after_linear": after_linear_adaptive,

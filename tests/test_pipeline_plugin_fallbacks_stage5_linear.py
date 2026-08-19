@@ -112,10 +112,13 @@ class PipelinePluginFallbackStage5LinearTests(PipelinePluginFallbackTestBase):
         self.assertEqual(report["deconvolution"]["psf_quality"]["status"], "available")
         self.assertEqual(
             report["deconvolution"]["local_star_guard"]["mode"],
-            "shadow",
+            "enforced",
         )
-        self.assertFalse(
+        self.assertTrue(
             report["deconvolution"]["local_star_guard"]["enforced"]
+        )
+        self.assertTrue(
+            report["deconvolution"]["local_star_guard"]["accepted"]
         )
 
     def test_stage5_prefers_graxpert_object_deconvolution_when_model_exists(self):
@@ -183,12 +186,128 @@ class PipelinePluginFallbackStage5LinearTests(PipelinePluginFallbackTestBase):
         )
         self.assertEqual(
             report["deconvolution"]["local_star_guard"]["mode"],
-            "shadow",
+            "enforced",
         )
-        self.assertFalse(
+        self.assertTrue(
             report["deconvolution"]["local_star_guard"][
                 "participates_in_acceptance"
             ]
+        )
+
+    def test_stage5_graxpert_local_guard_retries_once_at_lower_strength(self):
+        processor = self._new_processor()
+        processor.cfg.denoise_enabled = False
+        processor.available_scripts.add("processing/GraXpert-AI.py")
+        model = (
+            processor.work_dir
+            / "Library"
+            / "Application Support"
+            / "GraXpert"
+            / "deconvolution-object-ai-models"
+            / "1.0.1"
+            / "model.onnx"
+        )
+        model.parent.mkdir(parents=True)
+        model.write_bytes(b"mock onnx")
+        original_runner = processor._run_plugin_script_by_path
+
+        def ring_primary(step_key, label, script_path, *, args=()):
+            result = original_runner(
+                step_key,
+                label,
+                script_path,
+                args=args,
+            )
+            if step_key == "Stage5 GraXpert反卷积":
+                strength = args[args.index("-strength") + 1]
+                if strength == "0.30":
+                    yy, xx = np.mgrid[
+                        : processor.image_pixels.shape[-2],
+                        : processor.image_pixels.shape[-1],
+                    ]
+                    for star in self._stage5_psf_stars():
+                        radius = np.sqrt(
+                            (xx - float(star.xpos)) ** 2
+                            + (yy - float(star.ypos)) ** 2
+                        )
+                        ring = (radius >= 3.0) & (radius <= 4.5)
+                        processor.image_pixels[:, ring] += 0.08
+            return result
+
+        processor._run_plugin_script_by_path = ring_primary
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": str(processor.work_dir),
+                "STARUN_GRAXPERT_OBJECT_MODEL_PATH": "",
+            },
+            clear=False,
+        ):
+            stage5_linear_denoise(processor)
+
+        report = processor.stage_json_reports["stage5_linear_report.json"]
+        attempts = report["deconvolution"]["local_star_guard_attempts"]
+        self.assertEqual(len(attempts), 2)
+        self.assertFalse(attempts[0]["accepted"])
+        self.assertTrue(attempts[1]["accepted"])
+        self.assertEqual(report["deconvolution"]["method"], "graxpert_object")
+        self.assertEqual(
+            report["deconvolution"]["graxpert"]["accepted_strength"],
+            0.25,
+        )
+        self.assertEqual(
+            len(
+                [
+                    call
+                    for call in processor.script_calls
+                    if call[0] == "Stage5 GraXpert反卷积"
+                ]
+            ),
+            2,
+        )
+
+    def test_stage5_unavailable_local_measurement_rolls_back_without_retry(self):
+        processor = self._new_processor()
+        processor.cfg.denoise_enabled = False
+        processor.siril.get_image_stars = lambda: []
+        processor.available_scripts.add("processing/GraXpert-AI.py")
+        model = (
+            processor.work_dir
+            / "Library"
+            / "Application Support"
+            / "GraXpert"
+            / "deconvolution-object-ai-models"
+            / "1.0.1"
+            / "model.onnx"
+        )
+        model.parent.mkdir(parents=True)
+        model.write_bytes(b"mock onnx")
+
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": str(processor.work_dir),
+                "STARUN_GRAXPERT_OBJECT_MODEL_PATH": "",
+            },
+            clear=False,
+        ):
+            stage5_linear_denoise(processor)
+
+        report = processor.stage_json_reports["stage5_linear_report.json"]
+        guard = report["deconvolution"]["local_star_guard"]
+        self.assertEqual(guard["status"], "unavailable")
+        self.assertFalse(guard["accepted"])
+        self.assertTrue(guard["rollback_required"])
+        self.assertEqual(report["deconvolution"]["method"], "none")
+        self.assertEqual(
+            len(
+                [
+                    call
+                    for call in processor.script_calls
+                    if call[0] == "Stage5 GraXpert反卷积"
+                ]
+            ),
+            1,
         )
 
     def test_stage5_graxpert_cpu_compatibility_disables_hardware_acceleration(self):
@@ -458,6 +577,98 @@ class PipelinePluginFallbackStage5LinearTests(PipelinePluginFallbackTestBase):
         report = processor.stage_json_reports["stage5_linear_report.json"]
         self.assertFalse(report["deconvolution"]["applied"])
         self.assertEqual(report["denoise"]["input"], "stage5_input_linear")
+
+    def test_stage5_rl_local_star_rejection_rolls_back_without_retry(self):
+        processor = self._new_processor()
+        processor.cfg.denoise_enabled = False
+        original_cmd = processor.cmd_with_check
+
+        def ring_after_rl(*args, quiet=False):
+            result = original_cmd(*args, quiet=quiet)
+            if args and args[0] == "rl":
+                yy, xx = np.mgrid[
+                    : processor.image_pixels.shape[-2],
+                    : processor.image_pixels.shape[-1],
+                ]
+                for star in self._stage5_psf_stars():
+                    radius = np.sqrt(
+                        (xx - float(star.xpos)) ** 2
+                        + (yy - float(star.ypos)) ** 2
+                    )
+                    ring = (radius >= 3.0) & (radius <= 4.5)
+                    processor.image_pixels[:, ring] += 0.08
+            return result
+
+        processor.cmd_with_check = ring_after_rl
+
+        stage5_linear_denoise(processor)
+
+        report = processor.stage_json_reports["stage5_linear_report.json"]
+        self.assertEqual(report["deconvolution"]["method"], "none")
+        self.assertEqual(
+            report["components"]["deconvolution"]["status"],
+            "rolled_back",
+        )
+        self.assertFalse(
+            report["deconvolution"]["local_star_guard"]["accepted"]
+        )
+        self.assertEqual(
+            [call[0] for call in processor.cmd_calls].count("rl"),
+            1,
+        )
+        np.testing.assert_array_equal(
+            processor.image_pixels,
+            processor.saved_image_pixels["stage5_input_linear"],
+        )
+
+    def test_stage5_double_restore_failure_stops_later_candidates(self):
+        processor = self._new_processor()
+        original_cmd = processor.cmd_with_check
+
+        def ring_after_rl(*args, quiet=False):
+            result = original_cmd(*args, quiet=quiet)
+            if args and args[0] == "rl":
+                yy, xx = np.mgrid[
+                    : processor.image_pixels.shape[-2],
+                    : processor.image_pixels.shape[-1],
+                ]
+                for star in self._stage5_psf_stars():
+                    radius = np.sqrt(
+                        (xx - float(star.xpos)) ** 2
+                        + (yy - float(star.ypos)) ** 2
+                    )
+                    processor.image_pixels[
+                        :,
+                        (radius >= 3.0) & (radius <= 4.5),
+                    ] += 0.08
+            return result
+
+        processor.cmd_with_check = ring_after_rl
+        stage5_module = sys.modules["stages.stage5_linear_denoise"]
+        with patch.object(
+            stage5_module,
+            "_stage5_restore_denoise_baseline",
+            return_value={
+                "required": True,
+                "completed": False,
+                "method": "failed",
+                "checkpoint_error": "mock checkpoint failure",
+                "pixel_error": "mock frozen pixel failure",
+            },
+        ):
+            stage5_linear_denoise(processor)
+
+        report = processor.stage_json_reports["stage5_linear_report.json"]
+        self.assertFalse(report["deconvolution"]["integrity_ok"])
+        self.assertEqual(
+            report["components"]["deconvolution"]["status"],
+            "failed",
+        )
+        self.assertFalse(any(call[0] == "denoise" for call in processor.cmd_calls))
+        self.assertIn(
+            "deconvolution_rollback_failed",
+            processor._stage_review_reasons(5),
+        )
 
     def test_stage5_all_deconvolution_methods_failed_marks_stage_degraded(self):
         processor = self._new_processor()

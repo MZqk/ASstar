@@ -13,6 +13,45 @@ SYQON_SCRIPT_CANDIDATES = (
 )
 
 
+def _stage6_galaxy_roi_diagnostics(
+    derived: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return the additive Stage 6/7 audit view of galaxy ROI fitting."""
+    values = derived if isinstance(derived, dict) else {}
+    return {
+        "status": str(values.get("galaxy_roi_status") or "not_run"),
+        "available": bool(
+            float(values.get("galaxy_roi_available", 0.0) or 0.0) > 0.5
+        ),
+        "failure_reason": str(
+            values.get("galaxy_roi_failure_reason") or ""
+        ),
+        "seed_position_px": {
+            "x": values.get("galaxy_roi_seed_x_px"),
+            "y": values.get("galaxy_roi_seed_y_px"),
+        },
+        "signal_floor": values.get("galaxy_roi_signal_floor"),
+        "signal_floor_components": dict(
+            values.get("galaxy_roi_signal_floor_components") or {}
+        ),
+        "raw_covariance_scale_px": {
+            "major_sigma": values.get(
+                "galaxy_roi_raw_covariance_major_sigma"
+            ),
+            "minor_sigma": values.get(
+                "galaxy_roi_raw_covariance_minor_sigma"
+            ),
+            "minimum_extent": values.get(
+                "galaxy_roi_minimum_covariance_extent"
+            ),
+        },
+        "star_clip_percentile": values.get(
+            "galaxy_roi_star_clip_percentile"
+        ),
+        "star_clip_value": values.get("galaxy_roi_star_clip_value"),
+    }
+
+
 def _stage6_repair_acceptance(
     *,
     score_before: float,
@@ -567,10 +606,26 @@ def _stage8_handoff_from_stage6(
 
     if not separation_accepted:
         policy = "skip"
-        add_reason(
-            "star_separation_unavailable",
-            quality_status=quality_status,
+        failure_codes = list(
+            getattr(pipeline, "_stage6_quality_failure_codes", []) or []
         )
+        definite_failure_codes = [
+            str(code)
+            for code in failure_codes
+            if str(code).upper() in _STAGE6_DEFINITE_QUALITY_REJECTION_CODES
+        ]
+        if definite_failure_codes:
+            add_reason(
+                "star_separation_quality_rejected",
+                quality_status=quality_status,
+                failure_codes=definite_failure_codes,
+            )
+        else:
+            add_reason(
+                "star_separation_unavailable",
+                quality_status=quality_status,
+                failure_codes=failure_codes,
+            )
     elif (
         quality_hard_failed_retained
         or residual_gate["hard_failed"]
@@ -872,7 +927,27 @@ _QUALITY_FAILURE_CODES = {
     "dynamic_range_collapse": "DYNAMIC_RANGE_COLLAPSE",
     "galaxy_core_damage": "GALAXY_CORE_DAMAGE",
     "bright_core_integrity": "BRIGHT_CORE_INTEGRITY",
+    "starmask_coverage": "STARMASK_COVERAGE",
+    "starmask_coverage_unavailable": "STARMASK_COVERAGE_UNAVAILABLE",
 }
+
+_STAGE6_DEFINITE_QUALITY_REJECTION_CODES = frozenset(
+    {
+        "HALO",
+        "RESIDUAL_GLOBAL",
+        "RESIDUAL_COMPACT",
+        "BLACK_HOLE",
+        "DYNAMIC_RANGE_COLLAPSE",
+        "GALAXY_CORE_DAMAGE",
+        "BRIGHT_CORE_INTEGRITY",
+        "STARMASK_COVERAGE",
+        "SCRIPT_CONTRACT",
+        "TILE_ARTIFACT",
+    }
+)
+_STAGE6_RETAINABLE_MEASUREMENT_UNCERTAINTY_CODES = frozenset(
+    {"STARMASK_COVERAGE_UNAVAILABLE"}
+)
 
 
 def _syqon_quality_failure_codes(repair_triggers: List[str]) -> List[str]:
@@ -896,13 +971,55 @@ def _stage6_can_retain_hard_failed_pair(
     pair_valid: bool,
     bright_core_retry_terminal_failure: bool = False,
 ) -> bool:
-    """Keep legacy review retention except for destructive bright-core failures."""
+    """Retain only a contract-valid pair with pure measurement uncertainty."""
+    failure_codes = {
+        str(code).strip().upper()
+        for code in (final_quality_failure.get("failure_codes") or [])
+        if str(code).strip()
+    }
     return bool(
         final_quality_failure.get("hard_failed", False)
         and pair_valid
         and not final_quality_failure.get("destructive_core_failure", False)
         and not bright_core_retry_terminal_failure
+        and failure_codes
+        and failure_codes.issubset(
+            _STAGE6_RETAINABLE_MEASUREMENT_UNCERTAINTY_CODES
+        )
     )
+
+
+def _stage6_exchange_failure_semantics(
+    exchange_report: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Separate completed-inference quality rejection from backend failure."""
+    report = dict(exchange_report or {})
+    failure_code = str(report.get("failure_code") or "").strip().upper()
+    status = str(report.get("status") or "").strip().lower()
+    quality_rejected = bool(
+        report.get("accepted") is not True
+        and status == "rejected"
+        and failure_code in _STAGE6_DEFINITE_QUALITY_REJECTION_CODES
+    )
+    return {
+        "quality_rejected": quality_rejected,
+        "star_separation_state": (
+            StarSeparationState.REJECTED.value
+            if quality_rejected
+            else StarSeparationState.TOOL_FAILED.value
+        ),
+        "reason_code": (
+            "star_separation_quality_rejected"
+            if quality_rejected
+            else "star_separation_tool_failed"
+        ),
+        "underlying_failure_code": failure_code or None,
+        "retry_history": [
+            dict(item)
+            for item in (report.get("attempts") or [])
+            if isinstance(item, dict)
+        ],
+    }
 
 
 def _stage6_bright_core_retry_plan(
@@ -1130,6 +1247,9 @@ def run_stage6_star_separation(pipeline) -> None:
     pipeline._selected_syqon_pair_id = None
     pipeline._selected_syqon_attempt_id = None
     pipeline._stage6_pair_handoff = None
+    pipeline._stage6_galaxy_roi_diagnostics = (
+        _stage6_galaxy_roi_diagnostics()
+    )
     pipeline._stage8_handoff = {
         "schema": "starun.stage8-handoff.v2",
         "requested_policy": "full",
@@ -1246,6 +1366,7 @@ def run_stage6_star_separation(pipeline) -> None:
                 {
                     "attempts": [quality_record],
                     "selected": quality_record,
+                    "galaxy_roi": pipeline._stage6_galaxy_roi_diagnostics,
                     "mode": bypass_reason,
                     "star_separation_state": pipeline._star_separation_state,
                     "target_type": target_type,
@@ -1327,6 +1448,7 @@ def run_stage6_star_separation(pipeline) -> None:
                     {
                         "attempts": [],
                         "selected": None,
+                        "galaxy_roi": pipeline._stage6_galaxy_roi_diagnostics,
                         "mode": "user_preserve",
                         "star_separation_state": pipeline._star_separation_state,
                         "input_domain": "linear",
@@ -1412,6 +1534,7 @@ def run_stage6_star_separation(pipeline) -> None:
             else None
         )
         if syqon_script is not None:
+            pipeline._last_syqon_exchange_report = {}
             _syqon_args, _syqon_timeout, syqon_device_note = pipeline._syqon_starless_cli_options(
                 profile=syqon_profile,
             )
@@ -1426,6 +1549,33 @@ def run_stage6_star_separation(pipeline) -> None:
             )
             initial_exchange = getattr(pipeline, "_last_syqon_exchange_report", {})
             if (
+                not syqon_used
+                and isinstance(initial_exchange, dict)
+                and initial_exchange.get("failure_code") == "TILE_ARTIFACT"
+                and bool(
+                    getattr(
+                        pipeline.cfg,
+                        "stage6_syqon_seam_retry_enabled",
+                        True,
+                    )
+                )
+            ):
+                stage_messages.append(
+                    "SyQon tile artifact gate rejected the initial pair; "
+                    "retrying once with 512/128 CPU FP32"
+                )
+                syqon_profile = (
+                    syqon_starless.SYQON_TILE_ARTIFACT_RECOVERY_PROFILE
+                )
+                _syqon_args, _syqon_timeout, syqon_device_note = (
+                    pipeline._syqon_starless_cli_options(profile=syqon_profile)
+                )
+                syqon_used = pipeline._stage7_try_syqon_variant(
+                    syqon_script,
+                    attempt_name="tile_artifact_cpu_recovery",
+                    profile=syqon_profile,
+                )
+            elif (
                 not syqon_used
                 and isinstance(initial_exchange, dict)
                 and initial_exchange.get("failure_code") == "OOM_DEVICE"
@@ -1885,6 +2035,9 @@ def run_stage6_star_separation(pipeline) -> None:
             if isinstance(selected_quality, dict)
             else {}
         )
+        pipeline._stage6_galaxy_roi_diagnostics = (
+            _stage6_galaxy_roi_diagnostics(selected_derived)
+        )
         selected_advisories = [
             str(item).strip()
             for item in (selected_quality or {}).get("advisories", [])
@@ -1966,6 +2119,14 @@ def run_stage6_star_separation(pipeline) -> None:
             ),
         )
         separation_accepted = quality_gate_passed or poor_candidate_retained
+        quality_rejected = bool(
+            not separation_accepted
+            and (
+                final_quality_failure["hard_failed"]
+                or bright_core_retry_terminal_failure
+                or cleanup_hard_failed
+            )
+        )
         pipeline._bright_core_with_stars_fallback = (
             _stage6_bright_core_with_stars_fallback_contract(
                 pipeline,
@@ -1992,7 +2153,21 @@ def run_stage6_star_separation(pipeline) -> None:
             )
         if not separation_accepted:
             pipeline._stage7_starless_skipped = True
-            if failure_action != "auto_fallback":
+            if quality_rejected:
+                pipeline._require_review(6, "star_separation_quality_rejected")
+                if hasattr(pipeline, "_record_stage_policy_event"):
+                    pipeline._record_stage_policy_event(
+                        6,
+                        event="candidate_rejected",
+                        reason=(
+                            "starless candidate failed active quality gates: "
+                            + ", ".join(
+                                quality_failure_codes or ["UNKNOWN_QUALITY"]
+                            )
+                        ),
+                        source="starless_quality_gate",
+                    )
+            elif failure_action != "auto_fallback":
                 pipeline._require_review(6, "star_separation_candidate_rejected")
                 if hasattr(pipeline, "_record_stage_policy_event"):
                     pipeline._record_stage_policy_event(
@@ -2007,8 +2182,15 @@ def run_stage6_star_separation(pipeline) -> None:
             pipeline._stage7_update_star_remix_from_quality(None)
             stage9_remix_quality = None
             stage_messages.append(
-                "star separation candidate rejected; downstream uses with-stars "
-                "review passthrough"
+                (
+                    "star_separation_quality_rejected: bad Starless pair cannot "
+                    "enter downstream processing; using with-stars review passthrough"
+                )
+                if quality_rejected
+                else (
+                    "star separation candidate rejected; downstream uses with-stars "
+                    "review passthrough"
+                )
             )
             if removed_artifacts:
                 stage_messages.append(
@@ -2075,6 +2257,7 @@ def run_stage6_star_separation(pipeline) -> None:
             {
                 "attempts": quality_records,
                 "selected": selected_quality,
+                "galaxy_roi": pipeline._stage6_galaxy_roi_diagnostics,
                 "mode": quality_mode,
                 "backend_policy": backend_policy,
                 "failure_action": failure_action,
@@ -2093,6 +2276,11 @@ def run_stage6_star_separation(pipeline) -> None:
                 "retry_max": pipeline.cfg.stage7_quality_retry_max,
                 "automatic_quality_retries": parameter_retries_done,
                 "quality_failure_codes": quality_failure_codes,
+                "rejection_reason_code": (
+                    "star_separation_quality_rejected"
+                    if quality_rejected
+                    else None
+                ),
                 "quality_hard_failed_retained": poor_candidate_retained,
                 "bright_core_integrity": (
                     (selected_quality or {}).get("bright_core_integrity")
@@ -2184,6 +2372,8 @@ def run_stage6_star_separation(pipeline) -> None:
                 reason_code=(
                     "stage6_quality_hard_failed_retained"
                     if poor_candidate_retained
+                    else "star_separation_quality_rejected"
+                    if quality_rejected
                     else "failure_policy_stop"
                     if not separation_accepted and failure_action == "stop"
                     else "failure_policy_preserve_review"
@@ -2217,21 +2407,49 @@ def run_stage6_star_separation(pipeline) -> None:
             )
 
     except (CommandError, SirilError) as e:
-        pipeline.log.error(f"去星流程失败: {e}")
-        pipeline.log.error("请检查哈希锁定的 SyQon Zenith 环境与模型配置")
+        syqon_exchange = dict(
+            getattr(pipeline, "_last_syqon_exchange_report", {}) or {}
+        )
+        failure_semantics = _stage6_exchange_failure_semantics(syqon_exchange)
+        quality_rejected = bool(failure_semantics["quality_rejected"])
+        reason_code = str(failure_semantics["reason_code"])
+        underlying_failure_code = failure_semantics[
+            "underlying_failure_code"
+        ]
+        if quality_rejected:
+            pipeline.log.error(
+                "去星推理产物被质量门拒绝: "
+                f"{underlying_failure_code or pipeline._short_text(e, 180)}"
+            )
+        else:
+            pipeline.log.error(f"去星流程失败: {e}")
+            pipeline.log.error("请检查哈希锁定的 SyQon Zenith 环境与模型配置")
         pipeline.starless_file = None
         pipeline.starmask_file = None
         pipeline._stage7_starless_skipped = True
         pipeline._stage8_conservative_mode = True
-        pipeline._star_separation_state = StarSeparationState.TOOL_FAILED.value
-        if failure_action != "auto_fallback":
-            pipeline._require_review(6, "star_separation_tool_failed")
+        pipeline._star_separation_state = failure_semantics[
+            "star_separation_state"
+        ]
+        if quality_rejected:
+            pipeline._require_review(6, reason_code)
+        elif failure_action != "auto_fallback":
+            pipeline._require_review(6, reason_code)
+        if quality_rejected or failure_action != "auto_fallback":
             if hasattr(pipeline, "_record_stage_policy_event"):
                 pipeline._record_stage_policy_event(
                     6,
-                    event="backend_failed",
+                    event=(
+                        "candidate_rejected"
+                        if quality_rejected
+                        else "backend_failed"
+                    ),
                     reason=pipeline._short_text(e, 180),
-                    source="starless_backend",
+                    source=(
+                        "starless_quality_gate"
+                        if quality_rejected
+                        else "starless_backend"
+                    ),
                 )
         syqon_starless.purge_unaccepted_star_separation_outputs(pipeline)
         pipeline._stage8_handoff.update(
@@ -2239,16 +2457,18 @@ def run_stage6_star_separation(pipeline) -> None:
                 "requested_policy": "skip",
                 "processing_policy": "skip",
                 "restricted_downstream": True,
-                "reason_code": "star_separation_tool_failed",
-                "reason_text": "star_separation_tool_failed",
+                "reason_code": reason_code,
+                "reason_text": reason_code,
                 "reasons": [
                     {
-                        "code": "star_separation_tool_failed",
+                        "code": reason_code,
                         "source_stage": 6,
                         "error": pipeline._short_text(e, 180),
+                        "underlying_failure_code": underlying_failure_code,
+                        "retry_history": failure_semantics["retry_history"],
                     }
                 ],
-                "quality_status": "failed",
+                "quality_status": "rejected" if quality_rejected else "failed",
             }
         )
         pipeline._stage7_update_star_remix_from_quality(None)
@@ -2265,13 +2485,19 @@ def run_stage6_star_separation(pipeline) -> None:
                         "tool_label": "none",
                         "status": "degraded",
                         "issues": [pipeline._short_text(e, 180)],
+                        "reason_code": reason_code,
+                        "underlying_failure_code": underlying_failure_code,
                     }
                 ],
                 "selected": None,
+                "galaxy_roi": pipeline._stage6_galaxy_roi_diagnostics,
                 "mode": "with_stars_review_passthrough",
                 "backend_policy": backend_policy,
                 "failure_action": failure_action,
                 "star_separation_state": pipeline._star_separation_state,
+                "reason_code": reason_code,
+                "underlying_failure_code": underlying_failure_code,
+                "syqon_exchange": syqon_exchange,
                 "input_domain": "linear",
                 "selected_source_stem": pipeline.stretched_name,
                 "preflight": locals().get("stage7_preflight"),
@@ -2289,7 +2515,11 @@ def run_stage6_star_separation(pipeline) -> None:
         pipeline._export_sasp_exchange_files()
 
         elapsed = pipeline.log.stage_end(stage_label)
-        message = "无可用去星工具，已切换为含星复核路径"
+        message = (
+            "去星产物未通过质量门，已切换为含星复核路径"
+            if quality_rejected
+            else "无可用去星工具，已切换为含星复核路径"
+        )
         if not stage_saved:
             message += "；stage7 输出保存失败"
         pipeline._record_stage(
@@ -2301,7 +2531,9 @@ def run_stage6_star_separation(pipeline) -> None:
             fallback_used=True,
             upstream_passthrough=True,
             reason_code=(
-                "failure_policy_stop"
+                reason_code
+                if quality_rejected
+                else "failure_policy_stop"
                 if failure_action == "stop"
                 else "failure_policy_preserve_review"
                 if failure_action == "preserve_review"
@@ -2321,7 +2553,8 @@ def run_stage6_star_separation(pipeline) -> None:
                 {
                     "component": "star_separation",
                     "severity": "fatal" if failure_action == "stop" else "error",
-                    "code": "star_separation_tool_failed",
+                    "code": reason_code,
+                    "underlying_failure_code": underlying_failure_code,
                     "recovered": bool(stage_saved and failure_action != "stop"),
                     "message": pipeline._short_text(e, 180),
                 }

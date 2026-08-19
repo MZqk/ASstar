@@ -83,6 +83,21 @@ class TargetRuntimeMixin:
             self.process_dir,
             getattr(self, "input_dir", None),
         ]
+        task_manifest = getattr(self, "_task_run_manifest_payload", None)
+        source = (
+            task_manifest.get("source")
+            if isinstance(task_manifest, dict)
+            else None
+        )
+        if isinstance(source, dict):
+            values.append(source.get("selected_path"))
+            files = source.get("files")
+            if isinstance(files, list):
+                values.extend(
+                    item.get("display_path")
+                    for item in files
+                    if isinstance(item, dict)
+                )
         return " ".join(str(value) for value in values if value is not None)
 
 
@@ -115,6 +130,20 @@ class TargetRuntimeMixin:
                 source=stage_label,
                 policy_candidate=policy if isinstance(policy, dict) else None,
             )
+            if (
+                profile.get("identity_status") == "conflict"
+                and hasattr(self, "_require_review")
+            ):
+                self._require_review(
+                    3,
+                    "target_identity_conflict",
+                    {
+                        "source": stage_label,
+                        "identity_evidence": copy.deepcopy(
+                            profile.get("identity_evidence") or {}
+                        ),
+                    },
+                )
             self._write_stage_json("target_profile.json", profile)
             self._write_stage_json("pipeline_policy.json", policy)
             new_policy = self._active_policy_name()

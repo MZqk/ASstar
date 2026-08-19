@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -12,7 +13,7 @@ PIPELINE_DIR = Path(__file__).resolve().parents[1] / "pipeline"
 if str(PIPELINE_DIR) not in sys.path:
     sys.path.insert(0, str(PIPELINE_DIR))
 
-from managed_output import export_managed_outputs  # noqa: E402
+from managed_output import audit_display_visibility, export_managed_outputs  # noqa: E402
 from output_color import (  # noqa: E402
     build_output_color_manifest,
     inspect_output_artifact,
@@ -26,7 +27,78 @@ def _test_icc_profile() -> bytes:
     return bytes(profile)
 
 
+def _star_visibility_fixture(
+    coordinates: tuple[tuple[int, int], ...],
+) -> tuple[dict, SimpleNamespace]:
+    count = len(coordinates)
+    y = np.asarray([item[0] for item in coordinates], dtype=np.int32)
+    x = np.asarray([item[1] for item in coordinates], dtype=np.int32)
+    weak = np.zeros(count, dtype=bool)
+    weak[::2] = True
+    return (
+        {
+            "status": "ok",
+            "source_matched": True,
+            "_source_peak_y": y,
+            "_source_peak_x": x,
+            "_peak_y": y.copy(),
+            "_peak_x": x.copy(),
+            "_weak_flags": weak,
+            "_reference_local_contrast": np.full(
+                count,
+                0.10,
+                dtype=np.float32,
+            ),
+            "_stage9_visibility_inner_window_size_px": np.full(
+                count,
+                3,
+                dtype=np.int32,
+            ),
+            "_stage9_visibility_outer_window_size_px": np.full(
+                count,
+                7,
+                dtype=np.int32,
+            ),
+        },
+        SimpleNamespace(
+            stage9_psf_min_sample_count=4,
+            stage9_catalog_star_visibility_contrast_min=0.002,
+            stage9_star_recovery_ratio_min=0.75,
+            stage9_weak_star_recovery_ratio_min=0.70,
+            stage9_bright_star_visibility_ratio_min=0.90,
+        ),
+    )
+
+
 class ManagedOutputTests(unittest.TestCase):
+    def test_generic_compact_peaks_cannot_satisfy_required_stars(self) -> None:
+        image = np.full((3, 96, 128), 0.14, dtype=np.float32)
+        for y, x in (
+            (10, 12),
+            (18, 52),
+            (27, 96),
+            (42, 30),
+            (55, 75),
+            (70, 111),
+            (82, 20),
+            (88, 90),
+        ):
+            image[:, y, x] = 0.92
+
+        audit = audit_display_visibility(
+            image,
+            target_type="emission_nebula_widefield",
+            stars_required=True,
+        )
+
+        star_check = audit["checks"]["star_visibility"]
+        self.assertTrue(
+            star_check["compact_peak_diagnostic"]["passed"],
+            audit,
+        )
+        self.assertFalse(star_check["passed"])
+        self.assertIn("star_visibility", audit["failed_checks"])
+
     def test_managed_derivatives_are_tagged_and_fits_is_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -101,19 +173,25 @@ class ManagedOutputTests(unittest.TestCase):
         )
         green = 0.075 + 0.055 * galaxy
         image = np.stack((green * 1.03, green, green * 0.94)).astype(np.float32)
-        for y_pos, x_pos, value in (
+        star_coordinates = (
             (20, 30, 0.45),
             (40, 180, 0.35),
             (80, 40, 0.40),
             (130, 190, 0.50),
             (155, 90, 0.30),
             (60, 120, 0.40),
-        ):
+            (105, 210, 0.38),
+            (145, 55, 0.42),
+        )
+        for y_pos, x_pos, value in star_coordinates:
             image[:, y_pos, x_pos] = np.clip(
                 image[:, y_pos, x_pos] + value,
                 0.0,
                 1.0,
             )
+        star_reference, visibility_config = _star_visibility_fixture(
+            tuple((y, x) for y, x, _value in star_coordinates)
+        )
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -124,6 +202,8 @@ class ManagedOutputTests(unittest.TestCase):
                 output_format="png",
                 target_type="large_galaxy",
                 stars_required=True,
+                star_reference=star_reference,
+                star_visibility_config=visibility_config,
             )
 
             self.assertTrue(report["ready"], report)

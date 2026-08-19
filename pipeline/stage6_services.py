@@ -76,12 +76,14 @@ RESULT_BASENAME_TEMPLATE = (
 )
 STAGE7_ASINH_STRETCH_MIN = 1.0
 STAGE7_ASINH_STRETCH_MAX = 1000.0
-STAGE7_CANDIDATE_RANKING_POLICY = "hard_gate_bounded_presentation_score_v4"
+STAGE7_CANDIDATE_RANKING_POLICY = "hard_gate_bounded_subject_brightness_v6"
 STAGE7_CANDIDATE_RANKING_FIELDS = (
     "status",
     "hard_gate_eligibility",
     "technical_safety",
     "stretch_saturated_penalty",
+    "subject_brightness_floor",
+    "subject_brightness_goals_capped",
     "bounded_presentation_score",
     "preview_visibility_retention_capped_at_goal",
     "preview_subject_span_retention_capped_at_goal",
@@ -479,13 +481,30 @@ def _stage7_matched_domain_transfer_contract(
                 or parent.get("name")
                 or ""
             )
+    tone_method = str(tone_candidate.get("method") or "")
+    calibration = copy.deepcopy(
+        (tone_candidate.get("params") or {}).get("calibration") or {}
+    )
+    calibration_method = str(calibration.get("method") or "")
     if (
-        str(tone_candidate.get("method") or "") == "display90_linked_lut"
+        tone_method in stage7_stretch_metrics.DISPLAY_LUT_METHODS
+        or calibration_method in stage7_stretch_metrics.DISPLAY_LUT_METHODS
         or tone_candidate_id.startswith("cand_display")
     ):
-        calibration = copy.deepcopy(
-            (tone_candidate.get("params") or {}).get("calibration") or {}
-        )
+        if (
+            tone_method in stage7_stretch_metrics.DISPLAY_LUT_METHODS
+            and calibration_method in stage7_stretch_metrics.DISPLAY_LUT_METHODS
+            and tone_method != calibration_method
+        ):
+            return {
+                **base,
+                "method": tone_method,
+                "reason": (
+                    "selected Display90 candidate method does not match its "
+                    "calibration semantics"
+                ),
+            }
+        display_method = calibration_method or tone_method
         try:
             _lut, lut_contract = (
                 stage7_stretch_metrics.rebuild_display90_linked_lut(
@@ -495,13 +514,19 @@ def _stage7_matched_domain_transfer_contract(
         except (KeyError, TypeError, ValueError, FloatingPointError) as error:
             return {
                 **base,
-                "method": "display90_linked_lut",
+                "method": display_method or None,
                 "reason": f"selected Display90 contract is invalid: {error}",
             }
         return {
             **base,
+            "schema": (
+                stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V1
+                if calibration.get("schema")
+                == stage7_stretch_metrics.DISPLAY90_STRETCH_SCHEMA_V1
+                else stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V2
+            ),
             "status": "active",
-            "method": "display90_linked_lut",
+            "method": display_method,
             "source": "selected_stage7_candidate",
             "tone_candidate_id": tone_candidate_id,
             "calibration": calibration,
@@ -1240,7 +1265,7 @@ class Stage6ServiceMixin:
                     label=f"Stage7 {method}",
                 )
                 return True, method
-            if method == "display90_linked_lut":
+            if method in stage7_stretch_metrics.DISPLAY_LUT_METHODS:
                 image_data = self.siril.get_image_pixeldata(preview=False)
                 if image_data is None:
                     raise RuntimeError("image buffer is empty")
@@ -1717,6 +1742,19 @@ class Stage6ServiceMixin:
                 dict(preview_rendition_metrics or {}),
             ),
         }
+        subject_brightness = (
+            stage7_stretch_metrics.subject_brightness_selection(
+                candidate_rendition_metrics,
+                dict(preview_rendition_metrics or {}),
+            )
+        )
+        quality_gates["subject_brightness"] = subject_brightness
+        if not bool(subject_brightness.get("formal_floor_passed", False)):
+            quality_ok = False
+            issues = [
+                *issues,
+                "stage7_subject_brightness_floor_unmet",
+            ]
         quality_ok, issues, visibility_gate = (
             self._stage7_apply_candidate_visibility_gate(
                 quality_ok,
@@ -1813,7 +1851,9 @@ class Stage6ServiceMixin:
             "issues": [],
             "method": candidate.get("method"),
         }
-        if str(candidate.get("method") or "") == "display90_linked_lut":
+        if str(candidate.get("method") or "") in (
+            stage7_stretch_metrics.DISPLAY_LUT_METHODS
+        ):
             display90_curve_quality = (
                 stage7_stretch_metrics.assess_display90_curve_conformance(
                     dict(
@@ -1958,6 +1998,7 @@ class Stage6ServiceMixin:
             "pixel_stats": pixel_stats,
             "preview_retention": preview_retention,
             "rendition_metrics": rendition_metrics,
+            "subject_brightness_selection": subject_brightness,
             "visibility_gate": visibility_gate,
             "preview_target_attainment": preview_target_attainment,
             "mtf_reference_quality": mtf_reference_quality,
@@ -2311,12 +2352,17 @@ class Stage6ServiceMixin:
             "signal_exclusion_keys": signal_keys,
             "mask_scope": "stage6_frozen_signal_excluded_background_mask",
             "reference_application": "gui_rec709_luminance_gain",
-            "candidate_application": "linked_rgb_common_lut",
+            "candidate_application": (
+                "rec709_luminance_uniform_rgb_gain"
+                if candidate_method
+                == stage7_stretch_metrics.DISPLAY_LUMINANCE_VECTOR_METHOD
+                else "linked_rgb_common_lut"
+            ),
             "reference_metrics": {},
         }
         if not (
             str(candidate_name or "").startswith("cand_display")
-            and candidate_method == "display90_linked_lut"
+            and candidate_method in stage7_stretch_metrics.DISPLAY_LUT_METHODS
         ):
             return report
 
@@ -2719,7 +2765,8 @@ class Stage6ServiceMixin:
             and reference_match.get("measurement_status") == "available"
             and reference_match.get("applicable") is True
             and str(candidate_name or "").startswith("cand_display")
-            and str(candidate_method or "") == "display90_linked_lut"
+            and str(candidate_method or "")
+            in stage7_stretch_metrics.DISPLAY_LUT_METHODS
             and reference_match.get("automatic_accepted_starless_route") is True
             and reference_match.get("channel_semantics")
             == "narrowband_composite"
@@ -3364,32 +3411,50 @@ class Stage6ServiceMixin:
                 "microcontrast": 0.75,
             },
         }[profile]
-        weights = {
-            "nebula": {
-                "visibility": 0.28,
-                "subject_span": 0.24,
-                "saturation_median": 0.28,
-                "microcontrast": 0.20,
-            },
-            "galaxy": {
-                "visibility": 0.30,
-                "subject_span": 0.27,
-                "saturation_median": 0.18,
-                "microcontrast": 0.25,
-            },
-            "cluster": {
-                "visibility": 0.27,
-                "subject_span": 0.23,
-                "saturation_median": 0.25,
-                "microcontrast": 0.25,
-            },
-            "generic": {
-                "visibility": 0.28,
-                "subject_span": 0.25,
-                "saturation_median": 0.25,
-                "microcontrast": 0.22,
-            },
-        }[profile]
+        subject_brightness = attempt.get("subject_brightness_selection")
+        lift_reliable = bool(
+            not isinstance(subject_brightness, dict)
+            or (subject_brightness.get("preview_reliability") or {}).get(
+                "subject_lift_reliable",
+                True,
+            )
+        )
+        low_lift_nebula = bool(profile == "nebula" and not lift_reliable)
+        weights = (
+            {
+                "visibility": 0.25,
+                "subject_span": 0.30,
+                "saturation_median": 0.15,
+                "microcontrast": 0.30,
+            }
+            if low_lift_nebula
+            else {
+                "nebula": {
+                    "visibility": 0.28,
+                    "subject_span": 0.24,
+                    "saturation_median": 0.28,
+                    "microcontrast": 0.20,
+                },
+                "galaxy": {
+                    "visibility": 0.30,
+                    "subject_span": 0.27,
+                    "saturation_median": 0.18,
+                    "microcontrast": 0.25,
+                },
+                "cluster": {
+                    "visibility": 0.27,
+                    "subject_span": 0.23,
+                    "saturation_median": 0.25,
+                    "microcontrast": 0.25,
+                },
+                "generic": {
+                    "visibility": 0.28,
+                    "subject_span": 0.25,
+                    "saturation_median": 0.25,
+                    "microcontrast": 0.22,
+                },
+            }[profile]
+        )
         utilities: Dict[str, float] = {}
         missing: List[str] = []
         for name, goal in goals.items():
@@ -3497,6 +3562,11 @@ class Stage6ServiceMixin:
         return {
             "policy": STAGE7_CANDIDATE_RANKING_POLICY,
             "profile": profile,
+            "selection_mode": (
+                "low_lift_structure_first"
+                if low_lift_nebula
+                else "bounded_subject_brightness"
+            ),
             "score": float(score),
             "presentation_utility": float(presentation),
             "safety_headroom": float(safety),
@@ -3505,6 +3575,7 @@ class Stage6ServiceMixin:
             "safety": safety_values,
             "missing_metrics": missing,
             "saturation_p95_role": "gate_and_diagnostic_only",
+            "subject_brightness": subject_brightness,
         }
 
 
@@ -3532,6 +3603,38 @@ class Stage6ServiceMixin:
                 )
             )
         )
+        subject_brightness = attempt.get("subject_brightness_selection")
+        if isinstance(subject_brightness, dict):
+            brightness_floor_penalty = int(
+                not bool(
+                    subject_brightness.get("formal_floor_passed", False)
+                )
+            )
+            brightness_ranking = subject_brightness.get("ranking") or {}
+            try:
+                brightness_goal_count = max(
+                    0,
+                    int(brightness_ranking.get("goal_count", 0) or 0),
+                )
+            except (TypeError, ValueError):
+                brightness_goal_count = 0
+            try:
+                brightness_utility = float(
+                    brightness_ranking.get("utility", 0.0) or 0.0
+                )
+            except (TypeError, ValueError):
+                brightness_utility = 0.0
+            if not math.isfinite(brightness_utility):
+                brightness_utility = 0.0
+            brightness_utility = _clamp_float(
+                brightness_utility,
+                0.0,
+                1.0,
+            )
+        else:
+            brightness_floor_penalty = 0
+            brightness_goal_count = 0
+            brightness_utility = 0.0
         report = attempt.get("presentation_score") or cls._stage7_presentation_score(
             attempt
         )
@@ -3554,14 +3657,36 @@ class Stage6ServiceMixin:
             risk_score = 1_000_000.0
         if not math.isfinite(risk_score):
             risk_score = 1_000_000.0
+        lift_reliable = bool(
+            not isinstance(subject_brightness, dict)
+            or (subject_brightness.get("preview_reliability") or {}).get(
+                "subject_lift_reliable",
+                True,
+            )
+        )
+        if lift_reliable:
+            ranking_tail = (
+                -brightness_goal_count,
+                -brightness_utility,
+                -score,
+                advisory_count,
+                risk_score,
+            )
+        else:
+            ranking_tail = (
+                -score,
+                advisory_count,
+                risk_score,
+                -brightness_goal_count,
+                -brightness_utility,
+            )
         return (
             status_penalty,
             final_penalty,
             technical_penalty,
             stretch_saturated_penalty,
-            -score,
-            advisory_count,
-            risk_score,
+            brightness_floor_penalty,
+            *ranking_tail,
             str(attempt.get("name") or ""),
         )
 
@@ -3735,7 +3860,12 @@ class Stage6ServiceMixin:
         method = str(attempt.get("method") or "")
         required_contract = {
             "linked_mtf": "mtf_reference_quality",
-            "display90_linked_lut": "display90_curve_quality",
+            stage7_stretch_metrics.DISPLAY90_LEGACY_METHOD: (
+                "display90_curve_quality"
+            ),
+            stage7_stretch_metrics.DISPLAY_LUMINANCE_VECTOR_METHOD: (
+                "display90_curve_quality"
+            ),
         }.get(method)
         if required_contract and not bool(
             (attempt.get(required_contract) or {}).get("accepted", False)
@@ -5124,7 +5254,7 @@ class Stage6ServiceMixin:
         display90_calibration: Dict[str, Any] = {
             "schema": stage7_stretch_metrics.DISPLAY90_STRETCH_SCHEMA,
             "status": "not_applicable",
-            "method": "display90_linked_lut",
+            "method": stage7_stretch_metrics.DISPLAY_LUMINANCE_VECTOR_METHOD,
             "eligibility": {
                 "policy_requested": display90_requested,
                 "automatic_parameter_mode": not manual_parameter_mode,
@@ -5240,7 +5370,9 @@ class Stage6ServiceMixin:
                     preview_contract[
                         "candidate_" + candidate_name.removeprefix("cand_")
                     ] = {
-                        "calibration_method": "display90_linked_lut",
+                        "calibration_method": (
+                            stage7_stretch_metrics.DISPLAY_LUMINANCE_VECTOR_METHOD
+                        ),
                         "target_contract": (
                             "authenticated_display_ladder_lut_prediction"
                         ),
@@ -5264,7 +5396,9 @@ class Stage6ServiceMixin:
                     display_candidates.append({
                         "name": candidate_name,
                         "stem": candidate_stem,
-                        "method": "display90_linked_lut",
+                        "method": (
+                            stage7_stretch_metrics.DISPLAY_LUMINANCE_VECTOR_METHOD
+                        ),
                         "params": {
                             "calibration": calibration,
                             "strength_tier": tier,
@@ -5283,7 +5417,9 @@ class Stage6ServiceMixin:
                 display90_calibration = {
                     "schema": stage7_stretch_metrics.DISPLAY90_STRETCH_SCHEMA,
                     "status": "unavailable",
-                    "method": "display90_linked_lut",
+                    "method": (
+                        stage7_stretch_metrics.DISPLAY_LUMINANCE_VECTOR_METHOD
+                    ),
                     "reason": str(error),
                 }
                 display_ladder = {
@@ -6613,6 +6749,26 @@ class Stage6ServiceMixin:
                                     )
                                 ),
                             }
+                            subject_brightness = (
+                                stage7_stretch_metrics.subject_brightness_selection(
+                                    candidate_rendition_metrics,
+                                    dict(preview_rendition_metrics or {}),
+                                )
+                            )
+                            quality_gates["subject_brightness"] = (
+                                subject_brightness
+                            )
+                            if not bool(
+                                subject_brightness.get(
+                                    "formal_floor_passed",
+                                    False,
+                                )
+                            ):
+                                quality_ok = False
+                                issues = [
+                                    *issues,
+                                    "stage7_subject_brightness_floor_unmet",
+                                ]
                             rescue_saved = self._save_stage_output(rescue_stem)
                             rescue_attempt = {
                                 "name": rescue_name,
@@ -6649,6 +6805,9 @@ class Stage6ServiceMixin:
                                 "pixel_stats": pixel_stats,
                                 "preview_retention": preview_retention,
                                 "rendition_metrics": rendition_metrics,
+                                "subject_brightness_selection": (
+                                    subject_brightness
+                                ),
                                 "visibility_gate": visibility_gate,
                                 "preview_target_attainment": preview_target_attainment,
                                 "color_vector_reference": color_vector_reference,
@@ -6778,6 +6937,9 @@ class Stage6ServiceMixin:
                     key=self._stage7_forced_candidate_selection_key,
                 )
                 forced_attempt["forced_delivery"] = True
+                forced_attempt["formal_accepted"] = False
+                forced_attempt["delivery_class"] = "review_only"
+                forced_attempt["review_only"] = True
                 forced_attempt["forced_delivery_reason_codes"] = list(
                     dict.fromkeys(
                         str(item).split(" ", 1)[0]
@@ -6789,8 +6951,6 @@ class Stage6ServiceMixin:
                     forced_attempt["forced_delivery_reason_codes"] = [
                         "appearance_quality_gate"
                     ]
-                best_attempt = forced_attempt
-                self._stage7_stretch_forced_delivery = True
                 self._stage7_forced_delivery_reasons = list(
                     forced_attempt["forced_delivery_reason_codes"]
                 )
@@ -6805,7 +6965,9 @@ class Stage6ServiceMixin:
             if self._stage7_review_candidate_is_safe(attempt)
         ]
         review_attempt = (
-            min(
+            forced_attempt
+            if best_attempt is None and forced_attempt is not None
+            else min(
                 safe_review_attempts,
                 key=self._stage7_review_candidate_selection_key,
             )
@@ -6822,20 +6984,20 @@ class Stage6ServiceMixin:
         for attempt in attempts:
             attempt["selection_rank"] = selection_ranks.get(id(attempt))
             if attempt is best_attempt:
-                attempt["selection_role"] = (
-                    "selected_forced_delivery"
-                    if attempt is forced_attempt
-                    else "selected_final"
-                )
+                attempt["selection_role"] = "selected_final"
             elif attempt is review_attempt:
-                attempt["selection_role"] = "selected_review"
+                attempt["selection_role"] = (
+                    "selected_review_evidence"
+                    if attempt is forced_attempt
+                    else "selected_review"
+                )
             else:
                 attempt["selection_role"] = "not_selected"
 
         if forced_attempt is not None:
             messages.append(
-                "stage7 forced formal delivery selected a technically safe "
-                f"appearance reject (name={forced_attempt.get('name')}, "
+                "stage7 retained a technically safe appearance reject as "
+                f"review evidence only (name={forced_attempt.get('name')}, "
                 "reasons="
                 + ",".join(
                     forced_attempt.get("forced_delivery_reason_codes") or []
@@ -6843,8 +7005,8 @@ class Stage6ServiceMixin:
                 + ")"
             )
             self.log.warn(
-                "Stage7 所有正式候选均未通过画质门；已按出图优先策略选择"
-                "技术安全候选，任务最终状态将标记 partial_success"
+                "Stage7 所有正式候选均未通过画质门；仅保留最佳失败候选"
+                "作为诊断证据，正式交付保持关闭"
             )
         elif best_attempt is not None:
             messages.append(
@@ -6903,20 +7065,10 @@ class Stage6ServiceMixin:
                 f"(chroma_load={value_text}, "
                 f"limit={float(background_color_review_gate.get('limit', 0.12)):.3f})"
             )
-            if forced_attempt is not None:
-                messages.append(
-                    "stage7 background colour review recommendation overridden "
-                    "by technically-safe forced delivery"
-                )
-                self.log.warn(
-                    "Stage7 未接受物理校色且背景绝对色偏超过复核门；"
-                    "不做全局白平衡，按已启用的技术安全强制交付继续"
-                )
-            else:
-                self.log.warn(
-                    "Stage7 未接受物理校色且背景绝对色偏超过复核门；"
-                    "保留图像像素，不做全局白平衡，最终仅允许 review-only 交付"
-                )
+            self.log.warn(
+                "Stage7 未接受物理校色且背景绝对色偏超过复核门；"
+                "保留图像像素，不做全局白平衡，最终仅允许 review-only 交付"
+            )
         elif background_color_review_gate.get("status") == "advisory":
             messages.append(
                 "uncalibrated signal-excluded background color advisory "
@@ -6926,9 +7078,7 @@ class Stage6ServiceMixin:
             )
 
         selected_fallback_reason = (
-            "forced_quality_delivery"
-            if forced_attempt is not None
-            else self._stage7_validated_fallback_reason(best_attempt)
+            self._stage7_validated_fallback_reason(best_attempt)
             if best_attempt is not None
             else ""
         )
@@ -6963,7 +7113,8 @@ class Stage6ServiceMixin:
             ),
             "selected_fallback_reason": selected_fallback_reason or None,
             "rendition_intent": rendition_intent,
-            "forced_delivery": bool(forced_attempt is not None),
+            "forced_delivery": False,
+            "forced_review_evidence": bool(forced_attempt is not None),
             "forced_delivery_reason_codes": list(
                 self._stage7_forced_delivery_reasons
             ),
@@ -6982,6 +7133,10 @@ class Stage6ServiceMixin:
             "background_color_review_gate": background_color_review_gate,
             "strict_bright_core_evidence": strict_core_evidence,
             "delivery_mode": "starless",
+            "formal_accepted": bool(best_attempt is not None),
+            "delivery_class": (
+                "formal" if best_attempt is not None else "review_only"
+            ),
             "stage7_bright_core_integrity_rejected": bool(
                 self._stage7_destructive_core_rejected
             ),
@@ -7017,6 +7172,10 @@ class Stage6ServiceMixin:
                 "background_color_review_gate": background_color_review_gate,
                 "strict_bright_core_evidence": strict_core_evidence,
                 "delivery_mode": "starless",
+                "formal_accepted": bool(best_attempt is not None),
+                "delivery_class": (
+                    "formal" if best_attempt is not None else "review_only"
+                ),
                 "stage7_bright_core_integrity_rejected": bool(
                     self._stage7_destructive_core_rejected
                 ),
@@ -7030,6 +7189,13 @@ class Stage6ServiceMixin:
                 "matched_domain_transfer": matched_domain_transfer,
                 "attempts": attempts,
                 "selected": best_attempt,
+                "galaxy_roi": copy.deepcopy(
+                    getattr(
+                        self,
+                        "_stage6_galaxy_roi_diagnostics",
+                        {"status": "not_run", "available": False},
+                    )
+                ),
                 "best_rejected": best_rejected_attempt,
                 "selection": selection_summary,
             },
@@ -7131,6 +7297,9 @@ class Stage6ServiceMixin:
         self._stage7_stretch_candidates = attempts
         self._stage7_stretch_selected = (
             str(best_attempt.get("name")) if best_attempt else None
+        )
+        self._stage7_review_evidence = (
+            copy.deepcopy(review_attempt) if review_attempt is not None else None
         )
 
         if not best_attempt or not best_attempt.get("stem"):

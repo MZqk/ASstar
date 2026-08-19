@@ -23,6 +23,7 @@ from gui.history_store import (  # noqa: E402
     STATUS_FAILED,
     STATUS_SUCCESS,
     HistoryStore,
+    UnsafeTaskDeletionError,
 )
 import gui.main_window as main_window_module  # noqa: E402
 from gui.main_window import StarunGui, WORKSPACE_TASK  # noqa: E402
@@ -621,7 +622,7 @@ def test_running_task_keeps_history_browsable_but_locks_mutations(
             window.close()
 
 
-def test_delete_moves_only_selected_verified_task_then_removes_index(
+def test_delete_shows_inline_confirmation_before_moving_verified_task(
     app,
     monkeypatch,
 ) -> None:
@@ -639,51 +640,9 @@ def test_delete_moves_only_selected_verified_task_then_removes_index(
         )
         window = _window(root)
 
-        class _FakeMessageBox:
-            class Icon:
-                Warning = object()
-
-            class ButtonRole:
-                AcceptRole = object()
-
-            class StandardButton:
-                Cancel = object()
-
-            warnings = []
-
+        class _NoModalMessageBox:
             def __init__(self, *_args, **_kwargs):
-                self._move_button = None
-
-            def setWindowTitle(self, *_args):
-                return None
-
-            def setIcon(self, *_args):
-                return None
-
-            def setText(self, *_args):
-                return None
-
-            def setInformativeText(self, *_args):
-                return None
-
-            def addButton(self, value, *_args):
-                if value == "移到废纸篓":
-                    self._move_button = object()
-                    return self._move_button
-                return object()
-
-            def setDefaultButton(self, *_args):
-                return None
-
-            def exec(self):
-                return None
-
-            def clickedButton(self):
-                return self._move_button
-
-            @classmethod
-            def warning(cls, *_args):
-                cls.warnings.append(_args)
+                raise AssertionError("可用任务删除不应构造 QMessageBox")
 
         class _FakeFile:
             moved_paths = []
@@ -693,7 +652,11 @@ def test_delete_moves_only_selected_verified_task_then_removes_index(
                 cls.moved_paths.append(path)
                 return True, "/mock-trash/task"
 
-        monkeypatch.setattr(main_window_module, "QMessageBox", _FakeMessageBox)
+        monkeypatch.setattr(
+            main_window_module,
+            "QMessageBox",
+            _NoModalMessageBox,
+        )
         monkeypatch.setattr(main_window_module, "QFile", _FakeFile)
         try:
             window._last_task_root = workspace.root
@@ -702,10 +665,213 @@ def test_delete_moves_only_selected_verified_task_then_removes_index(
 
             window._delete_selected_history_task()
 
+            assert _FakeFile.moved_paths == []
+            assert window._pending_history_delete == (
+                task["task_key"],
+                workspace.root.resolve(),
+            )
+            assert window.history_delete_banner.isVisible() is True
+            assert "M31" in window.history_delete_banner_label.text()
+            assert str(workspace.root.resolve()) in (
+                window.history_delete_banner_label.text()
+            )
+            assert "运行记录：1 次" in window.history_delete_banner_label.text()
+            assert "目录大小：" in window.history_delete_banner_label.text()
+            assert window.history_delete_confirm_btn.isVisible() is True
+            assert window.history_delete_btn.isEnabled() is False
+
+            window.history_delete_confirm_btn.click()
+
             assert _FakeFile.moved_paths == [str(workspace.root.resolve())]
             assert window.history_store.find_task(task["task_key"]) is None
             assert window.workspace_stack.currentWidget() is window.empty_page
-            assert _FakeMessageBox.warnings == []
+            assert window._pending_history_delete is None
+            assert window.history_delete_banner.isHidden() is True
+        finally:
+            window.close()
+
+
+def test_delete_inline_confirmation_cancel_preserves_task_and_index(
+    app,
+    monkeypatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        store = HistoryStore(root / "history.json", session_id="seed")
+        task, workspace, _run = _register(
+            store,
+            _history_task(
+                root,
+                name="M33.fit",
+                status=STATUS_SUCCESS,
+                run_id="run-1",
+            ),
+        )
+        window = _window(root)
+
+        class _NoModalMessageBox:
+            def __init__(self, *_args, **_kwargs):
+                raise AssertionError("可用任务删除不应构造 QMessageBox")
+
+        class _FakeFile:
+            moved_paths = []
+
+            @classmethod
+            def moveToTrash(cls, path):
+                cls.moved_paths.append(path)
+                return True, "/mock-trash/task"
+
+        monkeypatch.setattr(
+            main_window_module,
+            "QMessageBox",
+            _NoModalMessageBox,
+        )
+        monkeypatch.setattr(main_window_module, "QFile", _FakeFile)
+        try:
+            window._show_history()
+            window.history_tree.setCurrentItem(window.history_tree.topLevelItem(0))
+
+            window._delete_selected_history_task()
+            window.history_delete_cancel_btn.click()
+
+            assert _FakeFile.moved_paths == []
+            assert window.history_store.find_task(task["task_key"]) is not None
+            assert workspace.root.is_dir() is True
+            assert window._pending_history_delete is None
+            assert window.history_delete_banner.isHidden() is True
+        finally:
+            window.close()
+
+
+def test_delete_inline_confirmation_revalidates_target_without_modal(
+    app,
+    monkeypatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        store = HistoryStore(root / "history.json", session_id="seed")
+        task, _workspace, _run = _register(
+            store,
+            _history_task(
+                root,
+                name="M51.fit",
+                status=STATUS_SUCCESS,
+                run_id="run-1",
+            ),
+        )
+        window = _window(root)
+        original_validate = main_window_module.validate_deletable_task_root
+        validate_calls = 0
+
+        class _NoModalMessageBox:
+            def __init__(self, *_args, **_kwargs):
+                raise AssertionError("可用任务删除不应构造 QMessageBox")
+
+        class _FakeFile:
+            moved_paths = []
+
+            @classmethod
+            def moveToTrash(cls, path):
+                cls.moved_paths.append(path)
+                return True, "/mock-trash/task"
+
+        def _validate(candidate):
+            nonlocal validate_calls
+            validate_calls += 1
+            if validate_calls == 1:
+                return original_validate(candidate)
+            raise UnsafeTaskDeletionError("确认期间任务根已失效")
+
+        monkeypatch.setattr(
+            main_window_module,
+            "QMessageBox",
+            _NoModalMessageBox,
+        )
+        monkeypatch.setattr(main_window_module, "QFile", _FakeFile)
+        monkeypatch.setattr(
+            main_window_module,
+            "validate_deletable_task_root",
+            _validate,
+        )
+        try:
+            window._show_history()
+            window.history_tree.setCurrentItem(window.history_tree.topLevelItem(0))
+
+            window._delete_selected_history_task()
+            window.history_delete_confirm_btn.click()
+
+            assert validate_calls == 2
+            assert _FakeFile.moved_paths == []
+            assert window.history_store.find_task(task["task_key"]) is not None
+            assert window._pending_history_delete is None
+            assert window.history_delete_banner.isVisible() is True
+            assert window.history_delete_confirm_btn.isHidden() is True
+            assert "不再满足安全条件" in window.history_delete_banner_label.text()
+        finally:
+            window.close()
+
+
+def test_delete_inline_confirmation_is_cancelled_when_selection_changes(
+    app,
+    monkeypatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        store = HistoryStore(root / "history.json", session_id="seed")
+        _first_task, _first_workspace, _first_run = _register(
+            store,
+            _history_task(
+                root,
+                name="M81.fit",
+                status=STATUS_SUCCESS,
+                run_id="run-1",
+            ),
+        )
+        _second_task, _second_workspace, _second_run = _register(
+            store,
+            _history_task(
+                root,
+                name="M82.fit",
+                status=STATUS_SUCCESS,
+                run_id="run-1",
+            ),
+        )
+        window = _window(root)
+
+        class _NoModalMessageBox:
+            def __init__(self, *_args, **_kwargs):
+                raise AssertionError("可用任务删除不应构造 QMessageBox")
+
+        class _FakeFile:
+            moved_paths = []
+
+            @classmethod
+            def moveToTrash(cls, path):
+                cls.moved_paths.append(path)
+                return True, "/mock-trash/task"
+
+        monkeypatch.setattr(
+            main_window_module,
+            "QMessageBox",
+            _NoModalMessageBox,
+        )
+        monkeypatch.setattr(main_window_module, "QFile", _FakeFile)
+        try:
+            window._show_history()
+            first_item = window.history_tree.topLevelItem(0)
+            second_item = window.history_tree.topLevelItem(1)
+            window.history_tree.setCurrentItem(first_item)
+            window._delete_selected_history_task()
+
+            assert window._pending_history_delete is not None
+            assert window.history_delete_banner.isVisible() is True
+
+            window.history_tree.setCurrentItem(second_item)
+
+            assert _FakeFile.moved_paths == []
+            assert window._pending_history_delete is None
+            assert window.history_delete_banner.isHidden() is True
+            assert window.history_delete_btn.isEnabled() is True
         finally:
             window.close()
 

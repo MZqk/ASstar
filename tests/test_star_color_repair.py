@@ -121,6 +121,47 @@ class StarColorRepairTests(unittest.TestCase):
             scoped["metrics"]["reference_sample_count"],
         )
 
+    def test_repair_samples_are_scoped_to_downstream_support(self) -> None:
+        stars, reference = _synthetic_star_data()
+        support = np.zeros(stars.shape[1:], dtype=bool)
+        support[25:135, 20:205] = True
+
+        candidate, report = repair_star_layer_colors(
+            stars,
+            reference,
+            validation_support_mask=support,
+        )
+
+        samples = report["_reference_samples"]
+        y_coord = np.asarray(samples["y"])
+        x_coord = np.asarray(samples["x"])
+        self.assertTrue(np.all(support[y_coord, x_coord]))
+        self.assertTrue(samples["support_scoped"])
+        self.assertEqual(
+            samples["coordinate_domain"],
+            "siril_pixel_buffer_bottom_up",
+        )
+        validation = assess_repaired_star_layer(
+            candidate,
+            samples,
+            support_mask=support,
+        )
+        self.assertTrue(validation["accepted"], validation)
+
+    def test_repair_rejects_unmeasurable_downstream_support(self) -> None:
+        stars, reference = _synthetic_star_data()
+        support = np.zeros(stars.shape[1:], dtype=bool)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "support-confirmed star color validation samples unavailable",
+        ):
+            repair_star_layer_colors(
+                stars,
+                reference,
+                validation_support_mask=support,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

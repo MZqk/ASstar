@@ -237,6 +237,11 @@ class DualbandPaletteCandidateTests(unittest.TestCase):
         self.assertEqual(report["formula"]["mode"], "regular")
         self.assertEqual(report["formula"]["preset"], "Classic")
         self.assertGreater(report["metrics"]["subject_change_p95"], 0.01)
+        self.assertIn(
+            "subject_background_chroma_separation_gain",
+            report["metrics"],
+        )
+        self.assertIn("subject_saturation_p50_gain", report["metrics"])
         self.assertLessEqual(
             report["metrics"]["luminance_drift_p95"],
             report["limits"]["luminance_drift_p95_max"],

@@ -206,8 +206,10 @@ class Stage5PSFQualityTests(unittest.TestCase):
                 )
                 self.assertTrue(report["would_rollback"], report)
                 self.assertIn(reason, report["would_rollback_reasons"])
-                self.assertFalse(report["enforced"])
-                self.assertFalse(report["participates_in_acceptance"])
+                self.assertTrue(report["enforced"])
+                self.assertTrue(report["participates_in_acceptance"])
+                self.assertFalse(report["accepted"])
+                self.assertTrue(report["rollback_required"])
 
     def test_local_guard_is_unavailable_when_catalog_evidence_is_insufficient(self) -> None:
         catalog, baseline = _catalog_and_gaussian_image()
@@ -223,7 +225,54 @@ class Stage5PSFQualityTests(unittest.TestCase):
 
         self.assertEqual(report["status"], "unavailable")
         self.assertEqual(report["eligible_star_count"], 2)
-        self.assertFalse(report["would_rollback"])
+        self.assertTrue(report["would_rollback"])
+        self.assertFalse(report["accepted"])
+        self.assertTrue(report["rollback_required"])
+
+    def test_local_guard_excludes_low_signal_stars_without_ratio_explosion(self) -> None:
+        catalog, baseline = _catalog_and_gaussian_image()
+        star = catalog[0]
+        yy, xx = np.mgrid[: baseline.shape[1], : baseline.shape[2]]
+        radius = np.sqrt(
+            (xx - float(star["x"])) ** 2
+            + (yy - float(star["y"])) ** 2
+        )
+        low_signal = baseline.copy()
+        low_signal[:, radius <= 5.0 * float(star["fwhm_geometry"])] = 0.01
+
+        report = quality.assess_local_star_guard(
+            low_signal,
+            low_signal.copy(),
+            catalog,
+            method="graxpert_object",
+        )
+
+        self.assertEqual(report["status"], "available", report)
+        self.assertTrue(report["accepted"])
+        self.assertEqual(report["excluded_low_signal_star_count"], 1)
+        self.assertEqual(report["evaluated_star_count"], 5)
+        excluded = report["excluded_low_signal_stars"]
+        self.assertEqual(len(excluded), 1)
+        self.assertNotIn(
+            "core_peak_ratio",
+            excluded[0]["signals"]["rec709"],
+        )
+
+    def test_all_near_zero_star_samples_fail_closed_without_large_ratios(self) -> None:
+        catalog, baseline = _catalog_and_gaussian_image()
+        near_zero = np.full_like(baseline, 1e-9)
+
+        report = quality.assess_local_star_guard(
+            near_zero,
+            near_zero.copy(),
+            catalog,
+            method="siril_rl",
+        )
+
+        self.assertEqual(report["status"], "unavailable")
+        self.assertEqual(report["excluded_low_signal_star_count"], 6)
+        self.assertTrue(report["rollback_required"])
+        self.assertNotIn("aggregates", report)
 
 
 class _RLFake:

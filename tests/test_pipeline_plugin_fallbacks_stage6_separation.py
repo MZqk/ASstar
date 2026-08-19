@@ -4,6 +4,204 @@ from tests.pipeline_plugin_fallbacks_support import *  # noqa: F401,F403
 
 
 class PipelinePluginFallbackStage6SeparationTests(PipelinePluginFallbackTestBase):
+    @staticmethod
+    def _syqon_tiling_manifest():
+        return {
+            "actual": {
+                "mode": "tiled",
+                "grid": {
+                    "x_positions": [0, 256],
+                    "y_positions": [0, 256],
+                },
+            }
+        }
+
+    def test_stage6_syqon_tiling_artifact_gate_accepts_stable_transfer(self):
+        yy, xx = np.mgrid[:512, :512]
+        source_gray = 0.01 + 0.002 * (xx / 511.0) + 0.001 * (yy / 511.0)
+        source = np.repeat(source_gray[None, :, :], 3, axis=0).astype(np.float32)
+        starless = (source * 0.995).astype(np.float32)
+        starmask = np.clip(source - starless, 0.0, None)
+
+        report = pipeline_module.syqon_starless.assess_syqon_tiling_artifacts(
+            source,
+            starless,
+            starmask,
+            self._syqon_tiling_manifest(),
+        )
+
+        self.assertTrue(report["accepted"], report)
+        self.assertFalse(report["hard_failure"])
+
+    def test_stage6_syqon_tiling_artifact_gate_ignores_smooth_transfer_gradient(self):
+        yy, xx = np.mgrid[:512, :512]
+        source_gray = 0.01 + 0.002 * (xx / 511.0) + 0.001 * (yy / 511.0)
+        source = np.repeat(source_gray[None, :, :], 3, axis=0).astype(np.float32)
+        smooth_amplitude = np.exp(0.5 * xx / 511.0 + 0.3 * yy / 511.0)
+        texture = np.where(((xx + yy) % 2) == 0, 1.0, -1.0)
+        starless = np.clip(
+            source + 1.0e-4 * smooth_amplitude[None, :, :] * texture[None, :, :],
+            0.0,
+            1.0,
+        ).astype(np.float32)
+        starmask = np.zeros_like(source)
+
+        report = pipeline_module.syqon_starless.assess_syqon_tiling_artifacts(
+            source,
+            starless,
+            starmask,
+            self._syqon_tiling_manifest(),
+        )
+
+        self.assertTrue(report["accepted"], report)
+        self.assertEqual(
+            report["regional"]["smooth_gradient_detrending"]["method"],
+            "iteratively_clipped_log_plane",
+        )
+
+    def test_stage6_syqon_tiling_artifact_gate_rejects_coherent_checkerboard(self):
+        yy, xx = np.mgrid[:512, :512]
+        source_gray = 0.01 + 0.002 * (xx / 511.0) + 0.001 * (yy / 511.0)
+        source = np.repeat(source_gray[None, :, :], 3, axis=0).astype(np.float32)
+        starless = source.copy()
+        checkerboard = ((xx + yy) % 2) * 2.0 - 1.0
+        starless[:, 256:, :] = np.clip(
+            starless[:, 256:, :] + 0.01 * checkerboard[256:, :],
+            0.0,
+            1.0,
+        )
+        starmask = np.clip(source - starless, 0.0, None)
+
+        report = pipeline_module.syqon_starless.assess_syqon_tiling_artifacts(
+            source,
+            starless,
+            starmask,
+            self._syqon_tiling_manifest(),
+        )
+
+        self.assertFalse(report["accepted"], report)
+        self.assertTrue(report["hard_failure"])
+        self.assertGreaterEqual(
+            report["regional"]["largest_connected_affected_ratio"],
+            0.15,
+        )
+
+    def test_stage6_syqon_tiling_artifact_gate_rejects_worker_boundary_band(self):
+        yy, xx = np.mgrid[:512, :512]
+        source_gray = 0.01 + 0.002 * (xx / 511.0) + 0.001 * (yy / 511.0)
+        source = np.repeat(source_gray[None, :, :], 3, axis=0).astype(np.float32)
+        starless = source.copy()
+        seam_pattern = np.where((yy % 2) == 0, 0.012, -0.012)
+        starless[:, :, 254:259] = np.clip(
+            starless[:, :, 254:259] + seam_pattern[None, :, 254:259],
+            0.0,
+            1.0,
+        )
+
+        report = pipeline_module.syqon_starless.assess_syqon_tiling_artifacts(
+            source,
+            starless,
+            np.zeros_like(source),
+            self._syqon_tiling_manifest(),
+        )
+
+        self.assertFalse(report["accepted"], report)
+        self.assertTrue(report["boundary_band"]["hard_failure"], report)
+
+    @staticmethod
+    def _low_scale_catalog_fixture(star_count=6):
+        yy, xx = np.mgrid[:128, :128]
+        source_gray = np.full((128, 128), 1.0e-5, dtype=np.float32)
+        starmask_gray = np.zeros((128, 128), dtype=np.float32)
+        positions = ((20, 20), (50, 20), (80, 20), (20, 60), (50, 60), (80, 60))
+        stars = []
+        for index, (x, y) in enumerate(positions[:star_count]):
+            signal = 1.0e-4 * np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / 4.5)
+            source_gray += signal.astype(np.float32)
+            starmask_gray += signal.astype(np.float32)
+            stars.append(
+                {
+                    "index": index,
+                    "x": x,
+                    "y": y,
+                    "fwhm_geometry": 3.0,
+                    "eligible_for_local_guard": True,
+                }
+            )
+        return (
+            np.repeat(source_gray[None, :, :], 3, axis=0),
+            np.repeat(starmask_gray[None, :, :], 3, axis=0),
+            stars,
+        )
+
+    def test_stage6_catalog_coverage_recovers_low_scale_stars(self):
+        processor = self._new_processor()
+        source, starmask, stars = self._low_scale_catalog_fixture()
+        processor._stage5_star_reference_report = {"stars": stars}
+
+        report = pipeline_module.stage7_quality._stage6_catalog_starmask_coverage(
+            processor,
+            source,
+            starmask,
+        )
+
+        self.assertTrue(report["available"], report)
+        self.assertEqual(report["counts"]["evaluated"], 6)
+        self.assertEqual(report["coverage_ratio"], 1.0)
+
+    def test_stage6_catalog_coverage_rejects_real_missing_starmask(self):
+        processor = self._new_processor()
+        source, starmask, stars = self._low_scale_catalog_fixture()
+        processor._stage5_star_reference_report = {"stars": stars}
+
+        report = pipeline_module.stage7_quality._stage6_catalog_starmask_coverage(
+            processor,
+            source,
+            np.zeros_like(starmask),
+        )
+
+        self.assertTrue(report["available"], report)
+        self.assertEqual(report["coverage_ratio"], 0.0)
+        self.assertEqual(report["counts"]["recovered"], 0)
+
+    def test_stage6_catalog_coverage_reports_insufficient_catalog(self):
+        processor = self._new_processor()
+        source, starmask, stars = self._low_scale_catalog_fixture(star_count=3)
+        processor._stage5_star_reference_report = {"stars": stars}
+
+        report = pipeline_module.stage7_quality._stage6_catalog_starmask_coverage(
+            processor,
+            source,
+            starmask,
+        )
+
+        self.assertFalse(report["available"])
+        self.assertEqual(report["status"], "measurement_unavailable")
+        self.assertEqual(report["reason"], "insufficient_evaluated_catalog_stars")
+
+    def test_stage6_galaxy_roi_report_view_preserves_diagnostics(self):
+        report = stage6_star_separation_module._stage6_galaxy_roi_diagnostics(
+            {
+                "galaxy_roi_available": 1.0,
+                "galaxy_roi_status": "ready",
+                "galaxy_roi_seed_x_px": 31,
+                "galaxy_roi_seed_y_px": 47,
+                "galaxy_roi_signal_floor": 0.0004,
+                "galaxy_roi_signal_floor_components": {"local_q70": 0.0004},
+                "galaxy_roi_raw_covariance_major_sigma": 18.0,
+                "galaxy_roi_raw_covariance_minor_sigma": 9.0,
+                "galaxy_roi_minimum_covariance_extent": 6.0,
+            }
+        )
+
+        self.assertEqual(report["status"], "ready")
+        self.assertTrue(report["available"])
+        self.assertEqual(report["seed_position_px"], {"x": 31, "y": 47})
+        self.assertEqual(
+            report["raw_covariance_scale_px"]["minor_sigma"],
+            9.0,
+        )
+
     def test_stage6_repair_score_growth_gate_honors_configured_limit(self):
         cases = (
             ("default_strict", 0.0, 0.0, True),
@@ -442,6 +640,16 @@ class PipelinePluginFallbackStage6SeparationTests(PipelinePluginFallbackTestBase
         )
 
         self.assertEqual(scores["galaxy_roi_available"], 1.0)
+        self.assertEqual(scores["galaxy_roi_status"], "ready")
+        self.assertIsNotNone(scores["galaxy_roi_seed_x_px"])
+        self.assertIn(
+            "local_q99_ratio_floor",
+            scores["galaxy_roi_signal_floor_components"],
+        )
+        self.assertGreater(
+            scores["galaxy_roi_raw_covariance_minor_sigma"],
+            scores["galaxy_roi_minimum_covariance_extent"],
+        )
         self.assertLess(scores["galaxy_roi_disk_coverage"], 0.30)
         self.assertLess(
             scores["galaxy_disk_halo_residue_score"],
@@ -508,6 +716,67 @@ class PipelinePluginFallbackStage6SeparationTests(PipelinePluginFallbackTestBase
             captured["output"][:, protection_mask],
             starless[:, protection_mask],
         )
+
+    def test_stage6_low_surface_brightness_galaxy_ignores_edge_bright_star(self):
+        processor = pipeline_module.StarunPostProcessor()
+        processor.log = FakeLogger()
+        processor._active_target_type = lambda: "large_galaxy"
+        height = width = 256
+        yy, xx = np.mgrid[:height, :width]
+        background = np.full((height, width), 0.001, dtype=np.float32)
+        galaxy = 0.0015 * np.exp(
+            -0.5
+            * (
+                ((xx.astype(np.float32) - 132.0) / 52.0) ** 2
+                + ((yy.astype(np.float32) - 126.0) / 24.0) ** 2
+            )
+        )
+        edge_star = 0.8 * np.exp(
+            -((xx - 8) ** 2 + (yy - 10) ** 2) / 4.0
+        )
+        source_gray = background + galaxy + edge_star
+
+        masks = stage7_quality_module.stage7_galaxy_structure_masks(
+            source_gray.astype(np.float32),
+            0.001,
+            0.00005,
+            processor.cfg,
+        )
+
+        self.assertEqual(masks["status"], "ready", masks)
+        self.assertTrue(masks["available"])
+        self.assertLess(abs(masks["seed_x"] - 132), 8)
+        self.assertLess(abs(masks["seed_y"] - 126), 8)
+        self.assertLess(masks["signal_floor"], 0.0025)
+        self.assertEqual(
+            masks["star_clip_percentile"],
+            99.5,
+        )
+
+    def test_stage6_truncated_galaxy_roi_fails_closed_with_diagnostics(self):
+        processor = pipeline_module.StarunPostProcessor()
+        height = width = 256
+        yy, xx = np.mgrid[:height, :width]
+        gray = 0.001 + 0.01 * np.exp(
+            -0.5
+            * (
+                ((xx.astype(np.float32) - 25.0) / 55.0) ** 2
+                + ((yy.astype(np.float32) - 128.0) / 25.0) ** 2
+            )
+        )
+
+        masks = stage7_quality_module.stage7_galaxy_structure_masks(
+            gray.astype(np.float32),
+            0.001,
+            0.00005,
+            processor.cfg,
+        )
+
+        self.assertFalse(masks["available"])
+        self.assertEqual(masks["status"], "unavailable")
+        self.assertEqual(masks["reason"], "truncated_disk_roi")
+        self.assertIsNotNone(masks["seed_x"])
+        self.assertIsNotNone(masks["raw_covariance_minor_sigma"])
 
     def test_stage6_candidate_selection_prefers_ok_before_soft_score(self):
         processor = SimpleNamespace(
@@ -595,7 +864,9 @@ class PipelinePluginFallbackStage6SeparationTests(PipelinePluginFallbackTestBase
         processor = pipeline_module.StarunPostProcessor()
         processor._active_target_type = lambda: "generic_low_snr_safe"
         processor._stage6_quality_hard_failed_retained = True
-        processor._stage6_quality_failure_codes = ["RESIDUAL_GLOBAL", "HALO"]
+        processor._stage6_quality_failure_codes = [
+            "STARMASK_COVERAGE_UNAVAILABLE"
+        ]
         processor._selected_syqon_attempt_id = "attempt-1"
         processor._selected_syqon_pair_id = "pair-1"
         handoff = stage6_star_separation_module._stage8_handoff_from_stage6(
@@ -622,6 +893,116 @@ class PipelinePluginFallbackStage6SeparationTests(PipelinePluginFallbackTestBase
         self.assertEqual(handoff["reasons"][0]["star_intensity_cap"], 0.70)
         self.assertEqual(handoff["attempt_id"], "attempt-1")
         self.assertEqual(handoff["pair_id"], "pair-1")
+
+    def test_stage6_definite_quality_failure_is_never_retained(self):
+        for failure_code in (
+            "HALO",
+            "RESIDUAL_GLOBAL",
+            "RESIDUAL_COMPACT",
+            "BLACK_HOLE",
+            "DYNAMIC_RANGE_COLLAPSE",
+            "GALAXY_CORE_DAMAGE",
+            "BRIGHT_CORE_INTEGRITY",
+            "STARMASK_COVERAGE",
+            "SCRIPT_CONTRACT",
+            "TILE_ARTIFACT",
+        ):
+            with self.subTest(failure_code=failure_code):
+                self.assertFalse(
+                    stage6_star_separation_module._stage6_can_retain_hard_failed_pair(
+                        {
+                            "hard_failed": True,
+                            "destructive_core_failure": False,
+                            "failure_codes": [failure_code],
+                        },
+                        pair_valid=True,
+                    )
+                )
+
+    def test_stage6_measurement_uncertainty_can_be_retained_for_review(self):
+        self.assertTrue(
+            stage6_star_separation_module._stage6_can_retain_hard_failed_pair(
+                {
+                    "hard_failed": True,
+                    "destructive_core_failure": False,
+                    "failure_codes": ["STARMASK_COVERAGE_UNAVAILABLE"],
+                },
+                pair_valid=True,
+            )
+        )
+
+    def test_stage6_quality_rejection_handoff_skips_starless(self):
+        processor = pipeline_module.StarunPostProcessor()
+        processor._stage6_quality_hard_failed_retained = False
+        processor._stage6_quality_failure_codes = ["HALO"]
+
+        handoff = stage6_star_separation_module._stage8_handoff_from_stage6(
+            processor,
+            {"status": "poor", "derived": {}},
+            [],
+            separation_accepted=False,
+        )
+
+        self.assertEqual(handoff["processing_policy"], "skip")
+        self.assertTrue(handoff["restricted_downstream"])
+        self.assertEqual(
+            handoff["reason_code"],
+            "star_separation_quality_rejected",
+        )
+        self.assertEqual(handoff["reasons"][0]["failure_codes"], ["HALO"])
+
+    def test_stage6_exchange_quality_rejection_is_not_tool_failure(self):
+        semantics = (
+            stage6_star_separation_module._stage6_exchange_failure_semantics(
+                {
+                    "status": "rejected",
+                    "accepted": False,
+                    "failure_code": "TILE_ARTIFACT",
+                    "attempts": [
+                        {
+                            "attempt_id": "initial",
+                            "failure_code": "TILE_ARTIFACT",
+                        },
+                        {
+                            "attempt_id": "tile_artifact_cpu_recovery",
+                            "failure_code": "TILE_ARTIFACT",
+                        },
+                    ],
+                }
+            )
+        )
+
+        self.assertTrue(semantics["quality_rejected"])
+        self.assertEqual(
+            semantics["star_separation_state"],
+            pipeline_module.StarSeparationState.REJECTED.value,
+        )
+        self.assertEqual(
+            semantics["reason_code"],
+            "star_separation_quality_rejected",
+        )
+        self.assertEqual(len(semantics["retry_history"]), 2)
+
+    def test_stage6_exchange_backend_failure_remains_tool_failed(self):
+        semantics = (
+            stage6_star_separation_module._stage6_exchange_failure_semantics(
+                {
+                    "status": "failed",
+                    "accepted": False,
+                    "failure_code": "OOM_DEVICE",
+                }
+            )
+        )
+
+        self.assertFalse(semantics["quality_rejected"])
+        self.assertEqual(
+            semantics["star_separation_state"],
+            pipeline_module.StarSeparationState.TOOL_FAILED.value,
+        )
+        self.assertEqual(
+            semantics["reason_code"],
+            "star_separation_tool_failed",
+        )
 
     def test_stage6_bright_core_hard_failure_is_never_retained(self):
         processor = pipeline_module.StarunPostProcessor()
@@ -878,6 +1259,8 @@ class PipelinePluginFallbackStage6SeparationTests(PipelinePluginFallbackTestBase
         )
 
         self.assertEqual(scores["galaxy_roi_available"], 0.0)
+        self.assertEqual(scores["galaxy_roi_status"], "unavailable")
+        self.assertTrue(scores["galaxy_roi_failure_reason"])
         self.assertLess(scores["compact_halo_mask_coverage"], 0.50)
         self.assertLess(scores["compact_halo_residue_score"], 0.60)
 
@@ -1198,6 +1581,61 @@ class PipelinePluginFallbackStage6SeparationTests(PipelinePluginFallbackTestBase
 
         self.assertIn("--no_gpu", args)
         self.assertIn("zenith_cpu_recovery", note)
+
+    def test_stage6_tile_artifact_recovery_is_single_safe_profile(self):
+        profile = pipeline_module.syqon_starless.SYQON_TILE_ARTIFACT_RECOVERY_PROFILE
+        processor = self._new_processor()
+
+        args, _timeout, note = processor._syqon_starless_cli_options(profile=profile)
+
+        self.assertEqual(profile.tile_size, 512)
+        self.assertEqual(profile.overlap, 128)
+        self.assertFalse(profile.use_gpu)
+        self.assertFalse(profile.use_amp)
+        self.assertIn("--no_gpu", args)
+        self.assertIn("zenith_tile_artifact_cpu_recovery", note)
+
+    def test_stage6_syqon_exchange_preserves_artifact_retry_history(self):
+        processor = self._new_processor()
+
+        pipeline_module.syqon_starless._write_syqon_exchange_report(
+            processor,
+            {
+                "attempt_id": "initial",
+                "status": "rejected",
+                "accepted": False,
+                "failure_code": "TILE_ARTIFACT",
+                "profile": {"tile_size": 512, "overlap": 64},
+            },
+        )
+        pipeline_module.syqon_starless._write_syqon_exchange_report(
+            processor,
+            {
+                "attempt_id": "tile_artifact_cpu_recovery",
+                "status": "accepted",
+                "accepted": True,
+                "profile": {
+                    "tile_size": 512,
+                    "overlap": 128,
+                    "device": "cpu",
+                    "precision": "fp32",
+                },
+            },
+        )
+
+        report = processor._last_syqon_exchange_report
+        self.assertEqual(
+            [item["attempt_id"] for item in report["attempts"]],
+            ["initial", "tile_artifact_cpu_recovery"],
+        )
+        self.assertEqual(
+            report["attempts"][0]["failure_code"],
+            "TILE_ARTIFACT",
+        )
+        self.assertEqual(
+            report["selected_attempt_id"],
+            "tile_artifact_cpu_recovery",
+        )
 
     def test_syqon_baseline_cli_is_explicit_zenith_fp32_contract(self):
         processor = self._new_processor()

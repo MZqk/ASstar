@@ -43,7 +43,7 @@ LOWER_HALF_RECENTERED_MAD_NORMAL_SIGMA_RATIO = 0.5916931999771552
 STRETCH_SEMANTICS_SCHEMA = "starun.siril-stretch-semantics.v1"
 TRANSFORM_LOSS_SCHEMA = "starun.stage7-transform-loss.v1"
 MULTISCALE_CONTRAST_SCHEMA = "starun.stage7-multiscale-contrast.v1"
-RENDITION_METRICS_SCHEMA = "starun.stage7-rendition-metrics.v1"
+RENDITION_METRICS_SCHEMA = "starun.stage7-rendition-metrics.v2"
 RENDITION_CHROMA_SCHEMA = "starun.stage7-subject-chroma.v1"
 MULTISCALE_CONTRAST_RADII = (1, 2, 4, 8, 16)
 SIRIL_MINIMUM_VERSION_CONTRACT = "1.4.0"
@@ -66,9 +66,22 @@ CONDITIONAL_GHS_REFERENCE = (
     "deep-sky-processor/scripts/stretch.py"
 )
 CONDITIONAL_STRETCH_SOURCE_LICENSE = "GPL-3.0-only"
-DISPLAY90_STRETCH_SCHEMA = "starun.stage7-display90-calibration.v1"
-STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA = (
+DISPLAY90_STRETCH_SCHEMA_V1 = "starun.stage7-display90-calibration.v1"
+DISPLAY90_STRETCH_SCHEMA_V2 = "starun.stage7-display90-calibration.v2"
+DISPLAY90_STRETCH_SCHEMA = DISPLAY90_STRETCH_SCHEMA_V2
+STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V1 = (
     "starun.stage7-matched-domain-transfer.v1"
+)
+STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V2 = (
+    "starun.stage7-matched-domain-transfer.v2"
+)
+STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA = (
+    STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V2
+)
+DISPLAY90_LEGACY_METHOD = "display90_linked_lut"
+DISPLAY_LUMINANCE_VECTOR_METHOD = "display_luminance_vector_lut"
+DISPLAY_LUT_METHODS = frozenset(
+    {DISPLAY90_LEGACY_METHOD, DISPLAY_LUMINANCE_VECTOR_METHOD}
 )
 DISPLAY90_STRENGTH_MIN = 0.50
 DISPLAY90_STRENGTH_MAX = 0.95
@@ -182,6 +195,15 @@ def measure_frozen_rendition_metrics(
             [50.0, 75.0, 99.0],
         )
         noise_sigma = max(1.4826 * bg_mad, 1e-4)
+        subject_lift = float(max(0.0, subject_p50 - bg_median))
+        background_sigma = float(1.4826 * bg_mad)
+        subject_lift_sigma = (
+            float(subject_lift / background_sigma)
+            if background_sigma > 0.0
+            else float("inf")
+            if subject_lift > 0.0
+            else 0.0
+        )
         return {
             "schema": RENDITION_METRICS_SCHEMA,
             "status": "available",
@@ -196,8 +218,11 @@ def measure_frozen_rendition_metrics(
                 "microcontrast": float(np.percentile(subject_detail, 75.0)),
                 "subject_p50": float(subject_p50),
                 "subject_p99": float(subject_p99),
+                "subject_lift": subject_lift,
+                "subject_lift_sigma": subject_lift_sigma,
                 "background_median": bg_median,
                 "background_mad": bg_mad,
+                "background_sigma": background_sigma,
             },
         }
     except (IndexError, TypeError, ValueError, FloatingPointError) as error:
@@ -225,6 +250,8 @@ def rendition_metric_retention(
         "saturation_median",
         "saturation_p95",
         "microcontrast",
+        "subject_p50",
+        "subject_lift",
     ):
         try:
             value = float(candidate_metrics[name])
@@ -251,6 +278,160 @@ def rendition_metric_retention(
             else "unavailable"
         ),
         "metrics": ratios,
+    }
+
+
+def subject_brightness_selection(
+    candidate: Dict[str, Any],
+    preview: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build the bounded subject-brightness ranking and formal floor report."""
+
+    goals = {
+        "subject_lift_retention": 0.75,
+        "subject_p50_retention": 0.80,
+    }
+    floors = {
+        "subject_lift_retention": 0.50,
+        "subject_p50_retention": 0.60,
+    }
+    candidate_metrics = dict(candidate.get("metrics") or {})
+    preview_metrics = dict(preview.get("metrics") or {})
+
+    def finite_metric(values: Dict[str, Any], name: str) -> Optional[float]:
+        try:
+            value = float(values[name])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return value if np.isfinite(value) else None
+
+    preview_lift = finite_metric(preview_metrics, "subject_lift")
+    preview_mad = finite_metric(preview_metrics, "background_mad")
+    preview_sigma = (
+        float(1.4826 * max(preview_mad, 0.0))
+        if preview_mad is not None
+        else None
+    )
+    preview_lift_sigma = (
+        float(preview_lift / preview_sigma)
+        if preview_lift is not None
+        and preview_sigma is not None
+        and preview_sigma > 0.0
+        else float("inf")
+        if preview_lift is not None and preview_lift > 0.0
+        else 0.0
+    )
+    lift_reliable = bool(
+        preview_lift is not None
+        and preview_lift >= 0.02
+        and preview_lift_sigma >= 3.0
+    )
+
+    ratios: Dict[str, Optional[float]] = {}
+    for name in ("subject_p50", "subject_lift"):
+        candidate_value = finite_metric(candidate_metrics, name)
+        preview_value = finite_metric(preview_metrics, name)
+        ratios[name] = (
+            float(candidate_value / preview_value)
+            if candidate_value is not None
+            and preview_value is not None
+            and preview_value > 1e-9
+            else None
+        )
+
+    p50_ratio = ratios["subject_p50"]
+    lift_ratio = ratios["subject_lift"] if lift_reliable else None
+    floor_issues = []
+    if p50_ratio is None:
+        floor_issues.append("subject_p50_retention_unavailable")
+    elif p50_ratio < floors["subject_p50_retention"]:
+        floor_issues.append("subject_p50_retention_below_floor")
+    if lift_reliable:
+        if lift_ratio is None:
+            floor_issues.append("subject_lift_retention_unavailable")
+        elif lift_ratio < floors["subject_lift_retention"]:
+            floor_issues.append("subject_lift_retention_below_floor")
+
+    def bounded_goal_utility(
+        ratio: Optional[float],
+        goal: float,
+    ) -> Optional[float]:
+        if ratio is None:
+            return None
+        if ratio + 1e-12 >= goal:
+            return 1.0
+        return float(np.clip(ratio / goal, 0.0, 1.0))
+
+    utilities = {
+        "subject_p50_retention": (
+            bounded_goal_utility(
+                p50_ratio,
+                goals["subject_p50_retention"],
+            )
+            or 0.0
+        ),
+        "subject_lift_retention": bounded_goal_utility(
+            lift_ratio,
+            goals["subject_lift_retention"],
+        ),
+    }
+    applicable_utilities = [
+        value for value in utilities.values() if value is not None
+    ]
+    goal_count = int(
+        (
+            p50_ratio is not None
+            and p50_ratio + 1e-12 >= goals["subject_p50_retention"]
+        )
+        + (
+            lift_reliable
+            and lift_ratio is not None
+            and lift_ratio + 1e-12 >= goals["subject_lift_retention"]
+        )
+    )
+    formal_floor_passed = not floor_issues
+    return {
+        "schema": "starun.stage7-subject-brightness-selection.v1",
+        "status": (
+            "ok"
+            if formal_floor_passed
+            else "rejected"
+        ),
+        "available": p50_ratio is not None,
+        "formal_floor_passed": formal_floor_passed,
+        "reason_code": (
+            "stage7_subject_brightness_floor_passed"
+            if formal_floor_passed
+            else "stage7_subject_brightness_floor_unmet"
+        ),
+        "issues": floor_issues,
+        "preview_reliability": {
+            "subject_lift_reliable": lift_reliable,
+            "subject_lift_min": 0.02,
+            "subject_lift_sigma_min": 3.0,
+            "subject_lift": preview_lift,
+            "background_mad": preview_mad,
+            "background_sigma": preview_sigma,
+            "subject_lift_sigma": preview_lift_sigma,
+        },
+        "retention": {
+            "subject_p50": p50_ratio,
+            "subject_lift": lift_ratio,
+        },
+        "goals": goals,
+        "floors": floors,
+        "ranking": {
+            "goal_count": goal_count,
+            "applicable_goal_count": len(applicable_utilities),
+            "utility": (
+                float(np.mean(applicable_utilities))
+                if applicable_utilities
+                else 0.0
+            ),
+            "utilities": utilities,
+            "above_goal_reward": "capped",
+            "global_p50_role": "diagnostic_only",
+        },
     }
 
 
@@ -652,14 +833,22 @@ def build_siril_stretch_semantics(
     if method_name in {
         "iterative_masked_mtf",
         "dual_stage_mtf_ghs",
-        "display90_linked_lut",
+        DISPLAY90_LEGACY_METHOD,
+        DISPLAY_LUMINANCE_VECTOR_METHOD,
     }:
-        is_display90 = method_name == "display90_linked_lut"
+        is_display90 = method_name in DISPLAY_LUT_METHODS
+        is_luminance_vector = (
+            method_name == DISPLAY_LUMINANCE_VECTOR_METHOD
+        )
         base.update(
             {
                 "engine": "numpy",
-                "luminance_mode": "linked_rgb_curve",
-                "human_weighted": False,
+                "luminance_mode": (
+                    "rec709_luminance_uniform_rgb_gain"
+                    if is_luminance_vector
+                    else "linked_rgb_curve"
+                ),
+                "human_weighted": is_luminance_vector,
                 "clip_mode": "bounded_monotonic_curve",
                 "minimum_siril_version": None,
                 "bundled_reference_version": None,
@@ -2431,6 +2620,50 @@ def _apply_authenticated_lut_rgb(
     )
 
 
+def _apply_authenticated_lut_luminance_vector(
+    rgb: np.ndarray,
+    lut: np.ndarray,
+) -> np.ndarray:
+    """Map Rec.709 luminance and scale each RGB vector with one safe gain."""
+
+    values = np.asarray(rgb, dtype=np.float32)
+    if values.ndim != 3 or values.shape[0] != 3:
+        raise ValueError(f"expected RGB CHW array, got shape={values.shape}")
+    luminance = (
+        values[0] * np.float32(0.2126)
+        + values[1] * np.float32(0.7152)
+        + values[2] * np.float32(0.0722)
+    )
+    grid = np.linspace(0.0, 1.0, lut.size, dtype=np.float64)
+    mapped_luminance = np.interp(
+        np.clip(luminance, 0.0, 1.0),
+        grid,
+        lut,
+    ).astype(np.float32)
+    gain = np.divide(
+        mapped_luminance,
+        luminance,
+        out=np.zeros_like(luminance, dtype=np.float32),
+        where=luminance > 1e-12,
+    )
+    mapped = values * gain[None, :, :]
+    mapped_peak = np.max(mapped, axis=0)
+    gamut_scale = np.minimum(
+        1.0,
+        np.divide(
+            CONDITIONAL_STRETCH_OUTPUT_HEADROOM,
+            mapped_peak,
+            out=np.ones_like(mapped_peak, dtype=np.float32),
+            where=mapped_peak > CONDITIONAL_STRETCH_OUTPUT_HEADROOM,
+        ),
+    )
+    mapped *= gamut_scale[None, :, :]
+    return np.asarray(
+        np.clip(mapped, 0.0, CONDITIONAL_STRETCH_OUTPUT_HEADROOM),
+        dtype=np.float32,
+    )
+
+
 def calibrate_display90_linked_lut(
     image: np.ndarray,
     display_curve: Dict[str, Any],
@@ -2438,7 +2671,7 @@ def calibrate_display90_linked_lut(
     strength: float,
     max_derivative: float,
 ) -> Dict[str, Any]:
-    """Build the authenticated shared-RGB LUT derived from the GUI D curve."""
+    """Build the authenticated luminance-vector LUT derived from the GUI D curve."""
 
     try:
         derivative_limit = float(max_derivative)
@@ -2462,7 +2695,10 @@ def calibrate_display90_linked_lut(
             analysis_rgb,
             display_curve,
         )
-        target_rgb = _apply_authenticated_lut_rgb(analysis_rgb, lut)
+        target_rgb = _apply_authenticated_lut_luminance_vector(
+            analysis_rgb,
+            lut,
+        )
         source_quantiles = _display90_quantiles(analysis_rgb)
         gui_quantiles = _display90_quantiles(gui_reference)
         target_quantiles = _display90_quantiles(target_rgb)
@@ -2470,7 +2706,14 @@ def calibrate_display90_linked_lut(
         return {
             "schema": DISPLAY90_STRETCH_SCHEMA,
             "status": "ok",
-            "method": "display90_linked_lut",
+            "method": DISPLAY_LUMINANCE_VECTOR_METHOD,
+            "application_contract": {
+                "schema": "starun.display-luminance-vector-lut.v1",
+                "source_scalar": "rec709_luminance",
+                "rgb_operation": "uniform_per_pixel_gain",
+                "gamut_policy": "uniform_scale_to_output_headroom",
+                "preserves_rgb_direction": True,
+            },
             "display_curve": dict(display_curve),
             "parameters": {
                 "strength": float(strength),
@@ -2508,7 +2751,7 @@ def calibrate_display90_linked_lut(
         return {
             "schema": DISPLAY90_STRETCH_SCHEMA,
             "status": "unavailable",
-            "method": "display90_linked_lut",
+            "method": DISPLAY_LUMINANCE_VECTOR_METHOD,
             "reason": str(error),
             "display_curve": (
                 dict(display_curve) if isinstance(display_curve, dict) else None
@@ -2521,13 +2764,27 @@ def rebuild_display90_linked_lut(
 ) -> tuple[np.ndarray, Dict[str, Any]]:
     """Rebuild and authenticate a Display90 LUT without trusting stored pixels."""
 
-    if (
-        not isinstance(calibration, dict)
-        or calibration.get("schema") != DISPLAY90_STRETCH_SCHEMA
-        or calibration.get("status") != "ok"
-        or calibration.get("method") != "display90_linked_lut"
-    ):
+    if not isinstance(calibration, dict) or calibration.get("status") != "ok":
         raise ValueError("Display90 calibration is invalid")
+    schema = str(calibration.get("schema") or "")
+    method = str(calibration.get("method") or "")
+    if (schema, method) not in {
+        (DISPLAY90_STRETCH_SCHEMA_V1, DISPLAY90_LEGACY_METHOD),
+        (DISPLAY90_STRETCH_SCHEMA_V2, DISPLAY_LUMINANCE_VECTOR_METHOD),
+    }:
+        raise ValueError("Display90 calibration schema/method contract is invalid")
+    if schema == DISPLAY90_STRETCH_SCHEMA_V2:
+        application_contract = dict(
+            calibration.get("application_contract") or {}
+        )
+        if application_contract != {
+            "schema": "starun.display-luminance-vector-lut.v1",
+            "source_scalar": "rec709_luminance",
+            "rgb_operation": "uniform_per_pixel_gain",
+            "gamut_policy": "uniform_scale_to_output_headroom",
+            "preserves_rgb_direction": True,
+        }:
+            raise ValueError("Display90 luminance-vector contract is invalid")
     parameters = dict(calibration.get("parameters") or {})
     stored_contract = calibration.get("lut_contract")
     if (
@@ -2598,11 +2855,13 @@ def apply_display90_linked_rgb_stretch(
     image: np.ndarray,
     calibration: Dict[str, Any],
 ) -> np.ndarray:
-    """Apply an authenticated Display90 LUT independently to R/G/B."""
+    """Replay v2 luminance-vector or legacy v1 per-channel LUT semantics."""
 
     rgb = _stage7_rgb_float_fullres(np.asarray(image))
     lut, _contract = rebuild_display90_linked_lut(calibration)
-    return _apply_authenticated_lut_rgb(rgb, lut)
+    if calibration.get("schema") == DISPLAY90_STRETCH_SCHEMA_V1:
+        return _apply_authenticated_lut_rgb(rgb, lut)
+    return _apply_authenticated_lut_luminance_vector(rgb, lut)
 
 
 def build_display90_gui_linked_reference(
@@ -2611,10 +2870,9 @@ def build_display90_gui_linked_reference(
 ) -> tuple[np.ndarray, Dict[str, Any]]:
     """Rebuild the exact GUI linked-D reference from an authenticated contract.
 
-    The production Display90 candidate intentionally uses one shared per-channel
-    LUT.  Its safety reference is different: this function reproduces the GUI's
-    existing Rec.709 luminance-gain display path without changing that candidate
-    or its Stage 9 matched-domain transfer.
+    This reproduces the GUI's existing Rec.709 luminance-gain display path as a
+    separate safety reference.  New v2 candidates use an authenticated bounded
+    luminance-vector LUT; legacy v1 candidates retain their original replay.
     """
 
     _lut, lut_contract = rebuild_display90_linked_lut(calibration)

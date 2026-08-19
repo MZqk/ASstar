@@ -106,7 +106,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
                 "star_wing_recovery_ratio": 0.65,
             },
             "psf_closure": {
-                "schema": "starun.stage9-psf-closure.v2",
+                "schema": "starun.stage9-psf-closure.v3",
                 "status": "ok" if accepted else "rejected",
                 "accepted": accepted,
                 "gate_enabled": True,
@@ -151,10 +151,10 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         self.assertFalse(pm_calls)
         report = processor.stage_json_reports["stage9_remix_quality.json"]
         json.dumps(report)
-        self.assertEqual(report["schema"], "starun.stage9-remix-quality.v7")
+        self.assertEqual(report["schema"], "starun.stage9-remix-quality.v9")
         self.assertEqual(
             report["selection_policy"],
-            "failure_directed_support_unscreen_targeted_recovery_v6",
+            "catalog_visibility_psf_fidelity_recovery_v7",
         )
         self.assertEqual(report["selection_class"], "formal")
         self.assertTrue(report["formal_accepted"])
@@ -200,7 +200,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
                 ],
                 "metrics": {},
                 "psf_closure": {
-                    "schema": "starun.stage9-psf-closure.v2",
+                    "schema": "starun.stage9-psf-closure.v3",
                     "status": "partial",
                     "accepted": True,
                     "review_required": True,
@@ -996,6 +996,9 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
             "accepted": True,
             "issues": [],
             "metrics": {},
+            "support_mode": "normal",
+            "support_starmask": "starmask_stretched",
+            "base_source_stem": "stage8_enhanced",
         }
         attempted_strengths = []
         qualities = iter(
@@ -1088,6 +1091,8 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         self.assertEqual(attempted_strengths, [0.95, 0.90])
         self.assertEqual(selected["attempt"], "screen_unscreen_source_presence_90")
         self.assertEqual(selected["source_wing_feather_strength"], 0.90)
+        self.assertEqual(selected["support_mode"], "normal")
+        self.assertEqual(selected["support_starmask"], "starmask_stretched")
         self.assertIs(selected_context["unscreen_stars"].dtype, base_stars.dtype)
         self.assertEqual(len(remix_attempts), 2)
         self.assertTrue(remix_attempts[-1]["accepted"])
@@ -1388,7 +1393,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         self.assertEqual(metadata["reason_code"], "upstream_safe_passthrough")
         self.assertEqual(metadata["details"]["reason_text"], "使用 Stage 8 安全旁路源")
 
-    def test_stage9_uses_plugin_stretched_starmask_without_builtin_asinh(self):
+    def test_stage9_rebuilds_inadequate_plugin_starmask_with_builtin_asinh(self):
         processor = self._new_processor()
         processor.cfg.workflow_plugin_probe_enabled = True
         processor.command_labels["星点拉伸"] = "SASP Star Stretch"
@@ -1402,7 +1407,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
             [("stage8_enhanced", "starmask_stretched", processor.cfg.star_intensity)],
         )
         asinh_calls = [call for call in processor.cmd_calls if call[0] == "asinh"]
-        self.assertFalse(asinh_calls)
+        self.assertTrue(asinh_calls)
         self.assertIn(("save", "starmask_stretched"), processor.cmd_calls)
 
     def test_stage9_refined_starless_uses_independent_base(self):
@@ -2195,7 +2200,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
                 "_bright_support_mask": np.zeros_like(support),
             }
             report = {
-                "schema": "starun.stage9-starmask_support_preflight.v1",
+                "schema": "starun.stage9-starmask-support-preflight.v2",
                 "status": "ready",
                 "route": "strict_only",
                 "reason_code": "stage9_support_preflight_normal_hard_failed",
@@ -2264,7 +2269,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
 
         def dual_preflight(pipeline, *_args, **_kwargs):
             report = {
-                "schema": "starun.stage9-starmask_support_preflight.v1",
+                "schema": "starun.stage9-starmask-support-preflight.v2",
                 "status": "ready",
                 "route": "dual_competition",
                 "reason_code": "stage9_support_preflight_boundary_dual",
@@ -2346,7 +2351,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
 
         def unavailable_preflight(pipeline, *_args, **_kwargs):
             report = {
-                "schema": "starun.stage9-starmask_support_preflight.v1",
+                "schema": "starun.stage9-starmask-support-preflight.v2",
                 "status": "rejected",
                 "route": "unavailable",
                 "reason_code": "stage9_support_preflight_no_usable_candidate",
@@ -3791,7 +3796,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
 
         def preflight(pipeline, *_args, **_kwargs):
             report = {
-                "schema": "starun.stage9-starmask_support_preflight.v1",
+                "schema": "starun.stage9-starmask-support-preflight.v2",
                 "status": "ready",
                 "route": "dual_competition",
                 "reason_code": "stage9_support_preflight_boundary_dual",
@@ -3908,6 +3913,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
             return quality
 
         processor._stage9_assess_current_remix = assess
+
         with (
             patch.object(
                 stage9_module,

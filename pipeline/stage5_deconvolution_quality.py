@@ -1,8 +1,8 @@
 """Pure Stage 5 PSF and deconvolution star-quality diagnostics.
 
 The reports in this module deliberately separate the small set of structural
-PSF failures that may skip Siril RL from report-only, local-star diagnostics.
-No function mutates Siril state or participates in Stage 5 candidate scoring.
+PSF failures that may skip Siril RL from the enforced, fixed-catalog local-star
+acceptance guard.  No function mutates Siril state.
 """
 from __future__ import annotations
 
@@ -14,12 +14,15 @@ import numpy as np
 
 PSF_QUALITY_SCHEMA = "starun.stage5-psf-quality.v1"
 STAR_REFERENCE_SCHEMA = "starun.stage5-star-reference.v1"
-LOCAL_STAR_GUARD_SCHEMA = "starun.stage5-local-star-guard.v1"
+LOCAL_STAR_GUARD_SCHEMA = "starun.stage5-local-star-guard.v2"
 TARGET_STRUCTURE_MASK_THRESHOLD = 0.12
 TARGET_STRUCTURE_OVERLAP_MAX = 0.25
 LOCAL_STAR_MIN_COUNT = 5
 LOCAL_STAR_EDGE_FWHM_MIN = 5.0
 LOCAL_STAR_NEIGHBOR_FWHM_MIN = 6.0
+LOCAL_STAR_SIGNAL_SNR_MIN = 5.0
+LOCAL_STAR_RING_SIGMA_MIN = 3.0
+LOCAL_STAR_SIGNAL_ABS_MIN = 1e-6
 
 
 def _finite_float(value: Any) -> Optional[float]:
@@ -537,16 +540,59 @@ def _one_signal_metrics(
         return None
     before_patch = np.asarray(before[y0:y1, x0:x1], dtype=np.float64)
     after_patch = np.asarray(after[y0:y1, x0:x1], dtype=np.float64)
-    before_residual = before_patch - float(np.median(before_patch[background]))
-    after_residual = after_patch - float(np.median(after_patch[background]))
+    before_background = float(np.median(before_patch[background]))
+    after_background = float(np.median(after_patch[background]))
+    before_background_mad = float(
+        np.median(np.abs(before_patch[background] - before_background))
+    )
+    after_background_mad = float(
+        np.median(np.abs(after_patch[background] - after_background))
+    )
+    before_noise_sigma = max(1.4826 * before_background_mad, 1e-7)
+    after_noise_sigma = max(1.4826 * after_background_mad, 1e-7)
+    before_residual = before_patch - before_background
+    after_residual = after_patch - after_background
     before_peak = float(np.max(before_residual[core]))
     after_peak = float(np.max(after_residual[core]))
     before_core_flux = float(np.sum(np.maximum(before_residual[core], 0.0)))
     after_core_flux = float(np.sum(np.maximum(after_residual[core], 0.0)))
     before_patch_flux = float(np.sum(np.maximum(before_residual[patch], 0.0)))
     after_patch_flux = float(np.sum(np.maximum(after_residual[patch], 0.0)))
-    normalization = max(before_peak, 1e-12)
+    peak_floor = max(
+        LOCAL_STAR_SIGNAL_SNR_MIN * before_noise_sigma,
+        LOCAL_STAR_SIGNAL_ABS_MIN,
+    )
+    flux_floor = max(
+        LOCAL_STAR_SIGNAL_SNR_MIN
+        * before_noise_sigma
+        * math.sqrt(float(np.count_nonzero(patch))),
+        LOCAL_STAR_SIGNAL_ABS_MIN,
+    )
+    if before_peak < peak_floor or before_patch_flux <= flux_floor:
+        return {
+            "status": "excluded_low_signal",
+            "reason_code": "baseline_star_signal_below_noise_floor",
+            "before_peak": before_peak,
+            "before_patch_flux": before_patch_flux,
+            "before_noise_sigma": before_noise_sigma,
+            "after_noise_sigma": after_noise_sigma,
+            "peak_floor": peak_floor,
+            "flux_floor": flux_floor,
+            "signal_snr_min": LOCAL_STAR_SIGNAL_SNR_MIN,
+        }
+
+    normalization = before_peak
     ring_delta = after_residual[ring] - before_residual[ring]
+    positive_ring_absolute = float(max(0.0, np.percentile(ring_delta, 95.0)))
+    negative_ring_absolute = float(max(0.0, -np.percentile(ring_delta, 5.0)))
+    ring_noise_sigma = math.sqrt(
+        before_noise_sigma * before_noise_sigma
+        + after_noise_sigma * after_noise_sigma
+    )
+    ring_absolute_floor = max(
+        LOCAL_STAR_RING_SIGMA_MIN * ring_noise_sigma,
+        LOCAL_STAR_SIGNAL_ABS_MIN,
+    )
     before_centroid = _centroid(
         before_residual,
         centroid_support,
@@ -569,16 +615,31 @@ def _one_signal_metrics(
             / fwhm
         )
     return {
+        "status": "ok",
         "core_peak_ratio": _safe_ratio(after_peak, before_peak),
         "core_flux_ratio": _safe_ratio(after_core_flux, before_core_flux),
-        "positive_ring_residual": float(
-            max(0.0, np.percentile(ring_delta, 95.0)) / normalization
+        "positive_ring_residual": positive_ring_absolute / normalization,
+        "negative_ring_residual": negative_ring_absolute / normalization,
+        "positive_ring_residual_absolute": positive_ring_absolute,
+        "negative_ring_residual_absolute": negative_ring_absolute,
+        "ring_noise_sigma": ring_noise_sigma,
+        "ring_absolute_floor": ring_absolute_floor,
+        "positive_ring_triggered": bool(
+            positive_ring_absolute / normalization > 0.10
+            and positive_ring_absolute > ring_absolute_floor
         ),
-        "negative_ring_residual": float(
-            max(0.0, -np.percentile(ring_delta, 5.0)) / normalization
+        "negative_ring_triggered": bool(
+            negative_ring_absolute / normalization > 0.08
+            and negative_ring_absolute > ring_absolute_floor
         ),
         "centroid_shift_fwhm": centroid_shift,
         "patch_flux_ratio": _safe_ratio(after_patch_flux, before_patch_flux),
+        "before_peak": before_peak,
+        "before_patch_flux": before_patch_flux,
+        "before_noise_sigma": before_noise_sigma,
+        "after_noise_sigma": after_noise_sigma,
+        "peak_floor": peak_floor,
+        "flux_floor": flux_floor,
     }
 
 
@@ -598,10 +659,65 @@ def _aggregate_signal(stars: Sequence[Dict[str, Any]], signal: str) -> Dict[str,
         "negative_ring_residual": _summary(
             block.get("negative_ring_residual") for block in blocks
         ),
+        "positive_ring_residual_absolute": _summary(
+            block.get("positive_ring_residual_absolute") for block in blocks
+        ),
+        "negative_ring_residual_absolute": _summary(
+            block.get("negative_ring_residual_absolute") for block in blocks
+        ),
+        "ring_absolute_floor": _summary(
+            block.get("ring_absolute_floor") for block in blocks
+        ),
         "centroid_shift_fwhm": _summary(
             block.get("centroid_shift_fwhm") for block in blocks
         ),
         "patch_flux_ratio": _summary(block.get("patch_flux_ratio") for block in blocks),
+    }
+
+
+def unavailable_local_star_guard_report(
+    reason: str,
+    *,
+    method: str = "none",
+    reason_code: str = "measurement_failed",
+) -> Dict[str, Any]:
+    """Return the fail-closed contract used when local stars cannot be measured."""
+    return {
+        "schema": LOCAL_STAR_GUARD_SCHEMA,
+        "status": "unavailable",
+        "mode": "enforced",
+        "enforced": True,
+        "participates_in_acceptance": True,
+        "method": str(method or "none"),
+        "source_checkpoint": "stage5_input_linear.fit",
+        "coordinate_policy": "fixed_baseline_catalog_no_output_redetection",
+        "minimum_star_count": LOCAL_STAR_MIN_COUNT,
+        "reason_code": str(reason_code or "measurement_failed"),
+        "reason": str(reason),
+        "decision_reasons": [str(reason_code or "measurement_failed")],
+        "accepted": False,
+        "rollback_required": True,
+        "decision": "rollback",
+        "would_rollback": True,
+    }
+
+
+def not_run_local_star_guard_report() -> Dict[str, Any]:
+    """Return the stable contract for a deconvolution candidate not attempted."""
+    return {
+        "schema": LOCAL_STAR_GUARD_SCHEMA,
+        "status": "not_run",
+        "mode": "enforced",
+        "enforced": True,
+        "participates_in_acceptance": True,
+        "method": "none",
+        "source_checkpoint": "stage5_input_linear.fit",
+        "reason_code": "deconvolution_not_applied",
+        "decision_reasons": ["deconvolution_not_applied"],
+        "accepted": False,
+        "rollback_required": False,
+        "decision": "not_run",
+        "would_rollback": False,
     }
 
 
@@ -612,12 +728,12 @@ def assess_local_star_guard(
     *,
     method: str,
 ) -> Dict[str, Any]:
-    """Compare fixed baseline stars after deconvolution in shadow-only mode."""
+    """Compare fixed baseline stars and return an enforced acceptance decision."""
     base: Dict[str, Any] = {
         "schema": LOCAL_STAR_GUARD_SCHEMA,
-        "mode": "shadow",
-        "enforced": False,
-        "participates_in_acceptance": False,
+        "mode": "enforced",
+        "enforced": True,
+        "participates_in_acceptance": True,
         "method": str(method or "none"),
         "source_checkpoint": "stage5_input_linear.fit",
         "coordinate_policy": "fixed_baseline_catalog_no_output_redetection",
@@ -646,8 +762,16 @@ def assess_local_star_guard(
                 **base,
                 "status": "unavailable",
                 "reason_code": "insufficient_eligible_baseline_stars",
+                "decision_reasons": [
+                    "insufficient_eligible_baseline_stars"
+                ],
                 "eligible_star_count": len(eligible),
-                "would_rollback": False,
+                "evaluated_star_count": 0,
+                "excluded_low_signal_star_count": 0,
+                "accepted": False,
+                "rollback_required": True,
+                "decision": "rollback",
+                "would_rollback": True,
             }
         signals_before = {
             "rec709": (
@@ -670,6 +794,7 @@ def assess_local_star_guard(
             "b": after_rgb[2],
         }
         evaluated: List[Dict[str, Any]] = []
+        excluded_low_signal: List[Dict[str, Any]] = []
         for star in eligible:
             x = _finite_float(star.get("x"))
             y = _finite_float(star.get("y"))
@@ -677,6 +802,7 @@ def assess_local_star_guard(
             if x is None or y is None or fwhm is None or fwhm <= 0.0:
                 continue
             signal_metrics: Dict[str, Any] = {}
+            signal_exclusions: Dict[str, Any] = {}
             for signal in ("rec709", "r", "g", "b"):
                 metrics = _one_signal_metrics(
                     signals_before[signal],
@@ -685,17 +811,34 @@ def assess_local_star_guard(
                     y=y,
                     fwhm=fwhm,
                 )
-                if metrics is not None:
+                if metrics is not None and metrics.get("status") == "ok":
                     signal_metrics[signal] = metrics
+                elif metrics is not None:
+                    signal_exclusions[signal] = metrics
             if "rec709" not in signal_metrics:
+                excluded_low_signal.append(
+                    {
+                        "index": star.get("index"),
+                        "x": x,
+                        "y": y,
+                        "fwhm_geometry": fwhm,
+                        "signals": signal_exclusions,
+                        "reason_code": str(
+                            (signal_exclusions.get("rec709") or {}).get(
+                                "reason_code"
+                            )
+                            or "rec709_measurement_unavailable"
+                        ),
+                    }
+                )
                 continue
             rec709 = signal_metrics["rec709"]
             peak = rec709.get("core_peak_ratio")
             patch_flux = rec709.get("patch_flux_ratio")
             centroid = rec709.get("centroid_shift_fwhm")
             anomalous = bool(
-                float(rec709.get("positive_ring_residual") or 0.0) > 0.10
-                or float(rec709.get("negative_ring_residual") or 0.0) > 0.08
+                bool(rec709.get("positive_ring_triggered", False))
+                or bool(rec709.get("negative_ring_triggered", False))
                 or (peak is not None and (float(peak) > 2.5 or float(peak) < 0.65))
                 or (
                     patch_flux is not None
@@ -710,6 +853,7 @@ def assess_local_star_guard(
                     "y": y,
                     "fwhm_geometry": fwhm,
                     "signals": signal_metrics,
+                    "signal_exclusions": signal_exclusions,
                     "anomalous": anomalous,
                 }
             )
@@ -718,9 +862,17 @@ def assess_local_star_guard(
                 **base,
                 "status": "unavailable",
                 "reason_code": "insufficient_evaluable_baseline_stars",
+                "decision_reasons": [
+                    "insufficient_evaluable_baseline_stars"
+                ],
                 "eligible_star_count": len(eligible),
                 "evaluated_star_count": len(evaluated),
-                "would_rollback": False,
+                "excluded_low_signal_star_count": len(excluded_low_signal),
+                "excluded_low_signal_stars": excluded_low_signal,
+                "accepted": False,
+                "rollback_required": True,
+                "decision": "rollback",
+                "would_rollback": True,
             }
 
         aggregates = {
@@ -730,6 +882,20 @@ def assess_local_star_guard(
         rec709 = aggregates["rec709"]
         positive_p95 = rec709["positive_ring_residual"].get("p95")
         negative_p95 = rec709["negative_ring_residual"].get("p95")
+        positive_absolute_p95 = rec709[
+            "positive_ring_residual_absolute"
+        ].get("p95")
+        negative_absolute_p95 = rec709[
+            "negative_ring_residual_absolute"
+        ].get("p95")
+        positive_ring_triggered_count = sum(
+            bool(star["signals"]["rec709"].get("positive_ring_triggered"))
+            for star in evaluated
+        )
+        negative_ring_triggered_count = sum(
+            bool(star["signals"]["rec709"].get("negative_ring_triggered"))
+            for star in evaluated
+        )
         peak_p95 = rec709["core_peak_ratio"].get("p95")
         peak_p05 = rec709["core_peak_ratio"].get("p05")
         flux_median = rec709["patch_flux_ratio"].get("median")
@@ -738,14 +904,24 @@ def assess_local_star_guard(
         checks = {
             "positive_ring_residual_p95": {
                 "observed": positive_p95,
-                "would_trigger": positive_p95 is not None and positive_p95 > 0.10,
+                "observed_absolute": positive_absolute_p95,
+                "significant_star_count": positive_ring_triggered_count,
+                "would_trigger": positive_ring_triggered_count > 0,
                 "limit": 0.10,
+                "absolute_limit": (
+                    f">{LOCAL_STAR_RING_SIGMA_MIN:.1f}x local delta noise"
+                ),
                 "operator": ">",
             },
             "negative_ring_residual_p95": {
                 "observed": negative_p95,
-                "would_trigger": negative_p95 is not None and negative_p95 > 0.08,
+                "observed_absolute": negative_absolute_p95,
+                "significant_star_count": negative_ring_triggered_count,
+                "would_trigger": negative_ring_triggered_count > 0,
                 "limit": 0.08,
+                "absolute_limit": (
+                    f">{LOCAL_STAR_RING_SIGMA_MIN:.1f}x local delta noise"
+                ),
                 "operator": ">",
             },
             "core_peak_ratio_p95": {
@@ -785,17 +961,30 @@ def assess_local_star_guard(
         reasons = [
             name for name, check in checks.items() if bool(check["would_trigger"])
         ]
+        accepted = not reasons
         return {
             **base,
             "status": "available",
-            "reason_code": "shadow_threshold_exceeded" if reasons else "within_shadow_limits",
+            "reason_code": (
+                "local_star_guard_rejected"
+                if reasons
+                else "local_star_guard_accepted"
+            ),
             "eligible_star_count": len(eligible),
             "evaluated_star_count": len(evaluated),
+            "excluded_low_signal_star_count": len(excluded_low_signal),
+            "excluded_low_signal_stars": excluded_low_signal,
             "anomalous_star_count": sum(star["anomalous"] for star in evaluated),
             "anomalous_star_ratio": anomalous_ratio,
             "decision_basis": "rec709",
+            "accepted": accepted,
+            "rollback_required": not accepted,
+            "decision": "accept" if accepted else "rollback",
             "would_rollback": bool(reasons),
             "would_rollback_reasons": reasons,
+            "decision_reasons": (
+                reasons if reasons else ["all_local_star_checks_passed"]
+            ),
             "checks": checks,
             "aggregate": aggregates,
             "stars": evaluated,
@@ -806,5 +995,9 @@ def assess_local_star_guard(
             "status": "unavailable",
             "reason_code": "measurement_failed",
             "reason": str(error),
-            "would_rollback": False,
+            "decision_reasons": ["measurement_failed"],
+            "accepted": False,
+            "rollback_required": True,
+            "decision": "rollback",
+            "would_rollback": True,
         }

@@ -1,4 +1,5 @@
 """Stretch selection and execution."""
+import copy
 from typing import List
 
 import display_rendition
@@ -158,14 +159,30 @@ def _run_with_stars_review_stretch(
             "stage": "stage7_stretch",
             "status": "review_only" if saved else "failed",
             "delivery_mode": "with_stars_review_only",
+            "formal_accepted": False,
+            "delivery_class": "review_only",
             "reason_code": review_reason,
             "review_required": True,
             "input": f"{source_stem}.fit",
             "source_stem": source_stem,
             "review_output": "stage7_review_with_stars" if saved else None,
-            "attempts": [],
-            "candidates": [],
+            "attempts": copy.deepcopy(
+                getattr(pipeline, "_stage7_stretch_candidates", []) or []
+            ),
+            "candidates": copy.deepcopy(
+                getattr(pipeline, "_stage7_stretch_candidates", []) or []
+            ),
             "selected": None,
+            "review_evidence": copy.deepcopy(
+                getattr(pipeline, "_stage7_review_evidence", None)
+            ),
+            "galaxy_roi": copy.deepcopy(
+                getattr(
+                    pipeline,
+                    "_stage6_galaxy_roi_diagnostics",
+                    {"status": "not_run", "available": False},
+                )
+            ),
             "strict_bright_core_evidence": dict(
                 bright_core_fallback.get("strict_target_evidence") or {}
             ),
@@ -330,6 +347,13 @@ def run_stage7_stretching(pipeline) -> None:
     messages.extend(stretch_messages)
     if stretch_method:
         messages.append(f"拉伸使用 {stretch_method}")
+    if bool(getattr(pipeline, "_stage7_stretch_forced_delivery", False)):
+        stretched = False
+        stage_degraded = True
+        messages.append(
+            "legacy forced-delivery candidate reclassified as review evidence; "
+            "formal Stage7 acceptance withheld"
+        )
 
     if bool(getattr(pipeline, "_stage7_destructive_core_rejected", False)):
         revoked_pair_id = getattr(pipeline, "_stage7_revoked_pair_id", None)
@@ -387,6 +411,44 @@ def run_stage7_stretching(pipeline) -> None:
         )
         return
 
+    if not stretched and failure_action == "auto_fallback":
+        review_input = (
+            "stage6_passthrough"
+            if separation_state == StarSeparationState.TARGET_BYPASS.value
+            else "stage6_input"
+        )
+        pipeline._star_separation_state = StarSeparationState.REJECTED.value
+        pipeline._stage7_starless_skipped = True
+        pipeline._stage6_passthrough_source = review_input
+        pipeline._stage6_pair_handoff = None
+        pipeline._stage7_matched_domain_transfer = None
+        pipeline.starless_file = None
+        pipeline.starmask_file = None
+        handoff = dict(getattr(pipeline, "_stage8_handoff", {}) or {})
+        handoff.update(
+            {
+                "requested_policy": "skip",
+                "processing_policy": "skip",
+                "source_stage": 7,
+                "source_stem": "stage7_review_with_stars",
+                "passthrough": True,
+                "restricted_downstream": True,
+                "reason_code": "stage7_stretch_not_accepted",
+                "reason_text": (
+                    "all Stage7 stretch candidates failed formal quality gates"
+                ),
+                "quality_status": "rejected",
+            }
+        )
+        pipeline._stage8_handoff = handoff
+        _run_with_stars_review_stretch(
+            pipeline,
+            StarSeparationState.REJECTED.value,
+            source_stem=review_input,
+            reason_code="stage7_stretch_not_accepted",
+        )
+        return
+
     compare_stem = pipeline._stage7_stretch_source
     failure_policy_triggered = bool(
         not stretched and failure_action != "auto_fallback"
@@ -432,7 +494,8 @@ def run_stage7_stretching(pipeline) -> None:
     pipeline._stage7_stretch_accepted = bool(
         stretched
         and stage_saved
-        and (not stage_degraded or validated_rescue or forced_delivery)
+        and (not stage_degraded or validated_rescue)
+        and not forced_delivery
     )
     if pipeline._stage7_stretch_accepted:
         pipeline._stage7_stretch_output = pipeline.stretched_name

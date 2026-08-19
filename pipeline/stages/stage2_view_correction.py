@@ -312,6 +312,33 @@ def _stage2_constrain_crop_to_center(
     ):
         return None, "center-area protection blocked crop: current image already violates protection"
 
+    requested_rect = (int(x), int(y), int(crop_w), int(crop_h))
+    legacy_detector_reason = bool(
+        reason in {"initial_auto_edge", "adaptive_color_edge"}
+        or reason.startswith("adaptive_edge_pass_")
+    )
+    if legacy_detector_reason and (
+        requested_left > int(protection["left"])
+        or requested_top > int(protection["top"])
+        or requested_right < int(protection["right"])
+        or requested_bottom < int(protection["bottom"])
+    ):
+        note = (
+            "center-area protection rejected crop detector conflict "
+            f"(reason={reason}, requested={requested_rect}, "
+            f"protected_area={float(protection['actual_area_ratio']):.3f})"
+        )
+        crop_report.setdefault("crop_limit_hits", []).append(
+            {
+                "reason": reason,
+                "reason_code": "crop_detector_conflict",
+                "requested": requested_rect,
+                "applied": None,
+                "message": note,
+            }
+        )
+        return None, note
+
     applied_left = max(current_left, min(requested_left, int(protection["left"])))
     applied_top = max(current_top, min(requested_top, int(protection["top"])))
     applied_right = min(current_right, max(requested_right, int(protection["right"])))
@@ -348,7 +375,6 @@ def _stage2_constrain_crop_to_center(
         applied_w,
         applied_h,
     )
-    requested_rect = (int(x), int(y), int(crop_w), int(crop_h))
     if applied_rect == (0, 0, current_width, current_height):
         note = (
             "center-area protection blocked crop "
@@ -910,6 +936,31 @@ def run_stage2_view_correction(pipeline) -> None:
             # serializable.
             crop_report["field_rotation"] = copy.deepcopy(field_report)
             messages.append(field_note)
+            native_report = crop_report.get("native_contour") or {}
+            native_full_frame_valid = bool(
+                not native_report.get("accepted", False)
+                and str(native_report.get("reason") or "")
+                == "full_frame_is_valid"
+            )
+            if field_rect is not None and native_full_frame_valid:
+                conflict = {
+                    "reason": "native_field_rotation",
+                    "reason_code": "crop_detector_conflict",
+                    "requested": tuple(int(value) for value in field_rect),
+                    "applied": None,
+                    "message": (
+                        "native contour accepted the full frame while the "
+                        "field-rotation detector requested a crop; preserve "
+                        "the immutable full frame for review"
+                    ),
+                }
+                crop_report.setdefault("crop_limit_hits", []).append(conflict)
+                crop_report["field_rotation"].update(
+                    application_status="rejected_detector_conflict",
+                    applied_crop=None,
+                )
+                messages.append(conflict["message"])
+                field_rect = None
             if field_rect is not None:
                 x, y, crop_w, crop_h = field_rect
                 configured_protection = float(
@@ -1162,8 +1213,69 @@ def run_stage2_view_correction(pipeline) -> None:
 
     primary_crop_applied = native_contour_applied or field_rotation_applied
 
+    native_report = crop_report.get("native_contour") or {}
+    field_report = crop_report.get("field_rotation") or {}
+    native_full_frame_valid = bool(
+        not native_report.get("accepted", False)
+        and str(native_report.get("reason") or "") == "full_frame_is_valid"
+    )
+    field_full_frame_valid = _field_rotation_verification_cleared(field_report)
+    preserve_full_frame_consensus = bool(
+        not primary_crop_applied
+        and native_full_frame_valid
+        and field_full_frame_valid
+    )
+    primary_detector_conflict = bool(
+        not primary_crop_applied
+        and any(
+            isinstance(item, dict)
+            and item.get("reason_code") == "crop_detector_conflict"
+            for item in crop_report.get("crop_limit_hits", [])
+        )
+    )
+    crop_report["detector_consensus"] = {
+        "decision": (
+            "preserve_full_frame"
+            if preserve_full_frame_consensus
+            else "crop_detector_conflict"
+            if primary_detector_conflict
+            else "fallback_permitted"
+        ),
+        "native_contour_reason": str(native_report.get("reason") or "unavailable"),
+        "field_rotation_reason": str(field_report.get("reason") or "unavailable"),
+        "legacy_fallback_permitted": bool(
+            not preserve_full_frame_consensus and not primary_detector_conflict
+        ),
+    }
+    if preserve_full_frame_consensus:
+        crop_report["mode"] = "native_no_crop"
+        crop_report["reason_code"] = "primary_detectors_preserve_full_frame"
+        messages.append(
+            "primary crop detectors agree that the full frame is valid; "
+            "legacy edge crop suppressed"
+        )
+    elif primary_detector_conflict:
+        crop_report["requires_review"] = True
+        crop_report["reason_code"] = "crop_detector_conflict"
+        pipeline._stage2_view_review_required = True
+        pipeline._require_review(
+            2,
+            "crop_detector_conflict",
+            {"detector_consensus": crop_report["detector_consensus"]},
+        )
+        review_reason_code = "crop_detector_conflict"
+        status = "degraded"
+        messages.append(
+            "primary detectors disagree on full-frame validity; legacy crop "
+            "suppressed and full frame retained for review"
+        )
+
     # 第一方候选没有通过安全门或没有实际裁切时，运行现有边缘检测方案。
-    if not primary_crop_applied:
+    if (
+        not primary_crop_applied
+        and not preserve_full_frame_consensus
+        and not primary_detector_conflict
+    ):
         pipeline.log.info("轮廓检测未裁切，自动识别黑边/叠加边缘并裁切...")
         try:
             crop_rect, crop_note = _detect_auto_edge_crop(pipeline, is_adaptive=False)
@@ -1184,6 +1296,28 @@ def run_stage2_view_correction(pipeline) -> None:
                 if applied_rect is None:
                     pipeline.log.warn("中心面积保护已阻止本次边界裁切")
                     status = "degraded"
+                    latest_limit = (
+                        crop_report.get("crop_limit_hits", [])[-1]
+                        if crop_report.get("crop_limit_hits")
+                        else {}
+                    )
+                    if latest_limit.get("reason_code") == "crop_detector_conflict":
+                        primary_detector_conflict = True
+                        crop_report["requires_review"] = True
+                        crop_report["reason_code"] = "crop_detector_conflict"
+                        crop_report["detector_consensus"] = {
+                            **crop_report.get("detector_consensus", {}),
+                            "decision": "crop_detector_conflict",
+                            "legacy_fallback_permitted": False,
+                            "legacy_candidate": latest_limit.get("requested"),
+                        }
+                        pipeline._stage2_view_review_required = True
+                        pipeline._require_review(
+                            2,
+                            "crop_detector_conflict",
+                            {"crop_limit_hit": latest_limit},
+                        )
+                        review_reason_code = "crop_detector_conflict"
                 else:
                     crop_report["mode"] = "native_edge"
                     applied_x, applied_y, applied_w, applied_h = applied_rect
@@ -1197,7 +1331,12 @@ def run_stage2_view_correction(pipeline) -> None:
             pipeline.log.warn(f"裁切失败: {e}")
             status = "degraded"
 
-    if status == "ok" and not primary_crop_applied:
+    if (
+        status == "ok"
+        and not primary_crop_applied
+        and not preserve_full_frame_consensus
+        and not primary_detector_conflict
+    ):
         target = float(getattr(pipeline.cfg, "stage2_edge_black_target", 0.10))
         max_passes = int(getattr(pipeline.cfg, "stage2_adaptive_edge_crop_max_passes", 3))
         last_edge_black = None
@@ -1293,6 +1432,8 @@ def run_stage2_view_correction(pipeline) -> None:
     if (
         status == "ok"
         and not primary_crop_applied
+        and not preserve_full_frame_consensus
+        and not primary_detector_conflict
         and bool(
             getattr(
                 pipeline.cfg,

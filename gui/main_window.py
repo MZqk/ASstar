@@ -344,9 +344,11 @@ try:
     from .task_intake import (
         PreparedTask,
         PreparedTaskQueue,
+        SPCC_ONLINE_CIRCUIT_ENV,
         describe_input_plan,
         discover_input_for_processing_settings,
         prepare_task_queue,
+        stage4_online_spcc_timeout_detected,
     )
     from .history_store import (
         STATUS_FAILED,
@@ -390,9 +392,11 @@ except ImportError:  # Support direct execution from the gui directory.
     from task_intake import (  # type: ignore[no-redef]
         PreparedTask,
         PreparedTaskQueue,
+        SPCC_ONLINE_CIRCUIT_ENV,
         describe_input_plan,
         discover_input_for_processing_settings,
         prepare_task_queue,
+        stage4_online_spcc_timeout_detected,
     )
     from history_store import (  # type: ignore[no-redef]
         STATUS_FAILED,
@@ -557,12 +561,14 @@ class StarunGui(QMainWindow):
         self._prepared_tasks: tuple[PreparedTask, ...] = ()
         self._prepared_task_index = 0
         self._active_prepared_task: PreparedTask | None = None
+        self._spcc_online_circuit_open = False
         self._last_task_root: Path | None = None
         self.history_store = HistoryStore(history_path_override)
         self._history_return_state = WORKSPACE_EMPTY
         self._history_return_status = ""
         self._history_return_task_root: Path | None = None
         self._history_task_records: dict[str, dict[str, object]] = {}
+        self._pending_history_delete: tuple[str, Path] | None = None
         self._active_history_task_key: str | None = None
         self._active_history_run_id: str | None = None
         self._history_detail_mode = False
@@ -1543,6 +1549,53 @@ class StarunGui(QMainWindow):
         self.history_mode_label.hide()
         layout.addWidget(self.history_mode_label)
 
+        self.history_delete_banner = QFrame()
+        self.history_delete_banner.setObjectName("stateBanner")
+        self.history_delete_banner.setProperty("tone", "warning")
+        self.history_delete_banner.setAccessibleName("历史任务删除确认")
+        self.history_delete_banner.setAccessibleDescription(
+            "显示待移到废纸篓的历史任务摘要和确认操作"
+        )
+        self.history_delete_banner.hide()
+        delete_banner_layout = QVBoxLayout(self.history_delete_banner)
+        delete_banner_layout.setContentsMargins(12, 10, 12, 10)
+        delete_banner_layout.setSpacing(8)
+
+        self.history_delete_banner_label = QLabel()
+        self.history_delete_banner_label.setWordWrap(True)
+        self.history_delete_banner_label.setAccessibleName("待删除任务摘要")
+        self.history_delete_banner_label.setAccessibleDescription(
+            "显示任务名称、目录、运行次数和目录大小"
+        )
+        delete_banner_layout.addWidget(self.history_delete_banner_label)
+
+        delete_actions = QHBoxLayout()
+        delete_actions.addStretch(1)
+        self.history_delete_cancel_btn = QPushButton("取消")
+        self.history_delete_cancel_btn.setAccessibleName("取消移到废纸篓")
+        self.history_delete_cancel_btn.setAccessibleDescription(
+            "不移动任务目录，返回历史记录"
+        )
+        self.history_delete_cancel_btn.clicked.connect(
+            self._cancel_pending_history_delete
+        )
+        delete_actions.addWidget(self.history_delete_cancel_btn)
+
+        self.history_delete_confirm_btn = QPushButton("确认移到废纸篓")
+        self.history_delete_confirm_btn.setProperty("variant", "destructive")
+        self.history_delete_confirm_btn.setAccessibleName(
+            "确认将任务移到废纸篓"
+        )
+        self.history_delete_confirm_btn.setAccessibleDescription(
+            "重新验证任务目录后，将整个任务移到系统废纸篓"
+        )
+        self.history_delete_confirm_btn.clicked.connect(
+            self._confirm_pending_history_delete
+        )
+        delete_actions.addWidget(self.history_delete_confirm_btn)
+        delete_banner_layout.addLayout(delete_actions)
+        layout.addWidget(self.history_delete_banner)
+
         self.history_tree = QTreeWidget()
         self.history_tree.setObjectName("historyTree")
         self.history_tree.setAccessibleName("历史任务和运行记录")
@@ -1568,7 +1621,7 @@ class StarunGui(QMainWindow):
             self._on_history_item_activated
         )
         self.history_tree.itemSelectionChanged.connect(
-            self._update_history_selection_actions
+            self._on_history_selection_changed
         )
         layout.addWidget(self.history_tree, 1)
 
@@ -1586,6 +1639,9 @@ class StarunGui(QMainWindow):
             from history_window import HistoryWindow  # type: ignore[no-redef]
 
         self.history_window = HistoryWindow(self.history_page, self)
+        self.history_window.aboutToClose.connect(
+            self._clear_pending_history_delete
+        )
         self.history_window.aboutToClose.connect(
             self._save_history_window_geometry
         )
@@ -2512,7 +2568,77 @@ class StarunGui(QMainWindow):
         badge.setContentsMargins(8, 2, 8, 2)
         self.history_tree.setItemWidget(item, 2, badge)
 
+    def _clear_pending_history_delete(self) -> None:
+        self._pending_history_delete = None
+        banner = getattr(self, "history_delete_banner", None)
+        if banner is None:
+            return
+        banner.hide()
+        self.history_delete_cancel_btn.setText("取消")
+        self.history_delete_cancel_btn.setAccessibleName("取消移到废纸篓")
+        self.history_delete_cancel_btn.setAccessibleDescription(
+            "不移动任务目录，返回历史记录"
+        )
+        self.history_delete_confirm_btn.show()
+
+    def _show_history_delete_banner(
+        self,
+        message: str,
+        *,
+        tone: str,
+        confirming: bool,
+    ) -> None:
+        set_style_property(self.history_delete_banner, "tone", tone)
+        self.history_delete_banner.setAccessibleName(
+            "历史任务删除确认" if confirming else "历史任务删除状态"
+        )
+        self.history_delete_banner.setAccessibleDescription(message)
+        self.history_delete_banner_label.setText(message)
+        self.history_delete_banner_label.setAccessibleDescription(message)
+        self.history_delete_confirm_btn.setVisible(confirming)
+        if confirming:
+            self.history_delete_cancel_btn.setText("取消")
+            self.history_delete_cancel_btn.setAccessibleName("取消移到废纸篓")
+            self.history_delete_cancel_btn.setAccessibleDescription(
+                "不移动任务目录，返回历史记录"
+            )
+        else:
+            self.history_delete_cancel_btn.setText("关闭")
+            self.history_delete_cancel_btn.setAccessibleName("关闭历史任务删除提示")
+            self.history_delete_cancel_btn.setAccessibleDescription(
+                "关闭提示，不会更改任务目录或历史索引"
+            )
+        self.history_delete_banner.show()
+
+    def _show_history_delete_notice(
+        self,
+        message: str,
+        *,
+        tone: str = "error",
+    ) -> None:
+        self._clear_pending_history_delete()
+        self._show_history_delete_banner(
+            message,
+            tone=tone,
+            confirming=False,
+        )
+        self._append_event(f"历史任务删除：{message.replace(chr(10), ' ')}")
+        self.statusBar().showMessage(message.splitlines()[0], 8000)
+        self._update_history_selection_actions()
+
+    def _cancel_pending_history_delete(self) -> None:
+        had_pending = self._pending_history_delete is not None
+        self._clear_pending_history_delete()
+        self._update_history_selection_actions()
+        if had_pending:
+            self.statusBar().showMessage("已取消移到废纸篓。", 4000)
+
+    def _on_history_selection_changed(self) -> None:
+        self._clear_pending_history_delete()
+        self._update_history_selection_actions()
+
     def _refresh_history_view(self, _value: object = None) -> None:
+        self._clear_pending_history_delete()
         if not hasattr(self, "history_tree"):
             return
         user_role = int(Qt.ItemDataRole.UserRole)
@@ -2661,11 +2787,12 @@ class StarunGui(QMainWindow):
             return
         task = self._selected_history_task()
         running = self._history_operations_running()
+        pending_delete = self._pending_history_delete is not None
         available = bool(task and task.get("available", False))
         run_identity = self._selected_history_run_identity()
         task_row_selected = self._selected_history_item_kind() == "task"
         self.history_open_btn.setEnabled(
-            bool(run_identity and available and not running)
+            bool(run_identity and available and not running and not pending_delete)
         )
         self.history_delete_btn.setText(
             "移到废纸篓"
@@ -2673,7 +2800,7 @@ class StarunGui(QMainWindow):
             else "从历史中移除"
         )
         self.history_delete_btn.setEnabled(
-            bool(task and task_row_selected and not running)
+            bool(task and task_row_selected and not running and not pending_delete)
         )
         self.history_delete_btn.setToolTip(
             "删除整个任务及其全部运行"
@@ -2751,18 +2878,10 @@ class StarunGui(QMainWindow):
     def _delete_selected_history_task(self) -> None:
         if self._selected_history_item_kind() != "task":
             return
-        parent = self._history_dialog_parent()
-        if self._ui_running or (
-            self.intake_worker and self.intake_worker.isRunning()
-        ) or (
-            self.bootstrap_worker and self.bootstrap_worker.isRunning()
-        ) or (
-            self.worker and self.worker.isRunning()
-        ):
-            QMessageBox.information(
-                parent,
-                "处理正在运行",
-                "请等待当前任务结束后再删除历史任务。",
+        if self._history_operations_running():
+            self._show_history_delete_notice(
+                "当前处理正在运行；请等待任务结束后再移到废纸篓。",
+                tone="warning",
             )
             return
         task = self._selected_history_task()
@@ -2772,14 +2891,18 @@ class StarunGui(QMainWindow):
             self._remove_unavailable_history_task(task)
             return
 
+        task_key = str(task.get("task_key") or "")
+        if not task_key:
+            self._show_history_delete_notice(
+                "删除未执行：所选历史任务缺少任务标识。",
+            )
+            return
         task_root = Path(str(task.get("task_directory") or "")).expanduser()
         try:
             workspace = validate_deletable_task_root(task_root)
         except UnsafeTaskDeletionError as error:
-            QMessageBox.warning(
-                parent,
-                "拒绝删除任务",
-                f"删除目标未通过安全校验：\n{error}",
+            self._show_history_delete_notice(
+                f"删除未执行：任务目录未通过安全校验。\n{error}",
             )
             return
         try:
@@ -2795,44 +2918,101 @@ class StarunGui(QMainWindow):
                 [item for item in task.get("runs", []) if isinstance(item, dict)]
             )
         task_size = directory_size_bytes(workspace.root)
-        dialog = QMessageBox(parent)
-        dialog.setWindowTitle("将任务移到废纸篓")
-        dialog.setIcon(QMessageBox.Icon.Warning)
-        dialog.setText(
-            f"确定将任务“{task.get('display_name') or workspace.task_id}”移到废纸篓吗？"
+        try:
+            normalized_root = workspace.root.expanduser().resolve(strict=True)
+        except OSError as error:
+            self._show_history_delete_notice(
+                f"删除未执行：无法规范化任务目录。\n{error}",
+            )
+            return
+        self._pending_history_delete = (task_key, normalized_root)
+        self._show_history_delete_banner(
+            "确认将任务“{display_name}”移到废纸篓吗？\n\n"
+            "将移动整个任务目录，其中的运行结果、断点和日志都会一并移除；"
+            "可在系统废纸篓恢复。\n\n"
+            "任务目录：{task_root}\n"
+            "运行记录：{run_count} 次\n"
+            "目录大小：{task_size}".format(
+                display_name=str(task.get("display_name") or workspace.task_id),
+                task_root=normalized_root,
+                run_count=run_count,
+                task_size=format_bytes(task_size),
+            ),
+            tone="warning",
+            confirming=True,
         )
-        dialog.setInformativeText(
-            "将移动整个任务目录，其中的运行结果、断点和日志都会一并移除。\n\n"
-            f"任务目录：{workspace.root}\n"
-            f"运行记录：{run_count} 次\n"
-            f"目录大小：{format_bytes(task_size)}"
-        )
-        move_button = dialog.addButton(
-            "移到废纸篓",
-            QMessageBox.ButtonRole.AcceptRole,
-        )
-        dialog.addButton(QMessageBox.StandardButton.Cancel)
-        dialog.setDefaultButton(QMessageBox.StandardButton.Cancel)
-        dialog.exec()
-        if dialog.clickedButton() is not move_button:
+        self._update_history_selection_actions()
+        self.history_delete_cancel_btn.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _confirm_pending_history_delete(self) -> None:
+        pending = self._pending_history_delete
+        if pending is None:
+            return
+        task_key, expected_root = pending
+        if self._history_operations_running():
+            self._show_history_delete_notice(
+                "当前处理正在运行；未移动任务目录。",
+                tone="warning",
+            )
             return
 
         try:
-            workspace = validate_deletable_task_root(workspace.root)
-        except UnsafeTaskDeletionError as error:
-            QMessageBox.warning(
-                parent,
-                "删除目标已变化",
-                f"确认后目标不再满足安全条件，未执行删除：\n{error}",
+            task = self.history_store.find_task(task_key)
+        except (HistoryStoreError, OSError) as error:
+            self._show_history_delete_notice(
+                f"确认未执行：无法重新读取历史索引。\n{error}",
+            )
+            return
+        if task is None:
+            self._show_history_delete_notice(
+                "确认未执行：历史索引中已找不到此任务，未移动任何文件。",
+            )
+            return
+        if str(task.get("task_key") or "") != task_key:
+            self._show_history_delete_notice(
+                "确认未执行：历史索引中的任务标识已变化，未移动任何文件。",
             )
             return
         try:
-            trash_result = QFile.moveToTrash(str(workspace.root))
+            recorded_root = Path(
+                str(task.get("task_directory") or "")
+            ).expanduser().resolve()
+        except (OSError, RuntimeError) as error:
+            self._show_history_delete_notice(
+                f"确认未执行：无法规范化历史任务目录。\n{error}",
+            )
+            return
+        if recorded_root != expected_root:
+            self._show_history_delete_notice(
+                "确认未执行：历史任务目录已变化，未移动任何文件。",
+            )
+            return
+
+        try:
+            workspace = validate_deletable_task_root(recorded_root)
+        except UnsafeTaskDeletionError as error:
+            self._show_history_delete_notice(
+                f"确认未执行：任务目录不再满足安全条件。\n{error}",
+            )
+            return
+        try:
+            verified_root = workspace.root.expanduser().resolve(strict=True)
+        except OSError as error:
+            self._show_history_delete_notice(
+                f"确认未执行：无法重新解析任务目录。\n{error}",
+            )
+            return
+        if verified_root != expected_root:
+            self._show_history_delete_notice(
+                "确认未执行：任务清单指向了不同目录，未移动任何文件。",
+            )
+            return
+        try:
+            trash_result = QFile.moveToTrash(str(verified_root))
         except (OSError, RuntimeError, TypeError) as error:
-            QMessageBox.warning(
-                parent,
-                "无法移到废纸篓",
-                str(error),
+            self._show_history_delete_notice(
+                "无法移到废纸篓，任务文件和历史索引均未更改。\n"
+                f"{error}",
             )
             return
         if isinstance(trash_result, tuple):
@@ -2840,40 +3020,36 @@ class StarunGui(QMainWindow):
         else:
             moved = bool(trash_result)
         if not moved:
-            QMessageBox.warning(
-                parent,
-                "无法移到废纸篓",
-                "系统未能移动该任务目录。任务文件和历史索引均未更改。",
+            self._show_history_delete_notice(
+                "无法移到废纸篓：系统未能移动该任务目录。"
+                "任务文件和历史索引均未更改。",
             )
             return
 
-        task_key = str(task.get("task_key") or history_task_key(workspace.root))
-        index_update_failed = False
+        index_update_notice = ""
         try:
             removed = self.history_store.remove_task(task_key)
         except (HistoryStoreError, OSError) as error:
             removed = False
-            index_update_failed = True
-            QMessageBox.warning(
-                parent,
-                "任务已移到废纸篓",
+            index_update_notice = (
                 "任务目录已成功移动，但历史索引更新失败；"
-                f"该记录会显示为位置不可用。\n\n{error}",
+                f"该记录会显示为位置不可用。\n{error}"
             )
-        if not removed and not index_update_failed:
-            QMessageBox.warning(
-                parent,
-                "任务已移到废纸篓",
+        if not removed and not index_update_notice:
+            index_update_notice = (
                 "任务目录已成功移动，但历史索引中未找到对应记录；"
-                "请重新打开历史窗口检查。",
+                "请重新打开历史窗口检查。"
             )
-        was_current = self._clear_deleted_task_state(workspace.root)
+        self._clear_pending_history_delete()
+        was_current = self._clear_deleted_task_state(verified_root)
         if was_current:
             self._show_workspace(WORKSPACE_EMPTY)
             self._set_status_text("Idle")
         else:
             self._refresh_history_view()
-        if removed:
+        if index_update_notice:
+            self._show_history_delete_notice(index_update_notice, tone="warning")
+        elif removed:
             self.statusBar().showMessage(
                 "任务目录已移到废纸篓，可从废纸篓恢复。",
                 8000,
@@ -4215,6 +4391,8 @@ class StarunGui(QMainWindow):
             self._apply_input_path(Path(selected), remember=True)
 
     def _set_running(self, running: bool) -> None:
+        if running:
+            self._clear_pending_history_delete()
         self._ui_running = bool(running)
         self.dir_edit.setEnabled(not running)
         self.browse_btn.setEnabled(not running)
@@ -8935,10 +9113,16 @@ class StarunGui(QMainWindow):
             return
         self._prepared_tasks = result.tasks
         self._prepared_task_index = 0
+        self._spcc_online_circuit_open = False
         first_task = result.tasks[0]
         self._append_event(
             f"来源校验完成：{len(result.tasks)} 个独立任务，将串行执行。"
         )
+        if result.skipped_duplicates:
+            self._append_event(
+                "已跳过完全相同的来源与处理参数组合："
+                f"{len(result.skipped_duplicates)} 项。"
+            )
         self._set_running(False)
         self._start_run(prepared_task=first_task)
 
@@ -8947,6 +9131,7 @@ class StarunGui(QMainWindow):
         self._prepared_tasks = ()
         self._prepared_task_index = 0
         self._active_prepared_task = None
+        self._spcc_online_circuit_open = False
         self._set_status_text("Idle")
         self._set_running(False)
         QMessageBox.critical(self, title, detail)
@@ -8957,6 +9142,7 @@ class StarunGui(QMainWindow):
         self._prepared_tasks = ()
         self._prepared_task_index = 0
         self._active_prepared_task = None
+        self._spcc_online_circuit_open = False
         self._set_status_text("Idle")
         self._set_running(False)
         self._append_event("已停止来源校验；原始文件未被修改。")
@@ -9042,6 +9228,12 @@ class StarunGui(QMainWindow):
             self._pending_runtime_unset_keys,
         ) = self._processing_runtime_configuration(input_mode)
         self._pending_runtime_overrides.update(prepared_task.runtime_overrides)
+        if self._spcc_online_circuit_open:
+            self._pending_runtime_overrides[SPCC_ONLINE_CIRCUIT_ENV] = "1"
+            self._append_event(
+                "本批次在线 Gaia SPCC 超时熔断已开启；"
+                "本任务跳过在线 SPCC，仍保留 localgaia/PCC 降级。"
+            )
         if self.graxpert_model_path:
             model_path = Path(self.graxpert_model_path).expanduser()
             if not model_path.exists():
@@ -9638,6 +9830,16 @@ class StarunGui(QMainWindow):
             failure_reason=history_failure_reason,
             exit_code=exit_code,
         )
+        if (
+            not self._spcc_online_circuit_open
+            and work_dir is not None
+            and stage4_online_spcc_timeout_detected(work_dir)
+        ):
+            self._spcc_online_circuit_open = True
+            self._append_event(
+                "检测到 online_unverified Gaia SPCC 超时；"
+                "已为本批次剩余任务开启在线 SPCC 熔断。"
+            )
         has_next_task = bool(
             status in {"Completed", "CompletedWithWarning"}
             and self._prepared_task_index + 1 < len(self._prepared_tasks)
@@ -9771,6 +9973,7 @@ class StarunGui(QMainWindow):
             self._active_prepared_task = None
             self._prepared_tasks = ()
             self._prepared_task_index = 0
+            self._spcc_online_circuit_open = False
             self._active_history_task_key = None
             self._active_history_run_id = None
 

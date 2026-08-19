@@ -216,6 +216,14 @@ class Display90CurveTests(unittest.TestCase):
         calibration = _calibration(image)
 
         self.assertEqual(calibration["status"], "ok", calibration)
+        self.assertEqual(
+            calibration["schema"],
+            stretch_metrics.DISPLAY90_STRETCH_SCHEMA_V2,
+        )
+        self.assertEqual(
+            calibration["method"],
+            stretch_metrics.DISPLAY_LUMINANCE_VECTOR_METHOD,
+        )
         lut, contract = stretch_metrics.rebuild_display90_linked_lut(calibration)
         grid = np.linspace(0.0, 1.0, lut.size, dtype=np.float64)
         curve = calibration["display_curve"]
@@ -256,6 +264,56 @@ class Display90CurveTests(unittest.TestCase):
             drifted,
         )
         self.assertFalse(rejected["accepted"], rejected)
+
+    def test_v2_luminance_lut_preserves_rgb_direction_and_uniform_gamut(self) -> None:
+        image = _linear_rgb()
+        image[:, 20:30, 40:50] = np.asarray(
+            [0.92, 0.18, 0.04],
+            dtype=np.float32,
+        )[:, None, None]
+        calibration = _calibration(image, strength=0.95)
+        mapped = stretch_metrics.apply_display90_linked_rgb_stretch(
+            image,
+            calibration,
+        )
+
+        source_sum = np.sum(image, axis=0)
+        mapped_sum = np.sum(mapped, axis=0)
+        support = (source_sum > 1e-8) & (mapped_sum > 1e-8)
+        source_direction = image[:, support] / source_sum[support]
+        mapped_direction = mapped[:, support] / mapped_sum[support]
+        np.testing.assert_allclose(
+            mapped_direction,
+            source_direction,
+            rtol=2e-6,
+            atol=2e-6,
+        )
+        self.assertLessEqual(float(np.max(mapped)), 0.995001)
+
+    def test_legacy_v1_calibration_replays_per_channel_semantics(self) -> None:
+        image = _linear_rgb()
+        calibration = _calibration(image)
+        legacy = copy.deepcopy(calibration)
+        legacy["schema"] = stretch_metrics.DISPLAY90_STRETCH_SCHEMA_V1
+        legacy["method"] = stretch_metrics.DISPLAY90_LEGACY_METHOD
+        legacy.pop("application_contract", None)
+
+        lut, _contract = stretch_metrics.rebuild_display90_linked_lut(legacy)
+        replayed = stretch_metrics.apply_display90_linked_rgb_stretch(
+            image,
+            legacy,
+        )
+        expected = stretch_metrics._apply_authenticated_lut_rgb(image, lut)
+        np.testing.assert_array_equal(replayed, expected)
+        self.assertFalse(
+            np.array_equal(
+                replayed,
+                stretch_metrics.apply_display90_linked_rgb_stretch(
+                    image,
+                    calibration,
+                ),
+            )
+        )
 
     def test_strength_bounds_and_digest_tampering_fail_closed(self) -> None:
         image = _linear_rgb()
@@ -844,6 +902,165 @@ class Display90RoutingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "display90_only"):
             normalize_processing_parameters(invalid)
 
+class Stage7SubjectBrightnessSelectionTests(unittest.TestCase):
+    @staticmethod
+    def _report(subject_p50: float, background: float, mad: float) -> dict:
+        lift = max(0.0, subject_p50 - background)
+        sigma = 1.4826 * mad
+        return {
+            "status": "available",
+            "metrics": {
+                "subject_p50": subject_p50,
+                "subject_lift": lift,
+                "subject_lift_sigma": lift / sigma if sigma > 0.0 else 0.0,
+                "background_median": background,
+                "background_mad": mad,
+            },
+        }
+
+    def test_reliable_subject_lift_and_p50_use_bounded_goals(self) -> None:
+        preview = self._report(0.10, 0.02, 0.005)
+        at_goal = stretch_metrics.subject_brightness_selection(
+            self._report(0.08, 0.02, 0.005),
+            preview,
+        )
+        above_goal = stretch_metrics.subject_brightness_selection(
+            self._report(0.14, 0.02, 0.005),
+            preview,
+        )
+
+        self.assertTrue(at_goal["formal_floor_passed"], at_goal)
+        self.assertEqual(at_goal["ranking"]["goal_count"], 2)
+        self.assertEqual(at_goal["ranking"]["utility"], 1.0)
+        self.assertEqual(above_goal["ranking"]["utility"], 1.0)
+        self.assertEqual(
+            above_goal["ranking"]["above_goal_reward"],
+            "capped",
+        )
+
+    def test_subject_brightness_floor_rejects_dim_candidate(self) -> None:
+        report = stretch_metrics.subject_brightness_selection(
+            self._report(0.05, 0.02, 0.005),
+            self._report(0.10, 0.02, 0.005),
+        )
+
+        self.assertFalse(report["formal_floor_passed"], report)
+        self.assertEqual(
+            report["reason_code"],
+            "stage7_subject_brightness_floor_unmet",
+        )
+        self.assertIn("subject_p50_retention_below_floor", report["issues"])
+        self.assertIn("subject_lift_retention_below_floor", report["issues"])
+
+    def test_unreliable_preview_lift_does_not_participate(self) -> None:
+        preview = self._report(0.039, 0.02, 0.005)
+        candidate = self._report(0.025, 0.02, 0.005)
+        report = stretch_metrics.subject_brightness_selection(
+            candidate,
+            preview,
+        )
+
+        self.assertFalse(
+            report["preview_reliability"]["subject_lift_reliable"]
+        )
+        self.assertIsNone(report["retention"]["subject_lift"])
+        self.assertTrue(report["formal_floor_passed"], report)
+        self.assertEqual(report["ranking"]["applicable_goal_count"], 1)
+
+    def test_selection_prefers_brightness_only_after_safety_gates(self) -> None:
+        preview = self._report(0.10, 0.02, 0.005)
+        dim = stretch_metrics.subject_brightness_selection(
+            self._report(0.065, 0.02, 0.005),
+            preview,
+        )
+        bright = stretch_metrics.subject_brightness_selection(
+            self._report(0.08, 0.02, 0.005),
+            preview,
+        )
+
+        def attempt(name: str, brightness: dict, *, technical: bool = True) -> dict:
+            return {
+                "name": name,
+                "stem": f"stage7_{name}",
+                "status": "ok",
+                "allowed_as_final": True,
+                "technical_safe": technical,
+                "subject_brightness_selection": brightness,
+                "presentation_score": {"score": 0.5},
+                "advisories": [],
+                "risk_score": 0.1,
+            }
+
+        safe_winner = min(
+            [attempt("dim", dim), attempt("bright", bright)],
+            key=Stage6ServiceMixin._stage7_candidate_selection_key,
+        )
+        self.assertEqual(safe_winner["name"], "bright")
+
+        unsafe_bright = attempt("unsafe_bright", bright, technical=False)
+        safe_dim = attempt("safe_dim", dim)
+        safety_winner = min(
+            [unsafe_bright, safe_dim],
+            key=Stage6ServiceMixin._stage7_candidate_selection_key,
+        )
+        self.assertEqual(safety_winner["name"], "safe_dim")
+
+    def test_unreliable_nebula_lift_ranks_structure_before_brightness_goal(self) -> None:
+        preview = self._report(0.039, 0.02, 0.005)
+        lower_p50 = stretch_metrics.subject_brightness_selection(
+            self._report(0.025, 0.02, 0.005),
+            preview,
+        )
+        higher_p50 = stretch_metrics.subject_brightness_selection(
+            self._report(0.034, 0.02, 0.005),
+            preview,
+        )
+
+        def attempt(
+            name: str,
+            brightness: dict,
+            *,
+            score: float,
+            advisories: list[str],
+            risk: float,
+        ) -> dict:
+            return {
+                "name": name,
+                "stem": f"stage7_{name}",
+                "status": "ok",
+                "allowed_as_final": True,
+                "technical_safe": True,
+                "subject_brightness_selection": brightness,
+                "presentation_score": {"score": score},
+                "advisories": advisories,
+                "risk_score": risk,
+            }
+
+        display70 = attempt(
+            "cand_display70",
+            lower_p50,
+            score=0.84,
+            advisories=[],
+            risk=0.00001,
+        )
+        vivid = attempt(
+            "cand_vivid_safe",
+            higher_p50,
+            score=0.81,
+            advisories=["background_chroma_load_growth"],
+            risk=0.02,
+        )
+        winner = min(
+            [vivid, display70],
+            key=Stage6ServiceMixin._stage7_candidate_selection_key,
+        )
+
+        self.assertFalse(
+            lower_p50["preview_reliability"]["subject_lift_reliable"]
+        )
+        self.assertEqual(winner["name"], "cand_display70")
+
+
 class Display90Stage9ContractTests(unittest.TestCase):
     def test_stage9_reuses_exact_display90_lut(self) -> None:
         image = _linear_rgb()
@@ -864,7 +1081,10 @@ class Display90Stage9ContractTests(unittest.TestCase):
             )
 
         self.assertEqual(resolved["status"], "ready", resolved)
-        self.assertEqual(resolved["method"], "display90_linked_lut")
+        self.assertEqual(
+            resolved["method"],
+            stretch_metrics.DISPLAY_LUMINANCE_VECTOR_METHOD,
+        )
         stage9_pixels = stage9_star_remixing._stage9_apply_matched_domain_transfer(
             image,
             resolved,
@@ -885,7 +1105,7 @@ class Display90Stage9ContractTests(unittest.TestCase):
                 "parent_name": "cand_display82",
                 "parent_candidate": {
                     "name": "cand_display82",
-                    "method": "display90_linked_lut",
+                    "method": stretch_metrics.DISPLAY_LUMINANCE_VECTOR_METHOD,
                     "params": {"calibration": calibration},
                 },
             },
@@ -914,6 +1134,47 @@ class Display90Stage9ContractTests(unittest.TestCase):
             calibration,
         )
         np.testing.assert_array_equal(stage9_pixels, expected)
+
+    def test_stage9_replays_legacy_v1_display_transfer_without_semantic_upgrade(
+        self,
+    ) -> None:
+        image = _linear_rgb()
+        legacy = _calibration(image)
+        legacy["schema"] = stretch_metrics.DISPLAY90_STRETCH_SCHEMA_V1
+        legacy["method"] = stretch_metrics.DISPLAY90_LEGACY_METHOD
+        legacy.pop("application_contract", None)
+        selected = {
+            "name": "cand_display90",
+            "method": stretch_metrics.DISPLAY90_LEGACY_METHOD,
+            "params": {"calibration": legacy},
+        }
+        transfer = _stage7_matched_domain_transfer_contract(selected, {})
+        self.assertEqual(
+            transfer["schema"],
+            stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V1,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            pipeline = types.SimpleNamespace(
+                _stage7_matched_domain_transfer=transfer,
+                _stage7_closed_form_mtf_reference=None,
+                process_dir=Path(td),
+            )
+            resolved = stage9_star_remixing._stage9_resolve_matched_domain_transfer(
+                pipeline
+            )
+
+        self.assertEqual(resolved["status"], "ready", resolved)
+        self.assertEqual(
+            resolved["method"],
+            stretch_metrics.DISPLAY90_LEGACY_METHOD,
+        )
+        np.testing.assert_array_equal(
+            stage9_star_remixing._stage9_apply_matched_domain_transfer(
+                image,
+                resolved,
+            ),
+            stretch_metrics.apply_display90_linked_rgb_stretch(image, legacy),
+        )
 
     def test_corrupt_or_missing_display90_contract_never_uses_mtf(self) -> None:
         image = _linear_rgb()

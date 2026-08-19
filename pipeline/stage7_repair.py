@@ -66,6 +66,7 @@ def _stage7_galaxy_protection_mask(
         source_gray,
         float(source_features.bg_median),
         max(float(source_features.bg_std), 1e-5),
+        pipeline.cfg,
     )
     if not bool(masks.get("available", False)):
         return None

@@ -16,6 +16,7 @@ from local_adjustments import dilate_mask, feather_mask
 from managed_output import (
     audit_display_visibility,
     export_managed_outputs,
+    read_managed_display_png,
     write_managed_display_png,
 )
 from models import PipelineStage
@@ -1271,6 +1272,180 @@ def _stage10_terminal_failure(
         raise RuntimeError(f"Stage 10 用户严格停止：{reason}")
 
 
+def _stage10_star_visibility_reference(
+    pipeline,
+    final_pixels: np.ndarray,
+    *,
+    restore_stem: str,
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Resolve a dimension-checked frozen catalog for final star audits."""
+    final_shape = _stage10_spatial_shape(final_pixels)
+    primary = getattr(pipeline, "_stage9_star_reference_catalog", None)
+    if isinstance(primary, dict) and primary.get("status") == "ok":
+        y = np.asarray(
+            primary.get("_source_peak_y", primary.get("_peak_y", ())),
+            dtype=np.int32,
+        )
+        x = np.asarray(
+            primary.get("_source_peak_x", primary.get("_peak_x", ())),
+            dtype=np.int32,
+        )
+        contrast = np.asarray(
+            primary.get("_reference_local_contrast", ()),
+            dtype=np.float32,
+        )
+        if (
+            y.size > 0
+            and x.size == y.size
+            and contrast.size == y.size
+            and np.all((y >= 0) & (y < final_shape[0]))
+            and np.all((x >= 0) & (x < final_shape[1]))
+        ):
+            return primary, {
+                "schema": "starun.stage10-star-catalog-resolution.v1",
+                "status": "ready",
+                "source": "stage9_frozen_star_reference",
+                "star_count": int(y.size),
+                "spatial_shape": list(final_shape),
+            }
+
+    stage5_report = getattr(pipeline, "_stage5_star_reference_report", None)
+    resolution: Dict[str, Any] = {
+        "schema": "starun.stage10-star-catalog-resolution.v1",
+        "status": "unavailable",
+        "source": "stage5_frozen_star_reference",
+        "reason": "validated Stage9 catalog and signed Stage5 fallback are unavailable",
+        "spatial_shape": list(final_shape),
+    }
+    if not (
+        isinstance(stage5_report, dict)
+        and stage5_report.get("schema") == "starun.stage5-star-reference.v1"
+        and stage5_report.get("status") == "available"
+        and stage5_report.get("fixed_before_deconvolution") is True
+        and stage5_report.get("source_checkpoint") == "stage5_input_linear.fit"
+    ):
+        return None, resolution
+    stars = [
+        star
+        for star in list(stage5_report.get("stars") or [])
+        if isinstance(star, dict)
+        and bool(star.get("geometry_valid", False))
+        and star.get("x") is not None
+        and star.get("y") is not None
+        and star.get("fwhm_geometry") is not None
+    ]
+    try:
+        source_path = pipeline.process_dir / "stage5_input_linear.fit"
+        if not source_path.is_file():
+            raise RuntimeError("signed Stage5 source checkpoint is missing")
+        pipeline.cmd_with_check("load", "stage5_input_linear")
+        source_pixels = pipeline.siril.get_image_pixeldata(preview=False)
+        if source_pixels is None:
+            raise RuntimeError("signed Stage5 source pixels are unavailable")
+        source_shape = _stage10_spatial_shape(np.asarray(source_pixels))
+        if source_shape != final_shape:
+            raise RuntimeError(
+                "Stage5/final spatial shape mismatch: "
+                f"{source_shape}!={final_shape}"
+            )
+        filtered = [
+            star
+            for star in stars
+            if 0 <= int(round(float(star["y"]))) < final_shape[0]
+            and 0 <= int(round(float(star["x"]))) < final_shape[1]
+        ]
+        if len(filtered) < 4:
+            raise RuntimeError("Stage5 frozen catalog has insufficient valid stars")
+        amplitudes = np.asarray(
+            [
+                float(star.get("amplitude"))
+                if star.get("amplitude") is not None
+                else float("-inf")
+                for star in filtered
+            ],
+            dtype=np.float32,
+        )
+        finite_amplitudes = amplitudes[np.isfinite(amplitudes)]
+        if finite_amplitudes.size < 4:
+            raise RuntimeError("Stage5 frozen catalog lacks amplitude classification")
+        amplitude_split = float(np.median(finite_amplitudes))
+        fwhm = np.asarray(
+            [float(star["fwhm_geometry"]) for star in filtered],
+            dtype=np.float32,
+        )
+        y = np.asarray(
+            [int(round(float(star["y"]))) for star in filtered],
+            dtype=np.int32,
+        )
+        x = np.asarray(
+            [int(round(float(star["x"]))) for star in filtered],
+            dtype=np.int32,
+        )
+        catalog: Dict[str, Any] = {
+            "status": "ok",
+            "source_matched": True,
+            "component_count": int(y.size),
+            "source_reference": {
+                "schema": "starun.stage5-star-reference.v1",
+                "status": "available",
+                "source_checkpoint": "stage5_input_linear.fit",
+                "fixed_before_deconvolution": True,
+            },
+            "stage9_spatial_scale": {
+                "status": "ready",
+                "source": "stage5_fwhm_geometry",
+                "fwhm_median_px": float(np.median(fwhm)),
+                "anchor_fwhm_px": 4.0,
+                "radius_scale": float(np.median(fwhm) / 4.0),
+                "area_scale": float((np.median(fwhm) / 4.0) ** 2),
+            },
+            "_peak_y": y,
+            "_peak_x": x,
+            "_source_peak_y": y.copy(),
+            "_source_peak_x": x.copy(),
+            "_weak_flags": np.asarray(
+                np.isfinite(amplitudes) & (amplitudes <= amplitude_split),
+                dtype=bool,
+            ),
+            "_stage9_spatial_fwhm_px": fwhm,
+        }
+        catalog = stage9_quality.enrich_star_reference_with_display_psf(
+            catalog,
+            np.asarray(source_pixels),
+            pipeline.cfg,
+        )
+        contrast = np.asarray(
+            catalog.get("_reference_local_contrast", ()),
+            dtype=np.float32,
+        )
+        if contrast.size != y.size:
+            raise RuntimeError("Stage5 visibility reference enrichment failed")
+        resolution.update(
+            status="ready",
+            source="stage5_frozen_star_reference",
+            star_count=int(y.size),
+            source_checkpoint="stage5_input_linear.fit",
+            source_shape=list(source_shape),
+        )
+        return catalog, resolution
+    except (
+        AttributeError,
+        CommandError,
+        OSError,
+        RuntimeError,
+        SirilError,
+        TypeError,
+        ValueError,
+    ) as error:
+        resolution["reason"] = str(error)
+        return None, resolution
+    finally:
+        try:
+            pipeline.cmd_with_check("load", restore_stem)
+        except (CommandError, SirilError):
+            pass
+
+
 def run_stage10_export(pipeline) -> None:
     """
     阶段 10: 最终降噪与导出
@@ -1403,7 +1578,6 @@ def run_stage10_export(pipeline) -> None:
     )
     stage7_background_color_blocks_normal = bool(
         stage7_background_color_review_required
-        and not stage7_forced_delivery
     )
     stage6_starmask_borderline_review_required = bool(
         "starmask_cleanup_borderline" in pipeline._stage_review_reasons(6)
@@ -1424,6 +1598,11 @@ def run_stage10_export(pipeline) -> None:
         pipeline._require_review(9, "stage9_starmask_stretch_failed")
     if stage6_quality_hard_failed_retained:
         pipeline._require_review(6, "stage6_quality_hard_failed_retained")
+    if stage7_forced_delivery:
+        pipeline._require_review(
+            7,
+            "stage7_forced_quality_delivery_review_only",
+        )
     if forced_review_only:
         pipeline._require_review(10, "forced_review_only_output")
     review_only_output = bool(pipeline._review_requirements_payload())
@@ -2635,34 +2814,8 @@ def run_stage10_export(pipeline) -> None:
                     or final_quality_status != "ok"
                     or issues
                 )
-                forced_appearance_delivery = False
-                if stage7_forced_delivery and issues:
-                    appearance_prefixes = (
-                        "uncalibrated_background_chroma_load",
-                        "background_chroma_noise_extreme",
-                        "background_mottling_extreme",
-                    )
-                    forced_appearance_delivery = all(
-                        str(issue).startswith(appearance_prefixes)
-                        for issue in issues
-                    )
-                if forced_appearance_delivery:
-                    quality_requires_review = False
-                    final_quality["forced_delivery_override"] = {
-                        "applied": True,
-                        "scope": "stage7_appearance_only",
-                        "technical_gates_overridden": False,
-                        "issues": list(issues),
-                    }
-                    status = "degraded" if status == "ok" else status
-                    messages.append(
-                        "Stage10 retained normal output names for Stage7 "
-                        "appearance-only forced delivery"
-                    )
                 final_quality_gate_status = (
-                    "forced_appearance_delivery"
-                    if forced_appearance_delivery
-                    else "review_required" if quality_requires_review else "ok"
+                    "review_required" if quality_requires_review else "ok"
                 )
                 pipeline._write_stage_json("final_quality_report.json", final_quality)
                 pipeline.log.info(
@@ -2747,6 +2900,12 @@ def run_stage10_export(pipeline) -> None:
     )
     managed_pixels: Optional[np.ndarray] = None
     managed_export_report: Optional[Dict[str, Any]] = None
+    stage10_star_reference: Optional[Dict[str, Any]] = None
+    stage10_star_catalog_resolution: Dict[str, Any] = {
+        "schema": "starun.stage10-star-catalog-resolution.v1",
+        "status": "not_required" if not stage9_stars_required else "not_run",
+    }
+    stage10_pre_export_visibility: Optional[Dict[str, Any]] = None
     if managed_export_enabled or review_only_output:
         try:
             if stage_saved:
@@ -2764,7 +2923,7 @@ def run_stage10_export(pipeline) -> None:
             ValueError,
         ) as error:
             managed_export_report = {
-                "schema": "starun.managed-output.v1",
+                "schema": "starun.managed-output.v2",
                 "status": "partial",
                 "ready": False,
                 "mode": "independent_managed_derivatives",
@@ -2773,6 +2932,75 @@ def run_stage10_export(pipeline) -> None:
             messages.append(
                 "managed output source unavailable; independent derivatives skipped"
             )
+
+    if stage9_stars_required:
+        if managed_pixels is None:
+            _stage10_terminal_failure(
+                pipeline,
+                stage_label,
+                messages,
+                reason_code="required_stars_catalog_visibility_failed",
+                reason=(
+                    "required-stars catalog audit cannot read the final pixel buffer"
+                ),
+                action=failure_action,
+                strict_stop=failure_action == "stop",
+            )
+            return
+        stage10_star_reference, stage10_star_catalog_resolution = (
+            _stage10_star_visibility_reference(
+                pipeline,
+                managed_pixels,
+                restore_stem="stage10_final" if stage_saved else final_file,
+            )
+        )
+        stage10_pre_export_visibility = audit_display_visibility(
+            managed_pixels,
+            target_type=active_target_type,
+            stars_required=True,
+            star_reference=stage10_star_reference,
+            pixel_coordinate_domain="siril_pixel_buffer_bottom_up",
+            star_visibility_config=pipeline.cfg,
+        )
+        pipeline._write_stage_json(
+            "stage10_pre_export_visibility.json",
+            {
+                "schema": "starun.stage10-pre-export-visibility.v1",
+                "catalog_resolution": stage10_star_catalog_resolution,
+                "audit": stage10_pre_export_visibility,
+            },
+        )
+        star_check = (
+            (stage10_pre_export_visibility.get("checks") or {}).get(
+                "star_visibility"
+            )
+            or {}
+        )
+        if star_check.get("passed") is not True:
+            catalog_reason = str(
+                (
+                    star_check.get("catalog_visibility")
+                    or {}
+                ).get("reason")
+                or (
+                    star_check.get("catalog_visibility")
+                    or {}
+                ).get("reason_code")
+                or "source-catalog star visibility thresholds failed"
+            )
+            _stage10_terminal_failure(
+                pipeline,
+                stage_label,
+                messages,
+                reason_code="required_stars_catalog_visibility_failed",
+                reason=(
+                    "required stars failed the pre-export source-catalog audit: "
+                    + catalog_reason
+                ),
+                action=failure_action,
+                strict_stop=failure_action == "stop",
+            )
+            return
 
     review_display_contract: Optional[Dict[str, Any]] = None
     if review_only_output:
@@ -2789,6 +3017,9 @@ def run_stage10_export(pipeline) -> None:
                     managed_pixels,
                     target_type=active_target_type,
                     stars_required=stage9_stars_required,
+                    star_reference=stage10_star_reference,
+                    pixel_coordinate_domain="siril_pixel_buffer_bottom_up",
+                    star_visibility_config=pipeline.cfg,
                 )
                 frozen_contract = display_rendition.build_review_contract(
                     managed_pixels,
@@ -2913,6 +3144,8 @@ def run_stage10_export(pipeline) -> None:
                 scientific_paths=scientific_paths,
                 target_type=active_target_type,
                 stars_required=stage9_stars_required,
+                star_reference=stage10_star_reference,
+                star_visibility_config=pipeline.cfg,
                 display_contract=(
                     review_display_contract if review_only_output else None
                 ),
@@ -2936,7 +3169,7 @@ def run_stage10_export(pipeline) -> None:
                 )
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             managed_export_report = {
-                "schema": "starun.managed-output.v1",
+                "schema": "starun.managed-output.v2",
                 "status": "partial",
                 "ready": False,
                 "mode": "independent_managed_derivatives",
@@ -3012,6 +3245,9 @@ def run_stage10_export(pipeline) -> None:
                     review_pixels,
                     target_type=active_target_type,
                     stars_required=stage9_stars_required,
+                    star_reference=stage10_star_reference,
+                    pixel_coordinate_domain="siril_pixel_buffer_bottom_up",
+                    star_visibility_config=pipeline.cfg,
                 )
                 if not bool(visibility.get("passed", False)):
                     raise ValueError(
@@ -3019,10 +3255,26 @@ def run_stage10_export(pipeline) -> None:
                         + ",".join(visibility.get("failed_checks") or [])
                     )
                 write_managed_display_png(selected_png_path, review_pixels)
+                decoded_visibility = audit_display_visibility(
+                    read_managed_display_png(selected_png_path),
+                    target_type=active_target_type,
+                    stars_required=stage9_stars_required,
+                    star_reference=stage10_star_reference,
+                    pixel_coordinate_domain="display_array_top_down",
+                    star_visibility_config=pipeline.cfg,
+                )
+                if not bool(decoded_visibility.get("passed", False)):
+                    raise ValueError(
+                        "decoded review PNG visibility audit failed: "
+                        + ",".join(
+                            decoded_visibility.get("failed_checks") or []
+                        )
+                    )
                 review_png_published = True
                 review_png_report.update(
                     primary=str(selected_png_path),
-                    visibility=visibility,
+                    visibility=decoded_visibility,
+                    pre_encode_visibility=visibility,
                 )
             except (OSError, RuntimeError, TypeError, ValueError) as error:
                 review_png_error = str(error)
@@ -3062,7 +3314,96 @@ def run_stage10_export(pipeline) -> None:
                 "review PNG withheld because the rendition contract or "
                 "visibility audit failed"
             )
+    normal_png_catalog_audit: Dict[str, Any] = {
+        "applicable": bool(
+            not review_only_output
+            and stage9_stars_required
+            and isinstance(png_export, dict)
+        ),
+        "status": "not_requested",
+    }
+    if (
+        not review_only_output
+        and stage9_stars_required
+        and isinstance(png_export, dict)
+    ):
+        selected_png_name = str(png_export.get("selected") or "")
+        selected_png_path = (
+            pipeline.work_dir / selected_png_name
+            if selected_png_name
+            else pipeline.work_dir / f"{base_filename}.png"
+        )
+        try:
+            managed_display = next(
+                (
+                    Path(str(artifact.get("path") or ""))
+                    for artifact in (
+                        (managed_export_report or {}).get("artifacts") or []
+                    )
+                    if artifact.get("role") == "display"
+                    and artifact.get("status") == "written"
+                    and Path(str(artifact.get("path") or "")).is_file()
+                ),
+                None,
+            )
+            if managed_display is not None:
+                shutil.copyfile(managed_display, selected_png_path)
+            elif managed_pixels is not None and not managed_export_enabled:
+                write_managed_display_png(selected_png_path, managed_pixels)
+            else:
+                raise RuntimeError(
+                    "catalog-audited managed display PNG is unavailable"
+                )
+            decoded_visibility = audit_display_visibility(
+                read_managed_display_png(selected_png_path),
+                target_type=active_target_type,
+                stars_required=True,
+                star_reference=stage10_star_reference,
+                pixel_coordinate_domain="display_array_top_down",
+                star_visibility_config=pipeline.cfg,
+            )
+            star_check = (
+                (decoded_visibility.get("checks") or {}).get(
+                    "star_visibility"
+                )
+                or {}
+            )
+            if star_check.get("passed") is not True:
+                raise ValueError(
+                    "decoded final PNG catalog-star visibility failed"
+                )
+            normal_png_catalog_audit.update(
+                status="passed",
+                path=str(selected_png_path),
+                visibility=decoded_visibility,
+                source=(
+                    str(managed_display)
+                    if managed_display is not None
+                    else "stage10_final_pixels"
+                ),
+            )
+            png_export["selected"] = selected_png_path.name
+            png_export["catalog_visibility_status"] = "passed"
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            selected_png_path.unlink(missing_ok=True)
+            normal_png_catalog_audit.update(
+                status="rejected_not_published",
+                error=str(error),
+            )
+            png_export.update(
+                status="rejected_not_published",
+                selected=None,
+                catalog_visibility_status="failed_closed",
+                catalog_visibility_error=str(error),
+            )
+            export_report["overall_status"] = "partial"
+            status = "degraded" if status == "ok" else status
+            messages.append(
+                "final PNG withheld because decoded source-catalog star "
+                "visibility failed"
+            )
     export_report["review_display"] = review_png_report
+    export_report["normal_png_catalog_audit"] = normal_png_catalog_audit
     pipeline._write_stage_json("stage10_export_report.json", export_report)
 
     try:
@@ -3245,7 +3586,7 @@ def run_stage10_export(pipeline) -> None:
         if stage6_starmask_borderline_review_required
         else "stage6_quality_hard_failed_retained"
         if stage6_quality_hard_failed_retained
-        else "stage7_forced_quality_delivery"
+        else "stage7_forced_quality_delivery_review_only"
         if stage7_forced_delivery
         else final_source_review_reason
         if final_source_review_reason

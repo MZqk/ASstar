@@ -676,6 +676,75 @@ class Stage4PccPolicyTests(unittest.TestCase):
         self.assertEqual(calls[0]["timeout_sec"], 45)
         self.assertEqual(attempts[0]["timeout_sec"], 45)
 
+    def test_spcc_batch_timeout_circuit_skips_online_gaia(self):
+        pipeline = _pipeline()
+        calls = []
+        pipeline._run_stage4_spcc_once = lambda **kwargs: (
+            calls.append(kwargs) or True,
+            "unexpected",
+        )
+        pipeline.log = SimpleNamespace(warn=lambda *_args: None, info=lambda *_args: None)
+
+        with patch.dict(
+            os.environ,
+            {
+                "STARUN_NETWORK_MODE": "1",
+                stage4.SPCC_ONLINE_CIRCUIT_ENV: "1",
+            },
+            clear=False,
+        ):
+            ok, detail, attempts = stage4._stage4_run_spcc(
+                pipeline,
+                phase="linear_broadband",
+                catalog="gaia",
+                args=("-oscsensor=x",),
+                narrowband=False,
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(calls, [])
+        self.assertIn("circuit is open", detail)
+        self.assertEqual(attempts[0]["status"], "skipped")
+        self.assertEqual(
+            attempts[0]["reason_code"],
+            "batch_online_timeout_circuit_open",
+        )
+
+    def test_spcc_batch_timeout_circuit_does_not_skip_localgaia(self):
+        pipeline = _pipeline()
+        calls = []
+        pipeline._run_stage4_spcc_once = lambda **kwargs: (
+            calls.append(kwargs) or False,
+            "local attempt",
+        )
+        pipeline.log = SimpleNamespace(warn=lambda *_args: None, info=lambda *_args: None)
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "STARUN_NETWORK_MODE": "0",
+                    stage4.SPCC_ONLINE_CIRCUIT_ENV: "1",
+                },
+                clear=False,
+            ),
+            patch.object(
+                stage4,
+                "_stage4_local_spcc_catalog_status",
+                return_value={"available": True},
+            ),
+        ):
+            _ok, _detail, attempts = stage4._stage4_run_spcc(
+                pipeline,
+                phase="linear_broadband",
+                catalog="localgaia",
+                args=("-oscsensor=x",),
+                narrowband=False,
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(attempts[0]["label"], "catalog:localgaia")
+
     def test_spcc_localgaia_keeps_configured_timeout(self):
         pipeline = _pipeline()
         calls = []
@@ -2081,6 +2150,68 @@ class Stage4PccPolicyTests(unittest.TestCase):
         self.assertFalse(pcc_calls)
         self.assertEqual(results[-1][0][1], "degraded")
         self.assertTrue(results[-1][1]["fallback_used"])
+
+    def test_strict_m42_broad_core_platform_uses_bounded_review_rollback(self):
+        source = _strict_bright_core_image()
+        pipeline, saved, _commands, results = _stage4_integration_fixture(
+            image=source
+        )
+        pipeline.target_profile = _strict_profile()
+        _base_report, context = (
+            stage4.bright_core_color.assess_spcc_bright_core_color(
+                source,
+                source,
+                target_type="bright_emission_reflection_nebula",
+                target_profile=pipeline.target_profile,
+            )
+        )
+        platform = np.zeros(source.shape[1:], dtype=bool)
+        platform[124:133, 124:133] = True
+        platform &= context["roi"]
+        bad_spcc = _blue_flip_candidate(source, platform)
+        pcc_calls = []
+
+        def spcc_success(**_kwargs):
+            saved[stage4.SPCC_CANDIDATE_STEM] = bad_spcc.copy()
+            return True, "spcc broad core candidate"
+
+        pipeline._run_stage4_spcc_once = spcc_success
+        pipeline._run_stage4_pcc_once = lambda **kwargs: (
+            pcc_calls.append(kwargs) or True,
+            "pcc must not run after bounded broad-core repair",
+        )
+
+        with patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False):
+            stage4.run_stage4_color_calibration(pipeline)
+
+        report = pipeline.color_calibration_report
+        integrity = report["bright_core_color_integrity"]
+        self.assertEqual(
+            report["method"],
+            "SPCC_BROAD_CORE_CHROMA_ROLLBACK",
+        )
+        self.assertEqual(integrity["status"], "repaired")
+        self.assertTrue(integrity["repair"]["passed"])
+        self.assertTrue(report["requires_review"])
+        self.assertTrue(pipeline._stage4_color_review_required)
+        self.assertFalse(report["physical_color"]["accepted"])
+        self.assertTrue(report["degraded_color_correction"]["applied"])
+        self.assertEqual(
+            report["degraded_color_correction"]["method"],
+            "SPCC_BROAD_CORE_CHROMA_ROLLBACK",
+        )
+        self.assertEqual(report["status"], "review_required")
+        self.assertFalse(pcc_calls)
+        self.assertEqual(
+            report["auto_local_reference"]["status"],
+            "shadow_skipped_degraded_color_accepted",
+        )
+        self.assertEqual(results[-1][0][1], "degraded")
+        self.assertTrue(results[-1][1]["fallback_used"])
+        self.assertEqual(
+            results[-1][1]["reason_code"],
+            "spcc_broad_core_chroma_rollback_review_required",
+        )
 
     def test_failed_strict_core_repair_rolls_back_before_pcc(self):
         source = _strict_bright_core_image(80)

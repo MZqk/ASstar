@@ -125,6 +125,14 @@ SYQON_BRIGHT_CORE_RECOVERY_PROFILE = replace(
     target_median=0.15,
     mask_method="subtraction",
 )
+SYQON_TILE_ARTIFACT_RECOVERY_PROFILE = replace(
+    SYQON_BASELINE_PROFILE,
+    profile_id="zenith_tile_artifact_cpu_recovery",
+    tile_size=512,
+    overlap=128,
+    use_gpu=False,
+    use_amp=False,
+)
 
 
 @lru_cache(maxsize=8)
@@ -738,6 +746,383 @@ def _tiling_shadow_metrics(worker_manifest: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _syqon_luminance(pixels: np.ndarray) -> np.ndarray:
+    array = np.asarray(pixels, dtype=np.float64)
+    if array.ndim == 2:
+        return array
+    if array.ndim != 3:
+        raise ValueError(f"unsupported image shape: {array.shape}")
+    if array.shape[0] in (1, 3, 4) and array.shape[0] < min(array.shape[1:]):
+        return np.mean(array[: min(3, array.shape[0])], axis=0)
+    if array.shape[-1] in (1, 3, 4):
+        return np.mean(array[..., : min(3, array.shape[-1])], axis=-1)
+    raise ValueError(f"unsupported image shape: {array.shape}")
+
+
+def _syqon_mask_strength(pixels: np.ndarray) -> np.ndarray:
+    array = np.abs(np.asarray(pixels, dtype=np.float64))
+    if array.ndim == 2:
+        return array
+    if array.ndim != 3:
+        raise ValueError(f"unsupported mask shape: {array.shape}")
+    if array.shape[0] in (1, 3, 4) and array.shape[0] < min(array.shape[1:]):
+        return np.max(array[: min(3, array.shape[0])], axis=0)
+    if array.shape[-1] in (1, 3, 4):
+        return np.max(array[..., : min(3, array.shape[-1])], axis=-1)
+    raise ValueError(f"unsupported mask shape: {array.shape}")
+
+
+def _syqon_box_blur_3x3(image: np.ndarray) -> np.ndarray:
+    padded = np.pad(np.asarray(image, dtype=np.float64), 1, mode="edge")
+    result = np.zeros_like(image, dtype=np.float64)
+    for dy in range(3):
+        for dx in range(3):
+            result += padded[dy : dy + image.shape[0], dx : dx + image.shape[1]]
+    return result / 9.0
+
+
+def _syqon_expand_mask(mask: np.ndarray) -> np.ndarray:
+    padded = np.pad(np.asarray(mask, dtype=bool), 1, mode="constant")
+    expanded = np.zeros_like(mask, dtype=bool)
+    for dy in range(3):
+        for dx in range(3):
+            expanded |= padded[dy : dy + mask.shape[0], dx : dx + mask.shape[1]]
+    return expanded
+
+
+def _syqon_largest_connected_fraction(
+    affected: set[Tuple[int, int]],
+    total_regions: int,
+) -> float:
+    if not affected or total_regions <= 0:
+        return 0.0
+    remaining = set(affected)
+    largest = 0
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        size = 1
+        while stack:
+            row, col = stack.pop()
+            for neighbor in (
+                (row - 1, col),
+                (row + 1, col),
+                (row, col - 1),
+                (row, col + 1),
+            ):
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    stack.append(neighbor)
+                    size += 1
+        largest = max(largest, size)
+    return float(largest / total_regions)
+
+
+def assess_syqon_tiling_artifacts(
+    source_pixels: np.ndarray,
+    starless_pixels: np.ndarray,
+    starmask_pixels: np.ndarray,
+    worker_manifest: Dict[str, Any],
+    *,
+    texture_ratio_max: float = 1.80,
+    sigma_min: float = 5.0,
+    affected_ratio_max: float = 0.15,
+) -> Dict[str, Any]:
+    """Detect spatially coherent tile-domain artifacts before pair commit."""
+
+    texture_ratio_max = max(1.20, min(4.0, float(texture_ratio_max)))
+    sigma_min = max(3.0, min(10.0, float(sigma_min)))
+    affected_ratio_max = max(0.05, min(0.50, float(affected_ratio_max)))
+    report: Dict[str, Any] = {
+        "schema": "starun.stage6-syqon-tiling-artifact-gate.v1",
+        "status": "unavailable",
+        "accepted": False,
+        "hard_failure": False,
+        "limits": {
+            "regional_texture_ratio_max": texture_ratio_max,
+            "regional_texture_sigma_min": sigma_min,
+            "regional_affected_ratio_max": affected_ratio_max,
+            "source_signal_percentile_max": 70.0,
+            "microtile_px": 16,
+            "region_px": 128,
+        },
+    }
+    try:
+        source, _ = canonicalize_stage7_pixels_01(source_pixels)
+        starless, _ = canonicalize_stage7_pixels_01(starless_pixels)
+        starmask, _ = canonicalize_stage7_pixels_01(starmask_pixels)
+        if source.shape != starless.shape or source.shape != starmask.shape:
+            raise ValueError(
+                f"shape mismatch: {source.shape}, {starless.shape}, {starmask.shape}"
+            )
+        source_luma = _syqon_luminance(source)
+        starless_luma = _syqon_luminance(starless)
+        mask_strength = _syqon_mask_strength(starmask)
+    except (TypeError, ValueError) as error:
+        report["reason"] = f"canonicalization_failed: {error}"
+        return report
+
+    height, width = source_luma.shape
+    actual = worker_manifest.get("actual") or {}
+    grid = actual.get("grid") if isinstance(actual, dict) else {}
+    grid = grid if isinstance(grid, dict) else {}
+    seam_x = [int(value) for value in grid.get("x_positions", [])[1:]]
+    seam_y = [int(value) for value in grid.get("y_positions", [])[1:]]
+    report["seams"] = {"x": seam_x, "y": seam_y}
+    if min(height, width) < 256 or not seam_x and not seam_y:
+        report.update(
+            {
+                "status": "not_applicable",
+                "accepted": True,
+                "reason": "small frame or single-tile execution",
+            }
+        )
+        return report
+
+    finite = (
+        np.isfinite(source_luma)
+        & np.isfinite(starless_luma)
+        & np.isfinite(mask_strength)
+    )
+    if not np.any(finite):
+        report["reason"] = "no finite pixels"
+        return report
+    source_q70 = float(np.percentile(source_luma[finite], 70.0))
+    mask_values = mask_strength[finite]
+    mask_median = float(np.median(mask_values))
+    mask_sigma = float(1.4826 * np.median(np.abs(mask_values - mask_median)))
+    mask_q99 = float(np.percentile(mask_values, 99.0))
+    mask_threshold = max(mask_median + 3.0 * mask_sigma, 0.10 * mask_q99, 1e-6)
+    raw_starmask_support = mask_strength > mask_threshold
+    raw_starmask_support_ratio = float(np.mean(raw_starmask_support))
+    # A genuine star support is sparse.  A broad/checkerboard residual in the
+    # subtraction mask is itself evidence of a bad decomposition and must not
+    # be allowed to mask the same tile artifact from this gate.
+    sparse_starmask_support = raw_starmask_support_ratio <= 0.10
+    excluded_stars = (
+        _syqon_expand_mask(raw_starmask_support)
+        if sparse_starmask_support
+        else np.zeros_like(raw_starmask_support, dtype=bool)
+    )
+    safe = finite & (source_luma <= source_q70) & ~excluded_stars
+    safe_ratio = float(np.mean(safe))
+    report["mask"] = {
+        "safe_pixel_ratio": safe_ratio,
+        "source_q70": source_q70,
+        "starmask_threshold": mask_threshold,
+        "raw_starmask_support_ratio": raw_starmask_support_ratio,
+        "starmask_support_mode": (
+            "sparse_star_exclusion"
+            if sparse_starmask_support
+            else "diffuse_residual_not_excluded"
+        ),
+    }
+    if safe_ratio < 0.10:
+        report["reason"] = "safe comparison support below 10%"
+        return report
+
+    source_high = source_luma - _syqon_box_blur_3x3(source_luma)
+    starless_high = starless_luma - _syqon_box_blur_3x3(starless_luma)
+    high_residual = starless_high - source_high
+    low_residual = starless_luma - source_luma
+    global_bias = float(np.median(low_residual[safe]))
+    source_noise = float(
+        1.4826
+        * np.median(np.abs(source_high[safe] - np.median(source_high[safe])))
+    )
+    numerical_floor = max(0.02 * source_noise, 1e-7)
+
+    region_values: Dict[Tuple[int, int], List[float]] = {}
+    for top in range(0, height, 16):
+        for left in range(0, width, 16):
+            tile_safe = safe[top : top + 16, left : left + 16]
+            if int(np.count_nonzero(tile_safe)) < max(16, int(tile_safe.size * 0.10)):
+                continue
+            high_values = high_residual[top : top + 16, left : left + 16][tile_safe]
+            low_values = low_residual[top : top + 16, left : left + 16][tile_safe]
+            high_center = float(np.median(high_values))
+            texture = float(1.4826 * np.median(np.abs(high_values - high_center)))
+            bias = abs(float(np.median(low_values)) - global_bias)
+            region_values.setdefault((top // 128, left // 128), []).append(
+                texture + bias
+            )
+    regional = {
+        key: float(np.median(values))
+        for key, values in region_values.items()
+        if len(values) >= 4
+    }
+    if len(regional) < 4:
+        report.update(
+            {
+                "status": "not_applicable",
+                "accepted": True,
+                "reason": "fewer than four measurable 128px regions",
+            }
+        )
+        return report
+
+    region_keys = list(regional)
+    raw_values = np.asarray(
+        [regional[key] for key in region_keys],
+        dtype=np.float64,
+    )
+    raw_p10, raw_p90 = (
+        float(value) for value in np.percentile(raw_values, (10.0, 90.0))
+    )
+
+    # A smooth exposure/noise gradient is not a tile artifact.  Remove only a
+    # robust log-domain plane before comparing regional texture.  Abrupt block
+    # or seam-connected excess remains in the residual, while legitimate M31-
+    # like low-frequency structure cannot turn a gentle corner-to-corner trend
+    # into a hard rejection.
+    design = np.asarray(
+        [[1.0, float(key[0]), float(key[1])] for key in region_keys],
+        dtype=np.float64,
+    )
+    log_values = np.log(np.maximum(raw_values, numerical_floor))
+    coefficients = np.linalg.lstsq(design, log_values, rcond=None)[0]
+    retained = np.ones(log_values.shape, dtype=bool)
+    for _ in range(3):
+        log_residual = log_values - design @ coefficients
+        residual_median = float(np.median(log_residual))
+        residual_sigma = float(
+            1.4826 * np.median(np.abs(log_residual - residual_median))
+        )
+        retained = (
+            np.abs(log_residual - residual_median)
+            <= 3.0 * max(residual_sigma, 1e-6)
+        )
+        if int(np.count_nonzero(retained)) < 3:
+            retained = np.ones(log_values.shape, dtype=bool)
+            break
+        coefficients = np.linalg.lstsq(
+            design[retained],
+            log_values[retained],
+            rcond=None,
+        )[0]
+    detrended_values = np.exp(log_values - design @ coefficients)
+    p10, p90 = (
+        float(value)
+        for value in np.percentile(detrended_values, (10.0, 90.0))
+    )
+    median_value = float(np.median(detrended_values))
+    robust_sigma = float(
+        1.4826 * np.median(np.abs(detrended_values - median_value))
+    )
+    robust_se = max(robust_sigma / np.sqrt(detrended_values.size), 1e-6)
+    ratio = float(p90 / max(p10, numerical_floor))
+    significance = float((p90 - p10) / robust_se)
+    affected_threshold = max(
+        p10 * texture_ratio_max,
+        p10 + sigma_min * robust_se,
+    )
+    affected = {
+        key
+        for key, value in zip(region_keys, detrended_values)
+        if value >= affected_threshold
+    }
+    connected_ratio = _syqon_largest_connected_fraction(affected, len(regional))
+    regional_hard = bool(
+        ratio > texture_ratio_max
+        and significance > sigma_min
+        and connected_ratio >= affected_ratio_max
+    )
+
+    combined_energy = np.abs(high_residual) + np.abs(low_residual - global_bias)
+    boundary_records: List[Dict[str, Any]] = []
+    for axis, seams in (("x", seam_x), ("y", seam_y)):
+        for position in seams:
+            if axis == "x":
+                band_slice = (slice(None), slice(max(0, position - 2), min(width, position + 3)))
+                ref_a = (slice(None), slice(max(0, position - 20), max(0, position - 4)))
+                ref_b = (slice(None), slice(min(width, position + 4), min(width, position + 20)))
+            else:
+                band_slice = (slice(max(0, position - 2), min(height, position + 3)), slice(None))
+                ref_a = (slice(max(0, position - 20), max(0, position - 4)), slice(None))
+                ref_b = (slice(min(height, position + 4), min(height, position + 20)), slice(None))
+            band_values = combined_energy[band_slice][safe[band_slice]]
+            reference_values = np.concatenate(
+                (
+                    combined_energy[ref_a][safe[ref_a]],
+                    combined_energy[ref_b][safe[ref_b]],
+                )
+            )
+            if band_values.size < 32 or reference_values.size < 64:
+                continue
+            band_metric = float(np.median(band_values))
+            reference_metric = float(np.median(reference_values))
+            reference_sigma = float(
+                1.4826
+                * np.median(np.abs(reference_values - reference_metric))
+            )
+            boundary_se = max(
+                reference_sigma / np.sqrt(reference_values.size),
+                numerical_floor,
+            )
+            boundary_ratio = float(
+                band_metric / max(reference_metric, numerical_floor)
+            )
+            boundary_significance = float(
+                (band_metric - reference_metric) / boundary_se
+            )
+            boundary_records.append(
+                {
+                    "axis": axis,
+                    "position": position,
+                    "ratio": boundary_ratio,
+                    "significance_sigma": boundary_significance,
+                    "affected": bool(
+                        boundary_ratio > texture_ratio_max
+                        and boundary_significance > sigma_min
+                    ),
+                }
+            )
+    boundary_affected_ratio = float(
+        sum(bool(item["affected"]) for item in boundary_records)
+        / max(1, len(boundary_records))
+    )
+    boundary_hard = bool(
+        boundary_records and boundary_affected_ratio >= affected_ratio_max
+    )
+    hard_failure = bool(regional_hard or boundary_hard)
+    report.update(
+        {
+            "status": "rejected" if hard_failure else "accepted",
+            "accepted": not hard_failure,
+            "hard_failure": hard_failure,
+            "regional": {
+                "region_count": len(regional),
+                "p10": p10,
+                "p90": p90,
+                "p90_p10_ratio": ratio,
+                "robust_se": robust_se,
+                "difference_significance_sigma": significance,
+                "affected_region_count": len(affected),
+                "largest_connected_affected_ratio": connected_ratio,
+                "hard_failure": regional_hard,
+                "raw_p10": raw_p10,
+                "raw_p90": raw_p90,
+                "smooth_gradient_detrending": {
+                    "method": "iteratively_clipped_log_plane",
+                    "clip_sigma": 3.0,
+                    "iterations": 3,
+                    "retained_region_count": int(np.count_nonzero(retained)),
+                    "coefficients": [float(value) for value in coefficients],
+                },
+            },
+            "boundary_band": {
+                "measured_count": len(boundary_records),
+                "affected_ratio": boundary_affected_ratio,
+                "hard_failure": boundary_hard,
+                "records": boundary_records,
+            },
+        }
+    )
+    if hard_failure:
+        report["reason"] = "coherent tile-domain texture or boundary artifact"
+    return report
+
+
 def _load_worker_manifest(path: Path) -> Dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1266,6 +1651,58 @@ def verify_stage6_pair_handoff(pipeline: object) -> Dict[str, Any]:
 
 def _write_syqon_exchange_report(pipeline: object, report: Dict[str, Any]) -> None:
     payload = dict(report)
+    previous = getattr(pipeline, "_last_syqon_exchange_report", None)
+    attempts: List[Dict[str, Any]] = []
+    if isinstance(previous, dict):
+        attempts.extend(
+            dict(item)
+            for item in previous.get("attempts", [])
+            if isinstance(item, dict)
+        )
+        if not attempts and previous.get("attempt_id"):
+            attempts.append(
+                {
+                    key: previous.get(key)
+                    for key in (
+                        "attempt_id",
+                        "status",
+                        "accepted",
+                        "failure_code",
+                        "reason",
+                        "profile",
+                        "shadow_metrics",
+                        "rollback",
+                    )
+                    if key in previous
+                }
+            )
+    if payload.get("attempt_id"):
+        attempt_summary = {
+            key: payload.get(key)
+            for key in (
+                "attempt_id",
+                "status",
+                "accepted",
+                "failure_code",
+                "reason",
+                "profile",
+                "shadow_metrics",
+                "rollback",
+            )
+            if key in payload
+        }
+        attempts = [
+            item
+            for item in attempts
+            if item.get("attempt_id") != attempt_summary.get("attempt_id")
+        ]
+        attempts.append(attempt_summary)
+    if attempts:
+        payload["attempts"] = attempts
+    if payload.get("accepted") is True and payload.get("attempt_id"):
+        payload["selected_attempt_id"] = payload.get("attempt_id")
+    elif isinstance(previous, dict) and previous.get("selected_attempt_id"):
+        payload["selected_attempt_id"] = previous.get("selected_attempt_id")
     if not payload.get("stop_reason"):
         failure_code = str(payload.get("failure_code") or "").strip()
         status = str(payload.get("status") or "unknown").strip().upper()
@@ -1561,6 +1998,73 @@ def stage7_try_syqon_variant(
         shutil.rmtree(temp_dir, ignore_errors=True)
         return None
 
+    tiling_geometry = _tiling_shadow_metrics(worker_manifest)
+    tiling_artifact_gate = assess_syqon_tiling_artifacts(
+        source_file_pixels,
+        output_pixels,
+        starmask_pixels,
+        worker_manifest,
+        texture_ratio_max=getattr(
+            pipeline.cfg,
+            "stage6_syqon_regional_texture_ratio_max",
+            1.80,
+        ),
+        sigma_min=getattr(
+            pipeline.cfg,
+            "stage6_syqon_regional_texture_sigma_min",
+            5.0,
+        ),
+        affected_ratio_max=getattr(
+            pipeline.cfg,
+            "stage6_syqon_regional_affected_ratio_max",
+            0.15,
+        ),
+    )
+    tiling_geometry["pixel_artifact_gate"] = tiling_artifact_gate
+    if tiling_artifact_gate.get("accepted") is not True:
+        reason = str(
+            tiling_artifact_gate.get("reason")
+            or "SyQon tiling artifact measurement unavailable"
+        )
+        pipeline._last_plugin_script_error = (
+            "SyQon 分块像素验收拒绝产物: " + reason
+        )
+        exchange_report.update(
+            {
+                "status": "rejected",
+                "accepted": False,
+                "failure_code": (
+                    "TILE_ARTIFACT"
+                    if tiling_artifact_gate.get("hard_failure")
+                    else "TILE_ARTIFACT_UNAVAILABLE"
+                ),
+                "reason": pipeline._last_plugin_script_error,
+                "worker": worker_manifest,
+                "shadow_metrics": {
+                    "tiling": tiling_geometry,
+                    "decomposition_closure": _closure_shadow_metrics(
+                        source_file_pixels,
+                        output_pixels,
+                        starmask_pixels,
+                    ),
+                },
+            }
+        )
+        rollback_error = ""
+        try:
+            pipeline.cmd_with_check("load", pipeline.stretched_name)
+        except (CommandError, SirilError, OSError, RuntimeError) as error:
+            rollback_error = str(error)
+            pipeline.log.warn(f"SyQon 分块验收拒绝后的源图回滚失败: {error}")
+        exchange_report["rollback"] = {
+            "source_stem": str(pipeline.stretched_name),
+            "status": "failed" if rollback_error else "restored",
+            "error": rollback_error or None,
+        }
+        _write_syqon_exchange_report(pipeline, exchange_report)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return None
+
     try:
         source_manifest = _pixel_file_manifest(source_file, source_file_pixels)
         starless_manifest = _pixel_file_manifest(target_starless, output_pixels)
@@ -1625,7 +2129,7 @@ def stage7_try_syqon_variant(
                 "transform_roundtrip",
                 {"status": "unavailable", "reason": "worker metric missing"},
             ),
-            "tiling": _tiling_shadow_metrics(worker_manifest),
+            "tiling": tiling_geometry,
             "decomposition_closure": closure_shadow,
         },
     }

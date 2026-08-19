@@ -5,6 +5,12 @@ import pytest
 from gui.ui_platform import current_platform_profile
 
 try:
+    from PySide6.QtGui import QAccessible
+    from PySide6.QtWidgets import QApplication, QComboBox, QTabWidget, QTreeWidget
+    from gui.accessibility_safety import (
+        _selection_safe_factory,
+        should_install_macos_accessibility_selection_guard,
+    )
     from gui.ui_theme import DARK_TOKENS, LIGHT_TOKENS, build_stylesheet
 except ImportError:
     pytest.skip(
@@ -80,3 +86,33 @@ def test_stylesheet_covers_component_and_pipeline_states() -> None:
     assert "gradient" not in lowered
     assert "backdrop-filter" not in lowered
     assert "text-shadow" not in lowered
+
+
+def test_macos_accessibility_selection_guard_is_platform_scoped() -> None:
+    assert should_install_macos_accessibility_selection_guard("darwin")
+    assert not should_install_macos_accessibility_selection_guard("linux")
+    assert not should_install_macos_accessibility_selection_guard("win32")
+
+
+def test_selection_guard_omits_volatile_selected_items() -> None:
+    app = QApplication.instance() or QApplication([])
+    combo = QComboBox()
+    combo.addItems(["first", "second"])
+    history_tree = QTreeWidget()
+    inspector_tabs = QTabWidget()
+    inspector_tabs.addTab(QTreeWidget(), "Run")
+
+    targets = (
+        ("QComboBoxListView", combo.view(), QAccessible.Role.List),
+        ("QTreeWidget", history_tree, QAccessible.Role.Tree),
+        ("QTabBar", inspector_tabs.tabBar(), QAccessible.Role.PageTabList),
+    )
+    for class_name, widget, expected_role in targets:
+        interface = _selection_safe_factory(class_name, widget)
+
+        assert interface is not None
+        assert interface.isValid()
+        assert interface.role() == expected_role
+        assert interface.selectionInterface() is None
+
+    assert _selection_safe_factory("QPushButton", combo) is None

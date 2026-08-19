@@ -295,6 +295,7 @@ CLAMP_RULES: list[tuple[str, type, float, float]] = [
     ("stage5_rl_gdstep", float, 0.00001, 0.01),
     ("stage5_rl_stop", float, 0.0001, 0.05),
     ("stage5_graxpert_deconv_strength", float, 0.20, 0.40),
+    ("stage5_graxpert_guard_retry_strength", float, 0.20, 0.30),
     ("stage7_display90_strength", float, 0.50, 0.95),
     ("stage7_display90_reference_chroma_load_ratio_max", float, 1.00, 1.20),
     ("stage7_display90_reference_chroma_load_absolute_max", float, 0.15, 0.50),
@@ -342,6 +343,9 @@ CLAMP_RULES: list[tuple[str, type, float, float]] = [
     ("stage7_uncalibrated_background_chroma_load_review_max", float, 0.04, 0.50),
     ("stage7_9_quality_advisory_multiplier", float, 1.0, 2.0),
     ("stage7_quality_retry_max", int, 0, 3),
+    ("stage6_syqon_regional_texture_ratio_max", float, 1.20, 4.00),
+    ("stage6_syqon_regional_texture_sigma_min", float, 3.0, 10.0),
+    ("stage6_syqon_regional_affected_ratio_max", float, 0.05, 0.50),
     ("stage7_edge_black_warn", float, 0.04, 0.30),
     ("stage7_bg_median_high", float, 0.08, 0.35),
     ("stage7_bg_std_high", float, 0.020, 0.120),
@@ -349,6 +353,9 @@ CLAMP_RULES: list[tuple[str, type, float, float]] = [
     ("stage7_residual_star_score_max", float, 0.10, 1.20),
     ("stage7_halo_residue_score_max", float, 0.05, 1.00),
     ("stage7_large_galaxy_halo_residue_score_max", float, 0.05, 1.00),
+    ("stage7_galaxy_roi_star_clip_percentile", float, 98.0, 99.9),
+    ("stage7_galaxy_roi_peak_floor_ratio", float, 0.005, 0.10),
+    ("stage7_galaxy_roi_min_extent_ratio", float, 0.004, 0.03),
     ("stage7_galaxy_core_preservation_ratio_min", float, 0.30, 0.95),
     ("stage7_galaxy_core_contrast_ratio_min", float, 0.30, 0.95),
     ("stage7_black_hole_score_max", float, 0.01, 0.35),
@@ -395,6 +402,8 @@ CLAMP_RULES: list[tuple[str, type, float, float]] = [
     ("stage9_unscreen_fwhm_regression_max", float, 0.0, 0.25),
     ("stage9_psf_fwhm_ratio_min", float, 0.50, 1.00),
     ("stage9_psf_fwhm_ratio_max", float, 1.00, 1.50),
+    ("stage9_psf_fwhm_ratio_uncertainty_floor", float, 0.0, 0.01),
+    ("stage9_psf_fwhm_ratio_uncertainty_max", float, 0.002, 0.05),
     ("stage9_psf_review_fwhm_ratio_max", float, 1.10, 1.65),
     ("stage9_psf_recovery_target_min", float, 0.50, 1.00),
     ("stage9_psf_recovery_target_max", float, 1.00, 1.50),
@@ -406,6 +415,9 @@ CLAMP_RULES: list[tuple[str, type, float, float]] = [
     ("stage9_stage5_bright_star_fwhm_min", float, 4.0, 20.0),
     ("stage9_stage5_bright_star_support_radius_max", int, 6, 16),
     ("stage9_stage5_bright_star_match_radius", float, 1.0, 8.0),
+    ("stage9_starmask_output_adequacy_min", float, 0.25, 0.90),
+    ("stage9_catalog_star_visibility_contrast_min", float, 0.0005, 0.02),
+    ("stage9_bright_star_visibility_ratio_min", float, 0.50, 1.00),
     ("stage9_highlight_clip_ratio_max", float, 0.001, 0.10),
     ("stage9_highlight_clip_growth_max", float, 0.0, 0.05),
     ("stage9_bright_pixel_growth_max", float, 0.0, 0.10),
@@ -1613,6 +1625,9 @@ class StarunPostProcessor(
             "stage5_star_reference_report": copy.deepcopy(
                 getattr(self, "_stage5_star_reference_report", {}) or {}
             ),
+            "stage5_deconvolution_acceptance": copy.deepcopy(
+                getattr(self, "_stage5_deconvolution_acceptance", {}) or {}
+            ),
         }
 
     def _stage_preview_candidates(self, stage: int) -> List[Path]:
@@ -2074,6 +2089,17 @@ class StarunPostProcessor(
                 source=source,
                 policy_candidate=policy if isinstance(policy, dict) else None,
             )
+            if profile.get("identity_status") == "conflict":
+                self._require_review(
+                    3,
+                    "target_identity_conflict",
+                    {
+                        "source": source,
+                        "identity_evidence": copy.deepcopy(
+                            profile.get("identity_evidence") or {}
+                        ),
+                    },
+                )
             self.log.info(
                 f"[{source}] Classification: "
                 f"{profile.get('target_type')} confidence={float(profile.get('target_confidence', 0.0)):.2f}"

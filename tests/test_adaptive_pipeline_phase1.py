@@ -190,7 +190,108 @@ class AdaptivePipelinePhase1Tests(unittest.TestCase):
             self.assertEqual(profile["target_type"], "open_cluster")
             self.assertEqual(profile["pipeline"], "open_cluster_color_preserve")
 
-    def test_target_profiler_preserves_auto_emission_hint_for_low_snr_rosette(self) -> None:
+    def test_catalog_identifiers_accept_space_underscore_and_hyphen_boundaries(self) -> None:
+        features = AdaptiveImageFeatures(
+            object_area_ratio=0.01,
+            bright_core_score=0.15,
+        )
+        cases = {
+            "/tasks/M_33/source.fit": ("M33", "large_galaxy"),
+            "/tasks/IC-434/source.fit": (
+                "Horsehead Nebula",
+                "dark_nebula_low_contrast",
+            ),
+            "/tasks/M-42/source.fit": (
+                "M42",
+                "bright_emission_reflection_nebula",
+            ),
+            "/tasks/NGC_6910/source.fit": ("NGC 6910", "open_cluster"),
+        }
+        for context, expected in cases.items():
+            with self.subTest(context=context):
+                profile = build_target_profile(
+                    features,
+                    context_text=context,
+                )
+                self.assertEqual(profile["target_name_guess"], expected[0])
+                self.assertEqual(profile["target_type"], expected[1])
+                self.assertGreaterEqual(profile["target_confidence"], 0.90)
+
+    def test_ngc1579_is_bright_nebula_in_main_and_builtin_catalogs(self) -> None:
+        features = AdaptiveImageFeatures(
+            object_area_ratio=0.02,
+            bright_core_score=0.42,
+            nebulosity_area_ratio=0.08,
+        )
+        for catalog in (None, BUILTIN_CATALOG):
+            profile = build_target_profile(
+                features,
+                context_text="/tasks/NGC-1579/source.fit",
+                **({"catalog": catalog} if catalog is not None else {}),
+            )
+            self.assertEqual(profile["target_name_guess"], "NGC 1579")
+            self.assertEqual(
+                profile["target_type"],
+                "bright_emission_reflection_nebula",
+            )
+            self.assertEqual(
+                profile["pipeline"],
+                "bright_nebula_hdr_conservative",
+            )
+
+    def test_unknown_visual_galaxy_is_demoted_to_generic_safe_policy(self) -> None:
+        features = AdaptiveImageFeatures(
+            object_area_ratio=0.05,
+            bright_core_score=0.42,
+            nebulosity_area_ratio=0.10,
+            elongation_score=0.42,
+        )
+
+        profile = build_target_profile(
+            features,
+            context_text="/tasks/Xiaoyinh/process/working.fit",
+        )
+
+        self.assertIsNone(profile["target_name_guess"])
+        self.assertEqual(profile["target_type"], "generic_low_snr_safe")
+        self.assertEqual(profile["pipeline"], "generic_low_snr_safe")
+        self.assertEqual(
+            profile["visual_hypothesis"]["target_type"],
+            "small_galaxy",
+        )
+
+    def test_explicit_name_coordinate_conflict_fails_safe_and_requires_review(self) -> None:
+        features = AdaptiveImageFeatures(
+            object_area_ratio=0.05,
+            bright_core_score=0.42,
+            nebulosity_area_ratio=0.10,
+            elongation_score=0.42,
+        )
+
+        profile = build_target_profile(
+            features,
+            metadata={
+                "OBJCTRA": "05:35:39.735",
+                "OBJCTDEC": "-05:27:33.020",
+            },
+            context_text="/tasks/M33/source.fit",
+        )
+
+        self.assertEqual(profile["identity_status"], "conflict")
+        self.assertTrue(profile["target_identity_conflict"])
+        self.assertTrue(profile["requires_review"])
+        self.assertIsNone(profile["target_name_guess"])
+        self.assertEqual(profile["target_type"], "generic_low_snr_safe")
+        self.assertEqual(
+            profile["identity_evidence"]["name"]["target"],
+            "M33",
+        )
+        self.assertEqual(
+            profile["identity_evidence"]["coordinate"]["target"],
+            "M42",
+        )
+
+    def test_target_profiler_prefers_explicit_rosette_name_over_auto_hint(self) -> None:
         features = AdaptiveImageFeatures(
             bg_median=0.0020,
             bg_std=0.0001,
@@ -210,8 +311,9 @@ class AdaptivePipelinePhase1Tests(unittest.TestCase):
             context_text="/Users/mz/SeeStar/NGC2237_sub0111/process/stage4_colorbalanced.fit",
         )
 
-        self.assertEqual(profile["target_type"], "bright_emission_reflection_nebula")
-        self.assertEqual(profile["pipeline"], "bright_nebula_hdr_conservative")
+        self.assertEqual(profile["target_name_guess"], "Rosette Nebula")
+        self.assertEqual(profile["target_type"], "emission_nebula_widefield")
+        self.assertEqual(profile["pipeline"], "emission_nebula_widefield")
         self.assertIn("auto_target_hint", ",".join(profile["diagnostics"]))
 
     def test_catalog_visual_difference_is_diagnostic_not_warning(self) -> None:

@@ -197,7 +197,7 @@ def _fixed_limits() -> Dict[str, Any]:
             "chroma_l1_over_2_drift_min": CHROMA_DRIFT_MIN,
             "post_saturation_min": BROAD_PLATFORM_SATURATION_MIN,
             "largest_component_ratio_max": BROAD_PLATFORM_COMPONENT_RATIO_MAX,
-            "action": "reject_spcc_to_pcc",
+            "action": "attempt_once_bounded_rgb_direction_rollback_then_reject",
         },
         "repair": {
             "component_ratio_min": COMPONENT_ACCEPTED_RATIO,
@@ -396,11 +396,21 @@ def assess_spcc_bright_core_color(
     }
 
 
-def _repair_candidate(context: Dict[str, Any]) -> Tuple[np.ndarray, Dict[str, Any]]:
+def _repair_candidate(
+    context: Dict[str, Any],
+    *,
+    component_domain: str,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
     before = np.asarray(context["before"], dtype=np.float64)
     after = np.asarray(context["after"], dtype=np.float64)
-    labels = np.asarray(context["labels"], dtype=np.int32)
-    areas = list(context["areas"])
+    if component_domain == "broad_core_chroma_platform":
+        labels = np.asarray(context["broad_platform_labels"], dtype=np.int32)
+        areas = list(context["broad_platform_areas"])
+    elif component_domain == "compact_anomaly_components":
+        labels = np.asarray(context["labels"], dtype=np.int32)
+        areas = list(context["areas"])
+    else:
+        raise ValueError(f"unsupported bright-core repair domain: {component_domain}")
     roi_support = max(int(np.count_nonzero(context["roi"])), 1)
     selected_labels = [
         index + 1
@@ -427,6 +437,7 @@ def _repair_candidate(context: Dict[str, Any]) -> Tuple[np.ndarray, Dict[str, An
         + reference[:, support] * weight[support][np.newaxis, :]
     )
     return candidate, {
+        "component_domain": component_domain,
         "selected_component_labels": selected_labels,
         "selected_component_count": len(selected_labels),
         "selected_seed_pixels": int(np.count_nonzero(selected)),
@@ -457,10 +468,33 @@ def evaluate_and_repair_spcc_bright_core(
         return np.asarray(after).copy(), initial
     if initial.get("accepted", False):
         return np.asarray(after).copy(), initial
-    if initial.get("status") != "repair_required" or not context.get("areas"):
+    broad_platform_repair = bool(
+        initial.get("status") == "hard_failed"
+        and "broad_core_chroma_platform"
+        in (initial.get("trigger_reasons") or [])
+        and context.get("broad_platform_areas")
+    )
+    compact_repair = bool(
+        initial.get("status") == "repair_required"
+        and context.get("areas")
+    )
+    if not (broad_platform_repair or compact_repair):
         return None, initial
 
-    candidate, repair = _repair_candidate(context)
+    component_domain = (
+        "broad_core_chroma_platform"
+        if broad_platform_repair
+        else "compact_anomaly_components"
+    )
+    repair_method = (
+        "SPCC_BROAD_CORE_CHROMA_ROLLBACK"
+        if broad_platform_repair
+        else "SPCC_LOCAL_CORE_CHROMA_ROLLBACK"
+    )
+    candidate, repair = _repair_candidate(
+        context,
+        component_domain=component_domain,
+    )
     support = np.asarray(repair.pop("support"), dtype=bool)
     after_rgb = np.asarray(context["after"], dtype=np.float64)
     finite = bool(np.all(np.isfinite(candidate)))
@@ -510,13 +544,23 @@ def evaluate_and_repair_spcc_bright_core(
         },
         "finite": {"passed": finite},
         "outside_support_exact": {"passed": outside_exact},
+        "post_repair_full_assessment": {
+            "status": post.get("status"),
+            "accepted": bool(post.get("accepted", False)),
+            "trigger_reasons": list(post.get("trigger_reasons") or []),
+            "passed": bool(post.get("accepted", False)),
+        },
     }
     passed = all(bool(check.get("passed")) for check in checks.values())
     report = dict(initial)
     report["repair"] = {
         **repair,
         "repair_mask": {
-            "source": "anomaly_components_above_0.5_percent_of_core_roi",
+            "source": (
+                "broad_platform_components_above_0.5_percent_of_core_roi"
+                if broad_platform_repair
+                else "anomaly_components_above_0.5_percent_of_core_roi"
+            ),
             "selected_component_count": repair["selected_component_count"],
             "seed_pixels": repair["selected_seed_pixels"],
             "dilated_pixels": repair["dilated_pixels"],
@@ -525,20 +569,26 @@ def evaluate_and_repair_spcc_bright_core(
             "support_pixels": repair["support_pixels"],
             "support_ratio_of_image": repair["support_ratio_of_image"],
         },
-        "method": "SPCC_LOCAL_CORE_CHROMA_ROLLBACK",
+        "method": repair_method,
         "reference_rgb_direction": "stage4_pre_pcc",
         "preserved_luminance": "SPCC Rec.709",
         "checks": checks,
         "post_repair_assessment": post,
         "passed": passed,
+        "requires_review": broad_platform_repair,
     }
     if passed:
         report.update(
             status="repaired",
             accepted=True,
             repaired=True,
-            final_action="accept_repaired_spcc",
+            final_action=(
+                "accept_bounded_broad_core_chroma_rollback_for_review"
+                if broad_platform_repair
+                else "accept_repaired_spcc"
+            ),
             trigger_reasons=list(initial.get("trigger_reasons") or []),
+            requires_review=broad_platform_repair,
         )
         native_candidate = np.asarray(
             context["after_native"],

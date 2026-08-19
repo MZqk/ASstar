@@ -173,6 +173,7 @@ class PipelineConfig:
     stage5_rl_gdstep: float = 0.0005  # RL 梯度下降步长
     stage5_rl_stop: float = 0.001  # RL 提前停止阈值
     stage5_graxpert_deconv_strength: float = 0.30  # 本地 Object Deconvolution 模型可用时的 GraXpert 强度
+    stage5_graxpert_guard_retry_strength: float = 0.25  # GraXpert 局部星点门失败后唯一一次降强度重试值
     stage5_deconv_bg_std_growth_max: float = 1.38  # 反卷积背景标准差最大增长倍率
     stage5_deconv_chroma_growth_max: float = 1.15  # 反卷积背景色噪最大增长倍率
     stage5_deconv_chroma_ratio_growth_max: float = 1.35  # 色噪/背景比最大增长倍率
@@ -246,7 +247,7 @@ class PipelineConfig:
     stage7_processing_mode: str = "auto"  # auto 使用预览标定；manual 使用签名参数并重建对应亮度契约
     stage7_failure_action: str = "auto_fallback"  # 决定性失败：auto_fallback/preserve_review/stop
     stage7_rendition_intent: str = "vivid_safe"  # vivid_safe 默认鲜艳安全出图；balanced/conservative 保留更自然或更保守的呈现
-    stage7_forced_delivery_enabled: bool = True  # 自动回退耗尽后，仅允许技术完整、但画质门未过的最佳候选正式降级交付
+    stage7_forced_delivery_enabled: bool = True  # 自动回退耗尽后，保留技术完整的最佳失败候选作为复核诊断，不参与正式交付
     stage7_candidate_policy: str = "auto_display90"  # auto_display90/auto_dual/candidate_a_only/candidate_b_only/display90_only
     stage7_display90_strength: float = 0.90  # GUI linked 显示曲线正式候选的保留强度，运行时钳制 0.50–0.95
     stage7_display90_reference_chroma_load_ratio_max: float = 1.05  # 已认证窄带 Display90 相对真实 GUI D 背景色度负载的最大比值
@@ -325,6 +326,8 @@ class PipelineConfig:
     stage9_psf_size_gate_enabled: bool = True  # 用 matched-domain 同星 FWHM 正式验收 Screen/Unscreen 候选
     stage9_psf_fwhm_ratio_min: float = 0.93  # 正式回星后同星 FWHM 相对源图的下限
     stage9_psf_fwhm_ratio_max: float = 1.10  # 正式回星后同星 FWHM 相对源图的上限
+    stage9_psf_fwhm_ratio_uncertainty_floor: float = 0.002  # FWHM 比例 95% 测量容差的最小有效值
+    stage9_psf_fwhm_ratio_uncertainty_max: float = 0.020  # FWHM 比例临界豁免允许的最大 95% 测量容差
     stage9_psf_review_fwhm_ratio_max: float = 1.65  # 正式候选全拒后，含星复核候选允许的独立 FWHM 上限；不改变正式门
     stage9_psf_recovery_target_min: float = 0.97  # 通过硬门后仍低于此软目标时逐级补回真实星翼
     stage9_psf_recovery_target_max: float = 1.05  # 任一可测星组高于此软上限时禁止统一补翼
@@ -371,6 +374,7 @@ class PipelineConfig:
     stage9_starmask_mid_target: float = 0.50  # 多锚点曲线中亮星目标亮度
     stage9_starmask_bright_target: float = 0.75  # 多锚点曲线亮星目标亮度
     stage9_starmask_peak_target: float = 0.90  # 多锚点曲线极亮星上限，保留高光和星色余量
+    stage9_starmask_output_adequacy_min: float = 0.50  # 实测星层四锚点相对冻结目标的最低比例；不足时插件不得进入正式候选
     stage9_starmask_chroma_regularization_enabled: bool = True  # 多锚点拉伸时用邻域星色约束微弱星翼，避免把单像素通道噪声放大成蓝紫色块
     stage9_starmask_faint_chroma_max: float = 0.35  # 微弱星翼允许的最大通道跨度比例，优先抑制低信号伪色
     stage9_starmask_bright_chroma_max: float = 0.60  # 亮星核心允许的最大通道跨度比例，保留真实星色同时限制极端色边
@@ -386,6 +390,8 @@ class PipelineConfig:
     stage9_darkening_ratio_max: float = 0.005  # 阶段9异常变暗像素占比上限
     stage9_weak_star_recovery_ratio_min: float = 0.70  # 候选相对 remix base 至少恢复的弱星组件数量比例
     stage9_star_recovery_ratio_min: float = 0.75  # 候选相对 remix base 至少恢复的全部星点组件数量比例
+    stage9_catalog_star_visibility_contrast_min: float = 0.002  # matched-display 源目录星及候选星的最低局部亮度对比度
+    stage9_bright_star_visibility_ratio_min: float = 0.90  # 候选中源目录亮星必须保持可见的最低数量比例
     stage9_weak_star_screen_intensity_min: float = 0.55  # 弱星 Screen 强度下限；亮星仍可按 fallback 梯级降至 0.40
     stage9_star_support_ratio_max: float = 0.12  # 独立星表生成的实际回混支持层最大覆盖
     stage9_unmatched_changed_ratio_max: float = 0.01  # 星点支持层之外允许发生显著变化的最大比例
@@ -489,6 +495,10 @@ class PipelineConfig:
     stage6_processing_mode: str = "auto"  # 阶段6处理方式：auto 去星；preserve 明确保留含星线性图并旁路 Starless 分支
     stage6_failure_action: str = "auto_fallback"  # 决定性失败：auto_fallback/preserve_review/stop
     stage6_starless_backend_policy: str = "auto_chain"  # auto_chain/syqon_only/sasp_only
+    stage6_syqon_regional_texture_ratio_max: float = 1.80  # SyQon 分块区域纹理 P90/P10 硬上限
+    stage6_syqon_regional_texture_sigma_min: float = 5.0  # SyQon 分块异常的最小绝对显著性
+    stage6_syqon_regional_affected_ratio_max: float = 0.15  # SyQon 相连异常区域覆盖硬上限
+    stage6_syqon_seam_retry_enabled: bool = True  # 分块像素门失败后仅允许一次 CPU/高重叠重试
     stage7_quality_retry_max: int = 2  # Stage 6 去星质量差时最多追加的同源 SyQon 参数重试次数
     stage7_quality_advisory_multiplier: float = 2.0  # Stage 6 数值门禁在接纳线至 2 倍异常度之间仅告警并继续；超过后才硬拒绝
     stage7_9_quality_advisory_multiplier: float = 1.5  # Stage 7-9 可恢复数值门禁在接纳线至 1.5 倍异常度之间仅告警并继续；结构性错误仍硬拒绝
@@ -502,6 +512,9 @@ class PipelineConfig:
     stage7_large_galaxy_halo_residue_score_max: float = 0.48  # M31/M81 等大星系的 halo 验收上限，避免全局统计混入盘面结构
     stage7_bright_nebula_halo_residue_score_max: float = 0.60  # M42/亮核心星云允许真实星云光晕保留，使用更高 halo 验收上限
     stage7_galaxy_roi_halo_gate_enabled: bool = True  # 星系目标用同一局部拉伸比较 original/starless 盘区，并从通用星点 halo 门排除核球/盘面
+    stage7_galaxy_roi_star_clip_percentile: float = 99.5  # 星系低频定位前的亮星 winsorize 百分位
+    stage7_galaxy_roi_peak_floor_ratio: float = 0.02  # 星系 ROI 信号底相对局部 Q99 的最低比例
+    stage7_galaxy_roi_min_extent_ratio: float = 0.008  # 星系未钳制协方差尺度相对短边的下限
     stage7_galaxy_core_preservation_ratio_min: float = 0.72  # 星系亮核去星后相对同拉伸原图的最低亮度保留比例
     stage7_galaxy_core_contrast_ratio_min: float = 0.60  # 星系亮核相对核周环带的最低对比保留比例
     stage7_black_hole_score_max: float = 0.08  # 阶段7验收：去星暗坑/暗环评分上限

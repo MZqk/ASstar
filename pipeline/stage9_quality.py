@@ -32,6 +32,10 @@ _STAGE9_STARMASK_OUTPUT_PROFILE_SCHEMA = (
 )
 _STAGE9_STARMASK_OUTPUT_TOLERANCE = 1e-4
 _STAGE9_STARMASK_OUTPUT_NAMES = ("faint", "mid", "bright", "peak")
+_STAGE9_STARMASK_SUPPORT_PREFLIGHT_SCHEMA = (
+    "starun.stage9-starmask-support-preflight.v2"
+)
+_STAGE9_CATALOG_VISIBILITY_SCHEMA = "starun.stage9-catalog-visibility.v1"
 
 
 def _bounded(value: Any, default: float, lower: float, upper: float) -> float:
@@ -40,6 +44,59 @@ def _bounded(value: Any, default: float, lower: float, upper: float) -> float:
     except (TypeError, ValueError):
         parsed = default
     return max(lower, min(upper, parsed))
+
+
+def interpret_stage9_remix_quality_report(
+    report: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    """Read v8/v9 reports without promoting legacy success silently."""
+    payload = dict(report or {})
+    schema = str(payload.get("schema") or "")
+    if schema == "starun.stage9-remix-quality.v9":
+        persisted = dict(payload.get("persisted_output_validation") or {})
+        accepted = bool(
+            payload.get("formal_accepted", False)
+            and persisted.get("accepted", False)
+        )
+        return {
+            "status": "accepted" if accepted else "review_required",
+            "schema": schema,
+            "supported": True,
+            "formal_accepted": accepted,
+            "reported_formal_accepted": bool(
+                payload.get("formal_accepted", False)
+            ),
+            "persisted_validation_present": bool(persisted),
+            "requires_review": not accepted,
+            "reason_code": (
+                "stage9_v9_formal_acceptance_verified"
+                if accepted
+                else "stage9_v9_persisted_validation_missing_or_rejected"
+            ),
+        }
+    if schema == "starun.stage9-remix-quality.v8":
+        return {
+            "status": "review_required",
+            "schema": schema,
+            "supported": True,
+            "formal_accepted": False,
+            "reported_formal_accepted": bool(
+                payload.get("formal_accepted", False)
+            ),
+            "persisted_validation_present": False,
+            "requires_review": True,
+            "reason_code": "stage9_v8_persisted_validation_unavailable",
+        }
+    return {
+        "status": "unsupported",
+        "schema": schema or None,
+        "supported": False,
+        "formal_accepted": False,
+        "reported_formal_accepted": False,
+        "persisted_validation_present": False,
+        "requires_review": True,
+        "reason_code": "stage9_remix_quality_schema_unsupported",
+    }
 
 
 def _image_scale(image: np.ndarray) -> float:
@@ -3843,7 +3900,325 @@ def enrich_star_reference_with_display_psf(
     catalog["_display_source_peak_y"] = confirmed_y
     catalog["_display_source_peak_x"] = confirmed_x
     catalog["_psf_measurements"] = measurements
+    reference_fwhm = np.asarray(
+        catalog.get("_stage9_spatial_fwhm_px", ()),
+        dtype=np.float32,
+    )
+    if reference_fwhm.size != count:
+        fallback_fwhm = float(
+            catalog.get(
+                "display_source_fwhm_median_px",
+                catalog.get("source_fwhm_median_px", _STAGE9_FWHM_ANCHOR_PX),
+            )
+            or _STAGE9_FWHM_ANCHOR_PX
+        )
+        reference_fwhm = np.full(count, fallback_fwhm, dtype=np.float32)
+    inner_windows = np.asarray(
+        [
+            stage9_scale_odd_window(3, catalog, fwhm_px=value)
+            for value in reference_fwhm
+        ],
+        dtype=np.int32,
+    )
+    outer_windows = np.asarray(
+        [
+            stage9_scale_odd_window(7, catalog, fwhm_px=value)
+            for value in reference_fwhm
+        ],
+        dtype=np.int32,
+    )
+    reference_luminance = _luminance(_normalized(np.asarray(original_display)))
+    reference_local_peak = _stage9_square_window_values(
+        reference_luminance,
+        source_y,
+        source_x,
+        inner_windows,
+        statistic="max",
+    )
+    reference_local_background = _stage9_square_window_values(
+        reference_luminance,
+        source_y,
+        source_x,
+        outer_windows,
+        statistic="median",
+    )
+    reference_local_contrast = np.maximum(
+        reference_local_peak - reference_local_background,
+        0.0,
+    ).astype(np.float32, copy=False)
+    contrast_min = _bounded(
+        getattr(cfg, "stage9_catalog_star_visibility_contrast_min", 0.002),
+        0.002,
+        0.0005,
+        0.02,
+    )
+    reference_visible = np.isfinite(reference_local_contrast) & (
+        reference_local_contrast >= contrast_min
+    )
+    catalog.update(
+        catalog_visibility_reference_status=(
+            "ready" if int(np.count_nonzero(reference_visible)) >= min_count else "partial"
+        ),
+        catalog_visibility_reference_count=int(np.count_nonzero(reference_visible)),
+        catalog_visibility_contrast_min=contrast_min,
+        catalog_visibility_reference_contrast_p50=(
+            float(np.median(reference_local_contrast[reference_visible]))
+            if np.any(reference_visible)
+            else None
+        ),
+    )
+    catalog["_reference_local_contrast"] = reference_local_contrast
+    catalog["_stage9_visibility_inner_window_size_px"] = inner_windows
+    catalog["_stage9_visibility_outer_window_size_px"] = outer_windows
     return catalog
+
+
+def assess_catalog_star_visibility(
+    image: np.ndarray,
+    star_reference: Dict[str, Any] | None,
+    cfg: Any,
+    *,
+    coordinate_domain: str,
+) -> Dict[str, Any]:
+    """Verify absolute star visibility at frozen same-source coordinates."""
+    coordinate_conversions = {
+        "siril_pixel_buffer_bottom_up": "y_array = y_siril",
+        "display_array_top_down": "y_array = image_height - 1 - y_siril",
+    }
+    report: Dict[str, Any] = {
+        "schema": _STAGE9_CATALOG_VISIBILITY_SCHEMA,
+        "status": "unavailable",
+        "available": False,
+        "passed": False,
+        "hard_failed": True,
+        "review_required": False,
+        "formal_gate": True,
+        "reason_code": "stage9_catalog_visibility_unavailable",
+        "coordinate_contract": {
+            "schema": "starun.pixel-coordinate-contract.v1",
+            "source_coordinate_domain": "siril_star_catalog_bottom_up",
+            "array_coordinate_domain": str(coordinate_domain or ""),
+            "conversion": coordinate_conversions.get(str(coordinate_domain or "")),
+            "validated": False,
+        },
+    }
+    try:
+        if coordinate_domain not in coordinate_conversions:
+            raise ValueError(
+                "catalog visibility coordinate domain must be explicitly one of "
+                f"{sorted(coordinate_conversions)}"
+            )
+        report["coordinate_contract"]["validated"] = True
+        if not isinstance(star_reference, dict) or star_reference.get("status") != "ok":
+            raise ValueError(
+                str(
+                    (star_reference or {}).get("reason")
+                    if isinstance(star_reference, dict)
+                    else "validated Stage9 star catalog is unavailable"
+                )
+            )
+        normalized = _normalized(np.asarray(image))
+        luminance = _luminance(normalized)
+        if luminance.ndim != 2:
+            raise ValueError("catalog visibility image is not spatial")
+        height, width = luminance.shape
+        source_y = np.asarray(
+            star_reference.get("_source_peak_y", star_reference.get("_peak_y", ())),
+            dtype=np.int32,
+        )
+        source_x = np.asarray(
+            star_reference.get("_source_peak_x", star_reference.get("_peak_x", ())),
+            dtype=np.int32,
+        )
+        weak_flags = np.asarray(star_reference.get("_weak_flags", ()), dtype=bool)
+        reference_contrast = np.asarray(
+            star_reference.get("_reference_local_contrast", ()),
+            dtype=np.float32,
+        )
+        count = int(source_y.size)
+        if not (
+            count > 0
+            and source_x.size == count
+            and weak_flags.size == count
+            and reference_contrast.size == count
+        ):
+            raise ValueError("catalog visibility reference arrays are incomplete")
+        if coordinate_domain == "display_array_top_down":
+            array_y = height - 1 - source_y
+        else:
+            array_y = source_y.copy()
+        array_x = source_x.copy()
+        inner_windows = np.asarray(
+            star_reference.get("_stage9_visibility_inner_window_size_px", ()),
+            dtype=np.int32,
+        )
+        outer_windows = np.asarray(
+            star_reference.get("_stage9_visibility_outer_window_size_px", ()),
+            dtype=np.int32,
+        )
+        if inner_windows.size != count or outer_windows.size != count:
+            per_star_fwhm = np.asarray(
+                star_reference.get("_stage9_spatial_fwhm_px", ()),
+                dtype=np.float32,
+            )
+            if per_star_fwhm.size != count:
+                per_star_fwhm = np.full(
+                    count,
+                    float(
+                        _stage9_catalog_scale(star_reference).get(
+                            "fwhm_median_px",
+                            _STAGE9_FWHM_ANCHOR_PX,
+                        )
+                        or _STAGE9_FWHM_ANCHOR_PX
+                    ),
+                    dtype=np.float32,
+                )
+            inner_windows = np.asarray(
+                [
+                    stage9_scale_odd_window(3, star_reference, fwhm_px=value)
+                    for value in per_star_fwhm
+                ],
+                dtype=np.int32,
+            )
+            outer_windows = np.asarray(
+                [
+                    stage9_scale_odd_window(7, star_reference, fwhm_px=value)
+                    for value in per_star_fwhm
+                ],
+                dtype=np.int32,
+            )
+        valid = (
+            (array_y >= 0)
+            & (array_y < height)
+            & (array_x >= 0)
+            & (array_x < width)
+            & np.isfinite(reference_contrast)
+        )
+        contrast_min = _bounded(
+            getattr(cfg, "stage9_catalog_star_visibility_contrast_min", 0.002),
+            0.002,
+            0.0005,
+            0.02,
+        )
+        eligible = valid & (reference_contrast >= contrast_min)
+        min_count = int(
+            _bounded(
+                getattr(cfg, "stage9_psf_min_sample_count", 16),
+                16,
+                4,
+                256,
+            )
+        )
+        if int(np.count_nonzero(eligible)) < min_count:
+            raise ValueError(
+                "insufficient source-visible catalog stars: "
+                f"{int(np.count_nonzero(eligible))}<{min_count}"
+            )
+        candidate_peak = _stage9_square_window_values(
+            luminance,
+            array_y,
+            array_x,
+            inner_windows,
+            statistic="max",
+        )
+        candidate_background = _stage9_square_window_values(
+            luminance,
+            array_y,
+            array_x,
+            outer_windows,
+            statistic="median",
+        )
+        candidate_contrast = np.maximum(
+            candidate_peak - candidate_background,
+            0.0,
+        )
+        visible = eligible & np.isfinite(candidate_contrast) & (
+            candidate_contrast >= contrast_min
+        )
+        subgroup_min_count = max(4, int(math.ceil(min_count * 0.20)))
+        limits = {
+            "all": _bounded(
+                getattr(cfg, "stage9_star_recovery_ratio_min", 0.75),
+                0.75,
+                0.40,
+                0.98,
+            ),
+            "weak": _bounded(
+                getattr(cfg, "stage9_weak_star_recovery_ratio_min", 0.70),
+                0.70,
+                0.40,
+                0.95,
+            ),
+            "bright": _bounded(
+                getattr(cfg, "stage9_bright_star_visibility_ratio_min", 0.90),
+                0.90,
+                0.50,
+                1.0,
+            ),
+        }
+        group_masks = {
+            "all": eligible,
+            "weak": eligible & weak_flags,
+            "bright": eligible & ~weak_flags,
+        }
+        groups: Dict[str, Dict[str, Any]] = {}
+        hard_failed = False
+        review_required = False
+        for name, group_mask in group_masks.items():
+            reference_count = int(np.count_nonzero(group_mask))
+            required_count = min_count if name == "all" else subgroup_min_count
+            if reference_count < required_count:
+                groups[name] = {
+                    "status": "insufficient_evidence",
+                    "reference_count": reference_count,
+                    "visible_count": int(np.count_nonzero(visible & group_mask)),
+                    "minimum_sample_count": required_count,
+                    "ratio": None,
+                    "ratio_min": limits[name],
+                    "passed": None,
+                }
+                review_required = True
+                continue
+            visible_count = int(np.count_nonzero(visible & group_mask))
+            ratio = float(visible_count / reference_count)
+            passed = bool(ratio >= limits[name])
+            groups[name] = {
+                "status": "measured",
+                "reference_count": reference_count,
+                "visible_count": visible_count,
+                "minimum_sample_count": required_count,
+                "ratio": ratio,
+                "ratio_min": limits[name],
+                "passed": passed,
+            }
+            hard_failed = hard_failed or not passed
+        eligible_contrast = candidate_contrast[eligible]
+        report.update(
+            status=(
+                "rejected" if hard_failed else "partial" if review_required else "ok"
+            ),
+            available=True,
+            passed=not hard_failed and not review_required,
+            hard_failed=hard_failed,
+            review_required=review_required,
+            reason_code=(
+                "stage9_catalog_visibility_failed"
+                if hard_failed
+                else "stage9_catalog_visibility_partial"
+                if review_required
+                else "stage9_catalog_visibility_ok"
+            ),
+            contrast_min=contrast_min,
+            source_reference_count=int(np.count_nonzero(eligible)),
+            candidate_visible_count=int(np.count_nonzero(visible)),
+            candidate_contrast_p50=float(np.median(eligible_contrast)),
+            candidate_contrast_p95=float(np.percentile(eligible_contrast, 95.0)),
+            groups=groups,
+        )
+        return report
+    except (IndexError, KeyError, TypeError, ValueError, FloatingPointError) as error:
+        report["reason"] = str(error)
+        return report
 
 
 def build_display_confirmed_starmask_catalog(
@@ -4898,27 +5273,47 @@ def build_stage5_bright_star_completion(
     original_display: np.ndarray,
     trusted_stars: np.ndarray,
     cfg: Any,
+    *,
+    coordinate_domain: str,
 ) -> Dict[str, Any]:
     """Build an independent support group for omitted bright/saturated stars.
 
-    Siril stores star coordinates bottom-up while numpy image arrays are
-    top-down.  The frozen Stage 5 coordinates are converted here, deduplicated
-    against the normal Stage 9 catalog, and then confirmed by local trusted
-    star-layer energy.  These entries never participate in the ordinary FWHM
+    Frozen Stage 5 coordinates use Siril's bottom-up ``y`` convention.  Siril
+    pixel buffers use that same domain and therefore require no conversion;
+    only explicitly top-down FITS arrays use ``height - 1 - y``.  The entries
+    are deduplicated against the normal Stage 9 catalog and confirmed by local
+    trusted star-layer energy.  They never participate in the ordinary FWHM
     hard gate.
     """
+    coordinate_domains = {
+        "siril_pixel_buffer_bottom_up": "y_array = y_siril",
+        "fits_array_top_down": "y_array = image_height - 1 - y_siril",
+    }
     report: Dict[str, Any] = {
-        "schema": "starun.stage9-stage5-bright-star-completion.v1",
+        "schema": "starun.stage9-stage5-bright-star-completion.v2",
         "status": "unavailable",
         "available": False,
         "reason_code": "stage9_stage5_bright_star_completion_unavailable",
         "gate_role": "presence_and_wing_observation_only",
         "ordinary_fwhm_gate_member": False,
+        "coordinate_contract": {
+            "schema": "starun.pixel-coordinate-contract.v1",
+            "source_coordinate_domain": "siril_star_catalog_bottom_up",
+            "array_coordinate_domain": str(coordinate_domain or ""),
+            "conversion": coordinate_domains.get(str(coordinate_domain or "")),
+            "validated": False,
+        },
     }
     if scipy_ndimage is None:
         report["reason"] = "scipy.ndimage unavailable"
         return report
     try:
+        if coordinate_domain not in coordinate_domains:
+            raise ValueError(
+                "Stage5 completion coordinate domain must be explicitly one of "
+                f"{sorted(coordinate_domains)}"
+            )
+        report["coordinate_contract"]["validated"] = True
         source_entries = list(stage5_stars or [])
         if not source_entries:
             raise ValueError("frozen Stage5 star catalog is empty")
@@ -4987,6 +5382,11 @@ def build_stage5_bright_star_completion(
             "already_in_stage9_catalog": 0,
             "trusted_star_evidence_missing": 0,
         }
+        source_layer_counts = {
+            "ordinary": 0,
+            "bright": 0,
+            "saturated": 0,
+        }
         for entry in source_entries:
             try:
                 x_float = float(entry.get("x"))
@@ -4999,11 +5399,20 @@ def build_stage5_bright_star_completion(
             if not all(math.isfinite(value) for value in (x_float, y_siril, fwhm)):
                 rejected["invalid_geometry"] += 1
                 continue
+            if saturated:
+                source_layer_counts["saturated"] += 1
+            elif fwhm >= fwhm_min:
+                source_layer_counts["bright"] += 1
+            else:
+                source_layer_counts["ordinary"] += 1
             if fwhm <= 0.0 or (not saturated and fwhm < fwhm_min):
                 rejected["ordinary_non_saturated"] += 1
                 continue
             x = int(round(x_float))
-            y = int(round((height - 1) - y_siril))
+            if coordinate_domain == "siril_pixel_buffer_bottom_up":
+                y = int(round(y_siril))
+            else:
+                y = int(round((height - 1) - y_siril))
             if not (0 <= x < width and 0 <= y < height):
                 rejected["invalid_geometry"] += 1
                 continue
@@ -5093,6 +5502,8 @@ def build_stage5_bright_star_completion(
                     "source_index": int(entry.get("index", len(selected)) or 0),
                     "x": peak_x,
                     "y": peak_y,
+                    "source_x": x_float,
+                    "source_y_siril": y_siril,
                     "stage5_fwhm_px": fwhm,
                     "saturated": saturated,
                     "support_radius_px": radius,
@@ -5126,12 +5537,18 @@ def build_stage5_bright_star_completion(
                 (grid_y - y) ** 2 + (grid_x - x) ** 2 <= radius * radius
             )
         saturated_count = sum(bool(entry["saturated"]) for entry in selected)
+        selected_layer_counts = {
+            "ordinary": 0,
+            "bright": len(selected) - saturated_count,
+            "saturated": saturated_count,
+        }
         report.update(
             status="ready",
             available=True,
             reason_code="stage9_stage5_bright_star_completion_ready",
             source_schema="starun.stage5-star-reference.v1",
-            coordinate_conversion="numpy_y = image_height - 1 - siril_y",
+            coordinate_domain=coordinate_domain,
+            coordinate_conversion=coordinate_domains[coordinate_domain],
             selection_semantics=(
                 "frozen_stage5_saturated_or_large_star_not_already_in_stage9_catalog_"
                 "and_confirmed_by_trusted_star_layer"
@@ -5140,6 +5557,8 @@ def build_stage5_bright_star_completion(
             selected_star_count=len(selected),
             selected_saturated_count=saturated_count,
             selected_large_unsaturated_count=len(selected) - saturated_count,
+            source_star_layer_counts=source_layer_counts,
+            selected_star_layer_counts=selected_layer_counts,
             support_pixel_count=int(np.count_nonzero(support)),
             support_ratio=float(np.mean(support)),
             support_radius_max=radius_max_nominal,
@@ -5200,6 +5619,26 @@ def apply_stage5_bright_star_completion(
     try:
         if completion.get("status") != "ready":
             raise ValueError(str(completion.get("reason") or "completion unavailable"))
+        if completion.get("schema") != (
+            "starun.stage9-stage5-bright-star-completion.v2"
+        ):
+            raise ValueError("Stage5 completion coordinate contract is missing")
+        coordinate_contract = completion.get("coordinate_contract")
+        if not isinstance(coordinate_contract, dict) or not bool(
+            coordinate_contract.get("validated", False)
+        ):
+            raise ValueError("Stage5 completion coordinate contract is invalid")
+        coordinate_domain = str(
+            coordinate_contract.get("array_coordinate_domain") or ""
+        )
+        expected_conversion = {
+            "siril_pixel_buffer_bottom_up": "y_array = y_siril",
+            "fits_array_top_down": "y_array = image_height - 1 - y_siril",
+        }.get(coordinate_domain)
+        if not expected_conversion or coordinate_contract.get(
+            "conversion"
+        ) != expected_conversion:
+            raise ValueError("Stage5 completion coordinate contract does not match")
         original = _normalized(np.asarray(original_display))
         starless = _normalized(np.asarray(starless_display))
         output = _normalized(np.asarray(stars)).copy()
@@ -5585,6 +6024,245 @@ def build_star_overlay_masks(
         cfg=cfg,
         extra_pixels=extra_pixels,
     )
+
+
+def contract_star_layer_components(
+    stars: np.ndarray,
+    catalog: Dict[str, Any],
+    *,
+    support_mask: np.ndarray,
+    weak_mask: np.ndarray | None,
+    bright_mask: np.ndarray | None,
+    target_groups: tuple[str, ...],
+    gamma: float,
+    centroid_drift_max_px: float = 0.05,
+) -> Tuple[np.ndarray | None, Dict[str, Any]]:
+    """Tighten only selected catalog components with one RGB-shared gain map."""
+    report: Dict[str, Any] = {
+        "schema": "starun.stage9-psf-component-contraction.v1",
+        "status": "unavailable",
+        "changed": False,
+        "gamma": float(gamma),
+        "target_groups": list(target_groups),
+        "operator": "component_local_rgb_shared_u_power",
+        "operator_formula": "gain=u^(gamma-1)",
+        "gamma_bounds": [1.0, 2.5],
+        "peak_preserved": False,
+        "channel_ratio_preserved_by_construction": True,
+    }
+    if scipy_ndimage is None:
+        report["reason"] = "scipy.ndimage unavailable"
+        return None, report
+    if not isinstance(catalog, dict) or catalog.get("status") != "ok":
+        report["reason"] = "frozen star reference catalog is unavailable"
+        return None, report
+    normalized_groups = tuple(
+        dict.fromkeys(str(group).strip().lower() for group in target_groups)
+    )
+    if not normalized_groups or any(
+        group not in {"all", "weak", "bright"}
+        for group in normalized_groups
+    ):
+        report["reason"] = "target groups are empty or unsupported"
+        return None, report
+    contraction_gamma = float(gamma)
+    if not math.isfinite(contraction_gamma) or not 1.0 <= contraction_gamma <= 2.5:
+        report["reason"] = "gamma is outside the frozen 1.0..2.5 bounds"
+        return None, report
+
+    source = np.asarray(stars)
+    scale = _image_scale(source)
+    normalized = _normalized(source, scale=scale)
+    peak_map = _pixel_peak(normalized)
+    labels = np.asarray(catalog.get("_labels"), dtype=np.int32)
+    component_ids = np.asarray(
+        catalog.get("_component_ids", ()), dtype=np.int32
+    )
+    weak_flags = np.asarray(catalog.get("_weak_flags", ()), dtype=bool)
+    if (
+        peak_map.ndim != 2
+        or labels.shape != peak_map.shape
+        or component_ids.size <= 0
+        or weak_flags.size != component_ids.size
+    ):
+        report["reason"] = "catalog and star-layer geometry do not match"
+        return None, report
+
+    if "all" in normalized_groups:
+        target_ids = component_ids
+    else:
+        selected_flags = np.zeros(component_ids.size, dtype=bool)
+        if "weak" in normalized_groups:
+            selected_flags |= weak_flags
+        if "bright" in normalized_groups:
+            selected_flags |= ~weak_flags
+        target_ids = component_ids[selected_flags]
+    if target_ids.size <= 0:
+        report["reason"] = "no frozen components match the target groups"
+        return None, report
+
+    union_support = np.asarray(support_mask, dtype=bool)
+    if union_support.shape != peak_map.shape:
+        report["reason"] = "support mask shape mismatch"
+        return None, report
+    target_scope = np.zeros_like(union_support, dtype=bool)
+    if "all" in normalized_groups:
+        target_scope |= union_support
+    if "weak" in normalized_groups:
+        if weak_mask is None or np.asarray(weak_mask).shape != peak_map.shape:
+            report["reason"] = "weak target support is unavailable"
+            return None, report
+        target_scope |= np.asarray(weak_mask, dtype=bool)
+    if "bright" in normalized_groups:
+        if bright_mask is None or np.asarray(bright_mask).shape != peak_map.shape:
+            report["reason"] = "bright target support is unavailable"
+            return None, report
+        target_scope |= np.asarray(bright_mask, dtype=bool)
+    target_scope &= union_support
+
+    target_core = np.isin(labels, target_ids)
+    if not np.any(target_core) or not np.any(target_scope):
+        report["reason"] = "target component support is empty"
+        return None, report
+    nearest_indices = scipy_ndimage.distance_transform_edt(
+        ~target_core,
+        return_distances=False,
+        return_indices=True,
+    )
+    assigned_labels = labels[
+        nearest_indices[0],
+        nearest_indices[1],
+    ]
+    target_scope &= np.isin(assigned_labels, target_ids)
+    if not np.any(target_scope):
+        report["reason"] = "target support cannot be assigned to components"
+        return None, report
+
+    max_label = int(max(int(np.max(labels)), int(np.max(target_ids))))
+    peak_lookup = np.zeros(max_label + 1, dtype=np.float32)
+    local_peaks = np.asarray(
+        scipy_ndimage.maximum(
+            peak_map,
+            labels=labels,
+            index=target_ids,
+        ),
+        dtype=np.float32,
+    )
+    peak_lookup[target_ids] = np.maximum(local_peaks, 1.0e-12)
+    local_peak_map = peak_lookup[np.clip(assigned_labels, 0, max_label)]
+    relative_peak = np.clip(
+        peak_map / np.maximum(local_peak_map, 1.0e-12),
+        0.0,
+        1.0,
+    )
+    gain = np.ones_like(peak_map, dtype=np.float32)
+    if contraction_gamma > 1.0 + 1.0e-12:
+        gain[target_scope] = np.power(
+            relative_peak[target_scope],
+            contraction_gamma - 1.0,
+        )
+
+    # The frozen component peak is unchanged by definition.  Reject individual
+    # asymmetric components whose flux centroid would move perceptibly.
+    ys, xs = np.nonzero(target_scope)
+    scoped_labels = assigned_labels[ys, xs]
+    before_weights = peak_map[ys, xs].astype(np.float64, copy=False)
+    after_weights = before_weights * gain[ys, xs].astype(
+        np.float64, copy=False
+    )
+    minlength = max_label + 1
+    before_sum = np.bincount(
+        scoped_labels, weights=before_weights, minlength=minlength
+    )
+    after_sum = np.bincount(
+        scoped_labels, weights=after_weights, minlength=minlength
+    )
+    before_y = np.bincount(
+        scoped_labels, weights=before_weights * ys, minlength=minlength
+    )
+    before_x = np.bincount(
+        scoped_labels, weights=before_weights * xs, minlength=minlength
+    )
+    after_y = np.bincount(
+        scoped_labels, weights=after_weights * ys, minlength=minlength
+    )
+    after_x = np.bincount(
+        scoped_labels, weights=after_weights * xs, minlength=minlength
+    )
+    valid_centroid = (
+        (before_sum[target_ids] > 1.0e-12)
+        & (after_sum[target_ids] > 1.0e-12)
+    )
+    centroid_drift = np.full(target_ids.size, np.inf, dtype=np.float64)
+    if np.any(valid_centroid):
+        ids = target_ids[valid_centroid]
+        dy = after_y[ids] / after_sum[ids] - before_y[ids] / before_sum[ids]
+        dx = after_x[ids] / after_sum[ids] - before_x[ids] / before_sum[ids]
+        centroid_drift[valid_centroid] = np.hypot(dy, dx)
+    unsafe_ids = target_ids[
+        (~valid_centroid)
+        | (centroid_drift > max(0.0, float(centroid_drift_max_px)))
+    ]
+    if unsafe_ids.size:
+        gain[np.isin(assigned_labels, unsafe_ids) & target_scope] = 1.0
+
+    changed_scope = target_scope & (gain < 1.0 - 1.0e-7)
+    expanded_gain = _expanded_spatial_mask(normalized, gain)
+    contracted = normalized * expanded_gain
+    peak_y = np.asarray(catalog.get("_peak_y", ()), dtype=np.int32)
+    peak_x = np.asarray(catalog.get("_peak_x", ()), dtype=np.int32)
+    peak_drift = 0.0
+    if peak_y.size == component_ids.size and peak_x.size == component_ids.size:
+        selected = np.isin(component_ids, target_ids)
+        if np.any(selected):
+            before_peak = peak_map[peak_y[selected], peak_x[selected]]
+            after_peak = _pixel_peak(contracted)[
+                peak_y[selected], peak_x[selected]
+            ]
+            peak_drift = float(np.max(np.abs(after_peak - before_peak)))
+
+    restored = contracted * scale
+    if np.issubdtype(source.dtype, np.integer):
+        info = np.iinfo(source.dtype)
+        restored = np.clip(np.rint(restored), info.min, info.max).astype(
+            source.dtype
+        )
+    else:
+        restored = restored.astype(source.dtype, copy=False)
+    outside = ~target_scope
+    spatial_abs_change = _pixel_peak(
+        np.abs(
+            np.asarray(restored, dtype=np.float64)
+            - np.asarray(source, dtype=np.float64)
+        )
+    )
+    outside_change = (
+        float(np.max(spatial_abs_change[outside]))
+        if np.any(outside)
+        else 0.0
+    )
+    applied_drift = centroid_drift[
+        np.isfinite(centroid_drift) & ~np.isin(target_ids, unsafe_ids)
+    ]
+    report.update(
+        status="changed" if np.any(changed_scope) else "unchanged",
+        changed=bool(np.any(changed_scope)),
+        target_component_count=int(target_ids.size),
+        contracted_component_count=int(
+            np.unique(assigned_labels[changed_scope]).size
+        ),
+        centroid_guard_skipped_component_count=int(unsafe_ids.size),
+        centroid_drift_max_px=(
+            float(np.max(applied_drift)) if applied_drift.size else None
+        ),
+        centroid_drift_limit_px=float(centroid_drift_max_px),
+        peak_max_abs_drift=peak_drift,
+        peak_preserved=bool(peak_drift <= 1.0e-7),
+        outside_target_max_abs_change=outside_change,
+        target_pixel_count=int(np.count_nonzero(target_scope)),
+        changed_pixel_count=int(np.count_nonzero(changed_scope)),
+    )
+    return restored, report
 
 
 def apply_compact_starmask_support(
@@ -6074,7 +6752,7 @@ def assess_stage9_psf_closure(
     """Measure same-star display-domain FWHM and enforce the natural-size gate."""
     enabled = bool(getattr(cfg, "stage9_psf_size_gate_enabled", True))
     result: Dict[str, Any] = {
-        "schema": "starun.stage9-psf-closure.v2",
+        "schema": "starun.stage9-psf-closure.v3",
         "status": "unavailable",
         "available": False,
         "accepted": True,
@@ -6238,10 +6916,34 @@ def assess_stage9_psf_closure(
         1.00,
         1.50,
     )
+    uncertainty_floor = _bounded(
+        getattr(
+            cfg,
+            "stage9_psf_fwhm_ratio_uncertainty_floor",
+            0.002,
+        ),
+        0.002,
+        0.0,
+        0.01,
+    )
+    uncertainty_max = max(
+        uncertainty_floor,
+        _bounded(
+            getattr(
+                cfg,
+                "stage9_psf_fwhm_ratio_uncertainty_max",
+                0.020,
+            ),
+            0.020,
+            0.002,
+            0.05,
+        ),
+    )
     subgroup_min_count = max(4, int(math.ceil(min_count * 0.20)))
     issues: list[str] = []
     partial_groups: list[str] = []
     diagnostic_incomplete_groups: list[str] = []
+    uncertainty_advisory_groups: list[str] = []
     metrics: Dict[str, float] = {}
     group_masks = {
         "all": (ordinary_reference, matched),
@@ -6287,6 +6989,68 @@ def assess_stage9_psf_closure(
             continue
         ratios = candidate_fwhm[candidate_mask] / source_fwhm[candidate_mask]
         ratio_median = float(np.median(ratios))
+        ratio_mad = float(np.median(np.abs(ratios - ratio_median)))
+        robust_se = float(1.858 * ratio_mad / math.sqrt(group_count))
+        group_source_area = source_halfmax_area[candidate_mask]
+        group_candidate_area = candidate_halfmax_area[candidate_mask]
+        area_valid = (
+            np.isfinite(group_source_area)
+            & np.isfinite(group_candidate_area)
+            & (group_source_area > 0.5)
+            & (group_candidate_area > 0.5)
+        )
+        pixel_sample_count = int(np.count_nonzero(area_valid))
+        pixel_se = 0.0
+        pixel_interval_halfwidth_median = None
+        if pixel_sample_count > 0:
+            source_area = group_source_area[area_valid].astype(
+                np.float64,
+                copy=False,
+            )
+            candidate_area = group_candidate_area[area_valid].astype(
+                np.float64,
+                copy=False,
+            )
+            area_ratio = np.sqrt(candidate_area / source_area)
+            quantized_low = np.sqrt(
+                np.maximum(candidate_area - 0.5, 1e-12)
+                / (source_area + 0.5)
+            )
+            quantized_high = np.sqrt(
+                (candidate_area + 0.5)
+                / np.maximum(source_area - 0.5, 1e-12)
+            )
+            pixel_halfwidth = np.maximum(
+                area_ratio - quantized_low,
+                quantized_high - area_ratio,
+            )
+            pixel_interval_halfwidth_median = float(
+                np.median(pixel_halfwidth)
+            )
+            pixel_se = float(
+                pixel_interval_halfwidth_median
+                / math.sqrt(pixel_sample_count)
+            )
+        raw_u95 = float(
+            1.96 * math.sqrt(robust_se**2 + pixel_se**2)
+        )
+        u95 = float(
+            min(uncertainty_max, max(uncertainty_floor, raw_u95))
+        )
+        interval_min = ratio_median - u95
+        interval_max = ratio_median + u95
+        strict_accepted = bool(ratio_min <= ratio_median <= ratio_max)
+        boundary_intersects = bool(
+            interval_max >= ratio_min and interval_min <= ratio_max
+        )
+        accepted_within_uncertainty = bool(
+            not strict_accepted and boundary_intersects
+        )
+        group_accepted = bool(
+            strict_accepted or accepted_within_uncertainty
+        )
+        if accepted_within_uncertainty:
+            uncertainty_advisory_groups.append(group_name)
         group_report = {
             "status": "ok",
             "reference_sample_count": group_reference_count,
@@ -6301,11 +7065,51 @@ def assess_stage9_psf_closure(
             "fwhm_ratio_p75": float(np.percentile(ratios, 75.0)),
             "ratio_min": ratio_min,
             "ratio_max": ratio_max,
-            "accepted": bool(ratio_min <= ratio_median <= ratio_max),
+            "strict_accepted": strict_accepted,
+            "accepted_within_uncertainty": (
+                accepted_within_uncertainty
+            ),
+            "accepted": group_accepted,
+            "decision": (
+                "accepted_strict"
+                if strict_accepted
+                else (
+                    "accepted_within_uncertainty"
+                    if accepted_within_uncertainty
+                    else "rejected"
+                )
+            ),
+            "measurement_uncertainty": {
+                "confidence": 0.95,
+                "ratio_mad": ratio_mad,
+                "robust_se": robust_se,
+                "robust_se_formula": "1.858*MAD(ratio)/sqrt(n)",
+                "pixel_se": pixel_se,
+                "pixel_interval_halfwidth_median": (
+                    pixel_interval_halfwidth_median
+                ),
+                "pixel_area_sample_count": pixel_sample_count,
+                "pixel_area_missing_count": (
+                    group_count - pixel_sample_count
+                ),
+                "pixel_interval_definition": (
+                    "source/candidate half-max area +/-0.5 px"
+                ),
+                "u95_raw": raw_u95,
+                "u95_effective": u95,
+                "u95_floor": uncertainty_floor,
+                "u95_max": uncertainty_max,
+                "ratio_interval_95": [interval_min, interval_max],
+                "gate_interval_intersects": boundary_intersects,
+            },
         }
         result["groups"][group_name] = group_report
         metrics[f"star_psf_fwhm_ratio_{group_name}"] = ratio_median
-        if enabled and not group_report["accepted"]:
+        metrics[f"star_psf_fwhm_u95_{group_name}"] = u95
+        metrics[
+            f"star_psf_fwhm_uncertainty_exemption_{group_name}"
+        ] = float(accepted_within_uncertainty)
+        if enabled and not group_accepted:
             issues.append(
                 f"star_psf_fwhm_ratio_{group_name} "
                 f"{ratio_median:.6f} outside {ratio_min:.6f}..{ratio_max:.6f}"
@@ -6377,6 +7181,8 @@ def assess_stage9_psf_closure(
         status = "rejected"
     elif partial_groups or diagnostic_incomplete_groups:
         status = "partial"
+    elif uncertainty_advisory_groups:
+        status = "advisory"
     else:
         status = "ok"
     advisories = []
@@ -6389,6 +7195,11 @@ def assess_stage9_psf_closure(
             "PSF candidate samples incomplete while gate disabled: "
             + ", ".join(diagnostic_incomplete_groups)
         )
+    if uncertainty_advisory_groups:
+        advisories.append(
+            "PSF ratio accepted within 95% measurement uncertainty: "
+            + ", ".join(uncertainty_advisory_groups)
+        )
     result.update(
         status=status,
         available=True,
@@ -6400,11 +7211,17 @@ def assess_stage9_psf_closure(
             else []
         ),
         advisories=advisories,
+        uncertainty_exemption_used=bool(uncertainty_advisory_groups),
+        uncertainty_advisory_groups=uncertainty_advisory_groups,
         issues=issues,
         metrics=metrics,
         limits={
             "stage9_psf_fwhm_ratio_min": ratio_min,
             "stage9_psf_fwhm_ratio_max": ratio_max,
+            "stage9_psf_fwhm_ratio_uncertainty_floor": (
+                uncertainty_floor
+            ),
+            "stage9_psf_fwhm_ratio_uncertainty_max": uncertainty_max,
         },
     )
     return result
@@ -7307,10 +8124,108 @@ def _stage9_support_candidate_summary(
         accepted_limit=weak_retention_min,
     )
 
+    actual_anchors = dict(output_profile.get("actual") or {})
+    target_anchors = dict(output_profile.get("targets") or {})
+    anchor_ratios: Dict[str, float] = {}
+    required_anchors = ("faint", "mid", "bright", "peak")
+    for anchor in required_anchors:
+        try:
+            actual_value = float(actual_anchors[anchor])
+            target_value = float(target_anchors[anchor])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if target_value > 1e-7 and np.isfinite(actual_value):
+            anchor_ratios[anchor] = float(actual_value / target_value)
+    missing_anchors = [
+        anchor for anchor in required_anchors if anchor not in anchor_ratios
+    ]
+    minimum_anchor_ratio = min(anchor_ratios.values(), default=None)
+    adequacy_min = _bounded(
+        getattr(cfg, "stage9_starmask_output_adequacy_min", 0.50),
+        0.50,
+        0.25,
+        0.90,
+    )
+    legacy_unmeasured_builtin = bool(
+        not plugin_measurement_required
+        and output_profile.get("status") == "legacy_not_assessed"
+    )
+    adequacy_assessed = not missing_anchors
+    adequacy_meets_threshold = bool(
+        legacy_unmeasured_builtin
+        or (
+            adequacy_assessed
+            and minimum_anchor_ratio is not None
+            and minimum_anchor_ratio + 1e-12 >= adequacy_min
+        )
+    )
+    if plugin_measurement_required:
+        adequacy_meets_threshold = bool(
+            plugin_measurement_available
+            and adequacy_assessed
+            and minimum_anchor_ratio is not None
+            and minimum_anchor_ratio + 1e-12 >= adequacy_min
+        )
+    formal_eligible = bool(
+        adequacy_meets_threshold or not plugin_measurement_required
+    )
+    psf_undersize_risk = bool(
+        not adequacy_meets_threshold and not legacy_unmeasured_builtin
+    )
+    inadequacy_reason_code = (
+        "stage9_plugin_starmask_output_inadequate"
+        if plugin_measurement_required
+        else "stage9_builtin_starmask_output_inadequate"
+    )
+    adequacy_gate = {
+        "status": (
+            "accepted"
+            if adequacy_meets_threshold
+            else "hard_failed"
+            if plugin_measurement_required
+            else "advisory"
+        ),
+        "accepted": formal_eligible,
+        "advisory": bool(
+            psf_undersize_risk and not plugin_measurement_required
+        ),
+        "hard_failed": bool(
+            psf_undersize_risk and plugin_measurement_required
+        ),
+        "value": minimum_anchor_ratio,
+        "accepted_limit": adequacy_min,
+        "comparison": ">=",
+        "missing_anchors": missing_anchors,
+        "reason": (
+            ""
+            if adequacy_meets_threshold
+            else plugin_measurement_reason
+            or f"required output anchors missing or below {adequacy_min:.3f}"
+        ),
+    }
+    output_adequacy = {
+        "status": "rejected" if psf_undersize_risk else "ok",
+        "advisory_only": not plugin_measurement_required,
+        "formal_gate": plugin_measurement_required,
+        "formal_eligible": formal_eligible,
+        "meets_threshold": adequacy_meets_threshold,
+        "threshold": adequacy_min,
+        "required_anchors": list(required_anchors),
+        "missing_anchors": missing_anchors,
+        "anchor_ratios": anchor_ratios,
+        "minimum_anchor_ratio": minimum_anchor_ratio,
+        "psf_undersize_risk": psf_undersize_risk,
+        "reason_code": (
+            inadequacy_reason_code
+            if psf_undersize_risk
+            else "stage9_starmask_output_adequate"
+        ),
+    }
     gates = {
         "star_support_ratio": support_gate,
         "predicted_change_ratio": predicted_change_gate,
         "starmask_output_targets": output_profile_gate,
+        "starmask_output_adequacy": adequacy_gate,
         "compact_weak_star_retention": weak_retention_gate,
     }
     gate_statuses = [
@@ -7323,34 +8238,6 @@ def _stage9_support_candidate_summary(
     else:
         risk_level = "ok"
     usable = bool(candidate_status == "ok" and risk_level != "hard_failed")
-    actual_anchors = dict(output_profile.get("actual") or {})
-    target_anchors = dict(output_profile.get("targets") or {})
-    anchor_ratios: Dict[str, float] = {}
-    for anchor in ("faint", "mid", "bright", "peak"):
-        try:
-            actual_value = float(actual_anchors[anchor])
-            target_value = float(target_anchors[anchor])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if target_value > 1e-7 and np.isfinite(actual_value):
-            anchor_ratios[anchor] = float(actual_value / target_value)
-    minimum_anchor_ratio = min(anchor_ratios.values(), default=None)
-    psf_undersize_risk = bool(
-        minimum_anchor_ratio is not None and minimum_anchor_ratio < 0.50
-    )
-    output_adequacy = {
-        "status": "risk" if psf_undersize_risk else "ok",
-        "advisory_only": True,
-        "formal_gate": False,
-        "anchor_ratios": anchor_ratios,
-        "minimum_anchor_ratio": minimum_anchor_ratio,
-        "psf_undersize_risk": psf_undersize_risk,
-        "reason_code": (
-            "stage9_starmask_output_undersize_risk"
-            if psf_undersize_risk
-            else "stage9_starmask_output_adequate"
-        ),
-    }
     star_reference = calibration.get("star_reference") or {}
     return {
         "status": candidate_status,
@@ -7369,6 +8256,7 @@ def _stage9_support_candidate_summary(
         "plugin_measurement_reason": plugin_measurement_reason,
         "output_profile": output_profile,
         "output_adequacy": output_adequacy,
+        "formal_eligible": bool(usable and formal_eligible),
         "output_target_scale": float(
             calibration.get("output_target_scale", 1.0) or 0.0
         ),
@@ -7422,19 +8310,69 @@ def assess_starmask_support_preflight(
         strict_support=False,
         reference_catalog=normal_catalog or None,
     )
-    normal_summary = _stage9_support_candidate_summary(
-        normal,
-        cfg,
-        plugin_stretched_stars=plugin_stretched_stars,
+    builtin_normal_summary = _stage9_support_candidate_summary(normal, cfg)
+    builtin_normal_summary["stretch_source"] = "builtin_calibrated"
+    plugin_summary: Dict[str, Any] = {
+        "status": "not_provided",
+        "usable": False,
+        "formal_eligible": False,
+        "risk_level": "not_assessed",
+        "support_mode": "normal",
+        "stretch_source": "plugin_stretched",
+        "reason": "plugin-stretched star layer was not supplied",
+        "output_adequacy": {
+            "status": "not_assessed",
+            "formal_gate": True,
+            "formal_eligible": False,
+            "threshold": _bounded(
+                getattr(cfg, "stage9_starmask_output_adequacy_min", 0.50),
+                0.50,
+                0.25,
+                0.90,
+            ),
+            "reason_code": "stage9_plugin_starmask_output_not_provided",
+        },
+        "gates": {},
+        "advisories": [],
+    }
+    if plugin_stretched_stars is not None:
+        plugin_summary = _stage9_support_candidate_summary(
+            normal,
+            cfg,
+            plugin_stretched_stars=plugin_stretched_stars,
+        )
+        plugin_summary["stretch_source"] = "plugin_stretched"
+    plugin_formal_eligible = bool(
+        plugin_stretched_stars is not None
+        and plugin_summary.get("formal_eligible", False)
+    )
+    plugin_fallback_reason = ""
+    if plugin_stretched_stars is not None and not plugin_formal_eligible:
+        plugin_fallback_reason = str(
+            (plugin_summary.get("output_adequacy") or {}).get("reason_code")
+            or plugin_summary.get("plugin_measurement_reason")
+            or "stage9_plugin_starmask_output_inadequate"
+        )
+    normal_summary = dict(
+        plugin_summary if plugin_formal_eligible else builtin_normal_summary
+    )
+    normal_summary.update(
+        stretch_source=(
+            "plugin_stretched"
+            if plugin_formal_eligible
+            else "builtin_calibrated"
+        ),
+        plugin_formal_eligible=plugin_formal_eligible,
+        plugin_fallback_reason=plugin_fallback_reason or None,
     )
     if plugin_stretched_stars is not None:
         normal["plugin_output_profile"] = dict(
-            normal_summary.get("output_profile") or {}
+            plugin_summary.get("output_profile") or {}
         )
-        normal["plugin_predicted_change_ratio"] = normal_summary.get(
+        normal["plugin_predicted_change_ratio"] = plugin_summary.get(
             "predicted_change_ratio"
         )
-        normal["plugin_predicted_change_source"] = normal_summary.get(
+        normal["plugin_predicted_change_source"] = plugin_summary.get(
             "predicted_change_source"
         )
     frozen_catalog = (
@@ -7464,6 +8402,7 @@ def assess_starmask_support_preflight(
             reference_catalog=frozen_catalog or strict_catalog or None,
         )
         strict_summary = _stage9_support_candidate_summary(strict, cfg)
+        strict_summary["stretch_source"] = "builtin_calibrated"
         normal_mask = normal.get("_compact_support_mask")
         strict_mask = strict.get("_compact_support_mask")
         if normal_mask is not None and strict_mask is not None:
@@ -7486,14 +8425,31 @@ def assess_starmask_support_preflight(
             False,
         )
     )
+    plugin_rejected = bool(
+        plugin_stretched_stars is not None and not plugin_formal_eligible
+    )
     route = "unavailable"
     reason_code = "stage9_support_preflight_no_usable_candidate"
     if not compact_enabled:
         route = "normal_only"
-        reason_code = "stage9_support_preflight_compact_disabled"
-    elif equivalent and normal_usable:
+        reason_code = (
+            "stage9_plugin_starmask_output_inadequate_builtin_fallback"
+            if plugin_rejected and normal_usable
+            else "stage9_support_preflight_compact_disabled"
+        )
+    elif (
+        plugin_rejected
+        and normal_usable
+        and strict_usable
+        and str(failure_action or "auto_fallback") == "auto_fallback"
+    ):
+        route = "dual_competition"
+        reason_code = (
+            "stage9_plugin_starmask_output_inadequate_builtin_dual_fallback"
+        )
+    elif plugin_rejected and normal_usable:
         route = "normal_only"
-        reason_code = "stage9_support_preflight_equivalent_masks"
+        reason_code = "stage9_plugin_starmask_output_inadequate_builtin_fallback"
     elif not normal_usable and strict_usable:
         route = "strict_only"
         reason_code = "stage9_support_preflight_normal_hard_failed"
@@ -7504,6 +8460,9 @@ def assess_starmask_support_preflight(
         else:
             route = "normal_only"
             reason_code = "stage9_support_preflight_output_adequacy_normal"
+    elif equivalent and normal_usable:
+        route = "normal_only"
+        reason_code = "stage9_support_preflight_equivalent_masks"
     elif normal_usable and normal_risk == "advisory" and strict_usable:
         if str(failure_action or "auto_fallback") == "auto_fallback":
             route = "dual_competition"
@@ -7548,20 +8507,48 @@ def assess_starmask_support_preflight(
             }
         )
     return {
-        "schema": "starun.stage9-starmask_support_preflight.v1",
+        "schema": _STAGE9_STARMASK_SUPPORT_PREFLIGHT_SCHEMA,
         "status": status,
-        "strategy": "adaptive_dual_route",
+        "strategy": "plugin_qualified_builtin_fallback",
         "compact_enabled": compact_enabled,
         "compact_support_enabled": compact_enabled,
         "pre_stretch_compact_enabled": pre_stretch_compact_enabled,
         "failure_action": str(failure_action or "auto_fallback"),
         "route": route,
         "reason_code": reason_code,
+        "selected_stretch_source": normal_summary.get("stretch_source"),
+        "fallback_reason": plugin_fallback_reason or None,
+        "plugin_formal_eligibility": {
+            "status": (
+                "accepted"
+                if plugin_formal_eligible
+                else "rejected"
+                if plugin_stretched_stars is not None
+                else "not_provided"
+            ),
+            "eligible": plugin_formal_eligible,
+            "reason_code": (
+                "stage9_plugin_starmask_output_adequate"
+                if plugin_formal_eligible
+                else plugin_fallback_reason
+                or "stage9_plugin_starmask_output_not_provided"
+            ),
+            "adequacy_threshold": (
+                (plugin_summary.get("output_adequacy") or {}).get("threshold")
+            ),
+            "actual_anchors": dict(
+                (plugin_summary.get("output_profile") or {}).get("actual") or {}
+            ),
+            "target_anchors": dict(
+                (plugin_summary.get("output_profile") or {}).get("targets") or {}
+            ),
+        },
         "support_masks_equivalent": equivalent,
         "planned_candidates": planned_candidates,
         "skipped_candidates": skipped_candidates,
         "candidates": {
             "normal": normal_summary,
+            "plugin_normal": plugin_summary,
             "strict_compact": strict_summary,
         },
         "executed_candidates": [],
@@ -7579,7 +8566,7 @@ def public_starmask_support_preflight(
     """Strip in-memory calibration masks from a support preflight report."""
     if not isinstance(report, dict):
         return {
-            "schema": "starun.stage9-starmask_support_preflight.v1",
+            "schema": _STAGE9_STARMASK_SUPPORT_PREFLIGHT_SCHEMA,
             "status": "unavailable",
             "reason": "support preflight report missing",
         }
@@ -7681,6 +8668,12 @@ def assess_remix(
         candidate_norm,
         star_reference,
         cfg,
+    )
+    catalog_visibility = assess_catalog_star_visibility(
+        candidate_norm,
+        star_reference,
+        cfg,
+        coordinate_domain="siril_pixel_buffer_bottom_up",
     )
 
     hollow_delta_min = _bounded(
@@ -7833,6 +8826,26 @@ def assess_remix(
     }
     metrics.update(local_quality.get("metrics") or {})
     metrics.update(psf_closure.get("metrics") or {})
+    for group_name, group_report in dict(
+        catalog_visibility.get("groups") or {}
+    ).items():
+        ratio = group_report.get("ratio")
+        metrics[f"catalog_star_visibility_reference_count_{group_name}"] = float(
+            group_report.get("reference_count", 0) or 0
+        )
+        metrics[f"catalog_star_visibility_visible_count_{group_name}"] = float(
+            group_report.get("visible_count", 0) or 0
+        )
+        if ratio is not None:
+            metrics[f"catalog_star_visibility_ratio_{group_name}"] = float(ratio)
+    if catalog_visibility.get("candidate_contrast_p50") is not None:
+        metrics["catalog_star_visibility_contrast_p50"] = float(
+            catalog_visibility["candidate_contrast_p50"]
+        )
+    if catalog_visibility.get("candidate_contrast_p95") is not None:
+        metrics["catalog_star_visibility_contrast_p95"] = float(
+            catalog_visibility["candidate_contrast_p95"]
+        )
 
     recovery_status = "unavailable"
     recovery_reason = "star reference catalog missing"
@@ -8124,6 +9137,21 @@ def assess_remix(
         structural_issues.extend(
             str(issue) for issue in (psf_closure.get("issues") or [])
         )
+    if not bool(catalog_visibility.get("available", False)):
+        structural_issues.append(
+            "catalog_star_visibility_unavailable: "
+            f"{catalog_visibility.get('reason') or catalog_visibility.get('reason_code')}"
+        )
+    elif bool(catalog_visibility.get("hard_failed", False)):
+        for group_name, group_report in dict(
+            catalog_visibility.get("groups") or {}
+        ).items():
+            if group_report.get("passed") is False:
+                structural_issues.append(
+                    "catalog_star_visibility_ratio_"
+                    f"{group_name} {float(group_report.get('ratio', 0.0)):.6f}"
+                    f"<{float(group_report.get('ratio_min', 0.0)):.6f}"
+                )
 
     limits = {
         "highlight_clip_ratio_after": _bounded(
@@ -8173,6 +9201,24 @@ def assess_remix(
             0.75,
             0.40,
             0.98,
+        ),
+        "catalog_star_visibility_ratio_all": _bounded(
+            getattr(cfg, "stage9_star_recovery_ratio_min", 0.75),
+            0.75,
+            0.40,
+            0.98,
+        ),
+        "catalog_star_visibility_ratio_weak": _bounded(
+            getattr(cfg, "stage9_weak_star_recovery_ratio_min", 0.70),
+            0.70,
+            0.40,
+            0.95,
+        ),
+        "catalog_star_visibility_ratio_bright": _bounded(
+            getattr(cfg, "stage9_bright_star_visibility_ratio_min", 0.90),
+            0.90,
+            0.50,
+            1.0,
         ),
         "star_support_ratio": _bounded(
             getattr(cfg, "stage9_star_support_ratio_max", 0.12),
@@ -8242,6 +9288,20 @@ def assess_remix(
     }
     limits.update(local_quality.get("limits") or {})
     limits.update(psf_closure.get("limits") or {})
+    for group_name, group_report in dict(
+        catalog_visibility.get("groups") or {}
+    ).items():
+        if group_report.get("passed") is False:
+            quality_gates[f"catalog_star_visibility_ratio_{group_name}"] = {
+                "status": "hard_failed",
+                "accepted": False,
+                "advisory": False,
+                "hard_failed": True,
+                "value": group_report.get("ratio"),
+                "accepted_limit": group_report.get("ratio_min"),
+                "comparison": ">=",
+                "reason": "source-catalog absolute visibility hard gate",
+            }
     upper_limit_names = (
         "highlight_clip_ratio_after",
         "highlight_clip_growth",
@@ -8374,16 +9434,26 @@ def assess_remix(
     psf_review_required = bool(psf_closure.get("review_required", False))
     if psf_review_required:
         reason_codes.append("STAGE9_PSF_SUBGROUP_EVIDENCE_INSUFFICIENT")
+    catalog_review_required = bool(
+        catalog_visibility.get("review_required", False)
+    )
+    if not bool(catalog_visibility.get("available", False)):
+        reason_codes.append("STAR_CATALOG_VISIBILITY_UNAVAILABLE")
+    elif bool(catalog_visibility.get("hard_failed", False)):
+        reason_codes.append("STAR_CATALOG_VISIBILITY_FAILURE")
+    if catalog_review_required:
+        reason_codes.append("STAGE9_CATALOG_VISIBILITY_EVIDENCE_INSUFFICIENT")
+    review_required = bool(psf_review_required or catalog_review_required)
     return {
         "attempt": attempt,
         "formula": formula,
         "status": (
-            "partial" if accepted and psf_review_required
+            "partial" if accepted and review_required
             else "ok" if accepted
             else "rejected"
         ),
         "accepted": accepted,
-        "review_required": psf_review_required,
+        "review_required": review_required,
         "gate_enabled": enabled,
         "issues": issues,
         "structural_issues": structural_issues,
@@ -8396,6 +9466,7 @@ def assess_remix(
         "reason_codes": reason_codes,
         "shadow_metrics": {"psf_scale": psf_scale_shadow},
         "psf_closure": psf_closure,
+        "catalog_visibility": catalog_visibility,
         "metrics": metrics,
         "limits": limits,
     }

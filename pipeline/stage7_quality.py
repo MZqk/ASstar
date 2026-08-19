@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import math
 import os
 import shutil
@@ -24,6 +25,7 @@ from image_metrics import (
     measure_quality_metrics,
 )
 from models import ImageFeatures, QualityMetrics
+from stage7_pixel_domain import canonicalize_stage7_pixels_01
 
 try:
     from sirilpy.exceptions import CommandError, SirilError
@@ -815,6 +817,7 @@ def stage7_galaxy_structure_masks(
     source_gray: np.ndarray,
     source_bg: float,
     source_std: float,
+    cfg: Any = None,
 ) -> Dict[str, Any]:
     """Locate a conservative elliptical galaxy disk/core from low frequencies."""
     gray = np.nan_to_num(
@@ -823,15 +826,59 @@ def stage7_galaxy_structure_masks(
         posinf=float(source_bg),
         neginf=float(source_bg),
     )
-    if gray.ndim != 2 or min(gray.shape) < 24:
-        return {"available": False, "reason": "image_too_small"}
+    diagnostics: Dict[str, Any] = {
+        "available": False,
+        "status": "unavailable",
+        "reason": "not_measured",
+        "seed_x": None,
+        "seed_y": None,
+        "star_clip_percentile": None,
+        "star_clip_value": None,
+        "signal_floor": None,
+        "signal_floor_components": {},
+        "raw_covariance_major_sigma": None,
+        "raw_covariance_minor_sigma": None,
+        "minimum_covariance_extent": None,
+    }
 
-    broad = gray.copy()
+    def unavailable(reason: str, **extra: Any) -> Dict[str, Any]:
+        return {**diagnostics, **extra, "available": False, "status": "unavailable", "reason": reason}
+
+    if gray.ndim != 2 or min(gray.shape) < 24:
+        return unavailable("image_too_small")
+
+    height, width = gray.shape
+    min_side = float(min(height, width))
+    max_side = float(max(height, width))
+    clip_percentile = _clamp_float(
+        getattr(cfg, "stage7_galaxy_roi_star_clip_percentile", 99.5),
+        98.0,
+        99.9,
+    )
+    clip_value = float(np.percentile(gray, clip_percentile))
+    diagnostics.update(
+        star_clip_percentile=clip_percentile,
+        star_clip_value=clip_value,
+    )
+    broad = np.minimum(gray, clip_value).astype(np.float32, copy=False)
     for _ in range(24):
         broad = _box_blur_gray(broad)
     signal = np.clip(broad - float(source_bg), 0.0, None)
-    height, width = gray.shape
-    peak_y, peak_x = np.unravel_index(int(np.argmax(broad)), broad.shape)
+    edge = max(2, min(height, width) // 50)
+    inner_margin = max(edge + 1, int(round(min_side * 0.08)))
+    inner = broad[
+        inner_margin : height - inner_margin,
+        inner_margin : width - inner_margin,
+    ]
+    if inner.size == 0:
+        return unavailable("interior_peak_search_unavailable")
+    inner_peak_y, inner_peak_x = np.unravel_index(
+        int(np.argmax(inner)),
+        inner.shape,
+    )
+    peak_y = int(inner_peak_y + inner_margin)
+    peak_x = int(inner_peak_x + inner_margin)
+    diagnostics.update(seed_x=peak_x, seed_y=peak_y)
     yy, xx = np.mgrid[:height, :width]
     search_radius = max(12.0, float(min(height, width)) * 0.42)
     search_mask = (
@@ -839,28 +886,49 @@ def stage7_galaxy_structure_masks(
         + np.square(yy.astype(np.float32) - float(peak_y))
     ) <= search_radius * search_radius
     search_values = signal[search_mask]
+    local_q70 = float(np.quantile(search_values, 0.70))
+    local_q99 = float(np.quantile(search_values, 0.99))
+    noise_floor = 1.5 * max(float(source_std), 0.0)
+    peak_floor_ratio = _clamp_float(
+        getattr(cfg, "stage7_galaxy_roi_peak_floor_ratio", 0.02),
+        0.005,
+        0.10,
+    )
+    peak_relative_floor = peak_floor_ratio * max(local_q99, 0.0)
+    absolute_floor = 1e-6
     floor = max(
-        float(np.quantile(search_values, 0.70)),
-        max(float(source_std), 1e-5) * 1.5,
-        0.0025,
+        local_q70,
+        noise_floor,
+        peak_relative_floor,
+        absolute_floor,
+    )
+    diagnostics.update(
+        signal_floor=floor,
+        signal_floor_components={
+            "local_q70": local_q70,
+            "noise_1p5_sigma": noise_floor,
+            "local_q99": local_q99,
+            "local_q99_ratio": peak_floor_ratio,
+            "local_q99_ratio_floor": peak_relative_floor,
+            "absolute_floor": absolute_floor,
+        },
     )
     weights = np.clip(signal - floor, 0.0, None)
     weights[~search_mask] = 0.0
-    edge = max(2, min(height, width) // 50)
     weights[:edge, :] = 0.0
     weights[-edge:, :] = 0.0
     weights[:, :edge] = 0.0
     weights[:, -edge:] = 0.0
     positive = weights[weights > 0.0]
     if positive.size < max(96, int(gray.size * 0.005)):
-        return {"available": False, "reason": "insufficient_broad_signal"}
+        return unavailable("insufficient_broad_signal")
     cap = float(np.quantile(positive, 0.92))
     if math.isfinite(cap) and cap > 0.0:
         weights = np.minimum(weights, cap)
 
     total = float(np.sum(weights))
     if not math.isfinite(total) or total <= 1e-6:
-        return {"available": False, "reason": "invalid_broad_signal"}
+        return unavailable("invalid_broad_signal")
     center_x = float(np.sum(weights * xx) / total)
     center_y = float(np.sum(weights * yy) / total)
     dx = xx.astype(np.float32) - center_x
@@ -881,14 +949,25 @@ def stage7_galaxy_structure_masks(
     try:
         eigenvalues, eigenvectors = np.linalg.eigh(covariance)
     except np.linalg.LinAlgError:
-        return {"available": False, "reason": "invalid_shape_covariance"}
+        return unavailable("invalid_shape_covariance")
     if not np.all(np.isfinite(eigenvalues)) or float(eigenvalues[-1]) <= 1.0:
-        return {"available": False, "reason": "degenerate_shape_covariance"}
+        return unavailable("degenerate_shape_covariance")
 
     minor_sigma = math.sqrt(max(float(eigenvalues[0]), 1.0))
     major_sigma = math.sqrt(max(float(eigenvalues[1]), 1.0))
-    min_side = float(min(height, width))
-    max_side = float(max(height, width))
+    min_extent_ratio = _clamp_float(
+        getattr(cfg, "stage7_galaxy_roi_min_extent_ratio", 0.008),
+        0.004,
+        0.03,
+    )
+    minimum_extent = max(6.0, min_extent_ratio * min_side)
+    diagnostics.update(
+        raw_covariance_major_sigma=major_sigma,
+        raw_covariance_minor_sigma=minor_sigma,
+        minimum_covariance_extent=minimum_extent,
+    )
+    if minor_sigma <= minimum_extent or major_sigma <= minimum_extent:
+        return unavailable("covariance_extent_too_small")
     major_radius = _clamp_float(
         major_sigma * 2.5,
         max(8.0, min_side * 0.06),
@@ -916,14 +995,12 @@ def stage7_galaxy_structure_masks(
         or bool(np.any(disk_mask[:, -1]))
     ):
         return {
-            "available": False,
-            "reason": "truncated_disk_roi",
+            **unavailable("truncated_disk_roi"),
             "disk_coverage": disk_coverage,
         }
     if not 0.003 <= disk_coverage <= 0.72:
         return {
-            "available": False,
-            "reason": "implausible_disk_coverage",
+            **unavailable("implausible_disk_coverage"),
             "disk_coverage": disk_coverage,
         }
 
@@ -947,7 +1024,9 @@ def stage7_galaxy_structure_masks(
         core_ring_mask = disk_mask & (~core_mask)
 
     return {
+        **diagnostics,
         "available": True,
+        "status": "ready",
         "reason": "",
         "disk_mask": disk_mask,
         "core_mask": core_mask,
@@ -969,9 +1048,10 @@ def _stage7_galaxy_artifact_scores(
     *,
     source_bg: float,
     source_std: float,
-) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    cfg: Any = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Compare galaxy disk/core under one shared local range stretch."""
-    metrics: Dict[str, float] = {
+    metrics: Dict[str, Any] = {
         "galaxy_roi_available": 0.0,
         "galaxy_disk_halo_evidence_available": 0.0,
         "galaxy_disk_halo_residue_score": 0.0,
@@ -989,8 +1069,54 @@ def _stage7_galaxy_artifact_scores(
         "galaxy_roi_minor_radius": 0.0,
         "galaxy_roi_disk_coverage": 0.0,
         "galaxy_roi_core_coverage": 0.0,
+        "galaxy_roi_status": "not_run",
+        "galaxy_roi_failure_reason": "",
+        "galaxy_roi_seed_x_px": None,
+        "galaxy_roi_seed_y_px": None,
+        "galaxy_roi_signal_floor": None,
+        "galaxy_roi_signal_floor_components": {},
+        "galaxy_roi_raw_covariance_major_sigma": None,
+        "galaxy_roi_raw_covariance_minor_sigma": None,
+        "galaxy_roi_minimum_covariance_extent": None,
+        "galaxy_roi_star_clip_percentile": None,
+        "galaxy_roi_star_clip_value": None,
+        "galaxy_roi_disk_range_q08": None,
+        "galaxy_roi_disk_range_q975": None,
+        "galaxy_roi_disk_range_span": None,
+        "galaxy_roi_disk_range_minimum": None,
+        "galaxy_roi_disk_range_minimum_components": {},
     }
-    masks = stage7_galaxy_structure_masks(source_gray, source_bg, source_std)
+    masks = stage7_galaxy_structure_masks(
+        source_gray,
+        source_bg,
+        source_std,
+        cfg,
+    )
+    metrics.update(
+        {
+            "galaxy_roi_status": str(masks.get("status") or "unavailable"),
+            "galaxy_roi_failure_reason": str(masks.get("reason") or ""),
+            "galaxy_roi_seed_x_px": masks.get("seed_x"),
+            "galaxy_roi_seed_y_px": masks.get("seed_y"),
+            "galaxy_roi_signal_floor": masks.get("signal_floor"),
+            "galaxy_roi_signal_floor_components": dict(
+                masks.get("signal_floor_components") or {}
+            ),
+            "galaxy_roi_raw_covariance_major_sigma": masks.get(
+                "raw_covariance_major_sigma"
+            ),
+            "galaxy_roi_raw_covariance_minor_sigma": masks.get(
+                "raw_covariance_minor_sigma"
+            ),
+            "galaxy_roi_minimum_covariance_extent": masks.get(
+                "minimum_covariance_extent"
+            ),
+            "galaxy_roi_star_clip_percentile": masks.get(
+                "star_clip_percentile"
+            ),
+            "galaxy_roi_star_clip_value": masks.get("star_clip_value"),
+        }
+    )
     if not bool(masks.get("available", False)):
         return metrics, masks
 
@@ -1003,11 +1129,61 @@ def _stage7_galaxy_artifact_scores(
     source_values = source_gray[disk_range_mask]
     black = float(np.quantile(source_values, 0.08))
     white = float(np.quantile(source_values, 0.975))
-    minimum_range = max(4.0 * max(float(source_std), 1e-5), 0.008)
+    peak_floor_ratio = max(
+        0.005,
+        min(
+            0.10,
+            float(
+                getattr(
+                    cfg,
+                    "stage7_galaxy_roi_peak_floor_ratio",
+                    0.02,
+                )
+            ),
+        ),
+    )
+    local_q99 = float(
+        (masks.get("signal_floor_components") or {}).get("local_q99", 0.0)
+        or 0.0
+    )
+    minimum_components = {
+        "source_std_4x": 4.0 * max(float(source_std), 0.0),
+        "local_q99_ratio": peak_floor_ratio * max(local_q99, 0.0),
+        "numerical_floor": 1e-6,
+        "peak_floor_ratio": peak_floor_ratio,
+        "local_q99": local_q99,
+    }
+    minimum_range = max(
+        minimum_components["source_std_4x"],
+        minimum_components["local_q99_ratio"],
+        minimum_components["numerical_floor"],
+    )
+    range_span = white - black
+    metrics.update(
+        {
+            "galaxy_roi_disk_range_q08": black,
+            "galaxy_roi_disk_range_q975": white,
+            "galaxy_roi_disk_range_span": range_span,
+            "galaxy_roi_disk_range_minimum": minimum_range,
+            "galaxy_roi_disk_range_minimum_components": minimum_components,
+        }
+    )
+    masks.update(
+        {
+            "disk_range_q08": black,
+            "disk_range_q975": white,
+            "disk_range_span": range_span,
+            "disk_range_minimum": minimum_range,
+            "disk_range_minimum_components": minimum_components,
+        }
+    )
     if not math.isfinite(black) or not math.isfinite(white) or white - black < minimum_range:
         masks = dict(masks)
         masks["available"] = False
+        masks["status"] = "unavailable"
         masks["reason"] = "insufficient_disk_range"
+        metrics["galaxy_roi_status"] = "unavailable"
+        metrics["galaxy_roi_failure_reason"] = "insufficient_disk_range"
         return metrics, masks
 
     denominator = max(white - black, 1e-6)
@@ -1302,6 +1478,17 @@ def stage7_starless_artifact_scores(
         "galaxy_roi_minor_radius": 0.0,
         "galaxy_roi_disk_coverage": 0.0,
         "galaxy_roi_core_coverage": 0.0,
+        "galaxy_roi_status": "not_applicable",
+        "galaxy_roi_failure_reason": "",
+        "galaxy_roi_seed_x_px": None,
+        "galaxy_roi_seed_y_px": None,
+        "galaxy_roi_signal_floor": None,
+        "galaxy_roi_signal_floor_components": {},
+        "galaxy_roi_raw_covariance_major_sigma": None,
+        "galaxy_roi_raw_covariance_minor_sigma": None,
+        "galaxy_roi_minimum_covariance_extent": None,
+        "galaxy_roi_star_clip_percentile": None,
+        "galaxy_roi_star_clip_value": None,
     }
     if source_data is None or starless_data is None:
         return scores
@@ -1472,6 +1659,7 @@ def stage7_starless_artifact_scores(
                 starmask_gray,
                 source_bg=source_bg,
                 source_std=source_std,
+                cfg=pipeline.cfg,
             )
             scores.update(galaxy_scores)
             if bool(galaxy_masks.get("available", False)):
@@ -1667,6 +1855,185 @@ def stage7_starless_artifact_scores(
         pipeline.log.debug(f"stage7 artifact scoring skipped: {e}")
     return scores
 
+def _stage6_stage5_star_reference_report(pipeline) -> Dict[str, Any]:
+    runtime_report = getattr(pipeline, "_stage5_star_reference_report", None)
+    if isinstance(runtime_report, dict) and runtime_report.get("stars"):
+        return runtime_report
+    resume_context = getattr(pipeline, "_resume_semantic_context", None)
+    if isinstance(resume_context, dict):
+        resumed_report = resume_context.get("stage5_star_reference_report")
+        if isinstance(resumed_report, dict) and resumed_report.get("stars"):
+            return resumed_report
+    process_dir = getattr(pipeline, "process_dir", None)
+    report_path = (
+        Path(process_dir) / "stage5_linear_report.json"
+        if process_dir is not None
+        else None
+    )
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+        report = payload.get("star_reference") or (
+            (payload.get("deconvolution") or {}).get("star_reference")
+        )
+        return report if isinstance(report, dict) else {}
+    except (AttributeError, json.JSONDecodeError, OSError, TypeError):
+        return {}
+
+
+def _stage6_catalog_starmask_coverage(
+    pipeline,
+    source_data: Optional[np.ndarray],
+    starmask_data: Optional[np.ndarray],
+) -> Dict[str, Any]:
+    report: Dict[str, Any] = {
+        "schema": "starun.stage6-starmask-catalog-coverage.v1",
+        "method": "stage5_frozen_catalog_apertures",
+        "status": "measurement_unavailable",
+        "available": False,
+        "coverage_ratio": None,
+        "minimum_evaluated_stars": 5,
+        "recovered_flux_ratio_min": 0.20,
+        "counts": {
+            "catalog": 0,
+            "eligible": 0,
+            "evaluated": 0,
+            "recovered": 0,
+            "excluded_low_signal": 0,
+            "excluded_geometry": 0,
+        },
+    }
+    if source_data is None or starmask_data is None:
+        report["reason"] = "source_or_starmask_unavailable"
+        return report
+    reference = _stage6_stage5_star_reference_report(pipeline)
+    stars = reference.get("stars") if isinstance(reference, dict) else None
+    if not isinstance(stars, list):
+        report["reason"] = "stage5_star_reference_unavailable"
+        return report
+    report["counts"]["catalog"] = len(stars)
+    try:
+        source, _ = canonicalize_stage7_pixels_01(source_data)
+        starmask, _ = canonicalize_stage7_pixels_01(starmask_data)
+        source_rgb = _to_rgb_float_fullres(source)
+        starmask_rgb = _to_rgb_float_fullres(starmask)
+        source_gray = (
+            0.2126 * source_rgb[0]
+            + 0.7152 * source_rgb[1]
+            + 0.0722 * source_rgb[2]
+        ).astype(np.float64)
+        starmask_gray = (
+            0.2126 * starmask_rgb[0]
+            + 0.7152 * starmask_rgb[1]
+            + 0.0722 * starmask_rgb[2]
+        ).astype(np.float64)
+    except (TypeError, ValueError) as error:
+        report["reason"] = f"canonicalization_failed: {error}"
+        return report
+    if source_gray.shape != starmask_gray.shape:
+        report["reason"] = "source_starmask_shape_mismatch"
+        return report
+
+    height, width = source_gray.shape
+    flux_ratios: List[float] = []
+    star_records: List[Dict[str, Any]] = []
+    for star in stars:
+        if not isinstance(star, dict) or not bool(
+            star.get("eligible_for_local_guard", False)
+        ):
+            continue
+        report["counts"]["eligible"] += 1
+        try:
+            x = float(star.get("x"))
+            y = float(star.get("y"))
+            fwhm = float(
+                star.get("fwhm_geometry")
+                or math.sqrt(float(star.get("fwhm_x")) * float(star.get("fwhm_y")))
+            )
+        except (TypeError, ValueError):
+            report["counts"]["excluded_geometry"] += 1
+            continue
+        if not all(math.isfinite(value) for value in (x, y, fwhm)) or fwhm <= 0.0:
+            report["counts"]["excluded_geometry"] += 1
+            continue
+        radius = max(5, int(math.ceil(5.0 * fwhm)))
+        x0 = max(0, int(math.floor(x)) - radius)
+        x1 = min(width, int(math.floor(x)) + radius + 1)
+        y0 = max(0, int(math.floor(y)) - radius)
+        y1 = min(height, int(math.floor(y)) + radius + 1)
+        if x0 == 0 or y0 == 0 or x1 == width or y1 == height:
+            report["counts"]["excluded_geometry"] += 1
+            continue
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        distance = np.sqrt((xx - x) ** 2 + (yy - y) ** 2)
+        aperture = distance <= 2.0 * fwhm
+        annulus = (distance >= 3.5 * fwhm) & (distance <= 5.0 * fwhm)
+        if int(np.count_nonzero(aperture)) < 4 or int(np.count_nonzero(annulus)) < 12:
+            report["counts"]["excluded_geometry"] += 1
+            continue
+        source_patch = source_gray[y0:y1, x0:x1]
+        mask_patch = starmask_gray[y0:y1, x0:x1]
+        source_background = float(np.median(source_patch[annulus]))
+        source_sigma = float(
+            1.4826
+            * np.median(np.abs(source_patch[annulus] - source_background))
+        )
+        source_signal = np.clip(source_patch - source_background, 0.0, None)
+        source_peak = float(np.max(source_signal[aperture]))
+        source_flux = float(np.sum(source_signal[aperture]))
+        aperture_count = int(np.count_nonzero(aperture))
+        peak_floor = max(5.0 * source_sigma, 1e-6)
+        flux_floor = max(5.0 * source_sigma * math.sqrt(aperture_count), 1e-6)
+        if source_peak < peak_floor or source_flux <= flux_floor:
+            report["counts"]["excluded_low_signal"] += 1
+            continue
+        mask_background = float(np.median(mask_patch[annulus]))
+        mask_sigma = float(
+            1.4826 * np.median(np.abs(mask_patch[annulus] - mask_background))
+        )
+        mask_signal = np.clip(mask_patch - mask_background, 0.0, None)
+        mask_peak = float(np.max(mask_signal[aperture]))
+        mask_flux = float(np.sum(mask_signal[aperture]))
+        flux_ratio = float(mask_flux / max(source_flux, 1e-12))
+        combined_sigma = math.sqrt(source_sigma**2 + mask_sigma**2)
+        recovered = bool(
+            flux_ratio >= 0.20
+            and mask_peak > max(3.0 * combined_sigma, 1e-6)
+        )
+        report["counts"]["evaluated"] += 1
+        report["counts"]["recovered"] += int(recovered)
+        flux_ratios.append(flux_ratio)
+        star_records.append(
+            {
+                "index": star.get("index"),
+                "flux_ratio": flux_ratio,
+                "source_peak": source_peak,
+                "source_flux": source_flux,
+                "source_sigma": source_sigma,
+                "mask_peak": mask_peak,
+                "mask_sigma": mask_sigma,
+                "recovered": recovered,
+            }
+        )
+    evaluated = int(report["counts"]["evaluated"])
+    report["stars"] = star_records
+    report["median_flux_ratio"] = (
+        float(np.median(flux_ratios)) if flux_ratios else None
+    )
+    if evaluated < int(report["minimum_evaluated_stars"]):
+        report["reason"] = "insufficient_evaluated_catalog_stars"
+        return report
+    coverage = float(report["counts"]["recovered"] / evaluated)
+    report.update(
+        {
+            "status": "available",
+            "available": True,
+            "coverage_ratio": coverage,
+            "reason": "measured_from_frozen_stage5_catalog",
+        }
+    )
+    return report
+
+
 def stage7_quality_assessment(
     pipeline,
     attempt_name: str,
@@ -1698,11 +2065,52 @@ def stage7_quality_assessment(
     if source_metrics.star_density <= 1e-7:
         global_residual_star_score = 0.0
 
-    starmask_coverage_ratio = (
+    pixel_starmask_coverage_ratio = (
         starmask_metrics.star_coverage_ratio / baseline_star_coverage
         if starmask_data is not None
         else 0.0
     )
+    pixel_coverage_reliable = bool(
+        starmask_data is not None
+        and source_metrics.star_density > 1e-7
+        and source_metrics.star_coverage_ratio > 1e-7
+    )
+    coverage_measurement: Dict[str, Any]
+    if pixel_coverage_reliable:
+        starmask_coverage_ratio: Optional[float] = float(
+            pixel_starmask_coverage_ratio
+        )
+        coverage_measurement = {
+            "status": "available",
+            "available": True,
+            "method": "pixel_star_coverage_ratio",
+            "coverage_ratio": starmask_coverage_ratio,
+            "source_star_density": float(source_metrics.star_density),
+            "source_star_coverage_ratio": float(
+                source_metrics.star_coverage_ratio
+            ),
+        }
+    elif starmask_data is not None:
+        coverage_measurement = _stage6_catalog_starmask_coverage(
+            pipeline,
+            source_data,
+            starmask_data,
+        )
+        starmask_coverage_ratio = (
+            float(coverage_measurement["coverage_ratio"])
+            if coverage_measurement.get("available") is True
+            and coverage_measurement.get("coverage_ratio") is not None
+            else None
+        )
+    else:
+        starmask_coverage_ratio = None
+        coverage_measurement = {
+            "status": "missing",
+            "available": False,
+            "method": "none",
+            "coverage_ratio": None,
+            "reason": "starmask_missing",
+        }
     starmask_width_ratio = (
         starmask_metrics.median_star_size / max(source_metrics.median_star_size, 1e-4)
         if starmask_data is not None and source_metrics.median_star_size > 0
@@ -2044,7 +2452,7 @@ def stage7_quality_assessment(
             advisories.append(dynamic_message)
     if starmask_data is None:
         issues.append("starmask_missing")
-    else:
+    elif starmask_coverage_ratio is not None:
         coverage_gate = stage7_lower_quality_gate(
             pipeline.cfg,
             value=starmask_coverage_ratio,
@@ -2058,6 +2466,22 @@ def stage7_quality_assessment(
             f"{starmask_coverage_ratio:.3f}<{pipeline.cfg.stage7_starmask_coverage_min_ratio:.3f}"
             ),
         )
+    else:
+        quality_gates["starmask_coverage_ratio"] = {
+            "status": "measurement_unavailable",
+            "advisory": True,
+            "hard_failed": False,
+            "accepted_limit": pipeline.cfg.stage7_starmask_coverage_min_ratio,
+            "measurement": coverage_measurement,
+        }
+        advisories.append("starmask_coverage_measurement_unavailable")
+        require_review = getattr(pipeline, "_require_review", None)
+        if callable(require_review):
+            require_review(
+                6,
+                "starmask_coverage_measurement_unavailable",
+                {"measurement": coverage_measurement},
+            )
     if (
         starmask_data is not None
         and source_metrics.median_star_size > 0
@@ -2143,6 +2567,7 @@ def stage7_quality_assessment(
             "dynamic_range_collapse_advisory": dynamic_assessment["advisory"],
             "dynamic_range_collapse_hard_failed": dynamic_assessment["hard_failed"],
             "starmask_coverage_ratio": starmask_coverage_ratio,
+            "starmask_coverage_measurement": coverage_measurement,
             "starmask_width_ratio": starmask_width_ratio,
             "halo_threshold": halo_threshold,
             "bright_core_integrity_status": bright_core_integrity.get("status"),
@@ -2196,7 +2621,13 @@ def stage7_quality_score(pipeline, quality: Optional[Dict[str, Any]]) -> float:
     noise_gain = float(derived.get("starless_noise_gain", 1.0))
     dynamic_range_ratio = float(derived.get("starless_dynamic_range_ratio", 1.0))
     peak_signal = float(derived.get("starless_peak_signal", 1.0))
-    coverage_ratio = float(derived.get("starmask_coverage_ratio", 0.0))
+    coverage_value = derived.get("starmask_coverage_ratio")
+    coverage_measurement = derived.get("starmask_coverage_measurement")
+    coverage_available = bool(
+        isinstance(coverage_measurement, dict)
+        and coverage_measurement.get("available") is True
+    ) or coverage_value is not None
+    coverage_ratio = float(coverage_value or 0.0)
     width_ratio = float(derived.get("starmask_width_ratio", 1.0))
     galaxy_roi_available = float(derived.get("galaxy_roi_available", 0.0)) > 0.5
     galaxy_core_preservation = float(
@@ -2205,7 +2636,14 @@ def stage7_quality_score(pipeline, quality: Optional[Dict[str, Any]]) -> float:
     galaxy_core_contrast = float(
         derived.get("galaxy_core_contrast_ratio", 1.0)
     )
-    coverage_penalty = max(0.0, pipeline.cfg.stage7_starmask_coverage_min_ratio - coverage_ratio)
+    coverage_penalty = (
+        max(
+            0.0,
+            pipeline.cfg.stage7_starmask_coverage_min_ratio - coverage_ratio,
+        )
+        if coverage_available
+        else 0.0
+    )
     width_penalty = max(0.0, width_ratio - pipeline.cfg.stage7_starmask_width_ratio_max)
     halo_penalty = max(0.0, halo - pipeline._stage7_effective_halo_threshold())
     compact_halo_penalty = max(
@@ -2325,6 +2763,22 @@ def stage7_repair_triggers(pipeline, quality: Optional[Dict[str, Any]]) -> List[
         galaxy_roi_available = False
         galaxy_core_preservation = 1.0
         galaxy_core_contrast = 1.0
+    coverage_measurement = derived.get("starmask_coverage_measurement")
+    coverage_value = derived.get("starmask_coverage_ratio")
+    if (
+        isinstance(coverage_measurement, dict)
+        and coverage_measurement.get("available") is not True
+        and str(coverage_measurement.get("status") or "")
+        == "measurement_unavailable"
+    ):
+        triggers.append("starmask_coverage_unavailable")
+    elif coverage_value is not None:
+        try:
+            coverage_ratio = float(coverage_value)
+        except (TypeError, ValueError):
+            coverage_ratio = 0.0
+        if coverage_ratio < float(pipeline.cfg.stage7_starmask_coverage_min_ratio):
+            triggers.append("starmask_coverage")
     if residual > float(pipeline.cfg.stage7_residual_star_score_max):
         triggers.append("residual_stars")
     if compact_residual > float(pipeline.cfg.stage7_residual_star_score_max):
