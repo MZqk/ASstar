@@ -4,6 +4,31 @@ from tests.pipeline_plugin_fallbacks_support import *  # noqa: F401,F403
 
 
 class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBase):
+    def test_stage8_mixed_nebula_saturation_is_bounded_above_galaxy_route(self):
+        galaxy_name, galaxy_bands = (
+            pipeline_module.stage8_pixels.stage8_broadband_hue_saturation_bands(
+                "large_galaxy",
+                0.10,
+            )
+        )
+        mixed_name, mixed_bands = (
+            pipeline_module.stage8_pixels.stage8_broadband_hue_saturation_bands(
+                "bright_emission_reflection_nebula",
+                0.10,
+            )
+        )
+
+        self.assertEqual(galaxy_name, "galaxy")
+        self.assertEqual(mixed_name, "mixed_nebula")
+        self.assertGreater(
+            max(band["amount"] for band in mixed_bands),
+            max(band["amount"] for band in galaxy_bands),
+        )
+        self.assertLessEqual(
+            max(band["amount"] for band in mixed_bands),
+            0.05,
+        )
+
     def test_stage8_legacy_accepted_hdr_state_is_review_passthrough(self):
         processor = self._new_processor()
         processor._star_separation_state = (

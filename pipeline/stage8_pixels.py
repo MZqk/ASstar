@@ -130,6 +130,13 @@ _STAGE8_BROADBAND_TARGET_PROFILES = {
     "bright_emission_reflection_nebula": "mixed_nebula",
 }
 
+_STAGE8_BROADBAND_SATURATION_LIMITS = {
+    "galaxy": (0.18, 0.045),
+    "emission": (0.22, 0.050),
+    "reflection": (0.18, 0.045),
+    "mixed_nebula": (0.24, 0.050),
+}
+
 def _clamp_int(value: int, lower: int, upper: int) -> int:
     return max(lower, min(upper, int(value)))
 
@@ -144,7 +151,11 @@ def stage8_broadband_hue_saturation_bands(
         "",
     )
     profile = _STAGE8_BROADBAND_HUE_PROFILES.get(profile_name, ())
-    base_amount = min(0.04, max(0.0, float(saturation)) * 0.16)
+    scale, maximum = _STAGE8_BROADBAND_SATURATION_LIMITS.get(
+        profile_name,
+        (0.16, 0.04),
+    )
+    base_amount = min(maximum, max(0.0, float(saturation)) * scale)
     if not profile or base_amount <= 1e-6:
         return "", []
     return profile_name, [

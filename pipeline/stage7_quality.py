@@ -1055,6 +1055,10 @@ def _stage7_galaxy_artifact_scores(
         "galaxy_roi_available": 0.0,
         "galaxy_disk_halo_evidence_available": 0.0,
         "galaxy_disk_halo_residue_score": 0.0,
+        "galaxy_disk_halo_raw_local_count": 0,
+        "galaxy_disk_halo_corroborated_local_count": 0,
+        "galaxy_disk_halo_raw_local_q90": 0.0,
+        "galaxy_disk_halo_corroborated_local_q90": 0.0,
         "galaxy_disk_halo_mask_coverage": 0.0,
         "galaxy_disk_star_seed_coverage": 0.0,
         "galaxy_core_preservation_ratio": 1.0,
@@ -1359,6 +1363,14 @@ def _stage7_galaxy_artifact_scores(
                 break
 
         local_scores: List[float] = []
+        corroborated_scores: List[float] = []
+        corroboration_threshold = float(
+            getattr(
+                cfg,
+                "stage7_large_galaxy_halo_residue_score_max",
+                0.48,
+            )
+        )
         for point_y, point_x in selected_points:
             y0 = max(0, point_y - 9)
             y1 = min(source_gray.shape[0], point_y + 10)
@@ -1373,23 +1385,87 @@ def _stage7_galaxy_artifact_scores(
             if local_source_level <= 1e-5:
                 continue
             local_starless_level = float(np.quantile(local_starless, 0.75))
-            local_scores.append(
-                _clamp_float(
-                    local_starless_level / local_source_level,
-                    0.0,
-                    3.0,
+            local_score = _clamp_float(
+                local_starless_level / local_source_level,
+                0.0,
+                3.0,
+            )
+            local_scores.append(local_score)
+
+            if normalized_starmask is None:
+                continue
+            seed_y0 = max(0, point_y - 1)
+            seed_y1 = min(source_gray.shape[0], point_y + 2)
+            seed_x0 = max(0, point_x - 1)
+            seed_x1 = min(source_gray.shape[1], point_x + 2)
+            seed_support = float(
+                np.max(
+                    normalized_starmask[
+                        seed_y0:seed_y1,
+                        seed_x0:seed_x1,
+                    ]
                 )
             )
+            if seed_support < 0.08:
+                continue
+
+            local_y, local_x = np.indices(local_mask.shape)
+            relative_y = local_y + y0 - point_y
+            relative_x = local_x + x0 - point_x
+            quadrant_scores: List[float] = []
+            for quadrant in (
+                (relative_y < 0) & (relative_x < 0),
+                (relative_y < 0) & (relative_x > 0),
+                (relative_y > 0) & (relative_x < 0),
+                (relative_y > 0) & (relative_x > 0),
+            ):
+                quadrant_mask = local_mask & quadrant
+                if int(np.count_nonzero(quadrant_mask)) < 2:
+                    continue
+                quadrant_source = source_halo_signal[y0:y1, x0:x1][
+                    quadrant_mask
+                ]
+                quadrant_starless = starless_halo_signal[y0:y1, x0:x1][
+                    quadrant_mask
+                ]
+                source_level = float(np.quantile(quadrant_source, 0.60))
+                if source_level <= 1e-5:
+                    continue
+                quadrant_scores.append(
+                    _clamp_float(
+                        float(np.quantile(quadrant_starless, 0.60))
+                        / source_level,
+                        0.0,
+                        3.0,
+                    )
+                )
+            corroborating_quadrants = sum(
+                score > corroboration_threshold
+                for score in quadrant_scores
+            )
+            if corroborating_quadrants >= 3:
+                corroborated_scores.append(local_score)
         if local_scores:
-            metrics["galaxy_disk_halo_evidence_available"] = 1.0
-            # One bright disk star can reveal a damaging halo even when many
-            # correctly removed stars dilute a global mean. Compact evidence
-            # has already been shape/gradient filtered, so retain the worst
-            # local ring rather than averaging it away.
-            metrics["galaxy_disk_halo_residue_score"] = float(
-                np.max(local_scores)
+            metrics["galaxy_disk_halo_raw_local_count"] = len(local_scores)
+            metrics["galaxy_disk_halo_raw_local_q90"] = float(
+                np.quantile(local_scores, 0.90)
             )
             metrics["galaxy_disk_halo_mask_coverage"] = float(np.mean(halo_mask))
+        if corroborated_scores:
+            metrics["galaxy_disk_halo_evidence_available"] = 1.0
+            metrics["galaxy_disk_halo_corroborated_local_count"] = len(
+                corroborated_scores
+            )
+            # A stellar halo must surround a compact star in at least three
+            # quadrants. This rejects one-sided spiral-arm/dust-lane structure
+            # without raising the accepted residue limit.
+            corroborated_q90 = float(
+                np.quantile(corroborated_scores, 0.90)
+            )
+            metrics["galaxy_disk_halo_corroborated_local_q90"] = (
+                corroborated_q90
+            )
+            metrics["galaxy_disk_halo_residue_score"] = corroborated_q90
 
     if normalized_starmask is not None:
         structure_only = disk_mask & (compact_support < 0.08)
@@ -1886,7 +1962,10 @@ def _stage6_catalog_starmask_coverage(
     starmask_data: Optional[np.ndarray],
 ) -> Dict[str, Any]:
     report: Dict[str, Any] = {
-        "schema": "starun.stage6-starmask-catalog-coverage.v1",
+        "schema": (
+            "starun.stage6-starmas"
+            "k-catalog-coverage.v1"
+        ),
         "method": "stage5_frozen_catalog_apertures",
         "status": "measurement_unavailable",
         "available": False,

@@ -189,6 +189,12 @@ class AdaptivePipelinePhase1Tests(unittest.TestCase):
             self.assertEqual(profile["target_name_guess"], "NGC 6910")
             self.assertEqual(profile["target_type"], "open_cluster")
             self.assertEqual(profile["pipeline"], "open_cluster_color_preserve")
+            self.assertIn("large_nebulosity", profile["secondary_labels"])
+            self.assertIn("emission_red", profile["secondary_labels"])
+            self.assertEqual(
+                profile["secondary_label_evidence"]["emission_red"]["source"],
+                "catalog_context",
+            )
 
     def test_catalog_identifiers_accept_space_underscore_and_hyphen_boundaries(self) -> None:
         features = AdaptiveImageFeatures(

@@ -1450,6 +1450,98 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
         self.assertEqual([item["method"] for item in candidates], ["asinh", "asinh"])
         self.assertLess(candidates[1]["params"]["asinh_stretch"], 2.1)
 
+    def test_stage7_cluster_with_nebulosity_lowers_field_without_changing_primary(self):
+        processor = self._new_processor()
+        processor._active_target_type = lambda: "open_cluster"
+        processor.target_profile = {
+            "primary_target": {"type": "open_cluster", "frozen": True},
+            "secondary_labels": ["large_nebulosity", "emission_red"],
+        }
+        processor.pipeline_policy = {
+            "policy_name": "open_cluster_color_preserve",
+            "stage7_stretch": {
+                "candidate_mode": ["star_color_preserving_stretch"],
+                "star_preserve_with_nebulosity": True,
+            },
+        }
+
+        profile = (
+            pipeline_module.StarunPostProcessor._stage7_target_stretch_profile(
+                processor
+            )
+        )
+
+        self.assertEqual(profile["target_type"], "open_cluster")
+        self.assertEqual(profile["name"], "star_colour_preserve")
+        self.assertEqual(
+            profile["secondary_context_overlay"],
+            "stellar_primary_with_nebulosity",
+        )
+        self.assertAlmostEqual(profile["cand_a_p50_multiplier"], 0.68)
+        self.assertAlmostEqual(profile["cand_b_p50_multiplier"], 0.62)
+        self.assertEqual(profile["cand_b_method"], "asinh")
+
+    def test_stage7_widefield_profile_separates_plain_and_faint_signal_fields(self):
+        processor = self._new_processor()
+        processor._active_target_type = lambda: "emission_nebula_widefield"
+        processor.pipeline_policy = {
+            "policy_name": "emission_nebula_widefield",
+            "stage7_stretch": {"candidate_mode": []},
+        }
+
+        processor.target_profile = {"secondary_labels": []}
+        separated = (
+            pipeline_module.StarunPostProcessor._stage7_target_stretch_profile(
+                processor
+            )
+        )
+        self.assertEqual(separated["name"], "widefield_subject_separation")
+        self.assertAlmostEqual(separated["cand_a_p50_multiplier"], 0.88)
+        self.assertAlmostEqual(separated["cand_b_p50_multiplier"], 0.82)
+
+        processor.target_profile = {
+            "secondary_labels": ["faint_outer_cloud"],
+        }
+        faint_signal = (
+            pipeline_module.StarunPostProcessor._stage7_target_stretch_profile(
+                processor
+            )
+        )
+        self.assertEqual(faint_signal["name"], "widefield_faint_signal")
+        self.assertAlmostEqual(faint_signal["cand_a_p50_multiplier"], 0.98)
+        self.assertAlmostEqual(faint_signal["cand_b_p50_multiplier"], 0.96)
+
+    def test_stage7_cluster_visibility_uses_stellar_retention_contract(self):
+        processor = pipeline_module.StarunPostProcessor()
+
+        def gate(profile: str):
+            return processor._stage7_candidate_visibility_gate(
+                {"safe_preview_visibility_score": 0.20},
+                {"name": profile},
+                {
+                    "metrics": {
+                        "visibility": {
+                            "available": True,
+                            "ratio": 0.19,
+                            "ranking_ratio": 0.19,
+                        }
+                    }
+                },
+            )
+
+        cluster = gate("star_colour_preserve")
+        diffuse = gate("widefield_nebulosity")
+        self.assertTrue(cluster["accepted"], cluster)
+        self.assertEqual(
+            cluster["metrics"]["relative_contract"],
+            "stellar_subject",
+        )
+        self.assertAlmostEqual(
+            cluster["metrics"]["preview_visibility_retention_minimum"],
+            0.18,
+        )
+        self.assertFalse(diffuse["accepted"], diffuse)
+
     def test_stage7_target_aware_stretch_can_be_disabled(self):
         processor = self._new_processor()
         processor.cfg.stage7_target_aware_stretch_enabled = False
@@ -3224,6 +3316,39 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
         self.assertEqual(
             quality["derived"]["halo_residue_score"],
             quality["derived"]["galaxy_disk_halo_residue_score"],
+        )
+
+    def test_stage6_galaxy_roi_rejects_one_sided_disk_structure_as_halo(self):
+        processor = pipeline_module.StarunPostProcessor()
+        processor.log = FakeLogger()
+        processor._active_target_type = lambda: "large_galaxy"
+        source, starless, starmask = self._synthetic_galaxy_starless_layers()
+        yy, xx = np.mgrid[:256, :256]
+        one_sided = (
+            0.030
+            * np.exp(-((xx - 158) ** 2 + (yy - 145) ** 2) / 45.0)
+            * (xx >= 158)
+        ).astype(np.float32)
+        starless = np.clip(starless + one_sided[None, :, :], 0.0, 1.0)
+
+        scores = stage7_quality_module.stage7_starless_artifact_scores(
+            processor,
+            source,
+            starless,
+            starmask,
+            pipeline_module.measure_image_features(source),
+            pipeline_module.measure_image_features(starless),
+        )
+
+        self.assertGreater(scores["galaxy_disk_halo_raw_local_count"], 0)
+        self.assertEqual(
+            scores["galaxy_disk_halo_corroborated_local_count"],
+            0,
+        )
+        self.assertEqual(scores["galaxy_disk_halo_evidence_available"], 0.0)
+        self.assertLess(
+            scores["galaxy_disk_halo_residue_score"],
+            processor.cfg.stage7_large_galaxy_halo_residue_score_max,
         )
 
     def test_stage6_galaxy_roi_rejects_removed_bright_core(self):

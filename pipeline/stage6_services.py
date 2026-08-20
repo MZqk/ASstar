@@ -1585,6 +1585,7 @@ class Stage6ServiceMixin:
             stage7_stretch_metrics.subject_brightness_selection(
                 candidate_rendition_metrics,
                 dict(preview_rendition_metrics or {}),
+                profile_name=str(target_stretch.get("name") or ""),
             )
         )
         quality_gates["subject_brightness"] = subject_brightness
@@ -1897,6 +1898,10 @@ class Stage6ServiceMixin:
                 0.60,
             )
         )
+        if profile_name == "star_colour_preserve":
+            # Cluster candidates are judged on preserved stellar visibility,
+            # not on retaining a diffuse-nebula preview lift.
+            relative_minimum = min(relative_minimum, 0.18)
         if relative_available:
             relative_gate = stage7_quality.stage7_9_lower_quality_gate(
                 self.cfg,
@@ -1960,6 +1965,11 @@ class Stage6ServiceMixin:
                     float(relative_ratio) if relative_available else None
                 ),
                 "preview_visibility_retention_minimum": relative_minimum,
+                "relative_contract": (
+                    "stellar_subject"
+                    if profile_name == "star_colour_preserve"
+                    else "diffuse_subject"
+                ),
             },
         }
 
@@ -3215,6 +3225,8 @@ class Stage6ServiceMixin:
         if profile_name in {
             "bright_core_protect",
             "widefield_nebulosity",
+            "widefield_faint_signal",
+            "widefield_subject_separation",
             "dark_nebula_separation",
         }:
             profile = "nebula"
@@ -3972,6 +3984,17 @@ class Stage6ServiceMixin:
             if str(item).strip()
         ]
         enabled = bool(getattr(self.cfg, "stage7_target_aware_stretch_enabled", True))
+        target_profile_value = getattr(self, "target_profile", {}) or {}
+        target_profile = (
+            target_profile_value
+            if isinstance(target_profile_value, dict)
+            else {}
+        )
+        secondary_labels = {
+            str(item).strip()
+            for item in (target_profile.get("secondary_labels") or [])
+            if str(item).strip()
+        }
 
         profile = {
             "enabled": enabled,
@@ -3979,6 +4002,7 @@ class Stage6ServiceMixin:
             "target_type": target_type,
             "policy_name": policy_name,
             "policy_candidate_modes": candidate_modes,
+            "secondary_labels": sorted(secondary_labels),
             "cand_a_p50_multiplier": 1.0,
             "cand_b_p50_multiplier": 1.0,
             "highlight_scale": 0.90,
@@ -4045,16 +4069,40 @@ class Stage6ServiceMixin:
             target_type in {"globular_cluster", "open_cluster", "reflection_nebula_cluster"}
             or "star_color_preserving_stretch" in mode_set
         ):
+            has_nebulosity_context = bool(
+                secondary_labels
+                & {"large_nebulosity", "faint_outer_cloud", "emission_red"}
+            )
             profile.update(
                 {
                     "name": "star_colour_preserve",
-                    "cand_a_p50_multiplier": 0.85,
-                    "cand_b_p50_multiplier": 0.80,
-                    "highlight_scale": 0.82,
-                    "cand_a_stretch_multiplier": 0.92,
-                    "cand_b_stretch_multiplier": 0.88,
+                    "cand_a_p50_multiplier": (
+                        0.68 if has_nebulosity_context else 0.85
+                    ),
+                    "cand_b_p50_multiplier": (
+                        0.62 if has_nebulosity_context else 0.80
+                    ),
+                    "highlight_scale": (
+                        0.78 if has_nebulosity_context else 0.82
+                    ),
+                    "cand_a_stretch_multiplier": (
+                        0.84 if has_nebulosity_context else 0.92
+                    ),
+                    "cand_b_stretch_multiplier": (
+                        0.80 if has_nebulosity_context else 0.88
+                    ),
                     "cand_b_method": "asinh",
-                    "reason": "avoid linked GHS star bloat and protect stellar colour",
+                    "secondary_context_overlay": (
+                        "stellar_primary_with_nebulosity"
+                        if has_nebulosity_context
+                        else None
+                    ),
+                    "reason": (
+                        "protect stellar colour while lowering the field "
+                        "background around real emission nebulosity"
+                        if has_nebulosity_context
+                        else "avoid linked GHS star bloat and protect stellar colour"
+                    ),
                 }
             )
         elif (
@@ -4100,18 +4148,38 @@ class Stage6ServiceMixin:
                 }
             )
         elif target_type == "emission_nebula_widefield" or policy_name == "emission_nebula_widefield":
-            profile.update(
-                {
-                    "name": "widefield_nebulosity",
-                    "cand_a_p50_multiplier": 1.00,
-                    "cand_b_p50_multiplier": 1.00,
-                    "highlight_scale": 0.90,
-                    "cand_a_stretch_multiplier": 1.05,
-                    "cand_b_stretch_multiplier": 1.03,
-                    "cand_b_ghs_amount": 1.04,
-                    "reason": "prioritise diffuse nebulosity while keeping GHS conservative",
-                }
-            )
+            if secondary_labels & {"faint_outer_cloud", "large_nebulosity"}:
+                profile.update(
+                    {
+                        "name": "widefield_faint_signal",
+                        "cand_a_p50_multiplier": 0.98,
+                        "cand_b_p50_multiplier": 0.96,
+                        "highlight_scale": 0.88,
+                        "cand_a_stretch_multiplier": 1.03,
+                        "cand_b_stretch_multiplier": 1.00,
+                        "cand_b_ghs_amount": 1.03,
+                        "reason": (
+                            "retain catalogued faint outer nebulosity with a "
+                            "bounded widefield lift"
+                        ),
+                    }
+                )
+            else:
+                profile.update(
+                    {
+                        "name": "widefield_subject_separation",
+                        "cand_a_p50_multiplier": 0.88,
+                        "cand_b_p50_multiplier": 0.82,
+                        "highlight_scale": 0.86,
+                        "cand_a_stretch_multiplier": 0.98,
+                        "cand_b_stretch_multiplier": 0.96,
+                        "cand_b_ghs_amount": 1.02,
+                        "reason": (
+                            "separate the widefield subject without lifting the "
+                            "whole field to the faint-cloud target"
+                        ),
+                    }
+                )
         return profile
 
 
@@ -4131,6 +4199,8 @@ class Stage6ServiceMixin:
             in {
                 "bright_core_protect",
                 "widefield_nebulosity",
+                "widefield_faint_signal",
+                "widefield_subject_separation",
                 "dark_nebula_separation",
                 "generic_balanced",
             }
@@ -4139,6 +4209,8 @@ class Stage6ServiceMixin:
         if profile_name in {
             "bright_core_protect",
             "widefield_nebulosity",
+            "widefield_faint_signal",
+            "widefield_subject_separation",
             "dark_nebula_separation",
         }:
             return 1.12
@@ -6592,6 +6664,9 @@ class Stage6ServiceMixin:
                                 stage7_stretch_metrics.subject_brightness_selection(
                                     candidate_rendition_metrics,
                                     dict(preview_rendition_metrics or {}),
+                                    profile_name=str(
+                                        target_stretch.get("name") or ""
+                                    ),
                                 )
                             )
                             quality_gates["subject_brightness"] = (

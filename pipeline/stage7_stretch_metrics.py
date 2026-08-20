@@ -284,17 +284,35 @@ def rendition_metric_retention(
 def subject_brightness_selection(
     candidate: Dict[str, Any],
     preview: Dict[str, Any],
+    *,
+    profile_name: str = "generic_balanced",
 ) -> Dict[str, Any]:
     """Build the bounded subject-brightness ranking and formal floor report."""
 
-    goals = {
-        "subject_lift_retention": 0.75,
-        "subject_p50_retention": 0.80,
-    }
-    floors = {
-        "subject_lift_retention": 0.50,
-        "subject_p50_retention": 0.60,
-    }
+    normalized_profile = str(profile_name or "generic_balanced").strip().lower()
+    star_subject_contract = normalized_profile == "star_colour_preserve"
+    goals = (
+        {
+            "subject_lift_retention": None,
+            "subject_p50_retention": 0.30,
+        }
+        if star_subject_contract
+        else {
+            "subject_lift_retention": 0.75,
+            "subject_p50_retention": 0.80,
+        }
+    )
+    floors = (
+        {
+            "subject_lift_retention": None,
+            "subject_p50_retention": 0.20,
+        }
+        if star_subject_contract
+        else {
+            "subject_lift_retention": 0.50,
+            "subject_p50_retention": 0.60,
+        }
+    )
     candidate_metrics = dict(candidate.get("metrics") or {})
     preview_metrics = dict(preview.get("metrics") or {})
 
@@ -340,13 +358,18 @@ def subject_brightness_selection(
         )
 
     p50_ratio = ratios["subject_p50"]
-    lift_ratio = ratios["subject_lift"] if lift_reliable else None
+    lift_applicable = not star_subject_contract
+    lift_ratio = (
+        ratios["subject_lift"]
+        if lift_reliable and lift_applicable
+        else None
+    )
     floor_issues = []
     if p50_ratio is None:
         floor_issues.append("subject_p50_retention_unavailable")
     elif p50_ratio < floors["subject_p50_retention"]:
         floor_issues.append("subject_p50_retention_below_floor")
-    if lift_reliable:
+    if lift_reliable and lift_applicable:
         if lift_ratio is None:
             floor_issues.append("subject_lift_retention_unavailable")
         elif lift_ratio < floors["subject_lift_retention"]:
@@ -370,9 +393,13 @@ def subject_brightness_selection(
             )
             or 0.0
         ),
-        "subject_lift_retention": bounded_goal_utility(
-            lift_ratio,
-            goals["subject_lift_retention"],
+        "subject_lift_retention": (
+            bounded_goal_utility(
+                lift_ratio,
+                float(goals["subject_lift_retention"]),
+            )
+            if goals["subject_lift_retention"] is not None
+            else None
         ),
     }
     applicable_utilities = [
@@ -385,19 +412,23 @@ def subject_brightness_selection(
         )
         + (
             lift_reliable
+            and lift_applicable
             and lift_ratio is not None
-            and lift_ratio + 1e-12 >= goals["subject_lift_retention"]
+            and lift_ratio + 1e-12
+            >= float(goals["subject_lift_retention"])
         )
     )
     formal_floor_passed = not floor_issues
     return {
-        "schema": "starun.stage7-subject-brightness-selection.v1",
+        "schema": "starun.stage7-subject-brightness-selection.v2",
         "status": (
             "ok"
             if formal_floor_passed
             else "rejected"
         ),
         "available": p50_ratio is not None,
+        "contract_profile": normalized_profile,
+        "subject_kind": "stellar" if star_subject_contract else "diffuse",
         "formal_floor_passed": formal_floor_passed,
         "reason_code": (
             "stage7_subject_brightness_floor_passed"
@@ -407,6 +438,7 @@ def subject_brightness_selection(
         "issues": floor_issues,
         "preview_reliability": {
             "subject_lift_reliable": lift_reliable,
+            "subject_lift_applicable": lift_applicable,
             "subject_lift_min": 0.02,
             "subject_lift_sigma_min": 3.0,
             "subject_lift": preview_lift,

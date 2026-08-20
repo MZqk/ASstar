@@ -63,6 +63,7 @@ BUILTIN_CATALOG: List[Dict[str, Any]] = [
         "dec_deg": 40.7717,
         "size_arcmin": [10.7, 10.7],
         "features": ["dense_stars", "bright_stars"],
+        "context_labels": ["large_nebulosity", "emission_red"],
         "default_policy": "open_cluster_color_preserve",
     },
     {
@@ -726,6 +727,27 @@ def build_target_profile(
 
     policy_name = TYPE_TO_POLICY.get(target_type, DEFAULT_POLICY_NAME)
     secondary_labels, secondary_evidence = _secondary_context(features, flags)
+    if match and not identity_conflict and target_name:
+        matched_item = match[0]
+        same_resolved_target = _norm(str(matched_item.get("name") or "")) == _norm(
+            str(target_name)
+        )
+        if same_resolved_target:
+            for label in matched_item.get("context_labels", []) or []:
+                clean_label = str(label).strip()
+                if clean_label not in SECONDARY_CONTEXT_LABELS:
+                    continue
+                if clean_label not in secondary_labels:
+                    secondary_labels.append(clean_label)
+                secondary_evidence.setdefault(
+                    clean_label,
+                    {
+                        "role": _SECONDARY_LABEL_ROLES[clean_label],
+                        "score": round(float(target_confidence), 4),
+                        "source": "catalog_context",
+                        "target": str(matched_item.get("name") or ""),
+                    },
+                )
     profile = {
         "target_name_guess": target_name,
         "target_confidence": round(float(target_confidence), 4),

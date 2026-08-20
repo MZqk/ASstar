@@ -952,6 +952,23 @@ class Stage7SubjectBrightnessSelectionTests(unittest.TestCase):
         self.assertIn("subject_p50_retention_below_floor", report["issues"])
         self.assertIn("subject_lift_retention_below_floor", report["issues"])
 
+    def test_star_subject_contract_does_not_require_diffuse_lift(self) -> None:
+        preview = self._report(0.10, 0.02, 0.005)
+        report = stretch_metrics.subject_brightness_selection(
+            self._report(0.025, 0.02, 0.005),
+            preview,
+            profile_name="star_colour_preserve",
+        )
+
+        self.assertTrue(report["formal_floor_passed"], report)
+        self.assertEqual(report["subject_kind"], "stellar")
+        self.assertEqual(report["contract_profile"], "star_colour_preserve")
+        self.assertFalse(
+            report["preview_reliability"]["subject_lift_applicable"]
+        )
+        self.assertIsNone(report["retention"]["subject_lift"])
+        self.assertEqual(report["floors"]["subject_p50_retention"], 0.20)
+
     def test_unreliable_preview_lift_does_not_participate(self) -> None:
         preview = self._report(0.039, 0.02, 0.005)
         candidate = self._report(0.025, 0.02, 0.005)
