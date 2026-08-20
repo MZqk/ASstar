@@ -195,6 +195,31 @@ class Stage2NativeCropDetectorTests(unittest.TestCase):
         self.assertFalse(result.accepted, result.as_report())
         self.assertIsNone(result.rect)
 
+    def test_single_noisy_edge_band_lacks_corner_wedge_geometry(self) -> None:
+        rng = np.random.default_rng(20260820)
+        height, width = 432, 576
+        image = np.clip(
+            0.02 + rng.normal(0.0, 0.001, (height, width, 3)),
+            0.0,
+            1.0,
+        ).astype(np.float32)
+        image[:72] = np.clip(
+            image[:72]
+            + rng.normal(0.0, 0.006, image[:72].shape),
+            0.0,
+            1.0,
+        )
+
+        result = detect_field_rotation_crop(image)
+
+        self.assertFalse(result.accepted, result.as_report())
+        self.assertIsNone(result.rect)
+        self.assertEqual(
+            result.reason,
+            "edge_connected_anomaly_lacks_corner_wedge_geometry",
+        )
+        self.assertLess(result.evidence["corner_hit_count"], 3)
+
     def test_interior_noise_does_not_authorize_boundary_crop(self) -> None:
         rng = np.random.default_rng(20260813)
         image = np.clip(

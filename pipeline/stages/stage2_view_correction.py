@@ -14,6 +14,133 @@ from stage2_crop_detector import (
 from sirilpy.exceptions import CommandError, SirilError
 
 
+_STAGE2_KNOWN_NATIVE_FRAMES = {
+    "seestar s30 pro": {(2160, 3840)},
+}
+
+
+def _stage2_full_frame_context(pipeline, initial_shape: dict) -> dict:
+    """Audit whether exact device geometry and WCS support full-frame use."""
+
+    report = {
+        "status": "unavailable",
+        "known_device": None,
+        "native_frame_match": False,
+        "wcs_valid": False,
+        "advisory_authorized": False,
+        "metadata_source": None,
+    }
+    reader = getattr(pipeline, "_read_fits_header_metadata", None)
+    if not callable(reader):
+        report["reason"] = "metadata_reader_unavailable"
+        return report
+    try:
+        metadata = reader(
+            "stage1_prepared",
+            "working",
+            getattr(pipeline, "source_file", None),
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        report["reason"] = f"metadata_read_failed:{error}"
+        return report
+    if not isinstance(metadata, dict) or not metadata:
+        report["reason"] = "metadata_unavailable"
+        return report
+    report["metadata_source"] = metadata.get("_header_source")
+
+    identity = " ".join(
+        str(metadata.get(key) or "").strip().lower()
+        for key in (
+            "TELESCOP",
+            "TELESCOPE",
+            "INSTRUME",
+            "INSTRUMENT",
+            "CAMERA",
+            "CREATOR",
+        )
+    )
+    known_device = next(
+        (
+            name
+            for name in _STAGE2_KNOWN_NATIVE_FRAMES
+            if name in identity
+        ),
+        None,
+    )
+    report["known_device"] = known_device
+    width = int(initial_shape.get("width", 0) or 0)
+    height = int(initial_shape.get("height", 0) or 0)
+    native_frames = _STAGE2_KNOWN_NATIVE_FRAMES.get(known_device or "", set())
+    report["native_frame_match"] = bool(
+        (width, height) in native_frames or (height, width) in native_frames
+    )
+
+    def finite_number(key: str) -> Optional[float]:
+        try:
+            value = float(metadata.get(key))
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    header_width = finite_number("NAXIS1")
+    header_height = finite_number("NAXIS2")
+    dimensions_match = bool(
+        header_width is not None
+        and header_height is not None
+        and int(round(header_width)) == width
+        and int(round(header_height)) == height
+    )
+    center_valid = bool(
+        finite_number("CRVAL1") is not None
+        and finite_number("CRVAL2") is not None
+    )
+    cdelt1 = finite_number("CDELT1")
+    cdelt2 = finite_number("CDELT2")
+    if cdelt1 is not None and cdelt2 is not None:
+        scale_valid = bool(
+            1e-7 <= abs(cdelt1) <= 0.1
+            and 1e-7 <= abs(cdelt2) <= 0.1
+        )
+    else:
+        cd_values = [
+            finite_number(key)
+            for key in ("CD1_1", "CD1_2", "CD2_1", "CD2_2")
+        ]
+        scale_valid = bool(
+            all(value is not None for value in cd_values)
+            and 1e-7
+            <= math.hypot(float(cd_values[0]), float(cd_values[2]))
+            <= 0.1
+            and 1e-7
+            <= math.hypot(float(cd_values[1]), float(cd_values[3]))
+            <= 0.1
+        )
+    report.update(
+        {
+            "header_dimensions_match": dimensions_match,
+            "wcs_center_valid": center_valid,
+            "wcs_scale_valid": scale_valid,
+            "wcs_valid": bool(dimensions_match and center_valid and scale_valid),
+        }
+    )
+    report["advisory_authorized"] = bool(
+        known_device
+        and report["native_frame_match"]
+        and report["wcs_valid"]
+    )
+    report["status"] = (
+        "trusted_full_frame"
+        if report["advisory_authorized"]
+        else "insufficient_evidence"
+    )
+    report["reason"] = (
+        "known_native_frame_with_valid_wcs"
+        if report["advisory_authorized"]
+        else "full_frame_evidence_incomplete"
+    )
+    return report
+
+
 def _line_edge_scores(gray: np.ndarray, rgb: np.ndarray, *, axis: int, black_threshold: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     if axis == 0:
         values = gray
@@ -760,6 +887,7 @@ def run_stage2_view_correction(pipeline) -> None:
         "total_crop": {"left": 0, "top": 0, "right": 0, "bottom": 0},
         "crops": [],
         "crop_limit_hits": [],
+        "advisories": [],
         "requires_review": False,
         "target_edge_black_ratio": float(getattr(pipeline.cfg, "stage2_edge_black_target", 0.03)),
         "center_protection": _stage2_center_protection(
@@ -767,6 +895,10 @@ def run_stage2_view_correction(pipeline) -> None:
             float(getattr(pipeline.cfg, "stage2_center_protect_area_ratio", 0.70)),
         ),
     }
+    crop_report["full_frame_context"] = _stage2_full_frame_context(
+        pipeline,
+        initial_shape,
+    )
     pipeline.stage2_crop_report = crop_report
 
     if str(getattr(pipeline.cfg, "stage2_processing_mode", "auto")) == "preserve":
@@ -943,20 +1075,42 @@ def run_stage2_view_correction(pipeline) -> None:
                 == "full_frame_is_valid"
             )
             if field_rect is not None and native_full_frame_valid:
+                full_frame_advisory = bool(
+                    (crop_report.get("full_frame_context") or {}).get(
+                        "advisory_authorized"
+                    )
+                )
                 conflict = {
                     "reason": "native_field_rotation",
-                    "reason_code": "crop_detector_conflict",
+                    "reason_code": (
+                        "field_rotation_full_frame_advisory"
+                        if full_frame_advisory
+                        else "crop_detector_conflict"
+                    ),
                     "requested": tuple(int(value) for value in field_rect),
                     "applied": None,
                     "message": (
                         "native contour accepted the full frame while the "
                         "field-rotation detector requested a crop; preserve "
-                        "the immutable full frame for review"
+                        "the immutable full frame"
+                        + (
+                            " as an advisory because native device geometry "
+                            "and WCS corroborate full-frame coverage"
+                            if full_frame_advisory
+                            else " for review"
+                        )
                     ),
                 }
-                crop_report.setdefault("crop_limit_hits", []).append(conflict)
+                target_list = (
+                    "advisories" if full_frame_advisory else "crop_limit_hits"
+                )
+                crop_report.setdefault(target_list, []).append(conflict)
                 crop_report["field_rotation"].update(
-                    application_status="rejected_detector_conflict",
+                    application_status=(
+                        "rejected_full_frame_advisory"
+                        if full_frame_advisory
+                        else "rejected_detector_conflict"
+                    ),
                     applied_crop=None,
                 )
                 messages.append(conflict["message"])
@@ -1225,6 +1379,12 @@ def run_stage2_view_correction(pipeline) -> None:
         and native_full_frame_valid
         and field_full_frame_valid
     )
+    preserve_full_frame_advisory = bool(
+        not primary_crop_applied
+        and native_full_frame_valid
+        and str(field_report.get("application_status") or "")
+        == "rejected_full_frame_advisory"
+    )
     primary_detector_conflict = bool(
         not primary_crop_applied
         and any(
@@ -1237,6 +1397,8 @@ def run_stage2_view_correction(pipeline) -> None:
         "decision": (
             "preserve_full_frame"
             if preserve_full_frame_consensus
+            else "preserve_full_frame_advisory"
+            if preserve_full_frame_advisory
             else "crop_detector_conflict"
             if primary_detector_conflict
             else "fallback_permitted"
@@ -1244,7 +1406,9 @@ def run_stage2_view_correction(pipeline) -> None:
         "native_contour_reason": str(native_report.get("reason") or "unavailable"),
         "field_rotation_reason": str(field_report.get("reason") or "unavailable"),
         "legacy_fallback_permitted": bool(
-            not preserve_full_frame_consensus and not primary_detector_conflict
+            not preserve_full_frame_consensus
+            and not preserve_full_frame_advisory
+            and not primary_detector_conflict
         ),
     }
     if preserve_full_frame_consensus:
@@ -1253,6 +1417,13 @@ def run_stage2_view_correction(pipeline) -> None:
         messages.append(
             "primary crop detectors agree that the full frame is valid; "
             "legacy edge crop suppressed"
+        )
+    elif preserve_full_frame_advisory:
+        crop_report["mode"] = "native_no_crop"
+        crop_report["reason_code"] = "field_rotation_full_frame_advisory"
+        messages.append(
+            "field-rotation candidate downgraded to advisory by known native "
+            "frame geometry and valid WCS; full frame retained"
         )
     elif primary_detector_conflict:
         crop_report["requires_review"] = True
@@ -1274,6 +1445,7 @@ def run_stage2_view_correction(pipeline) -> None:
     if (
         not primary_crop_applied
         and not preserve_full_frame_consensus
+        and not preserve_full_frame_advisory
         and not primary_detector_conflict
     ):
         pipeline.log.info("轮廓检测未裁切，自动识别黑边/叠加边缘并裁切...")

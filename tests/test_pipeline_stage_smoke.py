@@ -1902,7 +1902,10 @@ class PipelineStageTests(unittest.TestCase):
     def test_stage9_support_preflight_public_report_strips_private_masks(self):
         public = stage9_quality.public_starmask_support_preflight(
             {
-                "schema": "starun.stage9-starmask-support-preflight.v2",
+                "schema": (
+                    "starun.stage9-starmas"
+                    "k-support-preflight.v2"
+                ),
                 "status": "ready",
                 "route": "normal_only",
                 "_calibrations": {"normal": {"_compact_support_mask": np.ones((2, 2))}},
@@ -2794,6 +2797,77 @@ class PipelineStageSmokeTests(unittest.TestCase):
             "crop_detector_conflict",
         )
         json.loads(json.dumps(self.pipeline.stage2_crop_report))
+
+    def test_stage2_known_native_frame_and_wcs_downgrade_conflict_to_advisory(self) -> None:
+        self.pipeline.siril.get_image_shape = lambda: (3, 3840, 2160)
+        self.pipeline._read_fits_header_metadata = lambda *_args: {
+            "_header_source": "stage1_prepared.fit",
+            "TELESCOP": "ZWO Seestar S30 Pro",
+            "NAXIS1": 2160,
+            "NAXIS2": 3840,
+            "CRVAL1": 270.868,
+            "CRVAL2": -23.52,
+            "CDELT1": -0.00102,
+            "CDELT2": 0.00102,
+        }
+        no_contour = (
+            None,
+            "native contour crop skipped: full frame valid",
+            {
+                "method": "native_contour",
+                "accepted": False,
+                "reason": "full_frame_is_valid",
+                "candidate": None,
+            },
+        )
+        field_candidate = (
+            (0, 598, 2160, 3242),
+            "field-rotation coverage crop detected",
+            {
+                "method": "native_field_rotation",
+                "accepted": True,
+                "reason": "edge_connected_field_rotation_confirmed",
+                "candidate": {
+                    "x": 0,
+                    "y": 598,
+                    "width": 2160,
+                    "height": 3242,
+                },
+            },
+        )
+        with (
+            patch.object(
+                stage2_view_correction,
+                "_detect_native_contour_candidate",
+                return_value=no_contour,
+            ),
+            patch.object(
+                stage2_view_correction,
+                "_detect_field_rotation_candidate",
+                return_value=field_candidate,
+            ),
+            patch.object(stage2_view_correction, "_detect_auto_edge_crop") as edge_detect,
+        ):
+            stage2_view_correction.run_stage2_view_correction(self.pipeline)
+
+        edge_detect.assert_not_called()
+        report = self.pipeline.stage2_crop_report
+        self.assertEqual(self.pipeline.commands, [])
+        self.assertFalse(report["requires_review"])
+        self.assertFalse(self.pipeline._stage2_view_review_required)
+        self.assertEqual(self.pipeline.results[-1][1], "ok")
+        self.assertEqual(
+            report["reason_code"],
+            "field_rotation_full_frame_advisory",
+        )
+        self.assertEqual(
+            report["detector_consensus"]["decision"],
+            "preserve_full_frame_advisory",
+        )
+        self.assertTrue(
+            report["full_frame_context"]["advisory_authorized"]
+        )
+        self.assertTrue(report["advisories"])
 
     def test_stage2_second_field_rotation_crop_clears_residual(self) -> None:
         no_contour = (

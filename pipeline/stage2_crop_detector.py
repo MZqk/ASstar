@@ -454,6 +454,58 @@ def detect_field_rotation_crop(
             evidence=evidence,
         )
 
+    corner_rows = max(2, rows // 8)
+    corner_columns = max(2, columns // 8)
+    corner_hits = {
+        "top_left": bool(
+            np.any(edge_connected[:corner_rows, :corner_columns])
+        ),
+        "top_right": bool(
+            np.any(edge_connected[:corner_rows, columns - corner_columns :])
+        ),
+        "bottom_left": bool(
+            np.any(edge_connected[rows - corner_rows :, :corner_columns])
+        ),
+        "bottom_right": bool(
+            np.any(
+                edge_connected[
+                    rows - corner_rows :,
+                    columns - corner_columns :,
+                ]
+            )
+        ),
+    }
+    boundary_side_hits = {
+        "top": bool(np.any(edge_connected[0, :])),
+        "bottom": bool(np.any(edge_connected[-1, :])),
+        "left": bool(np.any(edge_connected[:, 0])),
+        "right": bool(np.any(edge_connected[:, -1])),
+    }
+    corner_hit_count = sum(corner_hits.values())
+    boundary_side_count = sum(boundary_side_hits.values())
+    wedge_geometry_confirmed = bool(
+        corner_hit_count >= 3 and boundary_side_count >= 3
+    )
+    evidence.update(
+        {
+            "corner_window_rows": corner_rows,
+            "corner_window_columns": corner_columns,
+            "corner_hits": corner_hits,
+            "corner_hit_count": corner_hit_count,
+            "boundary_side_hits": boundary_side_hits,
+            "boundary_side_count": boundary_side_count,
+            "wedge_geometry_confirmed": wedge_geometry_confirmed,
+        }
+    )
+    if not wedge_geometry_confirmed:
+        return NativeCropDetection(
+            None,
+            False,
+            "edge_connected_anomaly_lacks_corner_wedge_geometry",
+            method="native_field_rotation",
+            evidence=evidence,
+        )
+
     tile_rect = largest_rectangle_in_mask(~edge_connected)
     if tile_rect is None:
         return NativeCropDetection(
@@ -529,7 +581,7 @@ def detect_native_contour_crop(
     if lir_module is None:
         try:
             import largestinteriorrectangle as lir_module  # type: ignore[no-redef]
-        except (ImportError, OSError):
+        except (ImportError, OSError, RuntimeError):
             lir_module = None
 
     gray = _gray_image(rgb)
