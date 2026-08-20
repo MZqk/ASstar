@@ -338,8 +338,15 @@ class TargetRuntimeMixin:
         profile["primary_target"] = primary
         profile["target_type"] = primary["type"]
         profile.setdefault("routing_contract", {})["primary_frozen"] = True
+        frozen_composite_targets = copy.deepcopy(
+            profile.get("composite_targets") or []
+        )
+        profile["routing_contract"]["composite_target_context_frozen"] = bool(
+            frozen_composite_targets
+        )
         self.target_profile = profile
         self._frozen_primary_target = copy.deepcopy(primary)
+        self._frozen_composite_targets = frozen_composite_targets
         self._target_primary_frozen = True
         self.log.info(
             "[TargetProfile] primary frozen "
@@ -386,6 +393,29 @@ class TargetRuntimeMixin:
                 label: merged_evidence.get(label, {})
                 for label in merged_secondary
             }
+            composite_targets = []
+            seen_composite = set()
+            for item in (
+                *list(
+                    getattr(self, "_frozen_composite_targets", None)
+                    or current.get("composite_targets")
+                    or []
+                ),
+                *list(profile.get("composite_targets") or []),
+            ):
+                if not isinstance(item, dict):
+                    continue
+                key = (
+                    str(item.get("name") or "").strip().lower(),
+                    str(item.get("type") or "").strip().lower(),
+                )
+                if not key[0] or key in seen_composite:
+                    continue
+                seen_composite.add(key)
+                composite_targets.append(copy.deepcopy(item))
+            profile["composite_targets"] = composite_targets
+            if composite_targets:
+                profile["identity_status"] = "composite_resolved"
             profile["target_name_guess"] = frozen.get("name")
             profile["target_confidence"] = frozen.get("confidence", 0.0)
             profile["target_type"] = frozen.get(
@@ -399,6 +429,9 @@ class TargetRuntimeMixin:
                 or "generic_low_snr_safe"
             )
             profile.setdefault("routing_contract", {})["primary_frozen"] = True
+            profile["routing_contract"][
+                "composite_target_context_frozen"
+            ] = bool(composite_targets)
             if observed_primary.get("type") != frozen.get("type"):
                 profile["observed_primary_target"] = observed_primary
                 profile.setdefault("diagnostics", []).append(
@@ -433,6 +466,38 @@ class TargetRuntimeMixin:
             self.log.warn(
                 f"[Policy] loader returned {loaded_name}; forcing runtime policy={desired_name}"
             )
+        policy = copy.deepcopy(policy)
+        secondary_labels = {
+            str(item).strip()
+            for item in (profile.get("secondary_labels") or [])
+            if str(item).strip()
+        }
+        applied_contexts = []
+        if secondary_labels & {"large_nebulosity", "faint_outer_cloud"}:
+            stage3_policy = policy.setdefault("stage3_background", {})
+            stage3_policy["protect_nebulosity"] = True
+            stage3_policy["reject_samples_on_nebula"] = True
+            applied_contexts.append("diffuse_background_protection")
+        if "emission_red" in secondary_labels:
+            policy.setdefault("stage4_color", {})[
+                "preserve_emission_context"
+            ] = True
+            applied_contexts.append("emission_color_context")
+        if (
+            str(profile.get("target_type") or "").strip().lower()
+            in {"open_cluster", "globular_cluster"}
+            and secondary_labels
+            & {"large_nebulosity", "faint_outer_cloud", "emission_red"}
+        ):
+            policy.setdefault("stage7_stretch", {})[
+                "star_preserve_with_nebulosity"
+            ] = True
+            applied_contexts.append("stellar_primary_with_nebulosity")
+        policy["secondary_context"] = {
+            "labels": sorted(secondary_labels),
+            "applied_stage_contracts": applied_contexts,
+            "primary_policy_unchanged": True,
+        }
         self.target_profile = profile
         self.pipeline_policy = policy
         self.log.info(f"[Policy] runtime policy refreshed: {self._active_policy_name()} ({source})")

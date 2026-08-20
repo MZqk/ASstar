@@ -291,6 +291,43 @@ class AdaptivePipelinePhase1Tests(unittest.TestCase):
             "M42",
         )
 
+    def test_same_type_targets_inside_wcs_field_resolve_as_composite(self) -> None:
+        features = AdaptiveImageFeatures(
+            object_area_ratio=0.20,
+            bright_core_score=0.46,
+            nebulosity_area_ratio=0.32,
+            red_dominance=1.12,
+        )
+
+        profile = build_target_profile(
+            features,
+            metadata={
+                "CRVAL1": 270.868376824048,
+                "CRVAL2": -23.52,
+                "CDELT1": -0.001022709,
+                "CDELT2": 0.001022709,
+                "NAXIS1": 2146,
+                "NAXIS2": 3174,
+            },
+            context_text="/tasks/M8/source.fit",
+        )
+
+        self.assertEqual(profile["identity_status"], "composite_resolved")
+        self.assertFalse(profile["target_identity_conflict"])
+        self.assertFalse(profile["requires_review"])
+        self.assertEqual(profile["target_name_guess"], "Lagoon Nebula")
+        self.assertEqual(
+            profile["target_type"],
+            "bright_emission_reflection_nebula",
+        )
+        self.assertEqual(
+            {item["name"] for item in profile["composite_targets"]},
+            {"Lagoon Nebula", "Trifid Nebula"},
+        )
+        self.assertFalse(
+            profile["routing_contract"]["secondary_labels_can_route"]
+        )
+
     def test_target_profiler_prefers_explicit_rosette_name_over_auto_hint(self) -> None:
         features = AdaptiveImageFeatures(
             bg_median=0.0020,

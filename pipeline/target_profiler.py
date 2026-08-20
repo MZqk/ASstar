@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -201,6 +202,7 @@ def normalize_target_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
                 "policy_source": "primary_target.type",
                 "star_separation_source": "primary_target.type",
                 "secondary_labels_can_route": False,
+                "secondary_labels_can_shape_stage_contracts": True,
             },
         }
     )
@@ -333,14 +335,68 @@ def _metadata_coordinates(metadata: Optional[Dict[str, Any]]) -> Tuple[Optional[
 
 
 def _angular_distance_deg(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
-    import math
-
     r1 = math.radians(ra1)
     d1 = math.radians(dec1)
     r2 = math.radians(ra2)
     d2 = math.radians(dec2)
     cos_d = math.sin(d1) * math.sin(d2) + math.cos(d1) * math.cos(d2) * math.cos(r1 - r2)
     return math.degrees(math.acos(max(-1.0, min(1.0, cos_d))))
+
+
+def _metadata_field_radius_deg(
+    metadata: Optional[Dict[str, Any]],
+) -> Optional[float]:
+    """Return the WCS half-diagonal when image dimensions and scale agree."""
+    if not metadata:
+        return None
+    try:
+        width = float(metadata.get("NAXIS1") or 0.0)
+        height = float(metadata.get("NAXIS2") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if width <= 0.0 or height <= 0.0:
+        return None
+
+    def finite_value(key: str) -> Optional[float]:
+        try:
+            value = float(metadata.get(key))
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    cdelt1 = finite_value("CDELT1")
+    cdelt2 = finite_value("CDELT2")
+    if cdelt1 is not None and cdelt2 is not None:
+        scale_x = abs(cdelt1)
+        scale_y = abs(cdelt2)
+    else:
+        cd11 = finite_value("CD1_1")
+        cd21 = finite_value("CD2_1")
+        cd12 = finite_value("CD1_2")
+        cd22 = finite_value("CD2_2")
+        if None in {cd11, cd21, cd12, cd22}:
+            return None
+        scale_x = math.hypot(float(cd11), float(cd21))
+        scale_y = math.hypot(float(cd12), float(cd22))
+    radius = 0.5 * math.hypot(width * scale_x, height * scale_y)
+    if not math.isfinite(radius) or not 0.05 <= radius <= 10.0:
+        return None
+    return radius
+
+
+def _catalog_item_field_distance_deg(
+    item: Dict[str, Any],
+    metadata: Optional[Dict[str, Any]],
+) -> Optional[float]:
+    ra_deg, dec_deg = _metadata_coordinates(metadata)
+    try:
+        item_ra = float(item.get("ra_deg"))
+        item_dec = float(item.get("dec_deg"))
+    except (TypeError, ValueError):
+        return None
+    if ra_deg is None or dec_deg is None:
+        return None
+    return _angular_distance_deg(ra_deg, dec_deg, item_ra, item_dec)
 
 
 def _catalog_coordinate_match(
@@ -437,6 +493,7 @@ def build_target_profile(
     match_distance: Optional[float] = None
     identity_status = "unresolved"
     identity_conflict = False
+    composite_targets: List[Dict[str, Any]] = []
     identity_evidence: Dict[str, Any] = {
         "name": None,
         "coordinate": None,
@@ -470,6 +527,55 @@ def build_target_profile(
             match_method = "catalog_name_coordinate_match"
             match_distance = coord_distance
             identity_status = "corroborated"
+        elif (
+            str(name_item.get("type") or "").strip().lower()
+            == str(coord_item.get("type") or "").strip().lower()
+        ):
+            field_radius = _metadata_field_radius_deg(metadata)
+            name_distance = _catalog_item_field_distance_deg(
+                name_item,
+                metadata,
+            )
+            coord_field_distance = _catalog_item_field_distance_deg(
+                coord_item,
+                metadata,
+            )
+            within_field = bool(
+                field_radius is not None
+                and name_distance is not None
+                and coord_field_distance is not None
+                and name_distance <= field_radius * 1.05
+                and coord_field_distance <= field_radius * 1.05
+            )
+            if within_field:
+                match = (name_item, max(float(name_score), float(coord_score)))
+                match_method = "catalog_name_wcs_composite_match"
+                match_distance = name_distance
+                identity_status = "composite_resolved"
+                composite_targets = [
+                    {
+                        "name": str(item.get("name") or ""),
+                        "type": str(item.get("type") or ""),
+                        "distance_deg": round(float(distance), 6),
+                    }
+                    for item, distance in (
+                        (name_item, name_distance),
+                        (coord_item, coord_field_distance),
+                    )
+                ]
+                identity_evidence["composite"] = {
+                    "status": "same_type_targets_within_wcs_field",
+                    "field_radius_deg": round(float(field_radius), 6),
+                    "targets": copy.deepcopy(composite_targets),
+                }
+            elif float(name_score) >= 0.90:
+                identity_conflict = True
+                identity_status = "conflict"
+            else:
+                match = (coord_item, coord_score)
+                match_method = "catalog_coordinate_match"
+                match_distance = coord_distance
+                identity_status = "coordinate_resolved"
         elif float(name_score) >= 0.90:
             identity_conflict = True
             identity_status = "conflict"
@@ -628,6 +734,7 @@ def build_target_profile(
         "classification_method": method,
         "identity_status": identity_status,
         "identity_evidence": identity_evidence,
+        "composite_targets": composite_targets,
         "target_identity_conflict": identity_conflict,
         "requires_review": identity_conflict,
         "visual_hypothesis": visual_hypothesis,

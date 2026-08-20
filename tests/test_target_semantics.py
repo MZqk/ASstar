@@ -111,6 +111,78 @@ class TargetSemanticsTests(unittest.TestCase):
             runtime.target_profile["secondary_labels"],
         )
         self.assertTrue(runtime.target_profile["primary_target"]["frozen"])
+        self.assertTrue(
+            runtime.pipeline_policy["stage3_background"]["protect_nebulosity"]
+        )
+        self.assertTrue(
+            runtime.pipeline_policy["stage3_background"][
+                "reject_samples_on_nebula"
+            ]
+        )
+        self.assertTrue(
+            runtime.pipeline_policy["stage4_color"][
+                "preserve_emission_context"
+            ]
+        )
+        self.assertTrue(
+            runtime.pipeline_policy["stage7_stretch"][
+                "star_preserve_with_nebulosity"
+            ]
+        )
+        self.assertTrue(
+            runtime.pipeline_policy["secondary_context"][
+                "primary_policy_unchanged"
+            ]
+        )
+
+    def test_frozen_composite_context_survives_metadata_refresh(self):
+        runtime = _Runtime()
+        initial = {
+            "target_name_guess": "Lagoon Nebula",
+            "target_type": "bright_emission_reflection_nebula",
+            "target_confidence": 0.94,
+            "classification_method": "catalog_name_wcs_composite_match",
+            "composite_targets": [
+                {
+                    "name": "Lagoon Nebula",
+                    "type": "bright_emission_reflection_nebula",
+                },
+                {
+                    "name": "Trifid Nebula",
+                    "type": "bright_emission_reflection_nebula",
+                },
+            ],
+            "secondary_labels": ["large_nebulosity", "emission_red"],
+        }
+        runtime._sync_runtime_policy_from_profile(initial, source="initial")
+        runtime._freeze_primary_target()
+
+        later = {
+            "target_name_guess": "Trifid Nebula",
+            "target_type": "bright_emission_reflection_nebula",
+            "target_confidence": 0.90,
+            "classification_method": "catalog_coordinate_match",
+            "secondary_labels": ["reflection_blue"],
+        }
+        runtime._sync_runtime_policy_from_profile(later, source="later")
+
+        self.assertEqual(
+            runtime.target_profile["identity_status"],
+            "composite_resolved",
+        )
+        self.assertEqual(
+            {item["name"] for item in runtime.target_profile["composite_targets"]},
+            {"Lagoon Nebula", "Trifid Nebula"},
+        )
+        self.assertEqual(
+            runtime.pipeline_policy["policy_name"],
+            "bright_nebula_hdr_conservative",
+        )
+        self.assertTrue(
+            runtime.target_profile["routing_contract"][
+                "composite_target_context_frozen"
+            ]
+        )
 
 
 if __name__ == "__main__":
