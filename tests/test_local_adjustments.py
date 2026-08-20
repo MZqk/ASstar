@@ -89,7 +89,43 @@ class LocalAdjustmentTests(unittest.TestCase):
             first_report["metrics"]["changed_pixel_ratio"],
             0.0,
         )
+        saturation = first_report["operations"][1]
+        self.assertEqual(saturation["requested_amount"], 0.03)
+        self.assertEqual(saturation["amount"], 0.03)
+        self.assertGreater(saturation["effective_amount_peak"], 0.0)
+        self.assertEqual(saturation["effect_status"], "effective")
+        self.assertEqual(
+            first_report["saturation_effect"]["status"],
+            "effective",
+        )
         json.dumps(first_report)
+
+    def test_saturation_no_effect_is_reported_explicitly(self) -> None:
+        image = np.full((3, 64, 64), 0.20, dtype=np.float32)
+        recipe = {
+            "schema": LOCAL_ADJUSTMENT_SCHEMA,
+            "id": "test_no_effect",
+            "operations": [
+                {
+                    "type": "saturation",
+                    "mask": "subject",
+                    "amount": 0.20,
+                    "opacity": 0.50,
+                }
+            ],
+        }
+
+        candidate, report = apply_local_adjustment_recipe(
+            image,
+            recipe,
+            masks={"subject": np.ones((64, 64), dtype=np.float32)},
+        )
+
+        np.testing.assert_array_equal(candidate, image)
+        self.assertFalse(report["accepted"])
+        self.assertIn("no_effect", report["issues"])
+        self.assertEqual(report["saturation_effect"]["status"], "no_effect")
+        self.assertEqual(report["operations"][0]["effect_status"], "no_effect")
 
     def test_nonmonotonic_curve_is_rejected(self) -> None:
         recipe = {

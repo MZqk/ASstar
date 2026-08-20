@@ -2612,10 +2612,21 @@ def apply_stage8_masked_pixel_enhancement(
     saturation_applied = bool(
         local_adjustment_report.get("accepted", False)
         and saturation_operations
+        and str(
+            (
+                local_adjustment_report.get("saturation_effect") or {}
+            ).get("status")
+            or "effective"
+        )
+        == "effective"
     )
     saturation_amounts: List[float] = []
+    saturation_effective_amounts: List[float] = []
     for operation in saturation_operations:
         opacity = _clamp_float(operation.get("opacity", 1.0), 0.0, 1.0)
+        reported_effective = operation.get("effective_amount")
+        if reported_effective is not None:
+            saturation_effective_amounts.append(abs(float(reported_effective)))
         if str(operation.get("type")) == "hue_selective_saturation":
             bands = operation.get("bands") or []
             saturation_amounts.extend(
@@ -2625,9 +2636,22 @@ def apply_stage8_masked_pixel_enhancement(
             )
         else:
             saturation_amounts.append(
-                abs(float(operation.get("amount", 0.0) or 0.0)) * opacity
+                abs(
+                    float(
+                        operation.get(
+                            "effective_amount_peak",
+                            float(operation.get("amount", 0.0) or 0.0)
+                            * opacity,
+                        )
+                        or 0.0
+                    )
+                )
             )
     applied_saturation_amount = max(saturation_amounts, default=0.0)
+    saturation_effect_status = str(
+        (local_adjustment_report.get("saturation_effect") or {}).get("status")
+        or ("effective" if saturation_applied else "not_requested")
+    )
     diagnostics = {
         "mask_coverage": coverage,
         "masked_metrics": pipeline._stage8_masked_metrics(restored, masks),
@@ -2637,11 +2661,19 @@ def apply_stage8_masked_pixel_enhancement(
             "requested": saturation,
             "applied": saturation_applied,
             "applied_amount": applied_saturation_amount,
+            "effective_amount_mean": max(
+                saturation_effective_amounts,
+                default=0.0,
+            ),
+            "effect_status": saturation_effect_status,
             "passes": 1 if saturation_applied else 0,
             "position": "after_structure_and_plugin_blend",
             "method": (
                 "local_adjustment_recipe"
-                if local_adjustment_report.get("accepted", False)
+                if saturation_applied
+                else "local_adjustment_recipe_no_effect"
+                if saturation_operations
+                and local_adjustment_report.get("accepted", False)
                 else "none"
             ),
         },

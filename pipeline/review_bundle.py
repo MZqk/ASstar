@@ -185,6 +185,16 @@ def create_image_review_bundle(
     display_contract: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Write a review bundle from two already-loaded pixel arrays."""
+    display_contract_diagnostic = (
+        dict(display_contract) if isinstance(display_contract, dict) else None
+    )
+    active_display_contract = (
+        display_contract_diagnostic
+        if display_rendition.validate_review_contract(
+            display_contract_diagnostic
+        )
+        else None
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     before_rgb, after_rgb = _aligned_previews(before_data, after_data)
     difference = after_rgb - before_rgb
@@ -211,7 +221,7 @@ def create_image_review_bundle(
     write_png_rgb16(paths["before_preview"], _safe_preview(before_rgb))
     write_png_rgb16(
         paths["after_preview"],
-        _safe_preview(after_rgb, display_contract),
+        _safe_preview(after_rgb, active_display_contract),
     )
     write_png_rgb16(paths["absolute_difference"], absolute_preview)
     write_png_rgb16(paths["signed_luminance_difference"], signed)
@@ -220,7 +230,7 @@ def create_image_review_bundle(
         _compact_review_canvas(
             before_rgb,
             after_rgb,
-            display_contract=display_contract,
+            display_contract=active_display_contract,
         ),
     )
 
@@ -251,8 +261,21 @@ def create_image_review_bundle(
         },
         "context": dict(context or {}),
         "display_rendition_contract": (
-            dict(display_contract)
-            if isinstance(display_contract, dict)
+            dict(active_display_contract)
+            if isinstance(active_display_contract, dict)
+            else None
+        ),
+        "display_rendition_contract_status": (
+            "ready"
+            if active_display_contract is not None
+            else "unavailable"
+            if display_contract_diagnostic is not None
+            else "not_requested"
+        ),
+        "display_rendition_contract_diagnostic": (
+            display_contract_diagnostic
+            if display_contract_diagnostic is not None
+            and active_display_contract is None
             else None
         ),
         "candidates": _candidate_records(
@@ -466,6 +489,16 @@ def create_stage_review_bundle(
             display_contract=(
                 dict(getattr(pipeline, "_display_rendition_contract", {}) or {})
                 if bool(getattr(pipeline, "_review_display_route", False))
+                and display_rendition.validate_review_contract(
+                    dict(
+                        getattr(
+                            pipeline,
+                            "_display_rendition_contract",
+                            {},
+                        )
+                        or {}
+                    )
+                )
                 else None
             ),
         )

@@ -120,7 +120,16 @@ def _run_with_stars_review_stretch(
                     "linked Review display contract unavailable: "
                     f"{pipeline._short_text(error, 160)}"
                 )
-            pipeline._display_rendition_contract = display_contract
+            display_contract_valid = (
+                display_rendition.validate_review_contract(display_contract)
+            )
+            if display_contract_valid:
+                pipeline._display_rendition_contract = display_contract
+            else:
+                pipeline._display_rendition_contract = {}
+                messages.append(
+                    "invalid Review display contract retained as diagnostic only"
+                )
             pipeline._write_stage_json(
                 "display_rendition_contract.json",
                 display_contract,
@@ -204,6 +213,9 @@ def _run_with_stars_review_stretch(
             ),
             "background_color_review_gate": background_color_review_gate,
             "display_rendition_contract": display_contract,
+            "display_rendition_contract_active": bool(
+                display_rendition.validate_review_contract(display_contract)
+            ),
         }
     pipeline._write_stage_json(
         "stage7_stretch_quality.json",
@@ -412,12 +424,16 @@ def run_stage7_stretching(pipeline) -> None:
         return
 
     if not stretched and failure_action == "auto_fallback":
+        target_bypass_review = bool(
+            separation_state == StarSeparationState.TARGET_BYPASS.value
+        )
         review_input = (
             "stage6_passthrough"
-            if separation_state == StarSeparationState.TARGET_BYPASS.value
+            if target_bypass_review
             else "stage6_input"
         )
-        pipeline._star_separation_state = StarSeparationState.REJECTED.value
+        if not target_bypass_review:
+            pipeline._star_separation_state = StarSeparationState.REJECTED.value
         pipeline._stage7_starless_skipped = True
         pipeline._stage6_passthrough_source = review_input
         pipeline._stage6_pair_handoff = None
@@ -433,7 +449,11 @@ def run_stage7_stretching(pipeline) -> None:
                 "source_stem": "stage7_review_with_stars",
                 "passthrough": True,
                 "restricted_downstream": True,
-                "reason_code": "stage7_stretch_not_accepted",
+                "reason_code": (
+                    "stage7_stretch_not_accepted_target_bypass"
+                    if target_bypass_review
+                    else "stage7_stretch_not_accepted"
+                ),
                 "reason_text": (
                     "all Stage7 stretch candidates failed formal quality gates"
                 ),
@@ -443,9 +463,17 @@ def run_stage7_stretching(pipeline) -> None:
         pipeline._stage8_handoff = handoff
         _run_with_stars_review_stretch(
             pipeline,
-            StarSeparationState.REJECTED.value,
+            (
+                StarSeparationState.TARGET_BYPASS.value
+                if target_bypass_review
+                else StarSeparationState.REJECTED.value
+            ),
             source_stem=review_input,
-            reason_code="stage7_stretch_not_accepted",
+            reason_code=(
+                "stage7_stretch_not_accepted_target_bypass"
+                if target_bypass_review
+                else "stage7_stretch_not_accepted"
+            ),
         )
         return
 

@@ -51,9 +51,38 @@ from review_bundle import (  # noqa: E402
     create_image_review_bundle,
     prune_review_bundles,
 )
+import display_rendition  # noqa: E402
 
 
 class ReviewBundleTests(unittest.TestCase):
+    def test_invalid_display_contract_is_diagnostic_only(self) -> None:
+        before = np.full((3, 24, 32), 0.02, dtype=np.float32)
+        after = np.full((3, 24, 32), 0.04, dtype=np.float32)
+        unavailable = display_rendition.unavailable_contract(
+            reason="stage7_review",
+            error="visibility evidence unavailable",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload = create_image_review_bundle(
+                before,
+                after,
+                output_dir=Path(tmpdir) / "review",
+                stage_key="stage7_stretching",
+                source={"before_stem": "before", "after_stem": "after"},
+                display_contract=unavailable,
+            )
+
+        self.assertEqual(payload["status"], "ready")
+        self.assertIsNone(payload["display_rendition_contract"])
+        self.assertEqual(
+            payload["display_rendition_contract_status"],
+            "unavailable",
+        )
+        self.assertEqual(
+            payload["display_rendition_contract_diagnostic"]["status"],
+            "unavailable",
+        )
     def test_bundle_writes_previews_diffs_metrics_and_explicit_review_state(self) -> None:
         before = np.zeros((3, 24, 32), dtype=np.float32)
         before[:, 6:18, 8:24] = 0.10

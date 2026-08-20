@@ -1279,6 +1279,40 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
                 self.assertIn("saturation", operation_types)
                 self.assertNotIn("hue_selective_saturation", operation_types)
 
+    def test_stage8_generic_saturation_reports_measured_amount(self):
+        processor = pipeline_module.StarunPostProcessor()
+        processor._stage8_handoff = {"processing_policy": "full"}
+        processor._channel_semantics = "broadband_rgb_osc"
+        processor._active_target_type = lambda: "generic_low_snr_safe"
+        processor._stage7_halo_residue_score = lambda: 0.10
+        processor._stage7_effective_halo_threshold = lambda: 0.35
+        height, width = 120, 160
+        yy, xx = np.indices((height, width))
+        signal = np.exp(
+            -(((xx - 80) / 38.0) ** 2 + ((yy - 60) / 28.0) ** 2)
+        ).astype(np.float32)
+        image = np.full((3, height, width), 0.035, dtype=np.float32)
+        image += np.asarray([0.28, 0.15, 0.10], dtype=np.float32)[
+            :, None, None
+        ] * signal[None]
+
+        _enhanced, diagnostics, _messages = (
+            processor._apply_stage8_masked_pixel_enhancement(
+                image,
+                {"saturation": 0.10, "unsharp_amount": 0.0},
+                label="test",
+            )
+        )
+
+        saturation_execution = diagnostics["saturation_execution"]
+        self.assertTrue(saturation_execution["applied"])
+        self.assertEqual(saturation_execution["effect_status"], "effective")
+        self.assertGreater(saturation_execution["applied_amount"], 0.0)
+        self.assertGreater(
+            saturation_execution["effective_amount_mean"],
+            0.0,
+        )
+
     def test_stage8_physical_color_anchor_disables_blue_channel_rebalance(self):
         processor = pipeline_module.StarunPostProcessor()
         processor._stage8_handoff = {"processing_policy": "full"}

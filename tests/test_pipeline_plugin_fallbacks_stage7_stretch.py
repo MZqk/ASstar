@@ -1507,6 +1507,36 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
         self.assertTrue(processor._stage7_stretch_accepted)
         self.assertEqual(processor._stage7_stretch_output, "stage7_stretched")
 
+    def test_stage7_target_bypass_rejection_preserves_star_provenance(self):
+        processor = self._new_processor()
+        processor._star_separation_state = (
+            pipeline_module.StarSeparationState.TARGET_BYPASS.value
+        )
+        processor._star_preserve_target_bypass = True
+        processor._stage6_passthrough_source = "stage6_passthrough"
+        processor._run_stage7_stretching_candidates = lambda: (
+            False,
+            True,
+            ["all target-bypass stretch candidates rejected"],
+            "",
+        )
+
+        pipeline_module.run_stage7_stretching(processor)
+
+        self.assertEqual(
+            processor._star_separation_state,
+            pipeline_module.StarSeparationState.TARGET_BYPASS.value,
+        )
+        self.assertFalse(processor._stage7_stretch_accepted)
+        self.assertEqual(
+            processor._stage8_handoff["reason_code"],
+            "stage7_stretch_not_accepted_target_bypass",
+        )
+        self.assertEqual(
+            processor.result_metadata[-1]["reason_code"],
+            "stage7_stretch_not_accepted_target_bypass",
+        )
+
     def test_stage7_legacy_hdr_eligibility_is_forced_to_review_only(self):
         processor = self._new_processor()
         processor._stage6_galaxy_roi_diagnostics = {

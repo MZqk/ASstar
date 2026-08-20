@@ -377,6 +377,8 @@ def apply_local_adjustment_recipe(
         )
         effective_mask = mask * opacity
         used_union = np.maximum(used_union, effective_mask)
+        requested_amount: float | None = None
+        bounded_amount: float | None = None
         if kind == "curve":
             result = apply_monotonic_curve(
                 result,
@@ -385,13 +387,14 @@ def apply_local_adjustment_recipe(
                 opacity=opacity,
             )
         elif kind == "saturation":
-            amount = max(
+            requested_amount = float(operation.get("amount", 0.0))
+            bounded_amount = max(
                 -0.50,
-                min(0.50, float(operation.get("amount", 0.0))),
+                min(0.50, requested_amount),
             )
             luma = np.tensordot(_LUMA, result, axes=(0, 0))
             adjusted = luma[None] + (result - luma[None]) * (
-                1.0 + amount
+                1.0 + bounded_amount
             )
             result = (
                 result * (1.0 - effective_mask[None])
@@ -428,12 +431,42 @@ def apply_local_adjustment_recipe(
             "type": kind,
             "mask": mask_name,
             "opacity": opacity,
+            "mask_coverage": float(np.mean(mask > 0.05)),
+            "effective_mask_mean": float(np.mean(effective_mask)),
+            "effective_mask_peak": float(np.max(effective_mask)),
         }
+        if kind == "saturation":
+            operation_report.update(
+                {
+                    "requested_amount": requested_amount,
+                    "amount": bounded_amount,
+                    "effective_amount": float(
+                        bounded_amount * np.mean(effective_mask)
+                    ),
+                    "effective_amount_peak": float(
+                        bounded_amount * np.max(effective_mask)
+                    ),
+                }
+            )
         if kind == "hue_selective_saturation":
+            maximum_band_amount = max(
+                (
+                    abs(float(band.get("amount", 0.0)))
+                    for band in band_reports
+                    if isinstance(band, dict)
+                ),
+                default=0.0,
+            )
             operation_report.update(
                 {
                     "profile": str(operation.get("profile") or "broadband"),
                     "bands": band_reports,
+                    "effective_amount": float(
+                        maximum_band_amount * np.mean(effective_mask)
+                    ),
+                    "effective_amount_peak": float(
+                        maximum_band_amount * np.max(effective_mask)
+                    ),
                 }
             )
         operation_reports.append(operation_report)
@@ -492,6 +525,46 @@ def apply_local_adjustment_recipe(
         if np.count_nonzero(active_mask) >= 32
         else 0.0
     )
+    saturation_operation_reports = [
+        operation
+        for operation in operation_reports
+        if str(operation.get("type"))
+        in {"saturation", "hue_selective_saturation"}
+    ]
+    saturation_active_mask = np.zeros(rgb.shape[1:], dtype=np.float32)
+    for operation in saturation_operation_reports:
+        saturation_active_mask = np.maximum(
+            saturation_active_mask,
+            available_masks[str(operation["mask"])]
+            * float(operation.get("opacity", 1.0)),
+        )
+    saturation_pixels = saturation_active_mask > 0.05
+    saturation_chroma_abs_delta_p95 = (
+        float(
+            np.quantile(
+                np.abs(after_chroma - before_chroma)[saturation_pixels],
+                0.95,
+            )
+        )
+        if np.count_nonzero(saturation_pixels) >= 32
+        else 0.0
+    )
+    saturation_chroma_p95_delta = (
+        float(np.quantile(after_chroma[saturation_pixels], 0.95))
+        - float(np.quantile(before_chroma[saturation_pixels], 0.95))
+        if np.count_nonzero(saturation_pixels) >= 32
+        else 0.0
+    )
+    if not saturation_operation_reports:
+        saturation_effect_status = "not_requested"
+    elif np.count_nonzero(saturation_pixels) < 32:
+        saturation_effect_status = "insufficient_evidence"
+    elif saturation_chroma_abs_delta_p95 <= 1e-6:
+        saturation_effect_status = "no_effect"
+    else:
+        saturation_effect_status = "effective"
+    for operation in saturation_operation_reports:
+        operation["effect_status"] = saturation_effect_status
     metrics = {
         "clip_growth": after_clip - before_clip,
         "background_median_drift": background_drift,
@@ -501,6 +574,10 @@ def apply_local_adjustment_recipe(
         "active_mask_coverage": float(np.mean(used_union > 0.05)),
         "background_chroma_median_drift": background_chroma_drift,
         "active_chroma_p95_growth": active_chroma_p95_growth,
+        "saturation_active_chroma_abs_delta_p95": (
+            saturation_chroma_abs_delta_p95
+        ),
+        "saturation_active_chroma_p95_delta": saturation_chroma_p95_delta,
     }
     limits = {
         "clip_growth_max": 0.002,
@@ -544,6 +621,13 @@ def apply_local_adjustment_recipe(
         "metrics": metrics,
         "limits": limits,
         "issues": issues,
+        "saturation_effect": {
+            "status": saturation_effect_status,
+            "active_pixel_count": int(np.count_nonzero(saturation_pixels)),
+            "active_mask_coverage": float(np.mean(saturation_pixels)),
+            "chroma_abs_delta_p95": saturation_chroma_abs_delta_p95,
+            "chroma_p95_delta": saturation_chroma_p95_delta,
+        },
         "transaction": {
             "baseline": "stage8_input_starless.fit",
             "candidate": "stage8_enhanced.fit",
