@@ -56,7 +56,6 @@ from models import (
     InputProfile,
     PipelineStage,
     QualityMetrics,
-    Stage7StretchStrategy,
     StageResult,
     TargetType,
 )

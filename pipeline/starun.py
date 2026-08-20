@@ -63,7 +63,6 @@ from models import (
     PipelineStage,
     QualityMetrics,
     StarSeparationState,
-    Stage7StretchStrategy,
     StageResult,
     TargetType,
 )
@@ -2136,17 +2135,6 @@ class StarunPostProcessor(
             self._write_stage_json("pipeline_policy.json", self.pipeline_policy)
             messages.append(f"target profiler fallback: {reason}")
         return "；".join(messages)
-
-    def target_profile_preflight(self):
-        """Run target profiling as an internal Stage 3/4 preflight."""
-        message = self._run_target_profile_preflight(
-            source="Stage 3/4 target profile preflight",
-            preview_name="stage3_target_preview.png",
-        )
-        self.log.info(
-            "Target profiler 属于 Stage 3/4 内部 preflight，不写入独立阶段"
-            + (f"；{message}" if message else "")
-        )
 
     # ========================================
     # 阶段 3: 背景提取

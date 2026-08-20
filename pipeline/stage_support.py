@@ -37,7 +37,7 @@ from image_metrics import (
     measure_quality_metrics,
     measure_stage3_signal_preservation,
 )
-from models import ImageFeatures, QualityMetrics, Stage7StretchStrategy, StageResult, TargetType
+from models import ImageFeatures, QualityMetrics, StageResult, TargetType
 from save_utils import save_stage_output, write_stage_json
 
 try:

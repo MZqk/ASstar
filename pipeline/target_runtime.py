@@ -32,7 +32,7 @@ from image_metrics import (
     format_feature_summary,
     measure_quality_metrics,
 )
-from models import ImageFeatures, QualityMetrics, Stage7StretchStrategy, StageResult, TargetType
+from models import ImageFeatures, QualityMetrics, StageResult, TargetType
 from save_utils import save_stage_output, write_stage_json
 
 try:

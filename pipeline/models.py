@@ -625,17 +625,6 @@ class AutoTuneResult:
 
 
 @dataclass
-class Stage7StretchStrategy:
-    """Stage 7 主体拉伸策略。"""
-    name: str
-    summary: str
-    candidates: List[Dict[str, Any]]
-    use_curves: bool = False
-    curves_label: str = ""
-    protection_note: str = ""
-
-
-@dataclass
 class StageResult:
     """单个阶段的执行结果"""
     name: str
