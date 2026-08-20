@@ -48,6 +48,7 @@ class ManualCorePipelineSmokeTests(unittest.TestCase):
         self.assertIn("auto", command)
         self.assertIn("--debug", command)
         self.assertNotIn("--network", command)
+        self.assertNotIn("--offline-resource-root", command)
         self.assertNotIn("starun_gui_dev", command)
 
     def test_launcher_command_can_force_offline_mode(self) -> None:
@@ -65,6 +66,28 @@ class ManualCorePipelineSmokeTests(unittest.TestCase):
 
         self.assertFalse(args.network)
         self.assertNotIn("--network", command)
+        self.assertIn("--offline", command)
+
+    def test_launcher_command_forwards_external_resource_root(self) -> None:
+        args = smoke.build_parser().parse_args(
+            [
+                "--mode",
+                "auto",
+                "--work-dir",
+                "/tmp/core-work",
+                "--offline-resource-root",
+                "/Volumes/starun-e2e-resources",
+                "--offline",
+            ]
+        )
+
+        command = smoke.build_launcher_command(args, args.mode)
+
+        option_index = command.index("--offline-resource-root")
+        self.assertEqual(
+            command[option_index + 1],
+            "/Volumes/starun-e2e-resources",
+        )
         self.assertIn("--offline", command)
 
     def test_verify_result_manifest_checks_current_outputs_and_hashes(self) -> None:

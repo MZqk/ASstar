@@ -6,6 +6,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from gui import starun_pipeline_dev as launcher
 
@@ -20,6 +21,7 @@ class PipelineDevLauncherTests(unittest.TestCase):
         self.assertTrue(args.network)
         self.assertFalse(args.debug)
         self.assertEqual(args.input_mode, launcher.INPUT_MODE_AUTO)
+        self.assertIsNone(args.offline_resource_root)
 
     def test_parser_accepts_explicit_offline_mode(self):
         with tempfile.TemporaryDirectory() as td:
@@ -28,6 +30,77 @@ class PipelineDevLauncherTests(unittest.TestCase):
             )
 
         self.assertFalse(args.network)
+
+    def test_external_resource_root_selects_runner_plugin_bundle(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "offline-resources"
+            plugin_dir = root / "siril_plugins"
+            plugin_dir.mkdir(parents=True)
+            args = launcher.build_parser().parse_args(
+                [
+                    "--work-dir",
+                    td,
+                    "--offline-resource-root",
+                    str(root),
+                ]
+            )
+
+            resolved = launcher.resolve_siril_plugin_dir(
+                args.offline_resource_root
+            )
+
+        self.assertEqual(resolved, plugin_dir.resolve())
+
+    def test_external_resource_root_does_not_fallback_to_checkout(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing_root = Path(td) / "missing-resources"
+
+            with self.assertRaisesRegex(ValueError, "缺少 siril_plugins"):
+                launcher.resolve_siril_plugin_dir(missing_root)
+
+    def test_pipeline_worker_receives_external_plugin_bundle(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            plugin_dir = root / "offline-resources/siril_plugins"
+            plugin_dir.mkdir(parents=True)
+            args = launcher.build_parser().parse_args(
+                [
+                    "--work-dir",
+                    td,
+                    "--runtime-home",
+                    str(root / "runtime-home"),
+                    "--offline-resource-root",
+                    str(plugin_dir.parent),
+                ]
+            )
+            with (
+                mock.patch.object(
+                    launcher,
+                    "verify_siril_offline_seed_venv",
+                    return_value=(True, "ready"),
+                ),
+                mock.patch.object(
+                    launcher,
+                    "prepare_resource_overlay",
+                    return_value=root / "overlay",
+                ),
+                mock.patch.object(launcher, "PipelineWorker") as worker_class,
+            ):
+                worker = worker_class.return_value
+
+                def finish_run() -> None:
+                    callback = worker.done.connect.call_args.args[0]
+                    callback("Completed", 0, False, "siril-cli")
+
+                worker.run.side_effect = finish_run
+
+                exit_code = launcher.run_pipeline(args)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            worker_class.call_args.kwargs["siril_plugin_dir"],
+            plugin_dir.resolve(),
+        )
 
     def test_root_checkpoint_resume_is_rejected(self):
         with tempfile.TemporaryDirectory() as td:

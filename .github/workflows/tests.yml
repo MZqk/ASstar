@@ -84,11 +84,29 @@ jobs:
       STARUN_SIRIL_APP: ${{ vars.STARUN_SIRIL_APP }}
       STARUN_SIRIL_SEED: ${{ vars.STARUN_SIRIL_SEED }}
       STARUN_RUNTIME_HOME: ${{ vars.STARUN_RUNTIME_HOME }}
-      STARUN_OFFLINE_RESOURCE_ROOT: ${{ github.workspace }}/resources
+      # Runner-provisioned read-only bundle; model files are not supplied by Git/LFS.
+      STARUN_OFFLINE_RESOURCE_ROOT: ${{ vars.STARUN_OFFLINE_RESOURCE_ROOT }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          lfs: true
+
+      - name: Validate prepared offline resource root
+        shell: bash
+        run: |
+          test -n "${STARUN_OFFLINE_RESOURCE_ROOT:-}" || {
+            echo "::error::STARUN_OFFLINE_RESOURCE_ROOT is not configured"
+            exit 1
+          }
+          case "${STARUN_OFFLINE_RESOURCE_ROOT}" in
+            /*) ;;
+            *)
+              echo "::error::STARUN_OFFLINE_RESOURCE_ROOT must be an absolute path"
+              exit 1
+              ;;
+          esac
+          test -d "${STARUN_OFFLINE_RESOURCE_ROOT}/siril_plugins" || {
+            echo "::error::Prepared offline resource root has no siril_plugins directory"
+            exit 1
+          }
 
       - uses: actions/setup-python@v5
         with:

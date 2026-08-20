@@ -519,6 +519,24 @@ class RealSirilStage110E2EContractTests(unittest.TestCase):
 
         self.assertIn(f"工作目录路径不是目录：{work_path}", errors)
 
+    def test_core_smoke_command_forwards_external_resource_root(self) -> None:
+        args = Namespace(
+            work_dir=Path("/tmp/real-e2e-work"),
+            siril_app=Path("/Applications/Siril.app"),
+            siril_seed=Path("/tmp/siril-seed"),
+            runtime_home=Path("/tmp/runtime-home"),
+            offline_resource_root=Path("/Volumes/starun-e2e-resources"),
+        )
+
+        command = real_e2e.build_core_smoke_command(args)
+
+        option_index = command.index("--offline-resource-root")
+        self.assertEqual(
+            command[option_index + 1],
+            "/Volumes/starun-e2e-resources",
+        )
+        self.assertIn("--offline", command)
+
 
 if __name__ == "__main__":
     unittest.main()

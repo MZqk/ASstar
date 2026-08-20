@@ -180,6 +180,8 @@ def build_core_smoke_command(args: argparse.Namespace) -> list[str]:
         str(args.siril_seed),
         "--runtime-home",
         str(args.runtime_home),
+        "--offline-resource-root",
+        str(args.offline_resource_root),
         "--offline",
         "--debug",
     ]

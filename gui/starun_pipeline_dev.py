@@ -91,6 +91,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"隔离 runtime HOME（默认：{DEFAULT_RUNTIME_HOME}）",
     )
     parser.add_argument(
+        "--offline-resource-root",
+        type=_absolute_path,
+        default=None,
+        help="可选 runner 离线资源包根目录；必须包含 siril_plugins/",
+    )
+    parser.add_argument(
         "--offline",
         dest="network",
         action="store_false",
@@ -105,8 +111,18 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_siril_plugin_dir(offline_resource_root: Path | None) -> Path:
+    if offline_resource_root is None:
+        return PROJECT_RESOURCES / "siril_plugins"
+    plugin_dir = offline_resource_root / "siril_plugins"
+    if not plugin_dir.is_dir():
+        raise ValueError(f"离线资源包缺少 siril_plugins：{plugin_dir}")
+    return plugin_dir
+
+
 def run_pipeline(args: argparse.Namespace) -> int:
     validate_work_dir(args.work_dir, args.input_mode)
+    siril_plugin_dir = resolve_siril_plugin_dir(args.offline_resource_root)
     runtime_venv = (
         args.runtime_home
         / "Library/Application Support/org.siril.Siril/siril/venv"
@@ -141,7 +157,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             work_dir=args.work_dir,
             config_template=PROJECT_RESOURCES / "config.1.4.ini.template",
             pipeline_path=PROJECT_ROOT / "pipeline/starun.py",
-            siril_plugin_dir=PROJECT_RESOURCES / "siril_plugins",
+            siril_plugin_dir=siril_plugin_dir,
             resources=resources,
             runtime_home=args.runtime_home,
             siril_candidates=[

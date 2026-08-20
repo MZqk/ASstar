@@ -73,6 +73,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"隔离 runtime HOME（默认：{DEFAULT_RUNTIME_HOME}）",
     )
     parser.add_argument(
+        "--offline-resource-root",
+        type=_absolute_path,
+        default=None,
+        help="可选 runner 离线资源包根目录；必须包含 siril_plugins/",
+    )
+    parser.add_argument(
         "--offline",
         dest="network",
         action="store_false",
@@ -118,6 +124,13 @@ def build_launcher_command(args: argparse.Namespace, mode: str) -> list[str]:
         "--runtime-home",
         str(args.runtime_home),
     ]
+    if args.offline_resource_root is not None:
+        command.extend(
+            [
+                "--offline-resource-root",
+                str(args.offline_resource_root),
+            ]
+        )
     if not args.network:
         command.append("--offline")
     if args.debug:

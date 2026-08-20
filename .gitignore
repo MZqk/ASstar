@@ -82,6 +82,9 @@ dist/
 
 # Local-only non-code assets
 *.md
+!/README.md
+!/INTEGRATION_README.md
+!/resources/siril_plugins/README.md
 *.html
 *.png
 *.svg
