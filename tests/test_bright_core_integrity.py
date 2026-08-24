@@ -20,6 +20,7 @@ if str(PIPELINE_DIR) not in sys.path:
 
 from models import PipelineConfig  # noqa: E402
 import stage7_quality  # noqa: E402
+import stage7_repair  # noqa: E402
 import stage7_stretch_metrics  # noqa: E402
 import syqon_starless  # noqa: E402
 
@@ -199,6 +200,78 @@ class BrightCoreStage6IntegrityTests(unittest.TestCase):
         self.assertEqual(manifest["overlap"], 64)
         self.assertEqual(manifest["precision"], "fp32")
         self.assertEqual(manifest["mask_method"], "subtraction")
+
+    def test_bounded_overshoot_repair_restores_only_offending_core_pixels(self):
+        source, starmask = _linear_core()
+        roi, _evidence = stage7_quality.build_bright_core_roi(source, starmask)
+        starless = source.copy()
+        coordinates = np.argwhere(roi)[:48]
+        starless[0, coordinates[:, 0], coordinates[:, 1]] += 0.03
+
+        repaired, repaired_mask, audit = (
+            stage7_repair.repair_bright_core_starless_overshoot_pixels(
+                source,
+                starless,
+                starmask,
+                target_type="bright_emission_reflection_nebula",
+                target_profile=STRICT_PROFILE,
+            )
+        )
+
+        self.assertEqual(audit["status"], "applied", audit)
+        self.assertEqual(audit["metrics"]["repair_pixels"], 48)
+        np.testing.assert_array_equal(
+            repaired[0, coordinates[:, 0], coordinates[:, 1]],
+            source[0, coordinates[:, 0], coordinates[:, 1]],
+        )
+        np.testing.assert_array_equal(repaired_mask, starmask)
+        unchanged = np.ones_like(roi, dtype=bool)
+        unchanged[coordinates[:, 0], coordinates[:, 1]] = False
+        np.testing.assert_array_equal(repaired[:, unchanged], starless[:, unchanged])
+        self.assertFalse(audit["after"]["hard_failed"])
+
+    def test_bounded_overshoot_repair_refuses_other_destructive_gates(self):
+        source, starmask = _linear_core()
+        roi, _evidence = stage7_quality.build_bright_core_roi(source, starmask)
+        starless = source.copy()
+        coordinates = np.argwhere(roi)[:48]
+        starless[0, coordinates[:, 0], coordinates[:, 1]] = 1.0
+
+        repaired, repaired_mask, audit = (
+            stage7_repair.repair_bright_core_starless_overshoot_pixels(
+                source,
+                starless,
+                starmask,
+                target_type="bright_emission_reflection_nebula",
+                target_profile=STRICT_PROFILE,
+            )
+        )
+
+        self.assertEqual(audit["status"], "skipped")
+        self.assertEqual(audit["reason"], "unsupported_hard_gates")
+        np.testing.assert_array_equal(repaired, starless)
+        np.testing.assert_array_equal(repaired_mask, starmask)
+
+    def test_bounded_overshoot_repair_refuses_large_pixel_rewrites(self):
+        source, starmask = _linear_core()
+        roi, _evidence = stage7_quality.build_bright_core_roi(source, starmask)
+        starless = source.copy()
+        coordinates = np.argwhere(roi)[:48]
+        starless[0, coordinates[:, 0], coordinates[:, 1]] += 0.09
+
+        repaired, _repaired_mask, audit = (
+            stage7_repair.repair_bright_core_starless_overshoot_pixels(
+                source,
+                starless,
+                starmask,
+                target_type="bright_emission_reflection_nebula",
+                target_profile=STRICT_PROFILE,
+            )
+        )
+
+        self.assertEqual(audit["status"], "skipped")
+        self.assertEqual(audit["reason"], "repair_delta_exceeds_bound")
+        np.testing.assert_array_equal(repaired, starless)
 
     def test_rejected_pair_purge_clears_pointer_and_memory_handoff(self):
         with tempfile.TemporaryDirectory() as directory:

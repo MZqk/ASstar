@@ -21,6 +21,11 @@ from dualband_palette import (
 from image_metrics import format_feature_summary
 from models import PipelineStage, StarSeparationState
 from pipeline_safety import color_safety_limits, clamp_saturation_boost
+from stage8_pixels import (
+    stage8_mixed_nebula_composite_context,
+    stage8_star_preserve_nebulosity_context,
+    stage8_star_preserve_nebulosity_overlay,
+)
 
 
 def _set_stage8_handoff(
@@ -623,6 +628,7 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
     pipeline._stage8_palette_report = {}
     pipeline._stage8_saturation_execution = {}
     pipeline._stage8_color_quality_report = {}
+    pipeline._stage8_subject_boundary_seam_report = {}
     stage8_initial_quality = "unknown"
     stage8_reject_reason = ""
     stage8_policy_failure_recorded = False
@@ -812,26 +818,86 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
         source_stem = pipeline.stretched_name or "stage7_stretched"
         try:
             pipeline.cmd_with_check("load", source_stem)
+            secondary_context = stage8_star_preserve_nebulosity_context(
+                pipeline
+            )
+            secondary_overlay: Dict[str, Any] = {
+                **secondary_context,
+                "status": "not_requested",
+                "accepted": False,
+            }
+            if bool(secondary_context.get("eligible", False)):
+                try:
+                    source_pixels = pipeline.siril.get_image_pixeldata(
+                        preview=False
+                    )
+                    if source_pixels is None:
+                        raise RuntimeError(
+                            "star-preserve secondary-nebulosity pixels unavailable"
+                        )
+                    overlay_pixels, secondary_overlay = (
+                        stage8_star_preserve_nebulosity_overlay(
+                            pipeline,
+                            source_pixels,
+                        )
+                    )
+                    if bool(secondary_overlay.get("accepted", False)):
+                        _stage8_set_image_pixels(
+                            pipeline,
+                            overlay_pixels,
+                            label="Stage8 star-preserve secondary nebulosity",
+                        )
+                except (RuntimeError, TypeError, ValueError) as error:
+                    secondary_overlay = {
+                        **secondary_context,
+                        "status": "failed_safe_passthrough",
+                        "accepted": False,
+                        "error": pipeline._short_text(error, 160),
+                    }
+                    pipeline.log.warn(
+                        "Stage8 secondary-nebulosity overlay failed; preserving "
+                        f"the accepted stellar source unchanged: {error}"
+                    )
             pipeline._stage8_input_source = source_stem
             pipeline._stage8_input_fallback_used = False
             stage8_saved = pipeline._save_stage_output("stage8_enhanced")
-            pipeline._stage8_final_source = "stage8_enhanced" if stage8_saved else source_stem
-            pipeline._stage8_final_quality = "star_preserve_bypass"
+            pipeline._stage8_final_source = (
+                "stage8_enhanced" if stage8_saved else source_stem
+            )
+            overlay_accepted = bool(secondary_overlay.get("accepted", False))
+            pipeline._stage8_final_quality = (
+                "star_preserve_secondary_nebulosity"
+                if overlay_accepted
+                else "star_preserve_bypass"
+            )
             pipeline._stage8_fallback_used = False
             handoff = _set_stage8_handoff(
                 pipeline,
                 source_stem=pipeline._stage8_final_source,
-                passthrough=True,
+                passthrough=not overlay_accepted,
                 restricted_downstream=False,
                 final_quality=pipeline._stage8_final_quality,
-                reason_code="star_preserve_target_bypass",
-                reason_text="star_preserve_target_bypass",
+                reason_code=(
+                    "star_preserve_secondary_nebulosity"
+                    if overlay_accepted
+                    else "star_preserve_target_bypass"
+                ),
+                reason_text=(
+                    "stellar primary preserved; diffuse secondary nebulosity "
+                    "received one bounded local adjustment"
+                    if overlay_accepted
+                    else "star_preserve_target_bypass"
+                ),
             )
             pipeline.starless_file = pipeline.process_dir / f"{pipeline._stage8_final_source}.fit"
             report = {
                 "stage": "stage8_nebula_enhancement",
-                "status": "skipped",
-                "mode": "star_preserve_target_bypass",
+                "status": "ok" if overlay_accepted else "skipped",
+                "mode": (
+                    "star_preserve_secondary_nebulosity"
+                    if overlay_accepted
+                    else "star_preserve_target_bypass"
+                ),
                 "source": source_stem,
                 "final_source": pipeline._stage8_final_source,
                 "target_type": (
@@ -839,40 +905,69 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                     if hasattr(pipeline, "_active_target_type")
                     else "generic_low_snr_safe"
                 ),
+                "secondary_context": secondary_context,
+                "secondary_nebulosity_overlay": secondary_overlay,
                 "handoff": handoff,
             }
             pipeline._write_stage_json("stage8_enhancement_report.json", report)
             messages.append(
-                "star-preserve target bypassed Starless-only enhancement "
-                f"(source={source_stem})"
+                (
+                    "star-preserve target kept stellar pixels exact and applied "
+                    "one bounded diffuse-nebulosity overlay "
+                    if overlay_accepted
+                    else "star-preserve target bypassed Starless-only enhancement "
+                )
+                + f"(source={source_stem})"
             )
             if stage8_saved and hasattr(pipeline, "_create_stage_review_bundle"):
                 review = pipeline._create_stage_review_bundle(
                     "stage8_nebula_enhancement",
                     source_stem,
                     "stage8_enhanced",
-                    context={"mode": "star_preserve_target_bypass"},
+                    context={"mode": report["mode"]},
                     candidates=[
                         {
-                            "name": "star_preserve_bypass",
+                            "name": (
+                                "star_preserve_secondary_nebulosity"
+                                if overlay_accepted
+                                else "star_preserve_bypass"
+                            ),
                             "stem": "stage8_enhanced",
-                            "status": "skipped",
+                            "status": "accepted" if overlay_accepted else "skipped",
                             "selected": True,
                         }
                     ],
-                    selected_candidate="star_preserve_bypass",
+                    selected_candidate=(
+                        "star_preserve_secondary_nebulosity"
+                        if overlay_accepted
+                        else "star_preserve_bypass"
+                    ),
                 )
                 if review.get("report_path"):
                     messages.append(f"review_bundle={review['report_path']}")
             elapsed = pipeline.log.stage_end(stage_label)
+            stage_status = (
+                "ok"
+                if stage8_saved and overlay_accepted
+                else "skipped"
+                if stage8_saved
+                else "degraded"
+            )
             pipeline._record_stage(
                 stage_label,
-                "skipped" if stage8_saved else "degraded",
+                stage_status,
                 elapsed,
                 "；".join(messages),
-                execution="safe_passthrough",
-                reason_code="star_preserve_target_bypass",
-                details={"stage8_handoff": handoff},
+                execution=(
+                    "completed"
+                    if overlay_accepted
+                    else "safe_passthrough"
+                ),
+                reason_code=str(handoff.get("reason_code") or ""),
+                details={
+                    "stage8_handoff": handoff,
+                    "secondary_nebulosity_overlay": secondary_overlay,
+                },
             )
             return
         except (CommandError, SirilError) as error:
@@ -1321,6 +1416,23 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
             pipeline.cfg.nebula_saturation,
         )
     )
+    mixed_composite_context = stage8_mixed_nebula_composite_context(pipeline)
+    if (
+        broadband_color_allowed
+        and not stage8_high_risk
+        and not stage8_limited_mode
+        and mixed_composite_context.get("eligible", False)
+    ):
+        composite_floor = min(
+            0.14,
+            float(color_limits.get("max_saturation_boost", 0.10)),
+        )
+        if requested_saturation < composite_floor:
+            messages.append(
+                "resolved red/blue composite field raised the single masked "
+                f"color request {requested_saturation:.3f}->{composite_floor:.3f}"
+            )
+            requested_saturation = composite_floor
     if not broadband_color_allowed:
         requested_saturation = 0.0
         messages.append(
@@ -1688,6 +1800,14 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                                 )
                                 pipeline._stage8_final_source = fallback_source
                                 pipeline._stage8_fallback_used = True
+                            else:
+                                pipeline._stage8_final_source = "stage8_enhanced"
+                                pipeline._stage8_fallback_used = True
+                                status = "degraded" if status == "ok" else status
+                                messages.append(
+                                    "stage8 conservative rerun passed; "
+                                    "candidate retained as degraded fallback"
+                                )
                         safe_sat = rerun.get("safe_saturation")
                         safe_sat_text = (
                             f"{float(safe_sat):.3f}"

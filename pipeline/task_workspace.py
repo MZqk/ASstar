@@ -1,6 +1,7 @@
 """Independent, source-read-only product task workspaces and checkpoints."""
 from __future__ import annotations
 
+import hashlib
 import re
 import os
 import shutil
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence
 
 try:
-    from . import outcome, run_manifest, task_plan
+    from . import outcome, run_manifest, scene_support, task_plan
     from .processing_parameters import (
         default_processing_parameters,
         normalize_processing_parameters,
@@ -26,6 +27,7 @@ try:
 except ImportError:
     import outcome
     import run_manifest
+    import scene_support
     import task_plan
     from processing_parameters import (
         default_processing_parameters,
@@ -56,10 +58,144 @@ CHECKPOINT_MANIFEST_REL = Path("checkpoints") / "checkpoint-manifest.json"
 LATEST_RESULT_MANIFEST_REL = Path("results") / "latest-result.json"
 RETENTION_MANIFEST_REL = Path("results") / "retention.json"
 TASK_CONTAINER_NAME = "Starun"
+STAGE2_STACKED_FOOTPRINT_SCHEMA = (
+    "starun.stage2-stacked-footprint-evidence.v1"
+)
 
 
 class WorkspaceError(RuntimeError):
     pass
+
+
+def _normalize_stage2_footprint_grid(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise WorkspaceError("Stage 2 footprint 网格必须为映射")
+    if str(value.get("encoding") or "") != "rle-u8-row-major-v1":
+        raise WorkspaceError("Stage 2 footprint 网格编码不受支持")
+    rows = value.get("rows")
+    columns = value.get("columns")
+    if (
+        isinstance(rows, bool)
+        or not isinstance(rows, int)
+        or isinstance(columns, bool)
+        or not isinstance(columns, int)
+    ):
+        raise WorkspaceError("Stage 2 footprint 网格尺寸无效")
+    if not (1 <= rows <= 64 and 1 <= columns <= 64):
+        raise WorkspaceError("Stage 2 footprint 网格尺寸超出 64×64")
+    raw_runs = value.get("runs")
+    if not isinstance(raw_runs, list) or not raw_runs:
+        raise WorkspaceError("Stage 2 footprint 网格缺少 RLE 数据")
+    decoded = bytearray()
+    normalized_runs: list[list[int]] = []
+    for raw_run in raw_runs:
+        if not isinstance(raw_run, (list, tuple)) or len(raw_run) != 2:
+            raise WorkspaceError("Stage 2 footprint RLE 条目无效")
+        grid_value = raw_run[0]
+        count = raw_run[1]
+        if (
+            isinstance(grid_value, bool)
+            or not isinstance(grid_value, int)
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+        ):
+            raise WorkspaceError("Stage 2 footprint RLE 数值无效")
+        if not (0 <= grid_value <= 100) or count <= 0:
+            raise WorkspaceError("Stage 2 footprint RLE 范围无效")
+        if len(decoded) + count > rows * columns:
+            raise WorkspaceError("Stage 2 footprint RLE 长度超出网格")
+        decoded.extend([grid_value] * count)
+        normalized_runs.append([grid_value, count])
+    if len(decoded) != rows * columns:
+        raise WorkspaceError("Stage 2 footprint RLE 长度与网格不匹配")
+    claimed_sha256 = value.get("sha256")
+    actual_sha256 = hashlib.sha256(bytes(decoded)).hexdigest()
+    if not isinstance(claimed_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}",
+        claimed_sha256,
+    ):
+        raise WorkspaceError("Stage 2 footprint 网格 SHA-256 无效")
+    if claimed_sha256 != actual_sha256:
+        raise WorkspaceError("Stage 2 footprint 网格 SHA-256 不匹配")
+    return {
+        "rows": rows,
+        "columns": columns,
+        "encoding": "rle-u8-row-major-v1",
+        "runs": normalized_runs,
+        "sha256": claimed_sha256,
+    }
+
+
+def _normalize_stage2_stacked_footprint(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise WorkspaceError("Stage 2 footprint 证据必须为映射")
+    normalized = _json_safe_contract_value(dict(value))
+    if not isinstance(normalized, dict):
+        raise WorkspaceError("Stage 2 footprint 证据无法规范化")
+    if normalized.get("schema") != STAGE2_STACKED_FOOTPRINT_SCHEMA:
+        raise WorkspaceError("Stage 2 footprint schema 不受支持")
+    if normalized.get("source_mode") != "stacked_master_inference":
+        raise WorkspaceError("Stage 2 footprint 来源模式无效")
+    if normalized.get("observer_only") is not True:
+        raise WorkspaceError("Stage 2 footprint 必须保持 observer-only")
+    if normalized.get("captured_before_crop") is not True:
+        raise WorkspaceError("Stage 2 footprint 必须在裁切前采集")
+    status = str(normalized.get("status") or "")
+    if status not in {"available", "partial", "unavailable"}:
+        raise WorkspaceError("Stage 2 footprint 状态无效")
+    source_sha256 = normalized.get("source_sha256")
+    if source_sha256 is not None and (
+        not isinstance(source_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", source_sha256)
+    ):
+        raise WorkspaceError("Stage 2 footprint 来源 SHA-256 无效")
+    if status != "unavailable" and source_sha256 is None:
+        raise WorkspaceError("Stage 2 footprint 缺少 64 位来源 SHA-256")
+    source_artifact = normalized.get("source_artifact")
+    if status != "unavailable" and not str(source_artifact or "").strip():
+        raise WorkspaceError("Stage 2 footprint 缺少来源文件名")
+    if not isinstance(normalized.get("input_shape"), Mapping):
+        raise WorkspaceError("Stage 2 footprint 缺少输入尺寸")
+    limitations = normalized.get("limitations")
+    if not isinstance(limitations, list) or not {
+        "not_per_frame_registration_footprint",
+        "not_crop_authority",
+    }.issubset({str(item) for item in limitations}):
+        raise WorkspaceError("Stage 2 footprint 缺少证据边界")
+    layers = normalized.get("layers")
+    if not isinstance(layers, Mapping):
+        raise WorkspaceError("Stage 2 footprint 缺少证据层")
+
+    available_layers = 0
+    normalized_layers: Dict[str, Any] = {}
+    for key in ("fill_support", "relative_coverage"):
+        layer = layers.get(key)
+        if layer is None and status == "unavailable":
+            continue
+        if not isinstance(layer, Mapping):
+            raise WorkspaceError(f"Stage 2 footprint 缺少 {key}")
+        layer_status = str(layer.get("status") or "")
+        if layer_status not in {"available", "unavailable"}:
+            raise WorkspaceError(f"Stage 2 footprint {key} 状态无效")
+        normalized_layer = dict(layer)
+        grid = layer.get("grid")
+        if layer_status == "available":
+            normalized_layer["grid"] = _normalize_stage2_footprint_grid(grid)
+            available_layers += 1
+        elif grid is not None:
+            raise WorkspaceError(f"Stage 2 footprint {key} 不可用但包含网格")
+        normalized_layers[key] = normalized_layer
+    expected_status = (
+        "available"
+        if available_layers == 2
+        else "partial"
+        if available_layers == 1
+        else "unavailable"
+    )
+    if status != expected_status:
+        raise WorkspaceError("Stage 2 footprint 状态与可用证据层不一致")
+    normalized["layers"] = normalized_layers
+    return normalized
 
 
 def _json_safe_contract_value(value: Any) -> Any:
@@ -175,7 +311,13 @@ def _normalize_resume_semantic_context(
             raise WorkspaceError("Stage 2 场旋裁切轮次无效") from error
         if field_rotation_passes not in range(0, 3):
             raise WorkspaceError("Stage 2 场旋裁切轮次超出 0-2")
-        normalized["stage2_crop"] = dict(stage2_crop)
+        normalized_stage2_crop = dict(stage2_crop)
+        stacked_footprint = stage2_crop.get("stacked_master_footprint")
+        if stacked_footprint is not None:
+            normalized_stage2_crop["stacked_master_footprint"] = (
+                _normalize_stage2_stacked_footprint(stacked_footprint)
+            )
+        normalized["stage2_crop"] = normalized_stage2_crop
     if stage_number == 5:
         if not str(normalized.get("channel_semantics") or "").strip():
             raise WorkspaceError("Stage 5 续跑语义缺少通道语义")
@@ -193,6 +335,24 @@ def _normalize_resume_semantic_context(
         star_reference = normalized.get("stage5_star_reference_report")
         if star_reference is not None and not isinstance(star_reference, Mapping):
             raise WorkspaceError("Stage 5 续跑星表语义无效")
+        shared_support = normalized.get("stage3_scene_support")
+        if shared_support is not None:
+            if not isinstance(shared_support, Mapping) or str(
+                shared_support.get("schema") or ""
+            ) != scene_support.SCENE_SUPPORT_SCHEMA:
+                raise WorkspaceError("Stage 5 共享场景支持语义无效")
+            for field in (
+                "source_file_sha256",
+                "source_pixel_sha256",
+                "manifest_sha256",
+                "arrays_sha256",
+            ):
+                value = shared_support.get(field)
+                if value is not None and (
+                    len(str(value)) != 64
+                    or any(char not in "0123456789abcdef" for char in str(value).lower())
+                ):
+                    raise WorkspaceError(f"Stage 5 共享场景支持 {field} 无效")
     return normalized
 
 
@@ -563,6 +723,17 @@ def begin_task_run(
             if normalized_resume["semantic_context"] is not None
             else "not_applicable"
         )
+        normalized_auxiliary_artifacts = _normalize_checkpoint_auxiliary_artifacts(
+            normalized_resume.get("auxiliary_artifacts"),
+            task_root=workspace.root,
+            stage_number=resume_stage,
+        )
+        if normalized_auxiliary_artifacts:
+            normalized_resume["auxiliary_artifacts"] = (
+                normalized_auxiliary_artifacts
+            )
+        else:
+            normalized_resume.pop("auxiliary_artifacts", None)
         normalized_resume["path"] = str(checkpoint_path)
 
     try:
@@ -636,6 +807,7 @@ def publish_formal_checkpoint(
     stage_number: int,
     artifact_path: Path,
     semantic_context: Optional[Mapping[str, Any]] = None,
+    auxiliary_artifacts: Optional[Mapping[str, Path]] = None,
     completed_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Atomically promote one accepted linear stage to task-level retention."""
@@ -658,6 +830,27 @@ def publish_formal_checkpoint(
     artifact_sha256 = run_manifest.sha256_file(artifact)
     if not artifact_sha256:
         raise WorkspaceError(f"无法读取阶段产物：{artifact}")
+    source_auxiliaries: Dict[str, Dict[str, Any]] = {}
+    if auxiliary_artifacts is not None:
+        if stage_number != 5 or set(auxiliary_artifacts) != set(
+            _STAGE5_SCENE_SUPPORT_AUXILIARIES
+        ):
+            raise WorkspaceError("Stage 5 场景支持辅助产物集合无效")
+        loaded_support = scene_support.load_scene_support(artifact.parent)
+        if loaded_support.get("status") not in {"available", "partial"}:
+            raise WorkspaceError("Stage 5 场景支持辅助产物无法验证")
+        for name in sorted(_STAGE5_SCENE_SUPPORT_AUXILIARIES):
+            source_path = Path(auxiliary_artifacts[name]).expanduser().resolve()
+            if source_path.parent != artifact.parent or source_path.name != name:
+                raise WorkspaceError(f"Stage 5 辅助产物 {name} 来源路径无效")
+            source_hash = run_manifest.sha256_file(source_path)
+            if not source_hash:
+                raise WorkspaceError(f"Stage 5 辅助产物 {name} 无法读取")
+            source_auxiliaries[name] = {
+                "source": source_path,
+                "size": _safe_size(source_path),
+                "sha256": source_hash,
+            }
     normalized_semantic_context = _normalize_resume_semantic_context(
         semantic_context,
         stage_number=stage_number,
@@ -720,12 +913,57 @@ def publish_formal_checkpoint(
         except OSError:
             shutil.copy2(destination, backup_path)
 
+    auxiliary_destinations: Dict[str, Path] = {}
+    auxiliary_backups: Dict[str, Optional[Path]] = {}
+    auxiliary_existed: Dict[str, bool] = {}
+    for name in sorted(source_auxiliaries):
+        auxiliary_destination = workspace.checkpoints_dir / name
+        auxiliary_destinations[name] = auxiliary_destination
+        existed = auxiliary_destination.is_file()
+        auxiliary_existed[name] = existed
+        auxiliary_backup: Optional[Path] = None
+        if existed:
+            fd, backup_name = tempfile.mkstemp(
+                prefix=f".{name}.",
+                suffix=".bak",
+                dir=str(auxiliary_destination.parent),
+            )
+            os.close(fd)
+            auxiliary_backup = Path(backup_name)
+            auxiliary_backup.unlink(missing_ok=True)
+            try:
+                os.link(auxiliary_destination, auxiliary_backup)
+            except OSError:
+                shutil.copy2(auxiliary_destination, auxiliary_backup)
+        auxiliary_backups[name] = auxiliary_backup
+
     committed = False
     try:
         _atomic_copy(artifact, destination)
         copied_sha256 = run_manifest.sha256_file(destination)
         if copied_sha256 != artifact_sha256:
             raise WorkspaceError(f"{key} 断点复制后 SHA-256 不一致")
+        copied_auxiliaries: Dict[str, Dict[str, Any]] = {}
+        for name, source_record in source_auxiliaries.items():
+            auxiliary_destination = auxiliary_destinations[name]
+            _atomic_copy(source_record["source"], auxiliary_destination)
+            copied_hash = run_manifest.sha256_file(auxiliary_destination)
+            if copied_hash != source_record["sha256"]:
+                raise WorkspaceError(f"Stage 5 辅助产物 {name} 复制后 SHA-256 不一致")
+            copied_auxiliaries[name] = {
+                "path": auxiliary_destination.relative_to(workspace.root).as_posix(),
+                "size": _safe_size(auxiliary_destination),
+                "sha256": copied_hash,
+            }
+        if copied_auxiliaries:
+            loaded_checkpoint_support = scene_support.load_scene_support(
+                workspace.checkpoints_dir
+            )
+            if loaded_checkpoint_support.get("status") not in {
+                "available",
+                "partial",
+            }:
+                raise WorkspaceError("Stage 5 辅助产物复制后内容校验失败")
 
         for downstream_stage in FORMAL_RESUME_STAGES:
             downstream_key = f"stage{downstream_stage}"
@@ -764,6 +1002,11 @@ def publish_formal_checkpoint(
                 if normalized_semantic_context is not None
                 else "not_applicable"
             ),
+            **(
+                {"auxiliary_artifacts": copied_auxiliaries}
+                if copied_auxiliaries
+                else {}
+            ),
         }
         checkpoint_manifest = build_checkpoint_manifest(
             task_id=workspace.task_id,
@@ -779,8 +1022,17 @@ def publish_formal_checkpoint(
                 backup_path.replace(destination)
             elif not destination_existed:
                 destination.unlink(missing_ok=True)
+            for name, auxiliary_destination in auxiliary_destinations.items():
+                auxiliary_backup = auxiliary_backups.get(name)
+                if auxiliary_backup is not None and auxiliary_backup.is_file():
+                    auxiliary_backup.replace(auxiliary_destination)
+                elif not auxiliary_existed.get(name, False):
+                    auxiliary_destination.unlink(missing_ok=True)
         if backup_path is not None:
             backup_path.unlink(missing_ok=True)
+        for auxiliary_backup in auxiliary_backups.values():
+            if auxiliary_backup is not None:
+                auxiliary_backup.unlink(missing_ok=True)
     return dict(records[key])
 
 
@@ -1133,6 +1385,53 @@ def _resolve_checkpoint_path(task_root: Path, relative_path: Any) -> Optional[Pa
     return candidate
 
 
+_STAGE5_SCENE_SUPPORT_AUXILIARIES = frozenset(
+    {scene_support.SCENE_SUPPORT_JSON, scene_support.SCENE_SUPPORT_ARRAYS}
+)
+
+
+def _normalize_checkpoint_auxiliary_artifacts(
+    value: Any,
+    *,
+    task_root: Path,
+    stage_number: int,
+) -> Dict[str, Dict[str, Any]]:
+    if value is None:
+        return {}
+    if stage_number != 5 or not isinstance(value, Mapping):
+        raise WorkspaceError("断点辅助产物契约无效")
+    if set(value) != set(_STAGE5_SCENE_SUPPORT_AUXILIARIES):
+        raise WorkspaceError("Stage 5 场景支持辅助产物必须成对存在")
+    normalized: Dict[str, Dict[str, Any]] = {}
+    checkpoint_root = (task_root / "checkpoints").resolve()
+    for name in sorted(_STAGE5_SCENE_SUPPORT_AUXILIARIES):
+        record = value.get(name)
+        if not isinstance(record, Mapping):
+            raise WorkspaceError(f"Stage 5 辅助产物 {name} 记录无效")
+        path = _resolve_checkpoint_path(task_root, record.get("path"))
+        if path is None or path.parent != checkpoint_root or path.name != name:
+            raise WorkspaceError(f"Stage 5 辅助产物 {name} 路径无效")
+        expected_hash = str(record.get("sha256") or "")
+        actual_hash = run_manifest.sha256_file(path)
+        if not expected_hash or actual_hash != expected_hash:
+            raise WorkspaceError(f"Stage 5 辅助产物 {name} SHA-256 不匹配")
+        try:
+            size = int(record.get("size"))
+        except (TypeError, ValueError) as error:
+            raise WorkspaceError(f"Stage 5 辅助产物 {name} 大小无效") from error
+        if size != _safe_size(path):
+            raise WorkspaceError(f"Stage 5 辅助产物 {name} 大小不匹配")
+        normalized[name] = {
+            "path": path.relative_to(task_root.resolve()).as_posix(),
+            "size": size,
+            "sha256": expected_hash,
+        }
+    loaded = scene_support.load_scene_support(checkpoint_root)
+    if loaded.get("status") not in {"available", "partial"}:
+        raise WorkspaceError("Stage 5 场景支持辅助产物内容校验失败")
+    return normalized
+
+
 def _checkpoint_compatible(
     *,
     task_root: Path,
@@ -1178,6 +1477,14 @@ def _checkpoint_compatible(
     actual_hash = run_manifest.sha256_file(path)
     if not expected_hash or not actual_hash or expected_hash != actual_hash:
         return False, f"{key} SHA-256 mismatch", path
+    try:
+        _normalize_checkpoint_auxiliary_artifacts(
+            record.get("auxiliary_artifacts"),
+            task_root=task_root,
+            stage_number=stage_number,
+        )
+    except WorkspaceError as error:
+        return False, f"{key} auxiliary artifacts are invalid: {error}", path
     return True, "verified", path
 
 

@@ -88,6 +88,41 @@ DISPLAY90_STRENGTH_MAX = 0.95
 DISPLAY90_ANALYSIS_MAX_SIDE = ui_preview.DEFAULT_PREVIEW_MAX_SIDE
 DISPLAY90_REPORT_PERCENTILES = (0.2, 1.0, 10.0, 50.0, 90.0, 99.0, 99.8)
 DISPLAY90_CONFORMANCE_PERCENTILES = (50.0, 90.0, 99.0)
+DISPLAY90_SHADOW_MEDIAN_NORMALIZED_MIN = 0.08
+DISPLAY90_SHADOW_LOW_PERCENTILE = 0.001
+DISPLAY90_SHADOW_JOIN_PERCENTILE = 10.0
+DISPLAY90_SHADOW_LOW_OUTPUT_JOIN_RATIO = 0.90
+DISPLAY90_LARGE_GALAXY_CANONICAL_STRENGTH = 0.90
+DISPLAY90_LARGE_GALAXY_PERCENTILES = (
+    0.0,
+    0.1,
+    1.0,
+    5.0,
+    10.0,
+    25.0,
+    50.0,
+    75.0,
+    90.0,
+    95.0,
+    99.0,
+    99.8,
+    99.95,
+)
+DISPLAY90_LARGE_GALAXY_OUTPUTS = (
+    0.095,
+    0.108,
+    0.119,
+    0.127,
+    0.134,
+    0.145,
+    0.165,
+    0.215,
+    0.330,
+    0.440,
+    0.700,
+    0.900,
+    0.960,
+)
 
 
 def _stage7_mask(
@@ -291,6 +326,7 @@ def subject_brightness_selection(
 
     normalized_profile = str(profile_name or "generic_balanced").strip().lower()
     star_subject_contract = normalized_profile == "star_colour_preserve"
+    galaxy_subject_contract = normalized_profile == "galaxy_core_halo_balance"
     goals = (
         {
             "subject_lift_retention": None,
@@ -302,17 +338,21 @@ def subject_brightness_selection(
             "subject_p50_retention": 0.80,
         }
     )
-    floors = (
-        {
+    if star_subject_contract:
+        floors = {
             "subject_lift_retention": None,
             "subject_p50_retention": 0.20,
         }
-        if star_subject_contract
-        else {
+    elif galaxy_subject_contract:
+        floors = {
+            "subject_lift_retention": 0.50,
+            "subject_p50_retention": 0.58,
+        }
+    else:
+        floors = {
             "subject_lift_retention": 0.50,
             "subject_p50_retention": 0.60,
         }
-    )
     candidate_metrics = dict(candidate.get("metrics") or {})
     preview_metrics = dict(preview.get("metrics") or {})
 
@@ -480,7 +520,11 @@ def apply_subject_chroma_rendition(
     if not np.all(np.isfinite(rgb)):
         raise ValueError("subject chroma source contains non-finite pixels")
     shape = tuple(int(value) for value in rgb.shape[1:])
-    factor = float(np.clip(float(factor), 1.0, 1.20))
+    # The linked tone transform can dilute physically calibrated galaxy chroma
+    # by an order of magnitude.  A larger factor remains bounded by the frozen
+    # subject ROI, core/star protection, per-pixel gamut scaling, and the
+    # luminance-preservation check below.
+    factor = float(np.clip(float(factor), 1.0, 6.0))
     headroom = float(np.clip(float(output_headroom), 0.95, 0.999))
     has_frozen_roi = any(
         _stage7_mask(masks, name, shape) is not None
@@ -2591,9 +2635,121 @@ def _display90_quantiles(rgb: np.ndarray) -> Dict[str, Dict[str, float]]:
     }
 
 
+def _display90_large_galaxy_quantile_contract(
+    rgb: np.ndarray,
+    display_curve: Dict[str, Any],
+    strength: float,
+    target_type: str,
+) -> Dict[str, Any]:
+    """Build a bounded whole-frame tone ladder for compressed large galaxies."""
+
+    report: Dict[str, Any] = {
+        "schema": "starun.stage7-large-galaxy-quantile-tone.v1",
+        "status": "not_required",
+        "policy": "compressed_pedestal_large_galaxy_quantile_ladder",
+        "target_type": str(target_type or "").strip().lower(),
+        "canonical_strength": DISPLAY90_LARGE_GALAXY_CANONICAL_STRENGTH,
+    }
+    if report["target_type"] != "large_galaxy":
+        report["reason"] = "target_type_not_large_galaxy"
+        return report
+    try:
+        curve = dict(display_curve or {})
+        median_normalized = float(curve["median_normalized"])
+        report["source_median_normalized"] = median_normalized
+        if median_normalized >= DISPLAY90_SHADOW_MEDIAN_NORMALIZED_MIN:
+            report["reason"] = "source_pedestal_not_compressed"
+            return report
+        values = np.asarray(rgb, dtype=np.float32)
+        if values.ndim != 3 or values.shape[0] != 3:
+            raise ValueError(f"expected RGB CHW array, got shape={values.shape}")
+        luminance = (
+            values[0] * np.float32(0.2126)
+            + values[1] * np.float32(0.7152)
+            + values[2] * np.float32(0.0722)
+        )
+        finite = luminance[np.isfinite(luminance)]
+        if finite.size < 64:
+            raise ValueError("too few finite luminance samples")
+        source_anchors = np.percentile(
+            finite,
+            DISPLAY90_LARGE_GALAXY_PERCENTILES,
+        ).astype(np.float64)
+        canonical_outputs = np.asarray(
+            DISPLAY90_LARGE_GALAXY_OUTPUTS,
+            dtype=np.float64,
+        )
+        relative_strength = float(
+            np.clip(
+                float(strength) / DISPLAY90_LARGE_GALAXY_CANONICAL_STRENGTH,
+                DISPLAY90_STRENGTH_MIN
+                / DISPLAY90_LARGE_GALAXY_CANONICAL_STRENGTH,
+                DISPLAY90_STRENGTH_MAX
+                / DISPLAY90_LARGE_GALAXY_CANONICAL_STRENGTH,
+            )
+        )
+        output_anchors = source_anchors + relative_strength * (
+            canonical_outputs - source_anchors
+        )
+        output_anchors = np.maximum.accumulate(
+            np.clip(output_anchors, 0.0, CONDITIONAL_STRETCH_OUTPUT_HEADROOM)
+        )
+
+        unique_inputs = [0.0]
+        unique_outputs = [0.0]
+        unique_percentiles = []
+        for percentile, source_value, output_value in zip(
+            DISPLAY90_LARGE_GALAXY_PERCENTILES,
+            source_anchors,
+            output_anchors,
+        ):
+            source_value = float(source_value)
+            output_value = float(output_value)
+            if not (
+                np.isfinite(source_value)
+                and np.isfinite(output_value)
+                and 1e-8 < source_value < 1.0 - 1e-8
+            ):
+                continue
+            if source_value <= unique_inputs[-1] + 1e-8:
+                unique_outputs[-1] = max(unique_outputs[-1], output_value)
+                if unique_percentiles:
+                    unique_percentiles[-1] = float(percentile)
+                continue
+            unique_inputs.append(source_value)
+            unique_outputs.append(output_value)
+            unique_percentiles.append(float(percentile))
+        unique_inputs.append(1.0)
+        unique_outputs.append(1.0)
+        if len(unique_inputs) < 6 or np.any(np.diff(unique_inputs) <= 0.0):
+            raise ValueError("large-galaxy quantiles do not define a usable curve")
+        if np.any(np.diff(unique_outputs) < 0.0):
+            raise ValueError("large-galaxy output anchors are not monotonic")
+        report.update(
+            status="applied",
+            input_percentiles=unique_percentiles,
+            input_anchors=unique_inputs,
+            output_anchors=unique_outputs,
+            relative_strength=relative_strength,
+            output_policy=(
+                "bounded reference-guided luminance distribution; "
+                "uniform RGB-vector gain owns chroma preservation"
+            ),
+            highlight_policy="continuous_quantile_tail_without_hard_white_clip",
+            shadow_policy="bounded_low_percentile_span_without_flat_floor",
+        )
+        return report
+    except (KeyError, TypeError, ValueError, FloatingPointError) as error:
+        report.update(status="unavailable", reason=str(error))
+        return report
+
+
 def _display90_lut(
     display_curve: Dict[str, Any],
     strength: float,
+    *,
+    shadow_protection: Optional[Dict[str, Any]] = None,
+    quantile_tone_curve: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
     if (
         not isinstance(display_curve, dict)
@@ -2623,16 +2779,73 @@ def _display90_lut(
         CONDITIONAL_STRETCH_LUT_SIZE,
         dtype=np.float64,
     )
+    if (
+        isinstance(quantile_tone_curve, dict)
+        and quantile_tone_curve.get("status") == "applied"
+    ):
+        inputs = np.asarray(
+            quantile_tone_curve.get("input_anchors"),
+            dtype=np.float64,
+        )
+        outputs = np.asarray(
+            quantile_tone_curve.get("output_anchors"),
+            dtype=np.float64,
+        )
+        if (
+            inputs.ndim != 1
+            or outputs.ndim != 1
+            or inputs.size < 6
+            or inputs.size != outputs.size
+            or not np.all(np.isfinite(inputs))
+            or not np.all(np.isfinite(outputs))
+            or np.any(np.diff(inputs) <= 0.0)
+            or np.any(np.diff(outputs) < 0.0)
+            or abs(float(inputs[0])) > 1e-12
+            or abs(float(outputs[0])) > 1e-12
+            or abs(float(inputs[-1]) - 1.0) > 1e-12
+            or abs(float(outputs[-1]) - 1.0) > 1e-12
+        ):
+            raise ValueError("Display90 large-galaxy quantile contract is invalid")
+        return np.asarray(
+            np.interp(grid, inputs, outputs),
+            dtype=np.float32,
+        )
     display = np.power(
         np.clip((grid - black) / (white - black), 0.0, 1.0),
         gamma,
     )
     # The canonical LUT is float32 because that exact byte representation is
     # authenticated and reused by both Stage 7 and Stage 9.
-    return np.asarray(
+    lut = np.asarray(
         np.clip((1.0 - blend) * grid + blend * display, 0.0, 1.0),
         dtype=np.float32,
     )
+    if (
+        isinstance(shadow_protection, dict)
+        and shadow_protection.get("status") == "applied"
+    ):
+        low_input = float(shadow_protection["low_input"])
+        join_input = float(shadow_protection["join_input"])
+        low_output = float(shadow_protection["low_output"])
+        join_output = float(shadow_protection["join_output"])
+        if not (
+            0.0 < low_input < join_input < 1.0
+            and 0.0 <= low_output < join_output <= 1.0
+        ):
+            raise ValueError("Display90 shadow shoulder contract is invalid")
+        lower = grid <= low_input
+        shoulder = (grid > low_input) & (grid < join_input)
+        lut[lower] = np.asarray(
+            low_output * grid[lower] / low_input,
+            dtype=np.float32,
+        )
+        phase = (grid[shoulder] - low_input) / (join_input - low_input)
+        smooth = phase * phase * (3.0 - 2.0 * phase)
+        lut[shoulder] = np.asarray(
+            low_output + (join_output - low_output) * smooth,
+            dtype=np.float32,
+        )
+    return lut
 
 
 def _apply_authenticated_lut_rgb(
@@ -2696,12 +2909,114 @@ def _apply_authenticated_lut_luminance_vector(
     )
 
 
+def _display90_shadow_protection_contract(
+    rgb: np.ndarray,
+    display_curve: Dict[str, Any],
+    strength: float,
+    source_lut: np.ndarray,
+) -> Dict[str, Any]:
+    """Open only the clipped tail of a compressed-pedestal display LUT.
+
+    The GUI curve intentionally clips its lowest 0.2 percent for screen
+    display.  Replaying that black point into delivered pixels can turn a
+    narrow linear pedestal into distributed dark speckles.  Replace only the
+    low-background tail with a monotonic shoulder while leaving the median,
+    subject, and highlight transfer unchanged.
+    """
+
+    report: Dict[str, Any] = {
+        "schema": "starun.stage7-display90-shadow-protection.v1",
+        "status": "not_required",
+        "policy": "compressed_pedestal_open_shadow_shoulder",
+        "median_normalized_min": DISPLAY90_SHADOW_MEDIAN_NORMALIZED_MIN,
+        "low_percentile": DISPLAY90_SHADOW_LOW_PERCENTILE,
+        "join_percentile": DISPLAY90_SHADOW_JOIN_PERCENTILE,
+        "low_output_join_ratio": DISPLAY90_SHADOW_LOW_OUTPUT_JOIN_RATIO,
+        "preserved_domain": "join_input_to_one",
+    }
+    try:
+        curve = dict(display_curve or {})
+        values = np.asarray(rgb, dtype=np.float32)
+        if values.ndim != 3 or values.shape[0] != 3:
+            raise ValueError(f"expected RGB CHW array, got shape={values.shape}")
+        luminance = (
+            values[0] * np.float32(0.2126)
+            + values[1] * np.float32(0.7152)
+            + values[2] * np.float32(0.0722)
+        )
+        finite = luminance[np.isfinite(luminance)]
+        if finite.size < 64:
+            raise ValueError("too few finite luminance samples")
+        source_black = float(curve["black"])
+        median = float(curve["median"])
+        white = float(curve["white"])
+        source_gamma = float(curve["gamma"])
+        source_normalized = float(
+            np.clip(
+                (median - source_black) / max(white - source_black, 1e-12),
+                1e-6,
+                0.999999,
+            )
+        )
+        report.update(
+            source_black=source_black,
+            source_gamma=source_gamma,
+            source_median_normalized=source_normalized,
+            strength=float(strength),
+        )
+        if source_normalized >= DISPLAY90_SHADOW_MEDIAN_NORMALIZED_MIN:
+            return report
+
+        robust_low = float(
+            np.percentile(finite, DISPLAY90_SHADOW_LOW_PERCENTILE)
+        )
+        low_input = float(
+            robust_low - 0.5 * max(median - robust_low, 0.0)
+        )
+        join_input = float(
+            np.percentile(finite, DISPLAY90_SHADOW_JOIN_PERCENTILE)
+        )
+        low_input = float(np.clip(low_input, 1e-6, join_input - 1e-7))
+        grid = np.linspace(0.0, 1.0, source_lut.size, dtype=np.float64)
+        join_output = float(np.interp(join_input, grid, source_lut))
+        low_output = float(
+            DISPLAY90_SHADOW_LOW_OUTPUT_JOIN_RATIO * join_output
+        )
+        if not (
+            0.0 < low_input < join_input < 1.0
+            and 0.0 < low_output < join_output <= 1.0
+        ):
+            raise ValueError("compressed pedestal shoulder is degenerate")
+        report.update(
+            status="applied",
+            robust_low=robust_low,
+            low_input=low_input,
+            join_input=join_input,
+            low_output=low_output,
+            join_output=join_output,
+            source_below_low_input_ratio=float(
+                np.mean(finite <= low_input)
+            ),
+            source_below_join_input_ratio=float(
+                np.mean(finite <= join_input)
+            ),
+            source_median_target=float(
+                np.interp(median, grid, source_lut)
+            ),
+        )
+        return report
+    except (KeyError, TypeError, ValueError, FloatingPointError) as error:
+        report.update(status="unavailable", reason=str(error))
+        return report
+
+
 def calibrate_display90_linked_lut(
     image: np.ndarray,
     display_curve: Dict[str, Any],
     *,
     strength: float,
     max_derivative: float,
+    target_type: str = "",
 ) -> Dict[str, Any]:
     """Build the authenticated luminance-vector LUT derived from the GUI D curve."""
 
@@ -2709,7 +3024,47 @@ def calibrate_display90_linked_lut(
         derivative_limit = float(max_derivative)
         if not np.isfinite(derivative_limit) or derivative_limit <= 0.0:
             raise ValueError("Display90 derivative limit must be positive")
-        lut = _display90_lut(display_curve, strength)
+        analysis_rgb, sampling = _stage7_rgb_analysis_grid(
+            image,
+            max_side=DISPLAY90_ANALYSIS_MAX_SIDE,
+        )
+        source_lut = _display90_lut(display_curve, strength)
+        quantile_tone_curve = _display90_large_galaxy_quantile_contract(
+            analysis_rgb,
+            display_curve,
+            strength,
+            target_type,
+        )
+        if quantile_tone_curve.get("status") == "unavailable":
+            raise ValueError(
+                "Display90 large-galaxy quantile curve unavailable: "
+                + str(quantile_tone_curve.get("reason") or "unknown error")
+            )
+        if quantile_tone_curve.get("status") == "applied":
+            shadow_protection = {
+                "schema": "starun.stage7-display90-shadow-protection.v1",
+                "status": "not_required",
+                "policy": "large_galaxy_quantile_curve_owns_shadows",
+                "reason": "authenticated quantile anchors replace the clipped tail",
+            }
+        else:
+            shadow_protection = _display90_shadow_protection_contract(
+                analysis_rgb,
+                display_curve,
+                strength,
+                source_lut,
+            )
+            if shadow_protection.get("status") == "unavailable":
+                raise ValueError(
+                    "Display90 shadow protection unavailable: "
+                    + str(shadow_protection.get("reason") or "unknown error")
+                )
+        lut = _display90_lut(
+            display_curve,
+            strength,
+            shadow_protection=shadow_protection,
+            quantile_tone_curve=quantile_tone_curve,
+        )
         lut_contract = _conditional_lut_contract(
             lut,
             max_derivative=derivative_limit,
@@ -2719,10 +3074,6 @@ def calibrate_display90_linked_lut(
                 "Display90 LUT failed validation: "
                 + ",".join(lut_contract.get("issues") or [])
             )
-        analysis_rgb, sampling = _stage7_rgb_analysis_grid(
-            image,
-            max_side=DISPLAY90_ANALYSIS_MAX_SIDE,
-        )
         gui_reference = ui_preview.apply_linked_display_curve_contract(
             analysis_rgb,
             display_curve,
@@ -2747,6 +3098,8 @@ def calibrate_display90_linked_lut(
                 "preserves_rgb_direction": True,
             },
             "display_curve": dict(display_curve),
+            "shadow_protection": shadow_protection,
+            "quantile_tone_curve": quantile_tone_curve,
             "parameters": {
                 "strength": float(strength),
                 "strength_min": DISPLAY90_STRENGTH_MIN,
@@ -2755,8 +3108,14 @@ def calibrate_display90_linked_lut(
                 "lut_size": CONDITIONAL_STRETCH_LUT_SIZE,
                 "output_headroom": CONDITIONAL_STRETCH_OUTPUT_HEADROOM,
                 "formula": (
-                    "(1-strength)*x + strength*"
-                    "clip((x-black)/(white-black),0,1)^gamma"
+                    "authenticated large-galaxy quantile luminance LUT"
+                    if quantile_tone_curve.get("status") == "applied"
+                    else (
+                        "(1-strength)*x + strength*"
+                        "clip((x-black)/(white-black),0,1)^gamma; "
+                        "compressed pedestals replace only the low-background "
+                        "tail with an authenticated monotonic shoulder"
+                    )
                 ),
             },
             "lut_contract": lut_contract,
@@ -2840,6 +3199,16 @@ def rebuild_display90_linked_lut(
     lut = _display90_lut(
         dict(calibration.get("display_curve") or {}),
         float(parameters["strength"]),
+        shadow_protection=(
+            dict(calibration.get("shadow_protection") or {})
+            if schema == DISPLAY90_STRETCH_SCHEMA_V2
+            else None
+        ),
+        quantile_tone_curve=(
+            dict(calibration.get("quantile_tone_curve") or {})
+            if schema == DISPLAY90_STRETCH_SCHEMA_V2
+            else None
+        ),
     )
     contract = _conditional_lut_contract(
         lut,
@@ -3814,6 +4183,8 @@ def assess_target_local_stretch(
     target_profile: Optional[Dict[str, Any]] = None,
     starmask: Optional[np.ndarray] = None,
     frozen_reference_available: bool = True,
+    valid_mask: Optional[np.ndarray] = None,
+    original_saturation_map: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """Measure core, faint-structure and dark-lane regions derived from linear data."""
     normalized_target = str(target_type or "generic_low_snr_safe").strip().lower()
@@ -3888,11 +4259,32 @@ def assess_target_local_stretch(
         broad = source_gray.copy()
         for _ in range(4):
             broad = _box_blur_gray(broad)
-        q35, q55, q90, q99 = np.percentile(broad, [35.0, 55.0, 90.0, 99.0])
+        shared_valid = (
+            np.asarray(valid_mask, dtype=bool)
+            if valid_mask is not None
+            and np.asarray(valid_mask).shape == broad.shape
+            else np.ones_like(broad, dtype=bool)
+        )
+        if int(np.count_nonzero(shared_valid)) < 64:
+            raise ValueError("shared valid region contains too few samples")
+        q35, q55, q90, q99 = np.percentile(
+            broad[shared_valid],
+            [35.0, 55.0, 90.0, 99.0],
+        )
         background_mask = broad <= q35
         dark_mask = (broad > q35) & (broad <= q55)
         faint_mask = (broad > q55) & (broad <= q90)
         core_mask = broad > q99
+        original_saturation = (
+            np.asarray(original_saturation_map, dtype=np.uint8)
+            if original_saturation_map is not None
+            and np.asarray(original_saturation_map).shape == broad.shape
+            else np.zeros_like(broad, dtype=np.uint8)
+        )
+        background_mask &= shared_valid
+        dark_mask &= shared_valid
+        faint_mask &= shared_valid
+        core_mask &= shared_valid
         core_roi_evidence: Dict[str, Any] = {
             "available": True,
             "method": "target_local_top1pct",
@@ -3909,7 +4301,7 @@ def assess_target_local_stretch(
                     "strict bright-core ROI unavailable: "
                     f"{core_roi_evidence.get('reason', 'unknown')}"
                 )
-            core_mask = strict_core_mask
+            core_mask = strict_core_mask & shared_valid
             starmask_rgb = _stage7_rgb_float_fullres(np.asarray(starmask))
             star_pixels = (
                 np.max(starmask_rgb, axis=0)
@@ -3940,8 +4332,14 @@ def assess_target_local_stretch(
         faint_median = float(np.median(faint_values))
         faint_contrast = faint_median - background_median
         dark_separation = faint_median - dark_median
-        core_clip_ratio = float(np.mean(candidate_peak[core_mask] >= 0.995))
+        candidate_clipped = candidate_peak >= 0.995
+        original_saturated_any = original_saturation > 0
+        core_clip_ratio_total = float(np.mean(candidate_clipped[core_mask]))
+        core_clip_ratio = float(
+            np.mean((candidate_clipped & ~original_saturated_any)[core_mask])
+        )
         core_p99 = float(np.percentile(core_values, 99.0))
+        valid_count = max(int(np.count_nonzero(shared_valid)), 1)
         metrics = {
             "background_median": background_median,
             "background_std": background_std,
@@ -3953,9 +4351,13 @@ def assess_target_local_stretch(
             "core_median": float(np.median(core_values)),
             "core_p99": core_p99,
             "core_clip_ratio": core_clip_ratio,
-            "background_coverage": float(np.mean(background_mask)),
-            "faint_coverage": float(np.mean(faint_mask)),
-            "core_coverage": float(np.mean(core_mask)),
+            "core_clip_ratio_total": core_clip_ratio_total,
+            "original_saturation_ratio": float(
+                np.mean(original_saturated_any[core_mask])
+            ),
+            "background_coverage": float(np.count_nonzero(background_mask) / valid_count),
+            "faint_coverage": float(np.count_nonzero(faint_mask) / valid_count),
+            "core_coverage": float(np.count_nonzero(core_mask) / valid_count),
         }
 
         issues = []
@@ -3965,7 +4367,14 @@ def assess_target_local_stretch(
         if normalized_target in CORE_PROTECT_TARGETS:
             if strict_target:
                 channel_clip_ratios = [
-                    float(np.mean(candidate_rgb[channel][core_mask] >= 0.995))
+                    float(
+                        np.mean(
+                            (
+                                (candidate_rgb[channel] >= 0.995)
+                                & ((original_saturation & (1 << channel)) == 0)
+                            )[core_mask]
+                        )
+                    )
                     for channel in range(3)
                 ]
                 core_clip_ratio = max(channel_clip_ratios)

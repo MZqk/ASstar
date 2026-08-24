@@ -151,11 +151,12 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         self.assertFalse(pm_calls)
         report = processor.stage_json_reports["stage9_remix_quality.json"]
         json.dumps(report)
-        self.assertEqual(report["schema"], "starun.stage9-remix-quality.v9")
+        self.assertEqual(report["schema"], "starun.stage9-remix-quality.v10")
         self.assertEqual(
             report["selection_policy"],
-            "catalog_visibility_psf_fidelity_recovery_v7",
+            "sep_catalog_visibility_psf_fidelity_recovery_v8",
         )
+        self.assertTrue(report["sep_crossmatch"]["accepted"])
         self.assertEqual(report["selection_class"], "formal")
         self.assertTrue(report["formal_accepted"])
         self.assertFalse(report["review_candidate_selected"])
@@ -2599,8 +2600,15 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
                 )
                 if expected_apply:
                     self.assertEqual(len(writes), 1)
-                    self.assertTrue(np.all(writes[0][:, ~support] == 0.0))
-                    self.assertTrue(np.all(writes[0][:, support] == 0.2))
+                    weights = (
+                        stage9_module.stage9_quality._compact_starmask_support_weights(
+                            support
+                        )
+                    )
+                    np.testing.assert_allclose(
+                        writes[0],
+                        raw * weights[np.newaxis, ...],
+                    )
                 else:
                     self.assertEqual(writes, [])
 

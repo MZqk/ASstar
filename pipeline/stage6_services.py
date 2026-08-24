@@ -20,6 +20,7 @@ import cosmic_clarity
 import plugin_runner
 import sasp_runner
 import scunet_denoise
+import scene_support
 import syqon_starless
 import stage7_quality
 import stage7_repair
@@ -353,6 +354,7 @@ def _stage7_preview_target_attainment(
         "cand_b": "candidate_b",
         "cand_display70": "candidate_display70",
         "cand_display82": "candidate_display82",
+        "cand_display86": "candidate_display86",
         "cand_display90": "candidate_display90",
     }.get(str(candidate_name))
     calibration = (
@@ -565,6 +567,7 @@ def _stage7_candidates_for_policy(
             "cand_b",
             "cand_display70",
             "cand_display82",
+            "cand_display86",
             "cand_display90",
         },
         "auto_dual": {"cand_a", "cand_b"},
@@ -1446,6 +1449,16 @@ class Stage6ServiceMixin:
                     target_profile=getattr(self, "target_profile", None),
                     starmask=starmask_image_data,
                     frozen_reference_available=target_local_reference_available,
+                    valid_mask=(
+                        frozen_background_masks.get("shared_valid_mask")
+                        if isinstance(frozen_background_masks, dict)
+                        else None
+                    ),
+                    original_saturation_map=(
+                        frozen_background_masks.get("original_saturation_map")
+                        if isinstance(frozen_background_masks, dict)
+                        else None
+                    ),
                 )
                 color_vector_reference = (
                     stage7_stretch_metrics.assess_rec709_vector_color_reference(
@@ -3995,6 +4008,11 @@ class Stage6ServiceMixin:
             for item in (target_profile.get("secondary_labels") or [])
             if str(item).strip()
         }
+        composite_target_names = {
+            str(item.get("name") or "").strip().lower()
+            for item in (target_profile.get("composite_targets") or [])
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        }
 
         profile = {
             "enabled": enabled,
@@ -4028,7 +4046,7 @@ class Stage6ServiceMixin:
                 {
                     "name": "bright_core_protect",
                     "cand_a_p50_multiplier": 0.82,
-                    "cand_b_p50_multiplier": 0.76,
+                    "cand_b_p50_multiplier": 0.78,
                     "highlight_scale": 0.82,
                     "cand_a_stretch_multiplier": 0.92,
                     "cand_b_stretch_multiplier": 0.90,
@@ -4065,6 +4083,35 @@ class Stage6ServiceMixin:
                     "reason": "protect bright nebula core and preserve highlight colour",
                 }
             )
+            if (
+                {"lagoon nebula", "trifid nebula"}.issubset(
+                    composite_target_names
+                )
+                and {"emission_red", "reflection_blue"}.issubset(
+                    secondary_labels
+                )
+            ):
+                profile.update(
+                    {
+                        "name": "bright_core_composite_reveal",
+                        "cand_a_p50_multiplier": 0.94,
+                        "cand_b_p50_multiplier": 0.92,
+                        "highlight_scale": 0.80,
+                        "cand_a_stretch_multiplier": 0.96,
+                        "cand_b_stretch_multiplier": 0.94,
+                        "cand_a_pixel_params": {
+                            **profile["cand_a_pixel_params"],
+                            "faint_boost": 0.026,
+                            "core_protection": 0.80,
+                            "shadow_chroma_damping": 0.20,
+                            "faint_saturation_boost": 0.040,
+                        },
+                        "reason": (
+                            "reveal Lagoon and Trifid in one physical field while "
+                            "retaining masked core and star protection"
+                        ),
+                    }
+                )
         elif (
             target_type in {"globular_cluster", "open_cluster", "reflection_nebula_cluster"}
             or "star_color_preserving_stretch" in mode_set
@@ -4186,6 +4233,9 @@ class Stage6ServiceMixin:
     def _stage7_vivid_chroma_factor(
         self,
         target_stretch: Dict[str, Any],
+        *,
+        saturation_ratio: Optional[float] = None,
+        saturation_goal: Optional[float] = None,
     ) -> float:
         """Return the bounded target-aware colour factor for vivid-safe."""
 
@@ -4215,6 +4265,14 @@ class Stage6ServiceMixin:
         }:
             return 1.12
         if profile_name == "galaxy_core_halo_balance":
+            try:
+                ratio = float(saturation_ratio)
+                goal = min(float(saturation_goal), 0.50)
+            except (TypeError, ValueError):
+                ratio = 0.0
+                goal = 0.0
+            if math.isfinite(ratio) and math.isfinite(goal) and ratio > 1e-6:
+                return max(1.08, min(6.0, goal / ratio))
             return 1.08
         if profile_name == "star_colour_preserve":
             return 1.06
@@ -5193,7 +5251,7 @@ class Stage6ServiceMixin:
                 stage7_stretch_metrics.DISPLAY90_STRENGTH_MIN,
                 stage7_stretch_metrics.DISPLAY90_STRENGTH_MAX,
             )
-            strength_ladder = (
+            strength_ladder = [
                 (
                     "cand_display82",
                     "stage7_cand_display82",
@@ -5203,6 +5261,22 @@ class Stage6ServiceMixin:
                     ),
                     "mid",
                 ),
+            ]
+            if str(target_stretch.get("name") or "").strip().lower() == (
+                "galaxy_core_halo_balance"
+            ):
+                strength_ladder.append(
+                    (
+                        "cand_display86",
+                        "stage7_cand_display86",
+                        max(
+                            stage7_stretch_metrics.DISPLAY90_STRENGTH_MIN,
+                            high_strength - 0.04,
+                        ),
+                        "mid_high",
+                    )
+                )
+            strength_ladder.extend((
                 (
                     "cand_display70",
                     "stage7_cand_display70",
@@ -5218,7 +5292,7 @@ class Stage6ServiceMixin:
                     high_strength,
                     "high",
                 ),
-            )
+            ))
             max_derivative = _clamp_float(
                 getattr(
                     self.cfg,
@@ -5254,6 +5328,7 @@ class Stage6ServiceMixin:
                         display_curve,
                         strength=rounded_strength,
                         max_derivative=max_derivative,
+                        target_type=self._active_target_type(),
                     )
                     calibration["eligibility"] = {
                         "policy_requested": True,
@@ -5465,6 +5540,37 @@ class Stage6ServiceMixin:
             "canonical=float32[0,1]"
         )
         frozen_background_masks: Optional[Dict[str, Any]] = None
+        existing_scene_runtime = getattr(self, "_stage3_scene_support", None)
+        reuse_existing_scene_runtime = bool(
+            isinstance(existing_scene_runtime, dict)
+            and str(
+                ((existing_scene_runtime.get("manifest") or {}).get("reason_code"))
+                or ""
+            )
+            == "legacy_checkpoint_without_scene_support"
+        )
+        shared_scene_runtime = (
+            existing_scene_runtime
+            if reuse_existing_scene_runtime
+            else scene_support.load_scene_support(
+                self.process_dir,
+                expected_shape=tuple(np.asarray(baseline_image_data).shape),
+            )
+            if self.process_dir is not None and baseline_image_data is not None
+            else {
+                "status": "unavailable",
+                "manifest": scene_support.unavailable_scene_support(
+                    "stage7 baseline pixels unavailable",
+                    reason_code="scene_support_unavailable",
+                ),
+                "valid_mask": None,
+                "saturation_map": None,
+            }
+        )
+        self._stage3_scene_support = shared_scene_runtime
+        shared_scene_support_summary = scene_support.scene_support_summary(
+            shared_scene_runtime
+        )
         frozen_background_sampling: Dict[str, Any] = {
             "status": "unavailable",
             "method": "candidate_local_background_fallback",
@@ -5526,6 +5632,61 @@ class Stage6ServiceMixin:
                 FloatingPointError,
             ):
                 frozen_background_masks = None
+        if isinstance(frozen_background_masks, dict):
+            spatial_shape = tuple(
+                int(value) for value in frozen_background_masks["background_mask"].shape
+            )
+            shared_valid = shared_scene_runtime.get("valid_mask")
+            shared_saturation = shared_scene_runtime.get("saturation_map")
+            valid_weight = (
+                np.asarray(shared_valid, dtype=np.float32)
+                if shared_valid is not None
+                and np.asarray(shared_valid).shape == spatial_shape
+                else None
+            )
+            saturation_weight = (
+                (np.asarray(shared_saturation) > 0).astype(np.float32)
+                if shared_saturation is not None
+                and np.asarray(shared_saturation).shape == spatial_shape
+                else None
+            )
+            catalog_weight = scene_support.catalog_aperture_mask(
+                shared_scene_runtime,
+                spatial_shape,
+            )
+            if valid_weight is not None:
+                frozen_background_masks["background_mask"] = (
+                    np.asarray(
+                        frozen_background_masks["background_mask"],
+                        dtype=np.float32,
+                    )
+                    * valid_weight
+                ).astype(np.float32, copy=False)
+                frozen_background_masks["shared_valid_mask"] = np.asarray(
+                    shared_valid,
+                    dtype=np.uint8,
+                )
+            if (
+                shared_saturation is not None
+                and np.asarray(shared_saturation).shape == spatial_shape
+            ):
+                frozen_background_masks["original_saturation_map"] = np.asarray(
+                    shared_saturation,
+                    dtype=np.uint8,
+                )
+            protected_layers = [
+                value
+                for value in (saturation_weight, catalog_weight)
+                if value is not None
+            ]
+            if protected_layers:
+                protected = np.clip(
+                    np.maximum.reduce(protected_layers), 0.0, 1.0
+                ).astype(np.float32, copy=False)
+                frozen_background_masks["background_mask"] *= 1.0 - protected
+            frozen_background_sampling["shared_scene_support"] = (
+                shared_scene_support_summary
+            )
         baseline_background_quality = (
             self._background_quality_metrics(
                 baseline_image_data,
@@ -5616,6 +5777,7 @@ class Stage6ServiceMixin:
         messages.append(
             "stage7 primary stretch candidates: stage7_cand_a, stage7_cand_b, "
             "optional stage7_cand_display70/82/90; "
+            "galaxy routes also evaluate stage7_cand_display86; "
             "preview=stage7_preview_ref; vivid-safe and chroma rescue are conditional"
         )
         messages.append(
@@ -5918,7 +6080,11 @@ class Stage6ServiceMixin:
                     candidate
                     for candidate in candidate_list
                     if str(candidate.get("name") or "")
-                    not in {"cand_display82", "cand_display90"}
+                    not in {
+                        "cand_display82",
+                        "cand_display86",
+                        "cand_display90",
+                    }
                 ]
         stretch_adaptation["candidate_policy"] = candidate_policy
         stretch_adaptation["rendition_intent"] = rendition_intent
@@ -6043,7 +6209,11 @@ class Stage6ServiceMixin:
                 (saturation_ratio is None or saturation_ratio < saturation_goal)
                 and safety_headroom >= 0.15
             ):
-                vivid_factor = self._stage7_vivid_chroma_factor(target_stretch)
+                vivid_factor = self._stage7_vivid_chroma_factor(
+                    target_stretch,
+                    saturation_ratio=saturation_ratio,
+                    saturation_goal=saturation_goal,
+                )
                 vivid_candidate = {
                     "name": "cand_vivid_safe",
                     "stem": "stage7_cand_vivid_safe",
@@ -6396,6 +6566,24 @@ class Stage6ServiceMixin:
                                         starmask=starmask_image_data,
                                         frozen_reference_available=(
                                             target_local_reference_available
+                                        ),
+                                        valid_mask=(
+                                            frozen_background_masks.get(
+                                                "shared_valid_mask"
+                                            )
+                                            if isinstance(
+                                                frozen_background_masks, dict
+                                            )
+                                            else None
+                                        ),
+                                        original_saturation_map=(
+                                            frozen_background_masks.get(
+                                                "original_saturation_map"
+                                            )
+                                            if isinstance(
+                                                frozen_background_masks, dict
+                                            )
+                                            else None
                                         ),
                                     )
                                 )
@@ -7083,6 +7271,7 @@ class Stage6ServiceMixin:
                 "baseline_adaptive": baseline_adaptive,
                 "baseline_background_quality": baseline_background_quality,
                 "background_sampling": frozen_background_sampling,
+                "shared_scene_support": shared_scene_support_summary,
                 "background_color_review_gate": background_color_review_gate,
                 "strict_bright_core_evidence": strict_core_evidence,
                 "delivery_mode": "starless",
@@ -7127,6 +7316,7 @@ class Stage6ServiceMixin:
                 "matched_domain_transfer": matched_domain_transfer,
                 "baseline_background_quality": baseline_background_quality,
                 "background_sampling": frozen_background_sampling,
+                "shared_scene_support": shared_scene_support_summary,
                 "background_color_review_gate": background_color_review_gate,
                 "baseline_pixel_stats": baseline_pixel_stats,
                 "candidates": [

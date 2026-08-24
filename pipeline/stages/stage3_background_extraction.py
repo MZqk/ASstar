@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+import scene_support
+
 from background_sampling import (
     STAGE3_PROCESS_EVIDENCE_SCHEMA,
     assess_background_process,
@@ -124,6 +126,348 @@ def _stage3_color_shift(
             )
         )
     return max(shifts) if shifts else 0.0
+
+
+def _stage3_verified_background_color_normalization(
+    before: Dict[str, Any],
+    candidate: Dict[str, Any],
+    final_output_validation: Dict[str, Any],
+    *,
+    gate_profile: str,
+) -> Dict[str, Any]:
+    """Identify a fully evidenced Stage 3 sky-color normalization false alarm."""
+    report: Dict[str, Any] = {
+        "schema": "starun.stage3-verified-background-color-normalization.v1",
+        "applied": False,
+        "accepted": False,
+        "reason_code": "not_applicable",
+    }
+    generic_warning = "candidate does not meet clean-output sufficiency thresholds"
+    warnings = list(candidate.get("gate_warnings") or [])
+    if normalize_stage3_gate_profile(gate_profile) != "output_first":
+        report["reason_code"] = "strict_profile"
+        return report
+    if str(candidate.get("source") or "") != "builtin":
+        report["reason_code"] = "non_builtin_candidate"
+        return report
+    if warnings != [generic_warning]:
+        report["reason_code"] = "candidate_has_non_sufficiency_warnings"
+        return report
+
+    after = candidate.get("after_adaptive") or {}
+    preservation = candidate.get("preservation") or {}
+    score_components = candidate.get("background_score_components") or {}
+    components = score_components.get("components") or {}
+    weighted = score_components.get("weighted_components") or {}
+    raw_score = float(candidate.get("score", math.inf) or math.inf)
+    color_shift = float(components.get("color_shift", math.inf) or math.inf)
+    color_penalty = float(weighted.get("color_shift", math.inf) or math.inf)
+    effective_score = raw_score - color_penalty
+    max_score = float(
+        stage3_gate_thresholds("output_first")[
+            "sufficient_max_background_score"
+        ]
+    )
+
+    def finite_metric(mapping: Dict[str, Any], key: str, default: float) -> float:
+        try:
+            value = float(mapping.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return value if math.isfinite(value) else default
+
+    def neutral_distance(mapping: Dict[str, Any]) -> float:
+        return sum(
+            abs(finite_metric(mapping, key, math.inf) - 1.0)
+            for key in ("red_dominance", "blue_dominance", "green_cast")
+        )
+
+    before_std = max(finite_metric(before, "bg_std", math.inf), 1.0e-7)
+    after_std = finite_metric(after, "bg_std", math.inf)
+    before_gradient = finite_metric(before, "gradient_score", math.inf)
+    after_gradient = finite_metric(after, "gradient_score", math.inf)
+    before_neutrality = neutral_distance(before)
+    after_neutrality = neutral_distance(after)
+    final_pixel_gate = final_output_validation.get("pixel_integrity_gate") or {}
+    gate_checks = {
+        name: bool((candidate.get(name) or {}).get("accepted", False))
+        for name in (
+            "pixel_integrity_gate",
+            "target_fidelity_gate",
+            "validation_gate",
+            "pattern_quality_gate",
+        )
+    }
+    thresholds = {
+        "raw_score_min": max_score,
+        "effective_score_max": max_score,
+        "color_shift_min": float(
+            stage3_gate_thresholds("output_first")[
+                "sufficient_color_shift_max"
+            ]
+        ),
+        "neutral_distance_ratio_max": 0.50,
+        "gradient_after_max": 0.04,
+        "gradient_retention_ratio_max": 0.50,
+        "dirty_background_score_max": 0.05,
+        "chroma_noise_score_max": 0.05,
+        "bg_std_growth_max": 1.0,
+        "target_flux_retention_min": 0.95,
+        "target_flux_retention_max": 1.05,
+        "target_morphology_correlation_min": 0.98,
+        "target_centroid_shift_fraction_max": 0.02,
+        "target_change_residual_significance_max": 1.0,
+    }
+    evidence = {
+        "raw_score": raw_score,
+        "color_shift": color_shift,
+        "color_shift_penalty": color_penalty,
+        "effective_score_without_verified_color_normalization": effective_score,
+        "before_neutral_distance": before_neutrality,
+        "after_neutral_distance": after_neutrality,
+        "neutral_distance_ratio": (
+            after_neutrality / before_neutrality
+            if before_neutrality > 1.0e-12
+            else math.inf
+        ),
+        "gradient_before": before_gradient,
+        "gradient_after": after_gradient,
+        "dirty_background_score_after": finite_metric(
+            after, "dirty_background_score", math.inf
+        ),
+        "chroma_noise_score_after": finite_metric(
+            after, "chroma_noise_score", math.inf
+        ),
+        "bg_std_growth": after_std / before_std,
+        "color_balance_before": finite_metric(
+            before, "color_balance_score", -math.inf
+        ),
+        "color_balance_after": finite_metric(
+            after, "color_balance_score", -math.inf
+        ),
+        "target_flux_retention_ratio": finite_metric(
+            preservation, "target_flux_retention_ratio", math.inf
+        ),
+        "target_morphology_correlation": finite_metric(
+            preservation, "target_morphology_correlation", -math.inf
+        ),
+        "target_centroid_shift_fraction": finite_metric(
+            preservation, "target_centroid_shift_fraction", math.inf
+        ),
+        "target_change_residual_significance": finite_metric(
+            preservation, "target_change_residual_significance", math.inf
+        ),
+        "candidate_gate_checks": gate_checks,
+        "final_output_accepted": bool(
+            final_output_validation.get("accepted", False)
+        ),
+        "final_output_severity": str(
+            final_output_validation.get("severity") or ""
+        ),
+        "final_pixel_gate_accepted": bool(final_pixel_gate.get("accepted", False)),
+    }
+    issues: List[str] = []
+    if not all(gate_checks.values()):
+        issues.append("candidate_quality_gate_not_fully_accepted")
+    if not bool(candidate.get("hard_gate_metrics_available", False)):
+        issues.append("candidate_hard_gate_metrics_unavailable")
+    if not (
+        evidence["final_output_accepted"]
+        and evidence["final_output_severity"] == "normal"
+        and evidence["final_pixel_gate_accepted"]
+    ):
+        issues.append("final_saved_output_not_normally_accepted")
+    if not raw_score > thresholds["raw_score_min"]:
+        issues.append("raw_score_was_not_color_shift_limited")
+    if not effective_score <= thresholds["effective_score_max"]:
+        issues.append("non_color_background_score_remains_high")
+    if not color_shift > thresholds["color_shift_min"]:
+        issues.append("color_shift_did_not_trigger_sufficiency")
+    if not (
+        evidence["neutral_distance_ratio"]
+        <= thresholds["neutral_distance_ratio_max"]
+        and evidence["color_balance_after"] >= evidence["color_balance_before"]
+    ):
+        issues.append("sky_color_did_not_converge_toward_neutral")
+    if not (
+        after_gradient <= thresholds["gradient_after_max"]
+        and after_gradient
+        <= before_gradient * thresholds["gradient_retention_ratio_max"]
+    ):
+        issues.append("held_out_gradient_not_materially_reduced")
+    if not (
+        evidence["dirty_background_score_after"]
+        <= thresholds["dirty_background_score_max"]
+        and evidence["chroma_noise_score_after"]
+        <= thresholds["chroma_noise_score_max"]
+        and evidence["bg_std_growth"] <= thresholds["bg_std_growth_max"]
+    ):
+        issues.append("clean_background_evidence_failed")
+    if not (
+        thresholds["target_flux_retention_min"]
+        <= evidence["target_flux_retention_ratio"]
+        <= thresholds["target_flux_retention_max"]
+        and evidence["target_morphology_correlation"]
+        >= thresholds["target_morphology_correlation_min"]
+        and evidence["target_centroid_shift_fraction"]
+        <= thresholds["target_centroid_shift_fraction_max"]
+        and evidence["target_change_residual_significance"]
+        <= thresholds["target_change_residual_significance_max"]
+    ):
+        issues.append("target_signal_preservation_evidence_failed")
+
+    report.update(
+        accepted=not issues,
+        applied=not issues,
+        reason_code=(
+            "verified_background_color_normalization" if not issues else issues[0]
+        ),
+        evidence=evidence,
+        thresholds=thresholds,
+        issues=issues,
+        cleared_warning=(generic_warning if not issues else None),
+    )
+    return report
+
+
+def _stage3_color_normalization_candidate_evidence(
+    candidate: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Let a strongly preserved built-in candidate enter the clean tier.
+
+    This does not clear review by itself.  The selected, saved output must still
+    pass :func:`_stage3_verified_background_color_normalization` before the
+    generic sufficiency warning can be removed.
+    """
+    generic_warning = "candidate does not meet clean-output sufficiency thresholds"
+    report: Dict[str, Any] = {
+        "schema": "starun.stage3-color-normalization-candidate-evidence.v1",
+        "eligible": False,
+        "reason_code": "not_applicable",
+    }
+    if str(candidate.get("source") or "") != "builtin":
+        report["reason_code"] = "non_builtin_candidate"
+        return report
+    if list(candidate.get("gate_warnings") or []) != [generic_warning]:
+        report["reason_code"] = "candidate_has_non_sufficiency_warnings"
+        return report
+
+    def finite(mapping: Dict[str, Any], key: str, default: float) -> float:
+        try:
+            value = float(mapping.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return value if math.isfinite(value) else default
+
+    after = candidate.get("after_adaptive") or {}
+    preservation = candidate.get("preservation") or {}
+    score_components = candidate.get("background_score_components") or {}
+    components = score_components.get("components") or {}
+    weighted = score_components.get("weighted_components") or {}
+    raw_score = finite(candidate, "score", math.inf)
+    color_shift = finite(components, "color_shift", math.inf)
+    color_penalty = finite(weighted, "color_shift", math.inf)
+    effective_score = raw_score - color_penalty
+    thresholds = {
+        "background_score_max": float(
+            stage3_gate_thresholds("output_first")[
+                "sufficient_max_background_score"
+            ]
+        ),
+        "color_shift_min": float(
+            stage3_gate_thresholds("output_first")[
+                "sufficient_color_shift_max"
+            ]
+        ),
+        "gradient_after_max": 0.04,
+        "dirty_background_score_max": 0.05,
+        "chroma_noise_score_max": 0.05,
+        "target_flux_retention_min": 0.95,
+        "target_flux_retention_max": 1.05,
+        "target_morphology_correlation_min": 0.98,
+        "target_centroid_shift_fraction_max": 0.02,
+        "target_change_residual_significance_max": 1.0,
+    }
+    gate_checks = {
+        name: bool((candidate.get(name) or {}).get("accepted", False))
+        for name in (
+            "pixel_integrity_gate",
+            "target_fidelity_gate",
+            "validation_gate",
+            "pattern_quality_gate",
+        )
+    }
+    evidence = {
+        "raw_score": raw_score,
+        "color_shift": color_shift,
+        "color_shift_penalty": color_penalty,
+        "effective_score_without_color_shift": effective_score,
+        "gradient_after": finite(after, "gradient_score", math.inf),
+        "dirty_background_score_after": finite(
+            after, "dirty_background_score", math.inf
+        ),
+        "chroma_noise_score_after": finite(
+            after, "chroma_noise_score", math.inf
+        ),
+        "target_flux_retention_ratio": finite(
+            preservation, "target_flux_retention_ratio", math.inf
+        ),
+        "target_morphology_correlation": finite(
+            preservation, "target_morphology_correlation", -math.inf
+        ),
+        "target_centroid_shift_fraction": finite(
+            preservation, "target_centroid_shift_fraction", math.inf
+        ),
+        "target_change_residual_significance": finite(
+            preservation, "target_change_residual_significance", math.inf
+        ),
+        "candidate_gate_checks": gate_checks,
+    }
+    issues: List[str] = []
+    if not all(gate_checks.values()):
+        issues.append("candidate_quality_gate_not_fully_accepted")
+    if not bool(candidate.get("hard_gate_metrics_available", False)):
+        issues.append("candidate_hard_gate_metrics_unavailable")
+    if not (
+        raw_score > thresholds["background_score_max"]
+        and effective_score <= thresholds["background_score_max"]
+        and color_shift > thresholds["color_shift_min"]
+    ):
+        issues.append("generic_warning_not_isolated_to_color_shift")
+    if not (
+        evidence["gradient_after"] <= thresholds["gradient_after_max"]
+        and evidence["dirty_background_score_after"]
+        <= thresholds["dirty_background_score_max"]
+        and evidence["chroma_noise_score_after"]
+        <= thresholds["chroma_noise_score_max"]
+    ):
+        issues.append("candidate_background_not_clean")
+    if not (
+        thresholds["target_flux_retention_min"]
+        <= evidence["target_flux_retention_ratio"]
+        <= thresholds["target_flux_retention_max"]
+        and evidence["target_morphology_correlation"]
+        >= thresholds["target_morphology_correlation_min"]
+        and evidence["target_centroid_shift_fraction"]
+        <= thresholds["target_centroid_shift_fraction_max"]
+        and evidence["target_change_residual_significance"]
+        <= thresholds["target_change_residual_significance_max"]
+    ):
+        issues.append("candidate_target_signal_not_strongly_preserved")
+
+    report.update(
+        eligible=not issues,
+        reason_code=(
+            "candidate_color_normalization_evidence_ready"
+            if not issues
+            else issues[0]
+        ),
+        evidence=evidence,
+        thresholds=thresholds,
+        issues=issues,
+        final_saved_output_revalidation_required=True,
+    )
+    return report
 
 
 def _stage3_policy_float(
@@ -940,9 +1284,21 @@ def _stage3_statistical_shadow_selection(
         )
         runtime_score = finite_value(candidate.get("score"), 999.0)
         gate_warnings = list(candidate.get("gate_warnings") or [])
-        soft_warning_count = len(gate_warnings)
-        candidate_tier = 0 if not gate_warnings and bool(
-            candidate.get("sufficient", True)
+        color_normalization_evidence = (
+            _stage3_color_normalization_candidate_evidence(candidate)
+        )
+        color_normalization_eligible = bool(
+            color_normalization_evidence.get("eligible", False)
+        )
+        soft_warning_count = 0 if color_normalization_eligible else len(
+            gate_warnings
+        )
+        candidate_tier = 0 if (
+            color_normalization_eligible
+            or (
+                not gate_warnings
+                and bool(candidate.get("sufficient", True))
+            )
         ) else 1
         uncertainty_3sigma = gate.get("sampling_uncertainty_3sigma")
         span_improvement = gate.get("span_improvement")
@@ -967,6 +1323,12 @@ def _stage3_statistical_shadow_selection(
                 "candidate_tier": candidate_tier,
                 "soft_warning_count": soft_warning_count,
                 "gate_warnings": gate_warnings,
+                "verified_color_normalization_candidate": (
+                    color_normalization_eligible
+                ),
+                "color_normalization_candidate_evidence": (
+                    color_normalization_evidence
+                ),
                 "runtime_selected": str(candidate.get("label") or "")
                 == current_label,
                 "residual_span": residual_span,
@@ -1057,6 +1419,158 @@ def _stage3_statistical_shadow_selection(
         "statistical_order": [str(row["label"]) for row in shadow_order],
         "candidates": shadow_order,
     }
+
+
+def _stage3_outer_halo_selection_override(
+    legacy_selected: Dict[str, Any],
+    statistical_selected: Dict[str, Any],
+    stage3_policy: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Keep the safer low-order model when an outer-halo RBF is not better.
+
+    Large galaxies can occupy enough of the frame that a locally smoother RBF
+    residual is achieved by fitting real outer-halo signal.  Only override the
+    statistical order when the Polynomial candidate has the better aggregate
+    background score and no worse fixed-target fidelity.
+    """
+
+    report: Dict[str, Any] = {
+        "applied": False,
+        "reason_code": "not_applicable",
+    }
+    if not bool(stage3_policy.get("protect_outer_halo", False)):
+        return statistical_selected, report
+    legacy_label = str(legacy_selected.get("label") or "").lower()
+    selected_label = str(statistical_selected.get("label") or "").lower()
+    if "poly" not in legacy_label or "rbf" not in selected_label:
+        return statistical_selected, report
+
+    def finite(value: Any, default: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if math.isfinite(parsed) else default
+
+    legacy_score = finite(legacy_selected.get("score"), 999.0)
+    selected_score = finite(statistical_selected.get("score"), 999.0)
+    legacy_preservation = legacy_selected.get("preservation") or {}
+    selected_preservation = statistical_selected.get("preservation") or {}
+    legacy_flux_error = abs(
+        finite(legacy_preservation.get("target_flux_retention_ratio"), 1.0)
+        - 1.0
+    )
+    selected_flux_error = abs(
+        finite(selected_preservation.get("target_flux_retention_ratio"), 1.0)
+        - 1.0
+    )
+    legacy_morphology_loss = max(
+        0.0,
+        1.0
+        - finite(
+            legacy_preservation.get("target_morphology_correlation"),
+            1.0,
+        ),
+    )
+    selected_morphology_loss = max(
+        0.0,
+        1.0
+        - finite(
+            selected_preservation.get("target_morphology_correlation"),
+            1.0,
+        ),
+    )
+    legacy_validation = legacy_selected.get("validation") or {}
+    selected_validation = statistical_selected.get("validation") or {}
+    legacy_residual_span = finite(
+        legacy_validation.get("robust_span"),
+        float("inf"),
+    )
+    selected_residual_span = finite(
+        selected_validation.get("robust_span"),
+        float("inf"),
+    )
+    selected_centroid_shift = abs(
+        finite(
+            selected_preservation.get("target_centroid_shift_fraction"),
+            float("inf"),
+        )
+    )
+    # A low-order preference must not preserve a visible coverage boundary.
+    # Retain the statistically selected RBF only when its held-out residual
+    # span is materially smaller and every fixed-target fidelity measurement
+    # remains inside a deliberately tight budget.  The bounded aggregate-score
+    # allowance prevents a small colour/noise term from overruling the direct
+    # spatial-background evidence while still rejecting broadly worse models.
+    materially_cleaner_background = bool(
+        math.isfinite(legacy_residual_span)
+        and legacy_residual_span > 0.0
+        and math.isfinite(selected_residual_span)
+        and selected_residual_span
+        <= 0.50 * legacy_residual_span
+    )
+    aggregate_score_bounded = bool(
+        math.isfinite(legacy_score)
+        and legacy_score > 0.0
+        and math.isfinite(selected_score)
+        and selected_score <= 1.15 * legacy_score
+    )
+    selected_fidelity_bounded = bool(
+        selected_flux_error <= 0.01
+        and selected_morphology_loss <= 1.0e-4
+        and selected_centroid_shift <= 0.005
+    )
+    if (
+        materially_cleaner_background
+        and aggregate_score_bounded
+        and selected_fidelity_bounded
+    ):
+        return statistical_selected, {
+            "applied": False,
+            "reason_code": (
+                "rbf_material_background_gain_within_outer_halo_fidelity_budget"
+            ),
+            "preserved_statistical_selection": True,
+            "statistical_candidate": statistical_selected.get("label"),
+            "selected_candidate": statistical_selected.get("label"),
+            "aggregate_background_score": {
+                "polynomial": legacy_score,
+                "rbf": selected_score,
+                "rbf_to_polynomial_max": 1.15,
+            },
+            "residual_span": {
+                "polynomial": legacy_residual_span,
+                "rbf": selected_residual_span,
+                "rbf_to_polynomial_max": 0.50,
+            },
+            "target_flux_deviation": selected_flux_error,
+            "target_morphology_loss": selected_morphology_loss,
+            "target_centroid_shift_fraction": selected_centroid_shift,
+        }
+    if (
+        selected_score >= legacy_score
+        and selected_flux_error >= legacy_flux_error
+        and selected_morphology_loss >= legacy_morphology_loss
+    ):
+        return legacy_selected, {
+            "applied": True,
+            "reason_code": "outer_halo_low_order_fidelity_preferred",
+            "statistical_candidate": statistical_selected.get("label"),
+            "selected_candidate": legacy_selected.get("label"),
+            "aggregate_background_score": {
+                "polynomial": legacy_score,
+                "rbf": selected_score,
+            },
+            "target_flux_deviation": {
+                "polynomial": legacy_flux_error,
+                "rbf": selected_flux_error,
+            },
+            "target_morphology_loss": {
+                "polynomial": legacy_morphology_loss,
+                "rbf": selected_morphology_loss,
+            },
+        }
+    return statistical_selected, report
 
 
 def _stage3_final_output_validation(
@@ -2032,12 +2546,55 @@ def run_stage3_background_extraction(pipeline) -> None:
             pipeline.log.warn(f"failed to restore stage3 baseline ({context}): {e}")
             return False
 
-    before_feat = pipeline._stage3_measure_features("before")
     before_image = None
     try:
         before_image = pipeline.siril.get_image_pixeldata(preview=False)
     except (CommandError, SirilError, OSError, RuntimeError, TypeError, ValueError) as e:
         pipeline.log.debug(f"stage3 baseline image sampling skipped: {e}")
+    scene_support_runtime: Dict[str, Any] = {
+        "status": "unavailable",
+        "manifest": scene_support.unavailable_scene_support(
+            "stage3 baseline pixels unavailable",
+            reason_code="stage3_scene_support_pixels_unavailable",
+        ),
+        "valid_mask": None,
+        "saturation_map": None,
+    }
+    if getattr(pipeline, "process_dir", None) is not None:
+        try:
+            if before_image is None:
+                manifest = scene_support.write_unavailable_scene_support(
+                    pipeline.process_dir,
+                    "stage3 baseline pixels unavailable",
+                    reason_code="stage3_scene_support_pixels_unavailable",
+                )
+                scene_support_runtime["manifest"] = manifest
+            else:
+                scene_support.build_scene_support(
+                    before_image,
+                    pipeline.process_dir,
+                    source_path=pipeline.process_dir / f"{baseline_stem}.fit",
+                )
+                scene_support_runtime = scene_support.load_scene_support(
+                    pipeline.process_dir,
+                    expected_shape=tuple(np.asarray(before_image).shape),
+                )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            pipeline.log.debug(f"stage3 shared scene support unavailable: {error}")
+            try:
+                manifest = scene_support.write_unavailable_scene_support(
+                    pipeline.process_dir,
+                    str(error),
+                    reason_code="stage3_scene_support_build_failed",
+                )
+                scene_support_runtime["manifest"] = manifest
+            except OSError:
+                pass
+    pipeline._stage3_scene_support = scene_support_runtime
+    scene_support_report = scene_support.scene_support_summary(
+        scene_support_runtime
+    )
+    before_feat = pipeline._stage3_measure_features("before")
     before_adaptive = (
         pipeline._adaptive_features_current()
         if hasattr(pipeline, "_adaptive_features_current")
@@ -2079,6 +2636,8 @@ def run_stage3_background_extraction(pipeline) -> None:
 
     attempt_records: List[Dict[str, Any]] = []
     selected_preservation: Dict[str, Any] = {}
+    selected: Dict[str, Any] = {}
+    selected_loaded = False
     accepted_candidates: List[Dict[str, Any]] = []
     builtin_sufficient = False
     graxpert_attempted = False
@@ -2087,6 +2646,12 @@ def run_stage3_background_extraction(pipeline) -> None:
     selected_label = ""
     selected_gate_warnings: List[str] = []
     selected_pattern_report: Dict[str, Any] = {}
+    verified_color_normalization: Dict[str, Any] = {
+        "schema": "starun.stage3-verified-background-color-normalization.v1",
+        "applied": False,
+        "accepted": False,
+        "reason_code": "not_evaluated",
+    }
     builtin_order_reason = "safe_samples_rbf_before_poly"
     builtin_search_mode = "safe_samples_primary"
     diffuse_context: Dict[str, Any] = {}
@@ -2158,6 +2723,9 @@ def run_stage3_background_extraction(pipeline) -> None:
     )
 
     if before_image is not None:
+        shared_manifest = scene_support_runtime.get("manifest") or {}
+        shared_components = shared_manifest.get("components") or {}
+        shared_catalog = shared_components.get("star_catalog") or {}
         safe_sample_points, safe_sample_report = build_safe_background_samples(
             before_image,
             target_count=_stage3_cfg_int(
@@ -2196,6 +2764,13 @@ def run_stage3_background_extraction(pipeline) -> None:
                 0.75,
             ),
             candidate_refinement=not sample_refinement_blocked,
+            shared_valid_mask=scene_support_runtime.get("valid_mask"),
+            shared_saturation_map=scene_support_runtime.get("saturation_map"),
+            shared_star_catalog=(
+                shared_catalog.get("records")
+                if shared_catalog.get("status") == "available"
+                else None
+            ),
         )
     else:
         safe_sample_report = {
@@ -2459,6 +3034,7 @@ def run_stage3_background_extraction(pipeline) -> None:
                     "directional_pattern_noise": pattern_report,
                     "noise_route": noise_route,
                     "safe_samples": safe_sample_report,
+                    "shared_scene_support": scene_support_report,
                     "before": before_adaptive,
                     "after": after_adaptive,
                     "quality": (
@@ -3938,6 +4514,12 @@ def run_stage3_background_extraction(pipeline) -> None:
             ),
             legacy_selected,
         )
+        selected, outer_halo_selection = _stage3_outer_halo_selection_override(
+            legacy_selected,
+            selected,
+            stage3_policy,
+        )
+        selection_shadow["outer_halo_safety_override"] = outer_halo_selection
         selection_shadow["recommended_candidate"] = str(
             selected.get("label") or ""
         )
@@ -3950,6 +4532,12 @@ def run_stage3_background_extraction(pipeline) -> None:
                 "[Stage3] Statistical selection applied: "
                 f"legacy={legacy_selected.get('label')} "
                 f"selected={selected.get('label')}"
+            )
+        elif outer_halo_selection.get("applied"):
+            pipeline.log.info(
+                "[Stage3] Outer-halo safety override kept "
+                f"{selected.get('label')} instead of "
+                f"{outer_halo_selection.get('statistical_candidate')}"
             )
         selected_loaded = False
         try:
@@ -4098,6 +4686,62 @@ def run_stage3_background_extraction(pipeline) -> None:
             compound_selected = False
             compound_selected_degraded = False
             pipeline._stage3_pattern_noise_report["selected_candidate"] = None
+        elif selected_loaded:
+            verified_color_normalization = (
+                _stage3_verified_background_color_normalization(
+                    before_adaptive,
+                    selected,
+                    final_output_validation,
+                    gate_profile=gate_profile,
+                )
+            )
+            final_output_validation["verified_background_color_normalization"] = (
+                verified_color_normalization
+            )
+            if verified_color_normalization.get("applied", False):
+                cleared_warning = str(
+                    verified_color_normalization.get("cleared_warning") or ""
+                )
+                selected_gate_warnings = [
+                    warning
+                    for warning in selected_gate_warnings
+                    if str(warning) != cleared_warning
+                ]
+                selected["gate_warnings"] = list(selected_gate_warnings)
+                selected["severity"] = (
+                    "soft_warning" if selected_gate_warnings else "normal"
+                )
+                selected["verified_background_color_normalization"] = (
+                    verified_color_normalization
+                )
+                for record in attempt_records:
+                    if str(record.get("label") or "") == str(
+                        selected.get("label") or ""
+                    ):
+                        record["gate_warnings"] = list(selected_gate_warnings)
+                        record["severity"] = selected["severity"]
+                        record["status"] = (
+                            "accepted_with_warnings"
+                            if selected_gate_warnings
+                            else "accepted_verified_color_normalization"
+                        )
+                        record[
+                            "verified_background_color_normalization"
+                        ] = verified_color_normalization
+                        break
+                pipeline.log.info(
+                    "[Stage3] Verified background color normalization cleared "
+                    "the generic clean-output sufficiency warning"
+                )
+                normalization_note = (
+                    "verified background color normalization; target flux, "
+                    "morphology, centroid, held-out sky and saved pixels accepted"
+                )
+                stage_message = (
+                    f"{stage_message}; {normalization_note}"
+                    if stage_message
+                    else normalization_note
+                )
     elif bg_ok:
         final_output_validation = {
             "status": "not_run",
@@ -4274,6 +4918,7 @@ def run_stage3_background_extraction(pipeline) -> None:
                 "compound_fallback": compound_report,
                 "diffuse_nebula_context": diffuse_context,
                 "safe_samples": safe_sample_report,
+                "shared_scene_support": scene_support_report,
                 "subsky_existing_enforced": True,
                 "directional_pattern_noise": pattern_report,
                 "selected_directional_pattern_noise": (
@@ -4298,6 +4943,9 @@ def run_stage3_background_extraction(pipeline) -> None:
                 "selection": selection_shadow,
                 "selection_shadow": selection_shadow,
                 "selected_gate_warnings": selected_gate_warnings,
+                "verified_background_color_normalization": (
+                    verified_color_normalization
+                ),
                 "final_output_validation": final_output_validation,
                 "rollback_events": rollback_events,
                 "selected_preservation": selected_preservation,

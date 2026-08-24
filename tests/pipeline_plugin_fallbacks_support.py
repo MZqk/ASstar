@@ -225,8 +225,24 @@ def stage9_star_remixing(processor):
                 selected_quality.get("formula") or "screen"
             ),
             "catalog_visibility_groups_passed": True,
+            "sep_crossmatch_accepted": True,
             "test_double_compatibility": True,
         }
+        sep_summary = {
+            "schema": "starun.stage9-sep-crossmatch.v1",
+            "status": "ok",
+            "accepted": True,
+            "reason_code": "test_double_sep_crossmatch_compatibility",
+            "artifact": "stage9_sep_crossmatch.json",
+            "artifact_sha256": "0" * 64,
+            "test_double_compatibility": True,
+        }
+        report["sep_crossmatch"] = sep_summary
+        pipeline._stage9_sep_crossmatch_report = {
+            **sep_summary,
+            "formal_gate_applied": True,
+        }
+        pipeline._stage9_sep_crossmatch_summary = sep_summary
         pipeline._stage9_persisted_output_validation = report
         return report
 

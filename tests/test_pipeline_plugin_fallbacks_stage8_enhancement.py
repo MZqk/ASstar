@@ -4,6 +4,109 @@ from tests.pipeline_plugin_fallbacks_support import *  # noqa: F401,F403
 
 
 class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBase):
+    def _star_preserve_nebulosity_processor(self):
+        processor = self._new_processor()
+        processor._star_preserve_target_bypass = True
+        processor._stage7_stretch_accepted = True
+        processor._stage7_stretch_output = "stage7_stretched"
+        processor.target_profile = {
+            "primary_target": {
+                "name": "NGC6910",
+                "type": "open_cluster",
+                "frozen": True,
+            },
+            "secondary_labels": [
+                "bright_core",
+                "large_nebulosity",
+                "emission_red",
+            ],
+        }
+        height, width = 96, 128
+        y, x = np.mgrid[:height, :width]
+        diffuse = 0.04 + 0.12 * np.exp(
+            -(((x - 66) / 28.0) ** 2 + ((y - 48) / 20.0) ** 2)
+        )
+        processor.image_pixels = np.stack(
+            (diffuse * 1.20, diffuse * 0.92, diffuse * 0.75),
+            axis=0,
+        ).astype(np.float32)
+        for row, col in (
+            (20, 25),
+            (35, 55),
+            (45, 82),
+            (60, 42),
+            (70, 95),
+            (28, 106),
+        ):
+            processor.image_pixels[:, row - 1, col - 1] = (0.80, 0.75, 0.70)
+        processor.saved_image_pixels["stage7_stretched"] = (
+            processor.image_pixels.copy()
+        )
+        processor.siril.get_image_pixeldata = (
+            lambda preview=False: processor.image_pixels.copy()
+        )
+        processor.siril.set_image_pixeldata = lambda image: setattr(
+            processor,
+            "image_pixels",
+            np.asarray(image).copy(),
+        )
+        return processor
+
+    def test_stage8_star_preserve_nebulosity_overlay_restores_star_pixels(self):
+        processor = self._star_preserve_nebulosity_processor()
+        source = processor.image_pixels.copy()
+
+        output, report = (
+            pipeline_module.stage8_pixels.stage8_star_preserve_nebulosity_overlay(
+                processor,
+                source,
+            )
+        )
+
+        self.assertTrue(report["accepted"], report)
+        self.assertEqual(report["status"], "accepted")
+        self.assertEqual(
+            report["metrics"]["protected_star_max_abs_change"],
+            0.0,
+        )
+        self.assertGreater(report["metrics"]["changed_pixel_ratio"], 0.01)
+        self.assertGreater(float(np.max(np.abs(output - source))), 0.0)
+
+    def test_stage8_routes_stellar_primary_with_nebulosity_to_bounded_overlay(self):
+        processor = self._star_preserve_nebulosity_processor()
+
+        stage8_nebula_enhancement(processor)
+
+        report = processor.stage_json_reports["stage8_enhancement_report.json"]
+        self.assertEqual(report["mode"], "star_preserve_secondary_nebulosity")
+        self.assertTrue(report["secondary_context"]["primary_policy_unchanged"])
+        self.assertTrue(report["secondary_nebulosity_overlay"]["accepted"])
+        self.assertEqual(
+            processor._stage8_final_quality,
+            "star_preserve_secondary_nebulosity",
+        )
+        self.assertFalse(processor._stage8_handoff["passthrough"])
+        self.assertEqual(processor.results[-1][1], "ok")
+        self.assertEqual(
+            processor.result_metadata[-1]["execution"],
+            "completed",
+        )
+
+    def test_stage8_nebulosity_overlay_failure_preserves_stellar_route(self):
+        processor = self._star_preserve_nebulosity_processor()
+        processor.siril.get_image_pixeldata = lambda preview=False: None
+
+        stage8_nebula_enhancement(processor)
+
+        report = processor.stage_json_reports["stage8_enhancement_report.json"]
+        self.assertEqual(report["mode"], "star_preserve_target_bypass")
+        self.assertEqual(
+            report["secondary_nebulosity_overlay"]["status"],
+            "failed_safe_passthrough",
+        )
+        self.assertEqual(processor._stage8_final_quality, "star_preserve_bypass")
+        self.assertTrue(processor._stage8_handoff["passthrough"])
+
     def test_stage8_mixed_nebula_saturation_is_bounded_above_galaxy_route(self):
         galaxy_name, galaxy_bands = (
             pipeline_module.stage8_pixels.stage8_broadband_hue_saturation_bands(
@@ -27,6 +130,50 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
         self.assertLessEqual(
             max(band["amount"] for band in mixed_bands),
             0.05,
+        )
+
+    def test_stage8_resolved_mixed_composite_uses_larger_masked_color_budget(self):
+        standard_name, standard_bands = (
+            pipeline_module.stage8_pixels.stage8_broadband_hue_saturation_bands(
+                "bright_emission_reflection_nebula",
+                0.14,
+            )
+        )
+        composite_name, composite_bands = (
+            pipeline_module.stage8_pixels.stage8_broadband_hue_saturation_bands(
+                "bright_emission_reflection_nebula",
+                0.14,
+                mixed_composite=True,
+            )
+        )
+        processor = self._new_processor()
+        processor.target_profile = {
+            "primary_target": {
+                "name": "Lagoon Nebula",
+                "type": "bright_emission_reflection_nebula",
+                "confidence": 0.98,
+            },
+            "secondary_labels": ["emission_red", "reflection_blue"],
+            "composite_targets": [
+                {"name": "Lagoon Nebula"},
+                {"name": "Trifid Nebula"},
+            ],
+        }
+        context = (
+            pipeline_module.stage8_pixels.stage8_mixed_nebula_composite_context(
+                processor
+            )
+        )
+
+        self.assertEqual(standard_name, composite_name)
+        self.assertTrue(context["eligible"])
+        self.assertGreater(
+            max(band["amount"] for band in composite_bands),
+            max(band["amount"] for band in standard_bands),
+        )
+        self.assertLessEqual(
+            max(band["amount"] for band in composite_bands),
+            0.08,
         )
 
     def test_stage8_legacy_accepted_hdr_state_is_review_passthrough(self):
@@ -465,6 +612,76 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
         self.assertFalse(report["skip_enhancement"])
         self.assertTrue(report["background_available"])
         self.assertIn("stage7_quality_status=poor", report["subject_reasons"])
+
+    def test_stage8_input_guard_keeps_full_route_for_single_local_galaxy_halo(self):
+        image = np.full((3, 32, 32), 0.05, dtype=np.float32)
+        raw_local_halo = 1.376
+        probe = SimpleNamespace(
+            _stage8_handoff={
+                "processing_policy": "full",
+                "suppressed_advisories": [
+                    "galaxy_disk_halo_residue 1.376>0.480"
+                ],
+            },
+            _stage7_selected_quality={
+                "status": "ok",
+                "advisories": ["galaxy_disk_halo_residue 1.376>0.480"],
+                "quality_gates": {
+                    "galaxy_disk_halo_residue": {
+                        "status": "advisory",
+                        "hard_failed": False,
+                        "reason_code": "single_local_galaxy_halo_evidence",
+                    },
+                },
+                "derived": {
+                    "residual_star_score": 0.10,
+                    "halo_residue_score": raw_local_halo,
+                    "global_halo_residue_score": 0.0556,
+                    "compact_halo_residue_score": 0.1974,
+                    "galaxy_disk_halo_corroborated_local_count": 1,
+                    "starless_noise_gain": 1.0,
+                },
+            },
+            _stage7_starless_skipped=False,
+            cfg=SimpleNamespace(
+                stage8_processing_mode="auto",
+                stage8_masked_enhancement_enabled=True,
+                stage7_residual_star_score_max=0.45,
+                stage7_halo_residue_score_max=0.35,
+                stage7_starless_noise_gain_max=1.25,
+                stage8_mask_signal_coverage_min=0.002,
+            ),
+            siril=SimpleNamespace(
+                get_image_pixeldata=lambda preview=False: image.copy()
+            ),
+            _stage7_halo_residue_score=lambda: raw_local_halo,
+            _stage7_effective_halo_threshold=lambda: 0.48,
+            _active_target_type=lambda: "large_galaxy",
+            _stage8_generate_starless_masks=lambda _image: {
+                "background_mask": np.ones((32, 32), dtype=np.float32),
+                "coverage": {"nebula": 0.20, "faint_nebula": 0.10},
+            },
+            _stage8_starless_readiness_report=lambda _image, _masks: {
+                "schema": "starun.stage8-starless-readiness.v1",
+                "status": "reported",
+                "mode": "report_only",
+                "used_for_gate": False,
+            },
+            _short_text=lambda value, _limit=120: str(value),
+        )
+
+        report = pipeline_module.stage8_pixels.stage8_input_enhancement_guard(probe)
+
+        self.assertEqual(report["processing_policy"], "full")
+        self.assertFalse(report["background_only"])
+        self.assertEqual(report["subject_reasons"], [])
+        self.assertAlmostEqual(report["derived"]["halo_residue_score"], 0.1974)
+        self.assertAlmostEqual(
+            report["derived"]["raw_halo_residue_score"], raw_local_halo
+        )
+        self.assertTrue(
+            report["derived"]["single_local_galaxy_halo_override_active"]
+        )
 
     def test_stage8_user_mode_only_tightens_the_upstream_policy(self):
         td = tempfile.TemporaryDirectory()
@@ -1266,6 +1483,68 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
         self.assertTrue(
             any("broadband hue-selective saturation accepted" in item for item in messages),
             messages,
+        )
+
+    def test_stage8_resolved_mixed_composite_uses_budgeted_masked_chroma_recovery(self):
+        processor = pipeline_module.StarunPostProcessor()
+        processor._stage8_handoff = {"processing_policy": "full"}
+        processor._channel_semantics = "broadband_rgb_osc"
+        processor._active_target_type = lambda: "bright_emission_reflection_nebula"
+        processor._frozen_primary_target = {
+            "type": "bright_emission_reflection_nebula",
+            "confidence": 0.98,
+            "method": "catalog_name_wcs_composite_match",
+        }
+        processor.target_profile = {
+            "primary_target": {
+                **processor._frozen_primary_target,
+                "name": "Lagoon Nebula",
+            },
+            "secondary_labels": ["emission_red", "reflection_blue"],
+            "composite_targets": [
+                {"name": "Lagoon Nebula"},
+                {"name": "Trifid Nebula"},
+            ],
+        }
+        processor._stage7_halo_residue_score = lambda: 0.10
+        processor._stage7_effective_halo_threshold = lambda: 0.35
+        height, width = 120, 160
+        yy, xx = np.indices((height, width))
+        signal = np.exp(
+            -(((xx - 80) / 38.0) ** 2 + ((yy - 60) / 28.0) ** 2)
+        ).astype(np.float32)
+        image = np.full((3, height, width), 0.035, dtype=np.float32)
+        image += np.asarray([0.30, 0.14, 0.22], dtype=np.float32)[
+            :, None, None
+        ] * signal[None]
+
+        _enhanced, diagnostics, _messages = (
+            processor._apply_stage8_masked_pixel_enhancement(
+                image,
+                {"saturation": 0.14, "unsharp_amount": 0.0},
+                label="test",
+            )
+        )
+
+        operations = diagnostics["local_adjustment_engine"]["operations"]
+        operation_types = [operation["type"] for operation in operations]
+        self.assertEqual(operation_types.count("saturation"), 1)
+        self.assertEqual(operation_types.count("hue_selective_saturation"), 1)
+        broad = next(
+            operation
+            for operation in operations
+            if operation["type"] == "saturation"
+        )
+        self.assertLessEqual(broad["effective_amount_peak"], 0.115)
+        self.assertEqual(
+            diagnostics["local_adjustment_engine"]["metrics"]["clip_growth"],
+            0.0,
+        )
+        self.assertEqual(
+            diagnostics["local_adjustment_engine"]["metrics"][
+                "outside_mask_changed_ratio"
+            ],
+            0.0,
         )
 
     def test_stage8_selective_saturation_fails_closed_to_generic_routing(self):

@@ -1718,6 +1718,21 @@ class StageSupportMixin:
             derived = quality.get("derived") if isinstance(quality.get("derived"), dict) else {}
             residual = float(derived.get("residual_star_score", 0.0) or 0.0)
             halo = float(derived.get("halo_residue_score", 0.0) or 0.0)
+            if stage7_quality.stage7_single_local_galaxy_halo_override_active(
+                self,
+                quality,
+            ):
+                # Keep the local galaxy-disk measurement in the report, but do
+                # not let one uncorroborated sample revoke an otherwise safe
+                # starless pair at the final remix boundary.
+                halo = max(
+                    float(
+                        derived.get("global_halo_residue_score", 0.0) or 0.0
+                    ),
+                    float(
+                        derived.get("compact_halo_residue_score", 0.0) or 0.0
+                    ),
+                )
             noise_gain = float(derived.get("starless_noise_gain", 0.0) or 0.0)
             dynamic_range_ratio = float(
                 derived.get("starless_dynamic_range_ratio", 1.0) or 0.0
@@ -1807,6 +1822,7 @@ class StageSupportMixin:
                 "stage7_cand_rescue_1",
                 "stage7_cand_vivid_safe",
                 "stage7_cand_display90",
+                "stage7_cand_display86",
                 "stage7_cand_display82",
                 "stage7_cand_display70",
                 "stage7_cand_b",

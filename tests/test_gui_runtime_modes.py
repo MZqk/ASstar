@@ -599,6 +599,108 @@ class GuiRuntimeModesTests(unittest.TestCase):
         self.assertLess(calls.index("runtime_disk"), calls.index("seed"))
         self.assertTrue(any("跳过重复安装" in item for item in progress))
 
+    def test_session_spcc_cache_is_applied_after_capability_preflight(self):
+        manifest = {
+            "status": "ready",
+            "degraded_reasons": [],
+            "decisions": {
+                "stage4_color_calibration": {
+                    "status": "ready",
+                    "route": "physical_spcc_then_pcc",
+                    "spcc_available": True,
+                    "spcc_readiness": "online_unverified",
+                    "spcc_operational_verified": False,
+                    "commands": {"spcc": True, "pcc": True},
+                    "reason_codes": [
+                        "gaia_xp_endpoint_reachable_spcc_unverified"
+                    ],
+                    "skip_photometric_commands": [],
+                }
+            },
+            "capabilities": {
+                "siril": {
+                    "selected_path": "/app/Siril/siril-cli",
+                    "launch_probe": {"version": "siril 1.4.4"},
+                },
+                "network_endpoints": {
+                    "groups": {
+                        "gaia_xp": {
+                            "configured_endpoints": [
+                                "https://example.test/gaia-xp"
+                            ],
+                            "probes": [
+                                {
+                                    "url": "https://example.test/gaia-xp",
+                                    "reachable": True,
+                                    "status": "reachable",
+                                    "http_status": 206,
+                                }
+                            ],
+                        }
+                    }
+                },
+            },
+        }
+        cache_key = main_window_module.stage4_spcc_operational_cache_key(
+            manifest
+        )
+        self.assertIsNotNone(cache_key)
+        events = []
+        writes = []
+        proxy = SimpleNamespace(
+            _runtime_capability_manifest=manifest,
+            _spcc_operational_cache={
+                cache_key: {
+                    "status": "timeout",
+                    "label": "catalog:gaia",
+                    "spcc_readiness": "online_unverified",
+                }
+            },
+            _pending_runtime_overrides={},
+            _active_spcc_operational_cache_key=None,
+            _spcc_online_circuit_open=False,
+            _write_runtime_capability_manifest=lambda: writes.append(True),
+            _append_event=events.append,
+        )
+
+        main_window_module.StarunGui._apply_stage4_spcc_operational_cache_policy(
+            proxy
+        )
+
+        decision = manifest["decisions"]["stage4_color_calibration"]
+        self.assertEqual(proxy._active_spcc_operational_cache_key, cache_key)
+        self.assertEqual(
+            proxy._pending_runtime_overrides[
+                main_window_module.SPCC_OPERATIONAL_CACHE_ENV
+            ],
+            "operational_timeout_cached",
+        )
+        self.assertFalse(decision["commands"]["spcc"])
+        self.assertTrue(decision["commands"]["pcc"])
+        self.assertEqual(decision["route"], "physical_pcc_only")
+        self.assertEqual(writes, [True])
+        self.assertTrue(any("不再重复等待 SPCC" in item for item in events))
+
+    def test_bootstrap_success_applies_spcc_cache_before_pipeline_start(self):
+        calls = []
+        work_dir = Path("/tmp/starun-cache-timing")
+        proxy = SimpleNamespace(
+            _current_work_dir=work_dir,
+            _cleanup_bootstrap_worker=lambda: calls.append("cleanup"),
+            _apply_stage4_spcc_operational_cache_policy=lambda: calls.append(
+                "cache"
+            ),
+            _append_event=lambda _message: calls.append("event"),
+            _update_run_state=lambda **_kwargs: calls.append("state"),
+            _start_pipeline=lambda path, _estimate: calls.append(
+                ("start", path)
+            ),
+        )
+
+        main_window_module.StarunGui._on_bootstrap_succeeded(proxy, {})
+
+        self.assertLess(calls.index("cache"), calls.index(("start", work_dir)))
+
     def test_append_text_holds_log_lock_while_writing(self):
         lock = threading.Lock()
 

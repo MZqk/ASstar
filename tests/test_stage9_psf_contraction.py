@@ -185,6 +185,25 @@ class Stage9PsfContractionTests(unittest.TestCase):
         np.testing.assert_allclose(channel_gain[0], channel_gain[1], atol=1e-7)
         np.testing.assert_allclose(channel_gain[0], channel_gain[2], atol=1e-7)
 
+    def test_component_operator_allows_stronger_centroid_guarded_request(self) -> None:
+        stars, catalog, weak_mask, bright_mask, support = self._fixture()
+
+        contracted, report = stage9_quality.contract_star_layer_components(
+            stars,
+            catalog,
+            support_mask=support,
+            weak_mask=weak_mask,
+            bright_mask=bright_mask,
+            target_groups=("weak",),
+            gamma=3.2,
+        )
+
+        self.assertIsNotNone(contracted)
+        self.assertTrue(report["changed"], report)
+        self.assertEqual(report["gamma_bounds"], [1.0, 4.0])
+        self.assertLessEqual(report["centroid_drift_max_px"], 0.05)
+        self.assertTrue(report["peak_preserved"], report)
+
     def test_large_only_router_targets_failed_group_and_rejects_mixed_failure(self):
         pipeline = SimpleNamespace(
             cfg=SimpleNamespace(stage9_psf_fwhm_ratio_max=1.10)
@@ -211,6 +230,106 @@ class Stage9PsfContractionTests(unittest.TestCase):
                 mixed,
             )
         )
+
+    def test_asymmetric_component_uses_maximum_centroid_safe_gamma(self) -> None:
+        height = width = 64
+        yy, xx = np.indices((height, width))
+        weak = 0.30 * np.exp(
+            -((yy - 18.0) ** 2 + (xx - 18.0) ** 2) / (2.0 * 2.2**2)
+        )
+        weak += 0.14 * np.exp(
+            -((yy - 18.0) ** 2 + (xx - 22.0) ** 2) / (2.0 * 1.8**2)
+        )
+        bright = 0.82 * np.exp(
+            -((yy - 45.0) ** 2 + (xx - 44.0) ** 2) / (2.0 * 2.2**2)
+        )
+        scalar = (weak + bright).astype(np.float32)
+        stars = np.stack((scalar, scalar * 0.70, scalar * 0.40))
+        cfg = SimpleNamespace(
+            stage9_star_reference_sigma=3.0,
+            stage9_mixed_star_weak_count_min=1,
+            stage9_mixed_star_bright_count_min=1,
+            stage9_mixed_star_peak_ratio_min=2.0,
+        )
+        catalog = stage9_quality.build_star_reference_catalog(
+            stars,
+            cfg,
+            background=0.0,
+            noise_sigma=0.001,
+        )
+        weak_mask, bright_mask, support = (
+            stage9_quality.build_star_overlay_masks(
+                catalog,
+                strict=False,
+                cfg=cfg,
+            )
+        )
+
+        contracted, report = stage9_quality.contract_star_layer_components(
+            stars,
+            catalog,
+            support_mask=support,
+            weak_mask=weak_mask,
+            bright_mask=bright_mask,
+            target_groups=("weak",),
+            gamma=2.5,
+        )
+
+        self.assertIsNotNone(contracted)
+        self.assertEqual(report["centroid_guard_adjusted_component_count"], 1)
+        self.assertEqual(
+            report["centroid_moment_compensated_component_count"],
+            0,
+        )
+        self.assertEqual(report["centroid_guard_backoff_component_count"], 1)
+        self.assertEqual(report["centroid_guard_skipped_component_count"], 0)
+        self.assertEqual(report["centroid_compensation_pixel_count"], 0)
+        self.assertEqual(
+            report["centroid_guard_strategy"],
+            "per_component_uniform_gamma_backoff",
+        )
+        self.assertGreater(report["effective_gamma"]["median"], 1.0)
+        self.assertLess(report["effective_gamma"]["median"], 2.5)
+        self.assertLessEqual(report["centroid_drift_max_px"], 0.05)
+        self.assertTrue(report["peak_preserved"], report)
+
+    def test_compact_support_feathers_only_the_adjacent_source_ring(self) -> None:
+        stars = np.ones((3, 9, 9), dtype=np.float32)
+        support = np.zeros((9, 9), dtype=bool)
+        support[4, 4] = True
+
+        compact = stage9_quality.apply_compact_starmask_support(
+            stars,
+            support,
+        )
+
+        np.testing.assert_array_equal(compact[:, support], stars[:, support])
+        self.assertGreater(float(compact[0, 4, 5]), 0.0)
+        self.assertGreater(float(compact[0, 3, 3]), 0.0)
+        self.assertLess(float(compact[0, 3, 3]), float(compact[0, 4, 5]))
+        self.assertEqual(float(compact[0, 4, 6]), 0.0)
+
+    def test_calibrated_curve_uses_the_same_tapered_support(self) -> None:
+        stars = np.full((3, 9, 9), 0.5, dtype=np.float32)
+        support = np.zeros((9, 9), dtype=bool)
+        support[4, 4] = True
+        calibration = {
+            "_compact_support_mask": support,
+            "anchor_input_values": [1.0e-6, 0.5, 1.0],
+            "anchor_output_targets": [0.0, 0.5, 1.0],
+            "chroma_regularization_enabled": False,
+        }
+
+        curved = stage9_quality.apply_calibrated_starmask(
+            stars,
+            calibration,
+        )
+
+        self.assertEqual(float(curved[0, 4, 4]), 0.5)
+        self.assertGreater(float(curved[0, 4, 5]), 0.0)
+        self.assertGreater(float(curved[0, 3, 3]), 0.0)
+        self.assertLess(float(curved[0, 3, 3]), float(curved[0, 4, 5]))
+        self.assertEqual(float(curved[0, 4, 6]), 0.0)
 
     def test_search_selects_formal_candidate_closest_to_source_psf(self) -> None:
         stars, catalog, weak_mask, bright_mask, support = self._fixture()
@@ -270,11 +389,18 @@ class Stage9PsfContractionTests(unittest.TestCase):
             )
 
         self.assertTrue(selected["accepted"], selected)
-        self.assertAlmostEqual(selected["recovery_strength"], 1.9375)
+        self.assertAlmostEqual(selected["recovery_strength"], 1.502546414656)
         self.assertEqual(selected["recovery_target_groups"], ["weak"])
         self.assertEqual(
             len(selected["psf_contraction_candidate_comparison"]),
             3,
+        )
+        comparisons = selected["psf_contraction_candidate_comparison"]
+        self.assertAlmostEqual(comparisons[0]["feedback_input_ratio"], 1.18)
+        self.assertIn("feedback_next_gamma", comparisons[0])
+        self.assertNotEqual(
+            [round(item["gamma"], 4) for item in comparisons],
+            [1.75, 2.125, 2.3125],
         )
         self.assertTrue(selected["psf_contraction_rollback"]["selected"])
         self.assertIn("psf_contraction", selected_context)

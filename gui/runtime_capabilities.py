@@ -9,6 +9,7 @@ isolated runtime HOME.  It never searches a build output such as
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -23,6 +24,8 @@ from typing import Callable, Mapping, MutableMapping, Sequence
 RUNTIME_CAPABILITIES_SCHEMA = "starun.runtime-capabilities.v1"
 RUNTIME_CAPABILITIES_NAME = "runtime-capabilities.json"
 RUNTIME_CAPABILITIES_ENV = "STARUN_RUNTIME_CAPABILITIES_MANIFEST"
+SPCC_OPERATIONAL_CACHE_SCHEMA = "starun.stage4-spcc-operational-cache.v1"
+STAGE4_COLOR_DECISION_SCHEMA = "starun.stage4-color-capability-decision.v2"
 RUN_STATE_SCHEMA = "starun.run-state.v2"
 RUN_STATE_NAME = "run-state.json"
 
@@ -32,6 +35,13 @@ GAIA_XP_DIRNAME = "siril_cat1_healpix8_xpsamp"
 GAIA_XP_FILE_PREFIX = "siril_cat1_healpix8_xpsamp_"
 GAIA_XP_EXPECTED_CHUNKS = 48
 GAIA_XP_MIN_CHUNK_BYTES = 1024
+
+STAGE4_PLATE_SOLVER_BACKEND_IDS = (
+    "siril_platesolve",
+    "astap",
+    "ansvr",
+    "astrometry_net",
+)
 
 GAIA_ASTRO_ENDPOINT_ENV = "STARUN_PREFLIGHT_GAIA_ASTRO_ENDPOINTS"
 GAIA_XP_ENDPOINT_ENV = "STARUN_PREFLIGHT_GAIA_XP_ENDPOINTS"
@@ -50,6 +60,8 @@ PIPELINE_REQUIRED_PATHS = (
     "stages/stage3_background_extraction.py",
     "stages/stage4_color_calibration.py",
     "stage4_auto_reference.py",
+    "stage4_evidence.py",
+    "scene_support.py",
     "stages/stage5_linear_denoise.py",
     "stages/stage7_stretching.py",
     "stages/stage6_star_separation.py",
@@ -147,6 +159,52 @@ def _inspect_siril(
             "launchable": None,
         },
     }
+
+
+def _stage4_plate_solver_backends(
+    siril: Mapping[str, object],
+) -> list[dict[str, object]]:
+    """Describe the fixed Stage 4 backend inventory without probing PATH."""
+    backends: list[dict[str, object]] = [
+        {
+            "id": "siril_platesolve",
+            "implementation_status": "integrated",
+            "runtime_status": (
+                "available" if bool(siril.get("available")) else "unavailable"
+            ),
+            "packaged": bool(
+                any(
+                    isinstance(candidate, Mapping)
+                    and candidate.get("path") == siril.get("selected_path")
+                    and candidate.get("within_resources_root") is True
+                    for candidate in (siril.get("candidates") or ())
+                )
+            ),
+            "configured": True,
+            "eligible": bool(siril.get("available")),
+            "selected": False,
+            "attempted": False,
+            "result": "not_run",
+            "reason_codes": [],
+            "executor": "active_siril_session",
+        }
+    ]
+    for backend_id in STAGE4_PLATE_SOLVER_BACKEND_IDS[1:]:
+        backends.append(
+            {
+                "id": backend_id,
+                "implementation_status": "not_integrated",
+                "runtime_status": "not_probed",
+                "packaged": False,
+                "configured": False,
+                "eligible": False,
+                "selected": False,
+                "attempted": False,
+                "result": "not_run",
+                "reason_codes": ["backend_not_integrated"],
+            }
+        )
+    return backends
 
 
 def _inspect_template(
@@ -384,6 +442,11 @@ def build_runtime_capabilities(
     )
     astro = _inspect_gaia_astro(runtime, required=False)
     xp = _inspect_gaia_xp(runtime, required=False)
+    siril = _inspect_siril(
+        siril_candidates,
+        resources_root=resources,
+        enforce_resource_boundary=enforce_boundary,
+    )
     configured = configured_network_endpoints() if endpoints is None else endpoints
     manifest: dict[str, object] = {
         "schema": RUNTIME_CAPABILITIES_SCHEMA,
@@ -404,11 +467,8 @@ def build_runtime_capabilities(
             "siril_plugins": str(Path(siril_plugin_dir).expanduser()),
         },
         "capabilities": {
-            "siril": _inspect_siril(
-                siril_candidates,
-                resources_root=resources,
-                enforce_resource_boundary=enforce_boundary,
-            ),
+            "siril": siril,
+            "stage4_plate_solver_backends": _stage4_plate_solver_backends(siril),
             "config_template": _inspect_template(
                 config_template,
                 resources_root=resources,
@@ -440,6 +500,134 @@ def build_runtime_capabilities(
 def _capabilities(manifest: Mapping[str, object]) -> Mapping[str, object]:
     value = manifest.get("capabilities")
     return value if isinstance(value, Mapping) else {}
+
+
+def stage4_spcc_operational_cache_key(
+    manifest: Mapping[str, object],
+) -> str | None:
+    """Fingerprint one online-unverified SPCC runtime within this app session."""
+    decisions = manifest.get("decisions")
+    decisions = decisions if isinstance(decisions, Mapping) else {}
+    decision = decisions.get("stage4_color_calibration")
+    if not isinstance(decision, Mapping):
+        return None
+    commands = decision.get("commands")
+    if (
+        str(decision.get("spcc_readiness") or "") != "online_unverified"
+        or not isinstance(commands, Mapping)
+        or not bool(commands.get("spcc"))
+    ):
+        return None
+
+    capabilities = _capabilities(manifest)
+    siril = capabilities.get("siril")
+    siril = siril if isinstance(siril, Mapping) else {}
+    launch_probe = siril.get("launch_probe")
+    launch_probe = launch_probe if isinstance(launch_probe, Mapping) else {}
+    network = capabilities.get("network_endpoints")
+    network = network if isinstance(network, Mapping) else {}
+    groups = network.get("groups")
+    groups = groups if isinstance(groups, Mapping) else {}
+    xp_group = groups.get("gaia_xp")
+    xp_group = xp_group if isinstance(xp_group, Mapping) else {}
+    probes = xp_group.get("probes")
+    probes = probes if isinstance(probes, Sequence) else ()
+    configured_endpoints = xp_group.get("configured_endpoints")
+    configured_endpoints = (
+        configured_endpoints
+        if isinstance(configured_endpoints, Sequence)
+        and not isinstance(configured_endpoints, (str, bytes))
+        else ()
+    )
+    endpoint_evidence = sorted(
+        (
+            str(probe.get("url") or ""),
+            bool(probe.get("reachable")),
+            str(probe.get("status") or ""),
+            probe.get("http_status"),
+        )
+        for probe in probes
+        if isinstance(probe, Mapping) and str(probe.get("url") or "")
+    )
+    material = {
+        "schema": SPCC_OPERATIONAL_CACHE_SCHEMA,
+        "siril": {
+            "selected_path": str(siril.get("selected_path") or ""),
+            "version": str(launch_probe.get("version") or ""),
+        },
+        "gaia_xp": {
+            "configured_endpoints": sorted(
+                str(value)
+                for value in configured_endpoints
+                if str(value)
+            ),
+            "endpoint_evidence": endpoint_evidence,
+        },
+    }
+    encoded = json.dumps(
+        material,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "spcc-online-" + hashlib.sha256(encoded).hexdigest()
+
+
+def apply_stage4_spcc_operational_timeout_cache(
+    manifest: MutableMapping[str, object],
+    *,
+    cache_key: str,
+    evidence: Mapping[str, object],
+) -> None:
+    """Route a known timed-out online SPCC runtime directly to PCC fallback."""
+    decisions = manifest.get("decisions")
+    if not isinstance(decisions, MutableMapping):
+        return
+    decision = decisions.get("stage4_color_calibration")
+    if not isinstance(decision, MutableMapping):
+        return
+    if str(decision.get("spcc_readiness") or "") != "online_unverified":
+        return
+    commands = decision.get("commands")
+    if not isinstance(commands, MutableMapping) or not bool(commands.get("spcc")):
+        return
+
+    cache_record = {
+        "schema": SPCC_OPERATIONAL_CACHE_SCHEMA,
+        "status": "operational_timeout_cached",
+        "cache_key": str(cache_key),
+        "scope": "application_session",
+        "evidence": dict(evidence),
+    }
+    commands["spcc"] = False
+    decision.update(
+        status="degraded_allowed",
+        route="physical_pcc_only",
+        spcc_available=False,
+        spcc_readiness="unavailable",
+        spcc_operational_verified=False,
+        spcc_operational_cache=cache_record,
+    )
+    skipped = [
+        str(value)
+        for value in decision.get("skip_photometric_commands", ())
+        if str(value)
+    ]
+    if "spcc" not in skipped:
+        skipped.append("spcc")
+    decision["skip_photometric_commands"] = skipped
+    reasons = [str(value) for value in decision.get("reason_codes", ()) if str(value)]
+    if "operational_timeout_cached" not in reasons:
+        reasons.append("operational_timeout_cached")
+    decision["reason_codes"] = reasons
+    manifest["status"] = "degraded_allowed"
+    degraded = [
+        str(value) for value in manifest.get("degraded_reasons", ()) if str(value)
+    ]
+    if "operational_timeout_cached" not in degraded:
+        degraded.append("operational_timeout_cached")
+    manifest["degraded_reasons"] = degraded
+    manifest["updated_at"] = utc_now()
 
 
 def _stage4_color_decision(
@@ -489,15 +677,64 @@ def _stage4_color_decision(
     remote_xp = bool(
         network_enabled and probe_completed and xp_group.get("available")
     )
-    astro_available = local_astro or remote_astro
-    xp_available = local_xp or remote_xp
-    astrometric_source = (
-        "gaia" if remote_astro else "localgaia" if local_astro else None
+    astro_probes = astro_group.get("probes")
+    astro_probes = (
+        astro_probes
+        if isinstance(astro_probes, Sequence)
+        and not isinstance(astro_probes, (str, bytes))
+        else ()
     )
-    xp_source = "gaia" if remote_xp else "localgaia" if local_xp else None
+    xp_probes = xp_group.get("probes")
+    xp_probes = (
+        xp_probes
+        if isinstance(xp_probes, Sequence)
+        and not isinstance(xp_probes, (str, bytes))
+        else ()
+    )
+    remote_astro_unverified = bool(
+        network_enabled
+        and probe_completed
+        and not remote_astro
+        and any(
+            isinstance(probe, Mapping)
+            and str(probe.get("status") or "") == "unreachable"
+            for probe in astro_probes
+        )
+    )
+    remote_xp_unverified = bool(
+        network_enabled
+        and probe_completed
+        and not remote_xp
+        and any(
+            isinstance(probe, Mapping)
+            and str(probe.get("status") or "") == "unreachable"
+            for probe in xp_probes
+        )
+    )
+    observed_astro_available = local_astro or remote_astro
+    observed_xp_available = local_xp or remote_xp
+    # Network probes are evidence, not command authorization.  When the user
+    # allows networking, Stage 4 must make one real Siril attempt and let the
+    # command result drive fallback routing.
+    astro_available = bool(network_enabled or local_astro)
+    xp_available = bool(network_enabled or local_xp)
+    astrometric_source = (
+        "gaia"
+        if network_enabled
+        else "localgaia"
+        if local_astro
+        else None
+    )
+    xp_source = (
+        "gaia"
+        if network_enabled
+        else "localgaia"
+        if local_xp
+        else None
+    )
     spcc_readiness = (
         "online_unverified"
-        if astro_available and xp_source == "gaia"
+        if xp_source == "gaia"
         else "local_verified"
         if astro_available and xp_source == "localgaia"
         else "unavailable"
@@ -509,8 +746,16 @@ def _stage4_color_decision(
         status = "ready"
         skip_commands: list[str] = []
         requires_review = False
-        if spcc_readiness == "online_unverified":
+        if spcc_readiness == "online_unverified" and remote_xp:
             reasons.append("gaia_xp_endpoint_reachable_spcc_unverified")
+        if remote_astro_unverified:
+            reasons.append(
+                "gaia_astrometry_endpoint_unreachable_operational_probe_required"
+            )
+        if remote_xp_unverified:
+            reasons.append(
+                "gaia_xp_endpoint_unreachable_operational_probe_required"
+            )
     elif astro_available:
         route = "physical_pcc_only"
         status = "degraded_allowed"
@@ -537,9 +782,11 @@ def _stage4_color_decision(
     else:
         decision_state = status
     return {
-        "schema": "starun.stage4-color-capability-decision.v1",
+        "schema": STAGE4_COLOR_DECISION_SCHEMA,
         "status": decision_state,
         "route": route,
+        "attempt_policy": "attempt_then_fallback",
+        "preflight_advisory_only": True,
         "offline_fallback_mode": fallback_mode,
         "astrometric_source": astrometric_source,
         "xp_source": xp_source,
@@ -556,6 +803,14 @@ def _stage4_color_decision(
         "spcc_operational_verified": spcc_readiness == "local_verified",
         "spcc_online_unverified_timeout_sec": online_unverified_timeout_sec,
         "pcc_available": bool(astro_available),
+        "observed_capabilities": {
+            "gaia_astrometry": bool(observed_astro_available),
+            "gaia_xp": bool(observed_xp_available),
+            "remote_astrometry_probe": bool(remote_astro),
+            "remote_xp_probe": bool(remote_xp),
+            "remote_astrometry_unverified": bool(remote_astro_unverified),
+            "remote_xp_unverified": bool(remote_xp_unverified),
+        },
         "auto_local_reference_available": bool(
             not astro_available and fallback_mode == "auto_local_reference"
         ),
@@ -771,6 +1026,20 @@ def update_siril_launch_probe(
         "detail": str(detail or "") or None,
         "checked_at": utc_now(),
     }
+    backends = capabilities.get("stage4_plate_solver_backends")
+    if isinstance(backends, list):
+        for backend in backends:
+            if (
+                isinstance(backend, MutableMapping)
+                and backend.get("id") == "siril_platesolve"
+            ):
+                backend.update(
+                    runtime_status="available" if launchable else "unavailable",
+                    eligible=bool(launchable),
+                    version=str(version or "") or None,
+                    reason_codes=([] if launchable else ["siril_launch_probe_failed"]),
+                )
+                break
     refresh_blocking_errors(manifest)
 
 
@@ -854,6 +1123,7 @@ __all__ = [
     "RUN_STATE_NAME",
     "RUN_STATE_SCHEMA",
     "atomic_write_json",
+    "apply_stage4_spcc_operational_timeout_cache",
     "build_runtime_capabilities",
     "capability_summary_lines",
     "configured_network_endpoints",
@@ -862,6 +1132,7 @@ __all__ = [
     "refresh_blocking_errors",
     "resource_origin",
     "runtime_catalog_paths",
+    "stage4_spcc_operational_cache_key",
     "update_siril_launch_probe",
     "utc_now",
 ]

@@ -252,12 +252,12 @@ PROCESSING_PARAMETER_SPECS: Tuple[ParameterSpec, ...] = (
         help="自动执行解析与物理校色；保留颜色会安全直通。",
     ),
     ParameterSpec(
-        "stage4_offline_fallback_mode", 4, "无 Gaia 时", "recommended", "choice",
+        "stage4_offline_fallback_mode", 4, "物理校色失败时", "recommended", "choice",
         choices=_choice(
-            ("自动局部参考（非物理色彩，需复核）", "auto_local_reference"),
+            ("自动区域校色（非物理色彩，需复核）", "auto_local_reference"),
             ("保留输入颜色（需复核）", "preserve"),
         ),
-        help="Gaia 定位星表不可用时允许任务继续；两种路线均明确标记需复核。",
+        help="SPCC/PCC 技术失败时继续；两种路线均明确标记需复核。",
     ),
     ParameterSpec(
         "stage4_filter_hint", 4, "拍摄滤镜", "recommended", "choice",
@@ -273,8 +273,8 @@ PROCESSING_PARAMETER_SPECS: Tuple[ParameterSpec, ...] = (
     ParameterSpec("stage4_spcc_enabled", 4, "优先 SPCC", "expert", "bool", help="关闭后不尝试 SPCC，宽带按安全回退策略处理。"),
     ParameterSpec(
         "stage4_auto_reference_global_white_enabled", 4,
-        "应用恒星集合伪白参考", "expert", "bool",
-        help="关闭时仍生成影子评估，但只允许自动背景中和修改像素。",
+        "应用自动白参考区域", "expert", "bool",
+        help="默认启用；关闭时仍生成影子评估，但只应用自动背景平衡。",
     ),
     ParameterSpec("stage4_spcc_timeout_sec", 4, "SPCC 超时", "expert", "int", 5, 300, 5, suffix=" 秒"),
     ParameterSpec(
@@ -318,8 +318,6 @@ PROCESSING_PARAMETER_SPECS: Tuple[ParameterSpec, ...] = (
     ParameterSpec("stage4_spcc_narrowband_b_bandwidth_nm", 4, "B/OIII 带宽", "expert", "float", 1.0, 100.0, 0.5, 1, suffix=" nm"),
     ParameterSpec("stage4_narrowband_normalization_enabled", 4, "窄带归一化", "expert", "bool"),
     ParameterSpec("stage4_nbn_strength", 4, "窄带归一化强度", "expert", "float", 0.0, 1.0, 0.05, 2),
-    ParameterSpec("stage4_local_star_wb_enabled", 4, "本地恒星白平衡", "expert", "bool"),
-    ParameterSpec("stage4_local_star_wb_gain_limit", 4, "白平衡增益上限", "expert", "float", 1.01, 1.50, 0.01, 2, suffix="×"),
     ParameterSpec("denoise_enabled", 5, "线性降噪", "recommended", "bool", help="自动状态下允许 Stage 5 基于冻结基线低噪声门和候选质量门自行决定是否实际降噪。", depends_on=(("stage5_processing_mode", ("auto",)),)),
     ParameterSpec("denoise_mod", 5, "降噪强度", "recommended", "float", 0.20, 0.55, 0.05, 2, depends_on=(("stage5_processing_mode", ("auto",)), ("denoise_enabled", (True,)))),
     ParameterSpec(
@@ -1181,7 +1179,6 @@ PROCESSING_GATE_PARAMETER_SPECS: Tuple[ParameterSpec, ...] = (
     _gate("stage4_nbn_mapping_confidence_min", 4, "窄带映射置信度", "float", 0.70, 0.99, 0.01, 2),
     _gate("stage4_nbn_gain_limit", 4, "窄带通道增益上限", "float", 1.01, 1.15, 0.01, 2, suffix="×"),
     _gate("stage4_nbn_line_ratio_drift_max", 4, "Ha/OIII 比例漂移", "float", 0.04, 0.20, 0.01, 2),
-    _gate("stage4_pcc_quality_gate_enabled", 4, "SPCC/PCC 质量门", "bool"),
     _gate("stage4_pcc_channel_gain_ratio_max", 4, "校色通道增益跨度", "float", 1.10, 10.0, 0.10, 2, suffix="×"),
     _gate("stage4_pcc_emission_balance_gain_ratio_max", 4, "发射星云增益跨度", "float", 1.10, 5.0, 0.10, 2, suffix="×"),
     _gate("stage4_pcc_clip_growth_max", 4, "校色高光增长", "float", 0.0, 0.05, 0.001, 3),
@@ -1190,9 +1187,6 @@ PROCESSING_GATE_PARAMETER_SPECS: Tuple[ParameterSpec, ...] = (
     _gate("stage4_pcc_background_color_delta_max", 4, "背景色差上限", "float", 0.05, 0.60, 0.01, 2),
     _gate("stage4_pcc_target_color_drift_max", 4, "主体色度漂移", "float", 0.05, 0.75, 0.01, 2),
     _gate("stage4_pcc_emission_target_color_drift_max", 4, "发射主体色度漂移", "float", 0.05, 0.75, 0.01, 2),
-    _gate("stage4_local_star_wb_min_pixels", 4, "本地白平衡样本下限", "int", 16, 4096, 16),
-    _gate("stage4_local_star_mask_radius", 4, "恒星软遮罩半径", "int", 1, 4, 1, suffix=" px"),
-    _gate("stage4_local_star_mask_coverage_max", 4, "恒星软遮罩覆盖上限", "float", 0.01, 0.30, 0.01, 2),
 
     # Stage 5: denoise strength cap and shared candidate acceptance gates.
     _gate("denoise_safety_max", 5, "降噪强度安全上限", "float", 0.20, 0.55, 0.01, 2),
@@ -1308,6 +1302,9 @@ PROCESSING_GATE_PARAMETER_SPECS: Tuple[ParameterSpec, ...] = (
     _gate("stage8_highlight_clip_ratio_max", 8, "高光裁剪上限", "float", 0.001, 0.060, 0.001, 3),
     _gate("stage8_bg_std_growth_max", 8, "背景噪声增长", "float", 1.00, 1.50, 0.01, 2, suffix="×"),
     _gate("stage8_texture_artifact_growth_max", 8, "纹理伪影增长", "float", 1.00, 2.20, 0.05, 2, suffix="×"),
+    _gate("stage8_subject_boundary_luma_residual_max", 8, "主体边界亮度残差", "float", 0.0005, 0.0200, 0.0005, 4),
+    _gate("stage8_subject_boundary_chroma_residual_max", 8, "主体边界色度残差", "float", 0.0005, 0.0200, 0.0005, 4),
+    _gate("stage8_subject_boundary_residual_ratio_max", 8, "主体边界盘内残差倍率", "float", 1.00, 3.00, 0.05, 2, suffix="×"),
     _gate("stage8_limited_saturation_max", 8, "受限候选饱和上限", "float", 0.0, 0.10, 0.01, 2),
     _gate("stage8_limited_core_exclusion_expand", 8, "受限候选核心扩张", "int", 2, 16, 1, suffix=" px"),
     _gate("stage8_limited_halo_texture_growth_max", 8, "受限星晕纹理增长", "float", 1.0, 1.50, 0.01, 2, suffix="×"),
@@ -1437,7 +1434,6 @@ _GATE_PROFILE_RULES: Dict[
     "stage4_pcc_background_color_delta_max": (PROFILE_SCALE_UPPER, 0.0, None),
     "stage4_pcc_target_color_drift_max": (PROFILE_SCALE_UPPER, 0.0, None),
     "stage4_pcc_emission_target_color_drift_max": (PROFILE_SCALE_UPPER, 0.0, None),
-    "stage4_local_star_mask_coverage_max": (PROFILE_SCALE_UPPER, 0.0, 1.0),
 
     # Stage 5: measured detail/noise acceptance; denoise strength stays fixed.
     "stage5_multiscale_detail_retention_min": (PROFILE_SCALE_LOWER, 0.0, 1.0),
@@ -1492,6 +1488,9 @@ _GATE_PROFILE_RULES: Dict[
     "stage8_highlight_clip_ratio_max": (PROFILE_SCALE_UPPER, 0.0, 1.0),
     "stage8_bg_std_growth_max": (PROFILE_SCALE_UPPER_FROM_ONE, 1.0, None),
     "stage8_texture_artifact_growth_max": (PROFILE_SCALE_UPPER_FROM_ONE, 1.0, None),
+    "stage8_subject_boundary_luma_residual_max": (PROFILE_SCALE_UPPER, 0.0, 1.0),
+    "stage8_subject_boundary_chroma_residual_max": (PROFILE_SCALE_UPPER, 0.0, 1.0),
+    "stage8_subject_boundary_residual_ratio_max": (PROFILE_SCALE_UPPER_FROM_ONE, 1.0, None),
     "stage8_limited_halo_texture_growth_max": (PROFILE_SCALE_UPPER_FROM_ONE, 1.0, None),
     "stage8_limited_halo_texture_delta_max": (PROFILE_SCALE_UPPER, 0.0, 1.0),
     "stage8_dualband_palette_luma_drift_max": (PROFILE_SCALE_UPPER, 0.0, 1.0),
@@ -1569,9 +1568,6 @@ _GATE_PROFILE_EXCLUDED_FIELDS = frozenset(
         "stage4_auto_reference_target_chroma_drift_max",
         "stage4_nbn_mapping_confidence_min",
         "stage4_nbn_gain_limit",
-        "stage4_pcc_quality_gate_enabled",
-        "stage4_local_star_wb_min_pixels",
-        "stage4_local_star_mask_radius",
         "denoise_safety_max",
         "stage7_galaxy_roi_halo_gate_enabled",
         "stage6_syqon_regional_texture_ratio_max",

@@ -89,9 +89,19 @@ def test_splitter_widths_visibility_and_inspector_tab_restore(app) -> None:
         window._show_workspace(WORKSPACE_TASK)
         window.show()
         app.processEvents()
+        window.advanced_toggle_btn.setChecked(True)
+        window._set_processing_parameters_expanded(True)
+        app.processEvents()
+        assert window.task_section_splitter.widget(0) is window.task_top_region
+        assert (
+            window.task_section_splitter.widget(1)
+            is window.processing_params_scroll
+        )
         window.task_splitter.setSizes([640, 420])
+        window.task_section_splitter.setSizes([260, 390])
         app.processEvents()
         saved_task_sizes = window.task_splitter.sizes()
+        saved_task_section_sizes = window.task_section_splitter.sizes()
         window._show_workspace(WORKSPACE_RUN)
         window.run_splitter.setSizes([280, 620, 330])
         app.processEvents()
@@ -111,6 +121,19 @@ def test_splitter_widths_visibility_and_inspector_tab_restore(app) -> None:
                 abs(
                     restored_task_sizes[0] / restored_task_sizes[1]
                     - saved_task_sizes[0] / saved_task_sizes[1]
+                )
+                < 0.02
+            )
+            restored_task_section_sizes = (
+                restored.task_section_splitter.sizes()
+            )
+            assert not restored.processing_params_scroll.isHidden()
+            assert (
+                abs(
+                    restored_task_section_sizes[0]
+                    / restored_task_section_sizes[1]
+                    - saved_task_section_sizes[0]
+                    / saved_task_section_sizes[1]
                 )
                 < 0.02
             )

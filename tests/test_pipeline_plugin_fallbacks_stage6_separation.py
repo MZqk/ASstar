@@ -149,6 +149,52 @@ class PipelinePluginFallbackStage6SeparationTests(PipelinePluginFallbackTestBase
         self.assertEqual(report["counts"]["evaluated"], 6)
         self.assertEqual(report["coverage_ratio"], 1.0)
 
+    def test_stage6_shared_catalog_drives_fixed_position_diagnostics(self):
+        processor = self._new_processor()
+        source, starmask, stars = self._low_scale_catalog_fixture()
+        records = [
+            {
+                "id": f"S3{index + 1:06d}",
+                "x": star["x"],
+                "y": star["y"],
+                "fwhm_px": star["fwhm_geometry"],
+                "valid_fraction": 1.0,
+                "saturated": index == 0,
+            }
+            for index, star in enumerate(stars)
+        ]
+        processor._stage3_scene_support = {
+            "status": "available",
+            "manifest": {
+                "schema": pipeline_module.scene_support.SCENE_SUPPORT_SCHEMA,
+                "status": "available",
+                "components": {
+                    "star_catalog": {
+                        "status": "available",
+                        "records": records,
+                    }
+                },
+            },
+            "valid_mask": np.ones(source.shape[1:], dtype=np.uint8),
+            "saturation_map": np.zeros(source.shape[1:], dtype=np.uint8),
+        }
+
+        report = pipeline_module.stage7_quality._stage6_catalog_starmask_coverage(
+            processor,
+            source,
+            starmask,
+            starless_data=source - starmask,
+        )
+
+        self.assertTrue(report["available"], report)
+        self.assertTrue(report["shared_stage3_catalog"])
+        self.assertEqual(report["counts"]["excluded_saturated"], 1)
+        self.assertEqual(report["counts"]["evaluated"], 5)
+        self.assertEqual(
+            report["fixed_position_diagnostics"]["status"],
+            "available",
+        )
+
     def test_stage6_catalog_coverage_rejects_real_missing_starmask(self):
         processor = self._new_processor()
         source, starmask, stars = self._low_scale_catalog_fixture()
@@ -473,7 +519,11 @@ class PipelinePluginFallbackStage6SeparationTests(PipelinePluginFallbackTestBase
             )
 
         with patch.dict(os.environ, {"SIRIL_PYTHON_CLI": sys.executable}, clear=False):
-            with patch.object(pipeline_module.subprocess, "run", _fake_run):
+            with patch.object(
+                pipeline_module.plugin_runner,
+                "_run_subprocess_with_group_timeout",
+                _fake_run,
+            ):
                 used = processor._run_plugin_script_cli_subprocess(
                     "去星",
                     "SyQon Starless",

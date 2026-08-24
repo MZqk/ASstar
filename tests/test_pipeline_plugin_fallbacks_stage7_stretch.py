@@ -4,6 +4,17 @@ from tests.pipeline_plugin_fallbacks_support import *  # noqa: F401,F403
 
 
 class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
+    def test_stage7_galaxy_vivid_factor_recovers_linked_stretch_chroma_loss(self):
+        processor = pipeline_module.StarunPostProcessor()
+
+        factor = processor._stage7_vivid_chroma_factor(
+            {"name": "galaxy_core_halo_balance"},
+            saturation_ratio=0.08,
+            saturation_goal=0.75,
+        )
+
+        self.assertEqual(factor, 6.0)
+
     def test_stage7_prefers_final_stage5_linear_over_deconv_checkpoint(self):
         processor = self._new_processor()
         (processor.process_dir / "stage5_deconv.fit").write_bytes(b"mock")
@@ -1408,6 +1419,10 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
         )
 
         self.assertEqual(adaptation["target_aware"]["name"], "bright_core_protect")
+        self.assertAlmostEqual(
+            adaptation["target_aware"]["cand_b_p50_multiplier"],
+            0.78,
+        )
         self.assertEqual(candidates[0]["method"], "bright_nebula_hdr_masked")
         self.assertLess(candidates[0]["params"]["asinh_stretch"], 2.2)
         self.assertAlmostEqual(candidates[0]["params"]["core_protection"], 0.72)
@@ -1424,6 +1439,48 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
             pipeline_module.PipelineConfig().stage7_bright_nebula_star_growth_ratio_max,
             1.50,
         )
+        self.assertLessEqual(candidates[1]["params"]["ghs_stretchamount"], 1.0)
+
+    def test_stage7_compact_stretch_reveals_resolved_lagoon_trifid_field(self):
+        processor = self._new_processor()
+        processor._active_target_type = lambda: "bright_emission_reflection_nebula"
+        processor.pipeline_policy = {
+            "policy_name": "bright_nebula_hdr_conservative",
+            "stage7_stretch": {
+                "candidate_mode": ["bright_nebula_hdr_masked", "asinh_core_protect"]
+            },
+        }
+        processor.target_profile = {
+            "target_type": "bright_emission_reflection_nebula",
+            "secondary_labels": [
+                "bright_core",
+                "large_nebulosity",
+                "emission_red",
+                "reflection_blue",
+            ],
+            "composite_targets": [
+                {"name": "Lagoon Nebula"},
+                {"name": "Trifid Nebula"},
+            ],
+        }
+        processor._stage7_baseline_background_stats = types.MethodType(
+            pipeline_module.StarunPostProcessor._stage7_baseline_background_stats,
+            processor,
+        )
+
+        candidates, adaptation = (
+            pipeline_module.StarunPostProcessor._stage7_compact_stretch_candidates(
+                processor,
+                pipeline_module.QualityMetrics(bg_median=0.020),
+                {},
+            )
+        )
+
+        target = adaptation["target_aware"]
+        self.assertEqual(target["name"], "bright_core_composite_reveal")
+        self.assertAlmostEqual(target["cand_a_p50_multiplier"], 0.94)
+        self.assertAlmostEqual(target["cand_b_p50_multiplier"], 0.92)
+        self.assertAlmostEqual(target["cand_a_pixel_params"]["core_protection"], 0.80)
         self.assertLessEqual(candidates[1]["params"]["ghs_stretchamount"], 1.0)
 
     def test_stage7_compact_stretch_uses_asinh_only_for_star_preserve_targets(self):
@@ -3316,6 +3373,102 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
         self.assertEqual(
             quality["derived"]["halo_residue_score"],
             quality["derived"]["galaxy_disk_halo_residue_score"],
+        )
+
+    def test_stage6_single_galaxy_disk_halo_point_cannot_hard_reject_alone(self):
+        processor = pipeline_module.StarunPostProcessor()
+        processor.log = FakeLogger()
+        processor._active_target_type = lambda: "large_galaxy"
+        source, starless, starmask = self._synthetic_galaxy_starless_layers(
+            disk_halo_amplitude=0.030,
+        )
+        scores = stage7_quality_module.stage7_starless_artifact_scores(
+            processor,
+            source,
+            starless,
+            starmask,
+            pipeline_module.measure_image_features(source),
+            pipeline_module.measure_image_features(starless),
+        )
+        self.assertEqual(scores["galaxy_disk_halo_corroborated_local_count"], 1)
+        self.assertGreater(
+            scores["galaxy_disk_halo_residue_score"],
+            processor.cfg.stage7_large_galaxy_halo_residue_score_max * 2.0,
+        )
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        processor.stretched_name = "source"
+        processor.starmask_file = Path(temp_dir.name) / "starmask.fit"
+        processor.starmask_file.write_bytes(b"mock")
+        processor._read_image_by_stem = lambda stem: {
+            "source": source,
+            "starless": starless,
+            "starmask": starmask,
+        }.get(stem)
+
+        quality = processor._stage7_quality_assessment(
+            "galaxy-disk-single-point",
+            tool_label="synthetic",
+            source_stem="source",
+        )
+
+        self.assertEqual(quality["status"], "ok")
+        self.assertFalse(quality["issues"], quality)
+        gate = quality["quality_gates"]["galaxy_disk_halo_residue"]
+        self.assertEqual(gate["status"], "advisory")
+        self.assertEqual(
+            gate["reason_code"],
+            "single_local_galaxy_halo_evidence",
+        )
+        failure = (
+            stage6_star_separation_module._stage6_quality_hard_failure_summary(
+                processor,
+                quality,
+            )
+        )
+        self.assertFalse(failure["hard_failed"], failure)
+        self.assertNotIn("HALO", failure["failure_codes"])
+        self.assertNotIn(
+            "halo_residue",
+            stage7_quality_module.stage7_repair_triggers(processor, quality),
+        )
+        handoff = stage6_star_separation_module._stage8_handoff_from_stage6(
+            processor,
+            quality,
+            [],
+            separation_accepted=True,
+        )
+        self.assertEqual(handoff["processing_policy"], "full")
+        self.assertEqual(handoff["reason_code"], "")
+        self.assertTrue(
+            any(
+                advisory.startswith("galaxy_disk_halo_residue ")
+                for advisory in handoff["advisories"]
+            ),
+            handoff,
+        )
+        self.assertEqual(
+            handoff["suppressed_advisories"],
+            handoff["advisories"],
+        )
+        self.assertLessEqual(
+            handoff["metrics"]["effective_halo_residue_score"],
+            processor._stage7_effective_halo_threshold(),
+        )
+        processor.process_dir = Path(temp_dir.name)
+        processor._stage7_stretch_accepted = True
+        processor._stage7_stretch_output = "stage7_stretched"
+        processor._stage7_selected_quality = quality
+        (processor.process_dir / "stage7_stretched.fit").write_bytes(b"accepted")
+        stage9_reason = processor._stage9_bad_starless_reason()
+        self.assertNotIn("stage7_halo_residue_score", stage9_reason)
+        self.assertTrue(
+            any(
+                advisory.startswith("galaxy_disk_halo_residue ")
+                for advisory in processor._stage9_starless_advisories
+            ),
+            processor._stage9_starless_advisories,
         )
 
     def test_stage6_galaxy_roi_rejects_one_sided_disk_structure_as_halo(self):

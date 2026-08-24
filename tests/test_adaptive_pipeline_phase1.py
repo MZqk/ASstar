@@ -330,9 +330,46 @@ class AdaptivePipelinePhase1Tests(unittest.TestCase):
             {item["name"] for item in profile["composite_targets"]},
             {"Lagoon Nebula", "Trifid Nebula"},
         )
+        self.assertIn("reflection_blue", profile["secondary_labels"])
+        self.assertEqual(
+            profile["secondary_label_evidence"]["reflection_blue"]["source"],
+            "catalog_composite_context",
+        )
         self.assertFalse(
             profile["routing_contract"]["secondary_labels_can_route"]
         )
+
+    def test_same_type_targets_inside_physical_field_resolve_as_composite(self) -> None:
+        features = AdaptiveImageFeatures(
+            object_area_ratio=0.20,
+            bright_core_score=0.46,
+            nebulosity_area_ratio=0.32,
+            red_dominance=1.12,
+        )
+
+        profile = build_target_profile(
+            features,
+            metadata={
+                "RA": 271.311860502958,
+                "DEC": -23.5068506982248,
+                "FOCALLEN": 160.0,
+                "XPIXSZ": 2.9,
+                "YPIXSZ": 2.9,
+                "NAXIS1": 2146,
+                "NAXIS2": 3772,
+            },
+            context_text="/tasks/M8/source.fit",
+        )
+
+        self.assertEqual(profile["identity_status"], "composite_resolved")
+        self.assertFalse(profile["target_identity_conflict"])
+        self.assertFalse(profile["requires_review"])
+        self.assertEqual(profile["target_name_guess"], "Lagoon Nebula")
+        self.assertEqual(
+            {item["name"] for item in profile["composite_targets"]},
+            {"Lagoon Nebula", "Trifid Nebula"},
+        )
+        self.assertIn("reflection_blue", profile["secondary_labels"])
 
     def test_target_profiler_prefers_explicit_rosette_name_over_auto_hint(self) -> None:
         features = AdaptiveImageFeatures(

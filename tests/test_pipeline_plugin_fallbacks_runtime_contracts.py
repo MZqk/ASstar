@@ -545,7 +545,11 @@ class PipelinePluginFallbackRuntimeContractTests(PipelinePluginFallbackTestBase)
             lambda _path, _python_executable=None: (True, "")
         )
         with patch.dict(os.environ, {"SIRIL_PYTHON_CLI": sys.executable}, clear=False):
-            with patch.object(pipeline_module.subprocess, "run", _fake_run):
+            with patch.object(
+                pipeline_module.plugin_runner,
+                "_run_subprocess_with_group_timeout",
+                _fake_run,
+            ):
                 used = processor._run_plugin_script_cli_subprocess(
                     "去星",
                     "SyQon Starless",
@@ -1364,7 +1368,11 @@ class PipelinePluginFallbackRuntimeContractTests(PipelinePluginFallbackTestBase)
             "QT_QPA_PLATFORM": "cocoa",
         }
         with patch.dict(os.environ, contaminated_env, clear=False):
-            with patch.object(pipeline_module.subprocess, "run", _fake_run):
+            with patch.object(
+                pipeline_module.plugin_runner,
+                "_run_subprocess_with_group_timeout",
+                _fake_run,
+            ):
                 used = processor._run_plugin_script_cli_subprocess(
                     "最终降噪",
                     "CosmicClarity Denoise",
@@ -1413,7 +1421,11 @@ class PipelinePluginFallbackRuntimeContractTests(PipelinePluginFallbackTestBase)
             },
             clear=False,
         ):
-            with patch.object(pipeline_module.subprocess, "run", _fake_run):
+            with patch.object(
+                pipeline_module.plugin_runner,
+                "_run_subprocess_with_group_timeout",
+                _fake_run,
+            ):
                 used = processor._run_plugin_script_cli_subprocess(
                     "去星",
                     "SyQon Starless",
@@ -1461,7 +1473,11 @@ class PipelinePluginFallbackRuntimeContractTests(PipelinePluginFallbackTestBase)
             return SimpleNamespace(returncode=0, stdout="")
 
         with patch.dict(os.environ, {"SIRIL_PYTHON_CLI": sys.executable}, clear=False):
-            with patch.object(pipeline_module.subprocess, "run", _fake_run):
+            with patch.object(
+                pipeline_module.plugin_runner,
+                "_run_subprocess_with_group_timeout",
+                _fake_run,
+            ):
                 used = processor._run_plugin_script_cli_subprocess(
                     "去星",
                     "SyQon Starless",
@@ -1509,7 +1525,11 @@ class PipelinePluginFallbackRuntimeContractTests(PipelinePluginFallbackTestBase)
             return SimpleNamespace(returncode=0, stdout="")
 
         with patch.dict(os.environ, {"SIRIL_PYTHON_CLI": sys.executable}, clear=False):
-            with patch.object(pipeline_module.subprocess, "run", _fake_run):
+            with patch.object(
+                pipeline_module.plugin_runner,
+                "_run_subprocess_with_group_timeout",
+                _fake_run,
+            ):
                 used = processor._run_plugin_script_cli_subprocess(
                     "去星",
                     "SyQon Starless file worker",
@@ -1613,7 +1633,11 @@ class PipelinePluginFallbackRuntimeContractTests(PipelinePluginFallbackTestBase)
                     "Thread",
                     _SynchronousThread,
                 ):
-                    with patch.object(pipeline_module.subprocess, "run", _fake_run):
+                    with patch.object(
+                        pipeline_module.plugin_runner,
+                        "_run_subprocess_with_group_timeout",
+                        _fake_run,
+                    ):
                         used = processor._run_plugin_script_cli_subprocess(
                             "去星",
                             "SyQon Starless",
@@ -1659,15 +1683,72 @@ class PipelinePluginFallbackRuntimeContractTests(PipelinePluginFallbackTestBase)
         self.assertLess(elapsed, 1.8)
         self.assertIn("subprocess timeout", processor._last_plugin_script_error or "")
 
-    def test_final_denoise_cli_timeout_tracks_sirilpy_timeout_with_cap(self):
+    def test_cli_subprocess_timeout_terminates_descendant_process_group(self):
+        if os.name != "posix":
+            self.skipTest("process-group cleanup is POSIX-specific")
+
+        processor = pipeline_module.StarunPostProcessor()
+        processor.log = FakeLogger()
+        processor.workflow_command_used = {}
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        processor.process_dir = Path(td.name)
+        processor.work_dir = Path(td.name)
+        child_pid_path = Path(td.name) / "child.pid"
+        script_path = Path(td.name) / "spawning_plugin.py"
+        script_path.write_text(
+            "import pathlib, subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(30)'])\n"
+            f"pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid))\n"
+            "time.sleep(30)\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"SIRIL_PYTHON_CLI": sys.executable}, clear=False):
+            used = processor._run_plugin_script_cli_subprocess(
+                "测试脚本",
+                "Spawning Plugin",
+                script_path,
+                timeout_sec=1,
+            )
+
+        self.assertIsNone(used)
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail(f"descendant process {child_pid} survived plugin timeout")
+
+    def test_final_denoise_cli_timeout_is_independent_and_bounded(self):
         processor = pipeline_module.StarunPostProcessor()
 
-        with patch.dict(os.environ, {"STARUN_SIRILPY_TIMEOUT_SEC": "300"}, clear=False):
-            self.assertEqual(processor._final_denoise_cli_timeout_sec(), 300)
-        with patch.dict(os.environ, {"STARUN_SIRILPY_TIMEOUT_SEC": "999"}, clear=False):
-            self.assertEqual(processor._final_denoise_cli_timeout_sec(), 300)
-        with patch.dict(os.environ, {"STARUN_SIRILPY_TIMEOUT_SEC": "bad"}, clear=False):
-            self.assertEqual(processor._final_denoise_cli_timeout_sec(), 300)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(processor._final_denoise_cli_timeout_sec(), 900)
+        with patch.dict(
+            os.environ,
+            {"STARUN_FINAL_DENOISE_TIMEOUT_SEC": "999"},
+            clear=True,
+        ):
+            self.assertEqual(processor._final_denoise_cli_timeout_sec(), 999)
+        with patch.dict(
+            os.environ,
+            {"STARUN_FINAL_DENOISE_TIMEOUT_SEC": "9999"},
+            clear=True,
+        ):
+            self.assertEqual(processor._final_denoise_cli_timeout_sec(), 1800)
+        with patch.dict(
+            os.environ,
+            {"STARUN_FINAL_DENOISE_TIMEOUT_SEC": "bad"},
+            clear=True,
+        ):
+            self.assertEqual(processor._final_denoise_cli_timeout_sec(), 900)
 
     def test_stage_diff_note_separates_pixel_and_header_changes(self):
         from astropy.io import fits

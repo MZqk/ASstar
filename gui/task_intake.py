@@ -76,6 +76,8 @@ INPUT_MODE_STAGE2_CORRECTED_RESUME = "stage2_corrected_resume"
 INPUT_MODE_STAGE5_LINEAR_RESUME = "stage5_linear_resume"
 TASK_RUN_MANIFEST_ENV = "STARUN_TASK_RUN_MANIFEST"
 SPCC_ONLINE_CIRCUIT_ENV = "STARUN_STAGE4_SPCC_ONLINE_CIRCUIT_OPEN"
+SPCC_OPERATIONAL_CACHE_ENV = "STARUN_STAGE4_SPCC_OPERATIONAL_CACHE_STATUS"
+SPCC_OPERATIONAL_CACHE_KEY_ENV = "STARUN_STAGE4_SPCC_OPERATIONAL_CACHE_KEY"
 
 
 @dataclass(frozen=True)
@@ -483,36 +485,55 @@ def prepare_task_queue(
     )
 
 
-def stage4_online_spcc_timeout_detected(run_root: Path) -> bool:
-    """Return true only for a timed-out online-unverified Gaia SPCC attempt."""
+def stage4_online_spcc_timeout_evidence(
+    run_root: Path,
+) -> Optional[Dict[str, Any]]:
+    """Return auditable evidence for one timed-out online Gaia SPCC attempt."""
     report_path = Path(run_root) / "process" / "color_calibration_report.json"
     try:
         payload = json.loads(report_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, TypeError):
-        return False
+        return None
     spcc = payload.get("spcc") if isinstance(payload, dict) else None
     attempts = spcc.get("attempts") if isinstance(spcc, dict) else None
     if not isinstance(attempts, list):
-        return False
-    return any(
-        isinstance(attempt, dict)
-        and str(attempt.get("status") or "").lower() == "timeout"
-        and str(attempt.get("label") or "").lower() == "catalog:gaia"
-        and str(attempt.get("spcc_readiness") or "").lower()
-        == "online_unverified"
-        for attempt in attempts
-    )
+        return None
+    for attempt in attempts:
+        if (
+            isinstance(attempt, dict)
+            and str(attempt.get("status") or "").lower() == "timeout"
+            and str(attempt.get("label") or "").lower() == "catalog:gaia"
+            and str(attempt.get("spcc_readiness") or "").lower()
+            == "online_unverified"
+        ):
+            return {
+                "status": "timeout",
+                "label": "catalog:gaia",
+                "spcc_readiness": "online_unverified",
+                "timeout_sec": attempt.get("timeout_sec"),
+                "timeout_policy": attempt.get("timeout_policy"),
+                "error": attempt.get("error"),
+            }
+    return None
+
+
+def stage4_online_spcc_timeout_detected(run_root: Path) -> bool:
+    """Return true only for a timed-out online-unverified Gaia SPCC attempt."""
+    return stage4_online_spcc_timeout_evidence(run_root) is not None
 
 
 __all__ = [
     "PreparedTask",
     "PreparedTaskQueue",
     "SPCC_ONLINE_CIRCUIT_ENV",
+    "SPCC_OPERATIONAL_CACHE_ENV",
+    "SPCC_OPERATIONAL_CACHE_KEY_ENV",
     "TASK_RUN_MANIFEST_ENV",
     "TaskPlanPresentation",
     "describe_input_plan",
     "discover_input_for_processing_settings",
     "prepare_task_queue",
     "stage4_online_spcc_timeout_detected",
+    "stage4_online_spcc_timeout_evidence",
     "stage_config_from_processing_settings",
 ]

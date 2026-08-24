@@ -204,12 +204,12 @@ def run_cosmic_clarity_native_sharpen_fallback(pipeline, step_key: str) -> Optio
 
 
 def final_denoise_cli_timeout_sec(pipeline) -> int:
-    raw_timeout = str(os.getenv("STARUN_SIRILPY_TIMEOUT_SEC", "300")).strip()
+    raw_timeout = str(os.getenv("STARUN_FINAL_DENOISE_TIMEOUT_SEC", "900")).strip()
     try:
-        sirilpy_timeout = int(float(raw_timeout))
+        final_denoise_timeout = int(float(raw_timeout))
     except (TypeError, ValueError):
-        sirilpy_timeout = 300
-    return max(60, min(300, sirilpy_timeout + 60))
+        final_denoise_timeout = 900
+    return max(60, min(1800, final_denoise_timeout))
 
 
 def cosmic_clarity_native_denoise_cli_options(pipeline) -> Tuple[Tuple[str, ...], str]:

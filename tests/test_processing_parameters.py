@@ -91,7 +91,7 @@ class ProcessingParameterContractTests(unittest.TestCase):
             {value for _label, value in offline_color.choices},
             {"auto_local_reference", "preserve"},
         )
-        self.assertFalse(
+        self.assertTrue(
             SPECS_BY_FIELD[
                 "stage4_auto_reference_global_white_enabled"
             ].default
@@ -361,14 +361,13 @@ class ProcessingParameterContractTests(unittest.TestCase):
                 )
                 for stage in range(2, 10)
             },
-            {2: 4, 3: 22, 4: 32, 5: 4, 6: 32, 7: 51, 8: 14, 9: 84},
+            {2: 4, 3: 22, 4: 28, 5: 4, 6: 32, 7: 51, 8: 17, 9: 84},
         )
         gate_fields = {spec.field for spec in PROCESSING_GATE_PARAMETER_SPECS}
         self.assertTrue(
             {
                 "stage2_edge_black_target",
                 "bg_quality_gate_enabled",
-                "stage4_pcc_quality_gate_enabled",
                 "stage4_auto_reference_background_sample_target",
                 "stage4_auto_reference_star_min_objects",
                 "stage4_auto_reference_target_chroma_drift_max",
@@ -377,6 +376,9 @@ class ProcessingParameterContractTests(unittest.TestCase):
                 "stage7_9_quality_advisory_multiplier",
                 "stage7_stretch_chroma_noise_score_max",
                 "stage8_texture_artifact_growth_max",
+                "stage8_subject_boundary_luma_residual_max",
+                "stage8_subject_boundary_chroma_residual_max",
+                "stage8_subject_boundary_residual_ratio_max",
                 "stage9_quality_gate_enabled",
                 "stage9_core_color_jump_min",
                 "stage9_unscreen_denominator_floor",
@@ -386,6 +388,15 @@ class ProcessingParameterContractTests(unittest.TestCase):
                 "stage9_psf_selective_wing_target_ratio",
                 "stage9_psf_selective_wing_strength_max",
             }.issubset(gate_fields)
+        )
+        self.assertNotIn("stage4_pcc_quality_gate_enabled", gate_fields)
+        self.assertFalse(
+            {
+                "stage4_local_star_wb_min_pixels",
+                "stage4_local_star_mask_radius",
+                "stage4_local_star_mask_coverage_max",
+            }
+            & gate_fields
         )
         self.assertTrue(
             {

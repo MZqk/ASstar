@@ -229,6 +229,13 @@ class PipelineSafetyTests(unittest.TestCase):
                 stage8_fallback_used=False,
             )
         )
+        self.assertTrue(
+            should_skip_final_denoise(
+                stage5_denoise_applied=True,
+                stage8_final_quality="star_preserve_secondary_nebulosity",
+                stage8_fallback_used=False,
+            )
+        )
         self.assertFalse(
             should_skip_final_denoise(
                 stage5_denoise_applied=True,

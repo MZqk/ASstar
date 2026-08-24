@@ -18,10 +18,13 @@ from background_sampling import (
 )
 
 
-AUTO_REFERENCE_SCHEMA = "starun.stage4-auto-local-reference.v1"
+AUTO_REFERENCE_SCHEMA = "starun.stage4-auto-local-reference.v2"
 BACKGROUND_METHOD = "AUTO_BACKGROUND_NEUTRALIZATION"
-STAR_ENSEMBLE_METHOD = "AUTO_STAR_ENSEMBLE_REFERENCE"
-PSEUDO_WHITE_REFERENCE = "star_ensemble_pseudo_white_reference"
+WHITE_REGION_METHOD = "AUTO_BACKGROUND_WHITE_REGION"
+# Compatibility alias for existing report consumers.  New reports use a
+# single rectangular white reference, not a frame-wide ensemble.
+STAR_ENSEMBLE_METHOD = WHITE_REGION_METHOD
+PSEUDO_WHITE_REFERENCE = "single_rectangular_white_reference"
 STAR_ENSEMBLE_OBJECT_CAP = 256
 BACKGROUND_P90_GROWTH_MAX = 1.05
 BACKGROUND_IMPROVED_FRACTION_MIN = 0.75
@@ -215,6 +218,103 @@ def _measure_rgb_patches(
         "luminance_sigma": _robust_sigma(luminance_medians),
         "gradient": float(np.median(gradients)),
         "texture": float(np.median(textures)),
+    }
+
+
+def _rectangle_from_point(
+    point: Tuple[float, float],
+    *,
+    width: int,
+    height: int,
+    radius: int,
+) -> Dict[str, Any]:
+    x0, x1, y0, y1 = _patch_bounds(
+        point,
+        width=width,
+        height=height,
+        radius=radius,
+    )
+    return {
+        "x": int(x0),
+        "y": int(y0),
+        "width": int(x1 - x0),
+        "height": int(y1 - y0),
+        "coordinate_system": "numpy_top_left",
+    }
+
+
+def _select_background_rectangle(
+    chw: np.ndarray,
+    points: Sequence[Tuple[float, float]],
+    *,
+    patch_radius: int,
+) -> Tuple[Optional[Tuple[float, float]], Dict[str, Any]]:
+    """Choose one empty-sky rectangle without using RGB balance as a score."""
+    height, width = np.asarray(chw).shape[1:]
+    candidates: List[Dict[str, Any]] = []
+    for point in points:
+        measured = _measure_rgb_patches(
+            chw,
+            (point,),
+            patch_radius=patch_radius,
+        )
+        if measured.get("status") != "ready":
+            continue
+        candidate = {
+            "point": (float(point[0]), float(point[1])),
+            "rectangle": _rectangle_from_point(
+                point,
+                width=width,
+                height=height,
+                radius=patch_radius,
+            ),
+            "median_luminance": float(measured.get("median_luminance") or 0.0),
+            "gradient": float(measured.get("gradient") or 0.0),
+            "texture": float(measured.get("texture") or 0.0),
+        }
+        candidates.append(candidate)
+    if not candidates:
+        return None, {
+            "status": "unavailable",
+            "reason": "no_measurable_background_rectangle",
+        }
+    luminances = np.asarray(
+        [item["median_luminance"] for item in candidates],
+        dtype=np.float64,
+    )
+    gradients = np.asarray(
+        [item["gradient"] for item in candidates],
+        dtype=np.float64,
+    )
+    textures = np.asarray(
+        [item["texture"] for item in candidates],
+        dtype=np.float64,
+    )
+
+    def normalized(values: np.ndarray) -> np.ndarray:
+        span = float(np.ptp(values))
+        if span <= 1e-12:
+            return np.zeros_like(values)
+        return (values - float(np.min(values))) / span
+
+    scores = normalized(luminances) + normalized(gradients) + normalized(textures)
+    for item, score in zip(candidates, scores):
+        item["selection_score"] = float(score)
+    selected = min(
+        candidates,
+        key=lambda item: (
+            float(item["selection_score"]),
+            float(item["point"][1]),
+            float(item["point"][0]),
+        ),
+    )
+    return selected["point"], {
+        "status": "selected",
+        "selection_policy": (
+            "minimum_luminance_gradient_texture_without_rgb_scoring"
+        ),
+        "candidate_count": len(candidates),
+        **selected,
     }
 
 
@@ -856,6 +956,118 @@ def _select_star_records_for_analysis(
     }
 
 
+def _select_white_reference_rectangle(
+    records: Sequence[Dict[str, Any]],
+    *,
+    image_shape: Tuple[int, int],
+    minimum_objects: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Select one luminance-driven rectangle containing usable bright objects."""
+    source = list(records)
+    height, width = image_shape
+    if len(source) < minimum_objects:
+        return [], {
+            "status": "insufficient_star_evidence",
+            "minimum_objects": int(minimum_objects),
+            "valid_object_count": len(source),
+        }
+    short_side = max(1, min(height, width))
+    side_lengths = sorted(
+        {
+            max(32, min(short_side, int(round(short_side * fraction))))
+            for fraction in (0.25, 0.375, 0.50, 0.75, 1.0)
+        }
+    )
+    proposals: List[Dict[str, Any]] = []
+    centers = sorted(
+        {(int(round(float(item["x"]))), int(round(float(item["y"])))) for item in source}
+    )
+    for side in side_lengths:
+        half = side // 2
+        for center_x, center_y in centers:
+            x0 = max(0, min(width - side, center_x - half))
+            y0 = max(0, min(height - side, center_y - half))
+            x1 = min(width, x0 + side)
+            y1 = min(height, y0 + side)
+            members = [
+                item
+                for item in source
+                if x0 <= float(item["x"]) < x1
+                and y0 <= float(item["y"]) < y1
+            ]
+            if len(members) < minimum_objects:
+                continue
+            total_flux = float(
+                sum(float(np.sum(np.asarray(item["flux"], dtype=np.float64))) for item in members)
+            )
+            saturation = float(
+                np.median(
+                    [float(item.get("saturation_fraction") or 0.0) for item in members]
+                )
+            )
+            compactness = float(
+                np.median([float(item.get("compactness") or 0.0) for item in members])
+            )
+            proposals.append(
+                {
+                    "rectangle": {
+                        "x": int(x0),
+                        "y": int(y0),
+                        "width": int(x1 - x0),
+                        "height": int(y1 - y0),
+                        "coordinate_system": "numpy_top_left",
+                    },
+                    "members": members,
+                    "object_count": len(members),
+                    "total_background_subtracted_flux": total_flux,
+                    "median_saturation_fraction": saturation,
+                    "median_compactness": compactness,
+                    "side_length": int(side),
+                }
+            )
+        if proposals:
+            break
+    if not proposals:
+        return [], {
+            "status": "unavailable",
+            "reason": "no_single_rectangle_contains_minimum_objects",
+            "minimum_objects": int(minimum_objects),
+            "valid_object_count": len(source),
+            "tested_side_lengths": side_lengths,
+        }
+    selected = max(
+        proposals,
+        key=lambda item: (
+            int(item["object_count"]),
+            float(item["total_background_subtracted_flux"]),
+            float(item["median_compactness"]),
+            -float(item["median_saturation_fraction"]),
+            -int(item["rectangle"]["y"]),
+            -int(item["rectangle"]["x"]),
+        ),
+    )
+    rectangle = selected["rectangle"]
+    center_x = float(rectangle["x"] + rectangle["width"] / 2.0)
+    center_y = float(rectangle["y"] + rectangle["height"] / 2.0)
+    normalized_members: List[Dict[str, Any]] = []
+    for item in selected["members"]:
+        normalized_item = dict(item)
+        normalized_item["quadrant"] = int(float(item["x"]) >= center_x) + 2 * int(
+            float(item["y"]) >= center_y
+        )
+        normalized_members.append(normalized_item)
+    return normalized_members, {
+        "status": "selected",
+        "selection_policy": (
+            "smallest_multiscale_rectangle_then_object_count_flux_compactness"
+        ),
+        "color_values_used_for_selection": False,
+        "proposal_count": len(proposals),
+        "tested_side_lengths": side_lengths,
+        **{key: value for key, value in selected.items() if key != "members"},
+    }
+
+
 def _ratio_stats(
     records: Sequence[Dict[str, Any]],
     *,
@@ -1003,6 +1215,10 @@ def evaluate_auto_local_reference(
             "reason": None,
         },
         "sampling": {},
+        "reference_regions": {
+            "background": None,
+            "white": None,
+        },
         "candidates": {},
         "selection": {
             "method": "PRESERVE_INPUT",
@@ -1044,7 +1260,7 @@ def evaluate_auto_local_reference(
         return None, _json_safe(report)
     report["eligibility"].update(eligible=True, reason="linear_broadband_rgb_osc")
     global_white_enabled = bool(
-        _cfg(config, "stage4_auto_reference_global_white_enabled", False)
+        _cfg(config, "stage4_auto_reference_global_white_enabled", True)
     )
 
     target_count = int(
@@ -1101,7 +1317,22 @@ def evaluate_auto_local_reference(
         return None, _json_safe(report)
 
     patch_radius = int(safe_report.get("patch_radius") or 12)
-    fit_before = _measure_rgb_patches(before, fit_points, patch_radius=patch_radius)
+    selected_background_point, background_region = _select_background_rectangle(
+        before,
+        fit_points,
+        patch_radius=patch_radius,
+    )
+    report["reference_regions"]["background"] = background_region
+    selected_background_points = (
+        [selected_background_point]
+        if selected_background_point is not None
+        else []
+    )
+    fit_before = _measure_rgb_patches(
+        before,
+        selected_background_points,
+        patch_radius=patch_radius,
+    )
     validation_before = _measure_rgb_patches(
         before, validation_points, patch_radius=patch_radius
     )
@@ -1109,7 +1340,7 @@ def evaluate_auto_local_reference(
         fit_measurements=fit_before,
         validation_measurements=validation_before,
     )
-    if fit_before.get("sample_count", 0) < 12 or validation_before.get("sample_count", 0) < 4:
+    if fit_before.get("sample_count", 0) < 1 or validation_before.get("sample_count", 0) < 4:
         report["status"] = "rejected"
         report["eligibility"]["reason"] = "background_patch_measurement_failed"
         report["candidates"][BACKGROUND_METHOD] = {
@@ -1236,10 +1467,6 @@ def evaluate_auto_local_reference(
         subject_mask=subject_mask,
         saturation_ratio_max=saturation_max,
     )
-    analysis_records, star_limit_report = _select_star_records_for_analysis(
-        records,
-    )
-    star_detection_report.update(star_limit_report)
     minimum_stars = int(
         _clamp(
             _cfg(config, "stage4_auto_reference_star_min_objects", 16),
@@ -1248,6 +1475,17 @@ def evaluate_auto_local_reference(
             16,
         )
     )
+    bounded_records, star_limit_report = _select_star_records_for_analysis(
+        records,
+    )
+    rectangle_records, white_region = _select_white_reference_rectangle(
+        bounded_records,
+        image_shape=tuple(int(value) for value in before.shape[1:]),
+        minimum_objects=minimum_stars,
+    )
+    report["reference_regions"]["white"] = white_region
+    analysis_records = rectangle_records
+    star_detection_report.update(star_limit_report)
     fit_stars, validation_stars, star_split = _split_star_records(
         analysis_records, validation_ratio=holdout_ratio
     )
@@ -1311,7 +1549,9 @@ def evaluate_auto_local_reference(
                 candidate_b[:3] * gain_values[:, None, None], 0.0
             )
             fit_after_gain = _measure_rgb_patches(
-                candidate_b, fit_points, patch_radius=patch_radius
+                candidate_b,
+                selected_background_points,
+                patch_radius=patch_radius,
             )
             candidate_b, offsets_b = _subtract_to_lowest(candidate_b, fit_after_gain)
             validation_b = _measure_rgb_patches(
@@ -1344,7 +1584,7 @@ def evaluate_auto_local_reference(
             if after_dispersion > before_dispersion * 1.05 + 1e-8:
                 reasons_b.append("heldout_star_ratio_dispersion_growth_exceeded")
             candidate_b_bg_error = float(validation_b.get("median_color_error") or float("inf"))
-            if candidate_b_bg_error > after_error * 1.05 + 1e-8:
+            if candidate_b_bg_error > after_error * 1.05 + 0.0005:
                 reasons_b.append("background_regressed_after_pseudo_white_reference")
             safety_reasons_b, safety_b = _safety_gate(
                 before,
@@ -1357,8 +1597,8 @@ def evaluate_auto_local_reference(
             reasons_b.extend(safety_reasons_b)
 
     accepted_b = candidate_b is not None and not reasons_b
-    report["candidates"][STAR_ENSEMBLE_METHOD] = {
-        "method": STAR_ENSEMBLE_METHOD,
+    report["candidates"][WHITE_REGION_METHOD] = {
+        "method": WHITE_REGION_METHOD,
         "reference": PSEUDO_WHITE_REFERENCE,
         "accepted": bool(accepted_b),
         "would_accept": bool(accepted_b),
@@ -1386,7 +1626,7 @@ def evaluate_auto_local_reference(
     selected_method = "PRESERVE_INPUT"
     if accepted_b and global_white_enabled and candidate_b is not None:
         selected = adapter.restore(candidate_b)
-        selected_method = STAR_ENSEMBLE_METHOD
+        selected_method = WHITE_REGION_METHOD
     elif accepted_a:
         selected = adapter.restore(candidate_a)
         selected_method = BACKGROUND_METHOD
@@ -1417,5 +1657,6 @@ __all__ = [
     "BACKGROUND_METHOD",
     "PSEUDO_WHITE_REFERENCE",
     "STAR_ENSEMBLE_METHOD",
+    "WHITE_REGION_METHOD",
     "evaluate_auto_local_reference",
 ]

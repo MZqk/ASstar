@@ -144,6 +144,8 @@ def _clamp_int(value: int, lower: int, upper: int) -> int:
 def stage8_broadband_hue_saturation_bands(
     target_type: str,
     saturation: float,
+    *,
+    mixed_composite: bool = False,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Build the single conservative hue profile for a recognized broadband target."""
     profile_name = _STAGE8_BROADBAND_TARGET_PROFILES.get(
@@ -155,6 +157,8 @@ def stage8_broadband_hue_saturation_bands(
         profile_name,
         (0.16, 0.04),
     )
+    if profile_name == "mixed_nebula" and mixed_composite:
+        scale, maximum = 0.50, 0.080
     base_amount = min(maximum, max(0.0, float(saturation)) * scale)
     if not profile or base_amount <= 1e-6:
         return "", []
@@ -168,6 +172,60 @@ def stage8_broadband_hue_saturation_bands(
         }
         for band in profile
     ]
+
+
+def stage8_mixed_nebula_composite_context(pipeline) -> Dict[str, Any]:
+    """Authorize a larger masked color budget for a resolved red/blue composite."""
+    target_profile = getattr(pipeline, "target_profile", None)
+    target_profile = target_profile if isinstance(target_profile, dict) else {}
+    primary = target_profile.get("primary_target")
+    primary = primary if isinstance(primary, dict) else target_profile
+    target_type = str(
+        primary.get("type", target_profile.get("target_type", "")) or ""
+    ).strip().lower()
+    try:
+        confidence = float(
+            primary.get(
+                "confidence",
+                target_profile.get("target_confidence", 0.0),
+            )
+            or 0.0
+        )
+    except (TypeError, ValueError):
+        confidence = 0.0
+    secondary = {
+        str(value).strip()
+        for value in target_profile.get("secondary_labels", ())
+        if str(value).strip()
+    }
+    composite_names = {
+        str(item.get("name") or "").strip()
+        for item in target_profile.get("composite_targets", ())
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    }
+    required = {"emission_red", "reflection_blue"}
+    eligible = bool(
+        target_type == "bright_emission_reflection_nebula"
+        and confidence >= 0.55
+        and len(composite_names) >= 2
+        and required.issubset(secondary)
+    )
+    return {
+        "schema": "starun.stage8-mixed-composite-context.v1",
+        "eligible": eligible,
+        "primary_target_type": target_type or "unknown",
+        "target_confidence": round(confidence, 4),
+        "composite_targets": sorted(composite_names),
+        "secondary_labels": sorted(secondary),
+        "required_secondary_labels": sorted(required),
+        "route": (
+            "mixed_nebula_composite_masked_color"
+            if eligible
+            else "mixed_nebula_standard_color"
+        ),
+        "physical_anchor_preserved": True,
+        "background_and_core_protected": True,
+    }
 
 
 def stage8_target_color_route_allowed(pipeline) -> Tuple[bool, str]:
@@ -195,6 +253,171 @@ def stage8_target_color_route_allowed(pipeline) -> Tuple[bool, str]:
     if method in {"fallback", "unavailable", "unknown"}:
         return False, f"target_method={method}"
     return True, f"target_confidence={confidence:.3f}"
+
+
+def stage8_star_preserve_nebulosity_context(pipeline) -> Dict[str, Any]:
+    """Authorize a bounded diffuse overlay without changing the stellar route."""
+    target_profile = getattr(pipeline, "target_profile", None)
+    target_profile = target_profile if isinstance(target_profile, dict) else {}
+    primary = target_profile.get("primary_target")
+    primary = primary if isinstance(primary, dict) else target_profile
+    target_type = str(
+        primary.get("type", target_profile.get("target_type", "")) or ""
+    ).strip().lower()
+    secondary = {
+        str(value).strip()
+        for value in target_profile.get("secondary_labels", ())
+        if str(value).strip()
+    }
+    required = {"large_nebulosity", "emission_red"}
+    eligible = bool(
+        target_type in {"open_cluster", "globular_cluster"}
+        and required.issubset(secondary)
+    )
+    return {
+        "schema": "starun.stage8-star-preserve-context.v1",
+        "eligible": eligible,
+        "primary_target_type": target_type or "unknown",
+        "secondary_labels": sorted(secondary),
+        "required_secondary_labels": sorted(required),
+        "route": (
+            "star_preserve_secondary_nebulosity"
+            if eligible
+            else "star_preserve_passthrough"
+        ),
+        "primary_policy_unchanged": True,
+        "stars_excluded_from_adjustment": True,
+    }
+
+
+def stage8_star_preserve_nebulosity_overlay(
+    pipeline,
+    image_data: np.ndarray,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Apply one diffuse-only contrast/chroma pass with exact star restoration."""
+    source = np.asarray(image_data)
+    rgb = _to_rgb_float_fullres(source)
+    luma = (
+        0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+    ).astype(np.float32)
+    smooth = luma.copy()
+    for _ in range(3):
+        smooth = _box_blur_gray(smooth)
+    detail = np.maximum(luma - smooth, 0.0)
+    detail_sigma = float(
+        1.4826 * np.median(np.abs(detail - np.median(detail)))
+    )
+    star_threshold = max(
+        float(np.median(detail)) + 6.0 * detail_sigma,
+        float(np.quantile(detail, 0.985)),
+    )
+    star_seed = (detail >= star_threshold).astype(np.float32)
+    star_hard = dilate_mask(star_seed, iterations=2) > 0.50
+    star_feather = feather_mask(
+        dilate_mask(star_seed, iterations=3),
+        radius=2,
+    )
+    q35, q52, q90, q995 = (
+        float(value) for value in np.quantile(smooth, (0.35, 0.52, 0.90, 0.995))
+    )
+    diffuse = np.clip(
+        (smooth - q52) / max(q90 - q52, 1e-6),
+        0.0,
+        1.0,
+    )
+    bright_core = np.clip(
+        (smooth - q90) / max(q995 - q90, 1e-6),
+        0.0,
+        1.0,
+    )
+    diffuse = np.clip(
+        diffuse * (1.0 - 0.92 * star_feather) * (1.0 - 0.75 * bright_core),
+        0.0,
+        1.0,
+    ).astype(np.float32)
+    background = (smooth <= q35).astype(np.float32)
+    context = stage8_star_preserve_nebulosity_context(pipeline)
+    if not bool(context.get("eligible", False)):
+        return np.array(source, copy=True), {
+            **context,
+            "status": "skipped_ineligible",
+            "accepted": False,
+        }
+    if int(np.count_nonzero(diffuse > 0.05)) < 64:
+        return np.array(source, copy=True), {
+            **context,
+            "status": "skipped_insufficient_diffuse_support",
+            "accepted": False,
+            "diffuse_support_pixels": int(np.count_nonzero(diffuse > 0.05)),
+        }
+
+    candidate, adjustment = apply_local_adjustment_recipe(
+        rgb,
+        {
+            "schema": LOCAL_ADJUSTMENT_SCHEMA,
+            "id": "stage8_star_preserve_secondary_nebulosity_v1",
+            "operations": [
+                {
+                    "type": "local_contrast",
+                    "mask": "diffuse_nebulosity",
+                    "amount": 0.025,
+                    "radius": 3,
+                    "opacity": 0.45,
+                },
+                {
+                    "type": "saturation",
+                    "mask": "diffuse_nebulosity",
+                    "amount": 0.04,
+                    "opacity": 0.40,
+                },
+            ],
+        },
+        masks={
+            "diffuse_nebulosity": diffuse,
+            "background": background,
+        },
+    )
+    candidate_rgb = _to_rgb_float_fullres(candidate)
+    candidate_rgb[:, star_hard] = rgb[:, star_hard]
+    delta = np.max(np.abs(candidate_rgb - rgb), axis=0)
+    star_change = float(np.max(delta[star_hard])) if np.any(star_hard) else 0.0
+    background_change = (
+        float(np.quantile(delta[background > 0.50], 0.95))
+        if np.count_nonzero(background > 0.50) >= 64
+        else 0.0
+    )
+    changed_ratio = float(np.mean(delta > 1e-6))
+    issues = list(adjustment.get("issues") or [])
+    if not bool(adjustment.get("accepted", False)):
+        issues.append("local_adjustment_rejected")
+    if star_change > 1e-7:
+        issues.append("protected_star_pixels_changed")
+    if background_change > 0.002:
+        issues.append("background_change_exceeded")
+    if changed_ratio <= 1e-5:
+        issues.append("no_effect")
+    accepted = not issues
+    report = {
+        **context,
+        "status": "accepted" if accepted else "rejected",
+        "accepted": accepted,
+        "local_adjustment": adjustment,
+        "metrics": {
+            "star_hard_mask_coverage": float(np.mean(star_hard)),
+            "diffuse_mask_coverage": float(np.mean(diffuse > 0.05)),
+            "protected_star_max_abs_change": star_change,
+            "background_change_p95": background_change,
+            "changed_pixel_ratio": changed_ratio,
+        },
+        "limits": {
+            "protected_star_max_abs_change_max": 1e-7,
+            "background_change_p95_max": 0.002,
+        },
+        "issues": list(dict.fromkeys(issues)),
+    }
+    if not accepted:
+        return np.array(source, copy=True), report
+    return stage8_restore_rgb_like(pipeline, source, candidate_rgb), report
 
 try:
     from sirilpy.exceptions import CommandError, SirilError
@@ -387,6 +610,165 @@ def stage8_generate_starless_masks(pipeline, image_data: np.ndarray) -> Dict[str
         "background_mask": background_mask,
         "coverage": coverage,
     }
+
+
+def _stage8_smoothstep(
+    values: np.ndarray,
+    lower: float,
+    upper: float,
+) -> np.ndarray:
+    span = max(float(upper) - float(lower), 1e-6)
+    normalized = np.clip(
+        (np.asarray(values, dtype=np.float32) - float(lower)) / span,
+        0.0,
+        1.0,
+    )
+    return normalized * normalized * (3.0 - 2.0 * normalized)
+
+
+def stage8_large_galaxy_structure_masks(
+    pipeline,
+    masks: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Build continuous large-galaxy disk weights from Stage 7 geometry."""
+    route = "large_galaxy_elliptical_soft_v1"
+    report: Dict[str, Any] = {
+        "schema": "starun.stage8-large-galaxy-mask.v1",
+        "route": route,
+        "available": False,
+        "status": "unavailable",
+        "reason": "not_measured",
+        "geometry": {},
+        "coverage": {},
+    }
+    gray = np.asarray(masks.get("gray"), dtype=np.float32)
+    if gray.ndim != 2 or min(gray.shape, default=0) < 24:
+        report["reason"] = "invalid_stage8_gray_image"
+        return None, report
+    geometry = stage7_quality.stage7_galaxy_structure_masks(
+        gray,
+        float(masks.get("bg_median", 0.0) or 0.0),
+        float(masks.get("bg_std", 0.0) or 0.0),
+        getattr(pipeline, "cfg", None),
+    )
+    if not bool(geometry.get("available", False)):
+        report["reason"] = str(
+            geometry.get("reason") or "galaxy_geometry_unavailable"
+        )
+        report["geometry"] = {
+            key: geometry.get(key)
+            for key in (
+                "status",
+                "reason",
+                "seed_x",
+                "seed_y",
+                "disk_coverage",
+            )
+            if key in geometry
+        }
+        return None, report
+
+    try:
+        center_x = float(geometry["center_x"])
+        center_y = float(geometry["center_y"])
+        major_radius = float(geometry["major_radius"])
+        minor_radius = float(geometry["minor_radius"])
+        major_vector = np.asarray(
+            geometry["major_axis_vector"], dtype=np.float64
+        )
+        minor_vector = np.asarray(
+            geometry["minor_axis_vector"], dtype=np.float64
+        )
+    except (KeyError, TypeError, ValueError):
+        report["reason"] = "incomplete_galaxy_geometry"
+        return None, report
+    if (
+        major_vector.shape != (2,)
+        or minor_vector.shape != (2,)
+        or not np.all(np.isfinite(major_vector))
+        or not np.all(np.isfinite(minor_vector))
+        or not all(
+            math.isfinite(value)
+            for value in (center_x, center_y, major_radius, minor_radius)
+        )
+        or major_radius <= 1.0
+        or minor_radius <= 1.0
+    ):
+        report["reason"] = "invalid_galaxy_geometry"
+        return None, report
+
+    height, width = gray.shape
+    yy, xx = np.mgrid[:height, :width]
+    dx = xx.astype(np.float32) - center_x
+    dy = yy.astype(np.float32) - center_y
+    major_coord = dx * float(major_vector[0]) + dy * float(major_vector[1])
+    minor_coord = dx * float(minor_vector[0]) + dy * float(minor_vector[1])
+    rho = np.sqrt(
+        np.square(major_coord / major_radius)
+        + np.square(minor_coord / minor_radius)
+    ).astype(np.float32)
+    disk_weight = 1.0 - _stage8_smoothstep(rho, 0.72, 1.15)
+    outer_weight = disk_weight * _stage8_smoothstep(rho, 0.30, 0.68)
+    background_weight = 1.0 - disk_weight
+
+    disk_coverage = float(np.mean(disk_weight > 0.05))
+    transition_coverage = float(
+        np.mean((disk_weight > 0.05) & (disk_weight < 0.95))
+    )
+    inner_coverage = float(np.mean(disk_weight >= 0.80))
+    if (
+        bool(np.any(disk_weight[0, :] > 0.05))
+        or bool(np.any(disk_weight[-1, :] > 0.05))
+        or bool(np.any(disk_weight[:, 0] > 0.05))
+        or bool(np.any(disk_weight[:, -1] > 0.05))
+    ):
+        report["reason"] = "truncated_soft_disk_weight"
+        return None, report
+    if not 0.003 <= disk_coverage <= 0.72:
+        report["reason"] = "implausible_soft_disk_coverage"
+        report["coverage"] = {"disk": disk_coverage}
+        return None, report
+
+    routed = dict(masks)
+    routed["nebula_mask"] = disk_weight.astype(np.float32, copy=False)
+    routed["faint_nebula_mask"] = outer_weight.astype(np.float32, copy=False)
+    routed["background_mask"] = background_weight.astype(np.float32, copy=False)
+    routed["enhancement_subject_weight"] = routed["nebula_mask"]
+    routed["enhancement_outer_weight"] = routed["faint_nebula_mask"]
+    routed["mask_route"] = route
+    routed["coverage"] = {
+        **dict(masks.get("coverage", {})),
+        "nebula": disk_coverage,
+        "faint_nebula": float(np.mean(outer_weight > 0.05)),
+        "background": float(np.mean(background_weight > 0.50)),
+        "large_galaxy_disk": disk_coverage,
+        "large_galaxy_transition": transition_coverage,
+        "large_galaxy_interior": inner_coverage,
+    }
+    report.update(
+        {
+            "available": True,
+            "status": "ready",
+            "reason": "accepted",
+            "geometry": {
+                "center_x": center_x,
+                "center_y": center_y,
+                "major_radius": major_radius,
+                "minor_radius": minor_radius,
+                "major_axis_vector": major_vector.tolist(),
+                "minor_axis_vector": minor_vector.tolist(),
+            },
+            "coverage": {
+                "disk": disk_coverage,
+                "outer_disk": float(np.mean(outer_weight > 0.05)),
+                "transition": transition_coverage,
+                "interior": inner_coverage,
+                "background": float(np.mean(background_weight > 0.50)),
+            },
+        }
+    )
+    routed["large_galaxy_disk_report"] = report
+    return routed, report
 
 
 def stage8_starless_readiness_report(
@@ -785,6 +1167,14 @@ def stage8_enhancement_quality_report(pipeline) -> Dict[str, Any]:
     if before_data is not None:
         try:
             masks = pipeline._stage8_generate_starless_masks(before_data)
+            if (
+                str(pipeline._active_target_type() or "").strip().lower()
+                == "large_galaxy"
+            ):
+                masks, _ = stage8_large_galaxy_structure_masks(
+                    pipeline,
+                    masks,
+                )
         except (CommandError, SirilError, RuntimeError, TypeError, ValueError):
             masks = None
     before = pipeline._background_quality_metrics(before_data, masks)
@@ -796,6 +1186,27 @@ def stage8_enhancement_quality_report(pipeline) -> Dict[str, Any]:
     issues: List[str] = list(availability_issues)
     advisories: List[str] = []
     quality_gates: Dict[str, Dict[str, Any]] = {}
+    subject_boundary_seam = stage8_subject_boundary_seam_report(
+        pipeline,
+        before_data,
+        after_data,
+    )
+    if bool(subject_boundary_seam.get("applicable", False)):
+        if not bool(subject_boundary_seam.get("available", False)):
+            issues.append(
+                "large_galaxy_subject_boundary_gate_unavailable="
+                + str(subject_boundary_seam.get("reason") or "unknown")
+            )
+        elif str(subject_boundary_seam.get("status") or "") == "hard_failed":
+            issues.append("subject_boundary_mask_seam")
+        elif str(subject_boundary_seam.get("status") or "") == "advisory":
+            advisories.append(
+                "subject_boundary_mask_seam advisory; enhancement retained"
+            )
+        for metric_name, gate in (
+            subject_boundary_seam.get("quality_gates") or {}
+        ).items():
+            quality_gates[f"subject_boundary_{metric_name}"] = gate
 
     def record_upper_gate(
         metric_name: str,
@@ -860,6 +1271,15 @@ def stage8_enhancement_quality_report(pipeline) -> Dict[str, Any]:
         "blue_excess_after": after.get("blue_excess_score") if after else None,
         "bg_std_growth": bg_growth,
         "chroma_noise_growth": chroma_growth,
+        "mask_route": str(
+            subject_boundary_seam.get("mask_route")
+            or "generic_nebula_threshold_v1"
+        ),
+        "large_galaxy_disk": {
+            "geometry": dict(subject_boundary_seam.get("geometry") or {}),
+            "coverage": dict(subject_boundary_seam.get("coverage") or {}),
+        },
+        "subject_boundary_seam": subject_boundary_seam,
         "conservative_rerun_applied": False,
         "final_source": pipeline._stage8_final_source,
         "fallback_used": pipeline._stage8_fallback_used,
@@ -1161,6 +1581,12 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
             stage7_halo_limit = float(pipeline._stage7_effective_halo_threshold())
         except (TypeError, ValueError):
             stage7_halo_limit = 0.70
+    single_local_galaxy_halo_override = (
+        stage7_quality.stage7_single_local_galaxy_halo_override_active(
+            pipeline,
+            selected_stage7_quality,
+        )
+    )
     compact_halo_raw_limit_exceeded = bool(
         compact_halo_residue > stage7_halo_limit
     )
@@ -1277,6 +1703,11 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
         )
     except (TypeError, ValueError):
         effective_stage7_halo = halo_residue
+    if single_local_galaxy_halo_override:
+        effective_stage7_halo = max(
+            global_halo_residue,
+            compact_halo_residue,
+        )
     try:
         compact_residual_star_score = float(
             stage7_quality_derived.get("compact_residual_star_score", 1.0)
@@ -1345,7 +1776,7 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
         or stage9_starmask_preparation_failed
         or stage9_starmask_stretch_failed
         or uncalibrated_background_color_review_required
-        or halo_residue > 0.70
+        or effective_stage7_halo > 0.70
         or compact_halo_limit_exceeded
     )
     if uncalibrated_background_color_review_required:
@@ -1689,6 +2120,10 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
         "core_clip_score": metrics.get("core_clip_score") if metrics else None,
         "starless_artifact_score": metrics.get("starless_artifact_score") if metrics else None,
         "halo_artifact_score": halo_residue,
+        "stage7_effective_halo_residue_score": effective_stage7_halo,
+        "stage7_single_local_galaxy_halo_override_active": (
+            single_local_galaxy_halo_override
+        ),
         "stage7_global_halo_residue_score": global_halo_residue,
         "stage7_compact_halo_residue_score": compact_halo_residue,
         "stage7_compact_halo_mask_coverage": stage7_quality_derived.get(
@@ -1929,7 +2364,9 @@ def stage8_input_enhancement_guard(pipeline) -> Dict[str, Any]:
         )
 
     residual = 0.0
-    halo = pipeline._stage7_halo_residue_score()
+    raw_halo = pipeline._stage7_halo_residue_score()
+    halo = raw_halo
+    global_halo = raw_halo
     compact_halo = 0.0
     noise_gain = 0.0
     if isinstance(derived, dict):
@@ -1941,6 +2378,14 @@ def stage8_input_enhancement_guard(pipeline) -> Dict[str, Any]:
             halo = max(halo, float(derived.get("halo_residue_score", 0.0) or 0.0))
         except (TypeError, ValueError):
             pass
+        raw_halo = halo
+        try:
+            global_halo = max(
+                0.0,
+                float(derived.get("global_halo_residue_score", raw_halo) or 0.0),
+            )
+        except (TypeError, ValueError):
+            global_halo = raw_halo
         try:
             compact_halo = max(
                 compact_halo,
@@ -1953,6 +2398,17 @@ def stage8_input_enhancement_guard(pipeline) -> Dict[str, Any]:
             noise_gain = float(derived.get("starless_noise_gain", 0.0) or 0.0)
         except (TypeError, ValueError):
             noise_gain = 0.0
+    single_local_galaxy_halo_override = (
+        stage7_quality.stage7_single_local_galaxy_halo_override_active(
+            pipeline,
+            quality,
+        )
+    )
+    if single_local_galaxy_halo_override:
+        # A single localized galaxy-disk sample is audited as an advisory, but
+        # it must not re-enter here through the combined halo score after the
+        # Stage 6 handoff has already revalidated global and compact evidence.
+        halo = max(global_halo, compact_halo)
     residual_gate = stage7_quality.stage7_upper_quality_gate(
         pipeline.cfg,
         value=residual,
@@ -2149,7 +2605,12 @@ def stage8_input_enhancement_guard(pipeline) -> Dict[str, Any]:
         "derived": {
             "residual_star_score": residual,
             "halo_residue_score": halo,
+            "raw_halo_residue_score": raw_halo,
+            "global_halo_residue_score": global_halo,
             "compact_halo_residue_score": compact_halo,
+            "single_local_galaxy_halo_override_active": (
+                single_local_galaxy_halo_override
+            ),
             "starless_noise_gain": noise_gain,
         },
     }
@@ -2163,6 +2624,83 @@ def apply_stage8_masked_pixel_enhancement(
     plugin_candidate: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any], List[str]]:
     masks = pipeline._stage8_generate_starless_masks(image_data)
+    target_type = (
+        str(pipeline._active_target_type() or "").strip().lower()
+        if hasattr(pipeline, "_active_target_type")
+        else ""
+    )
+    handoff = getattr(pipeline, "_stage8_handoff", {}) or {}
+    limited_mode = bool(
+        isinstance(handoff, dict)
+        and str(handoff.get("processing_policy") or "").strip().lower()
+        == "limited"
+    )
+    mask_route = "generic_nebula_threshold_v1"
+    large_galaxy_report: Dict[str, Any] = {
+        "schema": "starun.stage8-large-galaxy-mask.v1",
+        "route": mask_route,
+        "available": False,
+        "status": "not_applicable",
+        "reason": "target_is_not_large_galaxy",
+        "geometry": {},
+        "coverage": {},
+    }
+    if target_type == "large_galaxy":
+        routed_masks, large_galaxy_report = (
+            stage8_large_galaxy_structure_masks(pipeline, masks)
+        )
+        mask_route = str(large_galaxy_report.get("route") or mask_route)
+        if routed_masks is not None:
+            masks = routed_masks
+        if limited_mode or routed_masks is None:
+            reason = (
+                "large_galaxy_limited_safe_passthrough"
+                if limited_mode
+                else "large_galaxy_geometry_unavailable="
+                + str(large_galaxy_report.get("reason") or "unknown")
+            )
+            messages = [f"{label} {reason}; Stage 8 input preserved"]
+            diagnostics = {
+                "mask_route": mask_route,
+                "large_galaxy_disk": large_galaxy_report,
+                "mask_coverage": dict(masks.get("coverage", {}))
+                if routed_masks is not None
+                else {},
+                "masked_metrics": (
+                    pipeline._stage8_masked_metrics(image_data, masks)
+                    if routed_masks is not None
+                    else {}
+                ),
+                "protection_actions": messages,
+                "local_adjustment_engine": {
+                    "schema": LOCAL_ADJUSTMENT_SCHEMA,
+                    "status": "passthrough",
+                    "accepted": False,
+                    "reason": reason,
+                },
+                "saturation_execution": {
+                    "requested": float(plan.get("saturation", 0.0) or 0.0),
+                    "applied": False,
+                    "applied_amount": 0.0,
+                    "effective_amount_mean": 0.0,
+                    "effect_status": "passthrough",
+                    "passes": 0,
+                    "position": "not_applied",
+                    "method": "none",
+                },
+                "structure_execution": {
+                    "source": mask_route,
+                    "scale": 0.0,
+                    "faint_nebula_boost": 0.0,
+                    "nebula_contrast": 0.0,
+                    "independent_from_saturation": True,
+                },
+                "processing_scope": {
+                    "mode": "large_galaxy_passthrough",
+                    "reason": reason,
+                },
+            }
+            return np.array(image_data, copy=True), diagnostics, messages
     base = masks["rgb"]
     gray = masks["gray"]
     core = masks["core_mask"]
@@ -2170,12 +2708,6 @@ def apply_stage8_masked_pixel_enhancement(
     faint = masks["faint_nebula_mask"]
     background = masks["background_mask"]
     coverage = dict(masks.get("coverage", {}))
-    handoff = getattr(pipeline, "_stage8_handoff", {}) or {}
-    limited_mode = bool(
-        isinstance(handoff, dict)
-        and str(handoff.get("processing_policy") or "").strip().lower()
-        == "limited"
-    )
     limited_core_exclusion = np.asarray(
         masks.get("limited_core_exclusion_mask", core),
         dtype=np.float32,
@@ -2199,7 +2731,7 @@ def apply_stage8_masked_pixel_enhancement(
         nebula_effect = np.clip(nebula * core_guard, 0.0, 1.0)
         faint_effect = np.clip(faint * core_guard, 0.0, 1.0)
     coverage["limited_weak_signal"] = float(np.mean(weak_signal > 0.05))
-    target_type = pipeline._active_target_type() if hasattr(pipeline, "_active_target_type") else ""
+    mixed_composite_context = stage8_mixed_nebula_composite_context(pipeline)
     high_halo_risk = pipeline._stage7_halo_residue_score() > pipeline._stage7_effective_halo_threshold()
     object_mask_only = target_type == "bright_emission_reflection_nebula" or high_halo_risk
     mask_signal_coverage = float(coverage.get("nebula", 0.0)) + float(
@@ -2218,7 +2750,7 @@ def apply_stage8_masked_pixel_enhancement(
         )
 
     saturation = _clamp_float(plan.get("saturation", pipeline.cfg.nebula_saturation), 0.0, 0.65)
-    structure_scale = 1.0
+    structure_scale = _clamp_float(plan.get("structure_scale", 1.0), 0.0, 1.0)
     unsharp_amount = min(
         _clamp_float(plan.get("unsharp_amount", 0.35), 0.0, 0.60),
         float(pipeline.cfg.stage8_masked_unsharp_amount_max),
@@ -2227,6 +2759,7 @@ def apply_stage8_masked_pixel_enhancement(
         saturation = 0.0
     if not bool(getattr(pipeline.cfg, "stage8_masked_unsharp_enabled", True)):
         unsharp_amount = 0.0
+    unsharp_amount *= structure_scale
     if masks["bg_std"] > pipeline.cfg.stage7_bg_std_high:
         unsharp_amount *= 0.40
         saturation *= 0.72
@@ -2291,7 +2824,13 @@ def apply_stage8_masked_pixel_enhancement(
         faint_boost = 0.0
     if not bool(getattr(pipeline.cfg, "stage8_nebula_contrast_enabled", True)):
         contrast_strength = 0.0
-    signal_weight = np.clip(nebula_effect + 0.60 * faint_effect, 0.0, 1.0)
+    signal_weight = np.clip(
+        nebula_effect
+        if target_type == "large_galaxy"
+        else nebula_effect + 0.60 * faint_effect,
+        0.0,
+        1.0,
+    )
     color_sample_weight = np.clip(
         signal_weight * core_guard * (1.0 - 0.85 * background),
         0.0,
@@ -2338,7 +2877,11 @@ def apply_stage8_masked_pixel_enhancement(
 
     if blue_pre_gain < 0.999:
         blue_weight = np.clip(
-            (nebula_effect + 0.45 * faint_effect)
+            (
+                nebula_effect
+                if target_type == "large_galaxy"
+                else nebula_effect + 0.45 * faint_effect
+            )
             * core_guard
             * (1.0 - background),
             0.0,
@@ -2360,7 +2903,12 @@ def apply_stage8_masked_pixel_enhancement(
     if contrast_strength > 1e-6:
         background_guard = 1.0 - (1.0 if object_mask_only else 0.90) * background
         signal_weight = np.clip(
-            (nebula_effect + 0.30 * faint_effect) * background_guard,
+            (
+                nebula_effect
+                if target_type == "large_galaxy"
+                else nebula_effect + 0.30 * faint_effect
+            )
+            * background_guard,
             0.0,
             1.0,
         )
@@ -2387,7 +2935,11 @@ def apply_stage8_masked_pixel_enhancement(
         plugin_rgb = _to_rgb_float_fullres(plugin_candidate)
         if blue_pre_gain < 0.999:
             blue_weight = np.clip(
-                (nebula_effect + 0.45 * faint_effect)
+                (
+                    nebula_effect
+                    if target_type == "large_galaxy"
+                    else nebula_effect + 0.45 * faint_effect
+                )
                 * core_guard
                 * (1.0 - background),
                 0.0,
@@ -2399,12 +2951,16 @@ def apply_stage8_masked_pixel_enhancement(
             )
         background_guard = 1.0 - (1.0 if object_mask_only else 0.98) * background
         plugin_weight = np.clip(
-            (0.34 * nebula_effect + 0.16 * faint_effect)
+            (
+                0.34 * nebula_effect
+                if target_type == "large_galaxy"
+                else 0.34 * nebula_effect + 0.16 * faint_effect
+            )
             * core_guard
             * background_guard,
             0.0,
             0.24 if object_mask_only else 0.38,
-        )
+        ) * structure_scale
         result = result + (plugin_rgb - result) * plugin_weight[None, :, :]
         messages.append(f"{label} SASP output blended through Starless masks")
 
@@ -2436,7 +2992,11 @@ def apply_stage8_masked_pixel_enhancement(
     ):
         local_operations: List[Dict[str, Any]] = []
         curve_mask_name = (
-            "limited_weak_signal" if limited_mode else "faint_nebula"
+            "limited_weak_signal"
+            if limited_mode
+            else "nebula"
+            if target_type == "large_galaxy"
+            else "faint_nebula"
         )
         subject_mask_name = (
             "limited_weak_signal" if limited_mode else "nebula"
@@ -2460,6 +3020,9 @@ def apply_stage8_masked_pixel_enhancement(
                 stage8_broadband_hue_saturation_bands(
                     target_type,
                     saturation,
+                    mixed_composite=bool(
+                        mixed_composite_context.get("eligible", False)
+                    ),
                 )
             )
             if selective_profile:
@@ -2489,19 +3052,34 @@ def apply_stage8_masked_pixel_enhancement(
                                 0.30,
                             )
                         )
-                        * mask_quality_scale,
+                        * mask_quality_scale
+                        * structure_scale,
                     ),
                 }
             )
         if saturation > 1e-6:
             if selective_bands:
+                if mixed_composite_context.get("eligible", False):
+                    local_operations.append(
+                        {
+                            "type": "saturation",
+                            "mask": subject_mask_name,
+                            "amount": min(0.18, saturation * 1.60),
+                            "opacity": 0.70 * mask_quality_scale,
+                        }
+                    )
                 local_operations.append(
                     {
                         "type": "hue_selective_saturation",
                         "mask": subject_mask_name,
                         "profile": selective_profile,
                         "bands": selective_bands,
-                        "opacity": 0.50 * mask_quality_scale,
+                        "opacity": (
+                            0.60
+                            if mixed_composite_context.get("eligible", False)
+                            else 0.50
+                        )
+                        * mask_quality_scale,
                     }
                 )
             else:
@@ -2560,6 +3138,9 @@ def apply_stage8_masked_pixel_enhancement(
                 "kept pre-recipe candidate"
             )
         local_adjustment_report["color_route"] = target_color_route
+        local_adjustment_report["mixed_composite_context"] = (
+            mixed_composite_context
+        )
         local_adjustment_report["target_route_allowed"] = bool(
             target_route_allowed
         )
@@ -2664,6 +3245,8 @@ def apply_stage8_masked_pixel_enhancement(
         or ("effective" if saturation_applied else "not_requested")
     )
     diagnostics = {
+        "mask_route": mask_route,
+        "large_galaxy_disk": large_galaxy_report,
         "mask_coverage": coverage,
         "masked_metrics": pipeline._stage8_masked_metrics(restored, masks),
         "protection_actions": messages,
@@ -3024,12 +3607,338 @@ def stage8_limited_halo_texture_report(
         report["reason"] = str(error)
         return report
 
+
+def stage8_subject_boundary_seam_report(
+    pipeline,
+    baseline_data: Optional[np.ndarray],
+    candidate_data: Optional[np.ndarray],
+    *,
+    mask_route_override: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Detect enhancement seams at the fitted large-galaxy disk boundary."""
+    target_type = (
+        str(pipeline._active_target_type() or "").strip().lower()
+        if hasattr(pipeline, "_active_target_type")
+        else ""
+    )
+    route = (
+        "large_galaxy_elliptical_soft_v1"
+        if target_type == "large_galaxy"
+        else "generic_nebula_threshold_v1"
+    )
+    if mask_route_override:
+        route = str(mask_route_override).strip()
+    luma_limit = float(
+        getattr(
+            pipeline.cfg,
+            "stage8_subject_boundary_luma_residual_max",
+            0.0035,
+        )
+    )
+    chroma_limit = float(
+        getattr(
+            pipeline.cfg,
+            "stage8_subject_boundary_chroma_residual_max",
+            0.0020,
+        )
+    )
+    ratio_limit = float(
+        getattr(
+            pipeline.cfg,
+            "stage8_subject_boundary_residual_ratio_max",
+            1.60,
+        )
+    )
+    report: Dict[str, Any] = {
+        "schema": "starun.stage8-subject-boundary-seam.v1",
+        "applicable": target_type == "large_galaxy",
+        "available": False,
+        "accepted": target_type != "large_galaxy",
+        "status": "not_applicable" if target_type != "large_galaxy" else "unavailable",
+        "reason": (
+            "target_is_not_large_galaxy"
+            if target_type != "large_galaxy"
+            else "not_measured"
+        ),
+        "mask_route": route,
+        "analysis_grid": {"max_side": 1024, "smoothing": "3x_3x3_box"},
+        "region_definition": {
+            "boundary": "0.05 < disk_weight < 0.95",
+            "interior": "disk_weight >= 0.80",
+            "minimum_samples": 64,
+        },
+        "thresholds": {
+            "boundary_luma_residual_p95_max": luma_limit,
+            "boundary_chroma_residual_p95_max": chroma_limit,
+            "boundary_to_interior_ratio_max": ratio_limit,
+        },
+        "sample_counts": {"boundary": 0, "interior": 0},
+        "metrics": {},
+        "quality_gates": {},
+        "geometry": {},
+        "coverage": {},
+        "seam_detected": False,
+    }
+    if target_type != "large_galaxy":
+        return report
+    if baseline_data is None or candidate_data is None:
+        report["reason"] = "required_image_data_unavailable"
+        return report
+    try:
+        baseline_rgb = _to_rgb_float_image(baseline_data, max_side=1024)
+        candidate_rgb = _to_rgb_float_image(candidate_data, max_side=1024)
+        if baseline_rgb.shape != candidate_rgb.shape:
+            report["reason"] = "baseline_candidate_shape_mismatch"
+            return report
+        if route in {
+            "generic_nebula_threshold_v1",
+            "legacy_generic_nebula_threshold_v1",
+        }:
+            legacy_masks = pipeline._stage8_generate_starless_masks(baseline_rgb)
+            disk_weight = np.asarray(
+                legacy_masks["nebula_mask"],
+                dtype=np.float32,
+            )
+            report["geometry"] = {
+                "source": "legacy_generic_nebula_threshold_reconstruction"
+            }
+            report["coverage"] = dict(legacy_masks.get("coverage") or {})
+        else:
+            execution_diagnostics = getattr(
+                pipeline,
+                "_last_stage8_masked_diagnostics",
+                {},
+            ) or {}
+            execution_disk = execution_diagnostics.get("large_galaxy_disk") or {}
+            execution_route = str(
+                execution_diagnostics.get("mask_route") or ""
+            )
+            if (
+                execution_route == "large_galaxy_elliptical_soft_v1"
+                and str(execution_disk.get("status") or "") == "unavailable"
+            ):
+                report["reason"] = (
+                    "large_galaxy_geometry_unavailable="
+                    + str(execution_disk.get("reason") or "unknown")
+                )
+                return report
+            geometry = dict(execution_disk.get("geometry") or {})
+            coverage = dict(execution_disk.get("coverage") or {})
+            if geometry:
+                full_rgb = _to_rgb_float_fullres(baseline_data)
+                height, width = full_rgb.shape[1:]
+                step = max(1, int(math.ceil(max(height, width) / 1024.0)))
+                yy, xx = np.indices(baseline_rgb.shape[1:])
+                dx = xx.astype(np.float32) * step - float(geometry["center_x"])
+                dy = yy.astype(np.float32) * step - float(geometry["center_y"])
+                major_vector = np.asarray(
+                    geometry["major_axis_vector"],
+                    dtype=np.float64,
+                )
+                minor_vector = np.asarray(
+                    geometry["minor_axis_vector"],
+                    dtype=np.float64,
+                )
+                major_coord = (
+                    dx * float(major_vector[0])
+                    + dy * float(major_vector[1])
+                )
+                minor_coord = (
+                    dx * float(minor_vector[0])
+                    + dy * float(minor_vector[1])
+                )
+                rho = np.sqrt(
+                    np.square(major_coord / float(geometry["major_radius"]))
+                    + np.square(minor_coord / float(geometry["minor_radius"]))
+                )
+                disk_weight = 1.0 - _stage8_smoothstep(rho, 0.72, 1.15)
+            else:
+                full_masks = pipeline._stage8_generate_starless_masks(
+                    baseline_data
+                )
+                routed_masks, disk_report = (
+                    stage8_large_galaxy_structure_masks(
+                        pipeline,
+                        full_masks,
+                    )
+                )
+                geometry = dict(disk_report.get("geometry") or {})
+                coverage = dict(disk_report.get("coverage") or {})
+                if routed_masks is None:
+                    report["reason"] = (
+                        "large_galaxy_geometry_unavailable="
+                        + str(disk_report.get("reason") or "unknown")
+                    )
+                    return report
+                full_weight = np.asarray(
+                    routed_masks["enhancement_subject_weight"],
+                    dtype=np.float32,
+                )
+                step = max(
+                    1,
+                    int(math.ceil(max(full_weight.shape) / 1024.0)),
+                )
+                disk_weight = full_weight[::step, ::step]
+            report["geometry"] = geometry
+            report["coverage"] = coverage
+        if disk_weight.shape != baseline_rgb.shape[1:]:
+            report["reason"] = "disk_weight_shape_mismatch"
+            return report
+        boundary_region = (disk_weight > 0.05) & (disk_weight < 0.95)
+        interior_region = disk_weight >= 0.80
+        boundary_count = int(np.count_nonzero(boundary_region))
+        interior_count = int(np.count_nonzero(interior_region))
+        report["sample_counts"] = {
+            "boundary": boundary_count,
+            "interior": interior_count,
+        }
+        if boundary_count < 64 or interior_count < 64:
+            report["reason"] = "insufficient_boundary_or_interior_samples"
+            return report
+
+        baseline_luma = (
+            0.2126 * baseline_rgb[0]
+            + 0.7152 * baseline_rgb[1]
+            + 0.0722 * baseline_rgb[2]
+        ).astype(np.float32)
+        candidate_luma = (
+            0.2126 * candidate_rgb[0]
+            + 0.7152 * candidate_rgb[1]
+            + 0.0722 * candidate_rgb[2]
+        ).astype(np.float32)
+        delta_luma = candidate_luma - baseline_luma
+        baseline_chroma = baseline_rgb - baseline_luma[None, :, :]
+        candidate_chroma = candidate_rgb - candidate_luma[None, :, :]
+        delta_chroma = np.sqrt(
+            np.mean(
+                np.square(candidate_chroma - baseline_chroma),
+                axis=0,
+            )
+        ).astype(np.float32)
+
+        def high_frequency_residual(values: np.ndarray) -> np.ndarray:
+            smoothed = np.asarray(values, dtype=np.float32)
+            for _ in range(3):
+                smoothed = _box_blur_gray(smoothed)
+            return np.abs(np.asarray(values, dtype=np.float32) - smoothed)
+
+        luma_residual = high_frequency_residual(delta_luma)
+        chroma_residual = high_frequency_residual(delta_chroma)
+
+        def p95(values: np.ndarray, region: np.ndarray) -> float:
+            return float(np.quantile(values[region], 0.95))
+
+        def residual_ratio(boundary: float, interior: float) -> float:
+            if boundary <= 1e-12 and interior <= 1e-12:
+                return 0.0
+            return float(boundary / max(interior, 1e-6))
+
+        boundary_luma = p95(luma_residual, boundary_region)
+        interior_luma = p95(luma_residual, interior_region)
+        boundary_chroma = p95(chroma_residual, boundary_region)
+        interior_chroma = p95(chroma_residual, interior_region)
+        luma_ratio = residual_ratio(boundary_luma, interior_luma)
+        chroma_ratio = residual_ratio(boundary_chroma, interior_chroma)
+        metrics = {
+            "boundary_luma_residual_p95": boundary_luma,
+            "interior_luma_residual_p95": interior_luma,
+            "boundary_luma_to_interior_ratio": luma_ratio,
+            "boundary_chroma_residual_p95": boundary_chroma,
+            "interior_chroma_residual_p95": interior_chroma,
+            "boundary_chroma_to_interior_ratio": chroma_ratio,
+        }
+        gates = {
+            "boundary_luma_residual_p95": (
+                stage7_quality.stage7_9_upper_quality_gate(
+                    pipeline.cfg,
+                    value=boundary_luma,
+                    accepted_limit=luma_limit,
+                )
+            ),
+            "boundary_luma_to_interior_ratio": (
+                stage7_quality.stage7_9_upper_quality_gate(
+                    pipeline.cfg,
+                    value=luma_ratio,
+                    accepted_limit=ratio_limit,
+                )
+            ),
+            "boundary_chroma_residual_p95": (
+                stage7_quality.stage7_9_upper_quality_gate(
+                    pipeline.cfg,
+                    value=boundary_chroma,
+                    accepted_limit=chroma_limit,
+                )
+            ),
+            "boundary_chroma_to_interior_ratio": (
+                stage7_quality.stage7_9_upper_quality_gate(
+                    pipeline.cfg,
+                    value=chroma_ratio,
+                    accepted_limit=ratio_limit,
+                )
+            ),
+        }
+        luma_seam = boundary_luma > luma_limit and luma_ratio > ratio_limit
+        chroma_seam = (
+            boundary_chroma > chroma_limit and chroma_ratio > ratio_limit
+        )
+        hard_failed = bool(
+            (
+                luma_seam
+                and (
+                    gates["boundary_luma_residual_p95"]["hard_failed"]
+                    or gates["boundary_luma_to_interior_ratio"]["hard_failed"]
+                )
+            )
+            or (
+                chroma_seam
+                and (
+                    gates["boundary_chroma_residual_p95"]["hard_failed"]
+                    or gates["boundary_chroma_to_interior_ratio"]["hard_failed"]
+                )
+            )
+        )
+        seam_detected = bool(luma_seam or chroma_seam)
+        report.update(
+            {
+                "available": True,
+                "accepted": not hard_failed,
+                "status": (
+                    "hard_failed"
+                    if hard_failed
+                    else "advisory"
+                    if seam_detected
+                    else "ok"
+                ),
+                "reason": (
+                    "subject_boundary_mask_seam"
+                    if seam_detected
+                    else "accepted"
+                ),
+                "metrics": metrics,
+                "quality_gates": gates,
+                "seam_detected": seam_detected,
+                "seam_channels": {
+                    "luma": luma_seam,
+                    "chroma": chroma_seam,
+                },
+            }
+        )
+        return report
+    except (IndexError, KeyError, TypeError, ValueError, FloatingPointError) as error:
+        report["reason"] = str(error)
+        return report
+
 def stage8_quality_assessment(
     pipeline,
     *,
     baseline_stem: str = "stage8_input_starless",
     candidate_stem: str = "stage8_enhanced",
 ) -> Dict[str, Any]:
+    target_type = (
+        str(pipeline._active_target_type() or "").strip().lower()
+        if hasattr(pipeline, "_active_target_type")
+        else ""
+    )
     handoff = getattr(pipeline, "_stage8_handoff", {}) or {}
     limited_mode = bool(
         isinstance(handoff, dict)
@@ -3084,6 +3993,14 @@ def stage8_quality_assessment(
                 "accepted": False,
                 "reason": "required image data unavailable",
             },
+            "subject_boundary_seam": {
+                "schema": "starun.stage8-subject-boundary-seam.v1",
+                "applicable": target_type == "large_galaxy",
+                "available": False,
+                "accepted": False,
+                "status": "unavailable",
+                "reason": "required image data unavailable",
+            },
             "protection_actions": getattr(
                 pipeline,
                 "_last_stage8_masked_diagnostics",
@@ -3102,8 +4019,19 @@ def stage8_quality_assessment(
         if baseline_data is not None
         else None
     )
+    if target_type == "large_galaxy" and masks is not None:
+        routed_masks, _ = stage8_large_galaxy_structure_masks(pipeline, masks)
+        masks = routed_masks
     baseline_masked_metrics = pipeline._stage8_masked_metrics(baseline_data, masks)
     candidate_masked_metrics = pipeline._stage8_masked_metrics(candidate_data, masks)
+    subject_boundary_seam = stage8_subject_boundary_seam_report(
+        pipeline,
+        baseline_data,
+        candidate_data,
+    )
+    pipeline._stage8_subject_boundary_seam_report = dict(
+        subject_boundary_seam
+    )
 
     saturation_growth = (
         candidate_metrics.saturation_p95 / max(baseline_metrics.saturation_p95, 0.05)
@@ -3134,6 +4062,47 @@ def stage8_quality_assessment(
     issues: List[str] = []
     advisories: List[str] = []
     quality_gates: Dict[str, Dict[str, Any]] = {}
+
+    execution_diagnostics = getattr(
+        pipeline,
+        "_last_stage8_masked_diagnostics",
+        {},
+    ) or {}
+    execution_disk_report = execution_diagnostics.get("large_galaxy_disk") or {}
+    if (
+        target_type == "large_galaxy"
+        and not limited_mode
+        and str(execution_disk_report.get("status") or "") == "unavailable"
+    ):
+        issues.append(
+            "large_galaxy_structure_mask_unavailable="
+            + str(execution_disk_report.get("reason") or "unknown")
+        )
+
+    if bool(subject_boundary_seam.get("applicable", False)):
+        seam_status = str(subject_boundary_seam.get("status") or "unavailable")
+        if not bool(subject_boundary_seam.get("available", False)):
+            issues.append(
+                "large_galaxy_subject_boundary_gate_unavailable="
+                + str(subject_boundary_seam.get("reason") or "unknown")
+            )
+        elif seam_status == "hard_failed":
+            metrics = subject_boundary_seam.get("metrics") or {}
+            issues.append(
+                "subject_boundary_mask_seam "
+                f"luma_p95={float(metrics.get('boundary_luma_residual_p95', 0.0)):.6f}, "
+                f"luma_ratio={float(metrics.get('boundary_luma_to_interior_ratio', 0.0)):.3f}, "
+                f"chroma_p95={float(metrics.get('boundary_chroma_residual_p95', 0.0)):.6f}, "
+                f"chroma_ratio={float(metrics.get('boundary_chroma_to_interior_ratio', 0.0)):.3f}"
+            )
+        elif seam_status == "advisory":
+            advisories.append(
+                "subject_boundary_mask_seam advisory; candidate retained"
+            )
+        for metric_name, gate in (
+            subject_boundary_seam.get("quality_gates") or {}
+        ).items():
+            quality_gates[f"subject_boundary_{metric_name}"] = gate
 
     def record_upper_gate(
         metric_name: str,
@@ -3284,6 +4253,7 @@ def stage8_quality_assessment(
             "texture_artifact_growth": texture_artifact_growth,
         },
         "limited_halo_texture": halo_texture_report,
+        "subject_boundary_seam": subject_boundary_seam,
         "local_issues": issues,
         "local_advisories": advisories,
         "quality_gates": quality_gates,
@@ -3306,7 +4276,14 @@ def stage8_quality_assessment(
             "candidate": candidate_masked_metrics,
         },
         "mask_coverage": observations["mask_coverage"],
+        "mask_route": str(
+            (execution_diagnostics.get("mask_route") or "")
+            or subject_boundary_seam.get("mask_route")
+            or "generic_nebula_threshold_v1"
+        ),
+        "large_galaxy_disk": execution_disk_report,
         "limited_halo_texture": halo_texture_report,
+        "subject_boundary_seam": subject_boundary_seam,
         "protection_actions": getattr(
             pipeline,
             "_last_stage8_masked_diagnostics",
@@ -3350,6 +4327,7 @@ def stage8_conservative_rerun(pipeline, original_saturation: float) -> Dict[str,
                 {
                     "saturation": safe_saturation,
                     "unsharp_amount": min(0.08, pipeline.cfg.stage8_masked_unsharp_amount_max),
+                    "structure_scale": 0.35,
                 },
                 label="conservative",
             )
@@ -3435,6 +4413,7 @@ def stage8_needs_conservative_rerun(pipeline, quality_record: Dict[str, Any]) ->
             "background_brightening",
             "core_clip_growth",
             "texture_artifact_growth",
+            "subject_boundary_mask_seam",
         )
     ):
         return True

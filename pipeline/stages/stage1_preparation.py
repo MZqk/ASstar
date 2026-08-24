@@ -85,6 +85,9 @@ def _load_explicit_master(pipeline, source: Path, source_kind: str) -> None:
 
     pipeline._stage1_input_mode = "explicit_master"
     pipeline.source_file = source
+    # Keep the verified, read-only source identity separate from mutable
+    # working/checkpoint paths so Stage 2 can audit device-native geometry.
+    pipeline._stage1_original_source_file = source
     pipeline._stage1_registration_stats = None
     if source.suffix.lower() == ".xisf":
         pipeline.log.info("XISF 以只读方式加载，并在 Stage 1 转换为任务内 FITS")

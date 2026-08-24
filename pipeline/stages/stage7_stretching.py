@@ -5,6 +5,7 @@ from typing import List
 import display_rendition
 from managed_output import audit_display_visibility
 from models import PipelineStage, StarSeparationState
+import scene_support
 from sirilpy.exceptions import CommandError, SirilError
 import syqon_starless
 
@@ -164,6 +165,9 @@ def _run_with_stars_review_stretch(
         ).get("bright_core_color_integrity")
         or {}
     )
+    shared_scene_support_summary = scene_support.scene_support_summary(
+        getattr(pipeline, "_stage3_scene_support", None)
+    )
     review_quality_report = {
             "stage": "stage7_stretch",
             "status": "review_only" if saved else "failed",
@@ -174,6 +178,7 @@ def _run_with_stars_review_stretch(
             "review_required": True,
             "input": f"{source_stem}.fit",
             "source_stem": source_stem,
+            "shared_scene_support": shared_scene_support_summary,
             "review_output": "stage7_review_with_stars" if saved else None,
             "attempts": copy.deepcopy(
                 getattr(pipeline, "_stage7_stretch_candidates", []) or []
@@ -248,8 +253,8 @@ def run_stage7_stretching(pipeline) -> None:
     """
     阶段 7: 主体拉伸
     - 常规输入为 stage6_starless.fit；target_bypass 使用 stage6_passthrough.fit
-    - 自动 Starless 路径默认生成 stage7_cand_a / stage7_cand_b /
-      stage7_cand_display90 和一个 stage7_preview_ref；旧 auto_dual 仍只生成 A/B
+    - 自动 Starless 路径默认生成 stage7_cand_a / stage7_cand_b / Display ladder
+      和一个 stage7_preview_ref；星系路线增加 0.86 安全档，旧 auto_dual 仍只生成 A/B
     - 严格目标条件可用 Iterative Masked MTF 或 Dual-stage MTF+GHS 替换 cand_a
     - 亮核心星云 cand_a 使用扩张的星点/halo 掩膜保护并保留 1.50x 尺寸门
     - 完整变换后实测 P50；偏离时从线性源校准参数并重跑一次

@@ -2,6 +2,7 @@
 """Regression tests for pipeline-side task checkpoint provenance."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -10,6 +11,8 @@ import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +38,7 @@ for exception_name in ("CommandError", "DataError", "SirilError"):
 
 import processor_runtime  # noqa: E402
 import run_manifest  # noqa: E402
+import scene_support  # noqa: E402
 import task_plan  # noqa: E402
 from stage_contracts import stage_contract  # noqa: E402
 from task_workspace import (  # noqa: E402
@@ -117,6 +121,43 @@ class TaskResumeRuntimeTests(unittest.TestCase):
         }
 
     @staticmethod
+    def _footprint_evidence() -> dict[str, object]:
+        decoded = bytes((100, 100, 0, 0))
+        grid = {
+            "rows": 2,
+            "columns": 2,
+            "encoding": "rle-u8-row-major-v1",
+            "runs": [[100, 2], [0, 2]],
+            "sha256": hashlib.sha256(decoded).hexdigest(),
+        }
+        return {
+            "schema": "starun.stage2-stacked-footprint-evidence.v1",
+            "status": "available",
+            "source_mode": "stacked_master_inference",
+            "observer_only": True,
+            "captured_before_crop": True,
+            "source_artifact": "stage1_prepared.fit",
+            "source_sha256": "b" * 64,
+            "input_shape": {"channels": 3, "height": 1080, "width": 1920},
+            "layers": {
+                "fill_support": {
+                    "status": "available",
+                    "reason": "full_frame_is_valid",
+                    "grid": dict(grid),
+                },
+                "relative_coverage": {
+                    "status": "available",
+                    "reason": "no_significant_edge_connected_coverage_anomaly",
+                    "grid": dict(grid),
+                },
+            },
+            "limitations": [
+                "not_per_frame_registration_footprint",
+                "not_crop_authority",
+            ],
+        }
+
+    @staticmethod
     def _stage2_semantic_context() -> dict[str, object]:
         return {
             "schema": "starun.resume-semantics.v2",
@@ -136,6 +177,9 @@ class TaskResumeRuntimeTests(unittest.TestCase):
                     "accepted": False,
                     "reason": "no_significant_edge_connected_coverage_anomaly",
                 },
+                "stacked_master_footprint": (
+                    TaskResumeRuntimeTests._footprint_evidence()
+                ),
             },
         }
 
@@ -146,6 +190,7 @@ class TaskResumeRuntimeTests(unittest.TestCase):
         stage_number: int = 5,
         with_semantics: bool = True,
         semantic_context: dict[str, object] | None = None,
+        with_scene_support: bool = False,
     ):
         source = root / "source" / "master.fit"
         source.parent.mkdir(parents=True)
@@ -174,19 +219,43 @@ class TaskResumeRuntimeTests(unittest.TestCase):
         contract = stage_contract(stage_number)
         checkpoint = process_dir / contract.primary_artifact
         checkpoint.write_bytes(f"verified-stage{stage_number}".encode("ascii"))
+        selected_context = (
+            semantic_context
+            if semantic_context is not None
+            else self._semantic_context()
+            if with_semantics and stage_number == 5
+            else self._stage2_semantic_context()
+            if with_semantics and stage_number == 2
+            else None
+        )
+        auxiliary_artifacts = None
+        if with_scene_support:
+            image = np.full((3, 24, 32), 0.1, dtype=np.float32)
+            scene_source = process_dir / "stage3_bg_input.fit"
+            scene_source.write_bytes(b"stage3-bg-input")
+            manifest = scene_support.build_scene_support(
+                image,
+                process_dir,
+                source_path=scene_source,
+                sep_module=None,
+            )
+            if isinstance(selected_context, dict):
+                selected_context["stage3_scene_support"] = (
+                    scene_support.scene_support_summary(manifest)
+                )
+            auxiliary_artifacts = {
+                name: process_dir / name
+                for name in (
+                    scene_support.SCENE_SUPPORT_JSON,
+                    scene_support.SCENE_SUPPORT_ARRAYS,
+                )
+            }
         publish_formal_checkpoint(
             run_manifest_path=first_run.manifest_path,
             stage_number=stage_number,
             artifact_path=checkpoint,
-            semantic_context=(
-                semantic_context
-                if semantic_context is not None
-                else self._semantic_context()
-                if with_semantics and stage_number == 5
-                else self._stage2_semantic_context()
-                if with_semantics and stage_number == 2
-                else None
-            ),
+            semantic_context=selected_context,
+            auxiliary_artifacts=auxiliary_artifacts,
         )
         inspection = inspect_task_workspace(
             workspace.root,
@@ -287,6 +356,10 @@ class TaskResumeRuntimeTests(unittest.TestCase):
         self.assertTrue(restored)
         self.assertEqual(runtime.stage2_crop_report["field_rotation_passes"], 1)
         self.assertEqual(
+            runtime.stage2_crop_report["stacked_master_footprint"],
+            context["stage2_crop"]["stacked_master_footprint"],
+        )
+        self.assertEqual(
             runtime._stage_review_reasons(2),
             ["field_rotation_residual_review"],
         )
@@ -355,6 +428,44 @@ class TaskResumeRuntimeTests(unittest.TestCase):
             runtime._stage5_star_reference_report["stars"][0]["index"],
             7,
         )
+        self.assertEqual(
+            runtime._stage3_scene_support["manifest"]["reason_code"],
+            "legacy_checkpoint_without_scene_support",
+        )
+
+    def test_stage5_resume_restores_scene_support_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            _workspace, run = self._resume_run(
+                Path(td),
+                with_scene_support=True,
+            )
+            runtime = processor_runtime.ProcessorRuntimeMixin()
+            runtime.work_dir = run.root
+            runtime.process_dir = run.root / "process"
+            runtime.process_dir.mkdir()
+            runtime.input_mode = processor_runtime.INPUT_MODE_LINEAR_RESUME
+            runtime.log = _Log()
+            runtime.color_calibration_report = {}
+            runtime.channel_profile = {}
+            runtime.target_profile = {}
+            runtime.pipeline_policy = {}
+
+            with patch.dict(
+                os.environ,
+                {processor_runtime.ENV_TASK_RUN_MANIFEST_KEY: str(run.manifest_path)},
+                clear=False,
+            ):
+                runtime._load_trusted_input_provenance_for_resume()
+                restored = runtime._apply_trusted_resume_semantics()
+
+            self.assertTrue(restored)
+            self.assertIn(runtime._stage3_scene_support["status"], {"available", "partial"})
+            self.assertTrue(
+                (runtime.process_dir / scene_support.SCENE_SUPPORT_JSON).is_file()
+            )
+            self.assertTrue(
+                (runtime.process_dir / scene_support.SCENE_SUPPORT_ARRAYS).is_file()
+            )
 
     def test_stage5_resume_restores_stage2_review_without_stage3_pollution(self) -> None:
         with tempfile.TemporaryDirectory() as td:

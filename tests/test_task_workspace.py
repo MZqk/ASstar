@@ -2,11 +2,14 @@
 """Regression tests for source-read-only tasks and formal checkpoints."""
 from __future__ import annotations
 
+import hashlib
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +20,7 @@ if str(PIPELINE_DIR) not in sys.path:
     sys.path.insert(0, str(PIPELINE_DIR))
 
 import run_manifest  # noqa: E402
+import scene_support  # noqa: E402
 import task_plan  # noqa: E402
 from input_discovery import InputKind, discover_input  # noqa: E402
 from stage_contracts import FORMAL_RESUME_STAGES, stage_contract  # noqa: E402
@@ -92,6 +96,43 @@ class TaskWorkspaceTests(unittest.TestCase):
         }
 
     @staticmethod
+    def _footprint_evidence() -> dict[str, object]:
+        decoded = bytes((100, 100, 0, 0))
+        grid = {
+            "rows": 2,
+            "columns": 2,
+            "encoding": "rle-u8-row-major-v1",
+            "runs": [[100, 2], [0, 2]],
+            "sha256": hashlib.sha256(decoded).hexdigest(),
+        }
+        return {
+            "schema": "starun.stage2-stacked-footprint-evidence.v1",
+            "status": "available",
+            "source_mode": "stacked_master_inference",
+            "observer_only": True,
+            "captured_before_crop": True,
+            "source_artifact": "stage1_prepared.fit",
+            "source_sha256": "a" * 64,
+            "input_shape": {"channels": 3, "height": 1080, "width": 1920},
+            "layers": {
+                "fill_support": {
+                    "status": "available",
+                    "reason": "full_frame_is_valid",
+                    "grid": dict(grid),
+                },
+                "relative_coverage": {
+                    "status": "available",
+                    "reason": "no_significant_edge_connected_coverage_anomaly",
+                    "grid": dict(grid),
+                },
+            },
+            "limitations": [
+                "not_per_frame_registration_footprint",
+                "not_crop_authority",
+            ],
+        }
+
+    @staticmethod
     def _stage2_semantic_context() -> dict[str, object]:
         return {
             "schema": "starun.resume-semantics.v2",
@@ -111,6 +152,7 @@ class TaskWorkspaceTests(unittest.TestCase):
                     "accepted": False,
                     "reason": "not_run",
                 },
+                "stacked_master_footprint": TaskWorkspaceTests._footprint_evidence(),
             },
         }
 
@@ -258,6 +300,176 @@ class TaskWorkspaceTests(unittest.TestCase):
 
         self.assertTrue(inspection["verified"])
         self.assertEqual(inspection["resume_after_stage"], 5)
+
+    def test_stage2_checkpoint_without_footprint_remains_compatible(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            _, source_record, workspace = self._workspace(Path(td))
+            fingerprints = self._fingerprints()
+            run = begin_task_run(
+                workspace=workspace,
+                source_record=source_record,
+                run_id="legacy-stage2-run",
+                checkpoint_fingerprints=fingerprints,
+            )
+            process_dir = run.root / "process"
+            process_dir.mkdir()
+            artifact = process_dir / "stage2_corrected.fit"
+            artifact.write_bytes(b"legacy-stage2")
+            context = self._stage2_semantic_context()
+            context["stage2_crop"].pop("stacked_master_footprint")
+
+            record = publish_formal_checkpoint(
+                run_manifest_path=run.manifest_path,
+                stage_number=2,
+                artifact_path=artifact,
+                semantic_context=context,
+            )
+
+        self.assertNotIn(
+            "stacked_master_footprint",
+            record["semantic_context"]["stage2_crop"],
+        )
+
+    def test_stage5_checkpoint_transports_and_validates_scene_support(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            _, source_record, workspace = self._workspace(Path(td))
+            fingerprints = task_plan.build_resume_fingerprints(
+                input_fingerprint=source_record["fingerprint"],
+                stage_config={stage: {"value": stage} for stage in range(1, 6)},
+            )
+            run = begin_task_run(
+                workspace=workspace,
+                source_record=source_record,
+                run_id="stage5-scene-support",
+                checkpoint_fingerprints=fingerprints,
+            )
+            process_dir = run.root / "process"
+            process_dir.mkdir()
+            artifact = process_dir / "stage5_linear.fit"
+            artifact.write_bytes(b"stage5-linear")
+            scene_source = process_dir / "stage3_bg_input.fit"
+            scene_source.write_bytes(b"stage3-bg-input")
+            image = np.full((3, 32, 40), 0.1, dtype=np.float32)
+            scene_support.build_scene_support(
+                image,
+                process_dir,
+                source_path=scene_source,
+                sep_module=None,
+            )
+            auxiliaries = {
+                scene_support.SCENE_SUPPORT_JSON: (
+                    process_dir / scene_support.SCENE_SUPPORT_JSON
+                ),
+                scene_support.SCENE_SUPPORT_ARRAYS: (
+                    process_dir / scene_support.SCENE_SUPPORT_ARRAYS
+                ),
+            }
+            record = publish_formal_checkpoint(
+                run_manifest_path=run.manifest_path,
+                stage_number=5,
+                artifact_path=artifact,
+                semantic_context=self._semantic_context(),
+                auxiliary_artifacts=auxiliaries,
+            )
+            self.assertEqual(
+                set(record["auxiliary_artifacts"]), set(auxiliaries)
+            )
+            inspection = inspect_task_workspace(
+                workspace.root,
+                current_resume_fingerprints=fingerprints,
+            )
+            self.assertTrue(inspection["verified"])
+
+            (workspace.checkpoints_dir / scene_support.SCENE_SUPPORT_ARRAYS).write_bytes(
+                b"tampered"
+            )
+            rejected = inspect_task_workspace(
+                workspace.root,
+                current_resume_fingerprints=fingerprints,
+            )
+            self.assertFalse(rejected["verified"])
+            self.assertIn(
+                "auxiliary",
+                str((rejected.get("rejections") or {}).get("stage5") or ""),
+            )
+
+    def test_stage2_checkpoint_rejects_invalid_footprint_grid_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            _, source_record, workspace = self._workspace(Path(td))
+            fingerprints = self._fingerprints()
+            run = begin_task_run(
+                workspace=workspace,
+                source_record=source_record,
+                run_id="invalid-stage2-footprint-run",
+                checkpoint_fingerprints=fingerprints,
+            )
+            process_dir = run.root / "process"
+            process_dir.mkdir()
+            artifact = process_dir / "stage2_corrected.fit"
+            artifact.write_bytes(b"invalid-stage2-footprint")
+            context = self._stage2_semantic_context()
+            footprint = context["stage2_crop"]["stacked_master_footprint"]
+            footprint["layers"]["fill_support"]["grid"]["sha256"] = "0" * 64
+
+            with self.assertRaisesRegex(WorkspaceError, "SHA-256 不匹配"):
+                publish_formal_checkpoint(
+                    run_manifest_path=run.manifest_path,
+                    stage_number=2,
+                    artifact_path=artifact,
+                    semantic_context=context,
+                )
+
+    def test_stage2_checkpoint_rejects_invalid_footprint_rle_length(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            _, source_record, workspace = self._workspace(Path(td))
+            fingerprints = self._fingerprints()
+            run = begin_task_run(
+                workspace=workspace,
+                source_record=source_record,
+                run_id="invalid-stage2-footprint-rle-run",
+                checkpoint_fingerprints=fingerprints,
+            )
+            process_dir = run.root / "process"
+            process_dir.mkdir()
+            artifact = process_dir / "stage2_corrected.fit"
+            artifact.write_bytes(b"invalid-stage2-footprint-rle")
+            context = self._stage2_semantic_context()
+            footprint = context["stage2_crop"]["stacked_master_footprint"]
+            footprint["layers"]["fill_support"]["grid"]["runs"] = [[100, 3]]
+
+            with self.assertRaisesRegex(WorkspaceError, "长度与网格不匹配"):
+                publish_formal_checkpoint(
+                    run_manifest_path=run.manifest_path,
+                    stage_number=2,
+                    artifact_path=artifact,
+                    semantic_context=context,
+                )
+
+    def test_stage2_checkpoint_rejects_missing_source_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            _, source_record, workspace = self._workspace(Path(td))
+            fingerprints = self._fingerprints()
+            run = begin_task_run(
+                workspace=workspace,
+                source_record=source_record,
+                run_id="invalid-stage2-footprint-source-run",
+                checkpoint_fingerprints=fingerprints,
+            )
+            process_dir = run.root / "process"
+            process_dir.mkdir()
+            artifact = process_dir / "stage2_corrected.fit"
+            artifact.write_bytes(b"invalid-stage2-footprint-source")
+            context = self._stage2_semantic_context()
+            footprint = context["stage2_crop"]["stacked_master_footprint"]
+            footprint["source_sha256"] = None
+
+            with self.assertRaisesRegex(WorkspaceError, "缺少 64 位来源 SHA-256"):
+                publish_formal_checkpoint(
+                    run_manifest_path=run.manifest_path,
+                    stage_number=2,
+                    artifact_path=artifact,
+                    semantic_context=context,
+                )
 
     def test_earlier_checkpoint_prunes_incompatible_later_record(self) -> None:
         with tempfile.TemporaryDirectory() as td:

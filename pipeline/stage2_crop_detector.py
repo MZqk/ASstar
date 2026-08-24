@@ -8,6 +8,7 @@ through the normal guarded crop command.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import math
 from typing import Any, Dict, Optional, Tuple
 
@@ -15,6 +16,54 @@ import numpy as np
 
 
 CropRect = Tuple[int, int, int, int]
+STACKED_FOOTPRINT_EVIDENCE_SCHEMA = (
+    "starun.stage2-stacked-footprint-evidence.v1"
+)
+_OBSERVER_GRID_MAX_SIDE = 64
+
+
+def _compact_observer_grid(mask: np.ndarray) -> Dict[str, Any]:
+    """Encode a 2D support mask as a bounded, deterministic percentage grid."""
+
+    support = np.asarray(mask, dtype=bool)
+    if support.ndim != 2 or support.size == 0:
+        raise ValueError("observer footprint grid requires a non-empty 2D mask")
+    height, width = support.shape
+    scale = min(1.0, _OBSERVER_GRID_MAX_SIDE / float(max(height, width)))
+    rows = max(1, min(_OBSERVER_GRID_MAX_SIDE, int(round(height * scale))))
+    columns = max(1, min(_OBSERVER_GRID_MAX_SIDE, int(round(width * scale))))
+    y_edges = np.linspace(0, height, rows + 1, dtype=np.int32)
+    x_edges = np.linspace(0, width, columns + 1, dtype=np.int32)
+    compact = np.zeros((rows, columns), dtype=np.uint8)
+    for row in range(rows):
+        y0 = int(y_edges[row])
+        y1 = max(y0 + 1, int(y_edges[row + 1]))
+        for column in range(columns):
+            x0 = int(x_edges[column])
+            x1 = max(x0 + 1, int(x_edges[column + 1]))
+            compact[row, column] = np.uint8(
+                np.clip(
+                    np.rint(float(np.mean(support[y0:y1, x0:x1])) * 100.0),
+                    0.0,
+                    100.0,
+                )
+            )
+
+    flattened = compact.reshape(-1)
+    runs: list[list[int]] = []
+    for raw_value in flattened:
+        value = int(raw_value)
+        if runs and runs[-1][0] == value:
+            runs[-1][1] += 1
+        else:
+            runs.append([value, 1])
+    return {
+        "rows": int(rows),
+        "columns": int(columns),
+        "encoding": "rle-u8-row-major-v1",
+        "runs": runs,
+        "sha256": hashlib.sha256(compact.tobytes(order="C")).hexdigest(),
+    }
 
 
 @dataclass(frozen=True)
@@ -315,6 +364,7 @@ def detect_field_rotation_crop(
     *,
     noise_ratio_min: float = 1.35,
     chroma_ratio_min: float = 1.20,
+    include_observer_grid: bool = False,
 ) -> NativeCropDetection:
     """Detect edge-connected low-coverage wedges from noise/chroma evidence.
 
@@ -444,6 +494,8 @@ def detect_field_rotation_crop(
         "boundary_noise_ratio_max": float(np.max(boundary_noise)),
         "boundary_chroma_ratio_max": float(np.max(boundary_chroma)),
     }
+    if include_observer_grid:
+        evidence["observer_grid"] = _compact_observer_grid(~edge_connected)
     if connected_count < minimum_connected:
         evidence["minimum_edge_connected_tile_count"] = minimum_connected
         return NativeCropDetection(
@@ -557,6 +609,7 @@ def detect_native_contour_crop(
     *,
     cv2_module: Any = None,
     lir_module: Any = None,
+    include_observer_grid: bool = False,
 ) -> NativeCropDetection:
     """Propose a safe contour/LIR crop for a canonical image array."""
 
@@ -642,6 +695,11 @@ def detect_native_contour_crop(
             evidence={"dependency_error": str(error)},
         )
     footprint_ratio = float(np.mean(contour_mask > 0))
+    observer_evidence = (
+        {"observer_grid": _compact_observer_grid(contour_mask > 0)}
+        if include_observer_grid
+        else {}
+    )
     if footprint_ratio < 0.25:
         return NativeCropDetection(
             None,
@@ -651,6 +709,7 @@ def detect_native_contour_crop(
                 "background_level": background,
                 "mask_threshold": threshold,
                 "footprint_ratio": footprint_ratio,
+                **observer_evidence,
             },
         )
 
@@ -684,6 +743,7 @@ def detect_native_contour_crop(
                 "mask_threshold": threshold,
                 "footprint_ratio": footprint_ratio,
                 "rectangle_source": rectangle_source,
+                **observer_evidence,
             },
         )
 
@@ -703,12 +763,24 @@ def detect_native_contour_crop(
                 "mask_threshold": threshold,
                 "footprint_ratio": footprint_ratio,
                 "rectangle_source": rectangle_source,
+                **observer_evidence,
             },
         )
 
     rect = _scale_rect_inward(mask_rect, scale, width, height)
     if rect is None:
-        return NativeCropDetection(None, False, "invalid_scaled_rectangle")
+        return NativeCropDetection(
+            None,
+            False,
+            "invalid_scaled_rectangle",
+            evidence={
+                "background_level": background,
+                "mask_threshold": threshold,
+                "footprint_ratio": footprint_ratio,
+                "rectangle_source": rectangle_source,
+                **observer_evidence,
+            },
+        )
     x, y, rect_width, rect_height = rect
     if x == 0 and y == 0 and rect_width == width and rect_height == height:
         return NativeCropDetection(
@@ -720,6 +792,7 @@ def detect_native_contour_crop(
                 "mask_threshold": threshold,
                 "footprint_ratio": footprint_ratio,
                 "rectangle_source": rectangle_source,
+                **observer_evidence,
             },
         )
 
@@ -729,6 +802,7 @@ def detect_native_contour_crop(
         "mask_threshold": threshold,
         "footprint_ratio": footprint_ratio,
         "rectangle_source": rectangle_source,
+        **observer_evidence,
         **boundary_evidence,
     }
     if not accepted:
@@ -746,11 +820,140 @@ def detect_native_contour_crop(
     )
 
 
+def _observer_candidate(result: NativeCropDetection) -> Optional[Dict[str, int]]:
+    if result.rect is None:
+        return None
+    return {
+        "x": int(result.rect[0]),
+        "y": int(result.rect[1]),
+        "width": int(result.rect[2]),
+        "height": int(result.rect[3]),
+    }
+
+
+def infer_stacked_master_footprint(
+    image: np.ndarray,
+    *,
+    source_artifact: Optional[str] = None,
+    source_sha256: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build observer-only footprint evidence from the current stacked master."""
+
+    limitations = [
+        "not_per_frame_registration_footprint",
+        "not_crop_authority",
+    ]
+    try:
+        rgb = _as_rgb_float(image)
+    except (TypeError, ValueError) as error:
+        return {
+            "schema": STACKED_FOOTPRINT_EVIDENCE_SCHEMA,
+            "status": "unavailable",
+            "source_mode": "stacked_master_inference",
+            "observer_only": True,
+            "captured_before_crop": True,
+            "source_artifact": source_artifact,
+            "source_sha256": source_sha256,
+            "input_shape": {},
+            "reason": str(error),
+            "layers": {},
+            "limitations": limitations,
+        }
+    height, width, channels = rgb.shape
+
+    try:
+        fill_result = detect_native_contour_crop(
+            rgb,
+            include_observer_grid=True,
+        )
+    except Exception as error:  # Observer-only detector isolation boundary.
+        fill_result = NativeCropDetection(
+            None,
+            False,
+            f"observer_detection_failed:{error}",
+            evidence={},
+        )
+    try:
+        coverage_result = detect_field_rotation_crop(
+            rgb,
+            include_observer_grid=True,
+        )
+    except Exception as error:  # Observer-only detector isolation boundary.
+        coverage_result = NativeCropDetection(
+            None,
+            False,
+            f"observer_detection_failed:{error}",
+            method="native_field_rotation",
+            evidence={},
+        )
+
+    fill_evidence = dict(fill_result.evidence or {})
+    fill_grid = fill_evidence.get("observer_grid")
+    fill_available = isinstance(fill_grid, dict)
+    fill_support: Dict[str, Any] = {
+        "status": "available" if fill_available else "unavailable",
+        "reason": str(fill_result.reason),
+        "observed_candidate": _observer_candidate(fill_result),
+        "valid_area_ratio": fill_evidence.get("footprint_ratio"),
+        "background_level": fill_evidence.get("background_level"),
+        "mask_threshold": fill_evidence.get("mask_threshold"),
+        "grid": fill_grid if fill_available else None,
+    }
+
+    coverage_evidence = dict(coverage_result.evidence or {})
+    coverage_grid = coverage_evidence.get("observer_grid")
+    coverage_available = isinstance(coverage_grid, dict)
+    relative_coverage: Dict[str, Any] = {
+        "status": "available" if coverage_available else "unavailable",
+        "reason": str(coverage_result.reason),
+        "observed_candidate": _observer_candidate(coverage_result),
+        "edge_connected_invalid_ratio": coverage_evidence.get(
+            "edge_connected_ratio"
+        ),
+        "candidate_retained_ratio": coverage_evidence.get(
+            "candidate_retained_ratio"
+        ),
+        "reference_noise": coverage_evidence.get("reference_noise"),
+        "reference_chroma": coverage_evidence.get("reference_chroma"),
+        "grid": coverage_grid if coverage_available else None,
+    }
+
+    available_count = int(fill_available) + int(coverage_available)
+    status = (
+        "available"
+        if available_count == 2
+        else "partial"
+        if available_count == 1
+        else "unavailable"
+    )
+    return {
+        "schema": STACKED_FOOTPRINT_EVIDENCE_SCHEMA,
+        "status": status,
+        "source_mode": "stacked_master_inference",
+        "observer_only": True,
+        "captured_before_crop": True,
+        "source_artifact": source_artifact,
+        "source_sha256": source_sha256,
+        "input_shape": {
+            "channels": int(channels),
+            "height": int(height),
+            "width": int(width),
+        },
+        "layers": {
+            "fill_support": fill_support,
+            "relative_coverage": relative_coverage,
+        },
+        "limitations": limitations,
+    }
+
+
 __all__ = [
     "CropRect",
     "NativeCropDetection",
+    "STACKED_FOOTPRINT_EVIDENCE_SCHEMA",
     "crop_black_boundary_evidence",
     "detect_field_rotation_crop",
     "detect_native_contour_crop",
+    "infer_stacked_master_footprint",
     "largest_rectangle_in_mask",
 ]

@@ -1729,10 +1729,16 @@ class Stage9PsfClosureTests(unittest.TestCase):
         )
         current = stage9_quality.interpret_stage9_remix_quality_report(
             {
-                "schema": "starun.stage9-remix-quality.v9",
+                "schema": "starun.stage9-remix-quality.v10",
                 "formal_accepted": True,
                 "persisted_output_validation": {
                     "accepted": True,
+                    "sep_crossmatch_accepted": True,
+                },
+                "sep_crossmatch": {
+                    "schema": "starun.stage9-sep-crossmatch.v1",
+                    "accepted": True,
+                    "artifact_sha256": "0" * 64,
                 },
             }
         )

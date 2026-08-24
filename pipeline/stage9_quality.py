@@ -3,11 +3,14 @@ from __future__ import annotations
 
 from typing import Any, Dict, Tuple
 
+import hashlib
+import json
 import math
 
 import numpy as np
 
 from image_metrics import _box_blur_gray
+import scene_support
 import stage7_quality
 
 try:
@@ -16,6 +19,11 @@ try:
 except ImportError:  # pragma: no cover - bundled runtime includes scipy
     scipy_ndimage = None
     scipy_spatial = None
+
+try:
+    import sep as sep_library
+except (ImportError, OSError):  # pragma: no cover - unavailable-evidence tests
+    sep_library = None
 
 
 _MOTTLING_LOW_ABSOLUTE_SCORE_MAX = 0.10
@@ -36,6 +44,661 @@ _STAGE9_STARMASK_SUPPORT_PREFLIGHT_SCHEMA = (
     "starun.stage9-starmask-support-preflight.v2"
 )
 _STAGE9_CATALOG_VISIBILITY_SCHEMA = "starun.stage9-catalog-visibility.v1"
+_STAGE9_SEP_CROSSMATCH_SCHEMA = "starun.stage9-sep-crossmatch.v1"
+_STAGE9_SEP_CATALOG_SCHEMA = "starun.stage9-sep-catalog.v1"
+_STAGE9_SEP_COORDINATE_DOMAIN = "siril_pixel_buffer_bottom_up"
+_STAGE9_SEP_DEFAULT = object()
+
+
+def _stage9_sep_payload_hash(payload: Any) -> str:
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _stage9_sep_valid_sha256(value: Any) -> bool:
+    text = str(value or "").lower()
+    return len(text) == 64 and all(char in "0123456789abcdef" for char in text)
+
+
+def _stage9_sep_unavailable(
+    reason: str,
+    *,
+    reason_code: str = "stage9_sep_crossmatch_unavailable",
+) -> Dict[str, Any]:
+    return {
+        "schema": _STAGE9_SEP_CROSSMATCH_SCHEMA,
+        "status": "unavailable",
+        "accepted": False,
+        "reason_code": reason_code,
+        "reason": str(reason),
+        "observer_only_until_persisted_gate": True,
+        "scientific_photometry_claim": False,
+    }
+
+
+def stage9_sep_crossmatch_not_applicable(reason: str) -> Dict[str, Any]:
+    """Return the stable evidence state for review/preserve routes."""
+    return {
+        "schema": _STAGE9_SEP_CROSSMATCH_SCHEMA,
+        "status": "not_applicable",
+        "accepted": False,
+        "reason_code": "stage9_sep_crossmatch_not_applicable",
+        "reason": str(reason),
+        "formal_gate_applied": False,
+        "scientific_photometry_claim": False,
+    }
+
+
+def _stage9_sep_image_plane(image: np.ndarray) -> np.ndarray:
+    raw = np.asarray(image)
+    if not np.issubdtype(raw.dtype, np.number):
+        raise ValueError("SEP source pixels are not numeric")
+    if not np.all(np.isfinite(raw)):
+        raise ValueError("SEP source pixels contain non-finite values")
+    normalized = _normalized(raw)
+    plane = np.ascontiguousarray(_luminance(normalized), dtype=np.float32)
+    if plane.ndim != 2 or min(plane.shape) < 3:
+        raise ValueError(f"SEP requires a readable 2-D image plane, got {plane.shape}")
+    if not np.all(np.isfinite(plane)):
+        raise ValueError("SEP image plane contains non-finite pixels")
+    return plane
+
+
+def _stage9_sep_config(cfg: Any) -> Dict[str, Any]:
+    fwhm_ratio_min = _bounded(
+        getattr(cfg, "stage9_sep_fwhm_ratio_min", 0.50),
+        0.50,
+        0.10,
+        2.00,
+    )
+    return {
+        "threshold_sigma": 5.0,
+        "background_mesh": [64, 64],
+        "background_filter": [3, 3],
+        "filter_kernel": "gaussian_3x3_1_2_1",
+        "minarea": 3,
+        "deblend_nthresh": 32,
+        "deblend_cont": 0.005,
+        "clean": True,
+        "clean_param": 1.0,
+        "axis_ratio_min": _bounded(
+            getattr(cfg, "stage9_sep_axis_ratio_min", 0.50),
+            0.50,
+            0.10,
+            1.00,
+        ),
+        "fwhm_ratio_min": fwhm_ratio_min,
+        "fwhm_ratio_max": _bounded(
+            getattr(cfg, "stage9_sep_fwhm_ratio_max", 2.20),
+            2.20,
+            fwhm_ratio_min,
+            5.00,
+        ),
+        "allowed_flags": ["MERGED"],
+        "rejected_flags": ["TRUNC", "DOVERFLOW", "SINGU"],
+    }
+
+
+def build_independent_sep_catalog(
+    image: np.ndarray,
+    cfg: Any,
+    *,
+    role: str,
+    pixel_sha256: str,
+    spatial_scale: Dict[str, Any] | None,
+    coordinate_domain: str = _STAGE9_SEP_COORDINATE_DOMAIN,
+    sep_module: Any = _STAGE9_SEP_DEFAULT,
+) -> Dict[str, Any]:
+    """Extract a standalone SEP catalog without consulting Stage9 masks."""
+    selected_sep = (
+        sep_library if sep_module is _STAGE9_SEP_DEFAULT else sep_module
+    )
+    role_name = str(role or "").upper()
+    source_array = np.asarray(image)
+    base: Dict[str, Any] = {
+        "schema": _STAGE9_SEP_CATALOG_SCHEMA,
+        "source_role": role_name,
+        "pixel_sha256": str(pixel_sha256 or ""),
+        "coordinate_domain": str(coordinate_domain or ""),
+        "membership_source": "independent_sep_detection",
+        "starmask_prefiltered": False,
+        "scientific_photometry_claim": False,
+        "source_shape": [int(value) for value in source_array.shape],
+        "sep_version": (
+            str(getattr(selected_sep, "__version__", "unknown"))
+            if selected_sep is not None
+            else None
+        ),
+        "extraction": _stage9_sep_config(cfg),
+    }
+    try:
+        if role_name not in {"O", "B", "C"}:
+            raise ValueError(f"invalid SEP source role: {role_name or 'empty'}")
+        if not _stage9_sep_valid_sha256(pixel_sha256):
+            raise ValueError("source pixel SHA-256 is missing or invalid")
+        if coordinate_domain != _STAGE9_SEP_COORDINATE_DOMAIN:
+            raise ValueError(f"unsupported SEP coordinate domain: {coordinate_domain}")
+        if selected_sep is None:
+            raise RuntimeError("SEP runtime dependency is unavailable")
+        scale = dict(spatial_scale or {})
+        if scale.get("status") != "ready":
+            raise ValueError("frozen Stage9 FWHM spatial scale is unavailable")
+        anchor_fwhm = float(scale.get("fwhm_median_px"))
+        if not np.isfinite(anchor_fwhm) or anchor_fwhm <= 0.0:
+            raise ValueError("frozen Stage9 FWHM spatial scale is invalid")
+        plane = _stage9_sep_image_plane(source_array)
+        base["image_size"] = [int(plane.shape[1]), int(plane.shape[0])]
+        base["frozen_fwhm_px"] = anchor_fwhm
+
+        background, objects = scene_support.extract_sep_objects_from_plane(
+            plane,
+            selected_sep,
+        )
+        rejected_flags = int(
+            getattr(selected_sep, "OBJ_TRUNC", 0)
+            | getattr(selected_sep, "OBJ_DOVERFLOW", 0)
+            | getattr(selected_sep, "OBJ_SINGU", 0)
+        )
+        ratio_min = float(base["extraction"]["axis_ratio_min"])
+        fwhm_min = anchor_fwhm * float(base["extraction"]["fwhm_ratio_min"])
+        fwhm_max = anchor_fwhm * float(base["extraction"]["fwhm_ratio_max"])
+        candidates = []
+        rejection_counts = {
+            "invalid_numeric": 0,
+            "rejected_flag": 0,
+            "axis_ratio": 0,
+            "fwhm_scale": 0,
+        }
+        for index, obj in enumerate(objects):
+            x = float(obj["x"])
+            y = float(obj["y"])
+            flux = float(obj["flux"])
+            peak = float(obj["peak"])
+            a = float(obj["a"])
+            b = float(obj["b"])
+            theta = float(obj["theta"])
+            npix = int(obj["npix"])
+            flag = int(obj["flag"])
+            values = (x, y, flux, peak, a, b, theta)
+            if (
+                not all(np.isfinite(value) for value in values)
+                or a <= 0.0
+                or b <= 0.0
+            ):
+                rejection_counts["invalid_numeric"] += 1
+                continue
+            if flag & rejected_flags:
+                rejection_counts["rejected_flag"] += 1
+                continue
+            axis_ratio = min(a, b) / max(a, b)
+            fwhm_px = 2.354820045 * math.sqrt(a * b)
+            if axis_ratio < ratio_min:
+                rejection_counts["axis_ratio"] += 1
+                continue
+            if not fwhm_min <= fwhm_px <= fwhm_max:
+                rejection_counts["fwhm_scale"] += 1
+                continue
+            candidates.append(
+                (
+                    y,
+                    x,
+                    -flux,
+                    index,
+                    {
+                        "x": x,
+                        "y": y,
+                        "flux": flux,
+                        "peak": peak,
+                        "a": a,
+                        "b": b,
+                        "theta": theta,
+                        "npix": npix,
+                        "flag": flag,
+                        "fwhm_px": fwhm_px,
+                        "axis_ratio": axis_ratio,
+                    },
+                )
+            )
+        candidates.sort(key=lambda item: item[:4])
+        records = []
+        for catalog_index, (*_sort_key, record) in enumerate(candidates, start=1):
+            records.append({"id": f"{role_name}{catalog_index:06d}", **record})
+        digest = _stage9_sep_payload_hash(records)
+        flux_values = np.asarray(
+            [float(record["flux"]) for record in records],
+            dtype=np.float64,
+        )
+        fwhm_values = np.asarray(
+            [float(record["fwhm_px"]) for record in records],
+            dtype=np.float64,
+        )
+        base.update(
+            status="ok",
+            reason_code="stage9_sep_catalog_ready",
+            detected_count=int(len(objects)),
+            valid_count=len(records),
+            rejected_count=int(len(objects) - len(records)),
+            rejection_counts=rejection_counts,
+            background={
+                "global_mean": float(background.globalback),
+                "global_rms": float(background.globalrms),
+            },
+            catalog_summary={
+                "flux_p50": (
+                    float(np.percentile(flux_values, 50.0))
+                    if flux_values.size
+                    else None
+                ),
+                "flux_p95": (
+                    float(np.percentile(flux_values, 95.0))
+                    if flux_values.size
+                    else None
+                ),
+                "fwhm_p50_px": (
+                    float(np.percentile(fwhm_values, 50.0))
+                    if fwhm_values.size
+                    else None
+                ),
+                "fwhm_p95_px": (
+                    float(np.percentile(fwhm_values, 95.0))
+                    if fwhm_values.size
+                    else None
+                ),
+            },
+            records_sha256=digest,
+            records=records,
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError, FloatingPointError) as error:
+        base.update(
+            status="unavailable",
+            reason_code="stage9_sep_catalog_unavailable",
+            reason=str(error),
+            valid_count=0,
+            records_sha256=_stage9_sep_payload_hash([]),
+            records=[],
+        )
+    return base
+
+
+def _stage9_sep_match_catalogs(
+    source: Dict[str, Any],
+    target: Dict[str, Any],
+    *,
+    radius_px: float,
+    source_records: list[Dict[str, Any]] | None = None,
+) -> Dict[str, Any]:
+    source_rows = list(
+        source_records
+        if source_records is not None
+        else source.get("records") or []
+    )
+    target_rows = list(target.get("records") or [])
+    if scipy_spatial is None:
+        raise RuntimeError("SciPy spatial runtime dependency is unavailable")
+    candidates: list[tuple[float, str, str]] = []
+    if source_rows and target_rows:
+        target_xy = np.asarray(
+            [[float(row["x"]), float(row["y"])] for row in target_rows],
+            dtype=np.float64,
+        )
+        tree = scipy_spatial.cKDTree(target_xy)
+        for source_row in source_rows:
+            point = [float(source_row["x"]), float(source_row["y"])]
+            for target_index in tree.query_ball_point(point, r=float(radius_px)):
+                target_row = target_rows[int(target_index)]
+                distance = math.hypot(
+                    point[0] - float(target_row["x"]),
+                    point[1] - float(target_row["y"]),
+                )
+                candidates.append(
+                    (distance, str(source_row["id"]), str(target_row["id"]))
+                )
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+    used_source: set[str] = set()
+    used_target: set[str] = set()
+    rows = []
+    for distance, source_id, target_id in candidates:
+        if source_id in used_source or target_id in used_target:
+            continue
+        used_source.add(source_id)
+        used_target.add(target_id)
+        rows.append(
+            {
+                "source_id": source_id,
+                "target_id": target_id,
+                "distance_px": float(distance),
+            }
+        )
+    distances = np.asarray(
+        [float(row["distance_px"]) for row in rows],
+        dtype=np.float64,
+    )
+    return {
+        "source_role": str(source.get("source_role") or ""),
+        "target_role": str(target.get("source_role") or ""),
+        "match_radius_px": float(radius_px),
+        "source_count": len(source_rows),
+        "target_count": len(target_rows),
+        "match_count": len(rows),
+        "source_match_ratio": (
+            float(len(rows) / len(source_rows)) if source_rows else 0.0
+        ),
+        "target_match_ratio": (
+            float(len(rows) / len(target_rows)) if target_rows else 0.0
+        ),
+        "distance_p50_px": (
+            float(np.percentile(distances, 50.0)) if distances.size else None
+        ),
+        "distance_p95_px": (
+            float(np.percentile(distances, 95.0)) if distances.size else None
+        ),
+        "matches_sha256": _stage9_sep_payload_hash(rows),
+        "matches": rows,
+    }
+
+
+def assess_independent_sep_crossmatch(
+    original: np.ndarray,
+    before_remix: np.ndarray,
+    persisted_after: np.ndarray,
+    cfg: Any,
+    *,
+    original_pixel_sha256: str,
+    before_pixel_sha256: str,
+    after_pixel_sha256: str,
+    spatial_scale: Dict[str, Any] | None,
+    coordinate_domain: str = _STAGE9_SEP_COORDINATE_DOMAIN,
+    source_names: Dict[str, str] | None = None,
+    sep_module: Any = _STAGE9_SEP_DEFAULT,
+) -> Dict[str, Any]:
+    """Independently extract and cross-match O/B/C at the persisted gate."""
+    arrays = {
+        "O": np.asarray(original),
+        "B": np.asarray(before_remix),
+        "C": np.asarray(persisted_after),
+    }
+    hashes = {
+        "O": original_pixel_sha256,
+        "B": before_pixel_sha256,
+        "C": after_pixel_sha256,
+    }
+    report: Dict[str, Any] = {
+        "schema": _STAGE9_SEP_CROSSMATCH_SCHEMA,
+        "status": "unavailable",
+        "accepted": False,
+        "formal_gate_applied": True,
+        "coordinate_domain": coordinate_domain,
+        "source_names": dict(source_names or {}),
+        "sources": {
+            role: {
+                "source_role": role,
+                "source_name": str((source_names or {}).get(role) or role),
+                "pixel_sha256": str(hashes[role] or ""),
+                "source_shape": [int(value) for value in array.shape],
+            }
+            for role, array in arrays.items()
+        },
+        "membership_contract": {
+            "detector": "SEP",
+            "independent_of_starmask_catalog": True,
+            "independent_of_stage9_masks": True,
+            "frozen_fwhm_reused_for_scale_only": True,
+        },
+        "scientific_photometry_claim": False,
+    }
+    try:
+        if len({tuple(array.shape) for array in arrays.values()}) != 1:
+            raise ValueError("O/B/C frame shapes do not share one coordinate domain")
+        if coordinate_domain != _STAGE9_SEP_COORDINATE_DOMAIN:
+            raise ValueError("O/B/C coordinate domain is not the Siril pixel buffer")
+        catalogs = {
+            role: build_independent_sep_catalog(
+                array,
+                cfg,
+                role=role,
+                pixel_sha256=hashes[role],
+                spatial_scale=spatial_scale,
+                coordinate_domain=coordinate_domain,
+                sep_module=sep_module,
+            )
+            for role, array in arrays.items()
+        }
+        for role, catalog in catalogs.items():
+            catalog["source_name"] = str((source_names or {}).get(role) or role)
+        report["catalogs"] = catalogs
+        unavailable_roles = [
+            role
+            for role, catalog in catalogs.items()
+            if catalog.get("status") != "ok"
+        ]
+        if unavailable_roles:
+            raise RuntimeError(
+                "independent SEP catalog unavailable for "
+                + ",".join(unavailable_roles)
+            )
+        minimum_catalog_count = max(
+            32,
+            min(
+                100000,
+                int(getattr(cfg, "stage9_sep_catalog_count_min", 32)),
+            ),
+        )
+        insufficient_roles = [
+            role
+            for role in ("O", "C")
+            if int(catalogs[role].get("valid_count", 0)) < minimum_catalog_count
+        ]
+        if insufficient_roles:
+            raise RuntimeError(
+                "independent SEP source count below minimum for "
+                + ",".join(insufficient_roles)
+            )
+        scale = dict(spatial_scale or {})
+        anchor_fwhm = float(scale.get("fwhm_median_px"))
+        radius_min_px = _bounded(
+            getattr(cfg, "stage9_sep_match_radius_min_px", 2.0),
+            2.0,
+            0.5,
+            16.0,
+        )
+        radius_max_px = _bounded(
+            getattr(cfg, "stage9_sep_match_radius_max_px", 4.0),
+            4.0,
+            radius_min_px,
+            32.0,
+        )
+        radius_px = max(
+            radius_min_px,
+            min(
+                radius_max_px,
+                _bounded(
+                    getattr(cfg, "stage9_sep_match_radius_fwhm", 0.75),
+                    0.75,
+                    0.10,
+                    4.00,
+                )
+                * anchor_fwhm,
+            ),
+        )
+        matches = {
+            "O_B": _stage9_sep_match_catalogs(
+                catalogs["O"], catalogs["B"], radius_px=radius_px
+            ),
+            "O_C": _stage9_sep_match_catalogs(
+                catalogs["O"], catalogs["C"], radius_px=radius_px
+            ),
+            "B_C": _stage9_sep_match_catalogs(
+                catalogs["B"], catalogs["C"], radius_px=radius_px
+            ),
+        }
+        report["matches"] = matches
+        c_records = list(catalogs["C"].get("records") or [])
+        requested_count = int(
+            math.ceil(
+                _bounded(
+                    getattr(cfg, "stage9_sep_high_confidence_fraction", 0.20),
+                    0.20,
+                    0.01,
+                    1.00,
+                )
+                * len(c_records)
+            )
+        )
+        minimum_high_count = max(
+            16,
+            min(
+                len(c_records),
+                int(
+                    getattr(cfg, "stage9_sep_high_confidence_count_min", 16)
+                ),
+            ),
+        )
+        selected_count = max(minimum_high_count, requested_count)
+        if len(c_records) < selected_count:
+            raise RuntimeError("C has fewer than 16 high-confidence SEP sources")
+        high_confidence = sorted(
+            c_records,
+            key=lambda row: (-float(row["flux"]), str(row["id"])),
+        )[:selected_count]
+        formal_match = _stage9_sep_match_catalogs(
+            catalogs["C"],
+            catalogs["O"],
+            radius_px=radius_px,
+            source_records=high_confidence,
+        )
+        source_ratio = float(formal_match["source_match_ratio"])
+        unmatched_ratio = float(1.0 - source_ratio)
+        p50 = formal_match.get("distance_p50_px")
+        p95 = formal_match.get("distance_p95_px")
+        gates = {
+            "source_match_ratio": {
+                "value": source_ratio,
+                "minimum": _bounded(
+                    getattr(cfg, "stage9_sep_source_match_ratio_min", 0.75),
+                    0.75,
+                    0.0,
+                    1.0,
+                ),
+            },
+            "unmatched_ratio": {
+                "value": unmatched_ratio,
+                "maximum": _bounded(
+                    getattr(cfg, "stage9_sep_unmatched_ratio_max", 0.25),
+                    0.25,
+                    0.0,
+                    1.0,
+                ),
+            },
+            "distance_p50_px": {
+                "value": p50,
+                "maximum": _bounded(
+                    getattr(cfg, "stage9_sep_separation_p50_max_px", 0.75),
+                    0.75,
+                    0.0,
+                    radius_max_px,
+                ),
+            },
+            "distance_p95_px": {
+                "value": p95,
+                "maximum": _bounded(
+                    getattr(cfg, "stage9_sep_separation_p95_max_px", 1.50),
+                    1.50,
+                    0.0,
+                    radius_max_px,
+                ),
+            },
+        }
+        gates["source_match_ratio"]["passed"] = bool(
+            source_ratio >= gates["source_match_ratio"]["minimum"]
+        )
+        gates["unmatched_ratio"]["passed"] = bool(
+            unmatched_ratio <= gates["unmatched_ratio"]["maximum"]
+        )
+        gates["distance_p50_px"]["passed"] = bool(
+            p50 is not None and float(p50) <= gates["distance_p50_px"]["maximum"]
+        )
+        gates["distance_p95_px"]["passed"] = bool(
+            p95 is not None and float(p95) <= gates["distance_p95_px"]["maximum"]
+        )
+        accepted = all(bool(gate["passed"]) for gate in gates.values())
+        report.update(
+            status="ok" if accepted else "rejected",
+            accepted=accepted,
+            reason_code=(
+                "stage9_sep_crossmatch_accepted"
+                if accepted
+                else "stage9_sep_crossmatch_rejected"
+            ),
+            match_radius_px=radius_px,
+            formal_set={
+                "source_role": "C",
+                "target_role": "O",
+                "selection": "highest_flux_20_percent_minimum_16",
+                "selected_count": len(high_confidence),
+                "selected_ids_sha256": _stage9_sep_payload_hash(
+                    [row["id"] for row in high_confidence]
+                ),
+                "crossmatch": formal_match,
+                "unmatched_ratio": unmatched_ratio,
+            },
+            gates=gates,
+            failed_gates=[
+                name for name, gate in gates.items() if not gate["passed"]
+            ],
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError, FloatingPointError) as error:
+        report.update(
+            status="unavailable",
+            accepted=False,
+            reason_code="stage9_sep_crossmatch_unavailable",
+            reason=str(error),
+        )
+    report["report_sha256"] = _stage9_sep_payload_hash(
+        {key: value for key, value in report.items() if key != "report_sha256"}
+    )
+    return report
+
+
+def stage9_sep_crossmatch_summary(report: Dict[str, Any] | None) -> Dict[str, Any]:
+    """Return the compact v10 embedding; catalogs stay in their artifact."""
+    payload = dict(report or {})
+    catalogs = dict(payload.get("catalogs") or {})
+    formal = dict(payload.get("formal_set") or {})
+    formal_match = dict(formal.get("crossmatch") or {})
+    return {
+        "schema": _STAGE9_SEP_CROSSMATCH_SCHEMA,
+        "status": str(payload.get("status") or "unavailable"),
+        "accepted": bool(payload.get("accepted", False)),
+        "reason_code": str(
+            payload.get("reason_code") or "stage9_sep_crossmatch_unavailable"
+        ),
+        "reason": payload.get("reason"),
+        "report_sha256": payload.get("report_sha256"),
+        "catalog_counts": {
+            role: int((catalogs.get(role) or {}).get("valid_count", 0))
+            for role in ("O", "B", "C")
+        },
+        "catalog_record_sha256": {
+            role: (catalogs.get(role) or {}).get("records_sha256")
+            for role in ("O", "B", "C")
+        },
+        "match_radius_px": payload.get("match_radius_px"),
+        "formal_metrics": {
+            "selected_count": formal.get("selected_count"),
+            "match_count": formal_match.get("match_count"),
+            "source_match_ratio": formal_match.get("source_match_ratio"),
+            "unmatched_ratio": formal.get("unmatched_ratio"),
+            "distance_p50_px": formal_match.get("distance_p50_px"),
+            "distance_p95_px": formal_match.get("distance_p95_px"),
+        },
+        "failed_gates": list(payload.get("failed_gates") or []),
+        "scientific_photometry_claim": False,
+    }
 
 
 def _bounded(value: Any, default: float, lower: float, upper: float) -> float:
@@ -49,14 +712,19 @@ def _bounded(value: Any, default: float, lower: float, upper: float) -> float:
 def interpret_stage9_remix_quality_report(
     report: Dict[str, Any] | None,
 ) -> Dict[str, Any]:
-    """Read v8/v9 reports without promoting legacy success silently."""
+    """Accept only v10 reports carrying both persisted and SEP evidence."""
     payload = dict(report or {})
     schema = str(payload.get("schema") or "")
-    if schema == "starun.stage9-remix-quality.v9":
+    if schema == "starun.stage9-remix-quality.v10":
         persisted = dict(payload.get("persisted_output_validation") or {})
+        sep_summary = dict(payload.get("sep_crossmatch") or {})
         accepted = bool(
             payload.get("formal_accepted", False)
             and persisted.get("accepted", False)
+            and persisted.get("sep_crossmatch_accepted", False)
+            and sep_summary.get("schema") == _STAGE9_SEP_CROSSMATCH_SCHEMA
+            and sep_summary.get("accepted", False)
+            and _stage9_sep_valid_sha256(sep_summary.get("artifact_sha256"))
         )
         return {
             "status": "accepted" if accepted else "review_required",
@@ -67,12 +735,29 @@ def interpret_stage9_remix_quality_report(
                 payload.get("formal_accepted", False)
             ),
             "persisted_validation_present": bool(persisted),
+            "sep_crossmatch_present": bool(sep_summary),
             "requires_review": not accepted,
             "reason_code": (
-                "stage9_v9_formal_acceptance_verified"
+                "stage9_v10_formal_acceptance_verified"
                 if accepted
-                else "stage9_v9_persisted_validation_missing_or_rejected"
+                else "stage9_v10_persisted_or_sep_validation_missing_or_rejected"
             ),
+        }
+    if schema == "starun.stage9-remix-quality.v9":
+        return {
+            "status": "review_required",
+            "schema": schema,
+            "supported": True,
+            "formal_accepted": False,
+            "reported_formal_accepted": bool(
+                payload.get("formal_accepted", False)
+            ),
+            "persisted_validation_present": bool(
+                payload.get("persisted_output_validation")
+            ),
+            "sep_crossmatch_present": False,
+            "requires_review": True,
+            "reason_code": "stage9_v9_sep_crossmatch_unavailable",
         }
     if schema == "starun.stage9-remix-quality.v8":
         return {
@@ -84,6 +769,7 @@ def interpret_stage9_remix_quality_report(
                 payload.get("formal_accepted", False)
             ),
             "persisted_validation_present": False,
+            "sep_crossmatch_present": False,
             "requires_review": True,
             "reason_code": "stage9_v8_persisted_validation_unavailable",
         }
@@ -94,6 +780,7 @@ def interpret_stage9_remix_quality_report(
         "formal_accepted": False,
         "reported_formal_accepted": False,
         "persisted_validation_present": False,
+        "sep_crossmatch_present": False,
         "requires_review": True,
         "reason_code": "stage9_remix_quality_schema_unsupported",
     }
@@ -6044,9 +6731,9 @@ def contract_star_layer_components(
         "changed": False,
         "gamma": float(gamma),
         "target_groups": list(target_groups),
-        "operator": "component_local_rgb_shared_u_power",
-        "operator_formula": "gain=u^(gamma-1)",
-        "gamma_bounds": [1.0, 2.5],
+        "operator": "component_local_rgb_shared_u_power_centroid_backoff",
+        "operator_formula": "gain=u^(gamma-1) with per-component gamma backoff",
+        "gamma_bounds": [1.0, 4.0],
         "peak_preserved": False,
         "channel_ratio_preserved_by_construction": True,
     }
@@ -6066,8 +6753,8 @@ def contract_star_layer_components(
         report["reason"] = "target groups are empty or unsupported"
         return None, report
     contraction_gamma = float(gamma)
-    if not math.isfinite(contraction_gamma) or not 1.0 <= contraction_gamma <= 2.5:
-        report["reason"] = "gamma is outside the frozen 1.0..2.5 bounds"
+    if not math.isfinite(contraction_gamma) or not 1.0 <= contraction_gamma <= 4.0:
+        report["reason"] = "gamma is outside the frozen 1.0..4.0 bounds"
         return None, report
 
     source = np.asarray(stars)
@@ -6155,27 +6842,18 @@ def contract_star_layer_components(
         0.0,
         1.0,
     )
-    gain = np.ones_like(peak_map, dtype=np.float32)
-    if contraction_gamma > 1.0 + 1.0e-12:
-        gain[target_scope] = np.power(
-            relative_peak[target_scope],
-            contraction_gamma - 1.0,
-        )
-
-    # The frozen component peak is unchanged by definition.  Reject individual
-    # asymmetric components whose flux centroid would move perceptibly.
+    # The frozen component peak is unchanged by definition.  A pure power
+    # contraction can pull the intensity centroid of an asymmetric star toward
+    # its peak.  Reduce gamma uniformly for that whole component instead of
+    # adding signal on only one side: a one-sided repair can satisfy the
+    # centroid scalar while turning an undersampled round PSF into a directional
+    # cross or diamond.
     ys, xs = np.nonzero(target_scope)
     scoped_labels = assigned_labels[ys, xs]
     before_weights = peak_map[ys, xs].astype(np.float64, copy=False)
-    after_weights = before_weights * gain[ys, xs].astype(
-        np.float64, copy=False
-    )
     minlength = max_label + 1
     before_sum = np.bincount(
         scoped_labels, weights=before_weights, minlength=minlength
-    )
-    after_sum = np.bincount(
-        scoped_labels, weights=after_weights, minlength=minlength
     )
     before_y = np.bincount(
         scoped_labels, weights=before_weights * ys, minlength=minlength
@@ -6183,43 +6861,139 @@ def contract_star_layer_components(
     before_x = np.bincount(
         scoped_labels, weights=before_weights * xs, minlength=minlength
     )
-    after_y = np.bincount(
-        scoped_labels, weights=after_weights * ys, minlength=minlength
+    relative_scoped = relative_peak[ys, xs].astype(
+        np.float64,
+        copy=False,
     )
-    after_x = np.bincount(
-        scoped_labels, weights=after_weights * xs, minlength=minlength
+
+    def centroid_drift_for_scoped_gain(
+        scoped_gain: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        after_weights = before_weights * scoped_gain
+        after_sum = np.bincount(
+            scoped_labels,
+            weights=after_weights,
+            minlength=minlength,
+        )
+        after_y = np.bincount(
+            scoped_labels,
+            weights=after_weights * ys,
+            minlength=minlength,
+        )
+        after_x = np.bincount(
+            scoped_labels,
+            weights=after_weights * xs,
+            minlength=minlength,
+        )
+        valid = (
+            (before_sum[target_ids] > 1.0e-12)
+            & (after_sum[target_ids] > 1.0e-12)
+        )
+        drift = np.full(target_ids.size, np.inf, dtype=np.float64)
+        if np.any(valid):
+            ids = target_ids[valid]
+            dy = (
+                after_y[ids] / after_sum[ids]
+                - before_y[ids] / before_sum[ids]
+            )
+            dx = (
+                after_x[ids] / after_sum[ids]
+                - before_x[ids] / before_sum[ids]
+            )
+            drift[valid] = np.hypot(dy, dx)
+        return drift, valid
+
+    def centroid_drift_for_gammas(
+        component_gammas: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        gamma_lookup = np.ones(max_label + 1, dtype=np.float64)
+        gamma_lookup[target_ids] = component_gammas
+        return centroid_drift_for_scoped_gain(
+            np.power(
+                relative_scoped,
+                gamma_lookup[scoped_labels] - 1.0,
+            )
+        )
+
+    requested_gammas = np.full(
+        target_ids.size,
+        contraction_gamma,
+        dtype=np.float64,
     )
-    valid_centroid = (
-        (before_sum[target_ids] > 1.0e-12)
-        & (after_sum[target_ids] > 1.0e-12)
+    drift_limit = max(0.0, float(centroid_drift_max_px))
+    requested_drift, requested_valid = centroid_drift_for_gammas(
+        requested_gammas
     )
-    centroid_drift = np.full(target_ids.size, np.inf, dtype=np.float64)
-    if np.any(valid_centroid):
-        ids = target_ids[valid_centroid]
-        dy = after_y[ids] / after_sum[ids] - before_y[ids] / before_sum[ids]
-        dx = after_x[ids] / after_sum[ids] - before_x[ids] / before_sum[ids]
-        centroid_drift[valid_centroid] = np.hypot(dy, dx)
-    unsafe_ids = target_ids[
+    adjusted = (~requested_valid) | (requested_drift > drift_limit)
+    selected_gammas = np.array(requested_gammas, copy=True)
+    if np.any(adjusted):
+        low = np.ones(target_ids.size, dtype=np.float64)
+        high = np.array(requested_gammas, copy=True)
+        for _iteration in range(12):
+            middle = 0.5 * (low + high)
+            middle_drift, middle_valid = centroid_drift_for_gammas(middle)
+            middle_safe = middle_valid & (middle_drift <= drift_limit)
+            low = np.where(adjusted & middle_safe, middle, low)
+            high = np.where(adjusted & ~middle_safe, middle, high)
+        selected_gammas[adjusted] = low[adjusted]
+
+    gamma_lookup = np.ones(max_label + 1, dtype=np.float64)
+    gamma_lookup[target_ids] = selected_gammas
+    scoped_gain = np.power(
+        relative_scoped,
+        gamma_lookup[scoped_labels] - 1.0,
+    )
+
+    centroid_drift, valid_centroid = centroid_drift_for_scoped_gain(
+        scoped_gain
+    )
+    unsafe = (
         (~valid_centroid)
-        | (centroid_drift > max(0.0, float(centroid_drift_max_px)))
-    ]
+        | (centroid_drift > drift_limit + 1.0e-9)
+        | (selected_gammas <= 1.0 + 1.0e-6)
+    )
+    selected_gammas[unsafe] = 1.0
+    unsafe_ids = target_ids[unsafe]
     if unsafe_ids.size:
-        gain[np.isin(assigned_labels, unsafe_ids) & target_scope] = 1.0
+        scoped_gain[np.isin(scoped_labels, unsafe_ids)] = 1.0
+    gain = np.ones_like(peak_map, dtype=np.float32)
+    gain[target_scope] = scoped_gain.astype(np.float32, copy=False)
 
     changed_scope = target_scope & (gain < 1.0 - 1.0e-7)
     expanded_gain = _expanded_spatial_mask(normalized, gain)
     contracted = normalized * expanded_gain
+    local_peak_positions = scipy_ndimage.maximum_position(
+        peak_map,
+        labels=labels,
+        index=target_ids,
+    )
+    peak_drift = 0.0
+    if local_peak_positions:
+        local_peak_y = np.asarray(
+            [position[0] for position in local_peak_positions],
+            dtype=np.int32,
+        )
+        local_peak_x = np.asarray(
+            [position[1] for position in local_peak_positions],
+            dtype=np.int32,
+        )
+        before_peak = peak_map[local_peak_y, local_peak_x]
+        after_peak = _pixel_peak(contracted)[local_peak_y, local_peak_x]
+        peak_drift = float(np.max(np.abs(after_peak - before_peak)))
+
+    catalog_position_change = 0.0
     peak_y = np.asarray(catalog.get("_peak_y", ()), dtype=np.int32)
     peak_x = np.asarray(catalog.get("_peak_x", ()), dtype=np.int32)
-    peak_drift = 0.0
     if peak_y.size == component_ids.size and peak_x.size == component_ids.size:
         selected = np.isin(component_ids, target_ids)
         if np.any(selected):
-            before_peak = peak_map[peak_y[selected], peak_x[selected]]
-            after_peak = _pixel_peak(contracted)[
+            before_catalog = peak_map[peak_y[selected], peak_x[selected]]
+            after_catalog = _pixel_peak(contracted)[
                 peak_y[selected], peak_x[selected]
             ]
-            peak_drift = float(np.max(np.abs(after_peak - before_peak)))
+            catalog_position_change = float(
+                np.max(np.abs(after_catalog - before_catalog))
+            )
 
     restored = contracted * scale
     if np.issubdtype(source.dtype, np.integer):
@@ -6244,6 +7018,8 @@ def contract_star_layer_components(
     applied_drift = centroid_drift[
         np.isfinite(centroid_drift) & ~np.isin(target_ids, unsafe_ids)
     ]
+    effective_component_gammas = np.array(selected_gammas, copy=True)
+
     report.update(
         status="changed" if np.any(changed_scope) else "unchanged",
         changed=bool(np.any(changed_scope)),
@@ -6251,13 +7027,27 @@ def contract_star_layer_components(
         contracted_component_count=int(
             np.unique(assigned_labels[changed_scope]).size
         ),
+        centroid_guard_adjusted_component_count=int(np.count_nonzero(adjusted)),
+        centroid_moment_compensated_component_count=0,
+        centroid_guard_backoff_component_count=int(np.count_nonzero(adjusted)),
         centroid_guard_skipped_component_count=int(unsafe_ids.size),
+        centroid_guard_strategy="per_component_uniform_gamma_backoff",
+        centroid_compensation_pixel_count=0,
+        centroid_compensation_added_signal_ratio=0.0,
+        centroid_compensation_iteration_max=0,
         centroid_drift_max_px=(
             float(np.max(applied_drift)) if applied_drift.size else None
         ),
         centroid_drift_limit_px=float(centroid_drift_max_px),
         peak_max_abs_drift=peak_drift,
         peak_preserved=bool(peak_drift <= 1.0e-7),
+        catalog_position_max_abs_change=catalog_position_change,
+        effective_gamma={
+            "min": float(np.min(effective_component_gammas)),
+            "median": float(np.median(effective_component_gammas)),
+            "p95": float(np.percentile(effective_component_gammas, 95.0)),
+            "max": float(np.max(effective_component_gammas)),
+        },
         outside_target_max_abs_change=outside_change,
         target_pixel_count=int(np.count_nonzero(target_scope)),
         changed_pixel_count=int(np.count_nonzero(changed_scope)),
@@ -6265,25 +7055,52 @@ def contract_star_layer_components(
     return restored, report
 
 
+def _compact_starmask_support_weights(
+    support_mask: np.ndarray,
+) -> np.ndarray:
+    """Return source-preserving weights for a compact core plus one-pixel ring."""
+    mask = np.asarray(support_mask, dtype=bool)
+    if scipy_ndimage is None:
+        return mask.astype(np.float32)
+    # A hard binary disk removes diagonal samples first on undersampled stars,
+    # creating a repeated plus/diamond morphology.  Preserve the immutable
+    # source inside the disk and taper only the immediately adjacent
+    # one-pixel/diagonal ring; pixels farther away remain zero so diffuse
+    # starless residuals cannot leak back into the remix.
+    weights = np.zeros(mask.shape, dtype=np.float32)
+    weights[mask] = 1.0
+    cross = np.asarray(
+        [[False, True, False], [True, True, True], [False, True, False]],
+        dtype=bool,
+    )
+    axial_ring = scipy_ndimage.binary_dilation(mask, structure=cross) & ~mask
+    adjacent_ring = (
+        scipy_ndimage.binary_dilation(
+            mask,
+            structure=np.ones((3, 3), dtype=bool),
+        )
+        & ~mask
+    )
+    diagonal_ring = adjacent_ring & ~axial_ring
+    sigma = 1.1
+    weights[axial_ring] = math.exp(-0.5 * (1.0 / sigma) ** 2)
+    weights[diagonal_ring] = math.exp(-0.5 * (math.sqrt(2.0) / sigma) ** 2)
+    return weights
+
+
 def apply_compact_starmask_support(
     stars: np.ndarray,
     support_mask: np.ndarray,
 ) -> np.ndarray:
-    """Keep only connected compact star cores and their narrow wing support."""
+    """Keep only connected compact star cores and their tapered wing support."""
     source = np.asarray(stars)
-    mask = np.asarray(support_mask, dtype=bool)
-    if source.ndim == 2 and source.shape == mask.shape:
-        expanded_mask = mask
-    elif source.ndim == 3 and source.shape[1:] == mask.shape:
-        expanded_mask = mask[np.newaxis, ...]
-    elif source.ndim == 3 and source.shape[:2] == mask.shape:
-        expanded_mask = mask[..., np.newaxis]
-    else:
-        raise ValueError(
-            "compact support shape mismatch: "
-            f"stars={source.shape}, support={mask.shape}"
-        )
-    return np.where(expanded_mask, source, 0).astype(source.dtype, copy=False)
+    weights = _compact_starmask_support_weights(support_mask)
+    expanded_weights = _expanded_spatial_mask(source, weights)
+    compact = np.asarray(source, dtype=np.float64) * expanded_weights
+    if np.issubdtype(source.dtype, np.integer):
+        info = np.iinfo(source.dtype)
+        compact = np.clip(np.rint(compact), info.min, info.max)
+    return compact.astype(source.dtype, copy=False)
 
 
 def _expanded_spatial_mask(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -6343,7 +7160,12 @@ def _color_preserving_asinh(
         output = source * gain[..., np.newaxis]
     else:
         raise ValueError(f"unsupported starmask dimensions: {source.shape}")
-    return np.where(_expanded_spatial_mask(source, support_mask), output, 0.0)
+    expanded_support = _expanded_spatial_mask(source, support_mask)
+    if np.issubdtype(np.asarray(support_mask).dtype, np.bool_):
+        return np.where(expanded_support, output, 0.0)
+    return (
+        output * np.clip(expanded_support, 0.0, 1.0)
+    ).astype(np.float32, copy=False)
 
 
 def _monotonic_anchor_map(
@@ -6424,10 +7246,15 @@ def _color_preserving_multi_anchor_curve(
         output = source * gain[..., np.newaxis]
     else:
         raise ValueError(f"unsupported starmask dimensions: {source.shape}")
-    return np.where(
-        _expanded_spatial_mask(source, support_mask),
-        output,
-        0.0,
+    expanded_support = _expanded_spatial_mask(source, support_mask)
+    if np.issubdtype(np.asarray(support_mask).dtype, np.bool_):
+        return np.where(
+            expanded_support,
+            output,
+            0.0,
+        ).astype(np.float32, copy=False)
+    return (
+        output * np.clip(expanded_support, 0.0, 1.0)
     ).astype(np.float32, copy=False)
 
 
@@ -6604,9 +7431,12 @@ def apply_calibrated_starmask(
     output_anchors = calibration.get("anchor_output_targets")
     if support_mask is None or input_anchors is None or output_anchors is None:
         raise ValueError("multi-anchor starmask calibration is incomplete")
+    support_weights = _compact_starmask_support_weights(support_mask)
+    if bool(calibration.get("_compact_support_preweighted", False)):
+        support_weights = support_weights > 0.0
     output = _color_preserving_multi_anchor_curve(
         normalized,
-        np.asarray(support_mask, dtype=bool),
+        support_weights,
         input_anchors=np.asarray(input_anchors, dtype=np.float32),
         output_anchors=np.asarray(output_anchors, dtype=np.float32),
     )
@@ -7629,6 +8459,7 @@ def calibrate_starmask_asinh(
         0.10,
         1.05,
     )
+    support_weights = _compact_starmask_support_weights(support_mask)
     compact_normalized = apply_compact_starmask_support(normalized, support_mask)
     coverage_peak_map = _pixel_peak(compact_normalized)
     anchor_input_values = None
@@ -7651,7 +8482,7 @@ def calibrate_starmask_asinh(
             coverage_limited,
         ) = _coverage_limited_anchor_targets(
             normalized,
-            support_mask,
+            support_weights,
             input_anchors=anchor_input_values,
             nominal_output_anchors=nominal_anchor_output_targets,
             intensity=reference_intensity,
@@ -7698,7 +8529,7 @@ def calibrate_starmask_asinh(
         )
         output_preview = _color_preserving_asinh(
             normalized,
-            support_mask,
+            support_weights,
             stretch=stretch,
             offset=offset,
         )
@@ -7739,7 +8570,7 @@ def calibrate_starmask_asinh(
             anchor_output_targets = anchor_output_targets.astype(np.float32)
             output_preview = _color_preserving_multi_anchor_curve(
                 normalized,
-                support_mask,
+                support_weights,
                 input_anchors=anchor_input_values,
                 output_anchors=anchor_output_targets,
             )
@@ -7900,7 +8731,12 @@ def calibrate_starmask_asinh(
         "reference_intensity": float(reference_intensity),
         "compact_component_count": int(catalog.get("component_count", 0)),
         "compact_core_coverage": float(np.mean(core_mask)),
-        "compact_support_coverage": float(np.mean(support_mask)),
+        "compact_support_coverage": float(np.mean(support_weights > 0.0)),
+        "compact_hard_support_coverage": float(np.mean(support_mask)),
+        "compact_feather_ring_coverage": float(
+            np.mean((support_weights > 0.0) & ~support_mask)
+        ),
+        "compact_support_operator": "source_preserving_one_pixel_gaussian_ring",
         "compact_core_threshold": float(
             initial_support.get("core_threshold", catalog.get("reference_threshold", 0.0))
         ),

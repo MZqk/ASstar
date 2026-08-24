@@ -980,6 +980,47 @@ def _stage9_pixel_hash(pixels: np.ndarray) -> str:
     return digest.hexdigest()
 
 
+def _persist_stage9_sep_crossmatch_evidence(
+    pipeline,
+    evidence: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Persist the full SEP evidence and return the compact v10 reference."""
+    payload = copy.deepcopy(evidence)
+    summary = stage9_quality.stage9_sep_crossmatch_summary(payload)
+    summary["artifact"] = "stage9_sep_crossmatch.json"
+    writer = getattr(pipeline, "_write_stage_json", None)
+    process_dir = getattr(pipeline, "process_dir", None)
+    if not callable(writer) or process_dir is None:
+        summary.update(
+            status="unavailable",
+            accepted=False,
+            reason_code="stage9_sep_crossmatch_artifact_unavailable",
+            reason="Stage9 JSON artifact writer or process directory is unavailable",
+            artifact_sha256=None,
+        )
+        pipeline._stage9_sep_crossmatch_report = payload
+        pipeline._stage9_sep_crossmatch_summary = summary
+        return summary
+    try:
+        writer("stage9_sep_crossmatch.json", payload)
+        artifact_path = Path(process_dir) / "stage9_sep_crossmatch.json"
+        artifact_sha256 = run_manifest.sha256_file(artifact_path)
+        if not artifact_sha256:
+            raise OSError("stage9_sep_crossmatch.json was not durably written")
+        summary["artifact_sha256"] = artifact_sha256
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        summary.update(
+            status="unavailable",
+            accepted=False,
+            reason_code="stage9_sep_crossmatch_artifact_unavailable",
+            reason=str(error),
+            artifact_sha256=None,
+        )
+    pipeline._stage9_sep_crossmatch_report = payload
+    pipeline._stage9_sep_crossmatch_summary = summary
+    return summary
+
+
 def _validate_stage9_persisted_output(
     pipeline,
     source_stem: str,
@@ -1040,11 +1081,123 @@ def _validate_stage9_persisted_output(
             )
         )
         quality_accepted = bool(reloaded_quality.get("accepted", False))
+        report.update(
+            active_pixel_hash=active_hash,
+            persisted_pixel_hash=persisted_hash,
+            active_shape=list(active.shape),
+            persisted_shape=list(persisted.shape),
+            active_dtype=str(active.dtype),
+            persisted_dtype=str(persisted.dtype),
+            shape_matches=shape_matches,
+            pixels_match=pixels_match,
+            maximum_absolute_pixel_error=max_abs_error,
+            quality_accepted=quality_accepted,
+            catalog_visibility_groups_passed=visibility_groups_passed,
+            coordinate_contract=catalog_visibility.get("coordinate_contract"),
+            reloaded_quality=reloaded_quality,
+        )
+        matched_context = getattr(
+            pipeline,
+            "_stage9_matched_domain_context",
+            None,
+        )
+        original_display = (
+            matched_context.get("original_display")
+            if isinstance(matched_context, dict)
+            else None
+        )
+        if (
+            original_display is None
+            or (matched_context or {}).get("available") is not True
+        ):
+            matched_report = (
+                dict(matched_context.get("report") or {})
+                if isinstance(matched_context, dict)
+                else {}
+            )
+            not_applicable = stage9_quality.stage9_sep_crossmatch_not_applicable(
+                str(
+                    matched_report.get("reason")
+                    or "verified Stage6 matched-domain original is unavailable"
+                )
+            )
+            sep_summary = _persist_stage9_sep_crossmatch_evidence(
+                pipeline,
+                not_applicable,
+            )
+            failures = ["persisted_sep_crossmatch_not_applicable"]
+            if not shape_matches:
+                failures.append("persisted_frame_shape_mismatch")
+            if not pixels_match:
+                failures.append("persisted_frame_pixels_mismatch")
+            if not quality_accepted:
+                failures.append("persisted_quality_gate_failed")
+            if not visibility_groups_passed:
+                failures.append("persisted_catalog_visibility_failed")
+            report.update(
+                status="rejected",
+                accepted=False,
+                reason_code="stage9_persisted_output_validation_failed",
+                reason=(
+                    "independent SEP is not applicable without a verified "
+                    "Stage6 matched domain"
+                ),
+                sep_crossmatch_accepted=False,
+                sep_crossmatch=sep_summary,
+                restored_after_sep=True,
+                restored_pixel_hash=persisted_hash,
+                failures=failures,
+            )
+            pipeline._stage9_persisted_output_validation = report
+            return report
+
+        remix_base_stem = str(
+            getattr(pipeline, "_stage9_remix_base_stem", source_stem)
+            or source_stem
+        )
+        pipeline.cmd_with_check("load", remix_base_stem)
+        before_pixels = getter(preview=False)
+        if before_pixels is None:
+            raise RuntimeError("Stage9 pre-remix base pixels are unavailable")
+        before = np.asarray(before_pixels)
+        original = np.asarray(original_display)
+        sep_evidence = stage9_quality.assess_independent_sep_crossmatch(
+            original,
+            before,
+            persisted,
+            pipeline.cfg,
+            original_pixel_sha256=_stage9_pixel_hash(original),
+            before_pixel_sha256=_stage9_pixel_hash(before),
+            after_pixel_sha256=persisted_hash,
+            spatial_scale=getattr(pipeline, "_stage9_spatial_scale", None),
+            source_names={
+                "O": "verified_stage6_input_in_stage7_matched_domain",
+                "B": remix_base_stem,
+                "C": "stage9_remixed",
+            },
+        )
+        sep_summary = _persist_stage9_sep_crossmatch_evidence(
+            pipeline,
+            sep_evidence,
+        )
+        sep_crossmatch_accepted = bool(sep_summary.get("accepted", False))
+
+        # SEP may temporarily load B, but Stage9 must leave the persisted C
+        # buffer active for Stage10 and for the exact-pixel delivery audit.
+        pipeline.cmd_with_check("load", "stage9_remixed")
+        restored_pixels = getter(preview=False)
+        if restored_pixels is None:
+            raise RuntimeError("stage9_remixed could not be restored after SEP")
+        restored_hash = _stage9_pixel_hash(np.asarray(restored_pixels))
+        restored_after_sep = bool(restored_hash == persisted_hash)
+
         accepted = bool(
             shape_matches
             and pixels_match
             and quality_accepted
             and visibility_groups_passed
+            and sep_crossmatch_accepted
+            and restored_after_sep
         )
         report.update(
             status="ok" if accepted else "rejected",
@@ -1066,6 +1219,10 @@ def _validate_stage9_persisted_output(
             quality_accepted=quality_accepted,
             catalog_visibility_groups_passed=visibility_groups_passed,
             coordinate_contract=catalog_visibility.get("coordinate_contract"),
+            sep_crossmatch_accepted=sep_crossmatch_accepted,
+            sep_crossmatch=sep_summary,
+            restored_after_sep=restored_after_sep,
+            restored_pixel_hash=restored_hash,
             reloaded_quality=reloaded_quality,
         )
         if not accepted:
@@ -1078,6 +1235,10 @@ def _validate_stage9_persisted_output(
                 failures.append("persisted_quality_gate_failed")
             if not visibility_groups_passed:
                 failures.append("persisted_catalog_visibility_failed")
+            if not sep_crossmatch_accepted:
+                failures.append("persisted_sep_crossmatch_failed")
+            if not restored_after_sep:
+                failures.append("persisted_stage9_buffer_restore_failed")
             report["failures"] = failures
     except (
         AttributeError,
@@ -1089,7 +1250,28 @@ def _validate_stage9_persisted_output(
         FloatingPointError,
     ) as error:
         report["reason"] = str(error)
-        report["failures"] = ["persisted_output_validation_unavailable"]
+        failures = ["persisted_output_validation_unavailable"]
+        if report.get("shape_matches") is False:
+            failures.append("persisted_frame_shape_mismatch")
+        if report.get("pixels_match") is False:
+            failures.append("persisted_frame_pixels_mismatch")
+        if report.get("quality_accepted") is False:
+            failures.append("persisted_quality_gate_failed")
+        if report.get("catalog_visibility_groups_passed") is False:
+            failures.append("persisted_catalog_visibility_failed")
+        report["failures"] = failures
+        sep_summary = getattr(pipeline, "_stage9_sep_crossmatch_summary", None)
+        if not isinstance(sep_summary, dict):
+            sep_summary = _persist_stage9_sep_crossmatch_evidence(
+                pipeline,
+                stage9_quality._stage9_sep_unavailable(str(error)),
+            )
+        report["sep_crossmatch_accepted"] = False
+        report["sep_crossmatch"] = sep_summary
+        try:
+            pipeline.cmd_with_check("load", "stage9_remixed")
+        except (CommandError, SirilError, OSError, RuntimeError):
+            pass
     pipeline._stage9_persisted_output_validation = report
     return report
 
@@ -2657,6 +2839,19 @@ def _write_stage9_quality_report(
     writer = getattr(pipeline, "_write_stage_json", None)
     if not callable(writer):
         return
+    sep_summary = getattr(pipeline, "_stage9_sep_crossmatch_summary", None)
+    if not isinstance(sep_summary, dict) or not sep_summary.get(
+        "artifact_sha256"
+    ):
+        sep_evidence = getattr(pipeline, "_stage9_sep_crossmatch_report", None)
+        if not isinstance(sep_evidence, dict):
+            sep_evidence = stage9_quality.stage9_sep_crossmatch_not_applicable(
+                "Stage9 did not enter a formal persisted remix route"
+            )
+        sep_summary = _persist_stage9_sep_crossmatch_evidence(
+            pipeline,
+            sep_evidence,
+        )
     pipeline.log.info(
         "[Stage9] star application contract "
         f"required={str(stars_required).lower()}, "
@@ -2807,9 +3002,9 @@ def _write_stage9_quality_report(
     writer(
         "stage9_remix_quality.json",
         {
-            "schema": "starun.stage9-remix-quality.v9",
+            "schema": "starun.stage9-remix-quality.v10",
             "selection_policy": (
-                "catalog_visibility_psf_fidelity_recovery_v7"
+                "sep_catalog_visibility_psf_fidelity_recovery_v8"
             ),
             "selection_class": selection_class,
             "formal_accepted": formal_accepted,
@@ -2979,7 +3174,7 @@ def _write_stage9_quality_report(
                     "target_groups": "failed_weak_bright_or_all_only",
                     "operator": "component_local_rgb_shared_u_power",
                     "operator_formula": "gain=u^(gamma-1)",
-                    "gamma_bounds": [1.0, 2.5],
+                    "gamma_bounds": [1.0, 4.0],
                     "retry_budget_shared_with_targeted_recovery": True,
                     "candidate_rebuild_source": "immutable_parent_star_layer",
                     "peak_preserved": True,
@@ -3254,6 +3449,7 @@ def _write_stage9_quality_report(
                     else None
                 )
             ),
+            "sep_crossmatch": copy.deepcopy(sep_summary),
             "persisted_output_validation": copy.deepcopy(
                 getattr(
                     pipeline,
@@ -3727,6 +3923,7 @@ def _prepare_stage9_starmask_for_pixel_remix(
                 )
                 if compact_applied:
                     stretch_input_data = compact_pixels
+                    calibration["_compact_support_preweighted"] = True
             if compact_applied:
                 compact_name = compact_output_name or (
                     "starmask_compact_recovery"
@@ -6663,13 +6860,34 @@ def _stage9_targeted_psf_contraction(
     parent_state = _capture_stage9_candidate_state(pipeline)
     immutable_parent_stars = np.array(stars, copy=True)
     low_gamma = 1.0
-    high_gamma = 2.5
+    high_gamma = 4.0
+    target_ratio = 1.0
     best: Dict[str, Any] | None = None
     comparisons: List[Dict[str, Any]] = []
     parent_attempt = str(parent_quality.get("attempt") or "unknown")
+    parent_ratios = _stage9_psf_group_ratios(parent_quality)
+    parent_target_values = [
+        parent_ratios[group]
+        for group in target_groups
+        if group in parent_ratios
+    ]
+    if not parent_target_values and "all" in parent_ratios:
+        parent_target_values = [parent_ratios["all"]]
+    if not parent_target_values:
+        return parent_quality, parent_context
+    feedback_ratio = float(max(parent_target_values))
+    requested_gamma = float(
+        np.clip(
+            (feedback_ratio / target_ratio) ** 2,
+            low_gamma,
+            high_gamma,
+        )
+    )
+    if requested_gamma <= 1.0 + 1.0e-6:
+        return parent_quality, parent_context
+    gamma = requested_gamma
 
     for _retry in range(retry_max):
-        gamma = 0.5 * (low_gamma + high_gamma)
         contracted, contraction_report = (
             stage9_quality.contract_star_layer_components(
                 immutable_parent_stars,
@@ -6801,6 +7019,8 @@ def _stage9_targeted_psf_contraction(
         comparison = {
             "attempt": attempt_name,
             "gamma": gamma,
+            "feedback_input_ratio": feedback_ratio,
+            "feedback_target_ratio": target_ratio,
             "target_groups": list(target_groups),
             "accepted": bool(quality.get("accepted", False)),
             "status": str(quality.get("status") or "unknown"),
@@ -6858,7 +7078,8 @@ def _stage9_targeted_psf_contraction(
         if not target_values and "all" in ratios:
             target_values = [ratios["all"]]
         if target_values:
-            if float(np.median(target_values)) > 1.0:
+            feedback_ratio = float(max(target_values))
+            if feedback_ratio > target_ratio:
                 low_gamma = gamma
             else:
                 high_gamma = gamma
@@ -6874,6 +7095,26 @@ def _stage9_targeted_psf_contraction(
             _stage9_psf_size_direction(quality) not in {"large", "small"}
         ):
             break
+        if high_gamma - low_gamma <= 1.0e-4:
+            break
+        feedback_gamma = float(
+            gamma * (feedback_ratio / target_ratio) ** 2
+        )
+        next_gamma = float(
+            np.clip(feedback_gamma, low_gamma, high_gamma)
+        )
+        if feedback_ratio > target_ratio and next_gamma <= gamma + 1.0e-4:
+            next_gamma = 0.5 * (gamma + high_gamma)
+        elif (
+            feedback_ratio < target_ratio
+            and next_gamma >= gamma - 1.0e-4
+        ):
+            next_gamma = 0.5 * (low_gamma + gamma)
+        if abs(next_gamma - gamma) <= 1.0e-4:
+            break
+        comparison["feedback_next_gamma"] = next_gamma
+        comparison["feedback_unclamped_gamma"] = feedback_gamma
+        gamma = next_gamma
 
     if best is None:
         _restore_stage9_candidate_state(
@@ -8040,6 +8281,12 @@ def run_stage9_star_remixing(pipeline) -> None:
         "accepted": False,
         "reason_code": "stage9_persisted_output_validation_not_run",
     }
+    pipeline._stage9_sep_crossmatch_report = (
+        stage9_quality.stage9_sep_crossmatch_not_applicable(
+            "Stage9 formal persisted remix route has not run"
+        )
+    )
+    pipeline._stage9_sep_crossmatch_summary = None
     pipeline._stage9_spatial_scale_review_required = False
     pipeline._stage9_spatial_scale = {
         "schema": "starun.stage9-fwhm-spatial-scale.v1",

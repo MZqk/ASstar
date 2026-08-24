@@ -33,6 +33,7 @@ from channel_semantics import channel_shape_dict, classify_channel_semantics
 from dualband_palette import PALETTE_CHANNELS, resolve_palette_selection
 from input_profile import infer_input_profile
 import run_manifest
+import scene_support
 import task_plan
 import task_workspace
 from processing_parameters import (
@@ -108,6 +109,8 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "STARUN_STAGE4_SPCC_TIMEOUT_SEC",
         "STARUN_STAGE4_SPCC_ONLINE_UNVERIFIED_TIMEOUT_SEC",
         "STARUN_STAGE4_SPCC_ONLINE_CIRCUIT_OPEN",
+        "STARUN_STAGE4_SPCC_OPERATIONAL_CACHE_STATUS",
+        "STARUN_STAGE4_SPCC_OPERATIONAL_CACHE_KEY",
         "STARUN_STAGE4_SPCC_OSC_SENSOR",
         "STARUN_STAGE4_SPCC_OSC_FILTER",
         "STARUN_STAGE4_SPCC_WHITE_REF",
@@ -273,6 +276,7 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "STARUN_COSMIC_CLARITY_EXECUTABLE",
         "STARUN_COSMIC_CLASSIC_GPU",
         "STARUN_COSMIC_NATIVE_GPU",
+        "STARUN_FINAL_DENOISE_TIMEOUT_SEC",
         "STARUN_SYQON_TIMEOUT_SEC",
         "STARUN_SYQON_MODEL_DIR",
         "STARUN_SIRILPY_TIMEOUT_SEC",
@@ -1300,7 +1304,7 @@ class ProcessorRuntimeMixin:
                 getattr(
                     self.cfg,
                     "stage4_auto_reference_global_white_enabled",
-                    False,
+                    True,
                 ),
             )
             self.cfg.stage4_auto_reference_global_white_enabled = parsed
@@ -2365,6 +2369,8 @@ class ProcessorRuntimeMixin:
                     expected_sha256 = str(resume.get("sha256") or "")
                     semantic_context = None
                     semantic_error = None
+                    auxiliary_artifacts: Dict[str, Dict[str, Any]] = {}
+                    auxiliary_error = None
                     if resume_stage in {2, 5}:
                         try:
                             semantic_context = (
@@ -2379,6 +2385,16 @@ class ProcessorRuntimeMixin:
                             semantic_error = (
                                 f"Stage {resume_stage} semantic context is missing"
                             )
+                    try:
+                        auxiliary_artifacts = (
+                            task_workspace._normalize_checkpoint_auxiliary_artifacts(
+                                resume.get("auxiliary_artifacts"),
+                                task_root=task_root,
+                                stage_number=resume_stage,
+                            )
+                        )
+                    except task_workspace.WorkspaceError as error:
+                        auxiliary_error = str(error)
                     if resume_stage != expected_stage or contract_record is None:
                         task_result["detail"] = "task-run resume stage does not match mode"
                     elif str(resume.get("artifact") or "") != (
@@ -2395,6 +2411,11 @@ class ProcessorRuntimeMixin:
                         task_result["detail"] = (
                             f"task-run Stage {resume_stage} semantic context is invalid: "
                             + semantic_error
+                        )
+                    elif auxiliary_error is not None:
+                        task_result["detail"] = (
+                            f"task-run Stage {resume_stage} auxiliary artifacts are invalid: "
+                            + auxiliary_error
                         )
                     else:
                         self._task_run_manifest_payload = copy.deepcopy(dict(payload))
@@ -2416,6 +2437,9 @@ class ProcessorRuntimeMixin:
                             }
                         )
                         self._task_resume_checkpoint_path = checkpoint_path
+                        self._resume_auxiliary_artifacts = copy.deepcopy(
+                            auxiliary_artifacts
+                        )
                         if resume_stage in {2, 5}:
                             self._resume_semantic_context = copy.deepcopy(
                                 semantic_context
@@ -2530,6 +2554,23 @@ class ProcessorRuntimeMixin:
                                 )
                             ),
                         },
+                        **(
+                            {
+                                "stacked_master_footprint": copy.deepcopy(
+                                    dict(
+                                        stage2_crop.get(
+                                            "stacked_master_footprint"
+                                        )
+                                        or {}
+                                    )
+                                )
+                            }
+                            if isinstance(
+                                stage2_crop.get("stacked_master_footprint"),
+                                Mapping,
+                            )
+                            else {}
+                        ),
                     }
                 )
                 self.stage2_crop_report = restored_crop
@@ -2593,6 +2634,89 @@ class ProcessorRuntimeMixin:
                 self.color_calibration_report["channel_mapping"] = copy.deepcopy(
                     restored_mapping
                 )
+                auxiliary_artifacts = getattr(
+                    self, "_resume_auxiliary_artifacts", {}
+                )
+                if auxiliary_artifacts:
+                    if self.process_dir is None:
+                        raise RuntimeError(
+                            "Stage 5 场景支持辅助产物缺少运行目录"
+                        )
+                    task_payload = getattr(
+                        self, "_task_run_manifest_payload", {}
+                    ) or {}
+                    task_root = Path(
+                        str(task_payload.get("task_directory") or "")
+                    ).expanduser().resolve()
+                    for name in (
+                        scene_support.SCENE_SUPPORT_JSON,
+                        scene_support.SCENE_SUPPORT_ARRAYS,
+                    ):
+                        record = auxiliary_artifacts.get(name) or {}
+                        source_path = (
+                            task_root / str(record.get("path") or "")
+                        ).resolve()
+                        destination = self.process_dir / name
+                        task_workspace._atomic_copy(source_path, destination)
+                        if run_manifest.sha256_file(destination) != str(
+                            record.get("sha256") or ""
+                        ):
+                            raise RuntimeError(
+                                f"Stage 5 场景支持辅助产物 {name} 恢复后哈希不一致"
+                            )
+                    restored_support = scene_support.load_scene_support(
+                        self.process_dir
+                    )
+                    if restored_support.get("status") not in {
+                        "available",
+                        "partial",
+                    }:
+                        raise RuntimeError(
+                            "Stage 5 场景支持辅助产物恢复后校验失败"
+                        )
+                    signed_summary = context.get("stage3_scene_support") or {}
+                    restored_summary = scene_support.scene_support_summary(
+                        restored_support
+                    )
+                    if isinstance(signed_summary, Mapping):
+                        for field in (
+                            "source_file_sha256",
+                            "source_pixel_sha256",
+                            "manifest_sha256",
+                            "arrays_sha256",
+                        ):
+                            expected = signed_summary.get(field)
+                            if expected is not None and expected != restored_summary.get(
+                                field
+                            ):
+                                raise RuntimeError(
+                                    f"Stage 5 场景支持 {field} 与验签语义不一致"
+                                )
+                    self._stage3_scene_support = restored_support
+                else:
+                    signed_support = context.get("stage3_scene_support")
+                    legacy_support = not isinstance(signed_support, Mapping)
+                    reason_code = (
+                        "legacy_checkpoint_without_scene_support"
+                        if legacy_support
+                        else str(
+                            signed_support.get("reason_code")
+                            or "checkpoint_scene_support_unavailable"
+                        )
+                    )
+                    self._stage3_scene_support = {
+                        "status": "unavailable",
+                        "manifest": scene_support.unavailable_scene_support(
+                            (
+                                "legacy Stage 5 checkpoint has no scene support"
+                                if legacy_support
+                                else "Stage 5 checkpoint records unavailable scene support"
+                            ),
+                            reason_code=reason_code,
+                        ),
+                        "valid_mask": None,
+                        "saturation_map": None,
+                    }
                 self._resume_semantic_context_status = "restored"
                 physical = self.color_calibration_report.get("physical_color") or {}
                 physical_accepted = bool(

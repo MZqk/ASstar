@@ -259,10 +259,12 @@ try:
         RUN_STATE_NAME,
         RUN_STATE_SCHEMA,
         atomic_write_json as atomic_write_runtime_json,
+        apply_stage4_spcc_operational_timeout_cache,
         build_runtime_capabilities,
         capability_summary_lines,
         probe_network_capabilities,
         refresh_blocking_errors,
+        stage4_spcc_operational_cache_key,
         update_siril_launch_probe,
         utc_now as runtime_utc_now,
     )
@@ -273,10 +275,12 @@ except ImportError:
         RUN_STATE_NAME,
         RUN_STATE_SCHEMA,
         atomic_write_json as atomic_write_runtime_json,
+        apply_stage4_spcc_operational_timeout_cache,
         build_runtime_capabilities,
         capability_summary_lines,
         probe_network_capabilities,
         refresh_blocking_errors,
+        stage4_spcc_operational_cache_key,
         update_siril_launch_probe,
         utc_now as runtime_utc_now,
     )
@@ -345,10 +349,12 @@ try:
         PreparedTask,
         PreparedTaskQueue,
         SPCC_ONLINE_CIRCUIT_ENV,
+        SPCC_OPERATIONAL_CACHE_ENV,
+        SPCC_OPERATIONAL_CACHE_KEY_ENV,
         describe_input_plan,
         discover_input_for_processing_settings,
         prepare_task_queue,
-        stage4_online_spcc_timeout_detected,
+        stage4_online_spcc_timeout_evidence,
     )
     from .history_store import (
         STATUS_FAILED,
@@ -393,10 +399,12 @@ except ImportError:  # Support direct execution from the gui directory.
         PreparedTask,
         PreparedTaskQueue,
         SPCC_ONLINE_CIRCUIT_ENV,
+        SPCC_OPERATIONAL_CACHE_ENV,
+        SPCC_OPERATIONAL_CACHE_KEY_ENV,
         describe_input_plan,
         discover_input_for_processing_settings,
         prepare_task_queue,
-        stage4_online_spcc_timeout_detected,
+        stage4_online_spcc_timeout_evidence,
     )
     from history_store import (  # type: ignore[no-redef]
         STATUS_FAILED,
@@ -465,9 +473,9 @@ DEFAULT_PROCESSING_SETTINGS = {
     "pcc_timeout_sec": int(
         SPECS_BY_FIELD["stage4_pcc_timeout_sec"].default
     ),
-    "local_wb_gain_limit": float(
-        SPECS_BY_FIELD["stage4_local_star_wb_gain_limit"].default
-    ),
+    # Retained in old task payloads only; Stage 4 v2 no longer exposes or runs
+    # the local star-mask white-balance path.
+    "local_wb_gain_limit": 1.20,
     "builtin_denoise_strength": float(SPECS_BY_FIELD["denoise_mod"].default),
     "graxpert_deconv_strength": float(
         SPECS_BY_FIELD["stage5_graxpert_deconv_strength"].default
@@ -562,6 +570,8 @@ class StarunGui(QMainWindow):
         self._prepared_task_index = 0
         self._active_prepared_task: PreparedTask | None = None
         self._spcc_online_circuit_open = False
+        self._spcc_operational_cache: dict[str, dict[str, object]] = {}
+        self._active_spcc_operational_cache_key: str | None = None
         self._last_task_root: Path | None = None
         self.history_store = HistoryStore(history_path_override)
         self._history_return_state = WORKSPACE_EMPTY
@@ -1689,8 +1699,6 @@ class StarunGui(QMainWindow):
         self.task_splitter.splitterMoved.connect(
             self._on_task_splitter_moved
         )
-        page_layout.addWidget(self.task_splitter, 1)
-
         phase_card = QFrame()
         phase_card.setObjectName("phaseBar")
         self.task_phase_bar = phase_card
@@ -1707,7 +1715,6 @@ class StarunGui(QMainWindow):
             label.setProperty("active", False)
             phase_row.addWidget(label, 1)
         phase_layout.addLayout(phase_row)
-        page_layout.addWidget(phase_card)
 
         self.processing_params_panel = self._build_processing_parameters_panel()
         self.processing_params_scroll = QScrollArea()
@@ -1716,7 +1723,34 @@ class StarunGui(QMainWindow):
         self.processing_params_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.processing_params_scroll.setWidget(self.processing_params_panel)
         self.processing_params_scroll.hide()
-        page_layout.addWidget(self.processing_params_scroll, 1)
+
+        self.task_top_region = QWidget()
+        task_top_layout = QVBoxLayout(self.task_top_region)
+        task_top_layout.setContentsMargins(0, 0, 0, 0)
+        task_top_layout.setSpacing(12)
+        task_top_layout.addWidget(self.task_splitter, 1)
+        task_top_layout.addWidget(phase_card)
+        self.task_top_region.setMinimumHeight(180)
+
+        self.task_section_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.task_section_splitter.setAccessibleName("任务页纵向分区")
+        self.task_section_splitter.setAccessibleDescription(
+            "拖动分隔条可调整输入与预览区域和处理参数区域的高度"
+        )
+        self.task_section_splitter.setChildrenCollapsible(False)
+        self.task_section_splitter.setHandleWidth(7)
+        self.task_section_splitter.addWidget(self.task_top_region)
+        self.task_section_splitter.addWidget(self.processing_params_scroll)
+        self.task_section_splitter.setStretchFactor(0, 2)
+        self.task_section_splitter.setStretchFactor(1, 3)
+        self._task_section_splitter_sizes = [260, 390]
+        self.task_section_splitter.setSizes(
+            self._task_section_splitter_sizes
+        )
+        self.task_section_splitter.splitterMoved.connect(
+            self._on_task_section_splitter_moved
+        )
+        page_layout.addWidget(self.task_section_splitter, 1)
         return page
 
     def _build_source_card(self) -> QFrame:
@@ -2448,6 +2482,7 @@ class StarunGui(QMainWindow):
             task_sizes = self.task_splitter.sizes()
             if len(task_sizes) == 2 and all(size > 0 for size in task_sizes):
                 self._task_splitter_sizes = task_sizes
+            self._capture_task_section_splitter_sizes()
         if (
             getattr(self, "_workspace_state", None) == WORKSPACE_RUN
             and hasattr(self, "run_splitter")
@@ -2467,6 +2502,7 @@ class StarunGui(QMainWindow):
         self.workspace_stack.setCurrentWidget(page)
         if normalized == WORKSPACE_TASK:
             self.task_splitter.setSizes(self._task_splitter_sizes)
+            self._restore_task_section_splitter_sizes()
         self._update_toolbar_state()
         self._update_responsive_layout()
 
@@ -3777,6 +3813,37 @@ class StarunGui(QMainWindow):
         ):
             self._task_splitter_sizes = sizes
 
+    def _capture_task_section_splitter_sizes(self) -> None:
+        splitter = getattr(self, "task_section_splitter", None)
+        processing_scroll = getattr(self, "processing_params_scroll", None)
+        if (
+            splitter is None
+            or processing_scroll is None
+            or processing_scroll.isHidden()
+        ):
+            return
+        sizes = splitter.sizes()
+        if len(sizes) == 2 and all(size > 0 for size in sizes):
+            self._task_section_splitter_sizes = sizes
+
+    def _restore_task_section_splitter_sizes(self) -> None:
+        splitter = getattr(self, "task_section_splitter", None)
+        processing_scroll = getattr(self, "processing_params_scroll", None)
+        if (
+            splitter is not None
+            and processing_scroll is not None
+            and not processing_scroll.isHidden()
+        ):
+            splitter.setSizes(self._task_section_splitter_sizes)
+
+    def _on_task_section_splitter_moved(
+        self,
+        _position: int,
+        _index: int,
+    ) -> None:
+        if self._workspace_state == WORKSPACE_TASK:
+            self._capture_task_section_splitter_sizes()
+
     def _set_run_inspector_visible(self, visible: bool) -> None:
         inspector = getattr(self, "run_inspector", None)
         splitter = getattr(self, "run_splitter", None)
@@ -4501,9 +4568,7 @@ class StarunGui(QMainWindow):
         )
         self.graxpert_model_path = str(effective("graxpert_object_model_path"))
         self.pcc_timeout_sec = int(effective("stage4_pcc_timeout_sec"))
-        self.local_wb_gain_limit = float(
-            effective("stage4_local_star_wb_gain_limit")
-        )
+        self.local_wb_gain_limit = 1.20
         self.builtin_denoise_strength = float(effective("denoise_mod"))
         self.graxpert_deconv_strength = float(
             effective("stage5_graxpert_deconv_strength")
@@ -5971,16 +6036,28 @@ class StarunGui(QMainWindow):
         visible = bool(expanded and self.advanced_toggle_btn.isChecked())
         processing_scroll = getattr(self, "processing_params_scroll", None)
         if processing_scroll is not None:
+            if not visible:
+                capture_sizes = getattr(
+                    self,
+                    "_capture_task_section_splitter_sizes",
+                    None,
+                )
+                if callable(capture_sizes):
+                    capture_sizes()
             processing_scroll.setVisible(visible)
         self.processing_params_panel.setVisible(visible)
         task_phase_bar = getattr(self, "task_phase_bar", None)
         if task_phase_bar is not None:
             task_phase_bar.setVisible(not visible)
-        task_splitter = getattr(self, "task_splitter", None)
-        if task_splitter is not None:
-            task_splitter.setMaximumHeight(
-                248 if visible else 16777215
+        if visible:
+            restore_sizes = getattr(
+                self,
+                "_restore_task_section_splitter_sizes",
+                None,
             )
+            if callable(restore_sizes):
+                restore_sizes()
+                QTimer.singleShot(0, restore_sizes)
         self.processing_params_btn.setText(
             "收起处理参数" if expanded else "处理参数…"
         )
@@ -6054,16 +6131,28 @@ class StarunGui(QMainWindow):
         )
         processing_scroll = getattr(self, "processing_params_scroll", None)
         if processing_scroll is not None:
+            if not processing_visible:
+                capture_sizes = getattr(
+                    self,
+                    "_capture_task_section_splitter_sizes",
+                    None,
+                )
+                if callable(capture_sizes):
+                    capture_sizes()
             processing_scroll.setVisible(processing_visible)
         self.processing_params_panel.setVisible(processing_visible)
         task_phase_bar = getattr(self, "task_phase_bar", None)
         if task_phase_bar is not None:
             task_phase_bar.setVisible(not processing_visible)
-        task_splitter = getattr(self, "task_splitter", None)
-        if task_splitter is not None:
-            task_splitter.setMaximumHeight(
-                248 if processing_visible else 16777215
+        if processing_visible:
+            restore_sizes = getattr(
+                self,
+                "_restore_task_section_splitter_sizes",
+                None,
             )
+            if callable(restore_sizes):
+                restore_sizes()
+                QTimer.singleShot(0, restore_sizes)
         self.advanced_toggle_btn.setText(
             "高级设置 ▾" if expanded else "高级设置 ▸"
         )
@@ -6123,6 +6212,14 @@ class StarunGui(QMainWindow):
             if task_splitter_sizes is not None:
                 self._task_splitter_sizes = task_splitter_sizes
                 self.task_splitter.setSizes(self._task_splitter_sizes)
+            task_section_splitter_sizes = self._splitter_sizes_setting(
+                self.settings.value("ui/taskSectionSplitterSizes"),
+                2,
+            )
+            if task_section_splitter_sizes is not None:
+                self._task_section_splitter_sizes = (
+                    task_section_splitter_sizes
+                )
             try:
                 sidebar_width = int(
                     self.settings.value(
@@ -6353,6 +6450,11 @@ class StarunGui(QMainWindow):
         self.settings.setValue(
             "ui/taskSplitterSizes",
             self._task_splitter_sizes,
+        )
+        self._capture_task_section_splitter_sizes()
+        self.settings.setValue(
+            "ui/taskSectionSplitterSizes",
+            self._task_section_splitter_sizes,
         )
         run_sizes = self.run_splitter.sizes()
         if self._workspace_state == WORKSPACE_RUN and len(run_sizes) == 3:
@@ -9228,12 +9330,7 @@ class StarunGui(QMainWindow):
             self._pending_runtime_unset_keys,
         ) = self._processing_runtime_configuration(input_mode)
         self._pending_runtime_overrides.update(prepared_task.runtime_overrides)
-        if self._spcc_online_circuit_open:
-            self._pending_runtime_overrides[SPCC_ONLINE_CIRCUIT_ENV] = "1"
-            self._append_event(
-                "本批次在线 Gaia SPCC 超时熔断已开启；"
-                "本任务跳过在线 SPCC，仍保留 localgaia/PCC 降级。"
-            )
+        self._active_spcc_operational_cache_key = None
         if self.graxpert_model_path:
             model_path = Path(self.graxpert_model_path).expanduser()
             if not model_path.exists():
@@ -9359,6 +9456,7 @@ class StarunGui(QMainWindow):
             return
         payload = result if isinstance(result, dict) else {}
         disk_estimate = payload.get("disk_estimate")
+        self._apply_stage4_spcc_operational_cache_policy()
         self._append_event("运行环境准备完成，正在启动处理…")
         self._update_run_state(
             phase="pipeline_starting",
@@ -9367,6 +9465,50 @@ class StarunGui(QMainWindow):
             errors=[],
         )
         self._start_pipeline(work_dir, disk_estimate)
+
+    def _apply_stage4_spcc_operational_cache_policy(self) -> None:
+        """Apply session SPCC evidence after network capability preflight."""
+
+        capability_manifest = getattr(
+            self,
+            "_runtime_capability_manifest",
+            None,
+        )
+        cache_key = (
+            stage4_spcc_operational_cache_key(capability_manifest)
+            if isinstance(capability_manifest, Mapping)
+            else None
+        )
+        self._active_spcc_operational_cache_key = cache_key
+        cached_spcc = (
+            self._spcc_operational_cache.get(cache_key)
+            if cache_key is not None
+            else None
+        )
+        if cache_key is not None and isinstance(cached_spcc, Mapping):
+            self._pending_runtime_overrides[SPCC_OPERATIONAL_CACHE_ENV] = (
+                "operational_timeout_cached"
+            )
+            self._pending_runtime_overrides[SPCC_OPERATIONAL_CACHE_KEY_ENV] = (
+                cache_key
+            )
+            if isinstance(capability_manifest, dict):
+                apply_stage4_spcc_operational_timeout_cache(
+                    capability_manifest,
+                    cache_key=cache_key,
+                    evidence=cached_spcc,
+                )
+                self._write_runtime_capability_manifest()
+            self._append_event(
+                "命中本应用会话的在线 Gaia SPCC 超时能力缓存；"
+                "本任务直接进入 PCC/local fallback，不再重复等待 SPCC。"
+            )
+        elif self._spcc_online_circuit_open:
+            self._pending_runtime_overrides[SPCC_ONLINE_CIRCUIT_ENV] = "1"
+            self._append_event(
+                "本批次在线 Gaia SPCC 超时熔断已开启；"
+                "本任务跳过在线 SPCC，仍保留 localgaia/PCC 降级。"
+            )
 
     def _on_bootstrap_failed(self, title: str, detail: str) -> None:
         self._cleanup_bootstrap_worker()
@@ -9830,16 +9972,43 @@ class StarunGui(QMainWindow):
             failure_reason=history_failure_reason,
             exit_code=exit_code,
         )
+        spcc_timeout_evidence = (
+            stage4_online_spcc_timeout_evidence(work_dir)
+            if work_dir is not None
+            else None
+        )
+        active_spcc_cache_key = self._active_spcc_operational_cache_key
         if (
-            not self._spcc_online_circuit_open
-            and work_dir is not None
-            and stage4_online_spcc_timeout_detected(work_dir)
+            spcc_timeout_evidence is not None
+            and active_spcc_cache_key is not None
         ):
-            self._spcc_online_circuit_open = True
-            self._append_event(
-                "检测到 online_unverified Gaia SPCC 超时；"
-                "已为本批次剩余任务开启在线 SPCC 熔断。"
+            self._spcc_operational_cache[active_spcc_cache_key] = dict(
+                spcc_timeout_evidence
             )
+            capability_manifest = getattr(
+                self,
+                "_runtime_capability_manifest",
+                None,
+            )
+            if isinstance(capability_manifest, dict):
+                apply_stage4_spcc_operational_timeout_cache(
+                    capability_manifest,
+                    cache_key=active_spcc_cache_key,
+                    evidence=spcc_timeout_evidence,
+                )
+                self._write_runtime_capability_manifest()
+        if not self._spcc_online_circuit_open and spcc_timeout_evidence is not None:
+            self._spcc_online_circuit_open = True
+            if active_spcc_cache_key is not None:
+                self._append_event(
+                    "检测到 online_unverified Gaia SPCC 超时；"
+                    "已写入本应用会话能力缓存并为本批次开启在线 SPCC 熔断。"
+                )
+            else:
+                self._append_event(
+                    "检测到 online_unverified Gaia SPCC 超时；"
+                    "能力缓存键不可用，仅为本批次开启在线 SPCC 熔断。"
+                )
         has_next_task = bool(
             status in {"Completed", "CompletedWithWarning"}
             and self._prepared_task_index + 1 < len(self._prepared_tasks)
@@ -9969,6 +10138,7 @@ class StarunGui(QMainWindow):
 
         self._current_work_dir = None
         self._run_input_mode = None
+        self._active_spcc_operational_cache_key = None
         if not keep_queue:
             self._active_prepared_task = None
             self._prepared_tasks = ()

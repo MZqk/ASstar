@@ -194,6 +194,21 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
                 launchable=True,
                 version="siril 1.4.4",
             )
+            solver_backends = manifest["capabilities"][
+                "stage4_plate_solver_backends"
+            ]
+            self.assertEqual(
+                [item["id"] for item in solver_backends],
+                list(capabilities.STAGE4_PLATE_SOLVER_BACKEND_IDS),
+            )
+            self.assertEqual(solver_backends[0]["version"], "siril 1.4.4")
+            self.assertTrue(solver_backends[0]["eligible"])
+            self.assertTrue(
+                all(
+                    item["runtime_status"] == "not_probed"
+                    for item in solver_backends[1:]
+                )
+            )
 
             def opener(request, *, timeout):
                 self.assertGreater(timeout, 0)
@@ -226,7 +241,84 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
                 any("单次预算 90 秒" in line for line in capabilities.capability_summary_lines(manifest))
             )
 
-    def test_online_mode_degrades_when_local_and_remote_gaia_are_missing(self) -> None:
+    def test_online_spcc_operational_cache_key_tracks_siril_and_xp_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            layout = self._make_bundle_layout(Path(td))
+            manifest = self._manifest(
+                layout,
+                network_enabled=True,
+                endpoints={
+                    "gaia_astro": ("https://astro.example.test/availability",),
+                    "gaia_xp": ("https://xp.example.test/chunk.dat",),
+                },
+            )
+            capabilities.update_siril_launch_probe(
+                manifest,
+                launchable=True,
+                version="siril 1.4.4",
+            )
+            capabilities.probe_network_capabilities(
+                manifest,
+                opener=lambda *_args, **_kwargs: _Response(),
+            )
+
+            cache_key = capabilities.stage4_spcc_operational_cache_key(manifest)
+            self.assertIsNotNone(cache_key)
+            manifest["generated_at"] = "later"
+            manifest["run_id"] = "another-run"
+            self.assertEqual(
+                capabilities.stage4_spcc_operational_cache_key(manifest),
+                cache_key,
+            )
+
+            launch_probe = manifest["capabilities"]["siril"]["launch_probe"]
+            launch_probe["version"] = "siril 1.4.5"
+            self.assertNotEqual(
+                capabilities.stage4_spcc_operational_cache_key(manifest),
+                cache_key,
+            )
+
+    def test_cached_online_spcc_timeout_routes_to_pcc_with_audit_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            layout = self._make_bundle_layout(Path(td))
+            manifest = self._manifest(
+                layout,
+                network_enabled=True,
+                endpoints={
+                    "gaia_astro": ("https://astro.example.test/availability",),
+                    "gaia_xp": ("https://xp.example.test/chunk.dat",),
+                },
+            )
+            capabilities.update_siril_launch_probe(
+                manifest,
+                launchable=True,
+                version="siril 1.4.4",
+            )
+            capabilities.probe_network_capabilities(
+                manifest,
+                opener=lambda *_args, **_kwargs: _Response(),
+            )
+            cache_key = capabilities.stage4_spcc_operational_cache_key(manifest)
+            assert cache_key is not None
+
+            capabilities.apply_stage4_spcc_operational_timeout_cache(
+                manifest,
+                cache_key=cache_key,
+                evidence={"status": "timeout", "timeout_sec": 90},
+            )
+
+            decision = manifest["decisions"]["stage4_color_calibration"]
+            self.assertEqual(manifest["status"], "degraded_allowed")
+            self.assertEqual(decision["route"], "physical_pcc_only")
+            self.assertFalse(decision["commands"]["spcc"])
+            self.assertTrue(decision["commands"]["pcc"])
+            self.assertEqual(
+                decision["spcc_operational_cache"]["status"],
+                "operational_timeout_cached",
+            )
+            self.assertIn("operational_timeout_cached", decision["reason_codes"])
+
+    def test_online_transport_failure_remains_operationally_unverified(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             layout = self._make_bundle_layout(Path(td))
             endpoint_map = {
@@ -247,10 +339,47 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
             capabilities.probe_network_capabilities(manifest, opener=opener)
 
             self.assertEqual(manifest["blocking_errors"], [])
-            self.assertEqual(manifest["status"], "degraded_allowed")
+            self.assertEqual(manifest["status"], "ready")
             decision = manifest["decisions"]["stage4_color_calibration"]
-            self.assertEqual(decision["route"], "auto_local_reference")
-            self.assertFalse(decision["physical_color_available"])
+            self.assertEqual(decision["route"], "physical_spcc_then_pcc")
+            self.assertTrue(decision["physical_color_available"])
+            self.assertEqual(decision["spcc_readiness"], "online_unverified")
+            self.assertTrue(decision["commands"]["platesolve"])
+            self.assertTrue(decision["commands"]["spcc"])
+            self.assertTrue(decision["commands"]["pcc"])
+            self.assertIn(
+                "gaia_astrometry_endpoint_unreachable_operational_probe_required",
+                decision["reason_codes"],
+            )
+
+    def test_online_confirmed_http_failure_is_advisory(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            layout = self._make_bundle_layout(Path(td))
+            manifest = self._manifest(
+                layout,
+                network_enabled=True,
+                endpoints={
+                    "gaia_astro": ("https://astro.example.test/availability",),
+                    "gaia_xp": ("https://xp.example.test/chunk.dat",),
+                },
+            )
+            capabilities.update_siril_launch_probe(manifest, launchable=True)
+
+            def opener(request, *, timeout):
+                self.assertGreater(timeout, 0)
+                self.assertTrue(request.full_url.startswith("https://"))
+                return _Response(status=503)
+
+            capabilities.probe_network_capabilities(manifest, opener=opener)
+
+            decision = manifest["decisions"]["stage4_color_calibration"]
+            self.assertEqual(manifest["status"], "ready")
+            self.assertEqual(decision["route"], "physical_spcc_then_pcc")
+            self.assertEqual(decision["attempt_policy"], "attempt_then_fallback")
+            self.assertTrue(decision["preflight_advisory_only"])
+            self.assertTrue(decision["physical_color_available"])
+            self.assertTrue(decision["commands"]["spcc"])
+            self.assertTrue(decision["commands"]["pcc"])
 
     def test_preserve_fallback_is_degraded_passthrough_not_a_blocker(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import starmask_cleanup
 import stage7_quality
+import syqon_starless
 
 from image_metrics import (
     _box_blur_gray,
@@ -169,6 +170,231 @@ def stage7_clean_starmask(
         result["status"] = "failed"
         result["reason"] = pipeline._short_text(e, 180)
         pipeline.log.warn(f"Stage6 starmask cleanup failed: {e}")
+        return result
+
+
+BRIGHT_CORE_OVERSHOOT_REPAIR_CHANNEL_RATIO_MAX = 0.35
+BRIGHT_CORE_OVERSHOOT_REPAIR_MAX_ABS_DELTA = 0.08
+
+
+def repair_bright_core_starless_overshoot_pixels(
+    source_data: Any,
+    starless_data: Any,
+    starmask_data: Any,
+    *,
+    target_type: str,
+    target_profile: Optional[Dict[str, Any]],
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """Restore impossible strict-core starless overshoot to frozen source pixels."""
+    source_rgb = _to_rgb_float_fullres(source_data)
+    starless_rgb = _to_rgb_float_fullres(starless_data)
+    starmask_rgb = _to_rgb_float_fullres(starmask_data)
+    result: Dict[str, Any] = {
+        "schema": "starun.bright-core-overshoot-repair.v1",
+        "status": "skipped",
+        "reason": "",
+        "limits": {
+            "overshoot_delta": stage7_quality.BRIGHT_CORE_OVERSHOOT_DELTA,
+            "channel_repair_ratio_max": (
+                BRIGHT_CORE_OVERSHOOT_REPAIR_CHANNEL_RATIO_MAX
+            ),
+            "max_abs_delta": BRIGHT_CORE_OVERSHOOT_REPAIR_MAX_ABS_DELTA,
+        },
+        "metrics": {},
+    }
+    if source_rgb.shape != starless_rgb.shape or source_rgb.shape != starmask_rgb.shape:
+        result["reason"] = "pair_shape_mismatch"
+        return starless_rgb.copy(), starmask_rgb.copy(), result
+
+    before = stage7_quality.assess_bright_core_integrity(
+        source_rgb,
+        starless_rgb,
+        starmask_rgb,
+        target_type=target_type,
+        target_profile=target_profile,
+    )
+    result["before"] = before
+    if not bool(before.get("applicable", False)):
+        result["reason"] = "strict_bright_core_not_applicable"
+        return starless_rgb.copy(), starmask_rgb.copy(), result
+    if not bool(before.get("hard_failed", False)):
+        result["reason"] = "bright_core_integrity_not_hard_failed"
+        return starless_rgb.copy(), starmask_rgb.copy(), result
+    hard_gates = {
+        str(name)
+        for name, gate in (before.get("gates") or {}).items()
+        if isinstance(gate, dict) and bool(gate.get("hard_failed", False))
+    }
+    if hard_gates != {"starless_overshoot_ratio_max"}:
+        result["reason"] = "unsupported_hard_gates"
+        result["unsupported_hard_gates"] = sorted(hard_gates)
+        return starless_rgb.copy(), starmask_rgb.copy(), result
+
+    roi, roi_evidence = stage7_quality.build_bright_core_roi(
+        source_rgb,
+        starmask_rgb,
+    )
+    result["roi"] = roi_evidence
+    if roi is None or not bool(roi_evidence.get("available", False)):
+        result["reason"] = str(roi_evidence.get("reason") or "roi_unavailable")
+        return starless_rgb.copy(), starmask_rgb.copy(), result
+
+    delta = starless_rgb - source_rgb
+    repair_mask = (
+        delta > stage7_quality.BRIGHT_CORE_OVERSHOOT_DELTA
+    ) & roi[None, :, :]
+    repair_counts = [
+        int(np.count_nonzero(repair_mask[channel])) for channel in range(3)
+    ]
+    support = max(int(np.count_nonzero(roi)), 1)
+    channel_ratios = [count / float(support) for count in repair_counts]
+    changed_delta = delta[repair_mask]
+    max_abs_delta = (
+        float(np.max(np.abs(changed_delta))) if changed_delta.size else 0.0
+    )
+    result["metrics"] = {
+        "repair_pixels_per_channel": repair_counts,
+        "repair_pixels": int(np.count_nonzero(repair_mask)),
+        "repair_ratio_full": float(np.mean(repair_mask)),
+        "repair_ratio_per_roi_channel": channel_ratios,
+        "repair_ratio_per_roi_channel_max": max(channel_ratios),
+        "max_abs_delta": max_abs_delta,
+        "mean_abs_delta": (
+            float(np.mean(np.abs(changed_delta))) if changed_delta.size else 0.0
+        ),
+    }
+    if not changed_delta.size:
+        result["reason"] = "no_overshoot_pixels"
+        return starless_rgb.copy(), starmask_rgb.copy(), result
+    if max(channel_ratios) > BRIGHT_CORE_OVERSHOOT_REPAIR_CHANNEL_RATIO_MAX:
+        result["reason"] = "repair_coverage_exceeds_bound"
+        return starless_rgb.copy(), starmask_rgb.copy(), result
+    if max_abs_delta > BRIGHT_CORE_OVERSHOOT_REPAIR_MAX_ABS_DELTA:
+        result["reason"] = "repair_delta_exceeds_bound"
+        return starless_rgb.copy(), starmask_rgb.copy(), result
+
+    repaired_starless = starless_rgb.copy()
+    repaired_starmask = starmask_rgb.copy()
+    repaired_starless[repair_mask] = source_rgb[repair_mask]
+    repaired_starmask[repair_mask] = 0.0
+    after = stage7_quality.assess_bright_core_integrity(
+        source_rgb,
+        repaired_starless,
+        repaired_starmask,
+        target_type=target_type,
+        target_profile=target_profile,
+    )
+    result["after"] = after
+    if bool(after.get("hard_failed", True)):
+        result["reason"] = "post_repair_bright_core_gate_failed"
+        return starless_rgb.copy(), starmask_rgb.copy(), result
+    result.update({"status": "applied", "reason": ""})
+    return repaired_starless, repaired_starmask, result
+
+
+def apply_stage6_bright_core_overshoot_repair(
+    pipeline,
+    *,
+    source_stem: str,
+    label: str,
+) -> Dict[str, Any]:
+    """Transactionally write the bounded strict-core repair candidate."""
+    result: Dict[str, Any] = {
+        "label": label,
+        "source_stem": source_stem,
+        "status": "skipped",
+        "metrics": {},
+    }
+    try:
+        if not pipeline.starmask_file or not pipeline.starmask_file.exists():
+            result["reason"] = "starmask_missing"
+            return result
+        source_data = pipeline._read_image_by_stem(source_stem)
+        if source_data is None:
+            result["reason"] = "source_unavailable"
+            return result
+        pipeline.cmd_with_check("load", "starless")
+        starless_data = pipeline.siril.get_image_pixeldata(preview=False)
+        starmask_data = pipeline._read_image_by_stem(pipeline.starmask_file.stem)
+        if starless_data is None or starmask_data is None:
+            result["reason"] = (
+                "starless_buffer_empty" if starless_data is None else "starmask_buffer_empty"
+            )
+            return result
+
+        starless_arr = np.asarray(starless_data)
+        starmask_arr = pipeline._match_star_layer_shape(
+            np.asarray(starmask_data),
+            starless_arr,
+        )
+        source_arr = pipeline._match_star_layer_shape(
+            np.asarray(source_data),
+            starless_arr,
+        )
+        repaired_starless_rgb, repaired_starmask_rgb, audit = (
+            repair_bright_core_starless_overshoot_pixels(
+                source_arr,
+                starless_arr,
+                starmask_arr,
+                target_type=str(pipeline._active_target_type() or ""),
+                target_profile=getattr(pipeline, "target_profile", None),
+            )
+        )
+        result.update(audit)
+        result["label"] = label
+        result["source_stem"] = source_stem
+        if audit.get("status") != "applied":
+            return result
+
+        repaired_starless = pipeline._stage8_restore_rgb_like(
+            starless_arr,
+            repaired_starless_rgb,
+        )
+        repaired_starmask = pipeline._stage8_restore_rgb_like(
+            starmask_arr,
+            repaired_starmask_rgb,
+        )
+        pipeline.cmd_with_check("load", "starless")
+        pipeline._set_current_image_pixeldata(
+            repaired_starless,
+            label="Stage6 bright-core overshoot repair",
+        )
+        if not pipeline._save_stage_output("starless"):
+            raise RuntimeError("repaired starless save failed")
+        pipeline._save_stage_output("stage6_starless_bright_core_repaired")
+        pipeline.starless_file = pipeline.process_dir / "starless.fit"
+
+        pipeline.cmd_with_check("load", pipeline.starmask_file.stem)
+        pipeline._set_current_image_pixeldata(
+            repaired_starmask,
+            label="Stage6 bright-core starmask closure repair",
+        )
+        repaired_mask_stem = "starmask_bright_core_repaired"
+        if not pipeline._save_stage_output(repaired_mask_stem):
+            raise RuntimeError("repaired starmask save failed")
+        pipeline.starmask_file = pipeline.process_dir / f"{repaired_mask_stem}.fit"
+        selected_generation = syqon_starless.record_syqon_derived_generation(
+            pipeline,
+            generation="repaired",
+            details={
+                "repair": "bounded_bright_core_overshoot",
+                "metrics": result.get("metrics") or {},
+            },
+        )
+        if selected_generation is None:
+            raise RuntimeError("repaired SyQon generation could not be committed")
+        result["selected_generation"] = selected_generation
+        pipeline.log.info(
+            "Stage6 bounded bright-core overshoot repair applied "
+            f"(pixels={result['metrics']['repair_pixels']}, "
+            f"full_ratio={result['metrics']['repair_ratio_full']:.6f}, "
+            f"max_delta={result['metrics']['max_abs_delta']:.5f})"
+        )
+        return result
+    except (CommandError, SirilError, DataError, RuntimeError, ValueError) as e:
+        result["status"] = "failed"
+        result["reason"] = pipeline._short_text(e, 180)
+        pipeline.log.warn(f"Stage6 bright-core overshoot repair failed: {e}")
         return result
 
 def apply_stage7_residual_suppression(

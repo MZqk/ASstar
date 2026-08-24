@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -314,6 +315,49 @@ def subprocess_output_tail(pipeline, output_text: str, max_lines: int = 12) -> s
     return " | ".join(lines[-max_lines:])
 
 
+def _run_subprocess_with_group_timeout(
+    cmd: List[str],
+    *,
+    timeout: int,
+    cwd: str,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    """Run a plugin in its own POSIX process group and clean up descendants."""
+    start_new_session = os.name == "posix"
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=cwd,
+        env=env,
+        start_new_session=start_new_session,
+    )
+    try:
+        stdout, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        if start_new_session:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        else:
+            proc.terminate()
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            if start_new_session:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                proc.kill()
+            proc.communicate()
+        raise exc
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout)
+
+
 def run_plugin_script_cli_subprocess(
     pipeline,
     step_key: str,
@@ -448,13 +492,9 @@ def run_plugin_script_cli_subprocess(
         heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
         heartbeat_thread.start()
         try:
-            proc = subprocess.run(
+            proc = _run_subprocess_with_group_timeout(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
                 timeout=timeout_value,
-                check=False,
-                text=True,
                 cwd=cwd,
                 env=env,
             )

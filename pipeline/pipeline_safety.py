@@ -81,5 +81,10 @@ def should_skip_final_denoise(
         stage5_denoise_applied
         and not stage8_fallback_used
         and str(stage8_final_quality or "").lower()
-        in {"ok", "conservative_skipped", "star_preserve_bypass"}
+        in {
+            "ok",
+            "conservative_skipped",
+            "star_preserve_bypass",
+            "star_preserve_secondary_nebulosity",
+        }
     )

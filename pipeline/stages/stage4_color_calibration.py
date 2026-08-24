@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 import numpy as np
 
 import bright_core_color
+import stage4_evidence
 import stage7_quality
 from channel_semantics import (
     channel_shape_dict,
@@ -41,7 +42,7 @@ from narrowband_normalization import (
 from stage4_auto_reference import (
     AUTO_REFERENCE_SCHEMA,
     BACKGROUND_METHOD as AUTO_BACKGROUND_METHOD,
-    STAR_ENSEMBLE_METHOD as AUTO_STAR_ENSEMBLE_METHOD,
+    WHITE_REGION_METHOD as AUTO_WHITE_REGION_METHOD,
     evaluate_auto_local_reference,
 )
 from sirilpy.exceptions import CommandError, SirilError
@@ -122,6 +123,8 @@ SPCC_ONLINE_UNVERIFIED_TIMEOUT_DEFAULT_SEC = 90
 SPCC_ONLINE_UNVERIFIED_TIMEOUT_MIN_SEC = 30
 SPCC_ONLINE_UNVERIFIED_TIMEOUT_MAX_SEC = 180
 SPCC_ONLINE_CIRCUIT_ENV = "STARUN_STAGE4_SPCC_ONLINE_CIRCUIT_OPEN"
+SPCC_OPERATIONAL_CACHE_ENV = "STARUN_STAGE4_SPCC_OPERATIONAL_CACHE_STATUS"
+SPCC_OPERATIONAL_CACHE_KEY_ENV = "STARUN_STAGE4_SPCC_OPERATIONAL_CACHE_KEY"
 PCC_CHECKPOINT_STEM = "stage4_pre_pcc"
 PCC_CANDIDATE_STEM = "stage4_pcc_candidate"
 SPCC_CANDIDATE_STEM = "stage4_spcc_candidate"
@@ -140,7 +143,8 @@ SPCC_IMPRECISE_LOG_MARKERS = (
 )
 SPCC_CAPABILITY_SCHEMA = "starun.stage4-spcc-capabilities.v1"
 RUNTIME_CAPABILITIES_SCHEMA = "starun.runtime-capabilities.v1"
-RUNTIME_COLOR_DECISION_SCHEMA = "starun.stage4-color-capability-decision.v1"
+RUNTIME_COLOR_DECISION_SCHEMA = "starun.stage4-color-capability-decision.v2"
+LEGACY_RUNTIME_COLOR_DECISION_SCHEMA = "starun.stage4-color-capability-decision.v1"
 RUNTIME_CAPABILITIES_ENV = "STARUN_RUNTIME_CAPABILITIES_MANIFEST"
 AUTO_REFERENCE_REPORT_NAME = "stage4_auto_local_reference.json"
 SPCC_CAPABILITY_TIMEOUT_SEC = 15
@@ -373,6 +377,8 @@ def _stage4_derived_runtime_decision(pipeline) -> Dict[str, Any]:
             "schema": RUNTIME_COLOR_DECISION_SCHEMA,
             "status": "online_unverified",
             "route": "current_network_attempt",
+            "attempt_policy": "attempt_then_fallback",
+            "preflight_advisory_only": True,
             "offline_fallback_mode": mode,
             "astrometric_source": PCC_CATALOG,
             "xp_source": SPCC_CATALOG,
@@ -408,6 +414,8 @@ def _stage4_derived_runtime_decision(pipeline) -> Dict[str, Any]:
         "schema": RUNTIME_COLOR_DECISION_SCHEMA,
         "status": "ready" if astro_available and xp_available else "degraded_allowed",
         "route": route,
+        "attempt_policy": "attempt_then_fallback",
+        "preflight_advisory_only": True,
         "offline_fallback_mode": mode,
         "astrometric_source": PCC_LOCAL_CATALOG if astro_available else None,
         "xp_source": SPCC_LOCAL_CATALOG if xp_available else None,
@@ -470,7 +478,11 @@ def _stage4_runtime_color_decision(pipeline) -> Dict[str, Any]:
         )
         if not isinstance(decision, dict):
             raise ValueError("Stage 4 capability decision is missing")
-        if decision.get("schema") != RUNTIME_COLOR_DECISION_SCHEMA:
+        decision_schema = str(decision.get("schema") or "")
+        if decision_schema not in {
+            RUNTIME_COLOR_DECISION_SCHEMA,
+            LEGACY_RUNTIME_COLOR_DECISION_SCHEMA,
+        }:
             raise ValueError("Stage 4 capability decision schema mismatch")
         if str(decision.get("status") or "") not in {"ready", "degraded_allowed"}:
             raise ValueError("Stage 4 capability decision is not final")
@@ -494,34 +506,35 @@ def _stage4_runtime_color_decision(pipeline) -> Dict[str, Any]:
             for name in ("platesolve", "spcc", "pcc")
         ):
             raise ValueError("Stage 4 command decision must use booleans")
-        expected_commands = {
-            "physical_spcc_then_pcc": {
-                "platesolve": True,
-                "spcc": True,
-                "pcc": True,
-            },
-            "physical_pcc_only": {
-                "platesolve": True,
-                "spcc": False,
-                "pcc": True,
-            },
-            "auto_local_reference": {
-                "platesolve": False,
-                "spcc": False,
-                "pcc": False,
-            },
-            "preserve_input": {
-                "platesolve": False,
-                "spcc": False,
-                "pcc": False,
-            },
-        }[route]
-        if any(
-            commands[name] != expected_commands[name]
-            for name in ("platesolve", "spcc", "pcc")
-        ):
-            raise ValueError("Stage 4 capability route and commands disagree")
         result = dict(decision)
+        # v1 manifests encoded speculative availability as command bans.  In
+        # online mode normalize them to the v2 attempt-first policy, unless a
+        # real SPCC timeout cache has explicitly disabled SPCC for this runtime.
+        operational_cache = result.get("spcc_operational_cache")
+        explicit_local_sources = bool(
+            str(result.get("astrometric_source") or "") == PCC_LOCAL_CATALOG
+            or str(result.get("xp_source") or "") == SPCC_LOCAL_CATALOG
+        )
+        if _stage4_network_enabled() and not explicit_local_sources:
+            normalized_commands = {
+                "platesolve": True,
+                "spcc": not isinstance(operational_cache, Mapping),
+                "pcc": True,
+            }
+            result.update(
+                schema=RUNTIME_COLOR_DECISION_SCHEMA,
+                route=(
+                    "physical_pcc_only"
+                    if isinstance(operational_cache, Mapping)
+                    else "physical_spcc_then_pcc"
+                ),
+                attempt_policy="attempt_then_fallback",
+                preflight_advisory_only=True,
+                astrometric_source=PCC_CATALOG,
+                xp_source=SPCC_CATALOG,
+                commands=normalized_commands,
+            )
+            commands = normalized_commands
         readiness = str(result.get("spcc_readiness") or "").strip()
         if readiness not in {
             "local_verified",
@@ -551,6 +564,123 @@ def _stage4_runtime_color_decision(pipeline) -> Dict[str, Any]:
             manifest_error=str(error),
         )
         return fallback
+
+
+def _stage4_runtime_manifest_for_evidence(
+    pipeline,
+    runtime_decision: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    raw_path = str(runtime_decision.get("manifest_path") or "").strip()
+    if not raw_path:
+        return None
+    try:
+        path = Path(raw_path).expanduser().resolve()
+        work_dir = Path(getattr(pipeline, "work_dir", "") or "").resolve()
+        if path.parent != work_dir:
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") != RUNTIME_CAPABILITIES_SCHEMA
+        ):
+            return None
+        return payload
+    except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _stage4_solver_catalog_evidence(pipeline) -> List[Dict[str, Any]]:
+    catalogs: List[Dict[str, Any]] = []
+    for order, catalog in enumerate(_stage4_platesolve_catalogs(pipeline)):
+        if catalog == PCC_LOCAL_CATALOG:
+            local = _stage4_local_astrometric_catalog_status(pipeline)
+            catalogs.append(
+                {
+                    "id": catalog,
+                    "kind": "local_catalog",
+                    "order": order,
+                    "available": bool(local.get("available")),
+                    "evidence_level": "exact_file_size",
+                    "size_bytes": local.get("size_bytes"),
+                    "expected_size_bytes": local.get("expected_size_bytes"),
+                    "skip_reason": (
+                        None
+                        if local.get("available")
+                        else "local_gaia_astrometric_catalog_unavailable"
+                    ),
+                    "selected": False,
+                    "attempted": False,
+                    "result": "not_run",
+                }
+            )
+        else:
+            network_enabled = _stage4_network_enabled()
+            catalogs.append(
+                {
+                    "id": catalog,
+                    "kind": "online_catalog",
+                    "order": order,
+                    "available": bool(network_enabled),
+                    "evidence_level": "runtime_network_policy",
+                    "skip_reason": (
+                        None if network_enabled else "network_mode_disabled"
+                    ),
+                    "selected": False,
+                    "attempted": False,
+                    "result": "not_run",
+                }
+            )
+    return catalogs
+
+
+def _stage4_write_observer_evidence(
+    pipeline,
+    *,
+    solver_evidence: Dict[str, Any],
+    header_evidence: Dict[str, Any],
+) -> Dict[str, Any]:
+    process_dir = Path(getattr(pipeline, "process_dir", "") or "")
+    stage_json = getattr(pipeline, "stage_json", None)
+    if isinstance(stage_json, dict):
+        # Unit-test/runtime adapters may intentionally virtualize stage JSON.
+        # Keep evidence on that same surface rather than bypassing the adapter.
+        records: Dict[str, Any] = {}
+        for key, filename, payload in (
+            (
+                "solver_capabilities",
+                stage4_evidence.SOLVER_CAPABILITIES_NAME,
+                solver_evidence,
+            ),
+            (
+                "filter_header",
+                stage4_evidence.FILTER_HEADER_EVIDENCE_NAME,
+                header_evidence,
+            ),
+        ):
+            stage4_evidence.validate_evidence_payload(payload)
+            pipeline._write_stage_json(filename, payload)
+            records[key] = {
+                "schema": payload.get("schema"),
+                "status": payload.get("status"),
+                "path": filename,
+                "sha256": stage4_evidence.canonical_sha256(payload),
+                "hash_scope": "virtualized_stage_json_payload",
+            }
+        return records
+    return {
+        "solver_capabilities": stage4_evidence.write_evidence_artifact(
+            process_dir,
+            stage4_evidence.SOLVER_CAPABILITIES_NAME,
+            solver_evidence,
+            log=pipeline.log,
+        ),
+        "filter_header": stage4_evidence.write_evidence_artifact(
+            process_dir,
+            stage4_evidence.FILTER_HEADER_EVIDENCE_NAME,
+            header_evidence,
+            log=pipeline.log,
+        ),
+    }
 
 
 def _stage4_spcc_runtime_enabled(pipeline) -> bool:
@@ -1446,6 +1576,28 @@ def _stage4_run_spcc(
 
     if (
         catalog == SPCC_CATALOG
+        and str(os.getenv(SPCC_OPERATIONAL_CACHE_ENV, "")).strip().lower()
+        == "operational_timeout_cached"
+    ):
+        cache_key = str(os.getenv(SPCC_OPERATIONAL_CACHE_KEY_ENV, "") or "").strip()
+        attempt.update(
+            status="skipped",
+            error="online SPCC operational timeout is cached for this app session",
+            reason_code="operational_timeout_cached",
+            operational_cache={
+                "status": "operational_timeout_cached",
+                "scope": "application_session",
+                "cache_key": cache_key or None,
+            },
+        )
+        return (
+            False,
+            "SPCC skipped: operational timeout cached for this app session",
+            [attempt],
+        )
+
+    if (
+        catalog == SPCC_CATALOG
         and str(os.getenv(SPCC_ONLINE_CIRCUIT_ENV, "")).strip().lower()
         in {"1", "true", "yes", "on"}
     ):
@@ -1497,10 +1649,15 @@ def _stage4_run_spcc(
             attempt["precision_warning_policy"] = (
                 "defer_to_target_aware_pixel_quality_gate"
             )
-        attempt["status"] = "ok" if ok else "failed"
+        detail_text = str(detail)
+        timed_out = bool(
+            not ok
+            and re.search(r"(?:^|\b)(?:timeout|timed out)(?:\b|$)", detail_text, re.I)
+        )
+        attempt["status"] = "ok" if ok else "timeout" if timed_out else "failed"
         if not ok:
-            attempt["error"] = str(detail)
-        return bool(ok), str(detail), [attempt]
+            attempt["error"] = detail_text
+        return bool(ok), detail_text, [attempt]
 
     cli = _stage4_resolve_siril_cli()
     process_dir = Path(getattr(pipeline, "process_dir", "") or "")
@@ -2250,6 +2407,23 @@ def _stage4_pcc_quality_gate(
     after: np.ndarray,
     pipeline,
 ) -> Tuple[bool, Dict[str, Any]]:
+    technical_accepted, technical_integrity = (
+        _stage4_candidate_technical_integrity(before, after)
+    )
+    if not technical_accepted:
+        return False, {
+            "enabled": bool(
+                getattr(pipeline.cfg, "stage4_pcc_quality_gate_enabled", True)
+            ),
+            "deprecated_no_routing_effect": True,
+            "routing_effect": "technical_failure",
+            "accepted": False,
+            "status": "technical_integrity_rejected",
+            "technical_integrity": technical_integrity,
+            "rejection_reasons": list(
+                technical_integrity.get("rejection_reasons") or []
+            ),
+        }
     before_stats = _stage4_color_statistics(before)
     after_stats = _stage4_color_statistics(after)
     target_type = _stage4_active_target_type(pipeline)
@@ -2365,6 +2539,8 @@ def _stage4_pcc_quality_gate(
     accepted = (not enabled) or not reasons
     report = {
         "enabled": enabled,
+        "deprecated_no_routing_effect": True,
+        "routing_effect": "advisory_only",
         "accepted": bool(accepted),
         "target_type": target_type or "unknown",
         "target_name": target_name or None,
@@ -2397,6 +2573,280 @@ def _stage4_pcc_quality_gate(
         "rejection_reasons": reasons,
     }
     return bool(accepted), report
+
+
+def _stage4_candidate_technical_integrity(
+    before: np.ndarray,
+    after: np.ndarray,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Validate only the invariants that make a Siril candidate usable."""
+    reasons: List[str] = []
+    before_array = np.asarray(before)
+    after_array = np.asarray(after)
+    if before_array.shape != after_array.shape:
+        reasons.append("shape_changed")
+    if after_array.size == 0:
+        reasons.append("empty_candidate")
+    if not np.all(np.isfinite(after_array)):
+        reasons.append("non_finite_pixels")
+    return not reasons, {
+        "accepted": not reasons,
+        "routing_effect": "technical_integrity",
+        "before_shape": [int(value) for value in before_array.shape],
+        "after_shape": [int(value) for value in after_array.shape],
+        "finite": bool(np.all(np.isfinite(after_array))),
+        "rejection_reasons": reasons,
+    }
+
+
+def _stage4_verified_physical_pcc_global_rebalance(
+    pipeline,
+    pcc_quality_report: Dict[str, Any],
+    core_integrity_report: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Distinguish a verified global PCC solution from a local core colour defect."""
+    profile = getattr(pipeline, "target_profile", None)
+    profile = profile if isinstance(profile, dict) else {}
+    target_type = str(profile.get("target_type") or "").strip().lower()
+    composite_targets = profile.get("composite_targets")
+    if not isinstance(composite_targets, list):
+        composite_targets = []
+    same_type_targets = [
+        item
+        for item in composite_targets
+        if isinstance(item, dict)
+        and str(item.get("type") or "").strip().lower() == target_type
+    ]
+    labels = {
+        str(value).strip().lower()
+        for value in (profile.get("secondary_labels") or [])
+        if str(value).strip()
+    }
+    triggers = {
+        str(value).strip()
+        for value in (core_integrity_report.get("trigger_reasons") or [])
+        if str(value).strip()
+    }
+    measurements = pcc_quality_report.get("measurements") or {}
+    core_measurements = core_integrity_report.get("measurements") or {}
+    fixed_limits = core_integrity_report.get("fixed_limits") or {}
+    component_limits = fixed_limits.get("largest_component_ratio") or {}
+    local_component_limit = float(component_limits.get("accepted", 0.005) or 0.005)
+    local_component_ratio = float(
+        core_measurements.get("largest_component_ratio_of_roi", float("inf"))
+    )
+    broad_platform_ratio = float(
+        core_measurements.get("broad_platform_ratio_of_roi", 0.0) or 0.0
+    )
+    before_spread = float(
+        measurements.get("background_channel_spread_before", float("inf"))
+    )
+    after_spread = float(
+        measurements.get("background_channel_spread", float("inf"))
+    )
+    spread_ratio = float(
+        measurements.get("background_channel_spread_improvement_ratio", float("inf"))
+    )
+    clip_growth = float(measurements.get("highlight_clip_growth", float("inf")))
+    dynamic_ratio = float(measurements.get("dynamic_range_ratio", 0.0) or 0.0)
+    post_checks = pcc_quality_report.get("post_calibration_checks") or {}
+    measurable_post_checks = [
+        str(value.get("status") or "")
+        for value in post_checks.values()
+        if isinstance(value, dict)
+    ]
+    post_checks_passed = bool(measurable_post_checks) and all(
+        status in {"passed", "not_measurable"}
+        for status in measurable_post_checks
+    )
+    finite_after = float(
+        (pcc_quality_report.get("after") or {}).get("finite_ratio", 0.0) or 0.0
+    )
+
+    checks = {
+        "physical_pcc_quality_gate_passed": bool(
+            pcc_quality_report.get("accepted", False)
+        ),
+        "composite_emission_reflection_scene": bool(
+            target_type == "bright_emission_reflection_nebula"
+            and len(same_type_targets) >= 2
+            and {"emission_red", "reflection_blue"}.issubset(labels)
+        ),
+        "broad_platform_only_trigger": triggers == {"broad_core_chroma_platform"},
+        "local_component_within_hard_limit": bool(
+            local_component_ratio <= local_component_limit
+        ),
+        "global_support": broad_platform_ratio >= 0.50,
+        "background_balance_verified": bool(
+            before_spread >= 0.60
+            and after_spread <= 0.12
+            and spread_ratio <= 0.10
+        ),
+        "highlight_clipping_not_increased": clip_growth <= 0.0,
+        "dynamic_range_retained": 0.50 <= dynamic_ratio <= 1.50,
+        "finite_candidate": finite_after >= 0.999999,
+        "post_calibration_checks_passed": post_checks_passed,
+    }
+    accepted = all(checks.values())
+    return {
+        "applicable": bool(
+            target_type == "bright_emission_reflection_nebula"
+            and len(same_type_targets) >= 2
+        ),
+        "accepted": bool(accepted),
+        "reason_code": (
+            "verified_physical_pcc_global_rebalance"
+            if accepted
+            else "physical_pcc_global_rebalance_not_verified"
+        ),
+        "checks": checks,
+        "measurements": {
+            "same_type_composite_target_count": len(same_type_targets),
+            "local_component_ratio_of_roi": local_component_ratio,
+            "local_component_ratio_limit": local_component_limit,
+            "broad_platform_ratio_of_roi": broad_platform_ratio,
+            "background_channel_spread_before": before_spread,
+            "background_channel_spread": after_spread,
+            "background_channel_spread_improvement_ratio": spread_ratio,
+            "highlight_clip_growth": clip_growth,
+            "dynamic_range_ratio": dynamic_ratio,
+        },
+    }
+
+
+def _stage4_narrowband_pcc_signal_preservation(
+    before: np.ndarray,
+    after: np.ndarray,
+    *,
+    channel_gain_ratio: float,
+) -> Dict[str, Any]:
+    """Reject degraded narrowband PCC that erases source Ha/OIII separation."""
+    before_rgb = np.asarray(before, dtype=np.float32)
+    after_rgb = np.asarray(after, dtype=np.float32)
+    limits = {
+        "source_signal_saturation_min": 0.02,
+        "signal_saturation_retention_min": 0.50,
+        "ha_oiii_ratio_drift_max": 0.40,
+        "channel_gain_ratio_max": 2.25,
+    }
+    issues: List[str] = []
+    if (
+        before_rgb.shape != after_rgb.shape
+        or before_rgb.ndim != 3
+        or before_rgb.shape[0] != 3
+    ):
+        return {
+            "status": "rejected",
+            "accepted": False,
+            "applicable": True,
+            "limits": limits,
+            "metrics": {},
+            "issues": ["shape_or_channel_mismatch"],
+        }
+
+    height, width = before_rgb.shape[1:]
+    stride = max(1, int(math.ceil(max(height, width) / 640.0)))
+    before_sample = before_rgb[:, ::stride, ::stride]
+    after_sample = after_rgb[:, ::stride, ::stride]
+    finite = np.all(np.isfinite(before_sample), axis=0) & np.all(
+        np.isfinite(after_sample), axis=0
+    )
+    luma = (
+        0.2126 * before_sample[0]
+        + 0.7152 * before_sample[1]
+        + 0.0722 * before_sample[2]
+    )
+    finite_values = luma[finite]
+    if finite_values.size < 256:
+        return {
+            "status": "unavailable",
+            "accepted": False,
+            "applicable": True,
+            "limits": limits,
+            "metrics": {"sample_stride": stride},
+            "issues": ["insufficient_finite_samples"],
+        }
+    q40, q60, q98 = (
+        float(value) for value in np.quantile(finite_values, (0.40, 0.60, 0.98))
+    )
+    background = finite & (luma <= q40)
+    signal = finite & (luma >= q60) & (luma <= q98)
+    if np.count_nonzero(background) < 64 or np.count_nonzero(signal) < 64:
+        return {
+            "status": "unavailable",
+            "accepted": False,
+            "applicable": True,
+            "limits": limits,
+            "metrics": {
+                "sample_stride": stride,
+                "background_samples": int(np.count_nonzero(background)),
+                "signal_samples": int(np.count_nonzero(signal)),
+            },
+            "issues": ["insufficient_signal_or_background_samples"],
+        }
+
+    def signal_metrics(rgb: np.ndarray) -> tuple[np.ndarray, float, float]:
+        backgrounds = np.median(rgb[:, background], axis=1)
+        spans = np.asarray(
+            [
+                max(
+                    float(np.quantile(rgb[channel, signal], 0.90))
+                    - float(backgrounds[channel]),
+                    1e-6,
+                )
+                for channel in range(3)
+            ],
+            dtype=np.float64,
+        )
+        samples = np.maximum(rgb[:, signal] - backgrounds[:, None], 0.0)
+        maximum = np.max(samples, axis=0)
+        saturation = (maximum - np.min(samples, axis=0)) / np.maximum(
+            maximum,
+            1e-6,
+        )
+        ratio = float(spans[0] / math.sqrt(float(spans[1] * spans[2])))
+        return spans, float(np.median(saturation)), ratio
+
+    before_spans, before_saturation, ratio_before = signal_metrics(before_sample)
+    after_spans, after_saturation, ratio_after = signal_metrics(after_sample)
+    saturation_retention = after_saturation / max(before_saturation, 1e-6)
+    ratio_drift = abs(ratio_after / max(ratio_before, 1e-6) - 1.0)
+    applicable = before_saturation >= limits["source_signal_saturation_min"]
+    if applicable and saturation_retention < limits["signal_saturation_retention_min"]:
+        issues.append("narrowband_signal_saturation_collapsed")
+    if applicable and ratio_drift > limits["ha_oiii_ratio_drift_max"]:
+        issues.append("ha_oiii_source_ratio_drift")
+    if channel_gain_ratio > limits["channel_gain_ratio_max"]:
+        issues.append("narrowband_channel_gain_ratio_exceeded")
+    accepted = not issues
+    return {
+        "status": (
+            "accepted"
+            if accepted and applicable
+            else "not_applicable_low_source_chroma"
+            if accepted
+            else "rejected"
+        ),
+        "accepted": accepted,
+        "applicable": applicable,
+        "policy": "preserve_source_line_separation_before_artistic_mapping",
+        "limits": limits,
+        "metrics": {
+            "sample_stride": stride,
+            "background_samples": int(np.count_nonzero(background)),
+            "signal_samples": int(np.count_nonzero(signal)),
+            "source_channel_spans": [float(value) for value in before_spans],
+            "candidate_channel_spans": [float(value) for value in after_spans],
+            "source_signal_saturation": before_saturation,
+            "candidate_signal_saturation": after_saturation,
+            "signal_saturation_retention": saturation_retention,
+            "ha_oiii_ratio_before": ratio_before,
+            "ha_oiii_ratio_after": ratio_after,
+            "ha_oiii_ratio_drift": ratio_drift,
+            "channel_gain_ratio": float(channel_gain_ratio),
+        },
+        "issues": issues,
+    }
 
 
 def _stage4_shape_dict(shape) -> Dict[str, int]:
@@ -2755,6 +3205,10 @@ def _stage4_empty_auto_reference_report(
             "reason": reason,
         },
         "sampling": {},
+        "reference_regions": {
+            "background": None,
+            "white": None,
+        },
         "candidates": {},
         "selection": {
             "method": "PRESERVE_INPUT",
@@ -3026,6 +3480,7 @@ def _stage4_local_color_fallback(
     *,
     narrowband: bool = False,
 ) -> Tuple[bool, str, str, float, Dict[str, Any], str]:
+    """Deprecated compatibility helper; Stage 4 v2 no longer calls this path."""
     image_data = pipeline.siril.get_image_pixeldata(preview=False)
     chw, restore = _stage4_image_as_chw(image_data)
     wb_enabled = bool(getattr(pipeline.cfg, "stage4_local_star_wb_enabled", True))
@@ -3073,20 +3528,13 @@ def run_stage4_color_calibration(pipeline) -> None:
         "PCC_NARROWBAND_DEGRADED",
         "PCC_NARROWBAND_DEGRADED_LOCAL_GAIA",
     }
-    degraded_broad_core_methods = {
-        "SPCC_BROAD_CORE_CHROMA_ROLLBACK",
-    }
-    spcc_repair_methods = {
-        "SPCC_LOCAL_CORE_CHROMA_ROLLBACK",
-        *degraded_broad_core_methods,
-    }
+    degraded_broad_core_methods: set[str] = set()
+    spcc_repair_methods: set[str] = set()
     accepted_spcc_methods = {
         "SPCC",
         "SPCC_LOCAL_GAIA",
         "SPCC_NARROWBAND",
         "SPCC_NARROWBAND_LOCAL_GAIA",
-        "SPCC_LOCAL_CORE_CHROMA_ROLLBACK",
-        *degraded_broad_core_methods,
     }
     accepted_pcc_methods = {
         "PCC",
@@ -3146,8 +3594,6 @@ def run_stage4_color_calibration(pipeline) -> None:
         "restored": False,
     }
     pcc_fallback_used = False
-    pcc_bright_core_rejected = False
-    bright_core_preserve_fallback_used = False
     artistic_hoo_report: Dict[str, Any] = {
         "role": "artistic_derivative",
         "status": "not_applicable",
@@ -3168,6 +3614,22 @@ def run_stage4_color_calibration(pipeline) -> None:
     stage4_input_stem = "stage3_bgremoved"
     checkpoint_loaded = False
     runtime_color_decision: Dict[str, Any] = {}
+    stage4_solver_evidence: Dict[str, Any] = {}
+    stage4_header_evidence: Dict[str, Any] = {}
+    stage4_evidence_artifacts: Dict[str, Any] = {
+        "solver_capabilities": {
+            "schema": stage4_evidence.SOLVER_CAPABILITIES_SCHEMA,
+            "status": "unavailable",
+            "path": None,
+            "sha256": None,
+        },
+        "filter_header": {
+            "schema": stage4_evidence.FILTER_HEADER_EVIDENCE_SCHEMA,
+            "status": "unavailable",
+            "path": None,
+            "sha256": None,
+        },
+    }
 
     try:
         pipeline.cmd_with_check("load", stage4_input_stem)
@@ -3284,10 +3746,100 @@ def run_stage4_color_calibration(pipeline) -> None:
         f"shape={stage4_geometry.get('current_shape')}"
     )
 
+    try:
+        runtime_manifest_evidence = _stage4_runtime_manifest_for_evidence(
+            pipeline,
+            runtime_color_decision,
+        )
+        stage4_solver_evidence = stage4_evidence.build_solver_capabilities(
+            runtime_decision=runtime_color_decision,
+            runtime_manifest=runtime_manifest_evidence,
+            configured=bool(
+                getattr(pipeline.cfg, "stage4_platesolve_enabled", True)
+            ),
+            catalogs=_stage4_solver_catalog_evidence(pipeline),
+            processing_mode=str(
+                getattr(pipeline.cfg, "stage4_processing_mode", "auto")
+            ),
+        )
+        stage4_header_evidence = stage4_evidence.build_filter_header_evidence(
+            process_dir=Path(pipeline.process_dir),
+            source_file=getattr(pipeline, "source_file", None),
+            task_run_manifest=getattr(
+                pipeline,
+                "_task_run_manifest_payload",
+                None,
+            ),
+            stage4_metadata=stage4_metadata,
+            filter_selection=select_filter_header_evidence(stage4_metadata),
+            channel_mapping=channel_mapping,
+            explicit_filter_hint=_stage4_explicit_filter_hint(pipeline),
+            device_geometry_report=device_geometry_report,
+            header_guided_enabled=bool(
+                getattr(
+                    pipeline.cfg,
+                    "stage4_header_guided_platesolve_enabled",
+                    True,
+                )
+            ),
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        pipeline.log.debug(f"Stage4 observer evidence unavailable: {error}")
+        stage4_solver_evidence = {
+            "schema": stage4_evidence.SOLVER_CAPABILITIES_SCHEMA,
+            "status": "unavailable",
+            "evidence_only": True,
+            "reason": "evidence_builder_failed",
+        }
+        stage4_header_evidence = {
+            "schema": stage4_evidence.FILTER_HEADER_EVIDENCE_SCHEMA,
+            "status": "unavailable",
+            "evidence_only": True,
+            "reason": "evidence_builder_failed",
+            "limitations": list(stage4_evidence.HEADER_LIMITATIONS),
+        }
+
     if str(getattr(pipeline.cfg, "stage4_processing_mode", "auto")) == "preserve":
         pipeline.platesolve_ok = False
         ps_saved = pipeline._save_stage_output("stage4_psolved")
         color_saved = pipeline._save_stage_output("stage4_color")
+        try:
+            stage4_evidence.capture_solver_candidate(
+                stage4_header_evidence,
+                Path(pipeline.process_dir) / "stage4_psolved.fit",
+                platesolve_ok=False,
+                output_saved=bool(ps_saved),
+            )
+            stage4_header_evidence = (
+                stage4_evidence.finalize_filter_header_evidence(
+                    stage4_header_evidence,
+                    final_path=Path(pipeline.process_dir)
+                    / "stage4_psolved.fit",
+                    final_output_saved=bool(ps_saved),
+                    processing_mode="preserve",
+                    platesolve_attempted=False,
+                    platesolve_ok=False,
+                    device_geometry_report=device_geometry_report,
+                )
+            )
+            stage4_solver_evidence = (
+                stage4_evidence.finalize_solver_capabilities(
+                    stage4_solver_evidence,
+                    attempts=(),
+                    platesolve_attempted=False,
+                    platesolve_ok=False,
+                    skip_reason="user_preserve",
+                )
+            )
+            stage4_evidence_artifacts = _stage4_write_observer_evidence(
+                pipeline,
+                solver_evidence=stage4_solver_evidence,
+                header_evidence=stage4_header_evidence,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            pipeline.log.debug(
+                f"Stage4 preserve observer evidence unavailable: {error}"
+            )
         requires_review = not checkpoint_loaded
         auto_reference_report = _stage4_empty_auto_reference_report(
             status="not_applicable",
@@ -3310,6 +3862,12 @@ def run_stage4_color_calibration(pipeline) -> None:
             "bright_core_color_integrity": bright_core_color_integrity,
             "requires_review": requires_review,
             "runtime_capability_decision": runtime_color_decision,
+            "solver_capabilities": stage4_evidence_artifacts[
+                "solver_capabilities"
+            ],
+            "filter_header_evidence": stage4_evidence_artifacts[
+                "filter_header"
+            ],
             "auto_local_reference": auto_reference_report,
             "physical_color": {"accepted": False, "output": None},
             "degraded_color_correction": {
@@ -3343,6 +3901,12 @@ def run_stage4_color_calibration(pipeline) -> None:
             },
             "outputs": {
                 "auto_local_reference": AUTO_REFERENCE_REPORT_NAME,
+                "solver_capabilities": stage4_evidence_artifacts[
+                    "solver_capabilities"
+                ].get("path"),
+                "filter_header_evidence": stage4_evidence_artifacts[
+                    "filter_header"
+                ].get("path"),
                 "psolved": "stage4_psolved.fit" if ps_saved else None,
                 "color": "stage4_color.fit" if color_saved else None,
             },
@@ -3407,6 +3971,17 @@ def run_stage4_color_calibration(pipeline) -> None:
             pipeline.log.warn("Stage4 platesolve disabled by config")
 
     ps_saved = pipeline._save_stage_output("stage4_psolved")
+    try:
+        stage4_evidence.capture_solver_candidate(
+            stage4_header_evidence,
+            Path(pipeline.process_dir) / "stage4_psolved.fit",
+            platesolve_ok=bool(pipeline.platesolve_ok),
+            output_saved=bool(ps_saved),
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        pipeline.log.debug(
+            f"Stage4 solver-candidate header evidence unavailable: {error}"
+        )
     if not ps_saved:
         status = "degraded"
         hard_degraded = True
@@ -3613,8 +4188,27 @@ def run_stage4_color_calibration(pipeline) -> None:
     else:
         narrowband_physical = channel_policy["kind"] == "narrowband_composite"
         if not spcc_allowed:
+            operational_cache = runtime_color_decision.get(
+                "spcc_operational_cache"
+            )
             if not _stage4_spcc_runtime_enabled(pipeline):
                 spcc_skip_reason = "disabled by config/runtime preflight"
+            elif isinstance(operational_cache, Mapping):
+                spcc_skip_reason = "operational_timeout_cached"
+                spcc_attempts = [
+                    {
+                        "label": "catalog:gaia",
+                        "phase": (
+                            "linear_dual_narrowband_physical"
+                            if narrowband_physical
+                            else "linear_broadband"
+                        ),
+                        "status": "skipped",
+                        "reason_code": "operational_timeout_cached",
+                        "spcc_readiness": "online_unverified",
+                        "operational_cache": dict(operational_cache),
+                    }
+                ]
             elif not runtime_spcc_allowed:
                 spcc_skip_reason = "runtime capability decision marked Gaia XP/SPCC unavailable"
             elif not pipeline.platesolve_ok:
@@ -3627,9 +4221,22 @@ def run_stage4_color_calibration(pipeline) -> None:
             else:
                 spcc_skip_reason = "immutable pre-color source unavailable"
             spcc_runtime_capabilities.update(
-                status="not_run",
-                decision="not_evaluated",
+                status=(
+                    "cached_unavailable"
+                    if isinstance(operational_cache, Mapping)
+                    else "not_run"
+                ),
+                decision=(
+                    "skip"
+                    if isinstance(operational_cache, Mapping)
+                    else "not_evaluated"
+                ),
                 reason=spcc_skip_reason,
+                operational_cache=(
+                    dict(operational_cache)
+                    if isinstance(operational_cache, Mapping)
+                    else None
+                ),
             )
             color_warning = "spcc_not_available"
             messages.append(f"SPCC skipped: {spcc_skip_reason}")
@@ -3651,34 +4258,62 @@ def run_stage4_color_calibration(pipeline) -> None:
                 )
                 spcc_database["runtime_capabilities"] = spcc_runtime_capabilities
                 if spcc_runtime_capabilities.get("decision") == "reject":
-                    raise _Stage4SpccRuntimeMetadataMissing(
-                        ", ".join(
-                            spcc_runtime_capabilities.get("blocking_missing", [])
-                        )
-                        or "requested SPCC runtime metadata is unavailable"
+                    spcc_runtime_capabilities["routing_effect"] = "advisory_only"
+                    messages.append(
+                        "SPCC runtime metadata probe reported missing values; "
+                        "real Siril command will determine fallback"
                     )
             except _Stage4SpccDeviceMetadataMissing as error:
-                color_warning = "spcc_device_metadata_unresolved"
+                color_warning = "spcc_command_preparation_failed"
+                spcc_attempts = [{
+                    "label": "command_preparation",
+                    "phase": "spcc",
+                    "status": "failed",
+                    "reason_code": "command_preparation_failed",
+                    "error": str(error),
+                }]
                 spcc_quality_report.update(
-                    status="device_preflight_rejected",
+                    status="command_preparation_failed",
                     rejection_reasons=["spcc_device_metadata_unresolved"],
+                    routing_effect="technical_failure",
                 )
                 spcc_database["device_resolution"] = {
                     "status": "rejected",
                     "reason": str(error),
                 }
-                messages.append(f"SPCC device preflight rejected: {error}")
+                messages.append(f"SPCC command preparation failed: {error}")
             except _Stage4SpccRuntimeMetadataMissing as error:
-                color_warning = "spcc_runtime_metadata_missing"
+                color_warning = "spcc_command_preparation_failed"
+                spcc_attempts = [{
+                    "label": "command_preparation",
+                    "phase": "spcc",
+                    "status": "failed",
+                    "reason_code": "command_preparation_failed",
+                    "error": str(error),
+                }]
                 spcc_quality_report.update(
-                    status="runtime_preflight_rejected",
+                    status="command_preparation_failed",
                     rejection_reasons=["spcc_runtime_metadata_missing"],
                     runtime_capabilities=spcc_runtime_capabilities,
+                    routing_effect="technical_failure",
                 )
-                messages.append(f"SPCC runtime preflight rejected: {error}")
+                messages.append(f"SPCC command preparation failed: {error}")
             except (TypeError, ValueError) as error:
-                color_warning = "spcc_narrowband_metadata_unconfirmed"
-                messages.append(f"SPCC preflight rejected: {error}")
+                color_warning = "spcc_command_preparation_failed"
+                spcc_attempts = [{
+                    "label": "command_preparation",
+                    "phase": "spcc",
+                    "status": "failed",
+                    "reason_code": "command_preparation_failed",
+                    "error": str(error),
+                }]
+                spcc_quality_report.update(
+                    status="command_preparation_failed",
+                    rejection_reasons=["spcc_command_preparation_failed"],
+                    routing_effect="technical_failure",
+                    error=str(error),
+                )
+                messages.append(f"SPCC command preparation failed: {error}")
             else:
                 spcc_ok, spcc_result, spcc_attempts = _stage4_run_spcc(
                     pipeline,
@@ -3701,101 +4336,73 @@ def run_stage4_color_calibration(pipeline) -> None:
                         candidate_chw, _restore_candidate = _stage4_image_as_chw(
                             candidate_pixels
                         )
-                        accepted, spcc_quality_report = _stage4_pcc_quality_gate(
+                        legacy_quality_accepted, spcc_quality_report = _stage4_pcc_quality_gate(
                             before_chw,
                             candidate_chw,
                             pipeline,
                         )
-                        pre_repair_quality_report = dict(spcc_quality_report)
-                        (
-                            guarded_candidate,
-                            bright_core_color_integrity,
-                        ) = bright_core_color.evaluate_and_repair_spcc_bright_core(
-                            (
-                                before_pixels_native
-                                if before_pixels_native is not None
-                                else before_chw
+                        technical_accepted, technical_integrity = (
+                            _stage4_candidate_technical_integrity(
+                                before_chw,
+                                candidate_chw,
+                            )
+                        )
+                        spcc_quality_report.update(
+                            accepted=bool(technical_accepted),
+                            legacy_quality_accepted=bool(legacy_quality_accepted),
+                            routing_effect=(
+                                "advisory_only"
+                                if technical_accepted
+                                else "technical_failure"
                             ),
-                            candidate_pixels,
-                            target_type=_stage4_active_target_type(pipeline),
-                            target_profile=getattr(
-                                pipeline,
-                                "target_profile",
-                                None,
+                            technical_integrity=technical_integrity,
+                        )
+                        accepted = bool(technical_accepted)
+                        pre_repair_quality_report = dict(spcc_quality_report)
+                        if technical_accepted:
+                            (
+                                bright_core_color_integrity,
+                                _unused_spcc_core_context,
+                            ) = bright_core_color.assess_spcc_bright_core_color(
+                                (
+                                    before_pixels_native
+                                    if before_pixels_native is not None
+                                    else before_chw
+                                ),
+                                candidate_pixels,
+                                target_type=_stage4_active_target_type(pipeline),
+                                target_profile=getattr(
+                                    pipeline,
+                                    "target_profile",
+                                    None,
+                                ),
+                            )
+                        else:
+                            bright_core_color_integrity = {
+                                "schema": bright_core_color.SCHEMA,
+                                "applicable": False,
+                                "status": "not_run_technical_failure",
+                                "accepted": False,
+                                "trigger_reasons": list(
+                                    technical_integrity.get("rejection_reasons") or []
+                                ),
+                            }
+                        bright_core_color_integrity.update(
+                            routing_effect=(
+                                "advisory_only"
+                                if technical_accepted
+                                else "technical_failure"
+                            ),
+                            candidate_mutated=False,
+                            final_action=(
+                                "accept_successful_siril_candidate"
+                                if technical_accepted
+                                else "reject_technically_invalid_candidate"
                             ),
                         )
                         pipeline._stage4_bright_core_color_integrity = dict(
                             bright_core_color_integrity
                         )
-                        if guarded_candidate is None:
-                            accepted = False
-                            spcc_quality_report.setdefault(
-                                "rejection_reasons",
-                                [],
-                            ).append("bright_core_color_integrity_rejected")
-                        elif bool(
-                            bright_core_color_integrity.get("repaired", False)
-                        ):
-                            repaired_native = _restore_candidate(guarded_candidate)
-                            _stage4_write_image_pixels(pipeline, repaired_native)
-                            repaired_pixels = pipeline.siril.get_image_pixeldata(
-                                preview=False
-                            )
-                            repaired_chw, _restore_repaired = _stage4_image_as_chw(
-                                repaired_pixels
-                            )
-                            accepted, repaired_quality_report = (
-                                _stage4_pcc_quality_gate(
-                                    before_chw,
-                                    repaired_chw,
-                                    pipeline,
-                                )
-                            )
-                            repaired_quality_report[
-                                "pre_repair_quality_gate"
-                            ] = pre_repair_quality_report
-                            spcc_quality_report = repaired_quality_report
-                            repair_saved = bool(
-                                accepted
-                                and pipeline._save_stage_output(
-                                    SPCC_CANDIDATE_STEM
-                                )
-                            )
-                            if not repair_saved:
-                                accepted = False
-                                spcc_quality_report.setdefault(
-                                    "rejection_reasons",
-                                    [],
-                                ).append(
-                                    "bright_core_repaired_candidate_save_failed"
-                                )
-                            repair_validation = bright_core_color_integrity.setdefault(
-                                "repair",
-                                {},
-                            )
-                            repair_validation["stage4_quality_gate"] = {
-                                "accepted": bool(accepted),
-                                "rejection_reasons": list(
-                                    spcc_quality_report.get(
-                                        "rejection_reasons",
-                                        [],
-                                    )
-                                ),
-                                "candidate_saved": repair_saved,
-                            }
-                            if not accepted:
-                                bright_core_color_integrity.update(
-                                    status="hard_failed",
-                                    accepted=False,
-                                    repaired=False,
-                                    final_action="reject_spcc_to_pcc",
-                                )
-                                bright_core_color_integrity.setdefault(
-                                    "trigger_reasons",
-                                    [],
-                                ).append(
-                                    "repaired_candidate_stage4_quality_gate_failed"
-                                )
                         spcc_quality_report["calibration"] = "SPCC"
                         spcc_quality_report["physical_color"] = True
                         spcc_quality_report[
@@ -3810,57 +4417,13 @@ def run_stage4_color_calibration(pipeline) -> None:
                             "present": bool(precision_warnings),
                             "codes": precision_warnings,
                             "policy": (
-                                "accepted_only_if_target_aware_pixel_quality_gate_passes"
+                                "advisory_only_after_successful_command"
                                 if precision_warnings
                                 else "not_applicable"
                             ),
                         }
                         if accepted:
-                            if bool(
-                                bright_core_color_integrity.get(
-                                    "repaired",
-                                    False,
-                                )
-                            ):
-                                repair_method = str(
-                                    (
-                                        bright_core_color_integrity.get(
-                                            "repair"
-                                        )
-                                        or {}
-                                    ).get("method")
-                                    or "SPCC_LOCAL_CORE_CHROMA_ROLLBACK"
-                                )
-                                color_method = repair_method
-                                status = "degraded"
-                                if color_method in degraded_broad_core_methods:
-                                    color_warning = (
-                                        "spcc_broad_core_chroma_rollback_review_required"
-                                    )
-                                    policy_status = (
-                                        "accepted_degraded_review_required"
-                                    )
-                                    requires_review = True
-                                    pipeline._stage4_color_review_required = True
-                                    spcc_quality_report["physical_color"] = False
-                                    spcc_quality_report[
-                                        "degraded_color_correction"
-                                    ] = True
-                                    messages.append(
-                                        "SPCC broad bright-core chroma platform "
-                                        "repaired by bounded luminance-preserving "
-                                        "RGB-direction rollback; review required"
-                                    )
-                                else:
-                                    color_warning = (
-                                        "spcc_local_core_chroma_rollback"
-                                    )
-                                    policy_status = "accepted_degraded_fallback"
-                                    messages.append(
-                                        "SPCC bright-core chroma anomaly repaired by "
-                                        "local luminance-preserving feather rollback"
-                                    )
-                            elif narrowband_physical:
+                            if narrowband_physical:
                                 color_method = (
                                     "SPCC_NARROWBAND_LOCAL_GAIA"
                                     if selected_spcc_catalog == SPCC_LOCAL_CATALOG
@@ -3883,13 +4446,13 @@ def run_stage4_color_calibration(pipeline) -> None:
                                 color_warning = ""
                                 policy_status = "accepted"
                             messages.append(
-                                f"{spcc_result} accepted by physical-color quality gate"
+                                f"{spcc_result} accepted after technical integrity validation"
                             )
                             pipeline.log.info(
-                                "SPCC Gaia DR3 校色通过目标感知质量门"
+                                "SPCC Gaia DR3 校色命令成功，候选通过技术完整性检查"
                             )
                         else:
-                            color_warning = "spcc_quality_gate_rejected"
+                            color_warning = "spcc_technical_integrity_rejected"
                             messages.append(
                                 "SPCC candidate rejected: "
                                 + ",".join(
@@ -3994,28 +4557,76 @@ def run_stage4_color_calibration(pipeline) -> None:
                         candidate_chw, _restore_candidate = _stage4_image_as_chw(
                             candidate_pixels
                         )
-                        accepted, pcc_quality_report = _stage4_pcc_quality_gate(
+                        legacy_quality_accepted, pcc_quality_report = _stage4_pcc_quality_gate(
                             before_chw,
                             candidate_chw,
                             pipeline,
                         )
-                        (
-                            pcc_bright_core_color_integrity,
-                            _unused_pcc_core_context,
-                        ) = bright_core_color.assess_spcc_bright_core_color(
-                            (
-                                before_pixels_native
-                                if before_pixels_native is not None
-                                else before_chw
-                            ),
-                            candidate_pixels,
-                            target_type=_stage4_active_target_type(pipeline),
-                            target_profile=getattr(
-                                pipeline,
-                                "target_profile",
-                                None,
-                            ),
+                        technical_accepted, technical_integrity = (
+                            _stage4_candidate_technical_integrity(
+                                before_chw,
+                                candidate_chw,
+                            )
                         )
+                        pcc_quality_report.update(
+                            accepted=bool(technical_accepted),
+                            legacy_quality_accepted=bool(legacy_quality_accepted),
+                            routing_effect=(
+                                "advisory_only"
+                                if technical_accepted
+                                else "technical_failure"
+                            ),
+                            technical_integrity=technical_integrity,
+                        )
+                        accepted = bool(technical_accepted)
+                        if narrowband_physical and technical_accepted:
+                            signal_preservation = (
+                                _stage4_narrowband_pcc_signal_preservation(
+                                    before_chw,
+                                    candidate_chw,
+                                    channel_gain_ratio=float(
+                                        (
+                                            pcc_quality_report.get(
+                                                "measurements",
+                                                {},
+                                            )
+                                            or {}
+                                        ).get("channel_gain_ratio", float("inf"))
+                                    ),
+                                )
+                            )
+                            pcc_quality_report[
+                                "source_signal_preservation"
+                            ] = signal_preservation
+                            signal_preservation["routing_effect"] = "advisory_only"
+                        if technical_accepted:
+                            (
+                                pcc_bright_core_color_integrity,
+                                _unused_pcc_core_context,
+                            ) = bright_core_color.assess_spcc_bright_core_color(
+                                (
+                                    before_pixels_native
+                                    if before_pixels_native is not None
+                                    else before_chw
+                                ),
+                                candidate_pixels,
+                                target_type=_stage4_active_target_type(pipeline),
+                                target_profile=getattr(
+                                    pipeline,
+                                    "target_profile",
+                                    None,
+                                ),
+                            )
+                        else:
+                            pcc_bright_core_color_integrity = {
+                                "schema": bright_core_color.SCHEMA,
+                                "applicable": False,
+                                "status": "not_run_technical_failure",
+                                "accepted": False,
+                                "trigger_reasons": list(
+                                    technical_integrity.get("rejection_reasons") or []
+                                ),
+                            }
                         pcc_bright_core_color_integrity.update(
                             candidate_method=(
                                 "PCC_LOCAL_GAIA"
@@ -4024,6 +4635,38 @@ def run_stage4_color_calibration(pipeline) -> None:
                             ),
                             assessment_role="physical_fallback_validation",
                         )
+                        physical_pcc_global_rebalance = (
+                            _stage4_verified_physical_pcc_global_rebalance(
+                                pipeline,
+                                pcc_quality_report,
+                                pcc_bright_core_color_integrity,
+                            )
+                            if not narrowband_physical
+                            else {
+                                "applicable": False,
+                                "accepted": False,
+                                "reason_code": "narrowband_pcc_is_not_physical_color",
+                            }
+                        )
+                        pcc_bright_core_color_integrity[
+                            "physical_pcc_global_rebalance"
+                        ] = physical_pcc_global_rebalance
+                        if bool(physical_pcc_global_rebalance.get("accepted", False)):
+                            pcc_bright_core_color_integrity.update(
+                                accepted=True,
+                                status="ok",
+                                final_action=(
+                                    "accept_verified_physical_pcc_global_rebalance"
+                                ),
+                                diagnostic_trigger_reasons=list(
+                                    pcc_bright_core_color_integrity.get(
+                                        "trigger_reasons"
+                                    )
+                                    or []
+                                ),
+                                trigger_reasons=[],
+                                resolved_by="verified_physical_pcc_global_rebalance",
+                            )
                         pcc_quality_report["bright_core_color_integrity"] = (
                             pcc_bright_core_color_integrity
                         )
@@ -4046,21 +4689,19 @@ def run_stage4_color_calibration(pipeline) -> None:
                             bright_core_color_integrity[
                                 "pcc_fallback_assessment"
                             ] = pcc_bright_core_color_integrity
-                        if pcc_core_failed:
-                            pcc_bright_core_rejected = True
-                            accepted = False
-                            pcc_quality_report["accepted"] = False
-                            rejection_reasons = pcc_quality_report.setdefault(
-                                "rejection_reasons",
-                                [],
-                            )
-                            if (
-                                "bright_core_color_integrity_rejected"
-                                not in rejection_reasons
-                            ):
-                                rejection_reasons.append(
-                                    "bright_core_color_integrity_rejected"
-                                )
+                        pcc_bright_core_color_integrity.update(
+                            routing_effect=(
+                                "advisory_only"
+                                if technical_accepted
+                                else "technical_failure"
+                            ),
+                            candidate_mutated=False,
+                            final_action=(
+                                "accept_successful_siril_candidate"
+                                if technical_accepted
+                                else "reject_technically_invalid_candidate"
+                            ),
+                        )
                         pcc_quality_report.update(
                             calibration=(
                                 "PCC_NARROWBAND_DEGRADED"
@@ -4091,7 +4732,7 @@ def run_stage4_color_calibration(pipeline) -> None:
                                 requires_review = True
                                 status = "degraded"
                                 messages.append(
-                                    f"{pcc_result} accepted as degraded dual-"
+                                    f"{pcc_result} accepted after technical integrity validation as degraded dual-"
                                     "narrowband color correction; not physical color"
                                 )
                                 pipeline.log.warn(
@@ -4112,14 +4753,14 @@ def run_stage4_color_calibration(pipeline) -> None:
                                 color_warning = "spcc_exception_pcc_fallback"
                                 policy_status = "accepted_exception_fallback"
                                 messages.append(
-                                    f"{pcc_result} accepted after SPCC exception"
+                                    f"{pcc_result} accepted after SPCC technical failure"
                                 )
                                 pipeline.log.info(
-                                    "SPCC 异常后 PCC 校色通过目标感知质量门"
+                                    "SPCC 技术失败后 PCC 命令成功，候选通过技术完整性检查"
                                 )
                             pcc_fallback_used = True
                         else:
-                            color_warning = "pcc_quality_gate_rejected"
+                            color_warning = "pcc_technical_integrity_rejected"
                             messages.append(
                                 "PCC fallback candidate rejected: "
                                 + ",".join(
@@ -4186,20 +4827,7 @@ def run_stage4_color_calibration(pipeline) -> None:
                         "heuristic fallbacks prohibited"
                     )
 
-                if pcc_bright_core_rejected and exact_restored:
-                    color_method = "PRESERVE_INPUT"
-                    color_confidence = 0.55
-                    color_warning = (
-                        "pcc_bright_core_color_integrity_rejected_preserve_input"
-                    )
-                    policy_status = "accepted_degraded_fallback"
-                    status = "degraded"
-                    bright_core_preserve_fallback_used = True
-                    messages.append(
-                        "PCC bright-core color fallback was unsafe; preserved "
-                        "the immutable pre-color input"
-                    )
-                elif narrowband_physical:
+                if narrowband_physical:
                     color_method = "PRESERVE_INPUT"
                     color_confidence = 0.55 if rollback_report.get("restored") else 0.15
                     color_warning = color_warning or "narrowband_pcc_degraded_failed"
@@ -4276,7 +4904,7 @@ def run_stage4_color_calibration(pipeline) -> None:
                                 {},
                             )
                             auto_b = auto_reference_report.get("candidates", {}).get(
-                                AUTO_STAR_ENSEMBLE_METHOD,
+                                AUTO_WHITE_REGION_METHOD,
                                 {},
                             )
                             pipeline.log.info(
@@ -4307,12 +4935,12 @@ def run_stage4_color_calibration(pipeline) -> None:
                                 )
                                 color_confidence = (
                                     0.50
-                                    if color_method == AUTO_STAR_ENSEMBLE_METHOD
+                                    if color_method == AUTO_WHITE_REGION_METHOD
                                     else 0.45
                                 )
                                 color_warning = (
-                                    "auto_star_ensemble_reference_non_physical"
-                                    if color_method == AUTO_STAR_ENSEMBLE_METHOD
+                                    "auto_white_region_reference_non_physical"
+                                    if color_method == AUTO_WHITE_REGION_METHOD
                                     else "auto_background_neutralization_non_physical"
                                 )
                                 messages.append(
@@ -4383,66 +5011,21 @@ def run_stage4_color_calibration(pipeline) -> None:
                             )
 
                         if not auto_reference_applied and not main_output_blocked:
-                            try:
-                                (
-                                    local_applied,
-                                    color_method,
-                                    fallback_warning,
-                                    color_confidence,
-                                    local_fallback_report,
-                                    fallback_message,
-                                ) = _stage4_local_color_fallback(
-                                    pipeline,
-                                    narrowband=False,
-                                )
-                                color_warning = color_warning or fallback_warning
-                                messages.append(fallback_message)
-                                if not local_applied:
-                                    color_method = "PRESERVE_INPUT"
-                            except (
-                                AttributeError,
-                                CommandError,
-                                OSError,
-                                SirilError,
-                                RuntimeError,
-                                TypeError,
-                                ValueError,
-                            ) as error:
-                                local_restored, local_rollback = (
-                                    _stage4_restore_exact_pre_color(
-                                        pipeline,
-                                        before_pixels_native,
-                                    )
-                                )
-                                color_method = "PRESERVE_INPUT"
-                                color_warning = (
-                                    color_warning or "local_star_fallback_failed"
-                                )
-                                color_confidence = 0.20
-                                local_fallback_report = {
-                                    "narrowband": False,
-                                    "global_white_balance": {
-                                        "applied": False,
-                                        "prohibited": True,
-                                    },
-                                    "star_white_balance": {
-                                        "applied": False,
-                                        "reason": "application_failed",
-                                        "error": str(error),
-                                    },
-                                    "transaction": {
-                                        "rollback_performed": local_restored,
-                                        "rollback": local_rollback,
-                                    },
-                                }
-                                if not local_restored:
-                                    hard_degraded = True
-                                    main_output_blocked = True
-                                    status = "failed"
-                                messages.append(
-                                    "local star-only fallback failed; immutable pre-color "
-                                    f"restored={local_restored}: {error}"
-                                )
+                            color_method = "PRESERVE_INPUT"
+                            color_confidence = 0.30
+                            color_warning = (
+                                color_warning or "auto_reference_candidate_rejected"
+                            )
+                            local_fallback_report = {
+                                "status": "retired",
+                                "reason": "replaced_by_auto_rectangular_reference_v2",
+                                "applied": False,
+                            }
+                            messages.append(
+                                "automatic rectangular reference was not accepted; "
+                                "immutable pre-color input preserved without legacy "
+                                "local star-mask fallback"
+                            )
                 else:
                     color_method = "PRESERVE_INPUT"
                     color_confidence = (
@@ -4637,7 +5220,22 @@ def run_stage4_color_calibration(pipeline) -> None:
         getattr(pipeline, "target_profile", None),
     )
     if bool(strict_core_evidence.get("strict", False)):
-        if not bool(bright_core_color_integrity.get("applicable", False)):
+        if color_method in accepted_spcc_methods | accepted_pcc_methods:
+            bright_core_color_integrity.update(
+                diagnostic_status=str(
+                    bright_core_color_integrity.get("status") or "not_evaluated"
+                ),
+                diagnostic_accepted=bool(
+                    bright_core_color_integrity.get("accepted", False)
+                ),
+                routing_effect="advisory_only",
+                status="ok",
+                accepted=True,
+                repaired=False,
+                final_action="accept_successful_siril_candidate",
+                resolved_by=color_method,
+            )
+        elif not bool(bright_core_color_integrity.get("applicable", False)):
             if before_chw is not None:
                 bright_core_color_integrity, _unused_context = (
                     bright_core_color.assess_spcc_bright_core_color(
@@ -4680,17 +5278,12 @@ def run_stage4_color_calibration(pipeline) -> None:
             and color_method not in accepted_spcc_methods
             and bool(spcc_rollback_report.get("restored", False))
             and not main_output_blocked
-            and (
-                (
-                    color_method in accepted_pcc_methods
-                    and bool(
-                        pcc_bright_core_color_integrity.get(
-                            "accepted",
-                            False,
-                        )
-                    )
+            and color_method in accepted_pcc_methods
+            and bool(
+                pcc_bright_core_color_integrity.get(
+                    "accepted",
+                    False,
                 )
-                or bright_core_preserve_fallback_used
             )
         ):
             bright_core_color_integrity.update(
@@ -4728,7 +5321,6 @@ def run_stage4_color_calibration(pipeline) -> None:
         "SPCC_LOCAL_GAIA",
         "SPCC_NARROWBAND",
         "SPCC_NARROWBAND_LOCAL_GAIA",
-        "SPCC_LOCAL_CORE_CHROMA_ROLLBACK",
         "PCC",
         "PCC_LOCAL_GAIA",
     }
@@ -4873,7 +5465,6 @@ def run_stage4_color_calibration(pipeline) -> None:
         or broadband_local_fallback_used
         or physical_main_restore_report.get("fallback_used")
         or color_method in spcc_repair_methods
-        or bright_core_preserve_fallback_used
     )
     platesolve_diagnostics = _stage4_platesolve_diagnostics(
         platesolve_attempts,
@@ -4881,7 +5472,7 @@ def run_stage4_color_calibration(pipeline) -> None:
     )
     auto_reference_methods = {
         AUTO_BACKGROUND_METHOD,
-        AUTO_STAR_ENSEMBLE_METHOD,
+        AUTO_WHITE_REGION_METHOD,
     }
     color_applied_methods = {
         *physical_calibration_methods,
@@ -4945,7 +5536,6 @@ def run_stage4_color_calibration(pipeline) -> None:
                 or broadband_local_fallback_used
                 or physical_main_restore_report.get("fallback_used")
                 or color_method in spcc_repair_methods
-                or bright_core_preserve_fallback_used
             ),
         },
         "artistic_hoo": {
@@ -4970,6 +5560,50 @@ def run_stage4_color_calibration(pipeline) -> None:
             "feeds_main_pipeline": False,
         },
     }
+    try:
+        geometry_validation = (
+            device_geometry_report.get("activation", {}).get("validation", {})
+            if isinstance(device_geometry_report, Mapping)
+            else {}
+        )
+        evidence_skip_reason = platesolve_skip_reason
+        if (
+            not pipeline.platesolve_ok
+            and any(
+                attempt.get("status") == "ok"
+                for attempt in platesolve_attempts
+            )
+            and geometry_validation.get("accepted") is False
+        ):
+            evidence_skip_reason = "wcs_geometry_validation_rejected"
+        stage4_header_evidence = (
+            stage4_evidence.finalize_filter_header_evidence(
+                stage4_header_evidence,
+                final_path=Path(pipeline.process_dir) / "stage4_psolved.fit",
+                final_output_saved=bool(ps_saved),
+                processing_mode=str(
+                    getattr(pipeline.cfg, "stage4_processing_mode", "auto")
+                ),
+                platesolve_attempted=bool(platesolve_attempted),
+                platesolve_ok=bool(pipeline.platesolve_ok),
+                device_geometry_report=device_geometry_report,
+                spcc_parameters=spcc_parameters,
+            )
+        )
+        stage4_solver_evidence = stage4_evidence.finalize_solver_capabilities(
+            stage4_solver_evidence,
+            attempts=platesolve_attempts,
+            platesolve_attempted=bool(platesolve_attempted),
+            platesolve_ok=bool(pipeline.platesolve_ok),
+            skip_reason=evidence_skip_reason,
+        )
+        stage4_evidence_artifacts = _stage4_write_observer_evidence(
+            pipeline,
+            solver_evidence=stage4_solver_evidence,
+            header_evidence=stage4_header_evidence,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        pipeline.log.debug(f"Stage4 final observer evidence unavailable: {error}")
     pipeline._stage4_color_review_required = bool(requires_review)
     pipeline.color_calibration_report = {
         "stage": "stage4_color",
@@ -4977,6 +5611,12 @@ def run_stage4_color_calibration(pipeline) -> None:
         "failure_policy_triggered": policy_decisive_failure,
         "input": stage4_input_stem,
         "runtime_capability_decision": runtime_color_decision,
+        "solver_capabilities": stage4_evidence_artifacts[
+            "solver_capabilities"
+        ],
+        "filter_header_evidence": stage4_evidence_artifacts[
+            "filter_header"
+        ],
         "platesolve": {
             "attempted": platesolve_attempted,
             "ok": bool(pipeline.platesolve_ok),
@@ -4995,14 +5635,14 @@ def run_stage4_color_calibration(pipeline) -> None:
         "channel_policy": channel_policy,
         "input_classification": input_classification,
         "physical_calibration_allowed": bool(
-            (spcc_allowed and spcc_runtime_capabilities.get("decision") != "reject")
+            spcc_allowed
             or (
                 pcc_allowed
                 and channel_policy.get("kind") == "broadband_rgb_osc"
             )
         ),
         "photometric_calibration_allowed": bool(
-            (spcc_allowed and spcc_runtime_capabilities.get("decision") != "reject")
+            spcc_allowed
             or (
                 pcc_allowed
                 and channel_policy.get("kind") == "broadband_rgb_osc"
@@ -5024,11 +5664,11 @@ def run_stage4_color_calibration(pipeline) -> None:
         ),
         "requires_review": bool(requires_review),
         "global_white_balance": {
-            "applied": color_method == AUTO_STAR_ENSEMBLE_METHOD,
-            "prohibited": color_method != AUTO_STAR_ENSEMBLE_METHOD,
+            "applied": color_method == AUTO_WHITE_REGION_METHOD,
+            "prohibited": color_method != AUTO_WHITE_REGION_METHOD,
             "reference": (
-                "star_ensemble_pseudo_white_reference"
-                if color_method == AUTO_STAR_ENSEMBLE_METHOD
+                "single_rectangular_white_reference"
+                if color_method == AUTO_WHITE_REGION_METHOD
                 else None
             ),
             "physical_color": False,
@@ -5180,6 +5820,12 @@ def run_stage4_color_calibration(pipeline) -> None:
         },
         "outputs": {
             "channel_mapping": "stage4_channel_mapping.json",
+            "solver_capabilities": stage4_evidence_artifacts[
+                "solver_capabilities"
+            ].get("path"),
+            "filter_header_evidence": stage4_evidence_artifacts[
+                "filter_header"
+            ].get("path"),
             "psolved": "stage4_psolved.fit" if ps_saved else None,
             "pre_color": f"{PCC_CHECKPOINT_STEM}.fit" if pre_pcc_saved else None,
             "pre_pcc": f"{PCC_CHECKPOINT_STEM}.fit" if pre_pcc_saved else None,
@@ -5235,8 +5881,8 @@ def run_stage4_color_calibration(pipeline) -> None:
         if hard_degraded
         else "narrowband_pcc_degraded_fallback"
         if color_method in degraded_narrowband_pcc_methods
-        else "auto_star_ensemble_reference_non_physical"
-        if color_method == AUTO_STAR_ENSEMBLE_METHOD
+        else "auto_white_region_reference_non_physical"
+        if color_method == AUTO_WHITE_REGION_METHOD
         else "auto_background_neutralization_non_physical"
         if color_method == AUTO_BACKGROUND_METHOD
         else "spcc_broad_core_chroma_rollback_review_required"

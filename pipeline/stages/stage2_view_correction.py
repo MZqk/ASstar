@@ -1,15 +1,19 @@
 """Stage 2 view correction and crop."""
 import copy
 import math
+import re
 from typing import List, Optional, Tuple
 
 import numpy as np
 
 from image_metrics import _to_rgb_float_fullres
 from models import PipelineStage
+import run_manifest
 from stage2_crop_detector import (
+    STACKED_FOOTPRINT_EVIDENCE_SCHEMA,
     detect_field_rotation_crop,
     detect_native_contour_crop,
+    infer_stacked_master_footprint,
 )
 from sirilpy.exceptions import CommandError, SirilError
 
@@ -17,6 +21,83 @@ from sirilpy.exceptions import CommandError, SirilError
 _STAGE2_KNOWN_NATIVE_FRAMES = {
     "seestar s30 pro": {(2160, 3840)},
 }
+_STAGE2_DEVICE_ALIASES = {
+    "seestar s30 pro": (
+        "seestar s30 pro",
+        "seestars30pro",
+        "s30 pro",
+        "s30pro",
+    ),
+}
+_STAGE2_NATIVE_AXIS_RETENTION_MIN = 0.95
+
+
+def _stage2_unavailable_footprint(
+    initial_shape: dict,
+    *,
+    source_artifact: Optional[str],
+    source_sha256: Optional[str],
+    reason: str,
+) -> dict:
+    return {
+        "schema": STACKED_FOOTPRINT_EVIDENCE_SCHEMA,
+        "status": "unavailable",
+        "source_mode": "stacked_master_inference",
+        "observer_only": True,
+        "captured_before_crop": True,
+        "source_artifact": source_artifact,
+        "source_sha256": source_sha256,
+        "input_shape": dict(initial_shape or {}),
+        "reason": str(reason or "stacked_master_pixels_unavailable"),
+        "layers": {},
+        "limitations": [
+            "not_per_frame_registration_footprint",
+            "not_crop_authority",
+        ],
+    }
+
+
+def _stage2_stacked_master_footprint(pipeline, initial_shape: dict) -> dict:
+    """Observe the untouched Stage 2 input without authorizing any crop."""
+
+    source_path = None
+    process_dir = getattr(pipeline, "process_dir", None)
+    if process_dir is not None:
+        for name in ("stage1_prepared.fit", "working.fit"):
+            candidate = process_dir / name
+            if candidate.is_file():
+                source_path = candidate
+                break
+    source_artifact = source_path.name if source_path is not None else None
+    source_sha256 = None
+    try:
+        if source_path is not None:
+            hasher = getattr(pipeline, "_sha256_file", None)
+            source_sha256 = (
+                hasher(source_path)
+                if callable(hasher)
+                else run_manifest.sha256_file(source_path)
+            )
+        image_data = pipeline.siril.get_image_pixeldata(preview=False)
+        if image_data is None:
+            raise ValueError("stacked_master_pixels_unavailable")
+        report = infer_stacked_master_footprint(
+            np.asarray(image_data),
+            source_artifact=source_artifact,
+            source_sha256=source_sha256,
+        )
+        if not report.get("input_shape"):
+            report["input_shape"] = dict(initial_shape or {})
+        return report
+    except InterruptedError:
+        raise
+    except Exception as error:  # Observer-only evidence must not alter Stage 2.
+        return _stage2_unavailable_footprint(
+            initial_shape,
+            source_artifact=source_artifact,
+            source_sha256=source_sha256,
+            reason=str(error),
+        )
 
 
 def _stage2_full_frame_context(pipeline, initial_shape: dict) -> dict:
@@ -26,7 +107,9 @@ def _stage2_full_frame_context(pipeline, initial_shape: dict) -> dict:
         "status": "unavailable",
         "known_device": None,
         "native_frame_match": False,
+        "native_frame_exact_match": False,
         "wcs_valid": False,
+        "astrometric_geometry_valid": False,
         "advisory_authorized": False,
         "metadata_source": None,
     }
@@ -48,6 +131,12 @@ def _stage2_full_frame_context(pipeline, initial_shape: dict) -> dict:
         return report
     report["metadata_source"] = metadata.get("_header_source")
 
+    source_file = getattr(pipeline, "source_file", None)
+    original_source_file = getattr(
+        pipeline,
+        "_stage1_original_source_file",
+        None,
+    )
     identity = " ".join(
         str(metadata.get(key) or "").strip().lower()
         for key in (
@@ -59,11 +148,18 @@ def _stage2_full_frame_context(pipeline, initial_shape: dict) -> dict:
             "CREATOR",
         )
     )
+    identity = (
+        f"{identity} {original_source_file or ''} {source_file or ''}"
+    ).strip().lower()
+    normalized_identity = re.sub(r"[^a-z0-9]+", "", identity)
     known_device = next(
         (
             name
-            for name in _STAGE2_KNOWN_NATIVE_FRAMES
-            if name in identity
+            for name, aliases in _STAGE2_DEVICE_ALIASES.items()
+            if any(
+                re.sub(r"[^a-z0-9]+", "", alias) in normalized_identity
+                for alias in aliases
+            )
         ),
         None,
     )
@@ -71,9 +167,46 @@ def _stage2_full_frame_context(pipeline, initial_shape: dict) -> dict:
     width = int(initial_shape.get("width", 0) or 0)
     height = int(initial_shape.get("height", 0) or 0)
     native_frames = _STAGE2_KNOWN_NATIVE_FRAMES.get(known_device or "", set())
-    report["native_frame_match"] = bool(
+    exact_native_match = bool(
         (width, height) in native_frames or (height, width) in native_frames
     )
+    native_geometry_candidates = []
+    for native_width, native_height in native_frames:
+        for expected_width, expected_height in (
+            (native_width, native_height),
+            (native_height, native_width),
+        ):
+            if expected_width <= 0 or expected_height <= 0:
+                continue
+            width_ratio = width / float(expected_width)
+            height_ratio = height / float(expected_height)
+            native_geometry_candidates.append(
+                {
+                    "expected_width": expected_width,
+                    "expected_height": expected_height,
+                    "width_ratio": width_ratio,
+                    "height_ratio": height_ratio,
+                    "axis_retention_min": min(width_ratio, height_ratio),
+                }
+            )
+    best_geometry = max(
+        native_geometry_candidates,
+        key=lambda item: float(item["axis_retention_min"]),
+        default=None,
+    )
+    near_native_match = bool(
+        best_geometry
+        and _STAGE2_NATIVE_AXIS_RETENTION_MIN
+        <= float(best_geometry["width_ratio"])
+        <= 1.01
+        and _STAGE2_NATIVE_AXIS_RETENTION_MIN
+        <= float(best_geometry["height_ratio"])
+        <= 1.01
+    )
+    report["native_frame_exact_match"] = exact_native_match
+    report["native_frame_match"] = bool(exact_native_match or near_native_match)
+    report["native_frame_geometry"] = best_geometry
+    report["native_axis_retention_min"] = _STAGE2_NATIVE_AXIS_RETENTION_MIN
 
     def finite_number(key: str) -> Optional[float]:
         try:
@@ -90,14 +223,21 @@ def _stage2_full_frame_context(pipeline, initial_shape: dict) -> dict:
         and int(round(header_width)) == width
         and int(round(header_height)) == height
     )
-    center_valid = bool(
+    wcs_center_valid = bool(
         finite_number("CRVAL1") is not None
         and finite_number("CRVAL2") is not None
+    )
+    pointing_valid = bool(
+        wcs_center_valid
+        or (
+            finite_number("RA") is not None
+            and finite_number("DEC") is not None
+        )
     )
     cdelt1 = finite_number("CDELT1")
     cdelt2 = finite_number("CDELT2")
     if cdelt1 is not None and cdelt2 is not None:
-        scale_valid = bool(
+        wcs_scale_valid = bool(
             1e-7 <= abs(cdelt1) <= 0.1
             and 1e-7 <= abs(cdelt2) <= 0.1
         )
@@ -106,7 +246,7 @@ def _stage2_full_frame_context(pipeline, initial_shape: dict) -> dict:
             finite_number(key)
             for key in ("CD1_1", "CD1_2", "CD2_1", "CD2_2")
         ]
-        scale_valid = bool(
+        wcs_scale_valid = bool(
             all(value is not None for value in cd_values)
             and 1e-7
             <= math.hypot(float(cd_values[0]), float(cd_values[2]))
@@ -115,18 +255,57 @@ def _stage2_full_frame_context(pipeline, initial_shape: dict) -> dict:
             <= math.hypot(float(cd_values[1]), float(cd_values[3]))
             <= 0.1
         )
+    pixel_size_x = finite_number("XPIXSZ")
+    pixel_size_y = finite_number("YPIXSZ")
+    focal_length = finite_number("FOCALLEN")
+    physical_scale_x = (
+        206.264806 * pixel_size_x / focal_length / 3600.0
+        if pixel_size_x is not None
+        and focal_length is not None
+        and pixel_size_x > 0.0
+        and focal_length > 0.0
+        else None
+    )
+    physical_scale_y = (
+        206.264806 * pixel_size_y / focal_length / 3600.0
+        if pixel_size_y is not None
+        and focal_length is not None
+        and pixel_size_y > 0.0
+        and focal_length > 0.0
+        else None
+    )
+    physical_scale_valid = bool(
+        physical_scale_x is not None
+        and physical_scale_y is not None
+        and 1e-7 <= physical_scale_x <= 0.1
+        and 1e-7 <= physical_scale_y <= 0.1
+    )
+    astrometric_geometry_valid = bool(
+        dimensions_match
+        and pointing_valid
+        and (wcs_scale_valid or physical_scale_valid)
+    )
     report.update(
         {
             "header_dimensions_match": dimensions_match,
-            "wcs_center_valid": center_valid,
-            "wcs_scale_valid": scale_valid,
-            "wcs_valid": bool(dimensions_match and center_valid and scale_valid),
+            "wcs_center_valid": wcs_center_valid,
+            "pointing_valid": pointing_valid,
+            "wcs_scale_valid": wcs_scale_valid,
+            "physical_scale_valid": physical_scale_valid,
+            "physical_scale_degrees_per_pixel": {
+                "x": physical_scale_x,
+                "y": physical_scale_y,
+            },
+            "wcs_valid": bool(
+                dimensions_match and wcs_center_valid and wcs_scale_valid
+            ),
+            "astrometric_geometry_valid": astrometric_geometry_valid,
         }
     )
     report["advisory_authorized"] = bool(
         known_device
         and report["native_frame_match"]
-        and report["wcs_valid"]
+        and astrometric_geometry_valid
     )
     report["status"] = (
         "trusted_full_frame"
@@ -134,7 +313,7 @@ def _stage2_full_frame_context(pipeline, initial_shape: dict) -> dict:
         else "insufficient_evidence"
     )
     report["reason"] = (
-        "known_native_frame_with_valid_wcs"
+        "known_native_frame_with_astrometric_geometry"
         if report["advisory_authorized"]
         else "full_frame_evidence_incomplete"
     )
@@ -681,6 +860,19 @@ def _field_rotation_verification_cleared(report: dict) -> bool:
     )
 
 
+def _field_rotation_lacks_required_geometry(report: dict) -> bool:
+    """Recognize an anomaly that explicitly failed the crop geometry gate."""
+
+    return bool(
+        not report.get("accepted", False)
+        and str(report.get("reason") or "")
+        == "edge_connected_anomaly_lacks_corner_wedge_geometry"
+        and not bool(
+            (report.get("evidence") or {}).get("wedge_geometry_confirmed")
+        )
+    )
+
+
 def _field_rotation_connected_ratio(report: dict) -> Optional[float]:
     evidence = report.get("evidence") if isinstance(report, dict) else None
     if not isinstance(evidence, dict):
@@ -877,6 +1069,10 @@ def run_stage2_view_correction(pipeline) -> None:
         initial_shape = _stage2_shape_dict(pipeline.siril.get_image_shape())
     except (CommandError, SirilError, OSError, RuntimeError, TypeError, ValueError):
         initial_shape = {}
+    stacked_master_footprint = _stage2_stacked_master_footprint(
+        pipeline,
+        initial_shape,
+    )
     crop_report = {
         "stage": "stage2_crop",
         "mode": "native_no_crop",
@@ -889,6 +1085,7 @@ def run_stage2_view_correction(pipeline) -> None:
         "crop_limit_hits": [],
         "advisories": [],
         "requires_review": False,
+        "stacked_master_footprint": stacked_master_footprint,
         "target_edge_black_ratio": float(getattr(pipeline.cfg, "stage2_edge_black_target", 0.03)),
         "center_protection": _stage2_center_protection(
             initial_shape,
@@ -1115,6 +1312,36 @@ def run_stage2_view_correction(pipeline) -> None:
                 )
                 messages.append(conflict["message"])
                 field_rect = None
+            if (
+                field_rect is None
+                and native_full_frame_valid
+                and bool(
+                    (crop_report.get("full_frame_context") or {}).get(
+                        "advisory_authorized"
+                    )
+                )
+                and _field_rotation_lacks_required_geometry(
+                    crop_report["field_rotation"]
+                )
+            ):
+                advisory = {
+                    "reason": "native_field_rotation",
+                    "reason_code": "field_rotation_full_frame_advisory",
+                    "requested": None,
+                    "applied": None,
+                    "message": (
+                        "edge-connected coverage anomaly lacked the required "
+                        "corner-wedge geometry; device frame, astrometric "
+                        "geometry and native contour corroborate the immutable "
+                        "full frame"
+                    ),
+                }
+                crop_report.setdefault("advisories", []).append(advisory)
+                crop_report["field_rotation"].update(
+                    application_status="rejected_full_frame_advisory",
+                    applied_crop=None,
+                )
+                messages.append(advisory["message"])
             if field_rect is not None:
                 x, y, crop_w, crop_h = field_rect
                 configured_protection = float(

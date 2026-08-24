@@ -180,11 +180,15 @@ class Stage4AutoReferenceTests(unittest.TestCase):
 
         first, first_report = evaluate_auto_local_reference(
             image,
-            config=SimpleNamespace(),
+            config=SimpleNamespace(
+                stage4_auto_reference_global_white_enabled=False,
+            ),
         )
         second, second_report = evaluate_auto_local_reference(
             image,
-            config=SimpleNamespace(),
+            config=SimpleNamespace(
+                stage4_auto_reference_global_white_enabled=False,
+            ),
         )
 
         self.assertIsNotNone(first)
@@ -217,7 +221,9 @@ class Stage4AutoReferenceTests(unittest.TestCase):
 
         candidate, report = evaluate_auto_local_reference(
             source,
-            config=SimpleNamespace(),
+            config=SimpleNamespace(
+                stage4_auto_reference_global_white_enabled=False,
+            ),
         )
 
         self.assertEqual(report["selection"]["method"], BACKGROUND_METHOD)
@@ -228,7 +234,7 @@ class Stage4AutoReferenceTests(unittest.TestCase):
         self.assertTrue(np.all(candidate[..., 1] <= source[..., 1]))
         self.assertTrue(np.array_equal(candidate[..., 2], source[..., 2]))
 
-    def test_star_ensemble_is_shadow_only_by_default(self) -> None:
+    def test_white_reference_rectangle_is_enabled_by_default(self) -> None:
         candidate, report = evaluate_auto_local_reference(
             _broadband_fixture(),
             config=SimpleNamespace(),
@@ -237,25 +243,42 @@ class Stage4AutoReferenceTests(unittest.TestCase):
         star = report["candidates"][STAR_ENSEMBLE_METHOD]
         self.assertIsNotNone(candidate)
         self.assertTrue(star["would_accept"], star)
-        self.assertTrue(star["shadow_only"])
-        self.assertFalse(star["pixels_authorized"])
-        self.assertEqual(report["selection"]["method"], BACKGROUND_METHOD)
-        self.assertEqual(star["reference"], "star_ensemble_pseudo_white_reference")
+        self.assertFalse(star["shadow_only"])
+        self.assertTrue(star["pixels_authorized"])
+        self.assertEqual(report["selection"]["method"], STAR_ENSEMBLE_METHOD)
+        self.assertEqual(star["reference"], "single_rectangular_white_reference")
         self.assertTrue(all((1 / 1.10) <= gain <= 1.10 for gain in star["gains"]))
+        for name in ("background", "white"):
+            region = report["reference_regions"][name]
+            self.assertEqual(region["status"], "selected")
+            rectangle = region["rectangle"]
+            self.assertGreater(rectangle["width"], 0)
+            self.assertGreater(rectangle["height"], 0)
+            self.assertGreaterEqual(rectangle["x"], 0)
+            self.assertGreaterEqual(rectangle["y"], 0)
+            self.assertLessEqual(rectangle["x"] + rectangle["width"], 256)
+            self.assertLessEqual(rectangle["y"] + rectangle["height"], 256)
+        self.assertFalse(
+            report["reference_regions"]["white"]["color_values_used_for_selection"]
+        )
+        split = report["sampling"]["stars"]["split"]
+        self.assertTrue(
+            set(split["fit_indexes"]).isdisjoint(split["validation_indexes"])
+        )
 
-    def test_expert_switch_authorizes_accepted_star_ensemble(self) -> None:
+    def test_expert_switch_can_disable_white_reference_application(self) -> None:
         candidate, report = evaluate_auto_local_reference(
             _broadband_fixture(),
             config=SimpleNamespace(
-                stage4_auto_reference_global_white_enabled=True,
+                stage4_auto_reference_global_white_enabled=False,
             ),
         )
 
         self.assertIsNotNone(candidate)
-        self.assertEqual(report["selection"]["method"], STAR_ENSEMBLE_METHOD)
-        self.assertFalse(
-            report["candidates"][STAR_ENSEMBLE_METHOD]["shadow_only"]
-        )
+        self.assertEqual(report["selection"]["method"], BACKGROUND_METHOD)
+        white = report["candidates"][STAR_ENSEMBLE_METHOD]
+        self.assertTrue(white["shadow_only"])
+        self.assertFalse(white["pixels_authorized"])
 
     def test_sparse_star_evidence_cannot_authorize_pseudo_white_reference(self) -> None:
         candidate, report = evaluate_auto_local_reference(

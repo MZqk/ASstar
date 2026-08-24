@@ -35,6 +35,7 @@ import cosmic_clarity
 import plugin_runner
 import review_bundle
 import run_manifest
+import scene_support
 import scunet_denoise
 import syqon_starless
 import sasp_runner
@@ -945,6 +946,7 @@ class StarunPostProcessor(
         self._stage8_palette_report: Dict[str, Any] = {}
         self._stage8_saturation_execution: Dict[str, Any] = {}
         self._stage8_color_quality_report: Dict[str, Any] = {}
+        self._stage8_subject_boundary_seam_report: Dict[str, Any] = {}
         self._stage10_color_rebalance_report: Dict[str, Any] = {}
         self._stage7_selected_quality: Optional[Dict[str, Any]] = None
         self._stage7_closed_form_mtf_reference: Optional[Dict[str, Any]] = None
@@ -982,6 +984,7 @@ class StarunPostProcessor(
         self._trusted_input_provenance: Optional[Dict[str, Any]] = None
         self._resume_semantic_context: Optional[Dict[str, Any]] = None
         self._resume_semantic_context_status: str = "not_applicable"
+        self._resume_auxiliary_artifacts: Dict[str, Dict[str, Any]] = {}
         self._input_state_review_route: bool = False
         self._skip_stage10_color_adjustments: bool = False
         self._stage2_view_review_required: bool = False
@@ -1496,6 +1499,23 @@ class StarunPostProcessor(
         try:
             contract = task_workspace.stage_contract(stage_number)
             artifact = self.process_dir / contract.primary_artifact
+            auxiliary_artifacts = None
+            if stage_number == 5:
+                candidates = {
+                    scene_support.SCENE_SUPPORT_JSON: (
+                        self.process_dir / scene_support.SCENE_SUPPORT_JSON
+                    ),
+                    scene_support.SCENE_SUPPORT_ARRAYS: (
+                        self.process_dir / scene_support.SCENE_SUPPORT_ARRAYS
+                    ),
+                }
+                support_runtime = scene_support.load_scene_support(
+                    self.process_dir
+                )
+                if all(path.is_file() for path in candidates.values()) and str(
+                    support_runtime.get("status") or ""
+                ) in {"available", "partial"}:
+                    auxiliary_artifacts = candidates
             record = task_workspace.publish_formal_checkpoint(
                 run_manifest_path=Path(manifest_value),
                 stage_number=stage_number,
@@ -1503,6 +1523,7 @@ class StarunPostProcessor(
                 semantic_context=self._formal_checkpoint_semantic_context(
                     stage_number
                 ),
+                auxiliary_artifacts=auxiliary_artifacts,
             )
             self.log.info(
                 "[TaskCheckpoint] published "
@@ -1593,6 +1614,18 @@ class StarunPostProcessor(
                         ),
                     ),
                     "final_residual_detection": copy.deepcopy(dict(residual)),
+                    **(
+                        {
+                            "stacked_master_footprint": copy.deepcopy(
+                                crop_report.get("stacked_master_footprint")
+                            )
+                        }
+                        if isinstance(
+                            crop_report.get("stacked_master_footprint"),
+                            Mapping,
+                        )
+                        else {}
+                    ),
                 },
             }
         if stage_number != 5:
@@ -1626,6 +1659,9 @@ class StarunPostProcessor(
             ),
             "stage5_deconvolution_acceptance": copy.deepcopy(
                 getattr(self, "_stage5_deconvolution_acceptance", {}) or {}
+            ),
+            "stage3_scene_support": scene_support.scene_support_summary(
+                getattr(self, "_stage3_scene_support", None)
             ),
         }
 
@@ -2631,6 +2667,7 @@ class StarunPostProcessor(
             self._stage8_palette_report = {}
             self._stage8_saturation_execution = {}
             self._stage8_color_quality_report = {}
+            self._stage8_subject_boundary_seam_report = {}
             self._stage10_color_rebalance_report = {}
             self._stage7_selected_quality = None
             self._stage7_closed_form_mtf_reference = None
@@ -2675,6 +2712,7 @@ class StarunPostProcessor(
             self._trusted_input_provenance = None
             self._resume_semantic_context = None
             self._resume_semantic_context_status = "not_applicable"
+            self._resume_auxiliary_artifacts = {}
             self._task_resume_checkpoint_path = None
             self._input_state_review_route = False
             self._skip_stage10_color_adjustments = False

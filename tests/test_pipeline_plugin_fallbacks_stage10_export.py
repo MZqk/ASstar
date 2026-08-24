@@ -1454,6 +1454,65 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
             review_report["metrics"]["stage9_review_candidate_selected"]
         )
 
+    def test_final_quality_uses_independent_halo_for_single_local_galaxy_point(self):
+        raw_local_halo = 1.3757370224687977
+        probe = SimpleNamespace(
+            _stage8_final_quality="background_only_passthrough",
+            _stage8_fallback_used=False,
+            _stage9_bypassed_bad_starless=False,
+            _stage9_stars_required=True,
+            _stage9_stars_applied=True,
+            _stage9_remix_formally_accepted=True,
+            _stage9_review_candidate_selected=False,
+            _stage9_starmask_stretch_failed=False,
+            _stage9_starmask_preparation_failed=False,
+            _stage7_selected_quality={
+                "status": "ok",
+                "quality_gates": {
+                    "galaxy_disk_halo_residue": {
+                        "status": "advisory",
+                        "hard_failed": False,
+                        "reason_code": "single_local_galaxy_halo_evidence",
+                    },
+                },
+                "derived": {
+                    "halo_residue_score": raw_local_halo,
+                    "global_halo_residue_score": 0.0556,
+                    "compact_halo_residue_score": 0.1974,
+                    "galaxy_disk_halo_corroborated_local_count": 1,
+                },
+            },
+            _read_image_by_stem=lambda _stem: object(),
+            _background_quality_metrics=lambda _image: {
+                "chroma_noise_score": 0.01,
+                "background_mottling_score": 0.03,
+                "local_patch_variance": 0.000001,
+                "core_clip_score": 0.0,
+                "starless_artifact_score": 0.06,
+                "bg_dirty_score": 0.04,
+                "bg_std": 0.004,
+            },
+            _stage7_halo_residue_score=lambda: raw_local_halo,
+            _stage7_effective_halo_threshold=lambda: 0.48,
+            _active_policy_name=lambda: "large_galaxy_core_protect",
+            _active_target_type=lambda: "large_galaxy",
+        )
+
+        report = pipeline_module.stage8_pixels.final_quality_report(probe)
+
+        self.assertFalse(report["strict_gate"], report)
+        self.assertEqual(report["final_quality"], "ok")
+        self.assertEqual(report["metrics"]["halo_artifact_score"], raw_local_halo)
+        self.assertAlmostEqual(
+            report["metrics"]["stage7_effective_halo_residue_score"],
+            0.1974,
+        )
+        self.assertTrue(
+            report["metrics"][
+                "stage7_single_local_galaxy_halo_override_active"
+            ]
+        )
+
     def test_final_quality_rejects_selected_stage9_chromatic_artifacts(self):
         probe = SimpleNamespace(
             _stage8_final_quality="ok",

@@ -290,6 +290,101 @@ class Display90CurveTests(unittest.TestCase):
         )
         self.assertLessEqual(float(np.max(mapped)), 0.995001)
 
+    def test_compressed_pedestal_opens_shadow_shoulder_without_median_drift(self) -> None:
+        rng = np.random.default_rng(7)
+        yy, xx = np.mgrid[:192, :256]
+        pedestal = 0.02578 + rng.normal(0.0, 0.00005, size=xx.shape)
+        galaxy = 0.008 * np.exp(
+            -(((xx - 132.0) / 46.0) ** 2)
+            - (((yy - 98.0) / 20.0) ** 2)
+        )
+        base = np.asarray(pedestal + galaxy, dtype=np.float32)
+        image = np.stack(
+            (base * 1.015, base, base * 0.985),
+            axis=0,
+        ).astype(np.float32)
+        source_curve = ui_preview.build_linked_display_curve_contract(image)
+        self.assertLess(source_curve["median_normalized"], 0.08)
+
+        calibration = _calibration(image)
+        self.assertEqual(calibration["status"], "ok", calibration)
+        protection = calibration["shadow_protection"]
+        self.assertEqual(protection["status"], "applied", protection)
+        self.assertLess(
+            protection["source_below_low_input_ratio"],
+            0.0001,
+        )
+        self.assertLess(protection["low_input"], protection["join_input"])
+        self.assertLess(protection["low_output"], protection["join_output"])
+
+        mapped = stretch_metrics.apply_display90_linked_rgb_stretch(
+            image,
+            calibration,
+        )
+        mapped_luminance = (
+            0.2126 * mapped[0]
+            + 0.7152 * mapped[1]
+            + 0.0722 * mapped[2]
+        )
+        p0_2, p50 = np.percentile(mapped_luminance, (0.2, 50.0))
+        self.assertGreater(float(p0_2 / p50), 0.20)
+        expected_p50 = float(calibration["predicted_p50"])
+        self.assertAlmostEqual(float(p50), expected_p50, delta=0.002)
+
+    def test_large_galaxy_compressed_pedestal_uses_bounded_quantile_tail(self) -> None:
+        rng = np.random.default_rng(17)
+        yy, xx = np.mgrid[:240, :320]
+        pedestal = 0.02578 + rng.normal(0.0, 0.00005, size=xx.shape)
+        galaxy = 0.030 * np.exp(
+            -(((xx - 164.0) / 62.0) ** 2)
+            - (((yy - 122.0) / 25.0) ** 2)
+        )
+        base = np.asarray(pedestal + galaxy, dtype=np.float32)
+        image = np.stack(
+            (base * 1.015, base, base * 0.985),
+            axis=0,
+        ).astype(np.float32)
+        curve = ui_preview.build_linked_display_curve_contract(image)
+
+        calibration = stretch_metrics.calibrate_display90_linked_lut(
+            image,
+            curve,
+            strength=0.90,
+            max_derivative=5000.0,
+            target_type="large_galaxy",
+        )
+
+        self.assertEqual(calibration["status"], "ok", calibration)
+        tone = calibration["quantile_tone_curve"]
+        self.assertEqual(tone["status"], "applied", tone)
+        self.assertEqual(
+            calibration["shadow_protection"]["policy"],
+            "large_galaxy_quantile_curve_owns_shadows",
+        )
+        mapped = stretch_metrics.apply_display90_linked_rgb_stretch(
+            image,
+            calibration,
+        )
+        luminance = (
+            0.2126 * mapped[0]
+            + 0.7152 * mapped[1]
+            + 0.0722 * mapped[2]
+        )
+        p10, p50, p90, p99 = np.percentile(
+            luminance,
+            (10.0, 50.0, 90.0, 99.0),
+        )
+        self.assertAlmostEqual(float(p10), 0.134, delta=0.004)
+        self.assertAlmostEqual(float(p50), 0.165, delta=0.004)
+        self.assertAlmostEqual(float(p90), 0.330, delta=0.006)
+        self.assertAlmostEqual(float(p99), 0.700, delta=0.010)
+        self.assertLess(float(np.mean(luminance >= 0.995)), 0.001)
+        conformance = stretch_metrics.assess_display90_curve_conformance(
+            calibration,
+            mapped,
+        )
+        self.assertTrue(conformance["accepted"], conformance)
+
     def test_legacy_v1_calibration_replays_per_channel_semantics(self) -> None:
         image = _linear_rgb()
         calibration = _calibration(image)
@@ -815,6 +910,65 @@ class Display90RoutingTests(unittest.TestCase):
             degenerate_adaptation["display90_calibration"]["status"],
             "unavailable",
         )
+
+    def test_galaxy_route_adds_bounded_mid_high_display_candidate(self) -> None:
+        image = _linear_rgb()
+        stats = _pixel_stats(image)
+        processor = _StretchProcessor()
+        processor._active_target_type = lambda: "large_galaxy"
+        processor._channel_semantics = "broadband_rgb_osc"
+
+        candidates, adaptation = processor._stage7_compact_stretch_candidates(
+            QualityMetrics(bg_median=stats["p50"]),
+            {"bg_std": 0.001},
+            stats,
+            {"p50": 0.25, "p99": 0.80},
+            starless_recomposition_planned=True,
+            source_stem="stage6_starless",
+            star_separation_state=StarSeparationState.ACCEPTED.value,
+            baseline_image_data=image,
+        )
+
+        names = [candidate["name"] for candidate in candidates]
+        self.assertIn("cand_display86", names)
+        tier = next(
+            item
+            for item in adaptation["display_ladder"]["tiers"]
+            if item["name"] == "cand_display86"
+        )
+        self.assertAlmostEqual(tier["strength"], 0.86)
+        self.assertEqual(tier["tier"], "mid_high")
+
+    def test_galaxy_brightness_floor_preserves_core_safe_tradeoff(self) -> None:
+        preview = {
+            "metrics": {
+                "subject_p50": 0.50,
+                "subject_lift": 0.20,
+                "background_mad": 0.02,
+            }
+        }
+        candidate = {
+            "metrics": {
+                "subject_p50": 0.295,
+                "subject_lift": 0.11,
+                "background_mad": 0.01,
+            }
+        }
+
+        galaxy = stretch_metrics.subject_brightness_selection(
+            candidate,
+            preview,
+            profile_name="galaxy_core_halo_balance",
+        )
+        generic = stretch_metrics.subject_brightness_selection(
+            candidate,
+            preview,
+            profile_name="generic_balanced",
+        )
+
+        self.assertTrue(galaxy["formal_floor_passed"])
+        self.assertEqual(galaxy["floors"]["subject_p50_retention"], 0.58)
+        self.assertFalse(generic["formal_floor_passed"])
 
     def test_policy_keeps_legacy_auto_dual_and_all_only_modes(self) -> None:
         candidates = [

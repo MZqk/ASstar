@@ -53,6 +53,8 @@ class PipelineExceptionPolicyTests(unittest.TestCase):
                     ("starun.py", "_record_stage"): 2,
                     ("starun.py", "run"): 1,
                     ("stage2_crop_detector.py", "detect_native_contour_crop"): 2,
+                    ("stage2_crop_detector.py", "infer_stacked_master_footprint"): 2,
+                    ("stage2_view_correction.py", "_stage2_stacked_master_footprint"): 1,
                     ("syqon_starless.py", "record_syqon_derived_generation"): 1,
                 }
             ),

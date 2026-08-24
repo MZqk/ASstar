@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -519,6 +519,9 @@ def build_safe_background_samples(
     texture_quantile_max: float = 0.55,
     candidate_refinement: bool = True,
     refinement_max_steps: int = 8,
+    shared_valid_mask: Optional[np.ndarray] = None,
+    shared_saturation_map: Optional[np.ndarray] = None,
+    shared_star_catalog: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Tuple[List[Tuple[float, float]], Dict[str, Any]]:
     """Select spatially distributed low-signal, low-texture Siril samples.
 
@@ -544,6 +547,55 @@ def build_safe_background_samples(
         }
 
     height, width = luminance.shape
+    shared_valid = None
+    shared_saturated = None
+    shared_star_mask = None
+    shared_support_status: Dict[str, Any] = {
+        "valid_mask": "unavailable",
+        "saturation_map": "unavailable",
+        "star_catalog": "unavailable",
+    }
+    if shared_valid_mask is not None:
+        candidate = np.asarray(shared_valid_mask, dtype=bool)
+        if candidate.shape == (height, width):
+            shared_valid = candidate
+            shared_support_status["valid_mask"] = "applied"
+    if shared_saturation_map is not None:
+        candidate = np.asarray(shared_saturation_map)
+        if candidate.shape == (height, width):
+            shared_saturated = candidate > 0
+            shared_support_status["saturation_map"] = "applied"
+    if shared_star_catalog is not None:
+        shared_star_mask = np.zeros((height, width), dtype=bool)
+        accepted_stars = 0
+        for star in shared_star_catalog:
+            if not isinstance(star, dict):
+                continue
+            try:
+                x = float(star.get("x"))
+                y = float(star.get("y"))
+                fwhm = float(star.get("fwhm_px"))
+            except (TypeError, ValueError):
+                continue
+            if not all(math.isfinite(value) for value in (x, y, fwhm)) or fwhm <= 0:
+                continue
+            radius = max(3.0, min(32.0, 2.5 * fwhm))
+            extent = int(math.ceil(radius))
+            x0 = max(0, int(math.floor(x)) - extent)
+            x1 = min(width, int(math.floor(x)) + extent + 1)
+            y0 = max(0, int(math.floor(y)) - extent)
+            y1 = min(height, int(math.floor(y)) + extent + 1)
+            if x0 >= x1 or y0 >= y1:
+                continue
+            yy, xx = np.mgrid[y0:y1, x0:x1]
+            shared_star_mask[y0:y1, x0:x1] |= (
+                (xx - x) ** 2 + (yy - y) ** 2 <= radius**2
+            )
+            accepted_stars += 1
+        shared_support_status["star_catalog"] = (
+            "applied" if accepted_stars else "available_empty"
+        )
+        shared_support_status["catalog_star_count"] = accepted_stars
     patch_radius = max(
         4,
         min(int(patch_radius), 24, max(4, min(height, width) // 12)),
@@ -640,6 +692,30 @@ def build_safe_background_samples(
             "source_mask_fraction": float(np.mean(local_source_mask)),
             "coverage_mask_fraction": float(np.mean(local_coverage_mask)),
             "candidate_source": source,
+            "shared_valid_fraction": (
+                float(np.mean(shared_valid[
+                    y - patch_radius : y + patch_radius + 1,
+                    x - patch_radius : x + patch_radius + 1,
+                ]))
+                if shared_valid is not None
+                else None
+            ),
+            "shared_saturated_fraction": (
+                float(np.mean(shared_saturated[
+                    y - patch_radius : y + patch_radius + 1,
+                    x - patch_radius : x + patch_radius + 1,
+                ]))
+                if shared_saturated is not None
+                else None
+            ),
+            "shared_star_fraction": (
+                float(np.mean(shared_star_mask[
+                    y - patch_radius : y + patch_radius + 1,
+                    x - patch_radius : x + patch_radius + 1,
+                ]))
+                if shared_star_mask is not None
+                else None
+            ),
         }
 
     for raw_y in y_values:
@@ -743,6 +819,15 @@ def build_safe_background_samples(
         )
 
     def audit_candidate(record: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+        if (
+            record.get("shared_valid_fraction") is not None
+            and float(record["shared_valid_fraction"]) < 0.999
+        ):
+            return False, "shared_invalid_region"
+        if float(record.get("shared_saturated_fraction") or 0.0) > 0.0:
+            return False, "shared_saturated"
+        if float(record.get("shared_star_fraction") or 0.0) > 0.0:
+            return False, "shared_catalog_star"
         if record["coverage_mask_fraction"] > 0.0:
             return False, "coverage_masked"
         if record["source_mask_center"] or record["source_mask_fraction"] > 0.35:
@@ -867,6 +952,9 @@ def build_safe_background_samples(
         "star_contaminated": 0,
         "source_masked": 0,
         "coverage_masked": 0,
+        "shared_invalid_region": 0,
+        "shared_saturated": 0,
+        "shared_catalog_star": 0,
     }
     for record in candidates:
         accepted, rejection_reason = audit_candidate(record)
@@ -1009,6 +1097,7 @@ def build_safe_background_samples(
             "y_span_ratio": y_span,
         },
         "masks": mask_report,
+        "shared_scene_support": shared_support_status,
         "thresholds": {
             "brightness_quantile_max": brightness_quantile_max,
             "absolute_brightness_limit": absolute_brightness_limit,

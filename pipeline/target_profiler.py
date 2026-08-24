@@ -375,10 +375,26 @@ def _metadata_field_radius_deg(
         cd21 = finite_value("CD2_1")
         cd12 = finite_value("CD1_2")
         cd22 = finite_value("CD2_2")
-        if None in {cd11, cd21, cd12, cd22}:
-            return None
-        scale_x = math.hypot(float(cd11), float(cd21))
-        scale_y = math.hypot(float(cd12), float(cd22))
+        if None not in {cd11, cd21, cd12, cd22}:
+            scale_x = math.hypot(float(cd11), float(cd21))
+            scale_y = math.hypot(float(cd12), float(cd22))
+        else:
+            pixel_size_x = finite_value("XPIXSZ")
+            pixel_size_y = finite_value("YPIXSZ")
+            focal_length = finite_value("FOCALLEN")
+            if (
+                pixel_size_x is None
+                or pixel_size_y is None
+                or focal_length is None
+                or pixel_size_x <= 0.0
+                or pixel_size_y <= 0.0
+                or focal_length <= 0.0
+            ):
+                return None
+            scale_x = 206.264806 * pixel_size_x / focal_length / 3600.0
+            scale_y = 206.264806 * pixel_size_y / focal_length / 3600.0
+    if not 1e-7 <= scale_x <= 0.1 or not 1e-7 <= scale_y <= 0.1:
+        return None
     radius = 0.5 * math.hypot(width * scale_x, height * scale_y)
     if not math.isfinite(radius) or not 0.05 <= radius <= 10.0:
         return None
@@ -495,6 +511,7 @@ def build_target_profile(
     identity_status = "unresolved"
     identity_conflict = False
     composite_targets: List[Dict[str, Any]] = []
+    composite_catalog_items: List[Dict[str, Any]] = []
     identity_evidence: Dict[str, Any] = {
         "name": None,
         "coordinate": None,
@@ -564,6 +581,7 @@ def build_target_profile(
                         (coord_item, coord_field_distance),
                     )
                 ]
+                composite_catalog_items = [name_item, coord_item]
                 identity_evidence["composite"] = {
                     "status": "same_type_targets_within_wcs_field",
                     "field_radius_deg": round(float(field_radius), 6),
@@ -746,6 +764,27 @@ def build_target_profile(
                         "score": round(float(target_confidence), 4),
                         "source": "catalog_context",
                         "target": str(matched_item.get("name") or ""),
+                    },
+                )
+    if composite_catalog_items and not identity_conflict:
+        for composite_item in composite_catalog_items:
+            catalog_labels = list(composite_item.get("features", []) or [])
+            catalog_labels.extend(composite_item.get("context_labels", []) or [])
+            for label in catalog_labels:
+                clean_label = str(label).strip()
+                if clean_label == "dense_stars":
+                    clean_label = "dense_star_field"
+                if clean_label not in SECONDARY_CONTEXT_LABELS:
+                    continue
+                if clean_label not in secondary_labels:
+                    secondary_labels.append(clean_label)
+                secondary_evidence.setdefault(
+                    clean_label,
+                    {
+                        "role": _SECONDARY_LABEL_ROLES[clean_label],
+                        "score": round(float(target_confidence), 4),
+                        "source": "catalog_composite_context",
+                        "target": str(composite_item.get("name") or ""),
                     },
                 )
     profile = {

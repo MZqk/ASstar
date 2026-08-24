@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+import scene_support
+
 from image_metrics import (
     _box_blur_gray,
     _clamp_float,
@@ -1036,6 +1038,14 @@ def stage7_galaxy_structure_masks(
         "center_y": center_y,
         "major_radius": float(major_radius),
         "minor_radius": float(minor_radius),
+        "major_axis_vector": [
+            float(major_vector[0]),
+            float(major_vector[1]),
+        ],
+        "minor_axis_vector": [
+            float(minor_vector[0]),
+            float(minor_vector[1]),
+        ],
         "disk_coverage": disk_coverage,
         "core_coverage": float(np.mean(core_mask)),
     }
@@ -1932,6 +1942,36 @@ def stage7_starless_artifact_scores(
     return scores
 
 def _stage6_stage5_star_reference_report(pipeline) -> Dict[str, Any]:
+    shared = _stage367_scene_support(pipeline)
+    shared_manifest = shared.get("manifest") if isinstance(shared, dict) else None
+    shared_catalog = (
+        ((shared_manifest or {}).get("components") or {}).get("star_catalog")
+        if isinstance(shared_manifest, dict)
+        else None
+    )
+    if isinstance(shared_catalog, dict) and shared_catalog.get("status") == "available":
+        stars = []
+        for record in shared_catalog.get("records") or []:
+            if not isinstance(record, dict):
+                continue
+            stars.append(
+                {
+                    **record,
+                    "index": record.get("id"),
+                    "fwhm_geometry": record.get("fwhm_px"),
+                    "eligible_for_local_guard": bool(
+                        not record.get("saturated", False)
+                        and float(record.get("valid_fraction", 0.0) or 0.0) >= 0.5
+                    ),
+                }
+            )
+        return {
+            "schema": scene_support.SCENE_SUPPORT_SCHEMA,
+            "status": "available",
+            "role": "stage3_shared_scene_catalog",
+            "source_checkpoint": "stage3_bg_input.fit",
+            "stars": stars,
+        }
     runtime_report = getattr(pipeline, "_stage5_star_reference_report", None)
     if isinstance(runtime_report, dict) and runtime_report.get("stars"):
         return runtime_report
@@ -1956,17 +1996,71 @@ def _stage6_stage5_star_reference_report(pipeline) -> Dict[str, Any]:
         return {}
 
 
+def _stage367_scene_support(pipeline) -> Dict[str, Any]:
+    runtime = getattr(pipeline, "_stage3_scene_support", None)
+    if isinstance(runtime, dict) and runtime.get("status") in {
+        "available",
+        "partial",
+    }:
+        return runtime
+    if (
+        isinstance(runtime, dict)
+        and str(((runtime.get("manifest") or {}).get("reason_code")) or "")
+        == "legacy_checkpoint_without_scene_support"
+    ):
+        return runtime
+    process_dir = getattr(pipeline, "process_dir", None)
+    if process_dir is not None:
+        loaded = scene_support.load_scene_support(Path(process_dir))
+        pipeline._stage3_scene_support = loaded
+        return loaded
+    return {
+        "status": "unavailable",
+        "manifest": scene_support.unavailable_scene_support(
+            "scene support process directory unavailable",
+            reason_code="scene_support_unavailable",
+        ),
+        "valid_mask": None,
+        "saturation_map": None,
+    }
+
+
+def _apply_shared_valid_region(
+    image: Optional[np.ndarray],
+    valid_mask: Optional[np.ndarray],
+    *,
+    zero_fill: bool = False,
+) -> Optional[np.ndarray]:
+    if image is None or valid_mask is None:
+        return image
+    source = np.asarray(image)
+    valid = np.asarray(valid_mask, dtype=bool)
+    try:
+        rgb = _to_rgb_float_fullres(source)
+    except (TypeError, ValueError):
+        return image
+    if rgb.shape[1:] != valid.shape or not bool(np.any(valid)):
+        return image
+    output = np.array(rgb, dtype=np.float32, copy=True)
+    for channel in range(output.shape[0]):
+        fill = 0.0 if zero_fill else float(np.median(output[channel][valid]))
+        output[channel][~valid] = fill
+    return output
+
+
 def _stage6_catalog_starmask_coverage(
     pipeline,
     source_data: Optional[np.ndarray],
     starmask_data: Optional[np.ndarray],
+    *,
+    starless_data: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     report: Dict[str, Any] = {
         "schema": (
             "starun.stage6-starmas"
             "k-catalog-coverage.v1"
         ),
-        "method": "stage5_frozen_catalog_apertures",
+        "method": "frozen_catalog_apertures",
         "status": "measurement_unavailable",
         "available": False,
         "coverage_ratio": None,
@@ -1979,12 +2073,27 @@ def _stage6_catalog_starmask_coverage(
             "recovered": 0,
             "excluded_low_signal": 0,
             "excluded_geometry": 0,
+            "excluded_saturated": 0,
+        },
+        "fixed_position_diagnostics": {
+            "status": "unavailable",
+            "residual_flux_ratio_p50": None,
+            "residual_flux_ratio_p95": None,
+            "black_hole_ratio_p50": None,
+            "black_hole_ratio_p95": None,
+            "halo_flux_ratio_p50": None,
+            "halo_flux_ratio_p95": None,
         },
     }
     if source_data is None or starmask_data is None:
         report["reason"] = "source_or_starmask_unavailable"
         return report
     reference = _stage6_stage5_star_reference_report(pipeline)
+    reference_role = str(reference.get("role") or "stage5_star_reference")
+    report["reference_role"] = reference_role
+    report["shared_stage3_catalog"] = (
+        reference_role == "stage3_shared_scene_catalog"
+    )
     stars = reference.get("stars") if isinstance(reference, dict) else None
     if not isinstance(stars, list):
         report["reason"] = "stage5_star_reference_unavailable"
@@ -2005,17 +2114,35 @@ def _stage6_catalog_starmask_coverage(
             + 0.7152 * starmask_rgb[1]
             + 0.0722 * starmask_rgb[2]
         ).astype(np.float64)
+        starless_gray = None
+        if starless_data is not None:
+            starless, _ = canonicalize_stage7_pixels_01(starless_data)
+            starless_rgb = _to_rgb_float_fullres(starless)
+            starless_gray = (
+                0.2126 * starless_rgb[0]
+                + 0.7152 * starless_rgb[1]
+                + 0.0722 * starless_rgb[2]
+            ).astype(np.float64)
     except (TypeError, ValueError) as error:
         report["reason"] = f"canonicalization_failed: {error}"
         return report
     if source_gray.shape != starmask_gray.shape:
         report["reason"] = "source_starmask_shape_mismatch"
         return report
+    if starless_gray is not None and source_gray.shape != starless_gray.shape:
+        report["reason"] = "source_starless_shape_mismatch"
+        return report
 
     height, width = source_gray.shape
     flux_ratios: List[float] = []
+    residual_flux_ratios: List[float] = []
+    black_hole_ratios: List[float] = []
+    halo_flux_ratios: List[float] = []
     star_records: List[Dict[str, Any]] = []
     for star in stars:
+        if isinstance(star, dict) and bool(star.get("saturated", False)):
+            report["counts"]["excluded_saturated"] += 1
+            continue
         if not isinstance(star, dict) or not bool(
             star.get("eligible_for_local_guard", False)
         ):
@@ -2045,8 +2172,13 @@ def _stage6_catalog_starmask_coverage(
         yy, xx = np.mgrid[y0:y1, x0:x1]
         distance = np.sqrt((xx - x) ** 2 + (yy - y) ** 2)
         aperture = distance <= 2.0 * fwhm
+        halo_ring = (distance > 2.0 * fwhm) & (distance < 3.5 * fwhm)
         annulus = (distance >= 3.5 * fwhm) & (distance <= 5.0 * fwhm)
-        if int(np.count_nonzero(aperture)) < 4 or int(np.count_nonzero(annulus)) < 12:
+        if (
+            int(np.count_nonzero(aperture)) < 4
+            or int(np.count_nonzero(halo_ring)) < 8
+            or int(np.count_nonzero(annulus)) < 12
+        ):
             report["counts"]["excluded_geometry"] += 1
             continue
         source_patch = source_gray[y0:y1, x0:x1]
@@ -2081,6 +2213,31 @@ def _stage6_catalog_starmask_coverage(
         report["counts"]["evaluated"] += 1
         report["counts"]["recovered"] += int(recovered)
         flux_ratios.append(flux_ratio)
+        local_diagnostics: Dict[str, Any] = {}
+        if starless_gray is not None:
+            starless_patch = starless_gray[y0:y1, x0:x1]
+            starless_background = float(np.median(starless_patch[annulus]))
+            starless_delta = starless_patch - starless_background
+            residual_flux_ratio = float(
+                np.sum(np.clip(starless_delta[aperture], 0.0, None))
+                / max(source_flux, 1e-12)
+            )
+            black_hole_ratio = float(
+                np.sum(np.clip(-starless_delta[aperture], 0.0, None))
+                / max(source_flux, 1e-12)
+            )
+            halo_flux_ratio = float(
+                np.sum(np.clip(starless_delta[halo_ring], 0.0, None))
+                / max(source_flux, 1e-12)
+            )
+            residual_flux_ratios.append(residual_flux_ratio)
+            black_hole_ratios.append(black_hole_ratio)
+            halo_flux_ratios.append(halo_flux_ratio)
+            local_diagnostics = {
+                "residual_flux_ratio": residual_flux_ratio,
+                "black_hole_ratio": black_hole_ratio,
+                "halo_flux_ratio": halo_flux_ratio,
+            }
         star_records.append(
             {
                 "index": star.get("index"),
@@ -2091,6 +2248,7 @@ def _stage6_catalog_starmask_coverage(
                 "mask_peak": mask_peak,
                 "mask_sigma": mask_sigma,
                 "recovered": recovered,
+                **local_diagnostics,
             }
         )
     evaluated = int(report["counts"]["evaluated"])
@@ -2098,6 +2256,17 @@ def _stage6_catalog_starmask_coverage(
     report["median_flux_ratio"] = (
         float(np.median(flux_ratios)) if flux_ratios else None
     )
+    if residual_flux_ratios:
+        report["fixed_position_diagnostics"] = {
+            "status": "available",
+            "evaluated_star_count": len(residual_flux_ratios),
+            "residual_flux_ratio_p50": float(np.median(residual_flux_ratios)),
+            "residual_flux_ratio_p95": float(np.quantile(residual_flux_ratios, 0.95)),
+            "black_hole_ratio_p50": float(np.median(black_hole_ratios)),
+            "black_hole_ratio_p95": float(np.quantile(black_hole_ratios, 0.95)),
+            "halo_flux_ratio_p50": float(np.median(halo_flux_ratios)),
+            "halo_flux_ratio_p95": float(np.quantile(halo_flux_ratios, 0.95)),
+        }
     if evaluated < int(report["minimum_evaluated_stars"]):
         report["reason"] = "insufficient_evaluated_catalog_stars"
         return report
@@ -2107,7 +2276,11 @@ def _stage6_catalog_starmask_coverage(
             "status": "available",
             "available": True,
             "coverage_ratio": coverage,
-            "reason": "measured_from_frozen_stage5_catalog",
+            "reason": (
+                "measured_from_shared_stage3_catalog"
+                if report["shared_stage3_catalog"]
+                else "measured_from_frozen_stage5_catalog_fallback"
+            ),
         }
     )
     return report
@@ -2126,6 +2299,17 @@ def stage7_quality_assessment(
     starmask_data = None
     if pipeline.starmask_file and pipeline.starmask_file.exists():
         starmask_data = pipeline._read_image_by_stem(pipeline.starmask_file.stem)
+
+    shared_support = _stage367_scene_support(pipeline)
+    shared_valid_mask = shared_support.get("valid_mask")
+    source_data = _apply_shared_valid_region(source_data, shared_valid_mask)
+    starless_data = _apply_shared_valid_region(starless_data, shared_valid_mask)
+    starmask_data = _apply_shared_valid_region(
+        starmask_data,
+        shared_valid_mask,
+        zero_fill=True,
+    )
+    shared_support_summary = scene_support.scene_support_summary(shared_support)
 
     source_metrics = measure_quality_metrics(source_data) if source_data is not None else QualityMetrics()
     starless_metrics = measure_quality_metrics(starless_data) if starless_data is not None else QualityMetrics()
@@ -2155,7 +2339,24 @@ def stage7_quality_assessment(
         and source_metrics.star_coverage_ratio > 1e-7
     )
     coverage_measurement: Dict[str, Any]
-    if pixel_coverage_reliable:
+    catalog_measurement = (
+        _stage6_catalog_starmask_coverage(
+            pipeline,
+            source_data,
+            starmask_data,
+            starless_data=starless_data,
+        )
+        if starmask_data is not None
+        else None
+    )
+    if (
+        isinstance(catalog_measurement, dict)
+        and catalog_measurement.get("available") is True
+        and catalog_measurement.get("shared_stage3_catalog") is True
+    ):
+        coverage_measurement = catalog_measurement
+        starmask_coverage_ratio = float(catalog_measurement["coverage_ratio"])
+    elif pixel_coverage_reliable:
         starmask_coverage_ratio: Optional[float] = float(
             pixel_starmask_coverage_ratio
         )
@@ -2170,11 +2371,7 @@ def stage7_quality_assessment(
             ),
         }
     elif starmask_data is not None:
-        coverage_measurement = _stage6_catalog_starmask_coverage(
-            pipeline,
-            source_data,
-            starmask_data,
-        )
+        coverage_measurement = catalog_measurement or {}
         starmask_coverage_ratio = (
             float(coverage_measurement["coverage_ratio"])
             if coverage_measurement.get("available") is True
@@ -2221,6 +2418,10 @@ def stage7_quality_assessment(
     )
     galaxy_disk_halo_evidence_available = (
         artifact_scores.get("galaxy_disk_halo_evidence_available", 0.0) > 0.5
+    )
+    galaxy_disk_halo_corroborated_count = int(
+        artifact_scores.get("galaxy_disk_halo_corroborated_local_count", 0)
+        or 0
     )
     galaxy_core_preservation_ratio = artifact_scores.get(
         "galaxy_core_preservation_ratio",
@@ -2360,6 +2561,30 @@ def stage7_quality_assessment(
         value=halo_residue_score,
         accepted_limit=halo_threshold,
     )
+    if (
+        bool(halo_gate.get("hard_failed", False))
+        and target_type in GALAXY_TARGET_TYPES
+        and galaxy_disk_halo_evidence_available
+        and galaxy_disk_halo_corroborated_count == 1
+        and global_halo_residue_score <= halo_threshold
+        and compact_halo_residue_score <= halo_threshold
+    ):
+        # One locally symmetric point inside a real galaxy disk is not enough
+        # to distinguish a stellar halo from a compact bulge/arm crossing.
+        # Preserve the raw score as an advisory, but require either a second
+        # corroborated point or independent global/compact evidence before a
+        # hard rejection can revoke the starless pair.
+        halo_gate = {
+            **halo_gate,
+            "raw_status": halo_gate.get("status"),
+            "status": "advisory",
+            "advisory": True,
+            "hard_failed": False,
+            "reason_code": "single_local_galaxy_halo_evidence",
+            "corroborated_local_count": galaxy_disk_halo_corroborated_count,
+            "independent_global_halo_score": global_halo_residue_score,
+            "independent_compact_halo_score": compact_halo_residue_score,
+        }
     if halo_gate["status"] != "ok":
         if (
             target_type in GALAXY_TARGET_TYPES
@@ -2647,6 +2872,12 @@ def stage7_quality_assessment(
             "dynamic_range_collapse_hard_failed": dynamic_assessment["hard_failed"],
             "starmask_coverage_ratio": starmask_coverage_ratio,
             "starmask_coverage_measurement": coverage_measurement,
+            "shared_catalog_fixed_position_diagnostics": (
+                (catalog_measurement or {}).get("fixed_position_diagnostics")
+            ),
+            "shared_catalog_reference_role": (
+                (catalog_measurement or {}).get("reference_role")
+            ),
             "starmask_width_ratio": starmask_width_ratio,
             "halo_threshold": halo_threshold,
             "bright_core_integrity_status": bright_core_integrity.get("status"),
@@ -2684,6 +2915,7 @@ def stage7_quality_assessment(
         "starless_metrics": asdict(starless_metrics),
         "starmask_metrics": asdict(starmask_metrics) if starmask_data is not None else None,
         "derived": observations["derived"],
+        "shared_scene_support": shared_support_summary,
     }
 
 def stage7_quality_score(pipeline, quality: Optional[Dict[str, Any]]) -> float:
@@ -2862,7 +3094,13 @@ def stage7_repair_triggers(pipeline, quality: Optional[Dict[str, Any]]) -> List[
         triggers.append("residual_stars")
     if compact_residual > float(pipeline.cfg.stage7_residual_star_score_max):
         triggers.append("compact_residual_stars")
-    if halo > float(pipeline._stage7_effective_halo_threshold()):
+    if (
+        halo > float(pipeline._stage7_effective_halo_threshold())
+        and not stage7_single_local_galaxy_halo_override_active(
+            pipeline,
+            quality,
+        )
+    ):
         triggers.append("halo_residue")
     if compact_halo > float(pipeline._stage7_effective_halo_threshold()):
         triggers.append("compact_halo_residue")
@@ -2899,6 +3137,51 @@ def stage7_repair_triggers(pipeline, quality: Optional[Dict[str, Any]]) -> List[
         triggers.append("dynamic_range_collapse")
     return triggers
 
+
+def stage7_single_local_galaxy_halo_override_active(
+    pipeline,
+    quality: Optional[Dict[str, Any]],
+) -> bool:
+    """Revalidate the one-point galaxy-disk advisory across Stage 6 consumers."""
+
+    if not isinstance(quality, dict):
+        return False
+    gates = quality.get("quality_gates")
+    gates = gates if isinstance(gates, dict) else {}
+    galaxy_gate = gates.get("galaxy_disk_halo_residue")
+    if (
+        not isinstance(galaxy_gate, dict)
+        or galaxy_gate.get("reason_code")
+        != "single_local_galaxy_halo_evidence"
+        or galaxy_gate.get("hard_failed") is not False
+    ):
+        return False
+    target_type = str(pipeline._active_target_type() or "").strip().lower()
+    if target_type not in GALAXY_TARGET_TYPES:
+        return False
+    derived = quality.get("derived")
+    derived = derived if isinstance(derived, dict) else {}
+    try:
+        corroborated_count = int(
+            derived.get("galaxy_disk_halo_corroborated_local_count", 0) or 0
+        )
+        global_halo = max(
+            float(derived.get("global_halo_residue_score", 0.0) or 0.0),
+            0.0,
+        )
+        compact_halo = max(
+            float(derived.get("compact_halo_residue_score", 0.0) or 0.0),
+            0.0,
+        )
+        accepted_limit = float(pipeline._stage7_effective_halo_threshold())
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        corroborated_count == 1
+        and global_halo <= accepted_limit
+        and compact_halo <= accepted_limit
+    )
+
 def stage7_update_star_remix_from_quality(
     pipeline,
     quality: Optional[Dict[str, Any]],
@@ -2930,6 +3213,14 @@ def stage7_update_star_remix_from_quality(
         halo_score = 0.0
         contamination_score = 0.0
         cleanup_borderline = False
+    if stage7_single_local_galaxy_halo_override_active(pipeline, quality):
+        try:
+            halo_score = max(
+                float(derived.get("global_halo_residue_score", 0.0) or 0.0),
+                float(derived.get("compact_halo_residue_score", 0.0) or 0.0),
+            )
+        except (AttributeError, TypeError, ValueError):
+            pass
     pipeline._stage7_residual_star_score = max(0.0, residual_score)
 
     threshold = max(float(pipeline.cfg.stage7_residual_star_score_max), 1e-4)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import builtins
+import hashlib
 import unittest
 from unittest.mock import patch
 
@@ -13,11 +14,19 @@ from pipeline.stage2_crop_detector import (
     crop_black_boundary_evidence,
     detect_field_rotation_crop,
     detect_native_contour_crop,
+    infer_stacked_master_footprint,
     largest_rectangle_in_mask,
 )
 
 
 class Stage2NativeCropDetectorTests(unittest.TestCase):
+    @staticmethod
+    def _decode_grid(grid: dict) -> bytes:
+        decoded = bytearray()
+        for value, count in grid["runs"]:
+            decoded.extend([int(value)] * int(count))
+        return bytes(decoded)
+
     def test_largest_rectangle_fallback_stays_inside_mask(self) -> None:
         mask = np.zeros((8, 10), dtype=np.uint8)
         mask[1:7, 2:9] = 255
@@ -132,6 +141,108 @@ class Stage2NativeCropDetectorTests(unittest.TestCase):
         self.assertFalse(result.accepted)
         self.assertIsNone(result.rect)
         self.assertEqual(result.reason, "opencv_unavailable")
+
+    def test_observer_grid_is_bounded_deterministic_and_does_not_change_crop(self) -> None:
+        image = np.full((3, 100, 120), 0.02, dtype=np.float32)
+        image[:, :8, :] = 0.0
+        image[:, -8:, :] = 0.0
+        image[:, :, :8] = 0.0
+        image[:, :, -8:] = 0.0
+
+        baseline = detect_native_contour_crop(image)
+        observed = detect_native_contour_crop(
+            image,
+            include_observer_grid=True,
+        )
+        repeated = detect_native_contour_crop(
+            image,
+            include_observer_grid=True,
+        )
+
+        self.assertEqual(
+            (observed.accepted, observed.reason, observed.rect),
+            (baseline.accepted, baseline.reason, baseline.rect),
+        )
+        self.assertNotIn("observer_grid", baseline.evidence)
+        grid = observed.evidence["observer_grid"]
+        self.assertLessEqual(max(grid["rows"], grid["columns"]), 64)
+        decoded = self._decode_grid(grid)
+        self.assertEqual(len(decoded), grid["rows"] * grid["columns"])
+        self.assertTrue(all(0 <= value <= 100 for value in decoded))
+        self.assertEqual(hashlib.sha256(decoded).hexdigest(), grid["sha256"])
+        self.assertEqual(grid, repeated.evidence["observer_grid"])
+
+    def test_stacked_master_footprint_contains_two_observer_layers(self) -> None:
+        image, _coverage_wedges = self._field_rotation_image()
+
+        report = infer_stacked_master_footprint(
+            image,
+            source_artifact="stage1_prepared.fit",
+            source_sha256="a" * 64,
+        )
+
+        self.assertEqual(
+            report["schema"],
+            "starun.stage2-stacked-footprint-evidence.v1",
+        )
+        self.assertEqual(report["status"], "available")
+        self.assertTrue(report["observer_only"])
+        self.assertTrue(report["captured_before_crop"])
+        self.assertEqual(report["source_sha256"], "a" * 64)
+        self.assertEqual(
+            set(report["layers"]),
+            {"fill_support", "relative_coverage"},
+        )
+        for layer in report["layers"].values():
+            self.assertEqual(layer["status"], "available")
+            grid = layer["grid"]
+            decoded = self._decode_grid(grid)
+            self.assertEqual(
+                hashlib.sha256(decoded).hexdigest(),
+                grid["sha256"],
+            )
+
+    def test_stacked_master_footprint_is_partial_without_opencv(self) -> None:
+        image, _coverage_wedges = self._field_rotation_image()
+        real_import = builtins.__import__
+
+        def reject_cv2(name, *args, **kwargs):
+            if name == "cv2":
+                raise ImportError("forced missing cv2")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=reject_cv2):
+            report = infer_stacked_master_footprint(image)
+
+        self.assertEqual(report["status"], "partial")
+        self.assertEqual(report["layers"]["fill_support"]["status"], "unavailable")
+        self.assertEqual(
+            report["layers"]["relative_coverage"]["status"],
+            "available",
+        )
+
+    def test_stacked_master_footprint_isolates_unexpected_layer_failure(self) -> None:
+        image, _coverage_wedges = self._field_rotation_image()
+
+        with patch(
+            "pipeline.stage2_crop_detector.detect_native_contour_crop",
+            side_effect=Exception("forced observer failure"),
+        ):
+            report = infer_stacked_master_footprint(image)
+
+        self.assertEqual(report["status"], "partial")
+        self.assertEqual(report["layers"]["fill_support"]["status"], "unavailable")
+        self.assertEqual(
+            report["layers"]["relative_coverage"]["status"],
+            "available",
+        )
+
+    def test_stacked_master_footprint_invalid_image_is_unavailable(self) -> None:
+        report = infer_stacked_master_footprint(np.asarray(1.0))
+
+        self.assertEqual(report["status"], "unavailable")
+        self.assertEqual(report["layers"], {})
+        self.assertTrue(report["observer_only"])
 
     @staticmethod
     def _field_rotation_image() -> tuple[np.ndarray, np.ndarray]:

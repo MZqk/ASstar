@@ -4,6 +4,97 @@ from tests.pipeline_plugin_fallbacks_support import *  # noqa: F401,F403
 
 
 class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase):
+    def test_stage3_outer_halo_keeps_better_scored_polynomial_fidelity(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        polynomial = {
+            "label": "subsky-poly-existing",
+            "score": 0.0828,
+            "preservation": {
+                "target_flux_retention_ratio": 0.9999,
+                "target_morphology_correlation": 0.999999,
+            },
+        }
+        rbf = {
+            "label": "subsky-rbf-existing-2",
+            "score": 0.0881,
+            "preservation": {
+                "target_flux_retention_ratio": 0.9963,
+                "target_morphology_correlation": 0.999993,
+            },
+        }
+
+        selected, report = stage3_module._stage3_outer_halo_selection_override(
+            polynomial,
+            rbf,
+            {"protect_outer_halo": True},
+        )
+
+        self.assertIs(selected, polynomial)
+        self.assertTrue(report["applied"])
+        self.assertEqual(
+            report["reason_code"],
+            "outer_halo_low_order_fidelity_preferred",
+        )
+
+    def test_stage3_outer_halo_allows_rbf_with_better_aggregate_score(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        polynomial = {
+            "label": "subsky-poly-existing",
+            "score": 0.12,
+            "preservation": {"target_flux_retention_ratio": 1.0},
+        }
+        rbf = {
+            "label": "subsky-rbf-existing-2",
+            "score": 0.08,
+            "preservation": {"target_flux_retention_ratio": 0.997},
+        }
+
+        selected, report = stage3_module._stage3_outer_halo_selection_override(
+            polynomial,
+            rbf,
+            {"protect_outer_halo": True},
+        )
+
+        self.assertIs(selected, rbf)
+        self.assertFalse(report["applied"])
+
+    def test_stage3_outer_halo_keeps_materially_cleaner_safe_rbf(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        polynomial = {
+            "label": "subsky-poly-existing",
+            "score": 0.0828,
+            "validation": {"robust_span": 3.58e-5},
+            "preservation": {
+                "target_flux_retention_ratio": 0.9999,
+                "target_morphology_correlation": 0.999999,
+                "target_centroid_shift_fraction": 1.2e-5,
+            },
+        }
+        rbf = {
+            "label": "subsky-rbf-existing-2",
+            "score": 0.0881,
+            "validation": {"robust_span": 1.11e-5},
+            "preservation": {
+                "target_flux_retention_ratio": 0.9963,
+                "target_morphology_correlation": 0.999993,
+                "target_centroid_shift_fraction": 0.00022,
+            },
+        }
+
+        selected, report = stage3_module._stage3_outer_halo_selection_override(
+            polynomial,
+            rbf,
+            {"protect_outer_halo": True},
+        )
+
+        self.assertIs(selected, rbf)
+        self.assertFalse(report["applied"])
+        self.assertTrue(report["preserved_statistical_selection"])
+        self.assertEqual(
+            report["reason_code"],
+            "rbf_material_background_gain_within_outer_halo_fidelity_budget",
+        )
+
     def test_background_chroma_noise_ignores_smooth_colour_bias(self):
         processor = pipeline_module.StarunPostProcessor()
         smooth_red = np.full((3, 64, 64), 0.04, dtype=np.float32)
@@ -286,6 +377,135 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
         )
         self.assertTrue(report["selection_would_change"])
 
+    def test_stage3_verified_background_color_normalization_clears_only_generic_warning(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        before = {
+            "bg_std": 0.00021,
+            "gradient_score": 0.13,
+            "dirty_background_score": 0.09,
+            "chroma_noise_score": 0.15,
+            "red_dominance": 2.75,
+            "blue_dominance": 0.89,
+            "green_cast": 0.55,
+            "color_balance_score": 0.07,
+        }
+        accepted_gate = {"accepted": True, "severity": "normal"}
+        candidate = {
+            "source": "builtin",
+            "score": 0.76,
+            "gate_warnings": [
+                "candidate does not meet clean-output sufficiency thresholds"
+            ],
+            "hard_gate_metrics_available": True,
+            "after_adaptive": {
+                "bg_std": 0.00016,
+                "gradient_score": 0.018,
+                "dirty_background_score": 0.014,
+                "chroma_noise_score": 0.015,
+                "red_dominance": 1.28,
+                "blue_dominance": 0.97,
+                "green_cast": 0.89,
+                "color_balance_score": 0.83,
+            },
+            "background_score_components": {
+                "components": {"color_shift": 1.47},
+                "weighted_components": {"color_shift": 0.66},
+            },
+            "preservation": {
+                "target_flux_retention_ratio": 0.98,
+                "target_morphology_correlation": 0.9998,
+                "target_centroid_shift_fraction": 0.006,
+                "target_change_residual_significance": 0.34,
+            },
+            "pixel_integrity_gate": accepted_gate,
+            "target_fidelity_gate": accepted_gate,
+            "validation_gate": accepted_gate,
+            "pattern_quality_gate": accepted_gate,
+        }
+        final_output = {
+            "accepted": True,
+            "severity": "normal",
+            "pixel_integrity_gate": accepted_gate,
+        }
+
+        report = stage3_module._stage3_verified_background_color_normalization(
+            before,
+            candidate,
+            final_output,
+            gate_profile="output_first",
+        )
+
+        self.assertTrue(report["applied"], report)
+        self.assertEqual(
+            report["reason_code"],
+            "verified_background_color_normalization",
+        )
+        candidate.update(
+            label="subsky-rbf-existing-2",
+            sufficient=False,
+            validation={
+                "status": "ready",
+                "robust_span": 0.00015,
+                "patch_median_uncertainty": 0.00003,
+            },
+            directional_pattern_penalty=0.0,
+        )
+        candidate_evidence = (
+            stage3_module._stage3_color_normalization_candidate_evidence(
+                candidate
+            )
+        )
+        self.assertTrue(candidate_evidence["eligible"], candidate_evidence)
+        adbe = {
+            "label": "ADBE",
+            "source": "plugin",
+            "score": 0.34,
+            "sufficient": True,
+            "severity": "normal",
+            "gate_warnings": [],
+            "validation": {
+                "status": "ready",
+                "robust_span": 0.00020,
+                "patch_median_uncertainty": 0.00003,
+            },
+            "validation_gate": accepted_gate,
+            "preservation": {
+                "target_flux_retention_ratio": 1.04,
+                "target_morphology_correlation": 0.89,
+                "target_centroid_shift_fraction": 0.049,
+                "target_change_residual_significance": 1.31,
+            },
+        }
+        selection = stage3_module._stage3_statistical_shadow_selection(
+            [candidate, adbe],
+            adbe,
+        )
+        self.assertEqual(
+            selection["shadow_recommended_candidate"],
+            "subsky-rbf-existing-2",
+        )
+        selected_row = next(
+            row
+            for row in selection["candidates"]
+            if row["label"] == "subsky-rbf-existing-2"
+        )
+        self.assertTrue(selected_row["verified_color_normalization_candidate"])
+
+        candidate["preservation"] = {
+            **candidate["preservation"],
+            "target_morphology_correlation": 0.90,
+        }
+        rejected = stage3_module._stage3_verified_background_color_normalization(
+            before,
+            candidate,
+            final_output,
+            gate_profile="output_first",
+        )
+        self.assertFalse(rejected["applied"], rejected)
+        self.assertIn(
+            "target_signal_preservation_evidence_failed",
+            rejected["issues"],
+        )
     def test_stage3_pixel_integrity_gate_hard_rejects_invalid_outputs(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
         baseline = np.ones((8, 10), dtype=np.float32)

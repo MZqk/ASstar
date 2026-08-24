@@ -20,6 +20,7 @@ from gui.task_intake import (  # noqa: E402
     discover_input_for_processing_settings,
     prepare_task_queue,
     stage4_online_spcc_timeout_detected,
+    stage4_online_spcc_timeout_evidence,
     stage_config_from_processing_settings,
 )
 from pipeline import run_manifest, task_plan  # noqa: E402
@@ -321,6 +322,11 @@ class GuiTaskIntakeTests(unittest.TestCase):
                         stage4_online_spcc_timeout_detected(run_root),
                         expected,
                     )
+                    evidence = stage4_online_spcc_timeout_evidence(run_root)
+                    self.assertEqual(evidence is not None, expected)
+                    if expected:
+                        self.assertEqual(evidence["status"], "timeout")
+                        self.assertEqual(evidence["label"], "catalog:gaia")
 
     def test_product_task_selects_latest_checkpoint_compatible_with_settings(self) -> None:
         with tempfile.TemporaryDirectory() as td:

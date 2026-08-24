@@ -235,6 +235,28 @@ class Stage7RenditionTests(unittest.TestCase):
                 factor=1.18,
             )
 
+    def test_high_factor_subject_chroma_is_still_luminance_and_gamut_bounded(self) -> None:
+        image, masks = self._scene()
+        rendered, metadata = stage7_stretch_metrics.apply_subject_chroma_rendition(
+            image,
+            masks,
+            factor=6.0,
+        )
+        source_luma = (
+            0.2126 * image[0] + 0.7152 * image[1] + 0.0722 * image[2]
+        )
+        rendered_luma = (
+            0.2126 * rendered[0]
+            + 0.7152 * rendered[1]
+            + 0.0722 * rendered[2]
+        )
+
+        np.testing.assert_allclose(rendered_luma, source_luma, atol=2e-7)
+        self.assertLessEqual(float(np.max(rendered)), 0.995001)
+        self.assertGreaterEqual(float(np.min(rendered)), 0.0)
+        self.assertEqual(metadata["factor"], 6.0)
+        self.assertEqual(metadata["newly_clipped_ratio"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

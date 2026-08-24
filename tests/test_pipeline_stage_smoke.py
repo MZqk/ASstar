@@ -1491,10 +1491,15 @@ class PipelineStageTests(unittest.TestCase):
         )
         support = plan.pop("_compact_support_mask")
         compact = stage9_quality.apply_compact_starmask_support(stars, support)
+        distance = stage9_quality.scipy_ndimage.distance_transform_edt(~support)
+        feather = (~support) & (distance <= np.sqrt(2.0) + 1.0e-6)
+        outside = (~support) & ~feather
 
         self.assertEqual(plan["status"], "ok")
         self.assertTrue(np.any(stars[:, ~support] > 0.0))
-        self.assertTrue(np.all(compact[:, ~support] == 0.0))
+        self.assertTrue(np.any(compact[:, feather] > 0.0))
+        self.assertTrue(np.all(compact[:, outside] == 0.0))
+        self.assertTrue(np.all(compact[:, feather] < stars[:, feather]))
         np.testing.assert_allclose(compact[:, support], stars[:, support])
         self.assertLessEqual(
             plan["predicted_change_ratio"],
@@ -2456,6 +2461,151 @@ class PipelineStageSmokeTests(unittest.TestCase):
         self.assertEqual(self.pipeline.results[-1][1], "ok")
         self.assertTrue((self.process_dir / "stage2_corrected.fit").exists())
         self.assertEqual(self.pipeline.stage2_crop_report["mode"], "native_no_crop")
+        self.assertEqual(
+            self.pipeline.stage2_crop_report["stacked_master_footprint"]["status"],
+            "unavailable",
+        )
+
+    def test_stage2_footprint_failure_does_not_change_stage_result(self) -> None:
+        self.pipeline.siril.get_image_pixeldata = lambda preview=False: np.ones(
+            (3, 100, 100),
+            dtype=np.float32,
+        )
+        with (
+            patch.object(
+                stage2_view_correction,
+                "infer_stacked_master_footprint",
+                side_effect=Exception("forced observer failure"),
+            ),
+            patch.object(
+                stage2_view_correction,
+                "_detect_native_contour_candidate",
+                return_value=(
+                    None,
+                    "native contour crop skipped: no candidate",
+                    {
+                        "method": "native_contour",
+                        "accepted": False,
+                        "reason": "no_candidate",
+                        "candidate": None,
+                    },
+                ),
+            ),
+            patch.object(
+                stage2_view_correction,
+                "_detect_auto_edge_crop",
+                return_value=(None, "no crop"),
+            ),
+            patch.object(
+                stage2_view_correction,
+                "_edge_color_artifact_crop",
+                return_value="",
+            ),
+        ):
+            stage2_view_correction.run_stage2_view_correction(self.pipeline)
+
+        self.assertEqual(self.pipeline.results[-1][1], "ok")
+        self.assertEqual(
+            self.pipeline.stage2_crop_report["stacked_master_footprint"]["status"],
+            "unavailable",
+        )
+        self.assertEqual(self.pipeline.stage2_crop_report["advisories"], [])
+        self.assertFalse(self.pipeline.stage2_crop_report["requires_review"])
+
+    def test_stage2_footprint_observer_runs_before_crop_without_owning_decision(self) -> None:
+        observed_before_commands = []
+        footprint = {
+            "schema": "starun.stage2-stacked-footprint-evidence.v1",
+            "status": "available",
+            "source_mode": "stacked_master_inference",
+            "observer_only": True,
+            "captured_before_crop": True,
+            "source_artifact": "stage1_prepared.fit",
+            "source_sha256": "a" * 64,
+            "input_shape": {"channels": 3, "height": 100, "width": 100},
+            "layers": {
+                "fill_support": {"status": "available"},
+                "relative_coverage": {"status": "available"},
+            },
+            "limitations": [
+                "not_per_frame_registration_footprint",
+                "not_crop_authority",
+            ],
+        }
+
+        def observe(_pipeline, _shape):
+            observed_before_commands.append(list(self.pipeline.commands))
+            return footprint
+
+        with (
+            patch.object(
+                stage2_view_correction,
+                "_stage2_stacked_master_footprint",
+                side_effect=observe,
+            ),
+            patch.object(
+                stage2_view_correction,
+                "_detect_native_contour_candidate",
+                return_value=(
+                    (4, 4, 92, 92),
+                    "native contour crop detected",
+                    {
+                        "method": "native_contour",
+                        "accepted": True,
+                        "reason": "near_black_boundary_confirmed",
+                        "candidate": {"x": 4, "y": 4, "width": 92, "height": 92},
+                    },
+                ),
+            ),
+            patch.object(stage2_view_correction, "_detect_auto_edge_crop") as fallback,
+            patch.object(stage2_view_correction, "_edge_color_artifact_crop") as color,
+        ):
+            stage2_view_correction.run_stage2_view_correction(self.pipeline)
+
+        self.assertEqual(observed_before_commands, [[]])
+        self.assertEqual(self.pipeline.commands, [("crop", "4", "4", "92", "92")])
+        fallback.assert_not_called()
+        color.assert_not_called()
+        self.assertIs(
+            self.pipeline.stage2_crop_report["stacked_master_footprint"],
+            footprint,
+        )
+        self.assertEqual(self.pipeline.results[-1][1], "ok")
+        self.assertFalse(self.pipeline.stage2_crop_report["requires_review"])
+
+    def test_stage2_preserve_mode_keeps_footprint_without_status_effect(self) -> None:
+        self.pipeline.cfg.stage2_processing_mode = "preserve"
+        footprint = {
+            "schema": "starun.stage2-stacked-footprint-evidence.v1",
+            "status": "unavailable",
+            "source_mode": "stacked_master_inference",
+            "observer_only": True,
+            "captured_before_crop": True,
+            "source_artifact": None,
+            "source_sha256": None,
+            "input_shape": {"channels": 3, "height": 100, "width": 100},
+            "layers": {},
+            "limitations": [
+                "not_per_frame_registration_footprint",
+                "not_crop_authority",
+            ],
+        }
+        with patch.object(
+            stage2_view_correction,
+            "_stage2_stacked_master_footprint",
+            return_value=footprint,
+        ) as observer:
+            stage2_view_correction.run_stage2_view_correction(self.pipeline)
+
+        observer.assert_called_once()
+        self.assertEqual(self.pipeline.commands, [])
+        self.assertEqual(self.pipeline.results[-1][1], "ok")
+        self.assertEqual(self.pipeline.stage2_crop_report["mode"], "user_preserve")
+        self.assertIs(
+            self.pipeline.stage2_crop_report["stacked_master_footprint"],
+            footprint,
+        )
+        self.assertEqual(self.pipeline.stage2_crop_report["advisories"], [])
 
     def test_stage2_native_contour_uses_guarded_crop_and_skips_fallback(self) -> None:
         with (
@@ -2868,6 +3018,166 @@ class PipelineStageSmokeTests(unittest.TestCase):
             report["full_frame_context"]["advisory_authorized"]
         )
         self.assertTrue(report["advisories"])
+
+    def test_stage2_s30_physical_geometry_downgrades_non_wedge_anomaly(self) -> None:
+        self.pipeline.source_file = self.root / (
+            "SeestarS30Pro-M8-60s169_IRCUT.xisf"
+        )
+        self.pipeline.siril.get_image_shape = lambda: (3, 3772, 2146)
+        self.pipeline._read_fits_header_metadata = lambda *_args: {
+            "_header_source": "stage1_prepared.fit",
+            "TELESCOP": "S30 Pro_6a110e03",
+            "INSTRUME": "imx585",
+            "NAXIS1": 2146,
+            "NAXIS2": 3772,
+            "RA": 271.311860502958,
+            "DEC": -23.5068506982248,
+            "FOCALLEN": 160.0,
+            "XPIXSZ": 2.9,
+            "YPIXSZ": 2.9,
+        }
+        no_contour = (
+            None,
+            "native contour crop skipped: full frame valid",
+            {
+                "method": "native_contour",
+                "accepted": False,
+                "reason": "full_frame_is_valid",
+                "candidate": None,
+            },
+        )
+        non_wedge_anomaly = (
+            None,
+            "field-rotation anomaly lacks corner wedge geometry",
+            {
+                "method": "native_field_rotation",
+                "accepted": False,
+                "reason": "edge_connected_anomaly_lacks_corner_wedge_geometry",
+                "candidate": None,
+                "evidence": {
+                    "edge_connected_ratio": 0.08,
+                    "wedge_geometry_confirmed": False,
+                    "corner_hit_count": 1,
+                    "boundary_side_count": 2,
+                },
+            },
+        )
+        with (
+            patch.object(
+                stage2_view_correction,
+                "_detect_native_contour_candidate",
+                return_value=no_contour,
+            ),
+            patch.object(
+                stage2_view_correction,
+                "_detect_field_rotation_candidate",
+                return_value=non_wedge_anomaly,
+            ),
+            patch.object(
+                stage2_view_correction,
+                "_detect_auto_edge_crop",
+            ) as edge_detect,
+        ):
+            stage2_view_correction.run_stage2_view_correction(self.pipeline)
+
+        edge_detect.assert_not_called()
+        report = self.pipeline.stage2_crop_report
+        self.assertEqual(self.pipeline.commands, [])
+        self.assertEqual(self.pipeline.results[-1][1], "ok")
+        self.assertFalse(report["requires_review"])
+        self.assertEqual(
+            report["reason_code"],
+            "field_rotation_full_frame_advisory",
+        )
+        self.assertEqual(report["full_frame_context"]["known_device"], "seestar s30 pro")
+        self.assertTrue(report["full_frame_context"]["native_frame_match"])
+        self.assertFalse(report["full_frame_context"]["wcs_valid"])
+        self.assertTrue(
+            report["full_frame_context"]["astrometric_geometry_valid"]
+        )
+        self.assertTrue(report["full_frame_context"]["advisory_authorized"])
+        self.assertEqual(
+            report["field_rotation"]["application_status"],
+            "rejected_full_frame_advisory",
+        )
+
+    def test_stage2_signed_source_name_supplies_s30_identity_for_full_frame(self) -> None:
+        self.pipeline.source_file = None
+        self.pipeline._stage1_original_source_file = self.root / (
+            "SeestarS30Pro-NGC6888-60s720_LP.xisf"
+        )
+        self.pipeline.siril.get_image_shape = lambda: (3, 3840, 2160)
+        self.pipeline._read_fits_header_metadata = lambda *_args: {
+            "_header_source": "stage1_prepared.fit",
+            "INSTRUME": "imx585",
+            "NAXIS1": 2160,
+            "NAXIS2": 3840,
+            "RA": 303.280899104167,
+            "DEC": 38.4100161652774,
+            "FOCALLEN": 160.0,
+            "XPIXSZ": 2.9,
+            "YPIXSZ": 2.9,
+        }
+        no_contour = (
+            None,
+            "native contour crop skipped: full frame valid",
+            {
+                "method": "native_contour",
+                "accepted": False,
+                "reason": "full_frame_is_valid",
+                "candidate": None,
+            },
+        )
+        non_wedge_anomaly = (
+            None,
+            "field-rotation anomaly lacks corner wedge geometry",
+            {
+                "method": "native_field_rotation",
+                "accepted": False,
+                "reason": "edge_connected_anomaly_lacks_corner_wedge_geometry",
+                "candidate": None,
+                "evidence": {
+                    "edge_connected_ratio": 0.0326,
+                    "wedge_geometry_confirmed": False,
+                    "corner_hit_count": 2,
+                    "boundary_side_count": 4,
+                },
+            },
+        )
+        with (
+            patch.object(
+                stage2_view_correction,
+                "_detect_native_contour_candidate",
+                return_value=no_contour,
+            ),
+            patch.object(
+                stage2_view_correction,
+                "_detect_field_rotation_candidate",
+                return_value=non_wedge_anomaly,
+            ),
+            patch.object(
+                stage2_view_correction,
+                "_detect_auto_edge_crop",
+            ) as edge_detect,
+        ):
+            stage2_view_correction.run_stage2_view_correction(self.pipeline)
+
+        edge_detect.assert_not_called()
+        report = self.pipeline.stage2_crop_report
+        self.assertFalse(report["requires_review"])
+        self.assertEqual(self.pipeline.results[-1][1], "ok")
+        self.assertEqual(
+            report["reason_code"],
+            "field_rotation_full_frame_advisory",
+        )
+        self.assertEqual(
+            report["full_frame_context"]["known_device"],
+            "seestar s30 pro",
+        )
+        self.assertTrue(report["full_frame_context"]["native_frame_match"])
+        self.assertTrue(
+            report["full_frame_context"]["astrometric_geometry_valid"]
+        )
 
     def test_stage2_second_field_rotation_crop_clears_residual(self) -> None:
         no_contour = (

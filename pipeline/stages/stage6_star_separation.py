@@ -1,9 +1,13 @@
 """Star separation and star-mask preparation."""
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+
 from models import PipelineStage, StarSeparationState
 from pipeline_safety import should_bypass_star_separation
 from sirilpy.exceptions import CommandError, SirilError
+import scene_support
+import stage7_repair
 import stage7_quality
 import syqon_starless
 
@@ -422,14 +426,28 @@ def _stage6_quality_hard_failure_summary(
             return 0.0
 
     combined_halo = metric("halo_residue_score")
-    effective_halo = max(
-        combined_halo,
+    global_halo = (
         metric("global_halo_residue_score")
         if "global_halo_residue_score" in derived
-        else combined_halo,
-        metric("compact_halo_residue_score"),
-        metric("galaxy_disk_halo_residue_score"),
+        else combined_halo
     )
+    compact_halo = metric("compact_halo_residue_score")
+    galaxy_disk_halo = metric("galaxy_disk_halo_residue_score")
+    single_local_galaxy_halo_override = (
+        stage7_quality.stage7_single_local_galaxy_halo_override_active(
+            pipeline,
+            quality,
+        )
+    )
+    if single_local_galaxy_halo_override:
+        effective_halo = max(global_halo, compact_halo)
+    else:
+        effective_halo = max(
+            combined_halo,
+            global_halo,
+            compact_halo,
+            galaxy_disk_halo,
+        )
     gates = {
         "residual": stage7_quality.stage7_upper_quality_gate(
             pipeline.cfg,
@@ -513,12 +531,21 @@ def _stage8_handoff_from_stage6(
     )
     compact_halo = metric("compact_halo_residue_score")
     galaxy_disk_halo = metric("galaxy_disk_halo_residue_score")
-    effective_halo = max(
-        combined_halo,
-        global_halo,
-        compact_halo,
-        galaxy_disk_halo,
+    single_local_galaxy_halo_override = (
+        stage7_quality.stage7_single_local_galaxy_halo_override_active(
+            pipeline,
+            quality,
+        )
     )
+    if single_local_galaxy_halo_override:
+        effective_halo = max(global_halo, compact_halo)
+    else:
+        effective_halo = max(
+            combined_halo,
+            global_halo,
+            compact_halo,
+            galaxy_disk_halo,
+        )
     residual_score = metric("residual_star_score")
     noise_gain = metric("starless_noise_gain")
     base_limit = float(pipeline.cfg.stage7_halo_residue_score_max)
@@ -528,11 +555,24 @@ def _stage8_handoff_from_stage6(
     quality_hard_failed_retained = bool(
         getattr(pipeline, "_stage6_quality_hard_failed_retained", False)
     )
-    quality_advisories = [
+    raw_quality_advisories = [
         str(item).strip()
         for item in (quality.get("advisories") or [])
         if str(item).strip()
     ]
+    suppressed_quality_advisories: List[str] = []
+    quality_advisories = raw_quality_advisories
+    if single_local_galaxy_halo_override:
+        suppressed_quality_advisories = [
+            item
+            for item in raw_quality_advisories
+            if item.startswith("galaxy_disk_halo_residue ")
+        ]
+        quality_advisories = [
+            item
+            for item in raw_quality_advisories
+            if item not in suppressed_quality_advisories
+        ]
     cleanup_borderline = bool(
         derived.get("starmask_cleanup_borderline", False)
     )
@@ -798,6 +838,8 @@ def _stage8_handoff_from_stage6(
         "reason_text": reason_text,
         "reasons": reasons,
         "quality_status": quality_status,
+        "advisories": raw_quality_advisories,
+        "suppressed_advisories": suppressed_quality_advisories,
         "metrics": handoff_metrics,
         "repair": {
             "attempted": bool(pixel_repairs),
@@ -1247,6 +1289,18 @@ def run_stage6_star_separation(pipeline) -> None:
     pipeline._selected_syqon_pair_id = None
     pipeline._selected_syqon_attempt_id = None
     pipeline._stage6_pair_handoff = None
+    existing_scene_support = getattr(pipeline, "_stage3_scene_support", None)
+    legacy_scene_support = bool(
+        isinstance(existing_scene_support, dict)
+        and str(
+            ((existing_scene_support.get("manifest") or {}).get("reason_code"))
+            or ""
+        )
+        == "legacy_checkpoint_without_scene_support"
+    )
+    shared_scene_support_summary = scene_support.scene_support_summary(
+        getattr(pipeline, "_stage3_scene_support", None)
+    )
     pipeline._stage6_galaxy_roi_diagnostics = (
         _stage6_galaxy_roi_diagnostics()
     )
@@ -1277,6 +1331,41 @@ def run_stage6_star_separation(pipeline) -> None:
     selected_source_stem, star_separation_mode, mode_input_records = (
         _prepare_star_separation_source(pipeline)
     )
+    if not legacy_scene_support and getattr(pipeline, "process_dir", None) is not None:
+        try:
+            stage6_source_pixels = pipeline.siril.get_image_pixeldata(preview=False)
+            if stage6_source_pixels is None:
+                raise ValueError("Stage 6 source pixel buffer is unavailable")
+            pipeline._stage3_scene_support = scene_support.load_scene_support(
+                pipeline.process_dir,
+                expected_shape=tuple(np.asarray(stage6_source_pixels).shape),
+            )
+        except (
+            AttributeError,
+            CommandError,
+            SirilError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            debug_log = getattr(pipeline.log, "debug", None)
+            if callable(debug_log):
+                debug_log(
+                    f"stage6 shared scene support validation unavailable: {error}"
+                )
+            pipeline._stage3_scene_support = {
+                "status": "unavailable",
+                "manifest": scene_support.unavailable_scene_support(
+                    str(error),
+                    reason_code="stage6_scene_support_validation_unavailable",
+                ),
+                "valid_mask": None,
+                "saturation_map": None,
+            }
+        shared_scene_support_summary = scene_support.scene_support_summary(
+            pipeline._stage3_scene_support
+        )
     target_type = (
         pipeline._active_target_type()
         if hasattr(pipeline, "_active_target_type")
@@ -1365,6 +1454,7 @@ def run_stage6_star_separation(pipeline) -> None:
                 "stage6_starless_quality.json",
                 {
                     "attempts": [quality_record],
+                    "shared_scene_support": shared_scene_support_summary,
                     "selected": quality_record,
                     "galaxy_roi": pipeline._stage6_galaxy_roi_diagnostics,
                     "mode": bypass_reason,
@@ -1447,6 +1537,7 @@ def run_stage6_star_separation(pipeline) -> None:
                     "stage6_starless_quality.json",
                     {
                         "attempts": [],
+                        "shared_scene_support": shared_scene_support_summary,
                         "selected": None,
                         "galaxy_roi": pipeline._stage6_galaxy_roi_diagnostics,
                         "mode": "user_preserve",
@@ -1794,11 +1885,82 @@ def run_stage6_star_separation(pipeline) -> None:
                         retry_quality["final_selection_state"] = (
                             "rejected_bright_core_integrity"
                         )
-                        bright_core_retry_terminal_failure = True
-                        stage_messages.append(
-                            "zenith_bright_core_ihs_recovery rejected; bad pair "
-                            "will be purged without restoring the baseline"
+                        repair_snapshot = pipeline._stage7_snapshot_current_outputs(
+                            "before_bright_core_overshoot_repair"
                         )
+                        bright_core_repair = (
+                            stage7_repair.apply_stage6_bright_core_overshoot_repair(
+                                pipeline,
+                                source_stem=selected_source_stem,
+                                label="bright_core_ihs_bounded_overshoot_repair",
+                            )
+                        )
+                        starless_pixel_repair_records.append(bright_core_repair)
+                        if bright_core_repair.get("status") == "applied":
+                            repaired_quality = pipeline._stage7_quality_assessment(
+                                "bright_core_ihs_after_bounded_overshoot_repair",
+                                tool_label="bounded bright-core overshoot repair",
+                                source_stem=selected_source_stem,
+                            )
+                            repaired_quality = _apply_starmask_cleanup_hard_gate(
+                                repaired_quality,
+                                retry_cleanup,
+                            )
+                            repaired_quality["retry_profile"] = (
+                                recovery_profile.manifest()
+                            )
+                            quality_records.append(repaired_quality)
+                            repair_safe = _stage6_bright_core_retry_passed(
+                                repaired_quality
+                            )
+                            bright_core_repair["accepted"] = repair_safe
+                            bright_core_repair["quality_after"] = repaired_quality
+                            bright_core_retry["bounded_overshoot_repair"] = (
+                                bright_core_repair
+                            )
+                            if repair_safe:
+                                quality_records[0]["final_selection_state"] = (
+                                    "superseded_by_bright_core_recovery"
+                                )
+                                retry_quality["final_selection_state"] = (
+                                    "superseded_by_bounded_overshoot_repair"
+                                )
+                                repaired_quality["final_selection_state"] = "selected"
+                                selected_quality = repaired_quality
+                                bright_core_retry.update(
+                                    {
+                                        "accepted": True,
+                                        "status": "accepted_after_bounded_repair",
+                                        "quality_status": repaired_quality.get("status"),
+                                        "bright_core_integrity": repaired_quality.get(
+                                            "bright_core_integrity"
+                                        ),
+                                    }
+                                )
+                                stage_messages.append(
+                                    "zenith_bright_core_ihs_recovery accepted after "
+                                    "bounded frozen-source overshoot repair"
+                                )
+                            else:
+                                pipeline._stage7_restore_snapshot(repair_snapshot)
+                                selected_quality = retry_quality
+                                bright_core_retry_terminal_failure = True
+                                stage_messages.append(
+                                    "bounded bright-core overshoot repair failed the "
+                                    "full Stage 6 recheck and was rolled back"
+                                )
+                        else:
+                            pipeline._stage7_restore_snapshot(repair_snapshot)
+                            selected_quality = retry_quality
+                            bright_core_retry["bounded_overshoot_repair"] = (
+                                bright_core_repair
+                            )
+                            bright_core_retry_terminal_failure = True
+                            stage_messages.append(
+                                "zenith_bright_core_ihs_recovery rejected; bounded "
+                                "overshoot repair was unavailable, so the bad pair "
+                                "will be purged"
+                            )
                 else:
                     bright_core_retry_terminal_failure = True
                     bright_core_retry.update(
@@ -2090,13 +2252,12 @@ def run_stage6_star_separation(pipeline) -> None:
             pipeline,
             selected_quality,
         )
+        # Attempts retain their own historical failure records.  The Stage 8
+        # handoff must expose only failures that remain on the selected pair;
+        # otherwise a successfully repaired generation is rejected by a stale
+        # BRIGHT_CORE_INTEGRITY code from its immutable parent.
         quality_failure_codes = list(
-            dict.fromkeys(
-                [
-                    *quality_failure_codes,
-                    *final_quality_failure["failure_codes"],
-                ]
-            )
+            dict.fromkeys(final_quality_failure["failure_codes"])
         )
         quality_gate_passed = bool(
             selected_quality
@@ -2256,6 +2417,7 @@ def run_stage6_star_separation(pipeline) -> None:
             "stage6_starless_quality.json",
             {
                 "attempts": quality_records,
+                "shared_scene_support": shared_scene_support_summary,
                 "selected": selected_quality,
                 "galaxy_roi": pipeline._stage6_galaxy_roi_diagnostics,
                 "mode": quality_mode,
@@ -2489,6 +2651,7 @@ def run_stage6_star_separation(pipeline) -> None:
                         "underlying_failure_code": underlying_failure_code,
                     }
                 ],
+                "shared_scene_support": shared_scene_support_summary,
                 "selected": None,
                 "galaxy_roi": pipeline._stage6_galaxy_roi_diagnostics,
                 "mode": "with_stars_review_passthrough",

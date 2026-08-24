@@ -112,6 +112,46 @@ class Stage3BackgroundSamplingTests(unittest.TestCase):
         self.assertEqual(points, [])
         self.assertEqual(report["status"], "unavailable")
 
+    def test_shared_scene_support_excludes_invalid_saturated_and_catalog_patches(self):
+        image = _gradient_image(seed=44)
+        height, width = image.shape
+        catalog = [
+            {
+                "x": float(x),
+                "y": float(y),
+                "fwhm_px": 20.0,
+            }
+            for y in range(0, height, 32)
+            for x in range(0, width, 32)
+        ]
+        cases = (
+            (
+                {"shared_valid_mask": np.zeros((height, width), dtype=np.uint8)},
+                "valid_mask",
+                "shared_invalid_region",
+            ),
+            (
+                {"shared_saturation_map": np.ones((height, width), dtype=np.uint8)},
+                "saturation_map",
+                "shared_saturated",
+            ),
+            (
+                {"shared_star_catalog": catalog},
+                "star_catalog",
+                "shared_catalog_star",
+            ),
+        )
+
+        for kwargs, component, rejection in cases:
+            with self.subTest(component=component):
+                points, report = build_safe_background_samples(image, **kwargs)
+                self.assertEqual(points, [])
+                self.assertEqual(
+                    report["shared_scene_support"][component],
+                    "applied",
+                )
+                self.assertGreater(report["rejection_counts"][rejection], 0)
+
     def test_dark_patch_refinement_is_deterministic_and_keeps_frozen_thresholds(self):
         image = _gradient_image(seed=31)
         height, width = image.shape
