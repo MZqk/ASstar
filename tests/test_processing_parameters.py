@@ -23,6 +23,7 @@ from pipeline.processing_parameters import (
     GATE_PROFILE_RELAXED,
     GATE_PROFILE_UNLIMITED,
     LEGACY_PROCESSING_PARAMETERS_SCHEMA_V4,
+    LEGACY_PROCESSING_PARAMETERS_SCHEMA_V5,
     PROCESSING_PARAMETERS_SCHEMA,
     PROCESSING_GATE_PARAMETER_SPECS,
     PROCESSING_PARAMETER_SPECS,
@@ -183,7 +184,36 @@ class ProcessingParameterContractTests(unittest.TestCase):
         self.assertTrue(cfg.stage9_compact_starmask_enabled)
         self.assertFalse(cfg.stage9_starmask_pre_stretch_compact_enabled)
 
-    def test_v5_contract_includes_general_stage1_stage9_and_stage10_controls(self) -> None:
+    def test_v4_v5_stage3_legacy_fields_migrate_but_v6_rejects(self) -> None:
+        for schema in (
+            LEGACY_PROCESSING_PARAMETERS_SCHEMA_V4,
+            LEGACY_PROCESSING_PARAMETERS_SCHEMA_V5,
+        ):
+            with self.subTest(schema=schema):
+                payload = default_processing_parameters()
+                payload["schema"] = schema
+                payload["stages"]["3"]["overrides"].update(
+                    {
+                        "bg_quality_gate_enabled": False,
+                        "stage3_apply_confidence_min": 0.60,
+                    }
+                )
+                normalized, adjustments = normalize_processing_parameters(payload)
+                self.assertEqual(normalized["schema"], PROCESSING_PARAMETERS_SCHEMA)
+                self.assertEqual(normalized["stages"]["3"]["overrides"], {})
+                self.assertEqual(
+                    {item["field"] for item in adjustments},
+                    {"bg_quality_gate_enabled", "stage3_apply_confidence_min"},
+                )
+
+        current = default_processing_parameters()
+        current["stages"]["3"]["overrides"][
+            "bg_quality_gate_enabled"
+        ] = False
+        with self.assertRaisesRegex(ValueError, "未知参数"):
+            normalize_processing_parameters(current)
+
+    def test_v6_contract_includes_general_stage1_stage9_and_stage10_controls(self) -> None:
         payload = default_processing_parameters()
         self.assertEqual(payload["schema"], PROCESSING_PARAMETERS_SCHEMA)
         self.assertEqual(set(payload["stages"]), {str(i) for i in range(1, 11)})
@@ -361,13 +391,13 @@ class ProcessingParameterContractTests(unittest.TestCase):
                 )
                 for stage in range(2, 10)
             },
-            {2: 4, 3: 22, 4: 28, 5: 4, 6: 32, 7: 51, 8: 17, 9: 84},
+            {2: 4, 3: 18, 4: 20, 5: 4, 6: 32, 7: 51, 8: 17, 9: 84},
         )
         gate_fields = {spec.field for spec in PROCESSING_GATE_PARAMETER_SPECS}
         self.assertTrue(
             {
                 "stage2_edge_black_target",
-                "bg_quality_gate_enabled",
+                "stage3_safe_sample_target_count",
                 "stage4_auto_reference_background_sample_target",
                 "stage4_auto_reference_star_min_objects",
                 "stage4_auto_reference_target_chroma_drift_max",
@@ -390,6 +420,18 @@ class ProcessingParameterContractTests(unittest.TestCase):
             }.issubset(gate_fields)
         )
         self.assertNotIn("stage4_pcc_quality_gate_enabled", gate_fields)
+        self.assertTrue(
+            {
+                "stage4_pcc_channel_gain_ratio_max",
+                "stage4_pcc_emission_balance_gain_ratio_max",
+                "stage4_pcc_clip_growth_max",
+                "stage4_pcc_star_temperature_ratio_min",
+                "stage4_pcc_star_temperature_ratio_max",
+                "stage4_pcc_background_color_delta_max",
+                "stage4_pcc_target_color_drift_max",
+                "stage4_pcc_emission_target_color_drift_max",
+            }.isdisjoint(gate_fields)
+        )
         self.assertFalse(
             {
                 "stage4_local_star_wb_min_pixels",
@@ -397,6 +439,14 @@ class ProcessingParameterContractTests(unittest.TestCase):
                 "stage4_local_star_mask_coverage_max",
             }
             & gate_fields
+        )
+        self.assertTrue(
+            {
+                "bg_quality_gate_enabled",
+                "stage3_conditional_decision_enabled",
+                "stage3_deterministic_auto_apply_enabled",
+                "stage3_apply_confidence_min",
+            }.isdisjoint(gate_fields)
         )
         self.assertTrue(
             {
@@ -422,7 +472,7 @@ class ProcessingParameterContractTests(unittest.TestCase):
                 self.assertIsInstance(spec.default, str, spec.field)
         self.assertEqual(cfg.denoise_mod, 0.35)
         self.assertEqual(cfg.stage4_spcc_timeout_sec, 300)
-        self.assertEqual(cfg.stage4_spcc_online_unverified_timeout_sec, 90)
+        self.assertEqual(cfg.stage4_spcc_online_unverified_timeout_sec, 300)
         self.assertEqual(cfg.stage4_pcc_timeout_sec, 180)
         self.assertEqual(cfg.stage3_gate_profile, "output_first")
         safe_stage9_defaults = {
@@ -577,6 +627,37 @@ class ProcessingParameterContractTests(unittest.TestCase):
             SPECS_BY_FIELD["stage9_quality_gate_enabled"].profile_scaling,
             "none",
         )
+
+    def test_stage4_advisory_diagnostics_ignore_gate_profiles(self) -> None:
+        diagnostic_fields = (
+            "stage4_pcc_channel_gain_ratio_max",
+            "stage4_pcc_emission_balance_gain_ratio_max",
+            "stage4_pcc_clip_growth_max",
+            "stage4_pcc_star_temperature_ratio_min",
+            "stage4_pcc_star_temperature_ratio_max",
+            "stage4_pcc_background_color_delta_max",
+            "stage4_pcc_target_color_drift_max",
+            "stage4_pcc_emission_target_color_drift_max",
+        )
+        defaults = PipelineConfig()
+        for profile in (GATE_PROFILE_RELAXED, GATE_PROFILE_UNLIMITED):
+            payload = default_processing_parameters()
+            payload["gate_profile"] = profile
+            cfg = PipelineConfig()
+            apply_processing_parameters_to_config(cfg, payload)
+            for field in diagnostic_fields:
+                self.assertEqual(getattr(cfg, field), getattr(defaults, field))
+                self.assertEqual(SPECS_BY_FIELD[field].section, "diagnostics")
+                self.assertEqual(SPECS_BY_FIELD[field].profile_scaling, "none")
+
+        payload = default_processing_parameters()
+        payload["gate_profile"] = GATE_PROFILE_UNLIMITED
+        payload["stages"]["4"]["overrides"][
+            "stage4_pcc_clip_growth_max"
+        ] = 0.010
+        cfg = PipelineConfig()
+        apply_processing_parameters_to_config(cfg, payload)
+        self.assertEqual(cfg.stage4_pcc_clip_growth_max, 0.010)
 
     def test_unknown_fields_and_schema_are_rejected(self) -> None:
         payload = default_processing_parameters()

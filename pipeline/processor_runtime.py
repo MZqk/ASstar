@@ -146,11 +146,6 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "STARUN_STAGE4_AUTO_REFERENCE_TEXTURE_GROWTH_MAX",
         "STARUN_STAGE4_AUTO_REFERENCE_TARGET_CHROMA_DRIFT_MAX",
         "STARUN_STAGE4_PCC_TIMEOUT_SEC",
-        "STARUN_STAGE4_LOCAL_STAR_WB_ENABLE",
-        "STARUN_STAGE4_LOCAL_STAR_WB_MIN_PIXELS",
-        "STARUN_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT",
-        "STARUN_STAGE4_LOCAL_STAR_MASK_RADIUS",
-        "STARUN_STAGE4_LOCAL_STAR_MASK_COVERAGE_MAX",
         "STARUN_ABERRATION_API_ENABLE",
         "STARUN_ABERRATION_PROVIDER",
         "STARUN_OPTIONAL_COLOR_TRANSFORM",
@@ -1316,19 +1311,6 @@ class ProcessorRuntimeMixin:
                     "invalid value; keeping current setting"
                 )
 
-        local_star_wb_raw = os.getenv("STARUN_STAGE4_LOCAL_STAR_WB_ENABLE")
-        if local_star_wb_raw is not None:
-            parsed = self._parse_env_bool(
-                local_star_wb_raw,
-                getattr(self.cfg, "stage4_local_star_wb_enabled", True),
-            )
-            self.cfg.stage4_local_star_wb_enabled = parsed
-            if local_star_wb_raw.strip().lower() not in (ENV_TRUE_VALUES | ENV_FALSE_VALUES):
-                self.log.warn(
-                    "STARUN_STAGE4_LOCAL_STAR_WB_ENABLE has invalid value; "
-                    "keeping current setting"
-                )
-
         for env_key, attr_name, caster in (
             (
                 "STARUN_STAGE4_AUTO_GEOMETRY_CONFIDENCE_MIN",
@@ -1465,10 +1447,6 @@ class ProcessorRuntimeMixin:
                 "stage4_auto_reference_target_chroma_drift_max",
                 float,
             ),
-            ("STARUN_STAGE4_LOCAL_STAR_WB_MIN_PIXELS", "stage4_local_star_wb_min_pixels", int),
-            ("STARUN_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT", "stage4_local_star_wb_gain_limit", float),
-            ("STARUN_STAGE4_LOCAL_STAR_MASK_RADIUS", "stage4_local_star_mask_radius", int),
-            ("STARUN_STAGE4_LOCAL_STAR_MASK_COVERAGE_MAX", "stage4_local_star_mask_coverage_max", float),
         ):
             raw_value = os.getenv(env_key)
             if raw_value is None:
@@ -1848,10 +1826,10 @@ class ProcessorRuntimeMixin:
             getattr(
                 self.cfg,
                 "stage4_spcc_online_unverified_timeout_sec",
-                90,
+                300,
             ),
             30,
-            180,
+            300,
         )
         self.cfg.stage4_spcc_limit_magnitude = _clamp_float(
             getattr(self.cfg, "stage4_spcc_limit_magnitude", 10.5),
@@ -2783,7 +2761,7 @@ class ProcessorRuntimeMixin:
         self._task_run_manifest_path = manifest_path
         raw_parameters = payload.get("processing_parameters")
         if raw_parameters is None:
-            raise RuntimeError("任务运行清单缺少 v4 处理参数")
+            raise RuntimeError("任务运行清单缺少版本化处理参数")
         self._task_processing_parameter_request = copy.deepcopy(raw_parameters)
         try:
             normalized, runtime_adjustments = normalize_processing_parameters(

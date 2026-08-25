@@ -2,7 +2,7 @@
   "policy_name": "bright_nebula_hdr_conservative",
   "applies_to": {"target_types": ["bright_emission_reflection_nebula"]},
   "stage3_background": {"model_priority": ["rbf_smooth", "polynomial_low_order"], "protect_nebulosity": true, "reject_samples_on_nebula": true, "protect_bright_core": true, "max_bg_std_growth": 1.03, "fallback_to_safe_model": true},
-  "stage4_color": {"calibration_policy": "spcc_first_then_pcc", "allow_pcc_warning": false, "blue_gain_limit": 0.85, "red_gain_limit": 1.10, "max_allowed_saturation_boost": 0.14},
+  "stage4_color": {"blue_gain_limit": 0.85, "red_gain_limit": 1.10, "max_allowed_saturation_boost": 0.14},
   "stage5_linear": {"denoise_mode": "chroma_first", "sharpen_mode": "object_masked", "protect_background": true, "protect_star_halo": true, "avoid_global_sharpen": true},
   "stage7_stretch": {"candidate_mode": ["bright_nebula_hdr_masked", "asinh_core_protect", "asinh_mild_ghs", "masked_curve_dark_boost", "autostretch_reference"], "forbidden_when_dirty": ["autostretch"], "allow_autostretch_as_reference_only": true, "hard_reject": {"max_bg_dirty_score": 0.42, "max_core_clip_score": 0.18, "max_chroma_noise_growth": 1.35, "mode_overrides": {"bright_nebula_hdr_masked": {"max_bg_dirty_score": 0.10, "max_chroma_noise_growth": 1.65, "max_chroma_noise_score": 0.018}}}, "fallback_candidate": "asinh_core_protect"}
 }

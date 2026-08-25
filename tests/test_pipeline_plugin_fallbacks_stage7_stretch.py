@@ -2619,16 +2619,10 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
         processor = pipeline_module.StarunPostProcessor()
         processor._channel_semantics = "broadband_rgb_osc"
         processor.color_calibration_report = {
-            "method": "LOCAL_STAR_COLOR_RESTORE",
+            "method": "PRESERVE_INPUT",
             "physical_color": {
                 "accepted": False,
-                "method": "LOCAL_STAR_COLOR_RESTORE",
-            },
-            "local_fallback": {
-                "star_white_balance": {
-                    "applied": True,
-                    "mask_coverage": 0.00135,
-                }
+                "method": "PRESERVE_INPUT",
             },
         }
         selected = {
@@ -2657,7 +2651,6 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
         )
         self.assertAlmostEqual(gate["value"], 0.189)
         self.assertAlmostEqual(gate["limit"], 0.12)
-        self.assertAlmostEqual(gate["stage4_local_star_mask_coverage"], 0.00135)
         self.assertFalse(gate["global_white_balance_applied"])
         self.assertTrue(gate["global_white_balance_prohibited"])
 
@@ -2716,7 +2709,7 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
         processor = pipeline_module.StarunPostProcessor()
         processor._channel_semantics = "broadband_rgb_osc"
         processor.color_calibration_report = {
-            "method": "LOCAL_STAR_COLOR_RESTORE",
+            "method": "PRESERVE_INPUT",
             "physical_color": {"accepted": False},
         }
         selected = {

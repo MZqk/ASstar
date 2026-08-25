@@ -4,8 +4,8 @@ from __future__ import annotations
 from typing import Any, Dict
 
 
-STAGE3_ALGORITHM_CONTRACT_VERSION = "1.2.0"
-STAGE3_BACKGROUND_QUALITY_SCHEMA = "starun.stage3-background-quality.v4"
+STAGE3_ALGORITHM_CONTRACT_VERSION = "1.3.0"
+STAGE3_BACKGROUND_QUALITY_SCHEMA = "starun.stage3-background-quality.v5"
 
 STAGE3_SIGNIFICANCE_SIGMA = 3.0
 STAGE3_MIN_VALIDATION_PATCHES = 4

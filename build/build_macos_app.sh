@@ -325,8 +325,9 @@ embed_project_legal_notices() {
 
 verify_locked_plugin_asset() {
   local relative_path="$1"
-  local absolute_path="$SIRIL_PLUGIN_DIR_SRC/$relative_path"
-  local checksum_file="$SIRIL_PLUGIN_DIR_SRC/asset-checksums.sha256"
+  local asset_root="${2:-$SIRIL_PLUGIN_DIR_SRC}"
+  local absolute_path="$asset_root/$relative_path"
+  local checksum_file="$asset_root/asset-checksums.sha256"
   local expected=""
   local actual=""
   require_file "$checksum_file" "[BUILD] plugin asset checksum manifest"
@@ -1293,9 +1294,13 @@ if [[ -d "$SIRIL_PLUGIN_DIR_SRC" ]]; then
   require_file "$SIRIL_PLUGIN_DIR_SRC/syqon_starless/zenith.pt" "[BUILD] SyQon Zenith model"
   require_file "$SIRIL_PLUGIN_DIR_SRC/syqon_starless/zenith.pt.sha256" "[BUILD] SyQon Zenith checksum"
   verify_locked_plugin_asset "patches/apply_syqon_offline_model_patch.py"
+  verify_locked_plugin_asset "patches/apply_graxpert_ai_runtime_patch.py"
   verify_locked_plugin_asset "vendor/siril-scripts/SyQon/Starless.py"
+  verify_locked_plugin_asset "vendor/siril-scripts/processing/GraXpert-AI.py"
   verify_locked_plugin_asset "syqon_starless/zenith.pt"
   require_file "$SIRIL_PLUGIN_DIR_SRC/graxpert/deconvolution-object-ai-models/1.0.1/model.onnx" "[BUILD] GraXpert object deconvolution model"
+  require_file "$SIRIL_PLUGIN_DIR_SRC/graxpert/bge-ai-models/model_v2_0_1/model.onnx" "[BUILD] GraXpert BGE model"
+  verify_locked_plugin_asset "graxpert/bge-ai-models/model_v2_0_1/model.onnx"
   require_file "$SIRIL_PLUGIN_DIR_SRC/cosmic_clarity/deep_denoise_mono_AI4.pth" "[BUILD] CosmicClarity mono denoise model"
   require_file "$SIRIL_PLUGIN_DIR_SRC/cosmic_clarity/deep_denoise_color_AI4.pth" "[BUILD] CosmicClarity color denoise model"
   require_file "$SIRIL_PLUGIN_DIR_SRC/cosmic_clarity/deep_sharp_stellar_AI4.pth" "[BUILD] CosmicClarity stellar sharpen model"
@@ -1306,6 +1311,9 @@ if [[ -d "$SIRIL_PLUGIN_DIR_SRC" ]]; then
     ditto "$SIRIL_PLUGIN_DIR_SRC" "$APP_RESOURCES/siril_plugins"
     prune_generated_plugin_runtime "$APP_RESOURCES/siril_plugins"
     "$BUILD_PYTHON" "$APP_RESOURCES/siril_plugins/patches/apply_graxpert_ai_runtime_patch.py" \
+      "$APP_RESOURCES/siril_plugins"
+    verify_locked_plugin_asset \
+      "vendor/siril-scripts/processing/GraXpert-AI.py" \
       "$APP_RESOURCES/siril_plugins"
     "$BUILD_PYTHON" "$APP_RESOURCES/siril_plugins/patches/apply_syqon_offline_model_patch.py" \
       "$APP_RESOURCES/siril_plugins"
@@ -1320,6 +1328,9 @@ if [[ -d "$SIRIL_PLUGIN_DIR_SRC" ]]; then
     prune_generated_plugin_runtime "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins"
     "$BUILD_PYTHON" \
       "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/patches/apply_graxpert_ai_runtime_patch.py" \
+      "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins"
+    verify_locked_plugin_asset \
+      "vendor/siril-scripts/processing/GraXpert-AI.py" \
       "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins"
     "$BUILD_PYTHON" \
       "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/patches/apply_syqon_offline_model_patch.py" \
@@ -1367,6 +1378,7 @@ else
   require_file "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/syqon_starless/zenith.pt" "[VERIFY] Core offline resource SyQon model"
   require_file "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/syqon_starless/zenith.pt.sha256" "[VERIFY] Core offline resource SyQon checksum"
   require_file "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/graxpert/deconvolution-object-ai-models/1.0.1/model.onnx" "[VERIFY] Core offline resource GraXpert object deconvolution model"
+  require_file "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/graxpert/bge-ai-models/model_v2_0_1/model.onnx" "[VERIFY] Core offline resource GraXpert BGE model"
   require_dir "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/cosmic_clarity" "[VERIFY] Core offline resource CosmicClarity models"
 fi
 

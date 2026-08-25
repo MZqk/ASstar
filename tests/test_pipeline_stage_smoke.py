@@ -3463,16 +3463,15 @@ class PipelineStageSmokeTests(unittest.TestCase):
         with (
             patch.object(stage4_color_calibration, "_stage4_header_metadata", return_value={}),
             patch.object(stage4_color_calibration, "_stage4_image_geometry", return_value={"current_shape": {}}),
-            patch.object(
-                stage4_color_calibration,
-                "_stage4_local_color_fallback",
-                return_value=(True, "LOCAL_STAR_WB", "", 0.6, {}, "local fallback"),
-            ),
         ):
             stage4_color_calibration.run_stage4_color_calibration(self.pipeline)
 
         self.assertEqual(self.pipeline.results[-1][1], "degraded")
-        self.assertEqual(self.pipeline.color_calibration_report["method"], "LOCAL_STAR_WB")
+        self.assertEqual(self.pipeline.color_calibration_report["method"], "PRESERVE_INPUT")
+        self.assertEqual(
+            self.pipeline.color_calibration_report["local_fallback"]["status"],
+            "retired",
+        )
         self.assertTrue(self.pipeline.color_calibration_report["requires_review"])
         self.assertEqual(
             self.pipeline.color_calibration_report["channel_policy"]["kind"],

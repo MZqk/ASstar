@@ -21,7 +21,6 @@ import stage7_quality
 from channel_semantics import (
     channel_shape_dict,
     classify_channel_semantics,
-    filter_hint_suggests_narrowband,
 )
 from device_geometry import (
     activate_device_geometry_report,
@@ -49,8 +48,6 @@ from sirilpy.exceptions import CommandError, SirilError
 
 
 ENV_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
-DEFAULT_STAGE4_FOCAL_LENGTH_MM = 160.0
-DEFAULT_STAGE4_PIXEL_SIZE_UM = 2.9
 DEFAULT_OSC_SENSOR = "Sony IMX585"
 DEFAULT_OSC_FILTER_LP = "ZWO Seestar LP"
 DEFAULT_OSC_FILTER_NO_FILTER = "No filter"
@@ -119,9 +116,9 @@ PCC_TIMEOUT_MAX_SEC = 180
 SPCC_TIMEOUT_DEFAULT_SEC = 300
 SPCC_TIMEOUT_MIN_SEC = 5
 SPCC_TIMEOUT_MAX_SEC = 300
-SPCC_ONLINE_UNVERIFIED_TIMEOUT_DEFAULT_SEC = 90
+SPCC_ONLINE_UNVERIFIED_TIMEOUT_DEFAULT_SEC = 300
 SPCC_ONLINE_UNVERIFIED_TIMEOUT_MIN_SEC = 30
-SPCC_ONLINE_UNVERIFIED_TIMEOUT_MAX_SEC = 180
+SPCC_ONLINE_UNVERIFIED_TIMEOUT_MAX_SEC = 300
 SPCC_ONLINE_CIRCUIT_ENV = "STARUN_STAGE4_SPCC_ONLINE_CIRCUIT_OPEN"
 SPCC_OPERATIONAL_CACHE_ENV = "STARUN_STAGE4_SPCC_OPERATIONAL_CACHE_STATUS"
 SPCC_OPERATIONAL_CACHE_KEY_ENV = "STARUN_STAGE4_SPCC_OPERATIONAL_CACHE_KEY"
@@ -197,38 +194,6 @@ EMISSION_NEBULA_TARGET_TYPES = frozenset(
         "bright_emission_reflection_nebula",
     }
 )
-DUAL_NARROWBAND_KEYWORDS = frozenset(
-    {
-        "narrowband",
-        "narrow-band",
-        "dualband",
-        "dual-band",
-        "dual narrow",
-        "dual-narrow",
-        "duo narrow",
-        "duo-narrow",
-        "l-extreme",
-        "l-enhance",
-        "l-ultimate",
-        "ha+oiii",
-        "ha oiii",
-        "ha-oiii",
-        "ha_oiii",
-        "haoiii",
-        "h-alpha",
-        "oiii",
-        "o-iii",
-        "triband",
-        "tri-band",
-        "hoo",
-        "sho",
-        "sii",
-        "s-ii",
-        "hubble palette",
-    }
-)
-
-
 def _stage4_network_enabled() -> bool:
     raw = os.getenv("STARUN_NETWORK_MODE")
     if raw is None:
@@ -832,10 +797,6 @@ def _stage4_active_target_type(pipeline) -> str:
         if target_type:
             return target_type
     return ""
-
-
-def _stage4_filter_hint_suggests_narrowband(filter_hint: str) -> bool:
-    return filter_hint_suggests_narrowband(filter_hint)
 
 
 def _stage4_focal_length() -> float:
@@ -1647,7 +1608,7 @@ def _stage4_run_spcc(
         if ok and _stage4_spcc_output_is_imprecise(str(detail)):
             attempt["precision_warning"] = "spcc_imprecise_solution"
             attempt["precision_warning_policy"] = (
-                "defer_to_target_aware_pixel_quality_gate"
+                "advisory_only_reduce_downstream_saturation_budget"
             )
         detail_text = str(detail)
         timed_out = bool(
@@ -1743,7 +1704,7 @@ def _stage4_run_spcc(
         # target colour drift against the unchanged pre-colour checkpoint.
         attempt["precision_warning"] = "spcc_imprecise_solution"
         attempt["precision_warning_policy"] = (
-            "defer_to_target_aware_pixel_quality_gate"
+            "advisory_only_reduce_downstream_saturation_budget"
         )
     if not candidate_path.is_file() or candidate_path.stat().st_size <= 0:
         attempt["error"] = "SPCC candidate output missing"
@@ -2096,25 +2057,6 @@ def _stage4_spcc_args(
         "osc_filter": osc_filter,
         "osc_filter_reason": filter_reason,
     }
-
-
-def _stage4_linearity(metadata: Dict[str, Any], *, checkpoint_loaded: bool) -> Dict[str, Any]:
-    evidence = " ".join(
-        str(metadata.get(key, "") or "").strip().lower()
-        for key in ("LINEAR", "NONLINEA", "STRETCH", "HISTORY", "PROCSTEP")
-    )
-    if any(token in evidence for token in ("nonlinear", "non-linear", "stretched", "histogram")):
-        return {"status": "nonlinear", "confidence": 0.95, "reason": "FITS metadata"}
-    explicit_linear = metadata.get("LINEAR")
-    if explicit_linear is True or str(explicit_linear).strip().lower() in ENV_TRUE_VALUES:
-        return {"status": "linear", "confidence": 0.98, "reason": "FITS LINEAR keyword"}
-    if checkpoint_loaded:
-        return {
-            "status": "linear",
-            "confidence": 0.96,
-            "reason": "Stage 3/Stage 4 linear checkpoint contract",
-        }
-    return {"status": "unknown", "confidence": 0.0, "reason": "linear checkpoint not confirmed"}
 
 
 def _stage4_channel_policy(
@@ -2664,8 +2606,14 @@ def _stage4_verified_physical_pcc_global_rebalance(
     )
 
     checks = {
-        "physical_pcc_quality_gate_passed": bool(
-            pcc_quality_report.get("accepted", False)
+        "physical_pcc_technical_integrity_passed": bool(
+            pcc_quality_report.get(
+                "technical_accepted",
+                (pcc_quality_report.get("technical_integrity") or {}).get(
+                    "accepted",
+                    False,
+                ),
+            )
         ),
         "composite_emission_reflection_scene": bool(
             target_type == "bright_emission_reflection_nebula"
@@ -2720,7 +2668,7 @@ def _stage4_narrowband_pcc_signal_preservation(
     *,
     channel_gain_ratio: float,
 ) -> Dict[str, Any]:
-    """Reject degraded narrowband PCC that erases source Ha/OIII separation."""
+    """Measure advisory Ha/OIII signal preservation for degraded narrowband PCC."""
     before_rgb = np.asarray(before, dtype=np.float32)
     after_rgb = np.asarray(after, dtype=np.float32)
     limits = {
@@ -2958,214 +2906,6 @@ def _stage4_luminance(rgb: np.ndarray) -> np.ndarray:
     return (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]).astype(np.float32)
 
 
-def _stage4_sigma_clip_star_colors(
-    rgb: np.ndarray,
-    mask: np.ndarray,
-    *,
-    max_iter: int = 3,
-    sigma: float = 2.5,
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    clipped = np.asarray(mask, dtype=bool).copy()
-    report: Dict[str, Any] = {
-        "enabled": True,
-        "iterations": 0,
-        "input_pixels": int(np.count_nonzero(clipped)),
-        "output_pixels": int(np.count_nonzero(clipped)),
-    }
-    if report["input_pixels"] < 8 or rgb.shape[0] < 3:
-        return clipped, report
-
-    eps = 1e-6
-    for iteration in range(max(1, int(max_iter))):
-        r = rgb[0][clipped]
-        g = rgb[1][clipped]
-        b = rgb[2][clipped]
-        if r.size < 8 or float(np.min(g)) <= 0.0:
-            break
-        ratios = np.stack(
-            [
-                np.log((r + eps) / (g + eps)),
-                np.log((b + eps) / (g + eps)),
-            ],
-            axis=0,
-        )
-        keep_values = np.ones(r.shape, dtype=bool)
-        for values in ratios:
-            center = float(np.median(values))
-            mad = float(np.median(np.abs(values - center)))
-            scale = max(1.4826 * mad, float(np.std(values)) * 0.25, 1e-4)
-            keep_values &= np.abs(values - center) <= sigma * scale
-        next_clipped = np.zeros_like(clipped)
-        coords = np.flatnonzero(clipped)
-        next_clipped.reshape(-1)[coords[keep_values]] = True
-        if int(np.count_nonzero(next_clipped)) == int(np.count_nonzero(clipped)):
-            report["iterations"] = iteration + 1
-            clipped = next_clipped
-            break
-        clipped = next_clipped
-        report["iterations"] = iteration + 1
-
-    report["output_pixels"] = int(np.count_nonzero(clipped))
-    return clipped, report
-
-
-def _stage4_soft_star_mask(star_mask: np.ndarray, radius: int) -> np.ndarray:
-    radius = max(1, min(int(radius), 4))
-    height, width = star_mask.shape
-    source = star_mask.astype(np.float32)
-    soft = source.copy()
-    for dy in range(-radius, radius + 1):
-        for dx in range(-radius, radius + 1):
-            distance = math.hypot(dx, dy)
-            if distance == 0.0 or distance > radius + 0.25:
-                continue
-            weight = max(0.12, 1.0 - distance / (radius + 0.75))
-            shifted = np.zeros_like(source)
-            src_y0 = max(0, -dy)
-            src_y1 = min(height, height - dy)
-            src_x0 = max(0, -dx)
-            src_x1 = min(width, width - dx)
-            dst_y0 = src_y0 + dy
-            dst_y1 = src_y1 + dy
-            dst_x0 = src_x0 + dx
-            dst_x1 = src_x1 + dx
-            shifted[dst_y0:dst_y1, dst_x0:dst_x1] = source[
-                src_y0:src_y1, src_x0:src_x1
-            ]
-            soft = np.maximum(soft, shifted * weight)
-    return np.clip(soft, 0.0, 1.0)
-
-
-def _stage4_select_local_star_reference_candidate(
-    chw: np.ndarray,
-    pipeline,
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    output = np.clip(chw.astype(np.float32, copy=True), 0.0, None)
-    if output.shape[0] < 3:
-        return output, {"applied": False, "reason": "mono image", "white_reference_pixels": 0}
-
-    rgb = output[:3]
-    lum = _stage4_luminance(rgb)
-    finite_mask = np.isfinite(lum)
-    if int(np.count_nonzero(finite_mask)) < 256:
-        return output, {"applied": False, "reason": "not enough finite pixels", "white_reference_pixels": 0}
-
-    valid_lum = lum[finite_mask]
-    max_channel = np.max(rgb, axis=0)
-    min_channel = np.min(rgb, axis=0)
-    chroma = (max_channel - min_channel) / np.maximum(max_channel, 1e-6)
-    saturation_limit = float(np.quantile(max_channel[finite_mask], 0.999))
-
-    min_pixels = int(getattr(pipeline.cfg, "stage4_local_star_wb_min_pixels", 32) or 32)
-    min_pixels = max(16, min(min_pixels, 4096))
-    star_mask = np.zeros_like(finite_mask, dtype=bool)
-    sample_policy = "medium-bright unsaturated low-chroma stars"
-    for quantile, sigma_floor, chroma_limit in (
-        (0.985, 3.0, 0.35),
-        (0.975, 2.5, 0.45),
-        (0.965, 2.0, 0.55),
-    ):
-        median_lum = float(np.median(valid_lum))
-        std_lum = float(np.std(valid_lum))
-        low = max(float(np.quantile(valid_lum, quantile)), median_lum + sigma_floor * std_lum)
-        high = float(np.quantile(valid_lum, 0.9995))
-        if high <= low:
-            high = float(np.max(valid_lum))
-        candidate_mask = (
-            finite_mask
-            & (lum >= low)
-            & (lum <= high)
-            & (max_channel <= saturation_limit)
-            & (chroma <= chroma_limit)
-        )
-        if int(np.count_nonzero(candidate_mask)) >= min_pixels:
-            star_mask = candidate_mask
-            sample_policy = (
-                "iterative sigma-clipped stars "
-                f"(lum_q={quantile:.3f}, sigma_floor={sigma_floor:.1f}, "
-                f"chroma<={chroma_limit:.2f})"
-            )
-            break
-        if int(np.count_nonzero(candidate_mask)) > int(np.count_nonzero(star_mask)):
-            star_mask = candidate_mask
-            sample_policy = (
-                "relaxed candidate stars "
-                f"(lum_q={quantile:.3f}, sigma_floor={sigma_floor:.1f}, "
-                f"chroma<={chroma_limit:.2f})"
-            )
-
-    sigma_report: Dict[str, Any] = {"enabled": False}
-    if int(np.count_nonzero(star_mask)) >= max(8, min_pixels // 2):
-        clipped_mask, sigma_report = _stage4_sigma_clip_star_colors(rgb, star_mask)
-        clipped_pixels = int(np.count_nonzero(clipped_mask))
-        if clipped_pixels >= max(16, min_pixels // 2):
-            star_mask = clipped_mask
-
-    star_pixels = int(np.count_nonzero(star_mask))
-    if star_pixels < min_pixels:
-        return output, {
-            "applied": False,
-            "reason": "insufficient unsaturated low-chroma star samples",
-            "white_reference_pixels": star_pixels,
-            "required_pixels": min_pixels,
-            "sample_policy": sample_policy,
-            "sigma_clip": sigma_report,
-        }
-
-    medians = np.array([float(np.median(channel[star_mask])) for channel in rgb], dtype=np.float32)
-    if float(np.min(medians)) <= 0.0:
-        return output, {
-            "applied": False,
-            "reason": "invalid star channel medians",
-            "white_reference_pixels": star_pixels,
-            "channel_medians_before": [float(v) for v in medians],
-        }
-
-    target = float(np.median(medians))
-    gain_limit = float(getattr(pipeline.cfg, "stage4_local_star_wb_gain_limit", 1.20) or 1.20)
-    gain_limit = max(1.01, min(gain_limit, 1.50))
-    gains = np.clip(target / medians, 1.0 / gain_limit, gain_limit)
-    mask_radius = int(getattr(pipeline.cfg, "stage4_local_star_mask_radius", 2) or 2)
-    soft_mask = _stage4_soft_star_mask(star_mask, mask_radius)
-    mask_coverage = float(np.mean(soft_mask > 0.01))
-    coverage_max = float(
-        getattr(pipeline.cfg, "stage4_local_star_mask_coverage_max", 0.12) or 0.12
-    )
-    coverage_max = max(0.01, min(coverage_max, 0.30))
-    if mask_coverage > coverage_max:
-        return output, {
-            "applied": False,
-            "reason": "star soft mask coverage exceeds safety limit",
-            "white_reference_pixels": star_pixels,
-            "mask_coverage": mask_coverage,
-            "mask_coverage_max": coverage_max,
-        }
-    local_gains = 1.0 + (gains[:, np.newaxis, np.newaxis] - 1.0) * soft_mask[np.newaxis]
-    output[:3] = np.clip(rgb * local_gains, 0.0, None)
-    return output, {
-        "applied": True,
-        "white_reference_pixels": star_pixels,
-        "channel_medians_before": [float(v) for v in medians],
-        "target_median": target,
-        "gains": [float(v) for v in gains],
-        "gain_limit": gain_limit,
-        "application": "star_soft_mask_only",
-        "mask_radius": mask_radius,
-        "mask_coverage": mask_coverage,
-        "mask_coverage_max": coverage_max,
-        "sample_policy": sample_policy,
-        "sigma_clip": sigma_report,
-    }
-
-
-def _stage4_star_white_balance(
-    chw: np.ndarray,
-    pipeline,
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Compatibility wrapper for selection/evaluation without pixel writes."""
-    return _stage4_select_local_star_reference_candidate(chw, pipeline)
-
-
 def _stage4_write_image_pixels(pipeline, pixels: np.ndarray) -> None:
     lock_factory = getattr(pipeline.siril, "image_lock", None)
     if callable(lock_factory):
@@ -3173,23 +2913,6 @@ def _stage4_write_image_pixels(pipeline, pixels: np.ndarray) -> None:
             pipeline.siril.set_image_pixeldata(pixels)
         return
     pipeline.siril.set_image_pixeldata(pixels)
-
-
-def _stage4_apply_local_star_reference_candidate(
-    pipeline,
-    candidate: np.ndarray,
-    report: Mapping[str, Any],
-) -> bool:
-    if not bool(report.get("applied")):
-        return False
-    expected = np.asarray(candidate)
-    _stage4_write_image_pixels(pipeline, expected)
-    actual = np.asarray(pipeline.siril.get_image_pixeldata(preview=False))
-    if actual.shape != expected.shape or not np.all(np.isfinite(actual)):
-        raise RuntimeError("local star reference post-write image is invalid")
-    if not np.array_equal(actual, expected):
-        raise RuntimeError("local star reference post-write pixels differ from candidate")
-    return True
 
 
 def _stage4_empty_auto_reference_report(
@@ -3475,45 +3198,6 @@ def _stage4_run_narrowband_normalization(
         )
 
 
-def _stage4_local_color_fallback(
-    pipeline,
-    *,
-    narrowband: bool = False,
-) -> Tuple[bool, str, str, float, Dict[str, Any], str]:
-    """Deprecated compatibility helper; Stage 4 v2 no longer calls this path."""
-    image_data = pipeline.siril.get_image_pixeldata(preview=False)
-    chw, restore = _stage4_image_as_chw(image_data)
-    wb_enabled = bool(getattr(pipeline.cfg, "stage4_local_star_wb_enabled", True))
-    star_report: Dict[str, Any] = {"applied": False, "reason": "disabled", "white_reference_pixels": 0}
-    balanced = chw
-    if wb_enabled:
-        balanced, star_report = _stage4_select_local_star_reference_candidate(
-            chw,
-            pipeline,
-        )
-        if star_report.get("applied"):
-            _stage4_apply_local_star_reference_candidate(
-                pipeline,
-                restore(balanced),
-                star_report,
-            )
-
-    report = {
-        "narrowband": bool(narrowband),
-        "global_white_balance": {"applied": False, "prohibited": True},
-        "input_color_preserved_when_not_applied": True,
-        "star_white_balance": star_report,
-    }
-    if star_report.get("applied"):
-        message = "local star-soft-mask color restoration applied"
-        if narrowband:
-            message += " (narrowband policy; global white balance prohibited)"
-        return True, "LOCAL_STAR_COLOR_RESTORE", "local_star_mask_fallback", 0.55, report, message
-
-    message = "star samples insufficient; input color preserved"
-    return False, "PRESERVE_INPUT", "insufficient_star_samples", 0.30, report, message
-
-
 def run_stage4_color_calibration(pipeline) -> None:
     """Stage 4: plate solve, SPCC-first physical color, then bounded fallbacks."""
     stage_label = PipelineStage.COLOR_CALIBRATION.label
@@ -3528,8 +3212,6 @@ def run_stage4_color_calibration(pipeline) -> None:
         "PCC_NARROWBAND_DEGRADED",
         "PCC_NARROWBAND_DEGRADED_LOCAL_GAIA",
     }
-    degraded_broad_core_methods: set[str] = set()
-    spcc_repair_methods: set[str] = set()
     accepted_spcc_methods = {
         "SPCC",
         "SPCC_LOCAL_GAIA",
@@ -3553,12 +3235,22 @@ def run_stage4_color_calibration(pipeline) -> None:
         "accepted": False,
     }
     pcc_attempts: List[Dict[str, Any]] = []
-    pcc_quality_report: Dict[str, Any] = {"enabled": True, "accepted": False, "status": "not_run"}
+    pcc_quality_report: Dict[str, Any] = {
+        "enabled": True,
+        "accepted": False,
+        "technical_accepted": False,
+        "diagnostic_quality_accepted": False,
+        "legacy_quality_accepted": False,
+        "status": "not_run",
+    }
     rollback_report: Dict[str, Any] = {"required": False, "restored": False}
     spcc_attempts: List[Dict[str, Any]] = []
     spcc_quality_report: Dict[str, Any] = {
         "enabled": True,
         "accepted": False,
+        "technical_accepted": False,
+        "diagnostic_quality_accepted": False,
+        "legacy_quality_accepted": False,
         "status": "not_run",
     }
     bright_core_color_integrity: Dict[str, Any] = {
@@ -4349,6 +4041,10 @@ def run_stage4_color_calibration(pipeline) -> None:
                         )
                         spcc_quality_report.update(
                             accepted=bool(technical_accepted),
+                            technical_accepted=bool(technical_accepted),
+                            diagnostic_quality_accepted=bool(
+                                legacy_quality_accepted
+                            ),
                             legacy_quality_accepted=bool(legacy_quality_accepted),
                             routing_effect=(
                                 "advisory_only"
@@ -4358,7 +4054,6 @@ def run_stage4_color_calibration(pipeline) -> None:
                             technical_integrity=technical_integrity,
                         )
                         accepted = bool(technical_accepted)
-                        pre_repair_quality_report = dict(spcc_quality_report)
                         if technical_accepted:
                             (
                                 bright_core_color_integrity,
@@ -4436,15 +4131,12 @@ def run_stage4_color_calibration(pipeline) -> None:
                                     else "SPCC"
                                 )
                             color_confidence = (
-                                0.55
-                                if color_method in degraded_broad_core_methods
-                                else 0.92
+                                0.92
                                 if selected_spcc_catalog == SPCC_LOCAL_CATALOG
                                 else 0.88
                             )
-                            if color_method not in spcc_repair_methods:
-                                color_warning = ""
-                                policy_status = "accepted"
+                            color_warning = ""
+                            policy_status = "accepted"
                             messages.append(
                                 f"{spcc_result} accepted after technical integrity validation"
                             )
@@ -4570,6 +4262,10 @@ def run_stage4_color_calibration(pipeline) -> None:
                         )
                         pcc_quality_report.update(
                             accepted=bool(technical_accepted),
+                            technical_accepted=bool(technical_accepted),
+                            diagnostic_quality_accepted=bool(
+                                legacy_quality_accepted
+                            ),
                             legacy_quality_accepted=bool(legacy_quality_accepted),
                             routing_effect=(
                                 "advisory_only"
@@ -4674,15 +4370,6 @@ def run_stage4_color_calibration(pipeline) -> None:
                             pcc_bright_core_color_integrity.get(
                                 "applicable",
                                 False,
-                            )
-                        )
-                        pcc_core_failed = bool(
-                            pcc_core_applicable
-                            and not bool(
-                                pcc_bright_core_color_integrity.get(
-                                    "accepted",
-                                    False,
-                                )
                             )
                         )
                         if pcc_core_applicable:
@@ -5273,40 +4960,7 @@ def run_stage4_color_calibration(pipeline) -> None:
                 accepted=True,
                 final_action="accept_spcc_with_advisory",
             )
-        elif (
-            not bool(bright_core_color_integrity.get("accepted", False))
-            and color_method not in accepted_spcc_methods
-            and bool(spcc_rollback_report.get("restored", False))
-            and not main_output_blocked
-            and color_method in accepted_pcc_methods
-            and bool(
-                pcc_bright_core_color_integrity.get(
-                    "accepted",
-                    False,
-                )
-            )
-        ):
-            bright_core_color_integrity.update(
-                spcc_assessment_status=str(
-                    bright_core_color_integrity.get("status") or "hard_failed"
-                ),
-                spcc_assessment_final_action=str(
-                    bright_core_color_integrity.get("final_action")
-                    or "reject_spcc_to_pcc"
-                ),
-                spcc_rejection_reasons=list(
-                    bright_core_color_integrity.get("trigger_reasons") or []
-                ),
-                status="ok",
-                accepted=True,
-                repaired=False,
-                final_action="bad_spcc_rejected_and_safe_fallback_selected",
-                resolved_by=color_method,
-            )
-        elif str(bright_core_color_integrity.get("status")) not in {
-            "ok",
-            "repaired",
-        }:
+        elif str(bright_core_color_integrity.get("status")) != "ok":
             bright_core_color_integrity.update(
                 status="hard_failed",
                 accepted=False,
@@ -5324,34 +4978,17 @@ def run_stage4_color_calibration(pipeline) -> None:
         "PCC",
         "PCC_LOCAL_GAIA",
     }
-    shadow_preserved_color_methods = {
-        *physical_calibration_methods,
-        *degraded_broad_core_methods,
-    }
     if (
         auto_reference_report.get("status") == "not_run"
-        and color_method in shadow_preserved_color_methods
+        and color_method in physical_calibration_methods
     ):
-        shadow_physical = color_method in physical_calibration_methods
         auto_reference_report = _stage4_empty_auto_reference_report(
-            status=(
-                "shadow_skipped_physical_color_accepted"
-                if shadow_physical
-                else "shadow_skipped_degraded_color_accepted"
-            ),
-            reason=(
-                "physical_color_accepted_shadow_disabled"
-                if shadow_physical
-                else "degraded_broad_core_color_accepted_shadow_disabled"
-            ),
+            status="shadow_skipped_physical_color_accepted",
+            reason="physical_color_accepted_shadow_disabled",
         )
         auto_reference_report["shadow_comparison"] = {
             "enabled": False,
-            "reason": (
-                "physical_color_accepted_shadow_disabled"
-                if shadow_physical
-                else "degraded_broad_core_color_accepted_shadow_disabled"
-            ),
+            "reason": "physical_color_accepted_shadow_disabled",
             "would_select": None,
             "physical_method_preserved": color_method,
             "pixels_written": False,
@@ -5362,8 +4999,8 @@ def run_stage4_color_calibration(pipeline) -> None:
             physical_method_preserved=color_method,
         )
         auto_reference_report["degraded_color_correction"].update(
-            applied=not shadow_physical,
-            method=color_method if not shadow_physical else None,
+            applied=False,
+            method=None,
         )
     elif auto_reference_report.get("status") == "not_run":
         auto_reference_report = _stage4_empty_auto_reference_report(
@@ -5377,14 +5014,19 @@ def run_stage4_color_calibration(pipeline) -> None:
     color_risk_warning = bool(
         color_warning and color_warning != "spcc_exception_pcc_fallback"
     )
-    if (
-        color_risk_warning
-        and stage4_policy.get("reduce_saturation_if_solution_imprecise", False)
-    ):
+    spcc_precision_warning = any(
+        str(attempt.get("status") or "") == "ok"
+        and str(attempt.get("precision_warning") or "")
+        == "spcc_imprecise_solution"
+        for attempt in spcc_attempts
+        if isinstance(attempt, dict)
+    )
+    reduce_saturation_boost = bool(
+        stage4_policy.get("reduce_saturation_if_solution_imprecise", False)
+        and (color_risk_warning or spcc_precision_warning)
+    )
+    if reduce_saturation_boost:
         messages.append("color policy limits later saturation/color gains due to imprecise solution")
-    if color_method == "LOCAL_STAR_COLOR_RESTORE" and platesolve_attempted and not pipeline.platesolve_ok:
-        messages.append("platesolve 失败，已使用恒星软遮罩局部色彩回退")
-
     color_saved = False
     if not main_output_blocked:
         color_saved = pipeline._save_stage_output("stage4_color")
@@ -5420,20 +5062,6 @@ def run_stage4_color_calibration(pipeline) -> None:
         if review.get("report_path"):
             messages.append(f"review_bundle={review['report_path']}")
 
-    local_star_applied = bool(
-        isinstance(local_fallback_report, dict)
-        and bool(
-            (
-                local_fallback_report.get("star_white_balance") or {}
-            ).get("applied")
-        )
-    )
-    broadband_local_fallback_used = bool(
-        channel_policy.get("kind") == "broadband_rgb_osc"
-        and policy_status == "fallback_review_required"
-        and color_method == "LOCAL_STAR_COLOR_RESTORE"
-        and local_star_applied
-    )
     policy_decisive_failure = bool(
         physical_color_input
         and failure_action != "auto_fallback"
@@ -5462,9 +5090,7 @@ def run_stage4_color_calibration(pipeline) -> None:
         profile_fallback_used
         or pcc_fallback_used
         or auto_reference_applied
-        or broadband_local_fallback_used
         or physical_main_restore_report.get("fallback_used")
-        or color_method in spcc_repair_methods
     )
     platesolve_diagnostics = _stage4_platesolve_diagnostics(
         platesolve_attempts,
@@ -5477,9 +5103,7 @@ def run_stage4_color_calibration(pipeline) -> None:
     color_applied_methods = {
         *physical_calibration_methods,
         *degraded_narrowband_pcc_methods,
-        *degraded_broad_core_methods,
         *auto_reference_methods,
-        "LOCAL_STAR_COLOR_RESTORE",
     }
     intentional_color_skip = channel_policy.get("kind") in {
         "mono",
@@ -5533,9 +5157,7 @@ def run_stage4_color_calibration(pipeline) -> None:
             "fallback_used": bool(
                 pcc_fallback_used
                 or auto_reference_applied
-                or broadband_local_fallback_used
                 or physical_main_restore_report.get("fallback_used")
-                or color_method in spcc_repair_methods
             ),
         },
         "artistic_hoo": {
@@ -5649,8 +5271,6 @@ def run_stage4_color_calibration(pipeline) -> None:
             )
         ),
         "degraded_color_correction_allowed": bool(
-            color_method in degraded_broad_core_methods
-            or
             (
                 pcc_allowed
                 and channel_policy.get("kind") == "narrowband_composite"
@@ -5682,13 +5302,13 @@ def run_stage4_color_calibration(pipeline) -> None:
             "metadata_database": spcc_database,
             "max_attempts": 1,
             "timeout_sec": (
-                int(spcc_attempts[0].get("timeout_sec", PCC_TIMEOUT_DEFAULT_SEC))
+                int(spcc_attempts[0].get("timeout_sec", SPCC_TIMEOUT_DEFAULT_SEC))
                 if spcc_attempts
                 else int(
                     getattr(
                         pipeline.cfg,
                         "stage4_spcc_timeout_sec",
-                        PCC_TIMEOUT_DEFAULT_SEC,
+                        SPCC_TIMEOUT_DEFAULT_SEC,
                     )
                 )
             ),
@@ -5761,7 +5381,6 @@ def run_stage4_color_calibration(pipeline) -> None:
             in (
                 degraded_narrowband_pcc_methods
                 | auto_reference_methods
-                | degraded_broad_core_methods
             ),
             "method": (
                 color_method
@@ -5769,7 +5388,6 @@ def run_stage4_color_calibration(pipeline) -> None:
                 in (
                     degraded_narrowband_pcc_methods
                     | auto_reference_methods
-                    | degraded_broad_core_methods
                 )
                 else None
             ),
@@ -5778,7 +5396,6 @@ def run_stage4_color_calibration(pipeline) -> None:
             in (
                 degraded_narrowband_pcc_methods
                 | auto_reference_methods
-                | degraded_broad_core_methods
             ),
             "output": (
                 "stage4_color.fit"
@@ -5787,7 +5404,6 @@ def run_stage4_color_calibration(pipeline) -> None:
                 in (
                     degraded_narrowband_pcc_methods
                     | auto_reference_methods
-                    | degraded_broad_core_methods
                 )
                 else None
             ),
@@ -5810,10 +5426,7 @@ def run_stage4_color_calibration(pipeline) -> None:
             else str(policy.get("policy_name", "generic_low_snr_safe"))
         ),
         "policy_adjustments": {
-            "reduce_saturation_boost": bool(
-                stage4_policy.get("reduce_saturation_if_solution_imprecise", False)
-                and color_risk_warning
-            ),
+            "reduce_saturation_boost": reduce_saturation_boost,
             "blue_gain_limit": stage4_policy.get("blue_gain_limit"),
             "red_gain_limit": stage4_policy.get("red_gain_limit"),
             "max_allowed_saturation_boost": stage4_policy.get("max_allowed_saturation_boost"),
@@ -5885,8 +5498,6 @@ def run_stage4_color_calibration(pipeline) -> None:
         if color_method == AUTO_WHITE_REGION_METHOD
         else "auto_background_neutralization_non_physical"
         if color_method == AUTO_BACKGROUND_METHOD
-        else "spcc_broad_core_chroma_rollback_review_required"
-        if color_method in degraded_broad_core_methods
         else "color_calibration_review_required"
         if requires_review
         else "stage4_platesolve_disabled"
@@ -5895,8 +5506,6 @@ def run_stage4_color_calibration(pipeline) -> None:
         if not pipeline.platesolve_ok
         else "target_profiler_fallback"
         if profile_fallback_used
-        else "broadband_local_star_fallback"
-        if broadband_local_fallback_used
         else "spcc_exception_pcc_fallback"
         if pcc_fallback_used
         else "color_not_applicable_mono"

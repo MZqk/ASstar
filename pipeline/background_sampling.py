@@ -199,7 +199,7 @@ def _build_source_and_coverage_masks(
     luminance: np.ndarray,
     *,
     max_side: int = 512,
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray], Dict[str, Any]]:
     """Build explicit source/blank masks on a bounded analysis grid.
 
     The source mask is derived from an iteratively clipped quadratic sky fit,
@@ -267,7 +267,6 @@ def _build_source_and_coverage_masks(
     usable = ~coverage_mask
     center = float(np.median(residual[usable]))
     sigma = max(_robust_sigma(residual[usable]), dynamic * 1e-4)
-    positive = residual > center + 2.5 * sigma
     coherent_support = _smooth3(
         (residual > center + 1.50 * sigma).astype(np.float64),
         passes=2,
@@ -278,7 +277,45 @@ def _build_source_and_coverage_masks(
     high_frequency = small - _smooth3(small, passes=2)
     high_frequency_sigma = max(_robust_sigma(high_frequency[usable]), dynamic * 1e-4)
     compact = high_frequency > 4.0 * high_frequency_sigma
-    source_mask = _dilate_mask((positive | coherent | compact) & usable, passes=1)
+    compact_mask = _dilate_mask(compact & usable, passes=1)
+    extended_structure_mask = _dilate_mask(
+        coherent & usable,
+        passes=2,
+    )
+    bright_core_seed = (
+        (
+            (residual > center + 5.0 * sigma)
+            | (small >= float(np.quantile(finite_values, 0.995)))
+        )
+        & usable
+    )
+    # A high residual alone is not evidence of an extended bright core: in a
+    # dense Milky-Way field it is commonly an isolated stellar peak that is
+    # already protected by both compact-source and scene-support masks.  Keep
+    # the bright-core layer tied to coherent positive structure so it cannot
+    # grow thousands of stellar seeds into a near-full-frame duplicate mask.
+    bright_core_mask = bright_core_seed & extended_structure_mask
+    negative_support = _smooth3(
+        (residual < center - 1.50 * sigma).astype(np.float64),
+        passes=2,
+    )
+    dark_structure_mask = _dilate_mask(
+        (
+            (negative_support >= 0.70)
+            & (residual < center - 0.50 * sigma)
+        )
+        & usable,
+        passes=1,
+    )
+    outer_halo_mask = _dilate_mask(
+        (
+            (coherent_support >= 0.55)
+            & (residual > center + 0.35 * sigma)
+            & usable
+        ),
+        passes=3,
+    )
+    source_mask = compact_mask | extended_structure_mask | bright_core_mask
     source_mask &= usable
 
     sky_mask = usable & ~source_mask
@@ -292,6 +329,13 @@ def _build_source_and_coverage_masks(
             cell = sky_mask[y0:y1, x0:x1]
             if cell.size and float(np.mean(cell)) >= 0.10:
                 sky_cells.add((cell_x, cell_y))
+    layers = {
+        "compact_source": compact_mask,
+        "extended_structure": extended_structure_mask,
+        "bright_core": bright_core_mask,
+        "dark_structure": dark_structure_mask,
+        "outer_halo": outer_halo_mask,
+    }
     report = {
         "status": "ready",
         "analysis_shape": [int(small.shape[0]), int(small.shape[1])],
@@ -303,8 +347,11 @@ def _build_source_and_coverage_masks(
         "usable_sky_grid_cell_ratio": len(sky_cells) / 16.0,
         "fit_residual_sigma": sigma,
         "mask_method": "iterative_quadratic_clip_plus_coherent_structure_growth",
+        "layer_fractions": {
+            name: float(np.mean(mask)) for name, mask in layers.items()
+        },
     }
-    return source_mask, coverage_mask, report
+    return source_mask, coverage_mask, layers, report
 
 
 def _offset_correlation(
@@ -522,6 +569,7 @@ def build_safe_background_samples(
     shared_valid_mask: Optional[np.ndarray] = None,
     shared_saturation_map: Optional[np.ndarray] = None,
     shared_star_catalog: Optional[Sequence[Dict[str, Any]]] = None,
+    protection_policy: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Tuple[float, float]], Dict[str, Any]]:
     """Select spatially distributed low-signal, low-texture Siril samples.
 
@@ -547,6 +595,7 @@ def build_safe_background_samples(
         }
 
     height, width = luminance.shape
+    protection_policy = dict(protection_policy or {})
     shared_valid = None
     shared_saturated = None
     shared_star_mask = None
@@ -579,7 +628,13 @@ def build_safe_background_samples(
                 continue
             if not all(math.isfinite(value) for value in (x, y, fwhm)) or fwhm <= 0:
                 continue
-            radius = max(3.0, min(32.0, 2.5 * fwhm))
+            radius_scale = (
+                4.0
+                if bool(protection_policy.get("protect_star_halo", False))
+                else 2.5
+            )
+            radius_cap = 48.0 if radius_scale > 2.5 else 32.0
+            radius = max(3.0, min(radius_cap, radius_scale * fwhm))
             extent = int(math.ceil(radius))
             x0 = max(0, int(math.floor(x)) - extent)
             x1 = min(width, int(math.floor(x)) + extent + 1)
@@ -609,9 +664,12 @@ def build_safe_background_samples(
         }
 
     try:
-        source_mask, coverage_mask, mask_report = _build_source_and_coverage_masks(
-            luminance
-        )
+        (
+            source_mask,
+            coverage_mask,
+            derived_masks,
+            mask_report,
+        ) = _build_source_and_coverage_masks(luminance)
     except (TypeError, ValueError, np.linalg.LinAlgError) as error:
         return [], {
             "status": "unavailable",
@@ -619,6 +677,87 @@ def build_safe_background_samples(
             "sample_count": 0,
         }
     mask_stride = max(1, int(mask_report.get("downsample_stride", 1) or 1))
+    combined_mask = source_mask | coverage_mask | derived_masks["dark_structure"]
+    applied_layers = {
+        "invalid_or_uncovered": coverage_mask,
+        "image_stars_and_sources": derived_masks["compact_source"],
+        "positive_structure_nebulosity": derived_masks["extended_structure"],
+        "bright_core": derived_masks["bright_core"],
+        "dark_structure": derived_masks["dark_structure"],
+    }
+    if bool(protection_policy.get("protect_outer_halo", False)):
+        applied_layers["outer_halo"] = derived_masks["outer_halo"]
+        combined_mask |= derived_masks["outer_halo"]
+
+    star_fraction = (
+        float(np.mean(shared_star_mask))
+        if shared_star_mask is not None
+        else None
+    )
+    if shared_star_mask is not None:
+        star_small = shared_star_mask[::mask_stride, ::mask_stride]
+        star_small = star_small[: combined_mask.shape[0], : combined_mask.shape[1]]
+        combined_mask[: star_small.shape[0], : star_small.shape[1]] |= star_small
+    mask_evidence = {
+        "schema_version": "starun.stage3-sample-masks.v1",
+        "method": "multiscale_quadratic_residual_plus_scene_support",
+        "applied_to_sampling": True,
+        "layers": {
+            name: {
+                "requested": True,
+                "available": True,
+                "applied": True,
+                "pixel_fraction": float(np.mean(mask)),
+                "method": {
+                    "invalid_or_uncovered": "finite_and_repeated_floor",
+                    "image_stars_and_sources": (
+                        "high_frequency_4sigma_compact_source_growth"
+                    ),
+                    "positive_structure_nebulosity": (
+                        "coherent_positive_quadratic_residual_growth"
+                    ),
+                    "bright_core": (
+                        "coherent_positive_structure_intersect_5sigma_or_p995"
+                    ),
+                    "dark_structure": (
+                        "coherent_negative_quadratic_residual_growth"
+                    ),
+                }[name],
+                "reason": None,
+            }
+            for name, mask in applied_layers.items()
+        },
+        "combined_excluded_fraction": float(np.mean(combined_mask)),
+        "usable_sky_fraction": float(np.mean(~combined_mask)),
+        "scene_support_stars": {
+            "requested": True,
+            "available": shared_star_mask is not None,
+            "applied": shared_star_mask is not None,
+            "pixel_fraction": star_fraction,
+            "method": (
+                "scene_support_catalog_4x_fwhm"
+                if bool(protection_policy.get("protect_star_halo", False))
+                else "scene_support_catalog_2_5x_fwhm"
+            ),
+            "reason": (
+                None
+                if shared_star_mask is not None
+                else "scene_support_star_catalog_unavailable_image_source_mask_used"
+            ),
+        },
+    }
+    mask_evidence["layers"]["scene_support_stars"] = mask_evidence.pop(
+        "scene_support_stars"
+    )
+    if "outer_halo" not in mask_evidence["layers"]:
+        mask_evidence["layers"]["outer_halo"] = {
+            "requested": False,
+            "available": True,
+            "applied": False,
+            "pixel_fraction": float(np.mean(derived_masks["outer_halo"])),
+            "method": "low_threshold_connected_positive_residual_growth",
+            "reason": "protect_outer_halo_not_requested",
+        }
 
     finite_values = luminance[np.isfinite(luminance)]
     low_limit = float(np.quantile(finite_values, 0.015))
@@ -628,7 +767,8 @@ def build_safe_background_samples(
         1e-8,
     )
     aspect = width / max(height, 1)
-    candidate_budget = target_count * 4
+    candidate_grid_multiplier = 6 if (star_fraction or 0.0) >= 0.15 else 4
+    candidate_budget = target_count * candidate_grid_multiplier
     columns = max(8, int(round(math.sqrt(candidate_budget * aspect))))
     rows = max(6, int(math.ceil(candidate_budget / columns)))
     x_values = np.linspace(margin, width - margin - 1, columns)
@@ -681,6 +821,7 @@ def build_safe_background_samples(
         my1 = min(source_mask.shape[0], mask_y + mask_radius + 1)
         local_source_mask = source_mask[my0:my1, mx0:mx1]
         local_coverage_mask = coverage_mask[my0:my1, mx0:mx1]
+        local_combined_mask = combined_mask[my0:my1, mx0:mx1]
         return {
             "x": int(x),
             "y": int(y),
@@ -691,6 +832,7 @@ def build_safe_background_samples(
             "source_mask_center": bool(source_mask[mask_y, mask_x]),
             "source_mask_fraction": float(np.mean(local_source_mask)),
             "coverage_mask_fraction": float(np.mean(local_coverage_mask)),
+            "combined_mask_fraction": float(np.mean(local_combined_mask)),
             "candidate_source": source,
             "shared_valid_fraction": (
                 float(np.mean(shared_valid[
@@ -828,10 +970,8 @@ def build_safe_background_samples(
             return False, "shared_saturated"
         if float(record.get("shared_star_fraction") or 0.0) > 0.0:
             return False, "shared_catalog_star"
-        if record["coverage_mask_fraction"] > 0.0:
-            return False, "coverage_masked"
-        if record["source_mask_center"] or record["source_mask_fraction"] > 0.35:
-            return False, "source_masked"
+        if record["combined_mask_fraction"] > 0.0:
+            return False, "exclusion_masked"
         if record["median"] <= low_limit:
             return False, "clipped_or_too_dark"
         if (
@@ -866,7 +1006,7 @@ def build_safe_background_samples(
     if refinement_max_steps <= 0:
         refinement_block_reasons.append("disabled_by_step_limit")
     if (
-        float(mask_report.get("usable_sky_fraction", 0.0) or 0.0)
+        float(mask_evidence.get("usable_sky_fraction", 0.0) or 0.0)
         < STAGE3_MIN_USABLE_SKY_FRACTION
     ):
         refinement_block_reasons.append("usable_sky_fraction_below_0_50")
@@ -946,6 +1086,7 @@ def build_safe_background_samples(
     safe: List[Dict[str, Any]] = []
     rejection_counts = {
         "nonfinite": rejected_nonfinite,
+        "exclusion_masked": 0,
         "clipped_or_too_dark": 0,
         "too_bright": 0,
         "structured": 0,
@@ -1058,6 +1199,8 @@ def build_safe_background_samples(
     )
     ready = bool(
         len(selected) >= min_count
+        and float(mask_evidence["usable_sky_fraction"])
+        >= STAGE3_MIN_USABLE_SKY_FRACTION
         and len(quadrants) >= STAGE3_MIN_SPATIAL_QUADRANTS
         and len(selected_grid_cells) >= STAGE3_MIN_SPATIAL_GRID_CELLS
         and x_span >= STAGE3_MIN_AXIS_SPAN_RATIO
@@ -1082,6 +1225,12 @@ def build_safe_background_samples(
         "base_candidate_count": base_candidate_count,
         "safe_candidate_count": len(safe),
         "base_safe_candidate_count": base_safe_candidate_count,
+        "candidate_search": {
+            "method": "regular_grid_plus_deterministic_dark_patch_refinement",
+            "grid_multiplier": candidate_grid_multiplier,
+            "dense_star_field_expansion": candidate_grid_multiplier > 4,
+            "scene_support_star_fraction": star_fraction,
+        },
         "refinement": refinement_report,
         "patch_radius": patch_radius,
         "margin_pixels": margin,
@@ -1097,6 +1246,7 @@ def build_safe_background_samples(
             "y_span_ratio": y_span,
         },
         "masks": mask_report,
+        "mask_evidence": mask_evidence,
         "shared_scene_support": shared_support_status,
         "thresholds": {
             "brightness_quantile_max": brightness_quantile_max,
@@ -1111,7 +1261,7 @@ def build_safe_background_samples(
         "rejection_counts": rejection_counts,
         "points": [[x, y] for x, y in points] if ready else [],
         "safety_contract": [
-            "exclude source-mask and coverage-mask pixels before sky sampling",
+            "require zero overlap with the combined multiscale exclusion mask",
             "reject clipped/bright/structured/star-contaminated patches",
             "dark-patch proposals reuse thresholds frozen from the regular grid",
             "refined proposals remain deterministic, deduplicated and spacing-audited",
@@ -1764,7 +1914,19 @@ def assess_background_process(
     sample_ready = bool((safe_sample_report or {}).get("status") == "ready")
     validation_ready = bool((baseline_validation or {}).get("status") == "ready")
     masks = (safe_sample_report or {}).get("masks") or {}
-    sky_grid_cells = int(masks.get("usable_sky_grid_cells", 0) or 0)
+    mask_evidence = (safe_sample_report or {}).get("mask_evidence") or {}
+    coverage = (safe_sample_report or {}).get("coverage") or {}
+    usable_sky_fraction = mask_evidence.get(
+        "usable_sky_fraction",
+        masks.get("usable_sky_fraction"),
+    )
+    sky_grid_cells = int(
+        coverage.get(
+            "available_grid_cells",
+            masks.get("usable_sky_grid_cells", 0),
+        )
+        or 0
+    )
     sky_supported = bool(
         sample_ready
         and validation_ready
@@ -1821,7 +1983,7 @@ def assess_background_process(
     low_complexity_required = bool(
         diffuse
         or target_type in {"large_galaxy", "galaxy", "dark_nebula"}
-        or float(masks.get("usable_sky_fraction", 0.0) or 0.0)
+        or float(usable_sky_fraction or 0.0)
         < STAGE3_MIN_USABLE_SKY_FRACTION
     )
     should_evaluate = bool(
@@ -1850,7 +2012,7 @@ def assess_background_process(
             "supported": sky_supported,
             "safe_samples_ready": sample_ready,
             "heldout_validation_ready": validation_ready,
-            "usable_sky_fraction": masks.get("usable_sky_fraction"),
+            "usable_sky_fraction": usable_sky_fraction,
             "usable_sky_grid_cells": sky_grid_cells,
         },
         "spatial_models": spatial,

@@ -39,6 +39,10 @@ Models and other non-code assets
   licensed by the GraXpert Development Team under CC BY-NC-SA 4.0.  It is not
   covered by GPL-3.0-only.  Attribution, the CC license text, and its
   NonCommercial and ShareAlike conditions remain in force.
+* The controlled GraXpert BGE model at
+  `resources/siril_plugins/graxpert/bge-ai-models/model_v2_0_1/` uses the same
+  CC BY-NC-SA 4.0 distribution boundary.  It is excluded from Git and may only
+  enter a release through the hash-locked offline resource preparation step.
 * Before distributing the SyQon Zenith or CosmicClarity model assets, verify
   their upstream redistribution terms and include their original notices.
 

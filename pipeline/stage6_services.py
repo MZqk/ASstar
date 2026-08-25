@@ -2798,18 +2798,6 @@ class Stage6ServiceMixin:
         report = report if isinstance(report, dict) else {}
         physical = report.get("physical_color") or {}
         physical = physical if isinstance(physical, dict) else {}
-        local_fallback = report.get("local_fallback") or {}
-        local_fallback = (
-            local_fallback if isinstance(local_fallback, dict) else {}
-        )
-        local_star_white_balance = (
-            local_fallback.get("star_white_balance") or {}
-        )
-        local_star_white_balance = (
-            local_star_white_balance
-            if isinstance(local_star_white_balance, dict)
-            else {}
-        )
         method = str(physical.get("method") or report.get("method") or "")
         # Current Stage 4 reports an explicit acceptance bit.  Do not let a
         # failed SPCC/PCC attempt bypass this review gate merely because its
@@ -2839,12 +2827,6 @@ class Stage6ServiceMixin:
             "reason_code": "physical_calibration_accepted",
             "physical_calibration_accepted": physical_accepted,
             "physical_calibration_method": method or None,
-            "stage4_local_star_white_balance_applied": bool(
-                local_star_white_balance.get("applied", False)
-            ),
-            "stage4_local_star_mask_coverage": local_star_white_balance.get(
-                "mask_coverage"
-            ),
             "channel_semantics": channel_semantics,
             "metric": "background_chroma_load",
             "value": None,

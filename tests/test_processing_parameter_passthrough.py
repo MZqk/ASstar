@@ -85,6 +85,11 @@ class ProcessingParameterPassthroughTests(unittest.TestCase):
 
             self.assertEqual(os.environ["STARUN_DENOISE_ENABLE"], "1")
             self.assertTrue(runtime.cfg.denoise_enabled)
+            self.assertNotIn("STARUN_STAGE4_LOCAL_STAR_WB_ENABLE", os.environ)
+            self.assertNotIn(
+                "STARUN_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT",
+                os.environ,
+            )
 
     def test_stage2_user_preserve_writes_canonical_artifact(self) -> None:
         self.pipeline.cfg.stage2_processing_mode = "preserve"

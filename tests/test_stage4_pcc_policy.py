@@ -77,11 +77,6 @@ def _pipeline(shape=(3, 64, 64)):
         stage4_pcc_channel_gain_ratio_max=1.80,
         stage4_pcc_emission_balance_gain_ratio_max=4.0,
         stage4_pcc_clip_growth_max=0.005,
-        stage4_local_star_wb_enabled=True,
-        stage4_local_star_wb_min_pixels=16,
-        stage4_local_star_wb_gain_limit=1.20,
-        stage4_local_star_mask_radius=2,
-        stage4_local_star_mask_coverage_max=0.12,
     )
     return SimpleNamespace(
         cfg=cfg,
@@ -667,7 +662,7 @@ class Stage4PccPolicyTests(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["timeout_sec"], 90)
+        self.assertEqual(calls[0]["timeout_sec"], 300)
         self.assertEqual(calls[0]["catalog"], "gaia")
         self.assertEqual(attempts[0]["max_attempts"], 1)
         self.assertEqual(attempts[0]["configured_timeout_sec"], 300)
@@ -695,6 +690,64 @@ class Stage4PccPolicyTests(unittest.TestCase):
 
         self.assertEqual(calls[0]["timeout_sec"], 45)
         self.assertEqual(attempts[0]["timeout_sec"], 45)
+
+    def test_spcc_report_uses_spcc_timeout_defaults(self):
+        configured, _saved, _commands, _results = _stage4_integration_fixture()
+        configured._run_stage4_spcc_once = lambda **_kwargs: (
+            False,
+            "spcc failed",
+        )
+        configured._run_stage4_pcc_once = lambda **_kwargs: (
+            False,
+            "pcc failed",
+        )
+        with patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False):
+            stage4.run_stage4_color_calibration(configured)
+        self.assertEqual(
+            configured.color_calibration_report["spcc"]["timeout_sec"],
+            stage4.SPCC_ONLINE_UNVERIFIED_TIMEOUT_DEFAULT_SEC,
+        )
+
+        missing_attempt_timeout, _saved, _commands, _results = (
+            _stage4_integration_fixture()
+        )
+        missing_attempt_timeout._run_stage4_pcc_once = lambda **_kwargs: (
+            False,
+            "pcc failed",
+        )
+        with (
+            patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False),
+            patch.object(
+                stage4,
+                "_stage4_run_spcc",
+                return_value=(False, "spcc failed", [{"status": "failed"}]),
+            ),
+        ):
+            stage4.run_stage4_color_calibration(missing_attempt_timeout)
+        self.assertEqual(
+            missing_attempt_timeout.color_calibration_report["spcc"]["timeout_sec"],
+            stage4.SPCC_TIMEOUT_DEFAULT_SEC,
+        )
+
+        missing_config, _saved, _commands, _results = _stage4_integration_fixture()
+        del missing_config.cfg.stage4_spcc_timeout_sec
+        missing_config._run_stage4_pcc_once = lambda **_kwargs: (
+            False,
+            "pcc failed",
+        )
+        with (
+            patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False),
+            patch.object(
+                stage4,
+                "_stage4_run_spcc",
+                return_value=(False, "spcc failed", []),
+            ),
+        ):
+            stage4.run_stage4_color_calibration(missing_config)
+        self.assertEqual(
+            missing_config.color_calibration_report["spcc"]["timeout_sec"],
+            stage4.SPCC_TIMEOUT_DEFAULT_SEC,
+        )
 
     def test_spcc_batch_timeout_circuit_skips_online_gaia(self):
         pipeline = _pipeline()
@@ -1247,7 +1300,7 @@ class Stage4PccPolicyTests(unittest.TestCase):
         self.assertEqual(calls, ["oscsensor", "whiteref"])
         self.assertNotIn("osc_filter", report["categories"])
 
-    def test_spcc_imprecise_advisory_defers_to_pixel_quality_gate(self):
+    def test_spcc_imprecise_advisory_marks_downstream_saturation_reduction(self):
         pipeline = _pipeline()
         advisory = (
             "Spectrophotometric Color Calibration succeeded. "
@@ -1283,8 +1336,88 @@ class Stage4PccPolicyTests(unittest.TestCase):
         )
         self.assertEqual(
             attempts[0]["precision_warning_policy"],
-            "defer_to_target_aware_pixel_quality_gate",
+            "advisory_only_reduce_downstream_saturation_budget",
         )
+
+    def test_successful_imprecise_spcc_reduces_downstream_saturation_budget(self):
+        pipeline, saved, _commands, _results = _stage4_integration_fixture()
+        pipeline.pipeline_policy = {
+            "stage4_color": {
+                "reduce_saturation_if_solution_imprecise": True,
+                "max_allowed_saturation_boost": 0.14,
+            }
+        }
+        advisory = (
+            "Spectrophotometric Color Calibration succeeded. "
+            "The photometric color calibration seems to have found an "
+            "imprecise solution"
+        )
+        pcc_calls = []
+
+        def spcc_success(**_kwargs):
+            saved[stage4.SPCC_CANDIDATE_STEM] = pipeline.current.copy()
+            return True, advisory
+
+        pipeline._run_stage4_spcc_once = spcc_success
+        pipeline._run_stage4_pcc_once = lambda **kwargs: (
+            pcc_calls.append(kwargs) or True,
+            "pcc must not run after successful SPCC",
+        )
+        with patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False):
+            stage4.run_stage4_color_calibration(pipeline)
+
+        report = pipeline.color_calibration_report
+        self.assertEqual(report["method"], "SPCC")
+        self.assertFalse(report["requires_review"])
+        self.assertIsNone(report["warning"])
+        self.assertFalse(pcc_calls)
+        self.assertTrue(report["policy_adjustments"]["reduce_saturation_boost"])
+
+    def test_precise_spcc_does_not_reduce_downstream_saturation_budget(self):
+        pipeline, saved, _commands, _results = _stage4_integration_fixture()
+        pipeline.pipeline_policy = {
+            "stage4_color": {
+                "reduce_saturation_if_solution_imprecise": True,
+            }
+        }
+
+        def spcc_success(**_kwargs):
+            saved[stage4.SPCC_CANDIDATE_STEM] = pipeline.current.copy()
+            return True, "spcc command ok"
+
+        pipeline._run_stage4_spcc_once = spcc_success
+        with patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False):
+            stage4.run_stage4_color_calibration(pipeline)
+
+        self.assertFalse(
+            pipeline.color_calibration_report["policy_adjustments"]
+            ["reduce_saturation_boost"]
+        )
+
+    def test_failed_spcc_imprecision_text_does_not_create_precision_advisory(self):
+        pipeline, saved, _commands, _results = _stage4_integration_fixture()
+        pipeline.pipeline_policy = {
+            "stage4_color": {
+                "reduce_saturation_if_solution_imprecise": True,
+            }
+        }
+        pipeline._run_stage4_spcc_once = lambda **_kwargs: (
+            False,
+            "spcc imprecise solution failure",
+        )
+
+        def pcc_success(**_kwargs):
+            saved[stage4.PCC_CANDIDATE_STEM] = pipeline.current.copy()
+            return True, "pcc command ok"
+
+        pipeline._run_stage4_pcc_once = pcc_success
+        with patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False):
+            stage4.run_stage4_color_calibration(pipeline)
+
+        report = pipeline.color_calibration_report
+        self.assertEqual(report["method"], "PCC")
+        self.assertNotIn("precision_warning", report["spcc"]["attempts"][0])
+        self.assertFalse(report["policy_adjustments"]["reduce_saturation_boost"])
 
     def test_pcc_runner_clamps_timeout_to_180_seconds(self):
         pipeline = _pipeline()
@@ -1495,7 +1628,105 @@ class Stage4PccPolicyTests(unittest.TestCase):
             self.assertIn("run_id mismatch", rejected["manifest_error"])
             self.assertTrue(rejected["commands"]["platesolve"])
 
-    def test_legacy_runtime_manifest_infers_local_spcc_readiness_from_xp_source(self):
+    def test_v1_runtime_manifest_normalizes_online_and_preserves_local_offline(self):
+        pipeline = _pipeline()
+        pipeline._run_id = "run-v1"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pipeline.work_dir = root
+            manifest_path = root / "runtime-capabilities.json"
+
+            def write_decision(decision):
+                manifest_path.write_text(
+                    json.dumps(
+                        {
+                            "schema": stage4.RUNTIME_CAPABILITIES_SCHEMA,
+                            "run_id": "run-v1",
+                            "status": decision["status"],
+                            "decisions": {
+                                "stage4_color_calibration": decision,
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            write_decision(
+                {
+                    "schema": stage4.LEGACY_RUNTIME_COLOR_DECISION_SCHEMA,
+                    "status": "degraded_allowed",
+                    "route": "preserve_input",
+                    "offline_fallback_mode": "auto_local_reference",
+                    "commands": {
+                        "platesolve": False,
+                        "spcc": False,
+                        "pcc": False,
+                    },
+                    "skip_photometric_commands": ["platesolve", "spcc", "pcc"],
+                    "requires_review": True,
+                }
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    stage4.RUNTIME_CAPABILITIES_ENV: str(manifest_path),
+                    "STARUN_NETWORK_MODE": "1",
+                },
+                clear=False,
+            ):
+                online = stage4._stage4_runtime_color_decision(pipeline)
+
+            self.assertEqual(online["schema"], stage4.RUNTIME_COLOR_DECISION_SCHEMA)
+            self.assertEqual(online["route"], "physical_spcc_then_pcc")
+            self.assertEqual(online["attempt_policy"], "attempt_then_fallback")
+            self.assertTrue(online["preflight_advisory_only"])
+            self.assertEqual(
+                online["commands"],
+                {"platesolve": True, "spcc": True, "pcc": True},
+            )
+            self.assertEqual(online["spcc_readiness"], "online_unverified")
+
+            write_decision(
+                {
+                    "schema": stage4.LEGACY_RUNTIME_COLOR_DECISION_SCHEMA,
+                    "status": "ready",
+                    "route": "physical_spcc_then_pcc",
+                    "offline_fallback_mode": "auto_local_reference",
+                    "astrometric_source": "localgaia",
+                    "xp_source": "localgaia",
+                    "commands": {
+                        "platesolve": True,
+                        "spcc": True,
+                        "pcc": True,
+                    },
+                    "skip_photometric_commands": [],
+                    "requires_review": False,
+                }
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    stage4.RUNTIME_CAPABILITIES_ENV: str(manifest_path),
+                    "STARUN_NETWORK_MODE": "0",
+                },
+                clear=False,
+            ):
+                offline = stage4._stage4_runtime_color_decision(pipeline)
+
+        self.assertTrue(offline["trusted"])
+        self.assertEqual(
+            offline["schema"],
+            stage4.LEGACY_RUNTIME_COLOR_DECISION_SCHEMA,
+        )
+        self.assertEqual(offline["astrometric_source"], "localgaia")
+        self.assertEqual(offline["xp_source"], "localgaia")
+        self.assertEqual(offline["spcc_readiness"], "local_verified")
+        self.assertEqual(
+            offline["commands"],
+            {"platesolve": True, "spcc": True, "pcc": True},
+        )
+
+    def test_runtime_manifest_infers_local_spcc_readiness_from_xp_source(self):
         pipeline = _pipeline()
         pipeline._run_id = "run-legacy"
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1601,20 +1832,13 @@ class Stage4PccPolicyTests(unittest.TestCase):
             root = Path(temp_dir)
             pipeline.local_gaia_astro_catalog = root / "missing_astro.dat"
             pipeline.local_gaia_photo_catalog = root / "missing_photo"
-            with (
-                patch.dict(
-                    os.environ,
-                    {
-                        "STARUN_NETWORK_MODE": "0",
-                        stage4.RUNTIME_CAPABILITIES_ENV: "",
-                    },
-                    clear=False,
-                ),
-                patch.object(
-                    stage4,
-                    "_stage4_local_color_fallback",
-                    side_effect=AssertionError("preserve mode must skip local restore"),
-                ),
+            with patch.dict(
+                os.environ,
+                {
+                    "STARUN_NETWORK_MODE": "0",
+                    stage4.RUNTIME_CAPABILITIES_ENV: "",
+                },
+                clear=False,
             ):
                 stage4.run_stage4_color_calibration(pipeline)
 
@@ -1634,7 +1858,6 @@ class Stage4PccPolicyTests(unittest.TestCase):
         pipeline, saved, _commands, _results = _stage4_integration_fixture(
             image=source
         )
-        pipeline.cfg.stage4_local_star_wb_enabled = False
         original_save = pipeline._save_stage_output
 
         def save(stem):
@@ -1704,13 +1927,6 @@ class Stage4PccPolicyTests(unittest.TestCase):
                         "missing immutable checkpoint must prohibit auto reference"
                     ),
                 ),
-                patch.object(
-                    stage4,
-                    "_stage4_local_color_fallback",
-                    side_effect=AssertionError(
-                        "missing immutable checkpoint must prohibit local restore"
-                    ),
-                ),
             ):
                 stage4.run_stage4_color_calibration(pipeline)
 
@@ -1760,17 +1976,11 @@ class Stage4PccPolicyTests(unittest.TestCase):
         self.assertTrue(result["transaction"]["rollback_performed"])
         self.assertTrue(np.array_equal(pipeline.current, source))
 
-    def test_local_star_write_mismatch_restores_exact_pre_color(self):
+    def test_rejected_auto_reference_preserves_exact_pre_color(self):
         source = _auto_reference_image()
         pipeline, saved, _commands, _results = _stage4_integration_fixture(
             image=source
         )
-
-        def corrupt_write(pixels):
-            pipeline.current = np.asarray(pixels).copy()
-            pipeline.current.flat[0] += np.float32(0.001)
-
-        pipeline.siril.set_image_pixeldata = corrupt_write
         rejected_report = stage4._stage4_empty_auto_reference_report(
             status="rejected",
             reason="test_auto_candidate_rejected",
@@ -1793,14 +2003,6 @@ class Stage4PccPolicyTests(unittest.TestCase):
                     "evaluate_auto_local_reference",
                     return_value=(None, rejected_report),
                 ),
-                patch.object(
-                    stage4,
-                    "_stage4_select_local_star_reference_candidate",
-                    side_effect=lambda chw, _pipeline: (
-                        chw + np.float32(0.002),
-                        {"applied": True, "application": "star_soft_mask_only"},
-                    ),
-                ),
             ):
                 stage4.run_stage4_color_calibration(pipeline)
 
@@ -1814,23 +2016,6 @@ class Stage4PccPolicyTests(unittest.TestCase):
         self.assertTrue(
             np.array_equal(saved["stage4_color"], saved[stage4.PCC_CHECKPOINT_STEM])
         )
-
-    def test_local_star_restore_does_not_apply_global_white_balance(self):
-        pipeline = _pipeline(shape=(3, 96, 96))
-        y, x = np.mgrid[:96, :96]
-        image = np.full((3, 96, 96), 0.02, dtype=np.float32)
-        for cy, cx in ((20, 20), (20, 70), (48, 48), (72, 24), (72, 72)):
-            star = np.exp(-((x - cx) ** 2 + (y - cy) ** 2) / 3.0) * 0.55
-            image[0] += star * 1.15
-            image[1] += star * 0.90
-            image[2] += star * 0.80
-
-        restored, report = stage4._stage4_star_white_balance(image, pipeline)
-        self.assertTrue(report["applied"])
-        self.assertEqual(report["application"], "star_soft_mask_only")
-        changed = np.max(np.abs(restored - image), axis=0) > 1e-7
-        self.assertLess(float(np.mean(changed)), pipeline.cfg.stage4_local_star_mask_coverage_max)
-        self.assertTrue(np.allclose(restored[:, 0, 0], image[:, 0, 0]))
 
     def test_m42_quality_gate_allows_red_subject_but_checks_background(self):
         pipeline = _pipeline()
@@ -2103,6 +2288,39 @@ class Stage4PccPolicyTests(unittest.TestCase):
             ["osc_sensor=Sony IMX585", "osc_filter=UV/IR Block"],
         )
 
+    def test_technical_success_preserves_diagnostic_quality_rejection(self):
+        source = np.full((3, 64, 64), 0.04, dtype=np.float32)
+        candidate = source.copy()
+        candidate[0] = 0.20
+        pipeline, saved, _commands, _results = _stage4_integration_fixture(
+            image=source
+        )
+        pcc_calls = []
+
+        def spcc_success(**_kwargs):
+            saved[stage4.SPCC_CANDIDATE_STEM] = candidate.copy()
+            return True, "spcc command ok"
+
+        pipeline._run_stage4_spcc_once = spcc_success
+        pipeline._run_stage4_pcc_once = lambda **kwargs: (
+            pcc_calls.append(kwargs) or True,
+            "pcc must not run after technically valid SPCC",
+        )
+
+        with patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False):
+            stage4.run_stage4_color_calibration(pipeline)
+
+        report = pipeline.color_calibration_report
+        quality = report["spcc"]["quality_gate"]
+        self.assertEqual(report["method"], "SPCC")
+        self.assertFalse(pcc_calls)
+        self.assertTrue(quality["accepted"])
+        self.assertTrue(quality["technical_accepted"])
+        self.assertFalse(quality["diagnostic_quality_accepted"])
+        self.assertFalse(quality["legacy_quality_accepted"])
+        self.assertTrue(quality["rejection_reasons"])
+        np.testing.assert_array_equal(saved["stage4_color"], candidate)
+
     def test_unresolved_auto_device_skips_spcc_and_uses_broadband_pcc(self):
         pipeline, saved, _commands, _results = _stage4_integration_fixture()
         pipeline.cfg.stage4_spcc_osc_sensor = ""
@@ -2305,7 +2523,7 @@ class Stage4PccPolicyTests(unittest.TestCase):
         pipeline._run_stage4_spcc_once = spcc_success
         pipeline._run_stage4_pcc_once = lambda **kwargs: (
             pcc_calls.append(kwargs) or True,
-            "pcc must not run after a valid local repair",
+            "pcc must not run after an advisory-only bright-core diagnostic",
         )
 
         with patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False):
@@ -2349,7 +2567,7 @@ class Stage4PccPolicyTests(unittest.TestCase):
         pipeline._run_stage4_spcc_once = spcc_success
         pipeline._run_stage4_pcc_once = lambda **kwargs: (
             pcc_calls.append(kwargs) or True,
-            "pcc must not run after bounded broad-core repair",
+            "pcc must not run after an advisory-only broad-core diagnostic",
         )
 
         with patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False):
@@ -2540,12 +2758,12 @@ class Stage4PccPolicyTests(unittest.TestCase):
             "accepted": False,
             "status": "hard_failed",
             "repaired": False,
-            "final_action": "reject_spcc_to_pcc",
+            "final_action": "flag_broad_core_chroma_platform",
             "trigger_reasons": ["broad_core_chroma_platform"],
             "fixed_limits": {
                 "largest_component_ratio": {
                     "accepted": 0.005,
-                    "repair": 0.01,
+                    "high_risk": 0.01,
                 }
             },
             "measurements": {
@@ -2571,6 +2789,12 @@ class Stage4PccPolicyTests(unittest.TestCase):
         pcc_integrity = report["pcc"]["quality_gate"][
             "bright_core_color_integrity"
         ]
+        for retired_field in (
+            "spcc_assessment_status",
+            "spcc_assessment_final_action",
+            "spcc_rejection_reasons",
+        ):
+            self.assertNotIn(retired_field, pcc_integrity)
         self.assertEqual(report["method"], "PCC")
         self.assertFalse(report["requires_review"])
         self.assertTrue(pcc_integrity["accepted"])
@@ -2585,6 +2809,13 @@ class Stage4PccPolicyTests(unittest.TestCase):
         self.assertTrue(
             pcc_integrity["physical_pcc_global_rebalance"]["accepted"]
         )
+        rebalance_checks = pcc_integrity["physical_pcc_global_rebalance"][
+            "checks"
+        ]
+        self.assertTrue(
+            rebalance_checks["physical_pcc_technical_integrity_passed"]
+        )
+        self.assertNotIn("physical_pcc_quality_gate_passed", rebalance_checks)
         np.testing.assert_array_equal(saved["stage4_color"], candidate)
         self.assertEqual(results[-1][0][1], "ok")
 
@@ -2982,30 +3213,11 @@ class Stage4PccPolicyTests(unittest.TestCase):
         self.assertEqual(results[-1][0][1], "failed")
         self.assertEqual(results[-1][1]["reason_code"], "stage4_main_output_blocked")
 
-    def test_legacy_local_star_restore_is_retired_after_auto_reference_rejection(self):
+    def test_retired_local_star_report_is_emitted_after_auto_reference_rejection(self):
         pipeline, _saved, _commands, _results = _stage4_integration_fixture()
         pipeline._run_stage4_spcc_once = lambda **_kwargs: (False, "spcc failed")
         pipeline._run_stage4_pcc_once = lambda **_kwargs: (False, "pcc failed")
-        fallback_report = {
-            "star_white_balance": {"applied": True},
-            "global_white_balance": {"applied": False, "prohibited": True},
-        }
-
-        with (
-            patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False),
-            patch.object(
-                stage4,
-                "_stage4_local_color_fallback",
-                return_value=(
-                    True,
-                    "LOCAL_STAR_COLOR_RESTORE",
-                    "local_star_mask_fallback",
-                    0.55,
-                    fallback_report,
-                    "local fallback",
-                ),
-            ),
-        ):
+        with patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False):
             stage4.run_stage4_color_calibration(pipeline)
 
         report = pipeline.color_calibration_report

@@ -152,6 +152,94 @@ class Stage3BackgroundSamplingTests(unittest.TestCase):
                 )
                 self.assertGreater(report["rejection_counts"][rejection], 0)
 
+    def test_multiscale_mask_evidence_is_applied_and_catalog_halo_has_zero_overlap(self):
+        image = _gradient_image(seed=52)
+        height, width = image.shape
+        star = {"x": width / 2, "y": height / 2, "fwhm_px": 8.0}
+
+        points, report = build_safe_background_samples(
+            image,
+            shared_star_catalog=[star],
+            protection_policy={"protect_star_halo": True},
+        )
+
+        self.assertEqual(report["status"], "ready")
+        evidence = report["mask_evidence"]
+        self.assertTrue(evidence["applied_to_sampling"])
+        self.assertGreater(evidence["combined_excluded_fraction"], 0.0)
+        self.assertGreater(evidence["usable_sky_fraction"], 0.0)
+        self.assertLess(evidence["usable_sky_fraction"], 1.0)
+        for layer in (
+            "invalid_or_uncovered",
+            "image_stars_and_sources",
+            "scene_support_stars",
+            "positive_structure_nebulosity",
+            "bright_core",
+            "dark_structure",
+            "outer_halo",
+        ):
+            self.assertIn(layer, evidence["layers"])
+            self.assertIn("requested", evidence["layers"][layer])
+            self.assertIn("available", evidence["layers"][layer])
+            self.assertIn("applied", evidence["layers"][layer])
+            self.assertIn("pixel_fraction", evidence["layers"][layer])
+            self.assertIn("method", evidence["layers"][layer])
+            self.assertIn("reason", evidence["layers"][layer])
+        self.assertTrue(evidence["layers"]["scene_support_stars"]["applied"])
+        self.assertEqual(
+            evidence["layers"]["scene_support_stars"]["method"],
+            "scene_support_catalog_4x_fwhm",
+        )
+        self.assertFalse(evidence["layers"]["outer_halo"]["requested"])
+        for point_x, point_y in points:
+            top_y = height - 1 - point_y
+            self.assertGreater(
+                np.hypot(point_x - star["x"], top_y - star["y"]),
+                4.0 * star["fwhm_px"] + report["patch_radius"],
+            )
+
+    def test_bright_core_mask_requires_coherent_positive_structure(self):
+        image = _gradient_image(seed=57)
+        height, width = image.shape
+        y, x = np.mgrid[:height, :width]
+        rng = np.random.default_rng(57)
+        for star_x, star_y in zip(
+            rng.integers(8, width - 8, size=240),
+            rng.integers(8, height - 8, size=240),
+        ):
+            image += 0.18 * np.exp(
+                -((x - star_x) ** 2 + (y - star_y) ** 2) / (2 * 1.1**2)
+            )
+
+        _points, report = build_safe_background_samples(image)
+
+        layers = report["masks"]["layer_fractions"]
+        self.assertLessEqual(
+            layers["bright_core"],
+            layers["extended_structure"] + 1e-12,
+        )
+        self.assertLess(layers["bright_core"], 0.20)
+
+    def test_dense_scene_catalog_expands_search_without_relaxing_star_mask(self):
+        image = _gradient_image(seed=58)
+        height, width = image.shape
+        catalog = [
+            {"x": float(x), "y": float(y), "fwhm_px": 3.0}
+            for y in range(8, height, 18)
+            for x in range(8, width, 18)
+        ]
+
+        _points, report = build_safe_background_samples(
+            image,
+            shared_star_catalog=catalog,
+        )
+
+        search = report["candidate_search"]
+        self.assertTrue(search["dense_star_field_expansion"])
+        self.assertEqual(search["grid_multiplier"], 6)
+        self.assertGreaterEqual(search["scene_support_star_fraction"], 0.15)
+        self.assertGreater(report["rejection_counts"]["shared_catalog_star"], 0)
+
     def test_dark_patch_refinement_is_deterministic_and_keeps_frozen_thresholds(self):
         image = _gradient_image(seed=31)
         height, width = image.shape
@@ -407,6 +495,38 @@ class Stage3BackgroundSamplingTests(unittest.TestCase):
         self.assertTrue(process["should_evaluate"])
         self.assertTrue(process["low_complexity_required"])
         self.assertEqual(process["model_complexity_limit"], "polynomial_degree_1")
+
+    def test_process_evidence_reports_combined_mask_and_safe_candidate_geometry(self):
+        image = _gradient_image()
+        process = assess_background_process(
+            image,
+            [],
+            {
+                "status": "insufficient_safe_coverage",
+                "masks": {
+                    "usable_sky_fraction": 0.60,
+                    "usable_sky_grid_cells": 16,
+                },
+                "mask_evidence": {"usable_sky_fraction": 0.455},
+                "coverage": {"available_grid_cells": 0},
+            },
+            {"status": "not_run"},
+            {"status": "ok", "detected": False},
+            input_profile={
+                "state": "linear",
+                "safe_for_linear_steps": True,
+            },
+        )
+
+        self.assertEqual(
+            process["true_sky_support"]["usable_sky_fraction"],
+            0.455,
+        )
+        self.assertEqual(
+            process["true_sky_support"]["usable_sky_grid_cells"],
+            0,
+        )
+        self.assertFalse(process["true_sky_support"]["supported"])
 
     def test_process_evidence_evaluates_radial_gradient_with_flat_advisory(self):
         rng = np.random.default_rng(61)

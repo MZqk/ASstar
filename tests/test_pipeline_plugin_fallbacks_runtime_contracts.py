@@ -890,7 +890,7 @@ class PipelinePluginFallbackRuntimeContractTests(PipelinePluginFallbackTestBase)
         )
         self.assertEqual(
             processor.cfg.stage4_spcc_online_unverified_timeout_sec,
-            180,
+            300,
         )
 
     def test_runtime_env_uses_canonical_stage5_denoise_mod(self):
@@ -1864,7 +1864,7 @@ class PipelinePluginFallbackRuntimeContractTests(PipelinePluginFallbackTestBase)
         stage3_identity = identity["stage_algorithms"]["stage3_background"]
 
         self.assertEqual(identity["schema"], "starun.software-identity.v1")
-        self.assertEqual(stage3_identity["algorithm_contract_version"], "1.2.0")
+        self.assertEqual(stage3_identity["algorithm_contract_version"], "1.3.0")
         self.assertEqual(len(stage3_identity["source_sha256"]), 64)
         self.assertEqual(
             set(stage3_identity["source_files"]),

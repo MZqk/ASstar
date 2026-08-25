@@ -16,10 +16,16 @@ SIRIL_ARCHIVE="${DOWNLOAD_DIR}/siril-scripts.tar.gz"
 SIRIL_UNPACK_DIR="${VENDOR_DIR}/siril-scripts"
 SIRIL_SCRIPTS_COMMIT="4cc9e204f9ddfd6d03cc4283aac76c82d4d19167"
 SIRIL_STARLESS_SOURCE_RELATIVE="siril-scripts/upstream/SyQon/Starless.py"
+SIRIL_GRAXPERT_SOURCE_RELATIVE="siril-scripts/upstream/processing/GraXpert-AI.py"
 SIRIL_STARLESS_PATCHED_RELATIVE="vendor/siril-scripts/SyQon/Starless.py"
 SIRIL_STARLESS_PATCH_RELATIVE="patches/apply_syqon_offline_model_patch.py"
 GRAXPERT_OBJECT_MODEL_DIR="${GRAXPERT_DIR}/deconvolution-object-ai-models/1.0.1"
 GRAXPERT_OBJECT_MODEL_RELATIVE="graxpert/deconvolution-object-ai-models/1.0.1/model.onnx"
+GRAXPERT_BGE_MODEL_DIR="${GRAXPERT_DIR}/bge-ai-models/model_v2_0_1"
+GRAXPERT_BGE_MODEL_RELATIVE="graxpert/bge-ai-models/model_v2_0_1/model.onnx"
+GRAXPERT_BGE_MODEL_SOURCE="${STARUN_GRAXPERT_BGE_MODEL_SOURCE:-}"
+GRAXPERT_PATCH_RELATIVE="patches/apply_graxpert_ai_runtime_patch.py"
+GRAXPERT_PATCHED_SCRIPT_RELATIVE="vendor/siril-scripts/processing/GraXpert-AI.py"
 
 mkdir -p "${DOWNLOAD_DIR}" "${VENDOR_DIR}" "${SYQON_DIR}" "${GRAXPERT_DIR}"
 
@@ -95,6 +101,26 @@ if [[ ! -f "${ASSET_CHECKSUM_FILE}" || ! -f "${WHEEL_LOCK_FILE}" ]]; then
   exit 1
 fi
 
+mkdir -p "${GRAXPERT_BGE_MODEL_DIR}"
+if [[ -f "${GRAXPERT_BGE_MODEL_DIR}/model.onnx" ]]; then
+  verify_sha256 \
+    "${GRAXPERT_BGE_MODEL_DIR}/model.onnx" \
+    "$(expected_sha256 "${GRAXPERT_BGE_MODEL_RELATIVE}")"
+else
+  if [[ -z "${GRAXPERT_BGE_MODEL_SOURCE}" || ! -f "${GRAXPERT_BGE_MODEL_SOURCE}" ]]; then
+    echo "GraXpert BGE model is missing." >&2
+    echo "Set STARUN_GRAXPERT_BGE_MODEL_SOURCE to the controlled model_v2_0_1 ONNX file." >&2
+    exit 1
+  fi
+  cp "${GRAXPERT_BGE_MODEL_SOURCE}" "${GRAXPERT_BGE_MODEL_DIR}/model.onnx.tmp"
+  verify_sha256 \
+    "${GRAXPERT_BGE_MODEL_DIR}/model.onnx.tmp" \
+    "$(expected_sha256 "${GRAXPERT_BGE_MODEL_RELATIVE}")"
+  mv \
+    "${GRAXPERT_BGE_MODEL_DIR}/model.onnx.tmp" \
+    "${GRAXPERT_BGE_MODEL_DIR}/model.onnx"
+fi
+
 echo "[1/5] Downloading pinned official siril-scripts archive..."
 download_latest \
   "https://gitlab.com/free-astro/siril-scripts/-/archive/${SIRIL_SCRIPTS_COMMIT}/siril-scripts-${SIRIL_SCRIPTS_COMMIT}.tar.gz" \
@@ -108,6 +134,9 @@ verify_sha256 \
   "${SIRIL_UNPACK_DIR}.tmp/SyQon/Starless.py" \
   "$(expected_sha256 "${SIRIL_STARLESS_SOURCE_RELATIVE}")"
 verify_sha256 \
+  "${SIRIL_UNPACK_DIR}.tmp/processing/GraXpert-AI.py" \
+  "$(expected_sha256 "${SIRIL_GRAXPERT_SOURCE_RELATIVE}")"
+verify_sha256 \
   "${ROOT_DIR}/patches/apply_syqon_offline_model_patch.py" \
   "$(expected_sha256 "${SIRIL_STARLESS_PATCH_RELATIVE}")"
 rm -rf "${SIRIL_UNPACK_DIR}"
@@ -116,6 +145,13 @@ python3 "${ROOT_DIR}/patches/apply_syqon_offline_model_patch.py" "${ROOT_DIR}"
 verify_sha256 \
   "${SIRIL_UNPACK_DIR}/SyQon/Starless.py" \
   "$(expected_sha256 "${SIRIL_STARLESS_PATCHED_RELATIVE}")"
+verify_sha256 \
+  "${ROOT_DIR}/${GRAXPERT_PATCH_RELATIVE}" \
+  "$(expected_sha256 "${GRAXPERT_PATCH_RELATIVE}")"
+python3 "${ROOT_DIR}/${GRAXPERT_PATCH_RELATIVE}" "${ROOT_DIR}"
+verify_sha256 \
+  "${ROOT_DIR}/${GRAXPERT_PATCHED_SCRIPT_RELATIVE}" \
+  "$(expected_sha256 "${GRAXPERT_PATCHED_SCRIPT_RELATIVE}")"
 
 echo "[3/5] Downloading hash-locked Python 3.12 wheels..."
 python3 -m pip download \

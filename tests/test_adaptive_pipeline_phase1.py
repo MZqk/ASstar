@@ -80,9 +80,12 @@ class AdaptivePipelinePhase1Tests(unittest.TestCase):
         policy = load_policy("does_not_exist")
 
         self.assertEqual(policy["policy_name"], "generic_low_snr_safe")
-        self.assertEqual(
-            policy["stage4_color"]["calibration_policy"],
-            "spcc_first_then_pcc",
+        self.assertNotIn("calibration_policy", policy["stage4_color"])
+        self.assertNotIn("allow_pcc_warning", policy["stage4_color"])
+        self.assertTrue(
+            policy["stage4_color"][
+                "reduce_saturation_if_solution_imprecise"
+            ]
         )
 
     def test_stage7_policy_does_not_expose_dead_scoring_weights(self) -> None:

@@ -168,6 +168,11 @@ class Stage4AutoReferenceTests(unittest.TestCase):
 
         self.assertIsNone(candidate)
         self.assertEqual(report["sampling"]["stars"]["status"], "not_run")
+        skipped_selection = report["sampling"]["stars"]["selection"]
+        self.assertEqual(skipped_selection["status"], "not_run")
+        self.assertEqual(skipped_selection["valid_object_count"], 0)
+        self.assertEqual(skipped_selection["quadrants"], 0)
+        self.assertEqual(skipped_selection["rejection_counts"], {})
         star = report["candidates"][STAR_ENSEMBLE_METHOD]
         self.assertTrue(star["analysis_skipped"])
         self.assertIn(
@@ -319,8 +324,8 @@ class Stage4AutoReferenceTests(unittest.TestCase):
     def test_star_quadrant_and_color_dispersion_gates_reject_weak_evidence(self) -> None:
         left_positions = [
             (cy, cx)
-            for cy in range(20, 241, 25)
-            for cx in (20, 50, 80)
+            for cy in (35, 70, 105, 150, 185, 220)
+            for cx in (20, 42, 64, 86)
         ]
         left_image = _custom_star_field(
             left_positions,
@@ -344,8 +349,8 @@ class Stage4AutoReferenceTests(unittest.TestCase):
 
         dispersed_positions = [
             (cy, cx)
-            for cy in (25, 60, 95, 160, 195, 230)
-            for cx in (25, 70, 115, 165, 210)
+            for cy in (25, 75, 125, 175, 225)
+            for cx in (25, 75, 125, 175, 225)
         ]
         count = len(dispersed_positions)
         dispersed_ratios = [

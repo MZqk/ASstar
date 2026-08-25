@@ -419,7 +419,7 @@ def build_runtime_capabilities(
     siril_plugin_dir: Path,
     network_enabled: bool,
     stage4_offline_fallback_mode: str = "auto_local_reference",
-    stage4_spcc_online_unverified_timeout_sec: int = 90,
+    stage4_spcc_online_unverified_timeout_sec: int = 300,
     run_id: str | None = None,
     endpoints: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, object]:
@@ -435,10 +435,10 @@ def build_runtime_capabilities(
             stage4_spcc_online_unverified_timeout_sec
         )
     except (TypeError, ValueError):
-        online_unverified_timeout_sec = 90
+        online_unverified_timeout_sec = 300
     online_unverified_timeout_sec = max(
         30,
-        min(online_unverified_timeout_sec, 180),
+        min(online_unverified_timeout_sec, 300),
     )
     astro = _inspect_gaia_astro(runtime, required=False)
     xp = _inspect_gaia_xp(runtime, required=False)
@@ -645,13 +645,13 @@ def _stage4_color_decision(
     try:
         online_unverified_timeout_sec = int(
             configuration.get("stage4_spcc_online_unverified_timeout_sec")
-            or 90
+            or 300
         )
     except (TypeError, ValueError):
-        online_unverified_timeout_sec = 90
+        online_unverified_timeout_sec = 300
     online_unverified_timeout_sec = max(
         30,
-        min(online_unverified_timeout_sec, 180),
+        min(online_unverified_timeout_sec, 300),
     )
 
     network = capabilities.get("network_endpoints")
@@ -1081,7 +1081,7 @@ def capability_summary_lines(manifest: Mapping[str, object]) -> list[str]:
         if stage4.get("spcc_readiness") == "online_unverified":
             lines.append(
                 "  - SPCC 在线能力: 未验证 · 单次预算 "
-                f"{int(stage4.get('spcc_online_unverified_timeout_sec') or 90)} 秒"
+                f"{int(stage4.get('spcc_online_unverified_timeout_sec') or 300)} 秒"
             )
     return lines
 

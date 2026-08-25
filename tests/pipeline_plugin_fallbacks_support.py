@@ -551,6 +551,39 @@ class Stage3SampleSiril:
         return list(self.samples)
 
 
+def complete_stage3_preservation(*, accepted: bool = True) -> dict[str, Any]:
+    """Return deterministic held-out target evidence for Stage 3 test doubles."""
+    return {
+        "available": True,
+        "target_sky_reference": "heldout_sky_plane_degree_1",
+        "target_flux_change_significance": 0.0 if accepted else -100.0,
+        "target_flux_retention_ratio": 1.0 if accepted else 0.1,
+        "target_morphology_correlation": 1.0 if accepted else 0.1,
+        "target_change_residual_significance": 0.0,
+        "target_centroid_shift_fraction": 0.0,
+        "star_retention_ratio": 1.0,
+        "nebula_mean_change_ratio": 0.0,
+    }
+
+
+class Stage3TransactionSiril(Stage3SampleSiril):
+    def __init__(self, owner: "Stage3TransactionFake") -> None:
+        super().__init__()
+        self.owner = owner
+        y, x = np.mgrid[: self.image.shape[0], : self.image.shape[1]]
+        self.candidate_image = (
+            self.image
+            - 0.035 * x / max(self.image.shape[1] - 1, 1)
+            - 0.010 * y / max(self.image.shape[0] - 1, 1)
+        ).astype(np.float32)
+
+    def get_image_pixeldata(self, preview: bool = False):
+        _ = preview
+        if str(self.owner.current_image).startswith("candidate:"):
+            return self.candidate_image.copy()
+        return self.image.copy()
+
+
 class Stage3TransactionFake(ReviewRegistryTestDouble):
     """Minimal buffer model for Stage 3 rollback regression tests."""
 
@@ -567,6 +600,11 @@ class Stage3TransactionFake(ReviewRegistryTestDouble):
             "stage3_background": {},
         }
         self.target_profile: dict[str, Any] = {}
+        self.input_profile = {
+            "state": "linear",
+            "safe_for_linear_steps": True,
+            "source": "test_fixture",
+        }
         self.current_image = "baseline"
         self.fail_selected_load = fail_selected_load
         self.gate_ok = gate_ok
@@ -576,7 +614,7 @@ class Stage3TransactionFake(ReviewRegistryTestDouble):
         self.results: list[tuple[str, str, float, str]] = []
         self.result_metadata: list[dict[str, Any]] = []
         self.report: dict[str, Any] = {}
-        self.siril = SimpleNamespace(get_image_pixeldata=lambda preview=False: None)
+        self.siril = Stage3TransactionSiril(self)
 
     def cmd_with_check(self, *args: Any, quiet: bool = False) -> bool:
         _ = quiet
@@ -600,7 +638,7 @@ class Stage3TransactionFake(ReviewRegistryTestDouble):
         return None
 
     def _stage3_signal_preservation_metrics(self, _before: Any, _after: Any):
-        return {"available": False}
+        return complete_stage3_preservation(accepted=self.gate_ok)
 
     def _stage3_quality_gate(self, _before: Any, _after: Any, _preservation: Any):
         return self.gate_ok, "accepted" if self.gate_ok else "mock rejection"
@@ -682,7 +720,6 @@ class Stage3CompoundFake(ReviewRegistryTestDouble):
         self.log = FakeLogger()
         self.cfg = SimpleNamespace(
             workflow_plugin_probe_enabled=False,
-            bg_quality_gate_enabled=True,
             stage3_gate_profile="strict",
         )
         self.pipeline_policy = {
@@ -690,6 +727,11 @@ class Stage3CompoundFake(ReviewRegistryTestDouble):
             "stage3_background": {},
         }
         self.target_profile: dict[str, Any] = {}
+        self.input_profile = {
+            "state": "linear",
+            "safe_for_linear_steps": True,
+            "source": "test_fixture",
+        }
         height, width = 512, 640
         y, x = np.mgrid[:height, :width]
         noise = np.random.default_rng(1).normal(
@@ -828,6 +870,11 @@ class Stage3CompoundFake(ReviewRegistryTestDouble):
                 raise pipeline_module.CommandError("mock external failure")
             self.state = "plugin"
             return True
+        if command == "pyscript" and "-bge" in args:
+            if not self.external_success:
+                raise pipeline_module.CommandError("mock external failure")
+            self.state = "plugin"
+            return True
         return True
 
     def _stage3_subsky_rbf_candidates(self):
@@ -845,11 +892,7 @@ class Stage3CompoundFake(ReviewRegistryTestDouble):
         return SimpleNamespace(state=self.state)
 
     def _stage3_signal_preservation_metrics(self, _before: Any, _after: Any):
-        return {
-            "available": True,
-            "star_retention_ratio": 1.0,
-            "nebula_mean_change_ratio": 0.0,
-        }
+        return complete_stage3_preservation()
 
     def _stage3_quality_gate(self, _before: Any, _after: Any, _preservation: Any):
         return True, "quality gate ok"
@@ -926,10 +969,6 @@ class FakeProcessor(ReviewRegistryTestDouble):
             stage4_platesolve_enabled=True,
             stage4_spcc_restore_cpu=8,
             stage4_pcc_header_fallback_enabled=True,
-            stage4_local_star_wb_enabled=True,
-            stage4_local_star_wb_min_pixels=32,
-            stage4_local_star_wb_gain_limit=1.25,
-            stage4_local_star_wb_target_aware_enabled=False,
         )
         self.auto_tune_result = None
         self.stretched_name = "stage7_stretched"

@@ -8,6 +8,7 @@
 - `vendor/`: 解压后的插件脚本或工具目录
 - `syqon_starless/`: 本机 SyQon Zenith 模型缓存、校验/日期文件（模型不随 Git 分发）
 - `graxpert/deconvolution-object-ai-models/1.0.1/`: GraXpert Object Deconvolution 官方模型
+- `graxpert/bge-ai-models/model_v2_0_1/`: Stage 3 固定的 GraXpert BGE 2.0.1 受控模型缓存
 - `cosmic_clarity/`: 本机 CosmicClarity Native/classic wrapper 共用模型（denoise 模型不随 Git 分发）
 - `bin/CosmicClarity`: classic CosmicClarity 兼容 wrapper
 - `download_siril_plugins.sh`: 基础离线依赖下载脚本（不包含 CosmicClarity denoise 模型）
@@ -23,6 +24,8 @@
 ```bash
 bash resources/siril_plugins/download_siril_plugins.sh
 ```
+
+GraXpert BGE 没有在公开 release 中提供可锁定下载 URL。首次准备缓存时必须设置 `STARUN_GRAXPERT_BGE_MODEL_SOURCE=/absolute/path/model_v2_0_1.onnx`；脚本只在 SHA-256 为 `26d9e68370dfc079698aece805240a41782364f48c75f18ee4ff262c3f2ea8d2` 时导入，之后可直接复用已校验缓存。
 
 脚本会尝试下载：
 
@@ -41,6 +44,7 @@ bash resources/siril_plugins/download_siril_plugins.sh
 
 - `syqon_starless/`: Zenith 模型仅保留在本机缓存，不随 Git 分发；执行 `download_siril_plugins.sh` 可下载并校验。正式推理由固定上游快照经离线补丁生成的 `vendor/siril-scripts/SyQon/Starless.py` 执行。
 - `graxpert/deconvolution-object-ai-models/1.0.1/`: 随项目保存 GraXpert Object Deconvolution 1.0.1 模型；Stage 5 自动注入该路径，不在任务中联网下载。
+- `graxpert/bge-ai-models/model_v2_0_1/`: 不随 Git 分发；full App/core 资源包构建前必须由受控来源预置并匹配固定摘要。Stage 3 只接受该路径，不读取顶层或 `downloads/` 中的同名文件。
 - `cosmic_clarity/`: CosmicClarity Native/classic wrapper 共用模型缓存目录。当前项目在本机保留 denoise + sharpen 的最小模型集：`deep_denoise_mono_AI4.pth`、`deep_denoise_color_AI4.pth`、`deep_sharp_stellar_AI4.pth`、`deep_nonstellar_sharp_conditional_psf_AI4.pth`；其中两个 denoise 模型不随 Git 分发，打包前须由本机缓存提供。
 - `bin/CosmicClarity`: 兼容 Siril classic `CosmicClarity_Denoise.py` / `CosmicClarity_Sharpen.py` 协议的 standalone wrapper；内部使用 bundled `setiastrosuitepro`/`lz4`/`zstandard`/`exifread`/`opencv-python-headless`/`requests` wheel 和 `cosmic_clarity/` 模型；wrapper 会复用当前 Siril runtime 的 torch/torchvision，避免 SASPro 额外创建联网安装运行时。
 
@@ -48,6 +52,7 @@ bash resources/siril_plugins/download_siril_plugins.sh
 
 - GUI 会复制小型插件脚本到临时覆盖层，并通过 `STARUN_SIRIL_PLUGIN_DIR` 注入 pipeline；`downloads/`、`syqon_starless/`、`graxpert/`、`cosmic_clarity/` 和模型保持只读链接。
 - GraXpert 对象反卷积模型 1.0.1 随 App 分发，且不会由 pipeline 联网下载。Stage 5 自动选择该模型并只读链接到隔离 HOME；只有随包模型缺失时，才尝试本机 GraXpert 模型或 `STARUN_GRAXPERT_OBJECT_MODEL_PATH` 指定的官方 `model.onnx`、语义版本目录或 `deconvolution-object-ai-models` 家族目录，全部无效时继续回退 Siril RL。
+- Stage 3 GraXpert BGE 固定使用 `model_v2_0_1`、减法、CPU 与 `-keep_bg`，同时保存背景模型和脚本/模型摘要。缺失或摘要不符时不会联网或尝试未注册原生命令，而是继续确定性候选链。
 - SyQon 与 CosmicClarity 分别通过 `STARUN_SYQON_MODEL_DIR`、`STARUN_COSMIC_CLARITY_MODEL_DIR` 直接读取 App/离线资源包模型；只清理与 bundled 文件同尺寸的旧 runtime 受管副本。Stage 6 同时核对 Zenith 固定项目摘要和旁车摘要；SyQon 对该只读模型跳过版本检查和下载，缺失/损坏会 fail-closed，不访问 `siril.syqon.it`。离线补丁使 Stage 6 文件模式只接受显式输入/输出/manifest 路径，由 Astropy 直接读写，不连接 Siril 或调用 Siril 回写；生产 profile 固定 Statistical `0.15`、unlinked、`bp_sigma=5.0`、black clip、subtraction、`512/64`、FP32。数值交换固定为有限 `float32 0..1` FITS，并在写出前剥离源整数存储的缩放卡；v2 报告记录资产、参数、padding/crop/grid/coverage、成对哈希、变换 roundtrip 和 `source ≈ starless + raw_starmask` 闭环。上游更新只通过补丁脚本重放，禁止直接维护派生 vendor 文件。
 - classic wrapper 仅在 `STARUN_COSMIC_CLASSIC_ENABLE=1` 时参与，其可写缓存留在临时覆盖层，模型仍使用只读链接。
 - runtime 安装 `opencv-python-headless` 后，GUI 会写入同版本的 `opencv-python` 兼容分发元数据；第三方脚本仍按发行包名调用 `ensure_installed("opencv-python")`，但实际导入继续使用 headless wheel 提供的 `cv2`。

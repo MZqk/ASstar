@@ -206,7 +206,6 @@ class GuiRuntimeModesTests(unittest.TestCase):
             graxpert_model_path="",
             compute_mode="cpu",
             pcc_timeout_sec=45,
-            local_wb_gain_limit=1.18,
             builtin_denoise_strength=0.35,
             graxpert_deconv_strength=0.26,
             rl_iterations=12,
@@ -241,9 +240,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
         self.assertEqual(overrides["STARUN_GRAXPERT_GPU"], "0")
         self.assertEqual(overrides["STARUN_STAGE4_SPCC_TIMEOUT_SEC"], "300")
         self.assertEqual(overrides["STARUN_STAGE4_PCC_TIMEOUT_SEC"], "45")
-        self.assertEqual(
-            overrides["STARUN_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT"], "1.18"
-        )
+        self.assertNotIn("STARUN_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT", overrides)
         self.assertEqual(overrides["STARUN_DENOISE_MOD"], "0.35")
         self.assertEqual(overrides["STARUN_STAGE5_RL_ITERS"], "12")
         self.assertEqual(overrides["STARUN_STAGE5_RL_MAXSTARS"], "320")
@@ -265,7 +262,6 @@ class GuiRuntimeModesTests(unittest.TestCase):
             graxpert_model_path="/tmp/model.onnx",
             compute_mode="auto",
             pcc_timeout_sec=30,
-            local_wb_gain_limit=1.20,
             builtin_denoise_strength=0.50,
             graxpert_deconv_strength=0.30,
             rl_iterations=8,
@@ -306,7 +302,6 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 proxy,
                 {
                 "pcc_timeout_sec": 999,
-                "local_wb_gain_limit": 9.0,
                 "builtin_denoise_strength": -1.0,
                 "graxpert_deconv_strength": "invalid",
                 "rl_iterations": 99,

@@ -1170,6 +1170,14 @@ def _mark_star_ensemble_prerequisite_skipped(
     report["sampling"]["stars"] = {
         "status": "not_run",
         "reason": "background_neutralization_prerequisite_rejected",
+        "selection": {
+            "status": "not_run",
+            "reason": "background_neutralization_prerequisite_rejected",
+            "detected_component_count": 0,
+            "valid_object_count": 0,
+            "quadrants": 0,
+            "rejection_counts": {},
+        },
     }
     report["candidates"][STAR_ENSEMBLE_METHOD] = {
         "method": STAR_ENSEMBLE_METHOD,

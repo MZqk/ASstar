@@ -108,7 +108,7 @@ class TestInfrastructureTests(unittest.TestCase):
         self.assertIn("starun.pipeline-result.v2", integration)
         self.assertIn("STARUN_REAL_E2E_READY=true", integration)
         self.assertIn("actions/setup-python", integration)
-        self.assertIn("starun.processing-parameters.v5", combined)
+        self.assertIn("starun.processing-parameters.v6", combined)
         self.assertIn("历史 v4", combined)
         self.assertNotIn(
             "唯一支持的 `starun.processing-parameters.v4`",

@@ -2,7 +2,7 @@
   "policy_name": "generic_low_snr_safe",
   "applies_to": {"target_types": ["generic_low_snr_safe"]},
   "stage3_background": {"model_priority": ["rbf_smooth", "polynomial_low_order"], "protect_nebulosity": true, "protect_bright_core": true, "max_bg_std_growth": 1.04, "fallback_to_safe_model": true},
-  "stage4_color": {"calibration_policy": "spcc_first_then_pcc", "blue_gain_limit": 0.90, "red_gain_limit": 1.08, "max_allowed_saturation_boost": 0.10},
+  "stage4_color": {"blue_gain_limit": 0.90, "red_gain_limit": 1.08, "max_allowed_saturation_boost": 0.10},
   "stage5_linear": {"denoise_mode": "chroma_first", "sharpen_mode": "conservative", "protect_background": true, "protect_star_halo": true, "avoid_global_sharpen": true},
   "stage7_stretch": {"candidate_mode": ["asinh_core_protect", "low_contrast_masked_lift", "asinh_mild_ghs", "autostretch_reference"], "forbidden_when_dirty": ["autostretch"], "allow_autostretch_as_reference_only": true, "fallback_candidate": "low_contrast_masked_lift"}
 }

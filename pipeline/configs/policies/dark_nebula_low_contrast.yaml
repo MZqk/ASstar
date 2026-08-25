@@ -2,7 +2,7 @@
   "policy_name": "dark_nebula_low_contrast",
   "applies_to": {"target_types": ["dark_nebula_low_contrast"]},
   "stage3_background": {"model_priority": ["polynomial_low_order", "rbf_smooth"], "protect_dark_structure": true, "protect_nebulosity": true, "max_bg_std_growth": 1.02, "fallback_to_safe_model": true},
-  "stage4_color": {"calibration_policy": "spcc_first_then_pcc", "blue_gain_limit": 0.90, "red_gain_limit": 1.08, "max_allowed_saturation_boost": 0.08},
+  "stage4_color": {"blue_gain_limit": 0.90, "red_gain_limit": 1.08, "max_allowed_saturation_boost": 0.08},
   "stage5_linear": {"denoise_mode": "chroma_first", "sharpen_mode": "minimal", "protect_background": true, "protect_star_halo": true, "avoid_global_sharpen": true},
   "stage7_stretch": {"candidate_mode": ["dark_nebula_masked_lift", "asinh_core_protect", "masked_curve_dark_boost", "asinh_mild_ghs", "autostretch_reference"], "forbidden_when_dirty": ["autostretch"], "allow_autostretch_as_reference_only": true, "fallback_candidate": "dark_nebula_masked_lift"}
 }

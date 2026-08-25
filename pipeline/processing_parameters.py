@@ -18,10 +18,28 @@ except ImportError:  # Direct execution from the pipeline directory.
     from models import PipelineConfig  # type: ignore[no-redef]
 
 
-PROCESSING_PARAMETERS_SCHEMA = "starun.processing-parameters.v5"
+PROCESSING_PARAMETERS_SCHEMA = "starun.processing-parameters.v6"
+LEGACY_PROCESSING_PARAMETERS_SCHEMA_V5 = "starun.processing-parameters.v5"
 LEGACY_PROCESSING_PARAMETERS_SCHEMA_V4 = "starun.processing-parameters.v4"
 SUPPORTED_PROCESSING_PARAMETERS_SCHEMAS = frozenset(
-    {PROCESSING_PARAMETERS_SCHEMA, LEGACY_PROCESSING_PARAMETERS_SCHEMA_V4}
+    {
+        PROCESSING_PARAMETERS_SCHEMA,
+        LEGACY_PROCESSING_PARAMETERS_SCHEMA_V5,
+        LEGACY_PROCESSING_PARAMETERS_SCHEMA_V4,
+    }
+)
+LEGACY_STAGE3_PROCESSING_FIELDS = frozenset(
+    {
+        "bg_quality_gate_enabled",
+        "stage3_conditional_decision_enabled",
+        "stage3_deterministic_auto_apply_enabled",
+        "stage3_apply_confidence_min",
+        "stage3_gradient_skip_max",
+        "stage3_dirty_skip_max",
+        "stage3_gradient_apply_min",
+        "stage3_dirty_apply_min",
+        "stage3_diffuse_auto_apply_enabled",
+    }
 )
 GATE_PROFILE_DEFAULT = "default"
 GATE_PROFILE_RELAXED = "relaxed"
@@ -279,9 +297,9 @@ PROCESSING_PARAMETER_SPECS: Tuple[ParameterSpec, ...] = (
     ParameterSpec("stage4_spcc_timeout_sec", 4, "SPCC 超时", "expert", "int", 5, 300, 5, suffix=" 秒"),
     ParameterSpec(
         "stage4_spcc_online_unverified_timeout_sec", 4,
-        "在线未验证 SPCC 超时", "expert", "int", 30, 180, 15,
+        "在线未验证 SPCC 超时", "expert", "int", 30, 300, 15,
         suffix=" 秒",
-        help="仅有在线 XP 端点可达证据时的单次预算；localgaia 使用普通 SPCC 超时。",
+        help="在线 XP 尚未完成真实命令验证时的单次预算，默认 300 秒；localgaia 使用普通 SPCC 超时。",
     ),
     ParameterSpec("stage4_pcc_timeout_sec", 4, "PCC 超时", "expert", "int", 5, 180, 5, suffix=" 秒"),
     ParameterSpec(
@@ -318,6 +336,50 @@ PROCESSING_PARAMETER_SPECS: Tuple[ParameterSpec, ...] = (
     ParameterSpec("stage4_spcc_narrowband_b_bandwidth_nm", 4, "B/OIII 带宽", "expert", "float", 1.0, 100.0, 0.5, 1, suffix=" nm"),
     ParameterSpec("stage4_narrowband_normalization_enabled", 4, "窄带归一化", "expert", "bool"),
     ParameterSpec("stage4_nbn_strength", 4, "窄带归一化强度", "expert", "float", 0.0, 1.0, 0.05, 2),
+    _spec(
+        "stage4_pcc_channel_gain_ratio_max", 4, "诊断 · 校色通道增益跨度",
+        "float", 1.10, 10.0, 0.10, 2, suffix="×", section="diagnostics",
+        help="仅改变 SPCC/PCC 诊断报告，不参与候选采用、回滚或路由。",
+    ),
+    _spec(
+        "stage4_pcc_emission_balance_gain_ratio_max", 4,
+        "诊断 · 发射星云增益跨度", "float", 1.10, 5.0, 0.10, 2,
+        suffix="×", section="diagnostics",
+        help="仅改变发射目标的诊断分类，不参与候选采用、回滚或路由。",
+    ),
+    _spec(
+        "stage4_pcc_clip_growth_max", 4, "诊断 · 校色高光增长", "float",
+        0.0, 0.05, 0.001, 3, section="diagnostics",
+        help="仅记录高光增长 advisory，不参与候选采用、回滚或路由。",
+    ),
+    _spec(
+        "stage4_pcc_star_temperature_ratio_min", 4,
+        "诊断 · 恒星色温比例下限", "float", 0.20, 0.95, 0.01, 2,
+        suffix="×", section="diagnostics",
+        help="仅改变恒星色温诊断分类，不参与候选采用、回滚或路由。",
+    ),
+    _spec(
+        "stage4_pcc_star_temperature_ratio_max", 4,
+        "诊断 · 恒星色温比例上限", "float", 1.05, 5.0, 0.05, 2,
+        suffix="×", section="diagnostics",
+        help="仅改变恒星色温诊断分类，不参与候选采用、回滚或路由。",
+    ),
+    _spec(
+        "stage4_pcc_background_color_delta_max", 4, "诊断 · 背景色差上限",
+        "float", 0.05, 0.60, 0.01, 2, section="diagnostics",
+        help="仅改变背景色差诊断分类，不参与候选采用、回滚或路由。",
+    ),
+    _spec(
+        "stage4_pcc_target_color_drift_max", 4, "诊断 · 主体色度漂移",
+        "float", 0.05, 0.75, 0.01, 2, section="diagnostics",
+        help="仅改变普通主体色度诊断分类，不参与候选采用、回滚或路由。",
+    ),
+    _spec(
+        "stage4_pcc_emission_target_color_drift_max", 4,
+        "诊断 · 发射主体色度漂移", "float", 0.05, 0.75, 0.01, 2,
+        section="diagnostics",
+        help="仅改变发射主体色度诊断分类，不参与候选采用、回滚或路由。",
+    ),
     ParameterSpec("denoise_enabled", 5, "线性降噪", "recommended", "bool", help="自动状态下允许 Stage 5 基于冻结基线低噪声门和候选质量门自行决定是否实际降噪。", depends_on=(("stage5_processing_mode", ("auto",)),)),
     ParameterSpec("denoise_mod", 5, "降噪强度", "recommended", "float", 0.20, 0.55, 0.05, 2, depends_on=(("stage5_processing_mode", ("auto",)), ("denoise_enabled", (True,)))),
     ParameterSpec(
@@ -1135,10 +1197,6 @@ PROCESSING_GATE_PARAMETER_SPECS: Tuple[ParameterSpec, ...] = (
     _gate("stage2_guard_band_pixels", 2, "边缘护带宽度", "int", 0, 8, 1, suffix=" px"),
 
     # Stage 3: audited samples, compound-candidate validation and routing.
-    _gate("bg_quality_gate_enabled", 3, "背景质量总门", "bool"),
-    _gate("stage3_conditional_decision_enabled", 3, "先诊断后决策", "bool"),
-    _gate("stage3_deterministic_auto_apply_enabled", 3, "高置信自动应用", "bool"),
-    _gate("stage3_apply_confidence_min", 3, "应用置信度下限", "float", 0.50, 0.99, 0.01, 2),
     _gate("stage3_safe_sample_target_count", 3, "安全样点目标数", "int", 16, 64, 1),
     _gate("stage3_safe_sample_min_count", 3, "安全样点下限", "int", 12, 48, 1),
     _gate("stage3_safe_sample_patch_radius", 3, "样点审计半径", "int", 4, 24, 1, suffix=" px"),
@@ -1179,15 +1237,6 @@ PROCESSING_GATE_PARAMETER_SPECS: Tuple[ParameterSpec, ...] = (
     _gate("stage4_nbn_mapping_confidence_min", 4, "窄带映射置信度", "float", 0.70, 0.99, 0.01, 2),
     _gate("stage4_nbn_gain_limit", 4, "窄带通道增益上限", "float", 1.01, 1.15, 0.01, 2, suffix="×"),
     _gate("stage4_nbn_line_ratio_drift_max", 4, "Ha/OIII 比例漂移", "float", 0.04, 0.20, 0.01, 2),
-    _gate("stage4_pcc_channel_gain_ratio_max", 4, "校色通道增益跨度", "float", 1.10, 10.0, 0.10, 2, suffix="×"),
-    _gate("stage4_pcc_emission_balance_gain_ratio_max", 4, "发射星云增益跨度", "float", 1.10, 5.0, 0.10, 2, suffix="×"),
-    _gate("stage4_pcc_clip_growth_max", 4, "校色高光增长", "float", 0.0, 0.05, 0.001, 3),
-    _gate("stage4_pcc_star_temperature_ratio_min", 4, "恒星色温比例下限", "float", 0.20, 0.95, 0.01, 2, suffix="×"),
-    _gate("stage4_pcc_star_temperature_ratio_max", 4, "恒星色温比例上限", "float", 1.05, 5.0, 0.05, 2, suffix="×"),
-    _gate("stage4_pcc_background_color_delta_max", 4, "背景色差上限", "float", 0.05, 0.60, 0.01, 2),
-    _gate("stage4_pcc_target_color_drift_max", 4, "主体色度漂移", "float", 0.05, 0.75, 0.01, 2),
-    _gate("stage4_pcc_emission_target_color_drift_max", 4, "发射主体色度漂移", "float", 0.05, 0.75, 0.01, 2),
-
     # Stage 5: denoise strength cap and shared candidate acceptance gates.
     _gate("denoise_safety_max", 5, "降噪强度安全上限", "float", 0.20, 0.55, 0.01, 2),
     _gate("stage5_multiscale_detail_retention_min", 5, "主体细节保留下限", "float", 0.70, 0.98, 0.01, 2),
@@ -1413,7 +1462,6 @@ _GATE_PROFILE_RULES: Dict[
     "stage2_edge_black_target": (PROFILE_SCALE_UPPER, 0.0, 1.0),
 
     # Stage 3: candidate acceptance after the immutable sample audit.
-    "stage3_apply_confidence_min": (PROFILE_SCALE_LOWER, 0.0, 1.0),
     "stage3_compound_score_abs_improvement_min": (PROFILE_SCALE_LOWER, 0.0, 1.0),
     "stage3_compound_score_rel_improvement_min": (PROFILE_SCALE_LOWER, 0.0, 1.0),
     "stage3_compound_validation_improvement_min": (PROFILE_SCALE_LOWER, 0.0, 1.0),
@@ -1426,15 +1474,6 @@ _GATE_PROFILE_RULES: Dict[
     "stage4_auto_geometry_confidence_min": (PROFILE_SCALE_LOWER, 0.0, 1.0),
     "stage4_auto_geometry_scale_residual_max": (PROFILE_SCALE_UPPER, 0.0, None),
     "stage4_nbn_line_ratio_drift_max": (PROFILE_SCALE_UPPER, 0.0, 1.0),
-    "stage4_pcc_channel_gain_ratio_max": (PROFILE_SCALE_UPPER_FROM_ONE, 1.0, None),
-    "stage4_pcc_emission_balance_gain_ratio_max": (PROFILE_SCALE_UPPER_FROM_ONE, 1.0, None),
-    "stage4_pcc_clip_growth_max": (PROFILE_SCALE_UPPER, 0.0, 1.0),
-    "stage4_pcc_star_temperature_ratio_min": (PROFILE_SCALE_LOWER, 0.0, None),
-    "stage4_pcc_star_temperature_ratio_max": (PROFILE_SCALE_UPPER_FROM_ONE, 1.0, None),
-    "stage4_pcc_background_color_delta_max": (PROFILE_SCALE_UPPER, 0.0, None),
-    "stage4_pcc_target_color_drift_max": (PROFILE_SCALE_UPPER, 0.0, None),
-    "stage4_pcc_emission_target_color_drift_max": (PROFILE_SCALE_UPPER, 0.0, None),
-
     # Stage 5: measured detail/noise acceptance; denoise strength stays fixed.
     "stage5_multiscale_detail_retention_min": (PROFILE_SCALE_LOWER, 0.0, 1.0),
     "stage5_multiscale_noise_reduction_min": (PROFILE_SCALE_LOWER, 0.0, 1.0),
@@ -1536,9 +1575,6 @@ _GATE_PROFILE_EXCLUDED_FIELDS = frozenset(
         "stage2_adaptive_edge_crop_max_passes",
         "stage2_adaptive_edge_crop_max_extra",
         "stage2_guard_band_pixels",
-        "bg_quality_gate_enabled",
-        "stage3_conditional_decision_enabled",
-        "stage3_deterministic_auto_apply_enabled",
         "stage3_safe_sample_target_count",
         "stage3_safe_sample_min_count",
         "stage3_safe_sample_patch_radius",
@@ -1982,7 +2018,7 @@ def normalize_processing_parameters(
     if raw_schema not in SUPPORTED_PROCESSING_PARAMETERS_SCHEMAS:
         raise ValueError(
             "不支持的处理参数 schema："
-            f"{raw.get('schema')!r}；仅接受 starun.processing-parameters.v4/v5"
+            f"{raw.get('schema')!r}；仅接受 starun.processing-parameters.v4/v5/v6"
         )
     gate_profile = str(
         raw.get("gate_profile", GATE_PROFILE_DEFAULT) or GATE_PROFILE_DEFAULT
@@ -2032,6 +2068,27 @@ def normalize_processing_parameters(
         if not isinstance(overrides_source, Mapping):
             raise ValueError(f"Stage {stage} overrides 必须是映射")
         overrides_raw = dict(overrides_source)
+        if (
+            stage == 3
+            and raw_schema
+            in {
+                LEGACY_PROCESSING_PARAMETERS_SCHEMA_V4,
+                LEGACY_PROCESSING_PARAMETERS_SCHEMA_V5,
+            }
+        ):
+            for field in sorted(
+                LEGACY_STAGE3_PROCESSING_FIELDS.intersection(overrides_raw)
+            ):
+                requested = overrides_raw.pop(field)
+                adjustments.append(
+                    {
+                        "stage": 3,
+                        "field": field,
+                        "requested": requested,
+                        "effective": "enforced_process_evidence_gate",
+                        "reason": "legacy_stage3_field_removed_in_v6",
+                    }
+                )
         allowed_fields = {
             spec.field
             for spec in SPECS_BY_STAGE[stage]
@@ -2294,6 +2351,7 @@ __all__ = [
     "PROCESSING_GATE_PARAMETER_SPECS",
     "PROCESSING_PARAMETERS_SCHEMA",
     "LEGACY_PROCESSING_PARAMETERS_SCHEMA_V4",
+    "LEGACY_PROCESSING_PARAMETERS_SCHEMA_V5",
     "SUPPORTED_PROCESSING_PARAMETERS_SCHEMAS",
     "PROCESSING_PARAMETER_SPECS",
     "ParameterSpec",

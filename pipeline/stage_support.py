@@ -1411,55 +1411,6 @@ class StageSupportMixin:
             return None
 
 
-    def _stage3_quality_gate(
-        self,
-        before: Optional[ImageFeatures],
-        after: Optional[ImageFeatures],
-        preservation: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[bool, str]:
-        """Collect source-fidelity diagnostics for the process-based Stage 3 gate.
-
-        Background/RMS acceptance is enforced on source-masked held-out sky
-        patches in ``stage3_background_extraction``.  The former fixed ratios
-        mixed sky-pedestal changes with source loss and are intentionally no
-        longer used to authorize or reject a candidate here.
-        """
-        if not self.cfg.bg_quality_gate_enabled:
-            return True, "quality gate disabled"
-        if before is None or after is None:
-            return True, "quality gate skipped: feature sampling unavailable"
-
-        preservation_notes: List[str] = []
-        if preservation and preservation.get("available"):
-            star_retention = preservation.get("star_retention_ratio")
-            if star_retention is not None:
-                preservation_notes.append(f"star_retention={float(star_retention):.3f}")
-            target_flux = preservation.get("target_flux_retention_ratio")
-            if target_flux is not None:
-                preservation_notes.append(
-                    f"target_flux_retention={float(target_flux):.3f}"
-                )
-            morphology = preservation.get("target_morphology_correlation")
-            if morphology is not None:
-                preservation_notes.append(
-                    f"target_morphology_correlation={float(morphology):.5f}"
-                )
-            centroid_shift = preservation.get("target_centroid_shift_fraction")
-            if centroid_shift is not None:
-                preservation_notes.append(
-                    f"target_centroid_shift_fraction={float(centroid_shift):.6f}"
-                )
-
-        message = (
-            "source-fidelity diagnostics recorded; held-out sky validation owns "
-            f"acceptance, bg_std {before.bg_std:.4f}->{after.bg_std:.4f}, "
-            f"bg_median {before.bg_median:.4f}->{after.bg_median:.4f}"
-        )
-        if preservation_notes:
-            message += ", " + ", ".join(preservation_notes)
-        return True, message
-
-
     def _stage3_signal_preservation_metrics(
         self,
         before_image: Optional[np.ndarray],
@@ -1468,11 +1419,7 @@ class StageSupportMixin:
         if before_image is None or after_image is None:
             return {"available": False, "notes": ["image sampling unavailable"]}
         safe_report = getattr(self, "_stage3_safe_sample_report", {}) or {}
-        split_report = (
-            safe_report.get("fit_validation_split")
-            or safe_report.get("compound_split")
-            or {}
-        )
+        split_report = safe_report.get("fit_validation_split") or {}
         sky_points = split_report.get("validation_points") or []
         return measure_stage3_signal_preservation(
             before_image,
@@ -1484,38 +1431,6 @@ class StageSupportMixin:
             ],
             sky_patch_radius=int(safe_report.get("patch_radius", 12) or 12),
         )
-
-
-    def _stage3_plugin_candidates(
-        self,
-        before: Optional[ImageFeatures],
-        adaptive: Optional[Dict[str, Any]] = None,
-    ) -> List[Tuple[str, Tuple[str, ...], str]]:
-        _ = adaptive
-        candidates: List[Tuple[str, Tuple[str, ...], str]] = [
-            ("GraXpert", ("gxp",), "graxpert"),
-            ("ADBE", ("adbe",), "plugin"),
-            ("DBE", ("dbe",), "plugin"),
-            ("AutoDBE", ("autodbe",), "plugin"),
-        ]
-        if before is None:
-            return candidates
-
-        bg_std = float(before.bg_std)
-        star_density = float(before.star_density)
-        object_area = float(before.object_area_ratio)
-        adaptive = adaptive or {}
-        dirty = float(adaptive.get("dirty_background_score", 0.0) or 0.0)
-        gradient = float(adaptive.get("gradient_score", 0.0) or 0.0)
-        self.log.info(
-            "[Stage3] Theoretical plugin order: "
-            + " -> ".join(label for label, _, _ in candidates)
-            + (
-                f" (bg_std={bg_std:.4f}, star_density={star_density:.5f}, "
-                f"object_area={object_area:.3f}, dirty={dirty:.3f}, gradient={gradient:.3f})"
-            )
-        )
-        return candidates
 
 
     def _stage3_subsky_rbf_candidates(self) -> List[Tuple[str, ...]]:

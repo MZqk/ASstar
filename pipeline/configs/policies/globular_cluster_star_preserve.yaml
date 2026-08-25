@@ -2,7 +2,7 @@
   "policy_name": "globular_cluster_star_preserve",
   "applies_to": {"target_types": ["globular_cluster"]},
   "stage3_background": {"model_priority": ["rbf_smooth", "polynomial_low_order"], "protect_star_core": true, "max_bg_std_growth": 1.08, "fallback_to_safe_model": true},
-  "stage4_color": {"calibration_policy": "spcc_first_then_pcc", "blue_gain_limit": 0.95, "red_gain_limit": 1.05, "max_allowed_saturation_boost": 0.08},
+  "stage4_color": {"blue_gain_limit": 0.95, "red_gain_limit": 1.05, "max_allowed_saturation_boost": 0.08},
   "stage5_linear": {"denoise_mode": "minimal", "sharpen_mode": "star_preserve", "protect_background": true, "protect_star_halo": true, "avoid_global_sharpen": true},
   "stage7_stretch": {"candidate_mode": ["star_color_preserving_stretch", "asinh_core_protect", "autostretch_reference"], "forbidden_when_dirty": ["autostretch"], "allow_autostretch_as_reference_only": true, "fallback_candidate": "star_color_preserving_stretch"}
 }

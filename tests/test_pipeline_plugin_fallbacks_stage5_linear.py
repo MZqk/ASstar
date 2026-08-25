@@ -1068,9 +1068,12 @@ class PipelinePluginFallbackStage5LinearTests(PipelinePluginFallbackTestBase):
                     "policy_name": "test",
                     "stage3_background": {"protect_nebulosity": True},
                 }
-                self.siril = SimpleNamespace(
-                    get_image_pixeldata=lambda preview=False: None
-                )
+                self.input_profile = {
+                    "state": "linear",
+                    "safe_for_linear_steps": True,
+                    "source": "test_fixture",
+                }
+                self.siril = Stage3SampleSiril()
                 self.cmd_calls: list[tuple[Any, ...]] = []
                 self.saved: list[str] = []
                 self.workflow_command_used: dict[str, str] = {}
@@ -1105,7 +1108,10 @@ class PipelinePluginFallbackStage5LinearTests(PipelinePluginFallbackTestBase):
             def cmd_with_check(self, *args: Any, quiet: bool = False) -> bool:
                 _ = quiet
                 self.cmd_calls.append(args)
-                if args and args[0] in ("pyscript", "gxp", "graxpert"):
+                if args and (
+                    args[0] in ("gxp", "graxpert")
+                    or (args[0] == "pyscript" and "-bge" in args)
+                ):
                     raise RuntimeError(
                         "GraXpert-AI.py Error: too many indices for array: "
                         "array is 2-dimensional, but 3 were indexed"
@@ -1119,7 +1125,7 @@ class PipelinePluginFallbackStage5LinearTests(PipelinePluginFallbackTestBase):
                 return None
 
             def _stage3_signal_preservation_metrics(self, _before: Any, _after: Any):
-                return {"available": False}
+                return complete_stage3_preservation()
 
             def _stage3_quality_gate(self, _before: Any, _after: Any, _preservation: Any):
                 return True, "quality gate ok"
@@ -1148,15 +1154,57 @@ class PipelinePluginFallbackStage5LinearTests(PipelinePluginFallbackTestBase):
         candidates = [
             (
                 "GraXpert-AI BGE CPU",
-                ("pyscript", "GraXpert-AI.py", "-bge", "-nogpu"),
+                (
+                    "pyscript",
+                    "GraXpert-AI.py",
+                    "-bge",
+                    "-model",
+                    "model_v2_0_1",
+                    "-correction",
+                    "subtraction",
+                    "-keep_bg",
+                    "-nogpu",
+                ),
                 "graxpert",
             ),
-            ("ADBE", ("adbe",), "plugin"),
+            (
+                "ADBE",
+                ("pyscript", "AutoBGE.py", "-npoints", "120"),
+                "plugin",
+            ),
         ]
-        with patch.object(
-            stage3_module,
-            "_stage3_theoretical_plugin_candidates",
-            return_value=candidates,
+        accepted_pixel_gate = {
+            "status": "accepted",
+            "accepted": True,
+            "severity": "normal",
+            "warnings": [],
+            "hard_issues": [],
+            "issues": [],
+        }
+        accepted_validation_gate = {
+            "status": "accepted",
+            "accepted": True,
+            "severity": "normal",
+            "warnings": [],
+            "hard_issues": [],
+            "issues": [],
+        }
+        with (
+            patch.object(
+                stage3_module,
+                "_stage3_background_candidate_chain",
+                return_value=(candidates, [], "test_integrated_backends"),
+            ),
+            patch.object(
+                stage3_module,
+                "_stage3_candidate_pixel_gate",
+                return_value=(True, accepted_pixel_gate),
+            ),
+            patch.object(
+                stage3_module,
+                "assess_single_background_validation",
+                return_value=(True, accepted_validation_gate),
+            ),
         ):
             stage3_module.run_stage3_background_extraction(processor)
         background_attempts = [
@@ -1168,9 +1216,12 @@ class PipelinePluginFallbackStage5LinearTests(PipelinePluginFallbackTestBase):
         self.assertEqual(
             background_attempts[:2],
             [
-                ("pyscript", "GraXpert-AI.py", "-bge", "-nogpu"),
-                ("adbe",),
+                candidates[0][1],
+                candidates[1][1],
             ],
+        )
+        self.assertFalse(
+            any(call and call[0] in {"gxp", "graxpert", "adbe"} for call in processor.cmd_calls)
         )
         self.assertEqual(processor.workflow_command_used["背景提取插件链"], "ADBE")
         self.assertTrue(processor.report["graxpert_runtime_error"])
@@ -1182,8 +1233,8 @@ class PipelinePluginFallbackStage5LinearTests(PipelinePluginFallbackTestBase):
         )
         self.assertFalse(processor.report["fallback_used"])
         self.assertIsNone(processor.report["fallback_reason"])
-        self.assertEqual(processor.results[-1][1], "degraded")
-        self.assertTrue(processor.report["review_required"])
+        self.assertEqual(processor.results[-1][1], "ok")
+        self.assertFalse(processor.report["review_required"])
         graxpert_statuses = [
             record["status"]
             for record in processor.report["attempts"]
@@ -1235,17 +1286,26 @@ class PipelinePluginFallbackStage5LinearTests(PipelinePluginFallbackTestBase):
             "graxpert_runtime_error: command returned success but image did not change",
         )
 
-    def test_stage3_primary_graxpert_candidate_uses_bge_nogpu(self):
+    def test_stage3_primary_graxpert_candidate_uses_locked_subtraction_contract(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
         processor = SimpleNamespace(log=FakeLogger())
         script = Path("/mock/siril-scripts/processing/GraXpert-AI.py")
+
+        def model_ready(target):
+            target._stage3_graxpert_provenance = {}
+            return True
 
         with (
             patch.object(stage3_module, "_stage3_find_script", return_value=script),
             patch.object(
                 stage3_module,
                 "_stage3_ensure_graxpert_bge_model",
-                return_value=True,
+                side_effect=model_ready,
+            ),
+            patch.object(
+                stage3_module,
+                "_stage3_sha256",
+                return_value=stage3_module.STAGE3_GRAXPERT_SCRIPT_SHA256,
             ),
         ):
             candidates = stage3_module._stage3_graxpert_candidates(processor)
@@ -1258,6 +1318,11 @@ class PipelinePluginFallbackStage5LinearTests(PipelinePluginFallbackTestBase):
                 "pyscript",
                 '"/mock/siril-scripts/processing/GraXpert-AI.py"',
                 "-bge",
+                "-model",
+                "model_v2_0_1",
+                "-correction",
+                "subtraction",
+                "-keep_bg",
                 "-nogpu",
             ),
         )

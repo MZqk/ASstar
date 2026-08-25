@@ -122,15 +122,6 @@ class PipelineConfig:
     bg_samples: int = 20            # subsky 兼容采样密度参数；实际样点坐标由 Stage3 自定义安全样点固定
     bg_tolerance: float = 1.0       # subsky 兼容容差参数；不得绕过 -existing 自动重建样点
     bg_smooth: float = 0.5          # 背景模型平滑度；增大更平滑，过大会吞掉大尺度弱信号
-    bg_quality_gate_enabled: bool = True  # Stage3 过程验证总开关；生产门禁由留出天空与目标保真证据执行
-    stage3_conditional_decision_enabled: bool = True  # 阶段3先诊断再决定 apply/skip/review，禁止无证据直接扣背景
-    stage3_deterministic_auto_apply_enabled: bool = True  # 无视觉顾问时仅对高置信梯度使用离线确定性 apply
-    stage3_apply_confidence_min: float = 0.75  # 外部/视觉背景建议获准执行所需最低置信度
-    stage3_gradient_skip_max: float = 0.045  # 旧无 InputProfile 调用方兼容；生产决策不读取该阈值
-    stage3_dirty_skip_max: float = 0.16  # 旧无 InputProfile 调用方兼容；生产决策不读取该阈值
-    stage3_gradient_apply_min: float = 0.08  # 旧兼容/诊断路由参数；生产授权使用过程证据
-    stage3_dirty_apply_min: float = 0.18  # 旧兼容/诊断路由参数；生产授权使用过程证据
-    stage3_diffuse_auto_apply_enabled: bool = False  # 旧决策兼容字段；生产场景由真实天空与复杂度限制裁决
     stage3_safe_sample_target_count: int = 40  # 自定义安全背景样点目标数；按低信号、低纹理与空间覆盖筛选
     stage3_safe_sample_min_count: int = 12  # 低于该数量或覆盖不足时禁止 subsky -existing，避免稀疏误拟合
     stage3_safe_sample_patch_radius: int = 12  # 样点安全评估半径；用于排除恒星、星云纹理和裁剪暗边
@@ -210,7 +201,7 @@ class PipelineConfig:
     stage4_auto_geometry_scale_residual_max: float = 0.05  # 解算 WCS 像素比例相对预测值最大偏差，超限回滚并禁止 SPCC/PCC
     stage4_spcc_enabled: bool = True  # Stage4 物理校色首选 SPCC；异常时宽带回退 PCC，双窄带只允许降级 PCC 基础校色并强制复核
     stage4_spcc_timeout_sec: int = 300  # SPCC 单次独立 Siril 子进程超时；不在同一进程中重试
-    stage4_spcc_online_unverified_timeout_sec: int = 90  # 仅有在线端点可达证据时的 SPCC 有界预算；本地 localgaia 不受此上限影响
+    stage4_spcc_online_unverified_timeout_sec: int = 300  # 在线未验证 SPCC 默认同样允许 300 秒；可显式收紧，本地 localgaia 不受此附加上限影响
     stage4_spcc_osc_sensor: str = ""  # 为空时按 FITS 设备画像自动选择；无法确认则禁止误套传感器响应
     stage4_spcc_osc_filter: str = ""  # 为空时按设备画像和 FITS 滤镜提示选择已校验响应
     stage4_spcc_white_ref: str = "Average Spiral Galaxy"  # SPCC 物理白参考
@@ -228,19 +219,20 @@ class PipelineConfig:
     stage4_nbn_line_ratio_drift_max: float = 0.12  # Ha/OIII 信号比例最大相对漂移
     stage4_pcc_timeout_sec: int = 180  # SPCC 异常后的 Gaia PCC 只尝试一次；双窄带结果仅作降级基础校色，达到该秒数即终止
     stage4_pcc_quality_gate_enabled: bool = True  # 兼容字段：仅控制旧质量指标的 accepted 诊断值，不再参与 Stage4 路由
-    stage4_pcc_channel_gain_ratio_max: float = 10.0  # SPCC/PCC 三通道相对增益最大跨度，超限仍回滚候选
-    stage4_pcc_emission_balance_gain_ratio_max: float = 4.0  # 发射星云仅在背景色差显著改善且其他门均安全时允许的大增益跨度
-    stage4_pcc_clip_growth_max: float = 0.005  # PCC 相对 pre_pcc 允许新增的高光裁剪比例
-    stage4_pcc_star_temperature_ratio_min: float = 0.45  # 校色后可测恒星综合色温中位数相对输入的最低比例
-    stage4_pcc_star_temperature_ratio_max: float = 2.20  # 校色后可测恒星综合色温中位数相对输入的最高比例
-    stage4_pcc_background_color_delta_max: float = 0.22  # 背景变得更失衡时允许的最大归一化 RGB 色差
-    stage4_pcc_target_color_drift_max: float = 0.40  # 普通主体归一化 RGB 色度允许的最大漂移
-    stage4_pcc_emission_target_color_drift_max: float = 0.45  # 发射星云保留真实线发射主色时允许的更宽主体色度漂移
-    stage4_local_star_wb_enabled: bool = True  # 旧任务兼容字段；Stage4 v2 不再运行局部星点软遮罩补偿
-    stage4_local_star_wb_min_pixels: int = 32  # 旧任务兼容字段，不参与 Stage4 v2 路由
-    stage4_local_star_wb_gain_limit: float = 1.20  # 旧任务兼容字段，不参与 Stage4 v2 路由
-    stage4_local_star_mask_radius: int = 2  # 恒星样本向星翼扩展的软遮罩半径，限制校色只影响局部
-    stage4_local_star_mask_coverage_max: float = 0.12  # 恒星软遮罩最大覆盖率，超限时保留输入颜色
+    stage4_pcc_channel_gain_ratio_max: float = 10.0  # SPCC/PCC 三通道相对增益跨度诊断线；仅 advisory，不参与路由
+    stage4_pcc_emission_balance_gain_ratio_max: float = 4.0  # 发射星云增益跨度诊断线；仅 advisory，不参与路由
+    stage4_pcc_clip_growth_max: float = 0.005  # 相对 pre_pcc 新增高光裁剪比例诊断线；仅 advisory
+    stage4_pcc_star_temperature_ratio_min: float = 0.45  # 校色后恒星综合色温中位数相对输入的诊断下限
+    stage4_pcc_star_temperature_ratio_max: float = 2.20  # 校色后恒星综合色温中位数相对输入的诊断上限
+    stage4_pcc_background_color_delta_max: float = 0.22  # 背景归一化 RGB 色差恶化的 advisory 诊断线
+    stage4_pcc_target_color_drift_max: float = 0.40  # 普通主体归一化 RGB 色度漂移的 advisory 诊断线
+    stage4_pcc_emission_target_color_drift_max: float = 0.45  # 发射主体色度漂移的 advisory 诊断线
+    # 旧 manifest 读取兼容字段；Stage 4 不读取这些值，GUI/env 入口已移除。
+    stage4_local_star_wb_enabled: bool = True
+    stage4_local_star_wb_min_pixels: int = 32
+    stage4_local_star_wb_gain_limit: float = 1.20
+    stage4_local_star_mask_radius: int = 2
+    stage4_local_star_mask_coverage_max: float = 0.12
     aberration_api_enabled: bool = False  # Disabled by default: API path may fail in siril-cli thread ownership context
 
     # 阶段 7: Starless 主体拉伸

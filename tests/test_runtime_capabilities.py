@@ -232,13 +232,13 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
             decision = manifest["decisions"]["stage4_color_calibration"]
             self.assertEqual(decision["spcc_readiness"], "online_unverified")
             self.assertFalse(decision["spcc_operational_verified"])
-            self.assertEqual(decision["spcc_online_unverified_timeout_sec"], 90)
+            self.assertEqual(decision["spcc_online_unverified_timeout_sec"], 300)
             self.assertIn(
                 "gaia_xp_endpoint_reachable_spcc_unverified",
                 decision["reason_codes"],
             )
             self.assertTrue(
-                any("单次预算 90 秒" in line for line in capabilities.capability_summary_lines(manifest))
+                any("单次预算 300 秒" in line for line in capabilities.capability_summary_lines(manifest))
             )
 
     def test_online_spcc_operational_cache_key_tracks_siril_and_xp_endpoint(self) -> None:

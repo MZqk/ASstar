@@ -17,17 +17,6 @@ PATCHER_PATH = (
     / "patches"
     / "apply_graxpert_ai_runtime_patch.py"
 )
-UPSTREAM_SCRIPT = (
-    REPO_ROOT
-    / "resources"
-    / "siril_plugins"
-    / "vendor"
-    / "siril-scripts"
-    / "processing"
-    / "GraXpert-AI.py"
-)
-
-
 def _load_patcher():
     spec = importlib.util.spec_from_file_location("graxpert_runtime_patch_test", PATCHER_PATH)
     if spec is None or spec.loader is None:
@@ -37,12 +26,23 @@ def _load_patcher():
     return module
 
 
+def _upstream_fixture(patcher) -> str:
+    """Build the minimal upstream regions owned by the runtime patch."""
+    return "\n".join(
+        (
+            patcher.OLD_PRE_INFERENCE,
+            patcher.OLD_PADDING,
+            patcher.OLD_BGE_KEEP_BACKGROUND_ARGUMENT,
+        )
+    )
+
+
 class GraXpertRuntimePatchTests(unittest.TestCase):
     def test_patch_requests_first_onnx_output_and_validates_shape(self) -> None:
         patcher = _load_patcher()
         with tempfile.TemporaryDirectory() as td:
             target = Path(td) / "GraXpert-AI.py"
-            target.write_bytes(UPSTREAM_SCRIPT.read_bytes())
+            target.write_text(_upstream_fixture(patcher), encoding="utf-8")
 
             self.assertTrue(patcher.apply_patch(target))
             patched = target.read_text(encoding="utf-8")
@@ -60,7 +60,7 @@ class GraXpertRuntimePatchTests(unittest.TestCase):
 
     def test_patch_upgrades_first_generation_layout_patch(self) -> None:
         patcher = _load_patcher()
-        upstream = UPSTREAM_SCRIPT.read_text(encoding="utf-8")
+        upstream = _upstream_fixture(patcher)
         legacy_pre = patcher.NEW_PRE_INFERENCE.replace(
             patcher.NEW_PATCHED_RUN_SUFFIX,
             patcher.OLD_PATCHED_RUN_SUFFIX,

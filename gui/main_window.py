@@ -473,9 +473,6 @@ DEFAULT_PROCESSING_SETTINGS = {
     "pcc_timeout_sec": int(
         SPECS_BY_FIELD["stage4_pcc_timeout_sec"].default
     ),
-    # Retained in old task payloads only; Stage 4 v2 no longer exposes or runs
-    # the local star-mask white-balance path.
-    "local_wb_gain_limit": 1.20,
     "builtin_denoise_strength": float(SPECS_BY_FIELD["denoise_mod"].default),
     "graxpert_deconv_strength": float(
         SPECS_BY_FIELD["stage5_graxpert_deconv_strength"].default
@@ -669,9 +666,6 @@ class StarunGui(QMainWindow):
             DEFAULT_PROCESSING_SETTINGS["checkpoint_mode"]
         )
         self.pcc_timeout_sec = int(DEFAULT_PROCESSING_SETTINGS["pcc_timeout_sec"])
-        self.local_wb_gain_limit = float(
-            DEFAULT_PROCESSING_SETTINGS["local_wb_gain_limit"]
-        )
         self.builtin_denoise_strength = float(
             DEFAULT_PROCESSING_SETTINGS["builtin_denoise_strength"]
         )
@@ -4150,7 +4144,6 @@ class StarunGui(QMainWindow):
             self.graxpert_model_dir_btn,
             self.compute_combo,
             self.pcc_timeout_spin,
-            self.local_wb_gain_spin,
             self.builtin_denoise_spin,
             self.graxpert_strength_spin,
             self.rl_iterations_spin,
@@ -4568,7 +4561,6 @@ class StarunGui(QMainWindow):
         )
         self.graxpert_model_path = str(effective("graxpert_object_model_path"))
         self.pcc_timeout_sec = int(effective("stage4_pcc_timeout_sec"))
-        self.local_wb_gain_limit = 1.20
         self.builtin_denoise_strength = float(effective("denoise_mod"))
         self.graxpert_deconv_strength = float(
             effective("stage5_graxpert_deconv_strength")
@@ -4690,9 +4682,6 @@ class StarunGui(QMainWindow):
                 {
                     "STARUN_STAGE4_SPCC_TIMEOUT_SEC": "300",
                     "STARUN_STAGE4_PCC_TIMEOUT_SEC": str(self.pcc_timeout_sec),
-                    "STARUN_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT": (
-                        f"{self.local_wb_gain_limit:.2f}"
-                    ),
                     "STARUN_DENOISE_MOD": (
                         f"{self.builtin_denoise_strength:.2f}"
                     ),
@@ -4858,7 +4847,7 @@ class StarunGui(QMainWindow):
                     "反卷积：" + deconv_labels[self.deconvolution_mode],
                     (
                         "专业线性：校色 "
-                        f"{self.pcc_timeout_sec}s · WB {self.local_wb_gain_limit:.2f}×"
+                        f"{self.pcc_timeout_sec}s"
                         f" · 降噪 {self.builtin_denoise_strength:.2f}"
                         f" · GraXpert {self.graxpert_deconv_strength:.2f}"
                         f" · RL {self.rl_iterations}/{self.rl_maxstars}"
@@ -5117,6 +5106,7 @@ class StarunGui(QMainWindow):
                 "algorithm": "算法参数",
                 "process_gate": "过程门禁",
                 "quality_gate": "质量验收",
+                "diagnostics": "诊断阈值",
                 "fallback": "回退与失败",
             }
             for section_key, section_title in section_titles.items():
@@ -5733,7 +5723,6 @@ class StarunGui(QMainWindow):
             self.graxpert_model_edit.setText(self.graxpert_model_path)
             for control, value in (
                 (self.pcc_timeout_spin, self.pcc_timeout_sec),
-                (self.local_wb_gain_spin, self.local_wb_gain_limit),
                 (self.builtin_denoise_spin, self.builtin_denoise_strength),
                 (self.graxpert_strength_spin, self.graxpert_deconv_strength),
                 (self.rl_iterations_spin, self.rl_iterations),
@@ -5983,7 +5972,6 @@ class StarunGui(QMainWindow):
         self.graxpert_model_path = self.graxpert_model_edit.text().strip()
         self.compute_mode = str(self.compute_combo.currentData())
         self.pcc_timeout_sec = self.pcc_timeout_spin.value()
-        self.local_wb_gain_limit = self.local_wb_gain_spin.value()
         self.builtin_denoise_strength = self.builtin_denoise_spin.value()
         self.graxpert_deconv_strength = self.graxpert_strength_spin.value()
         self.rl_iterations = self.rl_iterations_spin.value()
@@ -6672,7 +6660,7 @@ class StarunGui(QMainWindow):
                 )
             )
         except (AttributeError, KeyError, TypeError, ValueError):
-            spcc_online_unverified_timeout_sec = 90
+            spcc_online_unverified_timeout_sec = 300
         manifest = build_runtime_capabilities(
             resources_root=resources,
             runtime_home=runtime_home,

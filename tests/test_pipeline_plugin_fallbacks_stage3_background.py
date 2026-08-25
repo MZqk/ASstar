@@ -3,7 +3,198 @@
 from tests.pipeline_plugin_fallbacks_support import *  # noqa: F401,F403
 
 
+def _accepted_stage3_pixel_gate(*_args: Any, **kwargs: Any):
+    profile = str(kwargs.get("gate_profile") or "output_first")
+    return True, {
+        "status": "accepted",
+        "accepted": True,
+        "severity": "normal",
+        "warnings": [],
+        "hard_issues": [],
+        "issues": [],
+        "profile": profile,
+        "effective_thresholds": {"profile": profile},
+    }
+
+
 class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase):
+    def test_stage3_graxpert_model_requires_canonical_path_and_exact_sha(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        payload = b"locked-graxpert-bge-model"
+        payload_sha = hashlib.sha256(payload).hexdigest()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            plugin_root = root / "plugins"
+            runtime_root = root / "graxpert-home"
+            canonical = (
+                plugin_root
+                / "graxpert"
+                / "bge-ai-models"
+                / "model_v2_0_1"
+                / "model.onnx"
+            )
+            canonical.parent.mkdir(parents=True)
+            processor = SimpleNamespace(
+                log=FakeLogger(),
+                siril_plugin_dir=plugin_root,
+            )
+
+            self.assertFalse(
+                stage3_module._stage3_ensure_graxpert_bge_model(processor)
+            )
+            (plugin_root / "model_v2_0_1.onnx").write_bytes(payload)
+            self.assertFalse(
+                stage3_module._stage3_ensure_graxpert_bge_model(processor)
+            )
+            canonical.write_bytes(b"wrong")
+            self.assertFalse(
+                stage3_module._stage3_ensure_graxpert_bge_model(processor)
+            )
+
+            canonical.write_bytes(payload)
+            with (
+                patch.object(
+                    stage3_module,
+                    "STAGE3_GRAXPERT_BGE_MODEL_SHA256",
+                    payload_sha,
+                ),
+                patch.object(
+                    stage3_module.os.path,
+                    "expanduser",
+                    return_value=str(runtime_root),
+                ),
+            ):
+                self.assertTrue(
+                    stage3_module._stage3_ensure_graxpert_bge_model(processor)
+                )
+            installed = (
+                runtime_root
+                / "bge-ai-models"
+                / "model_v2_0_1"
+                / "model.onnx"
+            )
+            self.assertEqual(installed.read_bytes(), payload)
+            self.assertEqual(
+                processor._stage3_graxpert_provenance["correction"],
+                "subtraction",
+            )
+            self.assertEqual(
+                processor._stage3_graxpert_provenance["compute"],
+                "cpu",
+            )
+
+    def test_stage3_graxpert_background_model_is_preserved_and_finalized(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        with tempfile.TemporaryDirectory() as td:
+            process_dir = Path(td)
+            current = process_dir / "stage3_bg_input.fit"
+            emitted = process_dir / "stage3_bg_input_bg.fit"
+            emitted.write_bytes(b"background-model")
+            processor = SimpleNamespace(
+                process_dir=process_dir,
+                log=FakeLogger(),
+                siril=SimpleNamespace(
+                    get_image_filename=lambda: str(current),
+                ),
+                _stage3_graxpert_provenance={
+                    "background_model_artifact": None,
+                },
+            )
+
+            candidate_path = stage3_module._stage3_capture_graxpert_background_model(
+                processor,
+                label="GraXpert-AI BGE CPU",
+            )
+            self.assertIsNotNone(candidate_path)
+            self.assertTrue(Path(candidate_path).is_file())
+            selected = {"background_model_artifact": candidate_path}
+            final_path = stage3_module._stage3_finalize_graxpert_background_model(
+                processor,
+                selected,
+            )
+            self.assertEqual(
+                Path(str(final_path)).name,
+                "stage3_background_model.fit",
+            )
+            self.assertTrue(Path(str(final_path)).is_file())
+            self.assertEqual(
+                processor._stage3_graxpert_provenance[
+                    "background_model_artifact"
+                ],
+                final_path,
+            )
+
+    def test_stage3_outcome_reason_priority_is_deterministic(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        defaults = {
+            "policy_abort_candidate_search": False,
+            "failure_action": "auto_fallback",
+            "final_output_validation_rejected": False,
+            "bg_ok": True,
+            "stage_saved": True,
+            "pattern_review_required": False,
+            "compound_selected_degraded": False,
+            "selected_gate_warnings": [],
+            "background_backup_used": False,
+            "profile_fallback_used": False,
+            "fallback_warning": False,
+            "review_required": False,
+        }
+        cases = (
+            (
+                {
+                    "policy_abort_candidate_search": True,
+                    "failure_action": "stop",
+                    "final_output_validation_rejected": True,
+                },
+                "failure_policy_stop",
+            ),
+            (
+                {
+                    "policy_abort_candidate_search": True,
+                    "failure_action": "preserve_review",
+                },
+                "failure_policy_preserve_review",
+            ),
+            (
+                {"final_output_validation_rejected": True},
+                "final_output_validation_rejected",
+            ),
+            ({"stage_saved": False}, "stage3_output_save_failed"),
+            ({"bg_ok": False}, "no_background_candidate_accepted"),
+            (
+                {"pattern_review_required": True},
+                "mixed_gradient_pattern_noise_review",
+            ),
+            (
+                {"compound_selected_degraded": True},
+                "compound_poly_residual_rbf_degraded_review",
+            ),
+            (
+                {"selected_gate_warnings": ["limited improvement"]},
+                "background_accepted_with_soft_warnings",
+            ),
+            (
+                {"background_backup_used": True},
+                "background_backup_accepted",
+            ),
+            (
+                {"profile_fallback_used": True},
+                "target_profiler_fallback",
+            ),
+            (
+                {"fallback_warning": True},
+                "background_improvement_limited",
+            ),
+        )
+        for overrides, expected in cases:
+            with self.subTest(expected=expected):
+                values = {**defaults, **overrides}
+                self.assertEqual(
+                    stage3_module._stage3_outcome_reason_code(**values),
+                    expected,
+                )
+
     def test_stage3_outer_halo_keeps_better_scored_polynomial_fidelity(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
         polynomial = {
@@ -148,22 +339,8 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
         self.assertEqual(preview_calls, [True, True])
         self.assertNotEqual(before, after)
 
-    def test_stage3_plugin_order_uses_theoretical_effect_chain(self):
-        processor = pipeline_module.StarunPostProcessor()
-        processor.log = FakeLogger()
-
-        high_noise = pipeline_module.ImageFeatures(bg_std=0.060, star_density=0.001)
-        high_noise_order = processor._stage3_plugin_candidates(
-            high_noise,
-            {"dirty_background_score": 0.42},
-        )
-        self.assertEqual(
-            [label for label, _cmd, _source in high_noise_order],
-            ["GraXpert", "ADBE", "DBE", "AutoDBE"],
-        )
-
-    def test_stage3_legacy_ratio_gate_is_diagnostic_only(self):
-        processor = pipeline_module.StarunPostProcessor()
+    def test_stage3_quality_diagnostics_are_not_a_compatibility_gate(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
         preservation = {
             "available": True,
             "star_retention_ratio": 0.82,
@@ -171,15 +348,14 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
             "before_star_count": 100,
             "after_star_count": 82,
         }
-        gate_ok, gate_msg = processor._stage3_quality_gate(
+        gate_msg = stage3_module._stage3_quality_diagnostic_message(
             pipeline_module.ImageFeatures(bg_std=0.02, bg_median=0.08, object_area_ratio=0.20),
             pipeline_module.ImageFeatures(bg_std=0.02, bg_median=0.08, object_area_ratio=0.20),
             preservation,
         )
 
-        self.assertTrue(gate_ok)
-        self.assertIn("held-out sky validation owns acceptance", gate_msg)
-        self.assertIn("star_retention=0.820", gate_msg)
+        self.assertIn("held-out sky and pixel gates own acceptance", gate_msg)
+        self.assertIn("star_retention_ratio=0.82000", gate_msg)
 
     def test_stage3_background_score_prefers_cleaner_low_gradient_candidate(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
@@ -211,8 +387,12 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
             "green_cast": 0.99,
         }
 
-        dirty_score = stage3_module._stage3_background_score(before, dirty_candidate)
-        cleaner_score = stage3_module._stage3_background_score(before, cleaner_candidate)
+        dirty_score = stage3_module._stage3_background_score_components(
+            before, dirty_candidate
+        )["total"]
+        cleaner_score = stage3_module._stage3_background_score_components(
+            before, cleaner_candidate
+        )["total"]
 
         self.assertLess(cleaner_score, dirty_score)
         self.assertFalse(stage3_module._stage3_candidate_sufficient(before, dirty_candidate, dirty_score))
@@ -240,7 +420,7 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
 
         self.assertAlmostEqual(
             report["total"],
-            stage3_module._stage3_background_score(before, after),
+            report["total"],
         )
         self.assertEqual(
             set(report["components"]),
@@ -294,14 +474,14 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
             },
         }
 
-        report = stage3_module._stage3_statistical_shadow_selection(
+        report = stage3_module._stage3_select_candidate(
             [current, statistical],
             current,
         )
 
         self.assertEqual(report["current_runtime_candidate"], current["label"])
         self.assertEqual(
-            report["shadow_recommended_candidate"],
+            report["recommended_candidate"],
             statistical["label"],
         )
         self.assertTrue(report["selection_would_change"])
@@ -365,14 +545,14 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
             },
         ]
 
-        report = stage3_module._stage3_statistical_shadow_selection(
+        report = stage3_module._stage3_select_candidate(
             candidates,
             candidates[1],
         )
 
         self.assertEqual(report["status"], "ready")
         self.assertEqual(
-            report["shadow_recommended_candidate"],
+            report["recommended_candidate"],
             "M8-A subsky-rbf-existing-1",
         )
         self.assertTrue(report["selection_would_change"])
@@ -476,12 +656,12 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
                 "target_change_residual_significance": 1.31,
             },
         }
-        selection = stage3_module._stage3_statistical_shadow_selection(
+        selection = stage3_module._stage3_select_candidate(
             [candidate, adbe],
             adbe,
         )
         self.assertEqual(
-            selection["shadow_recommended_candidate"],
+            selection["recommended_candidate"],
             "subsky-rbf-existing-2",
         )
         selected_row = next(
@@ -664,6 +844,11 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
                     "policy_name": "test",
                     "stage3_background": {"protect_nebulosity": True},
                 }
+                self.input_profile = {
+                    "state": "linear",
+                    "safe_for_linear_steps": True,
+                    "source": "test_fixture",
+                }
                 self.siril = Stage3SampleSiril()
                 self.try_calls: list[tuple[str, ...]] = []
                 self.cmd_calls: list[tuple[Any, ...]] = []
@@ -746,7 +931,7 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
                 return None
 
             def _stage3_signal_preservation_metrics(self, _before: Any, _after: Any):
-                return {"available": False}
+                return complete_stage3_preservation()
 
             def _stage3_quality_gate(self, _before: Any, _after: Any, _preservation: Any):
                 return True, "quality gate ok"
@@ -772,7 +957,47 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
                 self.results.append((name, status, elapsed, message))
 
         processor = Stage3Fake()
-        stage3_module.run_stage3_background_extraction(processor)
+        graxpert_command = (
+            "pyscript",
+            "GraXpert-AI.py",
+            "-bge",
+            "-model",
+            "model_v2_0_1",
+            "-correction",
+            "subtraction",
+            "-keep_bg",
+            "-nogpu",
+        )
+        with (
+            patch.object(
+                stage3_module,
+                "_stage3_theoretical_plugin_candidates",
+                return_value=[
+                    ("GraXpert-AI BGE CPU", graxpert_command, "graxpert")
+                ],
+            ),
+            patch.object(
+                stage3_module,
+                "_stage3_candidate_pixel_gate",
+                side_effect=_accepted_stage3_pixel_gate,
+            ),
+            patch.object(
+                stage3_module,
+                "assess_single_background_validation",
+                return_value=(
+                    True,
+                    {
+                        "status": "accepted",
+                        "accepted": True,
+                        "severity": "normal",
+                        "warnings": [],
+                        "hard_issues": [],
+                        "issues": [],
+                    },
+                ),
+            ),
+        ):
+            stage3_module.run_stage3_background_extraction(processor)
         background_attempts = [
             tuple(call)
             for call in processor.cmd_calls
@@ -784,16 +1009,16 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
             [
                 ("subsky", "-rbf", "-existing"),
                 ("subsky", "1", "-existing"),
-                ("gxp",),
+                graxpert_command,
             ],
         )
         self.assertIn(
-            ("load", "stage3_candidate_graxpert_native_alias"),
+            ("load", "stage3_candidate_graxpert_ai_bge_cpu"),
             processor.cmd_calls,
         )
         self.assertEqual(
             processor.workflow_command_used["GraXpert 背景提取"],
-            "GraXpert native alias",
+            "GraXpert-AI BGE CPU",
         )
         self.assertTrue(processor.report["graxpert_attempted"])
         self.assertTrue(processor.report["backup_used"])
@@ -892,11 +1117,11 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
         self.assertIsNone(processor.report["fallback_reason"])
         self.assertEqual(
             processor.report["schema_version"],
-            "starun.stage3-background-quality.v4",
+            "starun.stage3-background-quality.v5",
         )
-        self.assertEqual(processor.report["algorithm_contract_version"], "1.2.0")
+        self.assertEqual(processor.report["algorithm_contract_version"], "1.3.0")
         self.assertIn("spatial_coverage", processor.report["decision_thresholds"])
-        self.assertEqual(processor.report["selection_shadow"]["status"], "ready")
+        self.assertEqual(processor.report["selection"]["status"], "ready")
         self.assertTrue(
             any(
                 "background_score_components" in attempt
@@ -904,7 +1129,7 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
                 if attempt.get("status") == "accepted"
             )
         )
-        split = processor.report["safe_samples"]["compound_split"]
+        split = processor.report["safe_samples"]["fit_validation_split"]
         validation_points = {
             tuple(point) for point in split["validation_points"]
         }
@@ -927,6 +1152,36 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
         self.assertEqual(processor.results[-1][1], "ok")
         self.assertFalse(processor.result_metadata[-1]["fallback_used"])
         self.assertTrue(processor.report["backup_used"])
+
+    def test_stage3_compound_soft_profile_records_missing_hard_gate_evidence(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        processor = Stage3CompoundFake()
+        processor.cfg.stage3_gate_profile = "output_first"
+        for state in ("single_rbf", "polynomial"):
+            processor.metrics[state].update(
+                gradient_score=0.90,
+                dirty_background_score=0.90,
+                chroma_noise_score=0.40,
+            )
+        processor._stage3_measure_features = lambda _label: (
+            None
+            if processor.state == "compound"
+            else SimpleNamespace(state=processor.state)
+        )
+
+        stage3_module.run_stage3_background_extraction(processor)
+
+        compound = next(
+            attempt
+            for attempt in processor.report["attempts"]
+            if attempt.get("source") == "compound"
+        )
+        self.assertFalse(compound["hard_gate_metrics_available"])
+        self.assertEqual(compound["status"], "accepted_with_warnings")
+        self.assertIn(
+            "compound hard-gate metrics unavailable",
+            compound["gate_warnings"],
+        )
 
     def test_stage3_candidate_attempt_limit_counts_compound_candidate(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
@@ -1036,6 +1291,58 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
             "soft_warning",
         )
 
+    def test_stage3_selected_soft_warning_does_not_require_review(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        processor = Stage3CompoundFake()
+        processor.cfg.stage3_gate_profile = "output_first"
+        soft_final = {
+            "status": "accepted",
+            "accepted": True,
+            "enforced": True,
+            "severity": "soft_warning",
+            "validation_gate": {
+                "status": "accepted_with_warnings",
+                "accepted": True,
+                "severity": "soft_warning",
+                "warnings": [
+                    "held-out span improvement is below sampling uncertainty"
+                ],
+                "issues": [
+                    "held-out span improvement is below sampling uncertainty"
+                ],
+                "hard_issues": [],
+            },
+            "pixel_integrity_gate": {
+                "status": "accepted",
+                "accepted": True,
+                "warnings": [],
+                "hard_issues": [],
+            },
+        }
+
+        with (
+            patch.object(
+                stage3_module,
+                "_stage3_final_output_validation",
+                return_value=soft_final,
+            ),
+            patch.object(
+                stage3_module,
+                "_stage3_verified_background_color_normalization",
+                return_value={"applied": False},
+            ),
+        ):
+            stage3_module.run_stage3_background_extraction(processor)
+
+        self.assertEqual(processor.results[-1][1], "ok")
+        self.assertFalse(processor.report["review_required"])
+        self.assertEqual(processor.report["quality"], "ok")
+        self.assertEqual(
+            processor.result_metadata[-1]["reason_code"],
+            "background_accepted_with_soft_warnings",
+        )
+        self.assertEqual(processor._stage_review_reasons(3), [])
+
     def test_stage3_final_consistency_warning_requires_review_without_rollback(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
         processor = Stage3CompoundFake()
@@ -1065,7 +1372,7 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
         self.assertEqual(processor.state, "compound")
         self.assertEqual(
             processor.report["final_output_validation"]["status"],
-            "not_enforced",
+            "accepted",
         )
 
     def test_stage3_compound_validation_rejection_continues_to_plugin(self):
@@ -1074,23 +1381,41 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
             compound_mode="validation_rejected",
             external_success=True,
         )
-
-        stage3_module.run_stage3_background_extraction(processor)
+        graxpert_command = (
+            "pyscript",
+            "GraXpert-AI.py",
+            "-bge",
+            "-model",
+            "model_v2_0_1",
+            "-correction",
+            "subtraction",
+            "-keep_bg",
+            "-nogpu",
+        )
+        with patch.object(
+            stage3_module,
+            "_stage3_theoretical_plugin_candidates",
+            return_value=[("GraXpert-AI BGE CPU", graxpert_command, "graxpert")],
+        ):
+            stage3_module.run_stage3_background_extraction(processor)
 
         self.assertEqual(
             processor.report["compound_fallback"]["status"],
             "validation_rejected",
         )
-        self.assertIn(("gxp",), processor.cmd_calls)
+        self.assertIn(graxpert_command, processor.cmd_calls)
         compound_rbf_index = max(
             index
             for index, call in enumerate(processor.cmd_calls)
             if call and call[0] == "subsky" and "-rbf" in call
         )
-        self.assertLess(compound_rbf_index, processor.cmd_calls.index(("gxp",)))
+        self.assertLess(
+            compound_rbf_index,
+            processor.cmd_calls.index(graxpert_command),
+        )
         self.assertEqual(
             processor.report["model_used"],
-            "GraXpert native command",
+            "GraXpert-AI BGE CPU",
         )
         self.assertEqual(processor.results[-1][1], "ok")
         self.assertIn(
@@ -1102,13 +1427,23 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
         stage3_module = sys.modules["stages.stage3_background_extraction"]
         processor = Stage3CompoundFake(external_success=True)
 
-        def quality_gate(_before: Any, _after: Any, _preservation: Any):
-            if processor.state == "polynomial":
-                return False, "mock protected-signal rejection"
-            return True, "quality gate ok"
+        original_pixel_gate = stage3_module._stage3_candidate_pixel_gate
 
-        processor._stage3_quality_gate = quality_gate
-        stage3_module.run_stage3_background_extraction(processor)
+        def pixel_gate(before: Any, after: Any, *, gate_profile: str):
+            if processor.state == "polynomial":
+                return False, {
+                    "accepted": False,
+                    "severity": "hard_reject",
+                    "hard_issues": ["mock protected-signal rejection"],
+                }
+            return original_pixel_gate(before, after, gate_profile=gate_profile)
+
+        with patch.object(
+            stage3_module,
+            "_stage3_candidate_pixel_gate",
+            side_effect=pixel_gate,
+        ):
+            stage3_module.run_stage3_background_extraction(processor)
 
         compound = processor.report["compound_fallback"]
         self.assertEqual(compound["status"], "not_triggered")
@@ -1120,7 +1455,9 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
             "stage3_compound_poly_intermediate",
             processor.saved_states,
         )
-        self.assertIn(("gxp",), processor.cmd_calls)
+        self.assertFalse(
+            any(call and call[0] in {"gxp", "graxpert"} for call in processor.cmd_calls)
+        )
 
     def test_stage3_compound_rollback_failure_invalidates_candidate(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
@@ -1207,6 +1544,7 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
     def test_stage3_subsky_existing_fails_closed_without_safe_samples(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
         processor = Stage3TransactionFake(gate_ok=True)
+        processor.siril.set_image_bgsamples = lambda *_args, **_kwargs: False
 
         with patch.object(
             stage3_module,
@@ -1358,7 +1696,7 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
         )
         self.assertEqual(
             processor.result_metadata[-1]["reason_code"],
-            "background_review_required",
+            "no_background_candidate_accepted",
         )
 
     def test_stage3_selected_candidate_load_failure_restores_baseline(self):
@@ -1446,7 +1784,7 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
                     expected,
                 )
 
-    def test_stage3_theoretical_plugins_exclude_unintegrated_nox(self):
+    def test_stage3_theoretical_plugins_require_integrated_scripts(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
         processor = SimpleNamespace(log=FakeLogger())
 
@@ -1456,10 +1794,7 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
         ):
             candidates = stage3_module._stage3_theoretical_plugin_candidates(processor)
 
-        self.assertEqual(
-            [label for label, _command, _source in candidates],
-            ["ADBE", "DBE", "AutoDBE"],
-        )
+        self.assertEqual(candidates, [])
 
     def test_stage3_autobge_success_without_image_change_is_rejected(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
@@ -1516,6 +1851,11 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
                 self.pipeline_policy = {
                     "policy_name": "test",
                     "stage3_background": {"protect_nebulosity": True},
+                }
+                self.input_profile = {
+                    "state": "linear",
+                    "safe_for_linear_steps": True,
+                    "source": "test_fixture",
                 }
                 self.siril = Stage3SampleSiril()
                 self.try_calls: list[tuple[str, ...]] = []
@@ -1601,7 +1941,12 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
                 self.results.append((name, status, elapsed, message))
 
         processor = Stage3Fake()
-        stage3_module.run_stage3_background_extraction(processor)
+        with patch.object(
+            stage3_module,
+            "_stage3_candidate_pixel_gate",
+            side_effect=_accepted_stage3_pixel_gate,
+        ):
+            stage3_module.run_stage3_background_extraction(processor)
         background_attempts = [
             tuple(call)
             for call in processor.cmd_calls
@@ -1629,8 +1974,12 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
                 self.log = FakeLogger()
                 self.cfg = SimpleNamespace(
                     workflow_plugin_probe_enabled=False,
-                    stage3_diffuse_auto_apply_enabled=True,
                 )
+                self.input_profile = {
+                    "state": "linear",
+                    "safe_for_linear_steps": True,
+                    "source": "test_fixture",
+                }
                 self.target_profile = {
                     "target_type": "emission_nebula_widefield",
                     "object_stats": {"object_area_ratio": 0.46},
@@ -1727,7 +2076,12 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
                 self.results.append((name, status, elapsed, message))
 
         processor = Stage3Fake()
-        stage3_module.run_stage3_background_extraction(processor)
+        with patch.object(
+            stage3_module,
+            "_stage3_candidate_pixel_gate",
+            side_effect=_accepted_stage3_pixel_gate,
+        ):
+            stage3_module.run_stage3_background_extraction(processor)
         background_attempts = [
             tuple(call)
             for call in processor.cmd_calls
@@ -1768,7 +2122,8 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
             diffuse_context={"diffuse": False},
         )
 
-        self.assertEqual(decision["decision"], "skip")
+        self.assertEqual(decision["decision"], "review_required")
+        self.assertEqual(decision["source"], "process_evidence")
 
     def test_stage3_decision_requires_review_for_diffuse_signal(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
@@ -1813,9 +2168,9 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
             },
         )
 
-        self.assertEqual(decision["decision"], "skip")
-        self.assertEqual(decision["source"], "target_protection_policy")
-        self.assertGreaterEqual(decision["confidence"], 0.80)
+        self.assertEqual(decision["decision"], "review_required")
+        self.assertEqual(decision["source"], "process_evidence")
+        self.assertEqual(decision["confidence"], 0.0)
 
     def test_stage3_decision_applies_high_confidence_offline_gradient(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
@@ -1834,8 +2189,8 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
             diffuse_context={"diffuse": False},
         )
 
-        self.assertEqual(decision["decision"], "apply")
-        self.assertEqual(decision["source"], "deterministic_offline_policy")
+        self.assertEqual(decision["decision"], "review_required")
+        self.assertEqual(decision["source"], "process_evidence")
 
     def test_stage3_dynamic_rbf_candidates_expand_for_noisy_complex_fields(self):
         processor = pipeline_module.StarunPostProcessor()

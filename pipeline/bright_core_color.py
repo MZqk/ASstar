@@ -1,4 +1,4 @@
-"""Fixed Stage 4 color-integrity guard for strict bright-core nebulae."""
+"""Stage 4 color-integrity assessment for strict bright-core nebulae."""
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -17,16 +17,10 @@ CHROMA_DRIFT_MIN = 0.08
 SATURATION_MIN = 0.30
 DOMINANT_ADVANTAGE_MIN = 0.08
 COMPONENT_ACCEPTED_RATIO = 0.005
-COMPONENT_REPAIR_RATIO = 0.01
+COMPONENT_HIGH_RISK_RATIO = 0.01
 BROAD_PLATFORM_STRONG_ANOMALY_RATIO_MIN = 0.02
 BROAD_PLATFORM_SATURATION_MIN = 0.10
 BROAD_PLATFORM_COMPONENT_RATIO_MAX = 0.05
-REPAIR_DILATION_RADIUS = 3
-REPAIR_FEATHER_PASSES = 4
-REPAIR_SUPPORT_RATIO_MAX = 0.015
-REPAIR_LUMA_ERROR_P99_MAX = 0.002
-REPAIR_NEW_CLIP_RATIO_MAX = 0.001
-CLIP_THRESHOLD = 0.995
 REC709 = np.asarray((0.2126, 0.7152, 0.0722), dtype=np.float64)
 
 
@@ -164,21 +158,6 @@ def _connected_components8(mask: np.ndarray) -> Tuple[np.ndarray, List[int]]:
     return labels, areas
 
 
-def _dilate8(mask: np.ndarray, radius: int) -> np.ndarray:
-    expanded = np.asarray(mask, dtype=bool).copy()
-    for _ in range(max(int(radius), 0)):
-        padded = np.pad(expanded, 1, mode="constant", constant_values=False)
-        height, width = expanded.shape
-        expanded = np.logical_or.reduce(
-            [
-                padded[dy : dy + height, dx : dx + width]
-                for dy in range(3)
-                for dx in range(3)
-            ]
-        )
-    return expanded
-
-
 def _fixed_limits() -> Dict[str, Any]:
     return {
         "roi_quantile": ROI_QUANTILE,
@@ -190,23 +169,14 @@ def _fixed_limits() -> Dict[str, Any]:
         "dominant_channel_advantage_min": DOMINANT_ADVANTAGE_MIN,
         "largest_component_ratio": {
             "accepted": COMPONENT_ACCEPTED_RATIO,
-            "repair": COMPONENT_REPAIR_RATIO,
+            "high_risk": COMPONENT_HIGH_RISK_RATIO,
         },
         "broad_core_chroma_platform": {
             "strong_anomaly_ratio_min": BROAD_PLATFORM_STRONG_ANOMALY_RATIO_MIN,
             "chroma_l1_over_2_drift_min": CHROMA_DRIFT_MIN,
             "post_saturation_min": BROAD_PLATFORM_SATURATION_MIN,
             "largest_component_ratio_max": BROAD_PLATFORM_COMPONENT_RATIO_MAX,
-            "action": "attempt_once_bounded_rgb_direction_rollback_then_reject",
-        },
-        "repair": {
-            "component_ratio_min": COMPONENT_ACCEPTED_RATIO,
-            "dilation_radius": REPAIR_DILATION_RADIUS,
-            "feather_smooth_passes": REPAIR_FEATHER_PASSES,
-            "support_ratio_max": REPAIR_SUPPORT_RATIO_MAX,
-            "luma_abs_error_p99_max": REPAIR_LUMA_ERROR_P99_MAX,
-            "new_clip_ratio_max": REPAIR_NEW_CLIP_RATIO_MAX,
-            "clip_threshold": CLIP_THRESHOLD,
+            "action": "flag_advisory_only",
         },
     }
 
@@ -244,7 +214,7 @@ def assess_spcc_bright_core_color(
         report.update(
             status="hard_failed",
             accepted=False,
-            final_action="reject_spcc_to_pcc",
+            final_action="flag_invalid_rgb_input",
             trigger_reasons=["invalid_rgb_input"],
             error=str(error),
         )
@@ -266,7 +236,7 @@ def assess_spcc_bright_core_color(
         report.update(
             status="hard_failed",
             accepted=False,
-            final_action="reject_spcc_to_pcc",
+            final_action="flag_shape_change",
             trigger_reasons=["shape_changed"],
             shape_before=list(before_rgb.shape),
             shape_after=list(after_rgb.shape),
@@ -276,7 +246,7 @@ def assess_spcc_bright_core_color(
         report.update(
             status="hard_failed",
             accepted=False,
-            final_action="reject_spcc_to_pcc",
+            final_action="flag_non_finite_input",
             trigger_reasons=["non_finite_input"],
         )
         return report, {}
@@ -300,7 +270,7 @@ def assess_spcc_bright_core_color(
         report.update(
             status="hard_failed",
             accepted=False,
-            final_action="reject_spcc_to_pcc",
+            final_action="flag_insufficient_roi_support",
             trigger_reasons=["bright_core_roi_support_insufficient"],
         )
         return report, {"before": before_rgb, "after": after_rgb, "roi": roi}
@@ -362,15 +332,15 @@ def assess_spcc_bright_core_color(
         report.update(
             status="hard_failed",
             accepted=False,
-            final_action="reject_spcc_to_pcc",
+            final_action="flag_broad_core_chroma_platform",
             trigger_reasons=["broad_core_chroma_platform"],
         )
-    elif largest_ratio > COMPONENT_REPAIR_RATIO:
+    elif largest_ratio > COMPONENT_HIGH_RISK_RATIO:
         report.update(
-            status="repair_required",
+            status="high_risk",
             accepted=False,
-            final_action="attempt_local_core_chroma_rollback",
-            trigger_reasons=["largest_anomaly_component_exceeded_repair_line"],
+            final_action="flag_compact_core_chroma_anomaly",
+            trigger_reasons=["largest_anomaly_component_exceeded_high_risk_line"],
         )
     elif largest_ratio > COMPONENT_ACCEPTED_RATIO:
         report.update(
@@ -396,222 +366,6 @@ def assess_spcc_bright_core_color(
     }
 
 
-def _repair_candidate(
-    context: Dict[str, Any],
-    *,
-    component_domain: str,
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    before = np.asarray(context["before"], dtype=np.float64)
-    after = np.asarray(context["after"], dtype=np.float64)
-    if component_domain == "broad_core_chroma_platform":
-        labels = np.asarray(context["broad_platform_labels"], dtype=np.int32)
-        areas = list(context["broad_platform_areas"])
-    elif component_domain == "compact_anomaly_components":
-        labels = np.asarray(context["labels"], dtype=np.int32)
-        areas = list(context["areas"])
-    else:
-        raise ValueError(f"unsupported bright-core repair domain: {component_domain}")
-    roi_support = max(int(np.count_nonzero(context["roi"])), 1)
-    selected_labels = [
-        index + 1
-        for index, area in enumerate(areas)
-        if float(area / roi_support) > COMPONENT_ACCEPTED_RATIO
-    ]
-    selected = np.isin(labels, np.asarray(selected_labels, dtype=np.int32))
-    expanded = _dilate8(selected, REPAIR_DILATION_RADIUS)
-    weight = expanded.astype(np.float64)
-    for _ in range(REPAIR_FEATHER_PASSES):
-        weight = _box_blur_gray(weight)
-    weight = np.clip(weight, 0.0, 1.0)
-    support = weight > 0.0
-
-    after_y = _luma(after)
-    positive_before = np.clip(before, 0.0, None)
-    before_y = _luma(positive_before)
-    reference = positive_before * (
-        after_y / np.maximum(before_y, 1e-12)
-    )[np.newaxis, ...]
-    candidate = after.copy()
-    candidate[:, support] = (
-        after[:, support] * (1.0 - weight[support])[np.newaxis, :]
-        + reference[:, support] * weight[support][np.newaxis, :]
-    )
-    return candidate, {
-        "component_domain": component_domain,
-        "selected_component_labels": selected_labels,
-        "selected_component_count": len(selected_labels),
-        "selected_seed_pixels": int(np.count_nonzero(selected)),
-        "dilation_radius": REPAIR_DILATION_RADIUS,
-        "dilated_pixels": int(np.count_nonzero(expanded)),
-        "feather_smooth_passes": REPAIR_FEATHER_PASSES,
-        "support": support,
-        "support_pixels": int(np.count_nonzero(support)),
-        "support_ratio_of_image": float(np.mean(support)),
-    }
-
-
-def evaluate_and_repair_spcc_bright_core(
-    before: Any,
-    after: Any,
-    *,
-    target_type: str,
-    target_profile: Optional[Dict[str, Any]],
-) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
-    """Accept, repair, or reject one SPCC candidate under the fixed policy."""
-    initial, context = assess_spcc_bright_core_color(
-        before,
-        after,
-        target_type=target_type,
-        target_profile=target_profile,
-    )
-    if not initial.get("applicable", False):
-        return np.asarray(after).copy(), initial
-    if initial.get("accepted", False):
-        return np.asarray(after).copy(), initial
-    broad_platform_repair = bool(
-        initial.get("status") == "hard_failed"
-        and "broad_core_chroma_platform"
-        in (initial.get("trigger_reasons") or [])
-        and context.get("broad_platform_areas")
-    )
-    compact_repair = bool(
-        initial.get("status") == "repair_required"
-        and context.get("areas")
-    )
-    if not (broad_platform_repair or compact_repair):
-        return None, initial
-
-    component_domain = (
-        "broad_core_chroma_platform"
-        if broad_platform_repair
-        else "compact_anomaly_components"
-    )
-    repair_method = (
-        "SPCC_BROAD_CORE_CHROMA_ROLLBACK"
-        if broad_platform_repair
-        else "SPCC_LOCAL_CORE_CHROMA_ROLLBACK"
-    )
-    candidate, repair = _repair_candidate(
-        context,
-        component_domain=component_domain,
-    )
-    support = np.asarray(repair.pop("support"), dtype=bool)
-    after_rgb = np.asarray(context["after"], dtype=np.float64)
-    finite = bool(np.all(np.isfinite(candidate)))
-    support_ratio = float(repair["support_ratio_of_image"])
-    outside_exact = bool(np.array_equal(candidate[:, ~support], after_rgb[:, ~support]))
-    if np.any(support):
-        luma_error = np.abs(_luma(candidate) - _luma(after_rgb))[support]
-        luma_error_p99 = float(np.quantile(luma_error, 0.99))
-    else:
-        luma_error_p99 = float("inf")
-    before_cap = after_rgb >= CLIP_THRESHOLD
-    candidate_cap = candidate >= CLIP_THRESHOLD
-    new_clip_ratio = float(np.mean(candidate_cap & ~before_cap))
-
-    post, _ = assess_spcc_bright_core_color(
-        context["before"],
-        candidate,
-        target_type=target_type,
-        target_profile=target_profile,
-    )
-    post_largest = float(
-        (post.get("measurements") or {}).get(
-            "largest_component_ratio_of_roi",
-            float("inf"),
-        )
-    )
-    checks = {
-        "largest_component_ratio": {
-            "value": post_largest,
-            "limit": COMPONENT_ACCEPTED_RATIO,
-            "passed": post_largest <= COMPONENT_ACCEPTED_RATIO,
-        },
-        "modified_support_ratio": {
-            "value": support_ratio,
-            "limit": REPAIR_SUPPORT_RATIO_MAX,
-            "passed": support_ratio <= REPAIR_SUPPORT_RATIO_MAX,
-        },
-        "luma_abs_error_p99": {
-            "value": luma_error_p99,
-            "limit": REPAIR_LUMA_ERROR_P99_MAX,
-            "passed": luma_error_p99 <= REPAIR_LUMA_ERROR_P99_MAX,
-        },
-        "new_clip_ratio": {
-            "value": new_clip_ratio,
-            "limit": REPAIR_NEW_CLIP_RATIO_MAX,
-            "passed": new_clip_ratio <= REPAIR_NEW_CLIP_RATIO_MAX,
-        },
-        "finite": {"passed": finite},
-        "outside_support_exact": {"passed": outside_exact},
-        "post_repair_full_assessment": {
-            "status": post.get("status"),
-            "accepted": bool(post.get("accepted", False)),
-            "trigger_reasons": list(post.get("trigger_reasons") or []),
-            "passed": bool(post.get("accepted", False)),
-        },
-    }
-    passed = all(bool(check.get("passed")) for check in checks.values())
-    report = dict(initial)
-    report["repair"] = {
-        **repair,
-        "repair_mask": {
-            "source": (
-                "broad_platform_components_above_0.5_percent_of_core_roi"
-                if broad_platform_repair
-                else "anomaly_components_above_0.5_percent_of_core_roi"
-            ),
-            "selected_component_count": repair["selected_component_count"],
-            "seed_pixels": repair["selected_seed_pixels"],
-            "dilated_pixels": repair["dilated_pixels"],
-            "dilation_radius": repair["dilation_radius"],
-            "feather_smooth_passes": repair["feather_smooth_passes"],
-            "support_pixels": repair["support_pixels"],
-            "support_ratio_of_image": repair["support_ratio_of_image"],
-        },
-        "method": repair_method,
-        "reference_rgb_direction": "stage4_pre_pcc",
-        "preserved_luminance": "SPCC Rec.709",
-        "checks": checks,
-        "post_repair_assessment": post,
-        "passed": passed,
-        "requires_review": broad_platform_repair,
-    }
-    if passed:
-        report.update(
-            status="repaired",
-            accepted=True,
-            repaired=True,
-            final_action=(
-                "accept_bounded_broad_core_chroma_rollback_for_review"
-                if broad_platform_repair
-                else "accept_repaired_spcc"
-            ),
-            trigger_reasons=list(initial.get("trigger_reasons") or []),
-            requires_review=broad_platform_repair,
-        )
-        native_candidate = np.asarray(
-            context["after_native"],
-            dtype=np.float64,
-        ).copy()
-        native_candidate[:, support] = (
-            candidate[:, support] * float(context["after_scale"])
-        )
-        return np.asarray(native_candidate, dtype=np.float32), report
-
-    failed_checks = [name for name, check in checks.items() if not check["passed"]]
-    report.update(
-        status="hard_failed",
-        accepted=False,
-        repaired=False,
-        final_action="reject_spcc_to_pcc",
-        trigger_reasons=list(initial.get("trigger_reasons") or [])
-        + [f"repair_check_failed:{name}" for name in failed_checks],
-    )
-    return None, report
-
-
 __all__ = [
     "assess_spcc_bright_core_color",
-    "evaluate_and_repair_spcc_bright_core",
 ]
