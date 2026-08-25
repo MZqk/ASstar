@@ -2035,7 +2035,7 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
 
         selected = min(
             candidates,
-            key=processor._stage7_candidate_selection_key,
+            key=processor._stage7_review_candidate_selection_key,
         )
 
         self.assertEqual(selected["name"], "chroma_rescue_2")
@@ -2074,7 +2074,7 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
         self.assertEqual(key_before, key_after)
         self.assertEqual(
             stage6_services_module.STAGE7_CANDIDATE_RANKING_POLICY,
-            "hard_gate_bounded_subject_brightness_v6",
+            "hard_gate_continuous_quality_v7",
         )
 
     def test_stage7_strict_target_prefers_unsaturated_safe_candidate(self):

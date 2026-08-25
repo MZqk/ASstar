@@ -45,6 +45,8 @@ TRANSFORM_LOSS_SCHEMA = "starun.stage7-transform-loss.v1"
 MULTISCALE_CONTRAST_SCHEMA = "starun.stage7-multiscale-contrast.v1"
 RENDITION_METRICS_SCHEMA = "starun.stage7-rendition-metrics.v2"
 RENDITION_CHROMA_SCHEMA = "starun.stage7-subject-chroma.v1"
+LUMA_NOISE_GROWTH_SCHEMA = "starun.stage7-luma-noise-growth.v1"
+LUMA_VISIBLE_NOISE_REFERENCE_FLOOR = 0.020
 MULTISCALE_CONTRAST_RADII = (1, 2, 4, 8, 16)
 SIRIL_MINIMUM_VERSION_CONTRACT = "1.4.0"
 SIRIL_BUNDLED_REFERENCE_VERSION = "1.4.4"
@@ -632,6 +634,207 @@ def apply_subject_chroma_rendition(
 def _stage7_rgb_float_fullres(image: np.ndarray) -> np.ndarray:
     pixels, _provenance = canonicalize_stage7_pixels_01(image)
     return _to_rgb_float_fullres(pixels)
+
+
+def assess_frozen_background_luma_noise_growth(
+    source: np.ndarray,
+    candidate: np.ndarray,
+    masks: Optional[Dict[str, Any]],
+    cfg,
+) -> Dict[str, Any]:
+    """Gate high-frequency luminance-noise growth on a frozen background ROI."""
+
+    accepted_limit = float(
+        getattr(cfg, "stage7_stretch_luma_noise_growth_max", 1.25)
+    )
+    unavailable_gate = {
+        "status": "unavailable",
+        "advisory": False,
+        "hard_failed": True,
+        "value": None,
+        "accepted_limit": accepted_limit,
+        "hard_limit": accepted_limit
+        * stage7_quality.stage7_9_quality_advisory_multiplier(cfg),
+        "severity_ratio": None,
+        "advisory_multiplier": (
+            stage7_quality.stage7_9_quality_advisory_multiplier(cfg)
+        ),
+    }
+    report: Dict[str, Any] = {
+        "schema": LUMA_NOISE_GROWTH_SCHEMA,
+        "status": "unavailable",
+        "accepted": False,
+        "issues": ["background_luma_noise_growth_measurement_unavailable"],
+        "advisories": [],
+        "measurement_domain": "canonical_float_0_1_rec709_luminance",
+        "mask_source": None,
+        "support_count": 0,
+        "low_absolute_exempted": False,
+        "quality_gate": unavailable_gate,
+        "metrics": {},
+    }
+    try:
+        source_rgb = _stage7_rgb_float_fullres(np.asarray(source))
+        candidate_rgb = _stage7_rgb_float_fullres(np.asarray(candidate))
+        if source_rgb.shape != candidate_rgb.shape:
+            raise ValueError(
+                "source/candidate shape mismatch: "
+                f"{source_rgb.shape}!={candidate_rgb.shape}"
+            )
+        if not np.all(np.isfinite(source_rgb)) or not np.all(
+            np.isfinite(candidate_rgb)
+        ):
+            raise ValueError("source/candidate contains non-finite pixels")
+
+        shape = tuple(int(value) for value in source_rgb.shape[1:])
+        source_luma = (
+            0.2126 * source_rgb[0]
+            + 0.7152 * source_rgb[1]
+            + 0.0722 * source_rgb[2]
+        ).astype(np.float32)
+        candidate_luma = (
+            0.2126 * candidate_rgb[0]
+            + 0.7152 * candidate_rgb[1]
+            + 0.0722 * candidate_rgb[2]
+        ).astype(np.float32)
+
+        background_weight = _stage7_mask(masks, "background_mask", shape)
+        fallback_weight = _stage7_mask(
+            masks,
+            "luma_noise_background_mask",
+            shape,
+        )
+        if background_weight is not None:
+            support = background_weight > 0.50
+            for name in (
+                "subject_mask",
+                "core_mask",
+                "nebula_mask",
+                "faint_nebula_mask",
+                "galaxy_signal_mask",
+                "star_mask",
+            ):
+                signal_weight = _stage7_mask(masks, name, shape)
+                if signal_weight is not None:
+                    support &= signal_weight <= 0.25
+            valid_weight = _stage7_mask(masks, "shared_valid_mask", shape)
+            if valid_weight is not None:
+                support &= valid_weight > 0.50
+            mask_source = "stage6_frozen_background_signal_excluded"
+        elif fallback_weight is not None:
+            support = fallback_weight > 0.50
+            mask_source = "stage6_source_luma_p35"
+        else:
+            threshold = float(np.quantile(source_luma, 0.35))
+            support = source_luma <= threshold
+            mask_source = "stage6_source_luma_p35"
+
+        support &= np.isfinite(source_luma) & np.isfinite(candidate_luma)
+        support_count = int(np.count_nonzero(support))
+        if support_count < 64:
+            raise ValueError(
+                f"frozen background ROI contains too few pixels: {support_count}"
+            )
+
+        def measure(luma: np.ndarray) -> Dict[str, float]:
+            background_values = np.asarray(luma[support], dtype=np.float32)
+            residual = luma - _box_blur_gray(luma)
+            residual_values = np.asarray(residual[support], dtype=np.float32)
+            residual_median = float(np.median(residual_values))
+            sigma = float(
+                1.4826
+                * np.median(np.abs(residual_values - residual_median))
+            )
+            background_median = float(np.median(background_values))
+            score = sigma / max(background_median, 0.015)
+            return {
+                "background_median": background_median,
+                "high_frequency_residual_median": residual_median,
+                "sigma": sigma,
+                "visible_noise_score": float(score),
+            }
+
+        source_metrics = measure(source_luma)
+        candidate_metrics = measure(candidate_luma)
+        source_score = float(source_metrics["visible_noise_score"])
+        candidate_score = float(candidate_metrics["visible_noise_score"])
+        # A linear, dark and integer-quantized source can have an almost-zero
+        # visible-noise score even though a valid nonlinear stretch must
+        # amplify its existing high-frequency signal.  Dividing directly by
+        # that unstable baseline rejects every useful stretch.  Keep the
+        # relative gate when the source is measurable, but use an auditable
+        # output-domain floor when it is not.  The configured 1.25x nominal
+        # gate therefore allows <=2.5% visible background noise and the usual
+        # advisory multiplier still hard-rejects >3.75% at its default.
+        reference_score = max(
+            source_score,
+            LUMA_VISIBLE_NOISE_REFERENCE_FLOOR,
+        )
+        growth = candidate_score / reference_score
+        sigma_delta = float(
+            candidate_metrics["sigma"] - source_metrics["sigma"]
+        )
+        low_absolute_exempted = bool(
+            candidate_metrics["sigma"] <= 0.00075
+            and sigma_delta <= 0.00050
+        )
+        nominal_gate = stage7_quality.stage7_9_upper_quality_gate(
+            cfg,
+            value=growth,
+            accepted_limit=accepted_limit,
+        )
+        gate = dict(nominal_gate)
+        if low_absolute_exempted and (
+            nominal_gate.get("advisory") or nominal_gate.get("hard_failed")
+        ):
+            gate.update(
+                status="low_absolute_exempted",
+                advisory=False,
+                hard_failed=False,
+                reason_code="low_absolute_luma_noise",
+                nominal_gate=nominal_gate,
+            )
+
+        message = (
+            "background_luma_noise_growth "
+            f"{growth:.3f}>{accepted_limit:.3f}"
+        )
+        issues = [message] if bool(gate.get("hard_failed")) else []
+        advisories = (
+            [message + " advisory"] if bool(gate.get("advisory")) else []
+        )
+        report.update(
+            status=(
+                "poor" if issues else "advisory" if advisories else "ok"
+            ),
+            accepted=not issues,
+            issues=issues,
+            advisories=advisories,
+            mask_source=mask_source,
+            support_count=support_count,
+            support_coverage=float(support_count / max(source_luma.size, 1)),
+            low_absolute_exempted=low_absolute_exempted,
+            quality_gate=gate,
+            metrics={
+                "source": source_metrics,
+                "candidate": candidate_metrics,
+                "visible_noise_growth": float(growth),
+                "visible_noise_reference_score": float(reference_score),
+                "visible_noise_reference_floor": (
+                    LUMA_VISIBLE_NOISE_REFERENCE_FLOOR
+                ),
+                "visible_noise_reference_floor_applied": bool(
+                    source_score < LUMA_VISIBLE_NOISE_REFERENCE_FLOOR
+                ),
+                "sigma_absolute_growth": sigma_delta,
+                "low_absolute_sigma_max": 0.00075,
+                "low_absolute_sigma_growth_max": 0.00050,
+            },
+        )
+        return report
+    except (IndexError, TypeError, ValueError, FloatingPointError) as error:
+        report["reason"] = str(error)
+        return report
 
 
 def _stage7_rgb_float_image(

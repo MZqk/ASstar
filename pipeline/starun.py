@@ -337,6 +337,7 @@ CLAMP_RULES: list[tuple[str, type, float, float]] = [
     ("stage7_starless_halo_detail_delta_min", float, 0.001, 0.10),
     ("stage7_stretch_chroma_noise_score_max", float, 0.10, 0.80),
     ("stage7_stretch_background_mottling_score_max", float, 0.10, 1.00),
+    ("stage7_stretch_luma_noise_growth_max", float, 1.00, 3.00),
     ("stage7_stretch_chroma_load_growth_max", float, 1.00, 3.00),
     ("stage7_stretch_chroma_load_low_absolute_max", float, 0.01, 0.15),
     ("stage7_stretch_chroma_load_low_absolute_tolerance", float, 0.0, 0.01),

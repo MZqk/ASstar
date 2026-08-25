@@ -391,7 +391,7 @@ class ProcessingParameterContractTests(unittest.TestCase):
                 )
                 for stage in range(2, 10)
             },
-            {2: 4, 3: 18, 4: 20, 5: 4, 6: 32, 7: 51, 8: 17, 9: 84},
+            {2: 4, 3: 18, 4: 20, 5: 4, 6: 32, 7: 52, 8: 17, 9: 84},
         )
         gate_fields = {spec.field for spec in PROCESSING_GATE_PARAMETER_SPECS}
         self.assertTrue(
@@ -405,6 +405,7 @@ class ProcessingParameterContractTests(unittest.TestCase):
                 "stage7_residual_star_score_max",
                 "stage7_9_quality_advisory_multiplier",
                 "stage7_stretch_chroma_noise_score_max",
+                "stage7_stretch_luma_noise_growth_max",
                 "stage8_texture_artifact_growth_max",
                 "stage8_subject_boundary_luma_residual_max",
                 "stage8_subject_boundary_chroma_residual_max",
@@ -551,6 +552,14 @@ class ProcessingParameterContractTests(unittest.TestCase):
         self.assertEqual(
             cfg.stage7_stretch_chroma_noise_score_max,
             PipelineConfig().stage7_stretch_chroma_noise_score_max,
+        )
+        self.assertAlmostEqual(
+            cfg.stage7_stretch_luma_noise_growth_max,
+            1.0
+            + (
+                PipelineConfig().stage7_stretch_luma_noise_growth_max - 1.0
+            )
+            * 3.0,
         )
         self.assertEqual(
             cfg.stage7_transform_new_hard_clip_ratio_max,

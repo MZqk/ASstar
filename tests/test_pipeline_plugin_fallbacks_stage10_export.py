@@ -5,6 +5,59 @@ from managed_output import _read_managed_display_png
 
 
 class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
+    def test_stage10_degraded_starmask_catalog_uses_signed_stage5_reference(self):
+        processor = self._new_processor()
+        self._stage10_final_input(processor)
+        (processor.process_dir / "stage5_input_linear.fit").write_bytes(b"mock")
+        processor._stage9_star_reference_catalog = {
+            "status": "ok",
+            "reference_source": "starmask_only",
+            "reference_degraded": True,
+            "_source_peak_y": np.asarray([4, 8, 12, 16], dtype=np.int32),
+            "_source_peak_x": np.asarray([4, 8, 12, 16], dtype=np.int32),
+            "_reference_local_contrast": np.full(4, 0.25, dtype=np.float32),
+        }
+        coordinates = tuple(
+            (y, x)
+            for y in (5, 12, 19, 26)
+            for x in (5, 12, 19, 26)
+        )
+        processor._stage5_star_reference_report = {
+            "schema": "starun.stage5-star-reference.v1",
+            "status": "available",
+            "fixed_before_deconvolution": True,
+            "source_checkpoint": "stage5_input_linear.fit",
+            "stars": [
+                {
+                    "geometry_valid": True,
+                    "x": x,
+                    "y": y,
+                    "fwhm_geometry": 2.8,
+                    "amplitude": 0.20 + index * 0.01,
+                }
+                for index, (y, x) in enumerate(coordinates)
+            ],
+        }
+
+        catalog, resolution = (
+            stage10_export_module._stage10_star_visibility_reference(
+                processor,
+                processor.siril.get_image_pixeldata(preview=False),
+                restore_stem="stage9_remixed",
+            )
+        )
+
+        self.assertIsNotNone(catalog)
+        self.assertEqual(resolution["status"], "ready")
+        self.assertEqual(resolution["source"], "stage5_frozen_star_reference")
+        self.assertEqual(resolution["star_count"], 16)
+        self.assertEqual(
+            catalog["stage5_visibility_classification"],
+            "source_visible_local_contrast_median",
+        )
+        self.assertGreater(catalog["stage5_visibility_weak_count"], 0)
+        self.assertGreater(catalog["stage5_visibility_bright_count"], 0)
+
     def test_stage10_catalog_failure_withholds_review_even_with_generic_peaks(self):
         processor = self._new_processor()
         self._stage10_final_input(processor)

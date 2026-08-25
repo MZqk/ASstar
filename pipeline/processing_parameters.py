@@ -1328,6 +1328,7 @@ PROCESSING_GATE_PARAMETER_SPECS: Tuple[ParameterSpec, ...] = (
     _gate("stage7_local_dark_separation_min", 7, "局部暗云分离下限", "float", 0.0, 0.020, 0.001, 3),
     _gate("stage7_stretch_chroma_noise_score_max", 7, "拉伸色噪评分", "float", 0.10, 0.80, 0.01, 2),
     _gate("stage7_stretch_background_mottling_score_max", 7, "背景斑驳评分", "float", 0.10, 1.00, 0.01, 2),
+    _gate("stage7_stretch_luma_noise_growth_max", 7, "高频亮度噪声增长", "float", 1.00, 3.00, 0.05, 2, suffix="×"),
     _gate("stage7_stretch_chroma_load_growth_max", 7, "综合色偏增长", "float", 1.00, 3.00, 0.05, 2, suffix="×"),
     _gate("stage7_stretch_chroma_load_low_absolute_max", 7, "低绝对色偏豁免", "float", 0.01, 0.15, 0.005, 3),
     _gate("stage7_stretch_chroma_load_low_absolute_tolerance", 7, "低色偏数值容差", "float", 0.0, 0.01, 0.0001, 4),
@@ -1517,6 +1518,11 @@ _GATE_PROFILE_RULES: Dict[
     "stage7_preview_visibility_retention_min": (PROFILE_SCALE_LOWER, 0.0, 1.0),
     "stage7_local_faint_snr_min": (PROFILE_SCALE_LOWER, 0.0, None),
     "stage7_local_dark_separation_min": (PROFILE_SCALE_LOWER, 0.0, 1.0),
+    "stage7_stretch_luma_noise_growth_max": (
+        PROFILE_SCALE_UPPER_FROM_ONE,
+        1.0,
+        None,
+    ),
 
     # Stage 8: post-enhancement quality acceptance; limited-mode strength caps
     # and mask construction remain static algorithm settings.

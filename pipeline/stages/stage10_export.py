@@ -1281,7 +1281,13 @@ def _stage10_star_visibility_reference(
     """Resolve a dimension-checked frozen catalog for final star audits."""
     final_shape = _stage10_spatial_shape(final_pixels)
     primary = getattr(pipeline, "_stage9_star_reference_catalog", None)
-    if isinstance(primary, dict) and primary.get("status") == "ok":
+    primary_is_source_confirmed = bool(
+        isinstance(primary, dict)
+        and primary.get("status") == "ok"
+        and primary.get("source_matched") is True
+        and primary.get("reference_degraded") is not True
+    )
+    if primary_is_source_confirmed:
         y = np.asarray(
             primary.get("_source_peak_y", primary.get("_peak_y", ())),
             dtype=np.int32,
@@ -1420,6 +1426,36 @@ def _stage10_star_visibility_reference(
         )
         if contrast.size != y.size:
             raise RuntimeError("Stage5 visibility reference enrichment failed")
+        contrast_min = min(
+            max(
+                float(
+                    getattr(
+                        pipeline.cfg,
+                        "stage9_catalog_star_visibility_contrast_min",
+                        0.002,
+                    )
+                ),
+                0.0005,
+            ),
+            0.02,
+        )
+        source_visible = np.isfinite(contrast) & (contrast >= contrast_min)
+        if int(np.count_nonzero(source_visible)) >= 4:
+            visible_split = float(np.median(contrast[source_visible]))
+            visibility_weak = source_visible & (contrast <= visible_split)
+            catalog["_weak_flags"] = visibility_weak
+            catalog.update(
+                stage5_visibility_classification=(
+                    "source_visible_local_contrast_median"
+                ),
+                stage5_visibility_contrast_split=visible_split,
+                stage5_visibility_weak_count=int(
+                    np.count_nonzero(visibility_weak)
+                ),
+                stage5_visibility_bright_count=int(
+                    np.count_nonzero(source_visible & ~visibility_weak)
+                ),
+            )
         resolution.update(
             status="ready",
             source="stage5_frozen_star_reference",

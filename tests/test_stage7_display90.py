@@ -738,7 +738,7 @@ class Display90BackgroundReferenceGateTests(unittest.TestCase):
             " ".join(mottled["issues"]),
         )
 
-    def test_matched_candidate_wins_by_existing_retention_rank_only(self) -> None:
+    def test_v7_continuous_quality_can_override_retention_advantage(self) -> None:
         processor = _StretchProcessor()
         display_gate = self._gate(0.39, 0.39)
         safe_gate = processor._stage7_stretch_background_gate(
@@ -801,7 +801,7 @@ class Display90BackgroundReferenceGateTests(unittest.TestCase):
             (display, candidate_b),
             key=processor._stage7_candidate_selection_key,
         )
-        self.assertEqual(selected["name"], "cand_display90")
+        self.assertEqual(selected["name"], "cand_b")
 
         display["preview_retention"] = copy.deepcopy(
             candidate_b["preview_retention"]
@@ -1176,7 +1176,7 @@ class Stage7SubjectBrightnessSelectionTests(unittest.TestCase):
         )
         self.assertEqual(safety_winner["name"], "safe_dim")
 
-    def test_unreliable_nebula_lift_ranks_structure_before_brightness_goal(self) -> None:
+    def test_v7_continuous_quality_precedes_brightness_goal(self) -> None:
         preview = self._report(0.039, 0.02, 0.005)
         lower_p50 = stretch_metrics.subject_brightness_selection(
             self._report(0.025, 0.02, 0.005),

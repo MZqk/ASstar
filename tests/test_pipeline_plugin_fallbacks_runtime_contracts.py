@@ -598,6 +598,10 @@ class PipelinePluginFallbackRuntimeContractTests(PipelinePluginFallbackTestBase)
             "STARUN_STAGE7_STRETCH_CHROMA_LOAD_LOW_ABSOLUTE_TOLERANCE",
             allowed,
         )
+        self.assertIn(
+            "STARUN_STAGE7_STRETCH_LUMA_NOISE_GROWTH_MAX",
+            allowed,
+        )
         self.assertIn("STARUN_STAGE7_CHROMA_RESCUE_ENABLE", allowed)
         self.assertIn("STARUN_STAGE7_GALAXY_ROI_HALO_GATE_ENABLE", allowed)
         self.assertIn(
@@ -982,6 +986,7 @@ class PipelinePluginFallbackRuntimeContractTests(PipelinePluginFallbackTestBase)
             "STARUN_STAGE7_STARLESS_HALO_DETAIL_GROWTH_RATIO_MAX": "1.45",
             "STARUN_STAGE7_STARLESS_HALO_DETAIL_DELTA_MIN": "0.008",
             "STARUN_STAGE7_QUANTILE_FALLBACK_ENABLE": "0",
+            "STARUN_STAGE7_STRETCH_LUMA_NOISE_GROWTH_MAX": "4.0",
             "STARUN_STAGE7_STRETCH_CHROMA_LOAD_LOW_ABSOLUTE_MAX": "0.045",
             "STARUN_STAGE7_STRETCH_CHROMA_LOAD_LOW_ABSOLUTE_TOLERANCE": "0.0008",
             "STARUN_STAGE7_PREVIEW_TARGET_P50_MAX_RATIO": "1.42",
@@ -1088,6 +1093,10 @@ class PipelinePluginFallbackRuntimeContractTests(PipelinePluginFallbackTestBase)
         )
         self.assertEqual(processor.cfg.stage7_starless_halo_detail_delta_min, 0.008)
         self.assertFalse(processor.cfg.stage7_quantile_fallback_enabled)
+        self.assertEqual(
+            processor.cfg.stage7_stretch_luma_noise_growth_max,
+            3.0,
+        )
         self.assertEqual(
             processor.cfg.stage7_stretch_chroma_load_low_absolute_max,
             0.045,

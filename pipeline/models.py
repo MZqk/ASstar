@@ -486,6 +486,7 @@ class PipelineConfig:
     stage7_local_dark_separation_min: float = 0.001  # 暗云周围亮云与暗结构的最低局部亮度分离
     stage7_stretch_chroma_noise_score_max: float = 0.34  # Stage 7 正式拉伸候选的背景绝对色噪上限
     stage7_stretch_background_mottling_score_max: float = 0.45  # Stage 7 正式拉伸候选的背景斑驳上限
+    stage7_stretch_luma_noise_growth_max: float = 1.25  # Stage 7 冻结背景高频亮度噪声相对线性源的名义增长上限
     stage7_stretch_chroma_load_growth_max: float = 1.37  # Stage 7 拉伸后综合色偏差相对背景亮度的最大放大倍数
     stage7_stretch_chroma_load_low_absolute_max: float = 0.05  # 绝对 chroma load 低于此值时豁免极低基线导致的相对增长失真
     stage7_stretch_chroma_load_low_absolute_tolerance: float = 0.0005  # 极低背景绝对 chroma load 门的数值抖动容差；仅与低绝对豁免组合使用

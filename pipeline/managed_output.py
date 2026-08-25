@@ -257,9 +257,13 @@ def audit_display_visibility(
     star_visibility_config: Any = None,
 ) -> Dict[str, Any]:
     """Measure whether encoded display pixels are bright and astronomically legible."""
-    arr = np.asarray(rgb, dtype=np.float32)
+    source = np.asarray(rgb)
+    original_dtype = source.dtype
+    arr = np.asarray(source, dtype=np.float32)
     if arr.ndim != 3 or arr.shape[0] != 3 or arr.size == 0:
         raise ValueError(f"expected non-empty RGB CHW array, got shape={arr.shape}")
+    if np.issubdtype(original_dtype, np.integer):
+        arr /= max(1.0, float(np.iinfo(original_dtype).max))
     if not np.all(np.isfinite(arr)):
         raise ValueError("nonfinite display-audit pixels")
     arr = np.clip(arr, 0.0, 1.0)

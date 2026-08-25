@@ -91,6 +91,21 @@ class ProcessingParameterPassthroughTests(unittest.TestCase):
                 os.environ,
             )
 
+    def test_stage7_luma_noise_growth_env_is_loaded_and_clamped(self) -> None:
+        runtime = ProcessorRuntimeMixin()
+        runtime.cfg = PipelineConfig()
+        runtime.log = self.pipeline.log
+        runtime._sync_logger_level = lambda: None
+
+        with patch.dict(
+            os.environ,
+            {"STARUN_STAGE7_STRETCH_LUMA_NOISE_GROWTH_MAX": "9.0"},
+            clear=False,
+        ):
+            runtime._apply_runtime_env_overrides()
+
+        self.assertEqual(runtime.cfg.stage7_stretch_luma_noise_growth_max, 3.0)
+
     def test_stage2_user_preserve_writes_canonical_artifact(self) -> None:
         self.pipeline.cfg.stage2_processing_mode = "preserve"
 

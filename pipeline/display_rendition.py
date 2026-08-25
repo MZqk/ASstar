@@ -202,7 +202,12 @@ def build_review_contract(
     """Select identity or one linked mapping from a frozen visibility audit."""
     visibility = dict(input_visibility or {})
     exposure_state = str(visibility.get("exposure_state") or "unmappable")
-    if bool(visibility.get("passed", False)) and exposure_state == "acceptable":
+    # Contract selection only decides how already-derived review pixels are
+    # displayed.  Formal star-catalog or target gates may keep ``passed``
+    # false even when exposure and scene content are safely visible; those
+    # gates still control delivery, but must not invalidate an identity
+    # observer mapping.
+    if exposure_state == "acceptable":
         return build_preserve_review_contract(
             image,
             reason=reason,

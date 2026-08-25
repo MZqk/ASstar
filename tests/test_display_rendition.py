@@ -191,6 +191,29 @@ class LinkedReviewRenditionTests(unittest.TestCase):
         self.assertFalse(contract["derivative_pixels_changed"])
         np.testing.assert_array_equal(rendered, source)
 
+    def test_acceptable_exposure_uses_identity_when_formal_star_gate_is_pending(self):
+        source = np.clip(_review_scene() * 0.72 + 0.14, 0.0, 1.0)
+        visibility = audit_display_visibility(
+            source,
+            target_type="bright_emission_reflection_nebula",
+            stars_required=True,
+        )
+
+        self.assertEqual(visibility["exposure_state"], "acceptable")
+        self.assertFalse(visibility["passed"])
+        self.assertIn("star_visibility", visibility["failed_checks"])
+
+        contract = display_rendition.build_review_contract(
+            source,
+            reason="formal_star_gate_pending",
+            source_stem="stage7_review_with_stars",
+            input_visibility=visibility,
+        )
+
+        self.assertEqual(contract["status"], "ready")
+        self.assertEqual(contract["mode"], "preserve")
+        self.assertTrue(display_rendition.validate_review_contract(contract))
+
     def test_underexposed_source_maps_once_to_target_median(self):
         source = _review_scene()
         star_reference, star_config = _review_star_visibility_contract()

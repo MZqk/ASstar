@@ -75,8 +75,22 @@ RESULT_BASENAME_TEMPLATE = (
 )
 STAGE7_ASINH_STRETCH_MIN = 1.0
 STAGE7_ASINH_STRETCH_MAX = 1000.0
-STAGE7_CANDIDATE_RANKING_POLICY = "hard_gate_bounded_subject_brightness_v6"
+STAGE7_CANDIDATE_RANKING_POLICY_V6 = (
+    "hard_gate_bounded_subject_brightness_v6"
+)
+STAGE7_CANDIDATE_RANKING_POLICY = "hard_gate_continuous_quality_v7"
 STAGE7_CANDIDATE_RANKING_FIELDS = (
+    "status",
+    "hard_gate_eligibility",
+    "technical_safety",
+    "stretch_saturated_penalty",
+    "subject_brightness_floor",
+    "continuous_quality_score",
+    "subject_brightness_goals_capped_tiebreaker",
+    "subject_brightness_utility_capped_tiebreaker",
+    "candidate_name",
+)
+STAGE7_CANDIDATE_RANKING_FIELDS_V6 = (
     "status",
     "hard_gate_eligibility",
     "technical_safety",
@@ -91,6 +105,15 @@ STAGE7_CANDIDATE_RANKING_FIELDS = (
     "background_and_colour_safety_headroom",
     "advisory_count",
     "fixed_risk_score",
+    "candidate_name",
+)
+STAGE7_REVIEW_RANKING_FIELDS = (
+    "technical_safety",
+    "measurement_availability",
+    "hard_failure_count",
+    "maximum_normalized_excess",
+    "total_normalized_excess",
+    "continuous_presentation_score",
     "candidate_name",
 )
 
@@ -1805,6 +1828,40 @@ class Stage6ServiceMixin:
         quality_gates["background"] = background_quality_gate.get(
             "quality_gates"
         )
+        luma_noise_quality = (
+            stage7_stretch_metrics.assess_frozen_background_luma_noise_growth(
+                baseline_image_data,
+                candidate_image_data,
+                frozen_background_masks,
+                self.cfg,
+            )
+            if baseline_image_data is not None
+            and candidate_image_data is not None
+            else {
+                "schema": stage7_stretch_metrics.LUMA_NOISE_GROWTH_SCHEMA,
+                "status": "unavailable",
+                "accepted": False,
+                "issues": [
+                    "background_luma_noise_growth_measurement_unavailable"
+                ],
+                "advisories": [],
+                "quality_gate": {
+                    "status": "unavailable",
+                    "hard_failed": True,
+                    "advisory": False,
+                },
+            }
+        )
+        if not bool(luma_noise_quality.get("accepted", False)):
+            quality_ok = False
+            issues = [
+                *issues,
+                *list(luma_noise_quality.get("issues") or []),
+            ]
+        advisories.extend(luma_noise_quality.get("advisories") or [])
+        quality_gates["background_luma_noise_growth"] = (
+            luma_noise_quality.get("quality_gate")
+        )
         if not bool(local_quality.get("accepted", True)):
             quality_ok = False
             issues = [*issues, *list(local_quality.get("issues") or [])]
@@ -1862,6 +1919,7 @@ class Stage6ServiceMixin:
             "target_local_quality": local_quality,
             "starless_structure_quality": starless_structure_quality,
             "background_quality_gate": background_quality_gate,
+            "luma_noise_quality": luma_noise_quality,
             "transform_loss": transform_loss,
             "transform_loss_gate": transform_loss_gate,
             "risk_score": risk_score,
@@ -1870,9 +1928,14 @@ class Stage6ServiceMixin:
         attempt["technical_safe"] = self._stage7_candidate_is_technically_safe(
             attempt
         )
+        attempt["presentation_score_v6"] = self._stage7_presentation_score_v6(
+            attempt
+        )
         attempt["presentation_score"] = self._stage7_presentation_score(
             attempt
         )
+        attempt["advisory_count"] = len(attempt.get("advisories") or [])
+        attempt["advisory_participates_in_selection"] = False
         return attempt
 
 
@@ -3203,7 +3266,7 @@ class Stage6ServiceMixin:
 
 
     @classmethod
-    def _stage7_presentation_score(
+    def _stage7_presentation_score_v6(
         cls,
         attempt: Dict[str, Any],
     ) -> Dict[str, Any]:
@@ -3406,7 +3469,7 @@ class Stage6ServiceMixin:
         )
         score = 0.70 * presentation + 0.30 * safety
         return {
-            "policy": STAGE7_CANDIDATE_RANKING_POLICY,
+            "policy": STAGE7_CANDIDATE_RANKING_POLICY_V6,
             "profile": profile,
             "selection_mode": (
                 "low_lift_structure_first"
@@ -3425,8 +3488,261 @@ class Stage6ServiceMixin:
         }
 
 
+    @staticmethod
+    def _stage7_continuous_upper_utility(
+        value: Any,
+        hard_limit: Any,
+        *,
+        ideal_value: float = 0.0,
+    ) -> float:
+        """Return continuous upper-bound headroom without reading gate status."""
+
+        try:
+            measured = float(value)
+            hard = float(hard_limit)
+            ideal = float(ideal_value)
+        except (TypeError, ValueError):
+            return 0.50
+        if not all(math.isfinite(item) for item in (measured, hard, ideal)):
+            return 0.50
+        span = hard - ideal
+        if span <= 0.0:
+            return 0.50
+        return 1.0 - _clamp_float((measured - ideal) / span, 0.0, 1.0)
+
+
+    @staticmethod
+    def _stage7_continuous_lower_utility(
+        value: Any,
+        accepted_limit: Any,
+        hard_limit: Any,
+    ) -> float:
+        """Return continuous lower-bound utility from hard floor to nominal goal."""
+
+        try:
+            measured = float(value)
+            accepted = float(accepted_limit)
+            hard = float(hard_limit)
+        except (TypeError, ValueError):
+            return 0.50
+        if not all(math.isfinite(item) for item in (measured, accepted, hard)):
+            return 0.50
+        span = accepted - hard
+        if span <= 0.0:
+            return 0.50
+        return _clamp_float((measured - hard) / span, 0.0, 1.0)
+
+
     @classmethod
-    def _stage7_candidate_selection_key(
+    def _stage7_presentation_score(
+        cls,
+        attempt: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Rank real quality continuously; advisory state is report-only."""
+
+        legacy = cls._stage7_presentation_score_v6(attempt)
+        profile = str(legacy.get("profile") or "generic")
+        presentation = float(legacy.get("presentation_utility", 0.0) or 0.0)
+        background_gate = attempt.get("background_quality_gate") or {}
+        background_metrics = background_gate.get("metrics") or {}
+        background_limits = background_gate.get("limits") or {}
+        background_quality_gates = background_gate.get("quality_gates") or {}
+
+        def upper_gate_utility(
+            gate_name: str,
+            value: Any,
+            *,
+            ideal_value: float = 0.0,
+            fallback_hard_limit: Any = None,
+        ) -> float:
+            gate = background_quality_gates.get(gate_name) or {}
+            hard_limit = gate.get("hard_limit", fallback_hard_limit)
+            return cls._stage7_continuous_upper_utility(
+                value,
+                hard_limit,
+                ideal_value=ideal_value,
+            )
+
+        safety_values: Dict[str, float] = {}
+        multiplier = 1.5
+        for gate in background_quality_gates.values():
+            try:
+                candidate_multiplier = float(
+                    (gate or {}).get("advisory_multiplier")
+                )
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(candidate_multiplier) and candidate_multiplier >= 1.0:
+                multiplier = candidate_multiplier
+                break
+
+        candidate_load = background_metrics.get("chroma_load")
+        load_growth = background_metrics.get("chroma_load_growth")
+        try:
+            nominal_growth_limit = float(
+                background_limits.get("chroma_load_growth_max")
+            )
+        except (TypeError, ValueError):
+            nominal_growth_limit = math.nan
+        fallback_growth_hard_limit = (
+            nominal_growth_limit * multiplier
+            if math.isfinite(nominal_growth_limit)
+            else None
+        )
+        if background_metrics.get("chroma_load_growth_display_reference_exempted"):
+            safety_values["background_chroma_load"] = (
+                cls._stage7_continuous_upper_utility(
+                    candidate_load,
+                    background_metrics.get(
+                        "display_reference_chroma_load_absolute_max"
+                    ),
+                )
+            )
+        elif background_metrics.get("chroma_load_growth_low_absolute_exempted"):
+            safety_values["background_chroma_load"] = (
+                cls._stage7_continuous_upper_utility(
+                    candidate_load,
+                    background_metrics.get(
+                        "chroma_load_low_absolute_effective_max",
+                        background_limits.get("chroma_load_low_absolute_max"),
+                    ),
+                )
+            )
+        elif load_growth is not None:
+            safety_values["background_chroma_load"] = upper_gate_utility(
+                "background_chroma_load_growth",
+                load_growth,
+                ideal_value=1.0,
+                fallback_hard_limit=fallback_growth_hard_limit,
+            )
+        else:
+            safety_values["background_chroma_load"] = (
+                cls._stage7_continuous_upper_utility(
+                    candidate_load,
+                    background_limits.get(
+                        "chroma_load_signal_excluded_max",
+                        background_limits.get("chroma_load_low_absolute_max"),
+                    ),
+                )
+            )
+
+        safety_values["chroma_noise"] = upper_gate_utility(
+            "background_chroma_noise_score",
+            background_metrics.get("chroma_noise_score"),
+        )
+        safety_values["mottling"] = upper_gate_utility(
+            "background_mottling_score",
+            background_metrics.get("background_mottling_score"),
+        )
+
+        luma_quality = attempt.get("luma_noise_quality") or {}
+        luma_metrics = luma_quality.get("metrics") or {}
+        luma_gate = luma_quality.get("quality_gate") or {}
+        if bool(luma_quality.get("low_absolute_exempted", False)):
+            safety_values["luma_noise_growth"] = (
+                cls._stage7_continuous_upper_utility(
+                    (luma_metrics.get("candidate") or {}).get("sigma"),
+                    luma_metrics.get("low_absolute_sigma_max", 0.00075),
+                )
+            )
+        else:
+            safety_values["luma_noise_growth"] = (
+                cls._stage7_continuous_upper_utility(
+                    luma_metrics.get("visible_noise_growth"),
+                    luma_gate.get("hard_limit"),
+                    ideal_value=1.0,
+                )
+            )
+
+        color_gate = attempt.get("color_vector_gate") or {}
+        safety_values["color_vector"] = cls._stage7_continuous_upper_utility(
+            (color_gate.get("metrics") or {}).get("chromaticity_l1_half_p95"),
+            (color_gate.get("limits") or {}).get(
+                "chromaticity_l1_half_p95_hard_max"
+            ),
+        )
+        transform_gate = attempt.get("transform_loss_gate") or {}
+        safety_values["new_hard_clip"] = cls._stage7_continuous_upper_utility(
+            (transform_gate.get("metrics") or {}).get(
+                "newly_hard_clipped_ratio"
+            ),
+            (transform_gate.get("limits") or {}).get(
+                "newly_hard_clipped_ratio_max"
+            ),
+        )
+        local_gates = (
+            (attempt.get("target_local_quality") or {}).get("quality_gates")
+            or {}
+        )
+        core_utilities = []
+        for gate_name in (
+            "local_core_clip_ratio",
+            "local_core_colored_plateau_component_ratio",
+            "local_core_parity_phase_span",
+        ):
+            gate = local_gates.get(gate_name) or {}
+            if "value" in gate and "hard_limit" in gate:
+                core_utilities.append(
+                    cls._stage7_continuous_upper_utility(
+                        gate.get("value"),
+                        gate.get("hard_limit"),
+                    )
+                )
+        safety_values["target_core_safety"] = (
+            min(core_utilities) if core_utilities else 0.50
+        )
+
+        if profile == "nebula":
+            safety_weights = {
+                "background_chroma_load": 0.20,
+                "chroma_noise": 0.10,
+                "mottling": 0.10,
+                "luma_noise_growth": 0.10,
+                "color_vector": 0.15,
+                "new_hard_clip": 0.15,
+                "target_core_safety": 0.20,
+            }
+        else:
+            safety_weights = {
+                "background_chroma_load": 0.25,
+                "chroma_noise": 0.15,
+                "mottling": 0.10,
+                "luma_noise_growth": 0.15,
+                "color_vector": 0.20,
+                "new_hard_clip": 0.15,
+            }
+        safety = sum(
+            safety_values[name] * safety_weights[name]
+            for name in safety_weights
+        )
+        advisory_count = len(
+            {
+                str(item).strip()
+                for item in (attempt.get("advisories") or [])
+                if str(item).strip()
+            }
+        )
+        result = dict(legacy)
+        result.update(
+            policy=STAGE7_CANDIDATE_RANKING_POLICY,
+            score=float(0.70 * presentation + 0.30 * safety),
+            safety_headroom=float(safety),
+            safety=safety_values,
+            continuous_safety_utilities=safety_values,
+            continuous_safety_weights=safety_weights,
+            advisory_count=advisory_count,
+            advisory_participates_in_selection=False,
+            formulas={
+                "upper_absolute": "1-clamp((value-0)/(hard_limit-0),0,1)",
+                "upper_growth": "1-clamp((value-1)/(hard_limit-1),0,1)",
+                "lower": "clamp((value-hard_limit)/(accepted_limit-hard_limit),0,1)",
+            },
+        )
+        return result
+
+
+    @classmethod
+    def _stage7_candidate_selection_key_v6(
         cls,
         attempt: Dict[str, Any],
     ) -> Tuple[Any, ...]:
@@ -3481,9 +3797,15 @@ class Stage6ServiceMixin:
             brightness_floor_penalty = 0
             brightness_goal_count = 0
             brightness_utility = 0.0
-        report = attempt.get("presentation_score") or cls._stage7_presentation_score(
-            attempt
-        )
+        report = attempt.get("presentation_score_v6")
+        if not isinstance(report, dict):
+            cached = attempt.get("presentation_score")
+            report = (
+                cached
+                if isinstance(cached, dict)
+                and cached.get("policy") != STAGE7_CANDIDATE_RANKING_POLICY
+                else cls._stage7_presentation_score_v6(attempt)
+            )
         try:
             score = float(report.get("score", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -3538,81 +3860,321 @@ class Stage6ServiceMixin:
 
 
     @classmethod
-    def _stage7_forced_candidate_selection_key(
+    def _stage7_candidate_selection_key(
         cls,
         attempt: Dict[str, Any],
     ) -> Tuple[Any, ...]:
-        """For forced output, minimise appearance-gate excess before vividness."""
+        """Rank formal candidates by quality before brightness tie-breakers."""
 
+        status_penalty = int(
+            not (
+                attempt.get("status") == "ok"
+                and bool(attempt.get("stem"))
+            )
+        )
+        final_penalty = int(
+            not bool(attempt.get("allowed_as_final", False))
+        )
+        technical_penalty = int(
+            not bool(attempt.get("technical_safe", True))
+        )
         local_quality = attempt.get("target_local_quality") or {}
         strict_target = bool(
             (local_quality.get("strict_target_evidence") or {}).get(
-                "strict", False
+                "strict",
+                False,
             )
         )
         stretch_saturated_penalty = int(
             strict_target
             and bool(
                 (attempt.get("preview_target_attainment") or {}).get(
-                    "stretch_saturated", False
+                    "stretch_saturated",
+                    False,
                 )
             )
+        )
+        subject_brightness = attempt.get("subject_brightness_selection")
+        if isinstance(subject_brightness, dict):
+            brightness_floor_penalty = int(
+                not bool(
+                    subject_brightness.get("formal_floor_passed", False)
+                )
+            )
+            ranking = subject_brightness.get("ranking") or {}
+            try:
+                brightness_goal_count = max(
+                    0,
+                    int(ranking.get("goal_count", 0) or 0),
+                )
+            except (TypeError, ValueError):
+                brightness_goal_count = 0
+            try:
+                brightness_utility = float(
+                    ranking.get("utility", 0.0) or 0.0
+                )
+            except (TypeError, ValueError):
+                brightness_utility = 0.0
+            if not math.isfinite(brightness_utility):
+                brightness_utility = 0.0
+            brightness_utility = _clamp_float(
+                brightness_utility,
+                0.0,
+                1.0,
+            )
+        else:
+            brightness_floor_penalty = 0
+            brightness_goal_count = 0
+            brightness_utility = 0.0
+        report = attempt.get("presentation_score")
+        if not isinstance(report, dict) or report.get("policy") not in {
+            STAGE7_CANDIDATE_RANKING_POLICY,
+            None,
+        }:
+            report = cls._stage7_presentation_score(attempt)
+        try:
+            score = float(report.get("score", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        if not math.isfinite(score):
+            score = 0.0
+        return (
+            status_penalty,
+            final_penalty,
+            technical_penalty,
+            stretch_saturated_penalty,
+            brightness_floor_penalty,
+            -score,
+            -brightness_goal_count,
+            -brightness_utility,
+            str(attempt.get("name") or ""),
         )
 
-        excesses: List[float] = []
-        background = attempt.get("background_quality_gate") or {}
-        metrics = background.get("metrics") or {}
-        limits = background.get("limits") or {}
-        for metric_name, limit_name in (
-            ("chroma_noise_score", "chroma_noise_score_max"),
-            ("background_mottling_score", "background_mottling_score_max"),
-        ):
-            try:
-                value = float(metrics.get(metric_name))
-                limit = float(limits.get(limit_name))
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(value) and math.isfinite(limit) and limit > 0.0:
-                excesses.append(max(0.0, value / limit - 1.0))
-        if metrics.get("chroma_load_growth_display_reference_exempted"):
-            load_value = metrics.get("display_reference_chroma_load_ratio")
-            load_limit = metrics.get("display_reference_chroma_load_ratio_max")
-        elif metrics.get("chroma_load_growth_low_absolute_exempted"):
-            load_value = metrics.get("chroma_load")
-            load_limit = metrics.get("chroma_load_low_absolute_effective_max")
-        else:
-            load_value = metrics.get("chroma_load_growth")
-            load_limit = limits.get("chroma_load_growth_max")
-        try:
-            numeric_load = float(load_value)
-            numeric_load_limit = float(load_limit)
-        except (TypeError, ValueError):
-            numeric_load = numeric_load_limit = math.nan
-        if (
-            math.isfinite(numeric_load)
-            and math.isfinite(numeric_load_limit)
-            and numeric_load_limit > 0.0
-        ):
-            excesses.append(
-                max(0.0, numeric_load / numeric_load_limit - 1.0)
-            )
-        color_gate = attempt.get("color_vector_gate") or {}
-        try:
-            color_value = float(
-                (color_gate.get("metrics") or {}).get("chromaticity_l1_half_p95")
-            )
-            color_limit = float(
-                (color_gate.get("limits") or {}).get(
-                    "chromaticity_l1_half_p95_hard_max"
-                )
-            )
-        except (TypeError, ValueError):
-            color_value = color_limit = math.nan
-        if math.isfinite(color_value) and math.isfinite(color_limit) and color_limit > 0.0:
-            excesses.append(max(0.0, color_value / color_limit - 1.0))
-        score_report = attempt.get("presentation_score") or cls._stage7_presentation_score(
-            attempt
+
+    @classmethod
+    def _stage7_forced_candidate_selection_key(
+        cls,
+        attempt: Dict[str, Any],
+    ) -> Tuple[Any, ...]:
+        """Choose the least severe measurable review-only candidate."""
+
+        technical_penalty = int(
+            not cls._stage7_candidate_is_technically_safe(attempt)
         )
+        excesses: List[float] = []
+        hard_failed_count = 0
+        measurement_unavailable = False
+        diagnostics = {
+            str(item).strip()
+            for item in (attempt.get("diagnostics") or [])
+            if str(item).strip()
+        }
+        local_quality = attempt.get("target_local_quality") or {}
+        strict_target_saturated = bool(
+            (local_quality.get("strict_target_evidence") or {}).get(
+                "strict",
+                False,
+            )
+            and (attempt.get("preview_target_attainment") or {}).get(
+                "stretch_saturated",
+                False,
+            )
+        )
+        if strict_target_saturated:
+            hard_failed_count += 1
+
+        def add_upper_gate(
+            gate: Dict[str, Any],
+            *,
+            value: Any = None,
+            hard_limit: Any = None,
+            failed: Optional[bool] = None,
+        ) -> None:
+            nonlocal hard_failed_count, measurement_unavailable
+            is_failed = bool(gate.get("hard_failed", False))
+            if failed is not None:
+                is_failed = bool(failed)
+            if not is_failed:
+                return
+            if str(gate.get("status") or "") == "unavailable":
+                measurement_unavailable = True
+            hard_failed_count += 1
+            measured_value = gate.get("value") if value is None else value
+            measured_limit = (
+                gate.get("hard_limit") if hard_limit is None else hard_limit
+            )
+            try:
+                numeric_value = float(measured_value)
+                numeric_limit = float(measured_limit)
+            except (TypeError, ValueError):
+                measurement_unavailable = True
+                return
+            if not (
+                math.isfinite(numeric_value)
+                and math.isfinite(numeric_limit)
+                and numeric_limit > 0.0
+            ):
+                measurement_unavailable = True
+                return
+            excesses.append(max(0.0, numeric_value / numeric_limit - 1.0))
+
+        def add_lower_gate(
+            gate: Dict[str, Any],
+            *,
+            value: Any = None,
+            hard_limit: Any = None,
+            failed: Optional[bool] = None,
+        ) -> None:
+            nonlocal hard_failed_count, measurement_unavailable
+            is_failed = bool(gate.get("hard_failed", False))
+            if failed is not None:
+                is_failed = bool(failed)
+            if not is_failed:
+                return
+            if str(gate.get("status") or "") == "unavailable":
+                measurement_unavailable = True
+            hard_failed_count += 1
+            measured_value = gate.get("value") if value is None else value
+            measured_limit = (
+                gate.get("hard_limit") if hard_limit is None else hard_limit
+            )
+            try:
+                numeric_value = float(measured_value)
+                numeric_limit = float(measured_limit)
+            except (TypeError, ValueError):
+                measurement_unavailable = True
+                return
+            if not (
+                math.isfinite(numeric_value)
+                and math.isfinite(numeric_limit)
+                and numeric_limit > 0.0
+            ):
+                measurement_unavailable = True
+                return
+            excesses.append(
+                max(0.0, (numeric_limit - numeric_value) / numeric_limit)
+            )
+
+        background = attempt.get("background_quality_gate") or {}
+        background_quality_gates = background.get("quality_gates") or {}
+        for gate in background_quality_gates.values():
+            if isinstance(gate, dict):
+                add_upper_gate(gate)
+        if not background_quality_gates:
+            background_metrics = background.get("metrics") or {}
+            background_limits = background.get("limits") or {}
+            for diagnostic_prefix, metric_name, limit_name in (
+                (
+                    "background_chroma_noise_score",
+                    "chroma_noise_score",
+                    "chroma_noise_score_max",
+                ),
+                (
+                    "background_mottling_score",
+                    "background_mottling_score",
+                    "background_mottling_score_max",
+                ),
+                (
+                    "background_chroma_load_growth",
+                    "chroma_load_growth",
+                    "chroma_load_growth_max",
+                ),
+            ):
+                if any(
+                    item.startswith(diagnostic_prefix)
+                    for item in diagnostics
+                ):
+                    try:
+                        nominal_limit = float(
+                            background_limits.get(limit_name)
+                        )
+                    except (TypeError, ValueError):
+                        nominal_limit = math.nan
+                    add_upper_gate(
+                        {"hard_failed": True},
+                        value=background_metrics.get(metric_name),
+                        hard_limit=(
+                            nominal_limit * 1.5
+                            if math.isfinite(nominal_limit)
+                            else None
+                        ),
+                    )
+
+        luma_quality = attempt.get("luma_noise_quality") or {}
+        luma_gate = luma_quality.get("quality_gate") or {}
+        if isinstance(luma_gate, dict):
+            add_upper_gate(luma_gate)
+
+        subject_brightness = attempt.get("subject_brightness_selection") or {}
+        if not bool(subject_brightness.get("formal_floor_passed", True)):
+            retention = subject_brightness.get("retention") or {}
+            floors = subject_brightness.get("floors") or {}
+            for metric_name, retention_name in (
+                ("subject_p50_retention", "subject_p50"),
+                ("subject_lift_retention", "subject_lift"),
+            ):
+                floor = floors.get(metric_name)
+                if floor is None:
+                    continue
+                measured = retention.get(retention_name)
+                try:
+                    floor_failed = float(measured) < float(floor)
+                except (TypeError, ValueError):
+                    floor_failed = True
+                add_lower_gate(
+                    {"hard_failed": floor_failed},
+                    value=measured,
+                    hard_limit=floor,
+                )
+
+        visibility = attempt.get("visibility_gate") or {}
+        for gate in (visibility.get("quality_gate") or {}).values():
+            if isinstance(gate, dict):
+                add_lower_gate(gate)
+
+        color_gate = attempt.get("color_vector_gate") or {}
+        add_upper_gate(
+            color_gate,
+            value=(color_gate.get("metrics") or {}).get(
+                "chromaticity_l1_half_p95"
+            ),
+            hard_limit=(color_gate.get("limits") or {}).get(
+                "chromaticity_l1_half_p95_hard_max"
+            ),
+            failed=not bool(color_gate.get("accepted", True)),
+        )
+
+        target_attainment = attempt.get("preview_target_attainment") or {}
+        if not bool(target_attainment.get("accepted", True)):
+            attainment_ratio = target_attainment.get("attainment_ratio")
+            hard_minimum = target_attainment.get("hard_minimum_ratio")
+            hard_maximum = target_attainment.get("hard_maximum_ratio")
+            try:
+                below_minimum = float(attainment_ratio) < float(hard_minimum)
+            except (TypeError, ValueError):
+                below_minimum = False
+            if below_minimum:
+                add_lower_gate(
+                    {"hard_failed": True},
+                    value=attainment_ratio,
+                    hard_limit=hard_minimum,
+                )
+            else:
+                add_upper_gate(
+                    {"hard_failed": True},
+                    value=attainment_ratio,
+                    hard_limit=hard_maximum,
+                )
+        diagnostic_codes = {
+            item.split(" ", 1)[0] for item in diagnostics
+        }
+        hard_failed_count = max(hard_failed_count, len(diagnostic_codes))
+        if any("unavailable" in item for item in diagnostics):
+            measurement_unavailable = True
+
+        score_report = attempt.get("presentation_score")
+        if not isinstance(score_report, dict):
+            score_report = cls._stage7_presentation_score(attempt)
         try:
             score = float(score_report.get("score", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -3620,11 +4182,12 @@ class Stage6ServiceMixin:
         if not math.isfinite(score):
             score = 0.0
         return (
-            stretch_saturated_penalty,
+            technical_penalty,
+            int(measurement_unavailable),
+            hard_failed_count,
             max(excesses, default=0.0),
             sum(excesses),
             -score,
-            len(attempt.get("diagnostics") or []),
             str(attempt.get("name") or ""),
         )
 
@@ -3774,6 +4337,7 @@ class Stage6ServiceMixin:
             "preview_target_p50_ratio_above_max",
             "background_chroma_noise_score",
             "background_chroma_load_growth",
+            "background_luma_noise_growth",
         )
         return bool(diagnostics) and all(
             item.startswith(reviewable_prefixes) for item in diagnostics
@@ -3785,8 +4349,8 @@ class Stage6ServiceMixin:
         cls,
         attempt: Dict[str, Any],
     ) -> Tuple[Any, ...]:
-        """Rank safe review rejects by gate severity before brightness proximity."""
-        return cls._stage7_candidate_selection_key(attempt)
+        """Rank safe review rejects with the review-only severity contract."""
+        return cls._stage7_forced_candidate_selection_key(attempt)
 
 
     def _stage7_attempt_allows_chroma_rescue(self, attempt: Dict[str, Any]) -> bool:
@@ -5720,6 +6284,37 @@ class Stage6ServiceMixin:
                     f"{self._short_text(error, 160)}"
                 )
                 return False, False, messages, ""
+        if (
+            baseline_image_data is not None
+            and not (
+                isinstance(frozen_background_masks, dict)
+                and frozen_background_masks.get("background_mask") is not None
+            )
+        ):
+            baseline_rgb = _to_rgb_float_fullres(baseline_image_data)
+            baseline_luma = (
+                0.2126 * baseline_rgb[0]
+                + 0.7152 * baseline_rgb[1]
+                + 0.0722 * baseline_rgb[2]
+            ).astype(np.float32)
+            luma_threshold = float(np.quantile(baseline_luma, 0.35))
+            if frozen_background_masks is None:
+                frozen_background_masks = {}
+            frozen_background_masks["luma_noise_background_mask"] = (
+                baseline_luma <= luma_threshold
+            ).astype(np.float32)
+            frozen_background_sampling["luma_noise_support"] = {
+                "method": "stage6_source_luma_p35",
+                "threshold": luma_threshold,
+                "support_count": int(
+                    np.count_nonzero(
+                        frozen_background_masks[
+                            "luma_noise_background_mask"
+                        ]
+                    )
+                ),
+                "frozen_once": True,
+            }
         active_target_type = str(
             self._active_target_type() or "generic_low_snr_safe"
             if hasattr(self, "_active_target_type")
@@ -5980,6 +6575,11 @@ class Stage6ServiceMixin:
             "policy": STAGE7_CANDIDATE_RANKING_POLICY,
             "configurable_weights": False,
             "key_order": list(STAGE7_CANDIDATE_RANKING_FIELDS),
+            "advisory_participates_in_selection": False,
+            "review_key_order": list(STAGE7_REVIEW_RANKING_FIELDS),
+            "shadow_policy": STAGE7_CANDIDATE_RANKING_POLICY_V6,
+            "shadow_key_order": list(STAGE7_CANDIDATE_RANKING_FIELDS_V6),
+            "shadow_participates_in_selection": False,
         }
         target_stretch = stretch_adaptation.get("target_aware") or {}
         candidate_a_replacement = (
@@ -6644,6 +7244,47 @@ class Stage6ServiceMixin:
                             quality_gates["background"] = (
                                 background_quality_gate.get("quality_gates")
                             )
+                            luma_noise_quality = (
+                                stage7_stretch_metrics.assess_frozen_background_luma_noise_growth(
+                                    baseline_image_data,
+                                    rescued_image_data,
+                                    frozen_background_masks,
+                                    self.cfg,
+                                )
+                                if baseline_image_data is not None
+                                else {
+                                    "schema": (
+                                        stage7_stretch_metrics.LUMA_NOISE_GROWTH_SCHEMA
+                                    ),
+                                    "status": "unavailable",
+                                    "accepted": False,
+                                    "issues": [
+                                        "background_luma_noise_growth_measurement_unavailable"
+                                    ],
+                                    "advisories": [],
+                                    "quality_gate": {
+                                        "status": "unavailable",
+                                        "hard_failed": True,
+                                        "advisory": False,
+                                    },
+                                }
+                            )
+                            if not bool(
+                                luma_noise_quality.get("accepted", False)
+                            ):
+                                quality_ok = False
+                                issues = [
+                                    *issues,
+                                    *list(
+                                        luma_noise_quality.get("issues") or []
+                                    ),
+                                ]
+                            advisories.extend(
+                                luma_noise_quality.get("advisories") or []
+                            )
+                            quality_gates[
+                                "background_luma_noise_growth"
+                            ] = luma_noise_quality.get("quality_gate")
                             if not bool(local_quality.get("accepted", True)):
                                 quality_ok = False
                                 issues = [
@@ -6902,6 +7543,7 @@ class Stage6ServiceMixin:
                                 "target_local_quality": local_quality,
                                 "starless_structure_quality": starless_structure_quality,
                                 "background_quality_gate": background_quality_gate,
+                                "luma_noise_quality": luma_noise_quality,
                                 "transform_semantics": rescue_semantics,
                                 "transform_loss": rescue_transform_loss,
                                 "transform_loss_gate": (
@@ -6925,9 +7567,20 @@ class Stage6ServiceMixin:
                                     rescue_attempt
                                 )
                             )
+                            rescue_attempt["presentation_score_v6"] = (
+                                self._stage7_presentation_score_v6(
+                                    rescue_attempt
+                                )
+                            )
                             rescue_attempt["presentation_score"] = (
                                 self._stage7_presentation_score(rescue_attempt)
                             )
+                            rescue_attempt["advisory_count"] = len(
+                                rescue_attempt.get("advisories") or []
+                            )
+                            rescue_attempt[
+                                "advisory_participates_in_selection"
+                            ] = False
                             attempts.append(rescue_attempt)
                             if rescue_saved and quality_ok:
                                 messages.append(
@@ -6995,6 +7648,14 @@ class Stage6ServiceMixin:
             for attempt in saved_attempts
             if not bool(attempt.get("allowed_as_final", False))
         ]
+        v6_shadow_best_attempt = (
+            min(
+                accepted_attempts,
+                key=self._stage7_candidate_selection_key_v6,
+            )
+            if accepted_attempts
+            else None
+        )
         deterministic_best_attempt = (
             min(accepted_attempts, key=self._stage7_candidate_selection_key)
             if accepted_attempts
@@ -7039,7 +7700,10 @@ class Stage6ServiceMixin:
                     forced_attempt["forced_delivery_reason_codes"]
                 )
         best_rejected_attempt = (
-            min(rejected_attempts, key=self._stage7_candidate_selection_key)
+            min(
+                rejected_attempts,
+                key=self._stage7_review_candidate_selection_key,
+            )
             if rejected_attempts
             else None
         )
@@ -7065,8 +7729,47 @@ class Stage6ServiceMixin:
                 start=1,
             )
         }
+        formal_selection_ranks = {
+            id(attempt): rank
+            for rank, attempt in enumerate(
+                sorted(
+                    accepted_attempts,
+                    key=self._stage7_candidate_selection_key,
+                ),
+                start=1,
+            )
+        }
+        review_selection_ranks = {
+            id(attempt): rank
+            for rank, attempt in enumerate(
+                sorted(
+                    rejected_attempts,
+                    key=self._stage7_review_candidate_selection_key,
+                ),
+                start=1,
+            )
+        }
+        v6_shadow_selection_ranks = {
+            id(attempt): rank
+            for rank, attempt in enumerate(
+                sorted(
+                    saved_attempts,
+                    key=self._stage7_candidate_selection_key_v6,
+                ),
+                start=1,
+            )
+        }
         for attempt in attempts:
             attempt["selection_rank"] = selection_ranks.get(id(attempt))
+            attempt["formal_selection_rank"] = formal_selection_ranks.get(
+                id(attempt)
+            )
+            attempt["review_selection_rank"] = review_selection_ranks.get(
+                id(attempt)
+            )
+            attempt["v6_shadow_selection_rank"] = (
+                v6_shadow_selection_ranks.get(id(attempt))
+            )
             if attempt is best_attempt:
                 attempt["selection_role"] = "selected_final"
             elif attempt is review_attempt:
@@ -7077,6 +7780,38 @@ class Stage6ServiceMixin:
                 )
             else:
                 attempt["selection_role"] = "not_selected"
+
+        ranking_comparison = {
+            "active_policy": STAGE7_CANDIDATE_RANKING_POLICY,
+            "shadow_policy": STAGE7_CANDIDATE_RANKING_POLICY_V6,
+            "shadow_participates_in_selection": False,
+            "v7_selected": (
+                str(best_attempt.get("name")) if best_attempt else None
+            ),
+            "v6_shadow_selected": (
+                str(v6_shadow_best_attempt.get("name"))
+                if v6_shadow_best_attempt
+                else None
+            ),
+            "diverged": bool(
+                (best_attempt or {}).get("name")
+                != (v6_shadow_best_attempt or {}).get("name")
+            ),
+            "v7_selection_key": (
+                list(self._stage7_candidate_selection_key(best_attempt))
+                if best_attempt
+                else None
+            ),
+            "v6_shadow_selection_key": (
+                list(
+                    self._stage7_candidate_selection_key_v6(
+                        v6_shadow_best_attempt
+                    )
+                )
+                if v6_shadow_best_attempt
+                else None
+            ),
+        }
 
         if forced_attempt is not None:
             messages.append(
@@ -7175,6 +7910,9 @@ class Stage6ServiceMixin:
         )
         selection_summary = {
             "strategy": "hard_gate_then_quality_rank_with_safe_review",
+            "ranking_policy": STAGE7_CANDIDATE_RANKING_POLICY,
+            "advisory_participates_in_selection": False,
+            "ranking_comparison": ranking_comparison,
             "candidate_policy": candidate_policy,
             "failure_action": failure_action,
             "selector": "deterministic_quality_rank",
@@ -7237,6 +7975,8 @@ class Stage6ServiceMixin:
             "stage7_stretch_quality.json",
             {
                 "stage": "stage7_stretch",
+                "ranking_policy": STAGE7_CANDIDATE_RANKING_POLICY,
+                "ranking_comparison": ranking_comparison,
                 "candidate_policy": candidate_policy,
                 "rendition_intent": rendition_intent,
                 "failure_action": failure_action,
@@ -7296,6 +8036,8 @@ class Stage6ServiceMixin:
                 "stretch_adaptation": stretch_adaptation,
                 "closed_form_mtf_reference": closed_form_mtf_reference,
                 "matched_domain_transfer": matched_domain_transfer,
+                "ranking_policy": STAGE7_CANDIDATE_RANKING_POLICY,
+                "ranking_comparison": ranking_comparison,
                 "baseline_background_quality": baseline_background_quality,
                 "background_sampling": frozen_background_sampling,
                 "shared_scene_support": shared_scene_support_summary,
@@ -7315,6 +8057,18 @@ class Stage6ServiceMixin:
                         "preview_target_attainment": item.get("preview_target_attainment"),
                         "rendition_metrics": item.get("rendition_metrics"),
                         "presentation_score": item.get("presentation_score"),
+                        "presentation_score_v6": item.get(
+                            "presentation_score_v6"
+                        ),
+                        "continuous_safety_utilities": (
+                            (item.get("presentation_score") or {}).get(
+                                "continuous_safety_utilities"
+                            )
+                        ),
+                        "advisory_count": item.get("advisory_count"),
+                        "advisory_participates_in_selection": item.get(
+                            "advisory_participates_in_selection"
+                        ),
                         "mtf_reference_quality": item.get("mtf_reference_quality"),
                         "display90_curve_quality": item.get(
                             "display90_curve_quality"
@@ -7326,6 +8080,7 @@ class Stage6ServiceMixin:
                         ),
                         "target_local_quality": item.get("target_local_quality"),
                         "background_quality_gate": item.get("background_quality_gate"),
+                        "luma_noise_quality": item.get("luma_noise_quality"),
                         "transform_semantics": item.get("transform_semantics"),
                         "transform_loss": item.get("transform_loss"),
                         "transform_loss_gate": item.get("transform_loss_gate"),
@@ -7341,6 +8096,15 @@ class Stage6ServiceMixin:
                         "feedback": item.get("feedback"),
                         "explicit_fallback": bool(item.get("explicit_fallback")),
                         "selection_rank": item.get("selection_rank"),
+                        "formal_selection_rank": item.get(
+                            "formal_selection_rank"
+                        ),
+                        "review_selection_rank": item.get(
+                            "review_selection_rank"
+                        ),
+                        "v6_shadow_selection_rank": item.get(
+                            "v6_shadow_selection_rank"
+                        ),
                         "selection_role": item.get("selection_role"),
                     }
                     for item in attempts

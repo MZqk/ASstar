@@ -71,6 +71,30 @@ def _star_visibility_fixture(
 
 
 class ManagedOutputTests(unittest.TestCase):
+    def test_visibility_audit_normalizes_integer_pixel_buffers(self) -> None:
+        image = np.full((3, 96, 128), 0.04, dtype=np.float32)
+        image[:, 24:72, 32:96] = 0.16
+        encoded = np.rint(image * 65535.0).astype(np.uint16)
+
+        float_audit = audit_display_visibility(
+            image,
+            target_type="emission_nebula_widefield",
+        )
+        integer_audit = audit_display_visibility(
+            encoded,
+            target_type="emission_nebula_widefield",
+        )
+
+        self.assertEqual(
+            integer_audit["exposure_state"],
+            float_audit["exposure_state"],
+        )
+        self.assertAlmostEqual(
+            integer_audit["metrics"]["luminance_median"],
+            float_audit["metrics"]["luminance_median"],
+            places=4,
+        )
+
     def test_generic_compact_peaks_cannot_satisfy_required_stars(self) -> None:
         image = np.full((3, 96, 128), 0.14, dtype=np.float32)
         for y, x in (
