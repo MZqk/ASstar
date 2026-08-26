@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -195,6 +196,12 @@ def measure_frozen_rendition_metrics(
             if background_weight is not None
             else ~subject
         )
+        non_background_signal = (
+            background_weight <= 0.50
+            if background_weight is not None
+            else subject
+        )
+        non_background_signal |= subject
         background &= ~subject
         if int(np.count_nonzero(background)) < 64:
             raise ValueError("frozen background ROI contains too few pixels")
@@ -223,6 +230,10 @@ def measure_frozen_rendition_metrics(
 
         subject_luma = sampled(luminance, subject)
         subject_saturation = sampled(saturation, subject)
+        non_background_saturation = sampled(
+            saturation,
+            non_background_signal,
+        )
         subject_detail = sampled(local_detail, subject)
         background_luma = sampled(luminance, background)
         bg_median = float(np.median(background_luma))
@@ -246,12 +257,21 @@ def measure_frozen_rendition_metrics(
             "status": "available",
             "mask_source": "stage6_frozen_roi",
             "subject_coverage": float(np.mean(subject)),
+            "non_background_signal_coverage": float(
+                np.mean(non_background_signal)
+            ),
             "background_coverage": float(np.mean(background)),
             "metrics": {
                 "visibility": float(max(0.0, subject_p75 - bg_median) / noise_sigma),
                 "subject_span": float(max(0.0, subject_p99 - subject_p50)),
                 "saturation_median": float(np.median(subject_saturation)),
                 "saturation_p95": float(np.percentile(subject_saturation, 95.0)),
+                "non_background_saturation_median": float(
+                    np.median(non_background_saturation)
+                ),
+                "non_background_saturation_p95": float(
+                    np.percentile(non_background_saturation, 95.0)
+                ),
                 "microcontrast": float(np.percentile(subject_detail, 75.0)),
                 "subject_p50": float(subject_p50),
                 "subject_p99": float(subject_p99),
@@ -329,12 +349,20 @@ def subject_brightness_selection(
     normalized_profile = str(profile_name or "generic_balanced").strip().lower()
     star_subject_contract = normalized_profile == "star_colour_preserve"
     galaxy_subject_contract = normalized_profile == "galaxy_core_halo_balance"
+    composite_subject_contract = (
+        normalized_profile == "bright_core_composite_reveal"
+    )
     goals = (
         {
             "subject_lift_retention": None,
             "subject_p50_retention": 0.30,
         }
         if star_subject_contract
+        else {
+            "subject_lift_retention": 0.55,
+            "subject_p50_retention": 0.60,
+        }
+        if composite_subject_contract
         else {
             "subject_lift_retention": 0.75,
             "subject_p50_retention": 0.80,
@@ -349,6 +377,11 @@ def subject_brightness_selection(
         floors = {
             "subject_lift_retention": 0.50,
             "subject_p50_retention": 0.58,
+        }
+    elif composite_subject_contract:
+        floors = {
+            "subject_lift_retention": 0.40,
+            "subject_p50_retention": 0.45,
         }
     else:
         floors = {
@@ -509,12 +542,53 @@ def subject_brightness_selection(
     }
 
 
+def apply_composite_preserving_tone(
+    image: np.ndarray,
+    *,
+    source_background: float,
+    target_background: float = 0.11,
+) -> tuple[np.ndarray, Dict[str, Any]]:
+    """Darken a washed composite with one linked luminance curve."""
+
+    rgb = _stage7_rgb_float_fullres(np.asarray(image))
+    source = float(np.clip(float(source_background), 0.02, 0.80))
+    target = float(np.clip(float(target_background), 0.04, source))
+    gamma = float(np.clip(math.log(target) / math.log(source), 1.0, 1.65))
+    luminance = (
+        0.2126 * rgb[0]
+        + 0.7152 * rgb[1]
+        + 0.0722 * rgb[2]
+    ).astype(np.float32)
+    mapped_luminance = np.power(
+        np.clip(luminance, 0.0, 1.0),
+        gamma,
+    ).astype(np.float32)
+    gain = mapped_luminance / np.maximum(luminance, 1e-6)
+    rendered = np.clip(rgb * gain[None, :, :], 0.0, 1.0).astype(np.float32)
+    return rendered, {
+        "schema": "starun.stage7-composite-preserving-tone.v1",
+        "mode": "linked_rec709_luminance_power",
+        "source_background": source,
+        "target_background": target,
+        "gamma": gamma,
+        "linked_rgb_gain": True,
+        "channel_order_preserved": True,
+        "newly_clipped_ratio": float(
+            np.mean(
+                (np.max(rendered, axis=0) >= 1.0 - TRANSFORM_ZERO_EPSILON)
+                & (np.max(rgb, axis=0) < 1.0 - TRANSFORM_ZERO_EPSILON)
+            )
+        ),
+    }
+
+
 def apply_subject_chroma_rendition(
     image: np.ndarray,
     masks: Optional[Dict[str, Any]],
     *,
     factor: float,
     output_headroom: float = 0.995,
+    expand_faint_signal: bool = False,
 ) -> tuple[np.ndarray, Dict[str, Any]]:
     """Boost only broad subject chroma while preserving luminance and headroom."""
 
@@ -543,11 +617,89 @@ def apply_subject_chroma_rendition(
     if not has_frozen_roi:
         raise ValueError("vivid-safe chroma requires a valid frozen Stage 6 ROI")
     subject_weight = _stage7_subject_weight(masks, shape)
+    non_background_smoothing_passes = 0
+    non_background_opening_passes = 0
+    non_background_star_exclusion_applied = False
+    star_weight = _stage7_mask(masks, "star_mask", shape)
+    if expand_faint_signal:
+        # Rebuild the wide subject support from semantic subject masks.  The
+        # precomputed aggregate subject_mask also includes the Stage 6 star
+        # layer for ordinary quality measurements; reusing that aggregate on
+        # a starless source would turn every removed star aperture into an
+        # isolated chroma-boost island.
+        broad_layers = []
+        for name in (
+            "core_mask",
+            "nebula_mask",
+            "faint_nebula_mask",
+            "galaxy_signal_mask",
+        ):
+            broad = _stage7_mask(masks, name, shape)
+            if broad is not None:
+                broad_layers.append(broad)
+        # Bright emission/reflection fields can have valid diffuse signal well
+        # outside the thresholded nebula masks.  The frozen Stage 6 background
+        # mask is the safer boundary for that signal: its complement broadens
+        # chroma recovery without touching pixels classified as sky background.
+        background = _stage7_mask(masks, "background_mask", shape)
+        if background is not None:
+            broad_signal = (1.0 - background).astype(
+                np.float32,
+                copy=False,
+            )
+            # Stage 7 deliberately removes catalog/star/saturation apertures
+            # from the frozen background sample.  Their complement therefore
+            # contains circular islands which are not diffuse subject signal.
+            # Exclude the independently frozen Stage 6 star layer before any
+            # smoothing so those apertures cannot be printed into chroma.
+            if star_weight is not None:
+                star_exclusion = (star_weight > 0.01).astype(np.float32)
+                for _ in range(2):
+                    star_exclusion = (
+                        _box_blur_gray(star_exclusion) > 1e-6
+                    ).astype(np.float32)
+                broad_signal *= 1.0 - star_exclusion
+                non_background_star_exclusion_applied = True
+
+            # Remove remaining compact catalog/saturation islands with a
+            # bounded binary opening.  Coherent nebula fields survive this;
+            # isolated circular apertures do not.  A final soft edge prevents
+            # the cleaned boundary itself from becoming visible.
+            non_background_opening_passes = 8
+            for _ in range(non_background_opening_passes):
+                broad_signal = (
+                    _box_blur_gray(broad_signal) >= 1.0 - 1e-6
+                ).astype(np.float32)
+            for _ in range(non_background_opening_passes):
+                broad_signal = (
+                    _box_blur_gray(broad_signal) > 1e-6
+                ).astype(np.float32)
+            non_background_smoothing_passes = 8
+            for _ in range(non_background_smoothing_passes):
+                broad_signal = _box_blur_gray(broad_signal)
+            broad_layers.append(broad_signal)
+        subject_weight = (
+            np.maximum.reduce(broad_layers).astype(
+                np.float32,
+                copy=False,
+            )
+            if broad_layers
+            else np.zeros(shape, dtype=np.float32)
+        )
     core_weight = _stage7_mask(masks, "core_mask", shape)
     if core_weight is not None:
         subject_weight *= 1.0 - 0.90 * core_weight
-    star_weight = _stage7_mask(masks, "star_mask", shape)
-    if star_weight is not None:
+    # The wide-field vivid candidate is replayed on the immutable Stage 6
+    # starless image.  Applying the pre-removal star mask there does not
+    # protect any stars; it punches thousands of circular holes into the
+    # chroma field and prints blue/red rings into diffuse nebulae.  Keep the
+    # protection for the ordinary path, where the caller may still provide a
+    # star-bearing source, but deliberately omit it for the starless
+    # faint-signal expansion path.
+    star_protection_applied = bool(
+        star_weight is not None and not expand_faint_signal
+    )
+    if star_protection_applied:
         subject_weight *= 1.0 - 0.90 * star_weight
     source_peak = np.max(rgb, axis=0)
     source_floor = np.min(rgb, axis=0)
@@ -562,10 +714,19 @@ def apply_subject_chroma_rendition(
         + 0.0722 * rgb[2]
     ).astype(np.float32)
     chroma = rgb - luminance[None, :, :]
-    broad_chroma = np.stack(
-        [_box_blur_gray(_box_blur_gray(channel)) for channel in chroma],
-        axis=0,
-    ).astype(np.float32)
+    # The starless source can retain tiny colour residuals even when its luma
+    # structure is clean.  A stronger M8 recovery must act on coherent nebula
+    # colour, not those compact residuals.  Smooth chroma only (never luma) on
+    # the wide faint-signal route; the ordinary subject-only route keeps the
+    # smaller historical kernel.
+    chroma_smoothing_passes = 6 if expand_faint_signal else 2
+    broad_channels = []
+    for channel in chroma:
+        broad_channel = channel
+        for _ in range(chroma_smoothing_passes):
+            broad_channel = _box_blur_gray(broad_channel)
+        broad_channels.append(broad_channel)
+    broad_chroma = np.stack(broad_channels, axis=0).astype(np.float32)
     delta = (factor - 1.0) * boost_weight[None, :, :] * broad_chroma
     delta_luma = (
         0.2126 * delta[0]
@@ -612,9 +773,26 @@ def apply_subject_chroma_rendition(
         "factor": factor,
         "output_headroom": headroom,
         "subject_coverage": float(np.mean(subject_weight > 0.25)),
+        "faint_signal_expansion_applied": bool(expand_faint_signal),
+        "non_background_signal_expansion_applied": bool(
+            expand_faint_signal and background is not None
+        ),
+        "non_background_signal_smoothing_passes": int(
+            non_background_smoothing_passes
+        ),
+        "non_background_signal_opening_passes": int(
+            non_background_opening_passes
+        ),
+        "non_background_star_exclusion_applied": bool(
+            non_background_star_exclusion_applied
+        ),
+        "chroma_smoothing_passes": int(chroma_smoothing_passes),
         "boosted_coverage": float(np.mean(boost_weight > 0.05)),
         "core_protection_applied": core_weight is not None,
-        "star_protection_applied": star_weight is not None,
+        "star_protection_applied": star_protection_applied,
+        "star_protection_skipped_for_starless_expansion": bool(
+            star_weight is not None and expand_faint_signal
+        ),
         "mean_effective_scale": float(np.mean(safe_scale[boost_weight > 0.05]))
         if np.any(boost_weight > 0.05)
         else 0.0,

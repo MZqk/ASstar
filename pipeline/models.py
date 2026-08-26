@@ -398,8 +398,11 @@ class PipelineConfig:
     stage9_sep_match_radius_max_px: float = 4.0  # 独立 SEP 匹配半径上限
     stage9_sep_source_match_ratio_min: float = 0.75  # C 高置信源被 O 佐证的最低比例
     stage9_sep_unmatched_ratio_max: float = 0.25  # C 高置信源未被 O 佐证的最高比例
+    stage9_sep_source_recovery_ratio_min: float = 0.30  # O 独立同源星点在 C 中被反向恢复的最低比例
     stage9_sep_separation_p50_max_px: float = 0.75  # C→O 匹配距离 P50 上限
     stage9_sep_separation_p95_max_px: float = 1.50  # C→O 匹配距离 P95 上限
+    stage9_independent_source_presence_enabled: bool = True  # 用 O 的独立 SEP 星表补回冻结星表漏掉的同源弱星
+    stage9_independent_source_residual_min: float = 0.0015  # 独立弱星回填所需的 O-B 最小正残差
     stage9_weak_star_screen_intensity_min: float = 0.55  # 弱星 Screen 强度下限；亮星仍可按 fallback 梯级降至 0.40
     stage9_star_support_ratio_max: float = 0.12  # 独立星表生成的实际回混支持层最大覆盖
     stage9_unmatched_changed_ratio_max: float = 0.01  # 星点支持层之外允许发生显著变化的最大比例

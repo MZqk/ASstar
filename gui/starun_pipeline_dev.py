@@ -97,6 +97,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="可选 runner 离线资源包根目录；必须包含 siril_plugins/",
     )
     parser.add_argument(
+        "--task-run-manifest",
+        type=_absolute_path,
+        default=None,
+        help="可选验签 task-run manifest；用于从只读 FITS/XISF 来源启动",
+    )
+    parser.add_argument(
         "--offline",
         dest="network",
         action="store_false",
@@ -123,6 +129,14 @@ def resolve_siril_plugin_dir(offline_resource_root: Path | None) -> Path:
 def run_pipeline(args: argparse.Namespace) -> int:
     validate_work_dir(args.work_dir, args.input_mode)
     siril_plugin_dir = resolve_siril_plugin_dir(args.offline_resource_root)
+    runtime_overrides: dict[str, str] = {}
+    if args.task_run_manifest is not None:
+        manifest_path = args.task_run_manifest.resolve()
+        if not manifest_path.is_file():
+            raise ValueError(f"任务运行清单不存在：{manifest_path}")
+        if manifest_path.parent != args.work_dir.resolve():
+            raise ValueError("任务运行清单必须位于当前工作目录")
+        runtime_overrides["STARUN_TASK_RUN_MANIFEST"] = str(manifest_path)
     runtime_venv = (
         args.runtime_home
         / "Library/Application Support/org.siril.Siril/siril/venv"
@@ -166,6 +180,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             input_mode=args.input_mode,
             debug_mode=args.debug,
             network_mode=args.network,
+            runtime_overrides=runtime_overrides,
         )
         worker.log.connect(lambda text: sys.stdout.write(text))
         worker.state.connect(

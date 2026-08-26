@@ -22,6 +22,7 @@ class PipelineDevLauncherTests(unittest.TestCase):
         self.assertFalse(args.debug)
         self.assertEqual(args.input_mode, launcher.INPUT_MODE_AUTO)
         self.assertIsNone(args.offline_resource_root)
+        self.assertIsNone(args.task_run_manifest)
 
     def test_parser_accepts_explicit_offline_mode(self):
         with tempfile.TemporaryDirectory() as td:
@@ -100,6 +101,50 @@ class PipelineDevLauncherTests(unittest.TestCase):
         self.assertEqual(
             worker_class.call_args.kwargs["siril_plugin_dir"],
             plugin_dir.resolve(),
+        )
+
+    def test_pipeline_worker_receives_task_run_manifest_override(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = root / "run-manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            args = launcher.build_parser().parse_args(
+                [
+                    "--work-dir",
+                    td,
+                    "--runtime-home",
+                    str(root / "runtime-home"),
+                    "--task-run-manifest",
+                    str(manifest),
+                ]
+            )
+            with (
+                mock.patch.object(
+                    launcher,
+                    "verify_siril_offline_seed_venv",
+                    return_value=(True, "ready"),
+                ),
+                mock.patch.object(
+                    launcher,
+                    "prepare_resource_overlay",
+                    return_value=root / "overlay",
+                ),
+                mock.patch.object(launcher, "PipelineWorker") as worker_class,
+            ):
+                worker = worker_class.return_value
+
+                def finish_run() -> None:
+                    callback = worker.done.connect.call_args.args[0]
+                    callback("Completed", 0, False, "siril-cli")
+
+                worker.run.side_effect = finish_run
+
+                exit_code = launcher.run_pipeline(args)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            worker_class.call_args.kwargs["runtime_overrides"],
+            {"STARUN_TASK_RUN_MANIFEST": str(manifest.resolve())},
         )
 
     def test_root_checkpoint_resume_is_rejected(self):

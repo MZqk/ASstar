@@ -3999,6 +3999,79 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
             1.0,
         )
 
+    def test_m8_composite_profile_uses_nebula_chroma_goal(self):
+        processor = pipeline_module.StarunPostProcessor()
+        attempt = {
+            "adaptation": {
+                "target_aware": {"name": "bright_core_composite_reveal"}
+            },
+            "rendition_metrics": {
+                "candidate": {
+                    "status": "available",
+                    "metrics": {"saturation_median": 0.11},
+                },
+                "retention": {
+                    "metrics": {
+                        name: {
+                            "available": True,
+                            "ratio": 0.87 if name == "saturation_median" else 0.90,
+                        }
+                        for name in (
+                            "visibility",
+                            "subject_span",
+                            "saturation_median",
+                            "microcontrast",
+                        )
+                    }
+                }
+            },
+        }
+
+        report = processor._stage7_presentation_score_v6(attempt)
+
+        self.assertEqual(report["profile"], "nebula")
+        self.assertEqual(report["goals"]["saturation_median"], 0.90)
+        self.assertLess(report["utilities"]["saturation_median"], 1.0)
+        self.assertEqual(report["absolute_subject_saturation_goal"], 0.30)
+        self.assertAlmostEqual(
+            report["absolute_subject_saturation_utility"],
+            0.11 / 0.30,
+        )
+        self.assertEqual(
+            processor._stage7_vivid_chroma_factor(
+                attempt["adaptation"]["target_aware"],
+                absolute_subject_saturation=0.11,
+                absolute_subject_goal=0.30,
+            ),
+            4.0,
+        )
+
+    def test_m8_ranking_prefers_absolute_broad_signal_color_after_hard_gates(self):
+        processor = pipeline_module.StarunPostProcessor()
+
+        def attempt(name, absolute_utility, score):
+            return {
+                "name": name,
+                "stem": f"stage7_{name}",
+                "status": "ok",
+                "allowed_as_final": True,
+                "technical_safe": True,
+                "presentation_score": {
+                    "policy": "hard_gate_continuous_quality_v7",
+                    "score": score,
+                    "absolute_subject_saturation_utility": absolute_utility,
+                },
+            }
+
+        pale = attempt("cand_b", 0.36, 0.95)
+        vivid = attempt("cand_vivid_safe", 0.74, 0.88)
+        selected = min(
+            [pale, vivid],
+            key=processor._stage7_candidate_selection_key,
+        )
+
+        self.assertEqual(selected["name"], "cand_vivid_safe")
+
     def test_stage7_forced_delivery_rejects_any_technical_damage(self):
         processor = pipeline_module.StarunPostProcessor()
         appearance_only = {

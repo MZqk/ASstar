@@ -5047,6 +5047,12 @@ def _prepare_stage9_source_presence_candidate(
             "status": "not_run",
             "reason": "ordinary source support not available",
         },
+        "independent_source_presence": {
+            "status": "not_run",
+            "available": False,
+            "changed": False,
+            "reason": "independent same-source recovery is disabled",
+        },
         "stage5_bright_star_completion": {
             "schema": "starun.stage9-stage5-bright-star-completion.v2",
             "status": "not_run",
@@ -5096,6 +5102,31 @@ def _prepare_stage9_source_presence_candidate(
             "available": False,
             "reason": str(error),
         }
+
+    if bool(
+        getattr(
+            pipeline.cfg,
+            "stage9_independent_source_presence_enabled",
+            True,
+        )
+    ):
+        independent, independent_support, independent_report = (
+            stage9_quality.build_independent_source_presence_candidate(
+                context["original_display"],
+                context["starless_display"],
+                candidate,
+                support,
+                pipeline.cfg,
+                spatial_scale=getattr(pipeline, "_stage9_spatial_scale", None),
+                strength=feather_strength,
+            )
+        )
+        presence_report["independent_source_presence"] = independent_report
+        if independent is not None and independent_support is not None:
+            added_support = np.asarray(independent_support, dtype=bool) & ~support
+            candidate = independent
+            support = np.asarray(independent_support, dtype=bool)
+            weak_mask |= added_support
 
     stage5_report = _stage9_stage5_star_reference_report(pipeline)
     completion_enabled = bool(
@@ -5154,7 +5185,8 @@ def _prepare_stage9_source_presence_candidate(
         support_pixel_count=int(np.count_nonzero(support)),
         support_ratio=float(np.mean(support)),
         semantics=(
-            "matched_source_psf_wings_plus_frozen_stage5_bright_star_completion"
+            "matched_source_psf_wings_plus_independent_same_source_weak_stars_"
+            "plus_frozen_stage5_bright_star_completion"
         ),
         ordinary_fwhm_gate_unchanged=True,
     )
@@ -7315,7 +7347,33 @@ def _stage9_targeted_unscreen_competition(
             review_candidate_registry=review_candidate_registry,
             retry_budget=targeted_attempt_budget,
         )
-        if bool(screen_quality.get("accepted", False)):
+        if bool(quality.get("accepted", False)):
+            quality, context = _stage9_extend_rescue_with_source_presence(
+                pipeline,
+                source_stem=source_stem,
+                accepted_context=context,
+                accepted_quality=quality,
+                intensity=intensity,
+                messages=messages,
+                remix_attempts=remix_attempts,
+            )
+        source_presence_selected = bool(
+            str(quality.get("attempt") or "").startswith(
+                "screen_unscreen_source_presence"
+            )
+            and quality.get("accepted", False)
+        )
+        if source_presence_selected:
+            eligible = True
+            comparison = {
+                "schema": "starun.stage9-unscreen-comparison.v1",
+                "selected": True,
+                "reason_code": "stage9_unscreen_source_presence_selected",
+                "selection_basis": (
+                    "same_source_completeness_after_all_unchanged_formal_gates"
+                ),
+            }
+        elif bool(screen_quality.get("accepted", False)):
             comparison = stage9_quality.compare_unscreen_candidate(
                 screen_quality,
                 quality,
@@ -7424,6 +7482,9 @@ def _stage9_targeted_unscreen_competition(
         and isinstance(selected_quality, dict)
         and isinstance(selected_context, dict)
         and bool(selected_quality.get("accepted", False))
+        and not str(selected_quality.get("attempt") or "").startswith(
+            "screen_unscreen_source_presence"
+        )
     ):
         support_comparison = selected_quality.get(
             "comparison_to_support_screen"

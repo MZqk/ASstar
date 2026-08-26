@@ -85,6 +85,7 @@ STAGE7_CANDIDATE_RANKING_FIELDS = (
     "technical_safety",
     "stretch_saturated_penalty",
     "subject_brightness_floor",
+    "absolute_subject_saturation_utility_capped",
     "continuous_quality_score",
     "subject_brightness_goals_capped_tiebreaker",
     "subject_brightness_utility_capped_tiebreaker",
@@ -1168,13 +1169,35 @@ class Stage6ServiceMixin:
                 image_data = self.siril.get_image_pixeldata(preview=False)
                 if image_data is None:
                     raise RuntimeError("vivid-safe parent pixel buffer is empty")
+                rendition_source = np.asarray(image_data)
+                composite_tone = None
+                tone_source_background = params.get(
+                    "composite_tone_source_background"
+                )
+                tone_target_background = params.get(
+                    "composite_tone_target_background"
+                )
+                if (
+                    tone_source_background is not None
+                    and tone_target_background is not None
+                ):
+                    rendition_source, composite_tone = (
+                        stage7_stretch_metrics.apply_composite_preserving_tone(
+                            rendition_source,
+                            source_background=float(tone_source_background),
+                            target_background=float(tone_target_background),
+                        )
+                    )
                 rendered_rgb, rendition = (
                     stage7_stretch_metrics.apply_subject_chroma_rendition(
-                        np.asarray(image_data),
+                        rendition_source,
                         frozen_masks,
                         factor=float(params.get("factor", 1.08)),
+                        expand_faint_signal=composite_tone is not None,
                     )
                 )
+                if composite_tone is not None:
+                    rendition["composite_tone"] = composite_tone
                 restored = self._stage8_restore_rgb_like(
                     np.asarray(image_data),
                     rendered_rgb,
@@ -1645,19 +1668,32 @@ class Stage6ServiceMixin:
         calibration_name = str(
             candidate.get("calibration_candidate") or candidate.get("name") or ""
         )
+        composite_vivid = bool(
+            str(candidate.get("method") or "") == "vivid_safe_chroma"
+            and str((target_stretch or {}).get("name") or "").strip().lower()
+            == "bright_core_composite_reveal"
+        )
         preview_target_attainment = _stage7_preview_target_attainment(
             calibration_name,
             pixel_stats,
             dict(candidate.get("adaptation") or {}),
-            min_ratio=getattr(
-                self.cfg,
-                "stage7_preview_target_p50_min_ratio",
-                0.90,
+            min_ratio=(
+                0.55
+                if composite_vivid
+                else getattr(
+                    self.cfg,
+                    "stage7_preview_target_p50_min_ratio",
+                    0.90,
+                )
             ),
-            hard_min_ratio=getattr(
-                self.cfg,
-                "stage7_preview_target_p50_hard_min_ratio",
-                0.80,
+            hard_min_ratio=(
+                0.45
+                if composite_vivid
+                else getattr(
+                    self.cfg,
+                    "stage7_preview_target_p50_hard_min_ratio",
+                    0.80,
+                )
             ),
             max_ratio=getattr(
                 self.cfg,
@@ -3265,6 +3301,39 @@ class Stage6ServiceMixin:
         return max(0.0, value) if math.isfinite(value) else None
 
 
+    @staticmethod
+    def _stage7_absolute_subject_saturation(
+        attempt: Dict[str, Any],
+    ) -> Optional[float]:
+        """Return broad frozen-signal saturation without a pale preview anchor."""
+
+        candidate = (attempt.get("rendition_metrics") or {}).get("candidate") or {}
+        metrics = candidate.get("metrics") or {}
+        try:
+            value = float(
+                metrics.get(
+                    "non_background_saturation_median",
+                    metrics.get("saturation_median"),
+                )
+            )
+        except (TypeError, ValueError):
+            return None
+        if candidate.get("status") != "available" or not math.isfinite(value):
+            return None
+        return max(0.0, value)
+
+
+    @staticmethod
+    def _stage7_absolute_subject_saturation_goal(
+        profile_name: Any,
+    ) -> Optional[float]:
+        """Set an absolute colour goal only for the resolved Lagoon/Trifid profile."""
+
+        if str(profile_name or "").strip().lower() == "bright_core_composite_reveal":
+            return 0.30
+        return None
+
+
     @classmethod
     def _stage7_presentation_score_v6(
         cls,
@@ -3282,6 +3351,7 @@ class Stage6ServiceMixin:
         ).strip().lower()
         if profile_name in {
             "bright_core_protect",
+            "bright_core_composite_reveal",
             "widefield_nebulosity",
             "widefield_faint_signal",
             "widefield_subject_separation",
@@ -3373,6 +3443,25 @@ class Stage6ServiceMixin:
                 utilities[name] = 0.0
             else:
                 utilities[name] = _clamp_float(ratio / goal, 0.0, 1.0)
+        absolute_saturation = cls._stage7_absolute_subject_saturation(attempt)
+        absolute_saturation_goal = cls._stage7_absolute_subject_saturation_goal(
+            profile_name
+        )
+        absolute_saturation_utility = None
+        if absolute_saturation_goal is not None:
+            absolute_saturation_utility = (
+                _clamp_float(
+                    (absolute_saturation or 0.0) / absolute_saturation_goal,
+                    0.0,
+                    1.0,
+                )
+                if absolute_saturation is not None
+                else 0.0
+            )
+            utilities["saturation_median"] = min(
+                utilities["saturation_median"],
+                absolute_saturation_utility,
+            )
         presentation = sum(
             utilities[name] * weights[name] for name in weights
         )
@@ -3481,6 +3570,9 @@ class Stage6ServiceMixin:
             "safety_headroom": float(safety),
             "goals": goals,
             "utilities": utilities,
+            "absolute_subject_saturation": absolute_saturation,
+            "absolute_subject_saturation_goal": absolute_saturation_goal,
+            "absolute_subject_saturation_utility": absolute_saturation_utility,
             "safety": safety_values,
             "missing_metrics": missing,
             "saturation_p95_role": "gate_and_diagnostic_only",
@@ -3938,12 +4030,26 @@ class Stage6ServiceMixin:
             score = 0.0
         if not math.isfinite(score):
             score = 0.0
+        try:
+            absolute_saturation_utility = float(
+                report.get("absolute_subject_saturation_utility", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            absolute_saturation_utility = 0.0
+        if not math.isfinite(absolute_saturation_utility):
+            absolute_saturation_utility = 0.0
+        absolute_saturation_utility = _clamp_float(
+            absolute_saturation_utility,
+            0.0,
+            1.0,
+        )
         return (
             status_penalty,
             final_penalty,
             technical_penalty,
             stretch_saturated_penalty,
             brightness_floor_penalty,
+            -absolute_saturation_utility,
             -score,
             -brightness_goal_count,
             -brightness_utility,
@@ -4782,6 +4888,8 @@ class Stage6ServiceMixin:
         *,
         saturation_ratio: Optional[float] = None,
         saturation_goal: Optional[float] = None,
+        absolute_subject_saturation: Optional[float] = None,
+        absolute_subject_goal: Optional[float] = None,
     ) -> float:
         """Return the bounded target-aware colour factor for vivid-safe."""
 
@@ -4802,6 +4910,30 @@ class Stage6ServiceMixin:
             }
         ):
             return 1.18
+        if profile_name == "bright_core_composite_reveal":
+            try:
+                absolute = float(absolute_subject_saturation)
+                absolute_goal = float(absolute_subject_goal)
+            except (TypeError, ValueError):
+                absolute = 0.0
+                absolute_goal = 0.0
+            if (
+                math.isfinite(absolute)
+                and math.isfinite(absolute_goal)
+                and absolute > 1e-6
+                and absolute_goal > 0.0
+            ):
+                compensated = 1.0 + 2.0 * max(
+                    0.0,
+                    absolute_goal / absolute - 1.0,
+                )
+                # The Stage 7 physical-color vector gate remains unchanged and
+                # is the final authority.  After compact star/catalog islands
+                # are removed from the broad-signal mask, M8 has enough vector
+                # headroom for a stronger bounded recovery without printing
+                # aperture topology into the image.
+                return max(1.12, min(4.0, compensated))
+            return 1.12
         if profile_name in {
             "bright_core_protect",
             "widefield_nebulosity",
@@ -6787,14 +6919,41 @@ class Stage6ServiceMixin:
             safety_headroom = float(
                 score_report.get("safety_headroom", 0.0) or 0.0
             )
+            absolute_subject_saturation = (
+                self._stage7_absolute_subject_saturation(vivid_parent)
+            )
+            absolute_subject_goal = (
+                self._stage7_absolute_subject_saturation_goal(
+                    (target_stretch or {}).get("name")
+                )
+            )
+            absolute_subject_below_goal = bool(
+                absolute_subject_goal is not None
+                and (
+                    absolute_subject_saturation is None
+                    or absolute_subject_saturation < absolute_subject_goal
+                )
+            )
+            parent_rendition_metrics = (
+                ((vivid_parent.get("rendition_metrics") or {}).get("candidate") or {}).get(
+                    "metrics"
+                )
+                or {}
+            )
             if (
-                (saturation_ratio is None or saturation_ratio < saturation_goal)
+                (
+                    saturation_ratio is None
+                    or saturation_ratio < saturation_goal
+                    or absolute_subject_below_goal
+                )
                 and safety_headroom >= 0.15
             ):
                 vivid_factor = self._stage7_vivid_chroma_factor(
                     target_stretch,
                     saturation_ratio=saturation_ratio,
                     saturation_goal=saturation_goal,
+                    absolute_subject_saturation=absolute_subject_saturation,
+                    absolute_subject_goal=absolute_subject_goal,
                 )
                 vivid_candidate = {
                     "name": "cand_vivid_safe",
@@ -6802,6 +6961,16 @@ class Stage6ServiceMixin:
                     "method": "vivid_safe_chroma",
                     "params": {
                         "factor": vivid_factor,
+                        "absolute_subject_saturation": absolute_subject_saturation,
+                        "absolute_subject_saturation_goal": absolute_subject_goal,
+                        "composite_tone_source_background": (
+                            parent_rendition_metrics.get("background_median")
+                            if absolute_subject_goal is not None
+                            else None
+                        ),
+                        "composite_tone_target_background": (
+                            0.11 if absolute_subject_goal is not None else None
+                        ),
                         "parent_name": vivid_parent.get("name"),
                         "parent_candidate": {
                             "name": vivid_parent.get("name"),

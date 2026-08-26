@@ -573,6 +573,7 @@ def assess_independent_sep_crossmatch(
         )
         source_ratio = float(formal_match["source_match_ratio"])
         unmatched_ratio = float(1.0 - source_ratio)
+        source_recovery_ratio = float(matches["O_C"]["source_match_ratio"])
         p50 = formal_match.get("distance_p50_px")
         p95 = formal_match.get("distance_p95_px")
         gates = {
@@ -590,6 +591,15 @@ def assess_independent_sep_crossmatch(
                 "maximum": _bounded(
                     getattr(cfg, "stage9_sep_unmatched_ratio_max", 0.25),
                     0.25,
+                    0.0,
+                    1.0,
+                ),
+            },
+            "source_recovery_ratio": {
+                "value": source_recovery_ratio,
+                "minimum": _bounded(
+                    getattr(cfg, "stage9_sep_source_recovery_ratio_min", 0.30),
+                    0.30,
                     0.0,
                     1.0,
                 ),
@@ -619,6 +629,10 @@ def assess_independent_sep_crossmatch(
         gates["unmatched_ratio"]["passed"] = bool(
             unmatched_ratio <= gates["unmatched_ratio"]["maximum"]
         )
+        gates["source_recovery_ratio"]["passed"] = bool(
+            source_recovery_ratio
+            >= gates["source_recovery_ratio"]["minimum"]
+        )
         gates["distance_p50_px"]["passed"] = bool(
             p50 is not None and float(p50) <= gates["distance_p50_px"]["maximum"]
         )
@@ -645,6 +659,13 @@ def assess_independent_sep_crossmatch(
                 ),
                 "crossmatch": formal_match,
                 "unmatched_ratio": unmatched_ratio,
+                "source_recovery": {
+                    "source_role": "O",
+                    "target_role": "C",
+                    "selection": "all_independent_compact_same_source_O",
+                    "crossmatch": matches["O_C"],
+                    "source_match_ratio": source_recovery_ratio,
+                },
             },
             gates=gates,
             failed_gates=[
@@ -670,6 +691,7 @@ def stage9_sep_crossmatch_summary(report: Dict[str, Any] | None) -> Dict[str, An
     catalogs = dict(payload.get("catalogs") or {})
     formal = dict(payload.get("formal_set") or {})
     formal_match = dict(formal.get("crossmatch") or {})
+    source_recovery = dict(formal.get("source_recovery") or {})
     return {
         "schema": _STAGE9_SEP_CROSSMATCH_SCHEMA,
         "status": str(payload.get("status") or "unavailable"),
@@ -693,6 +715,9 @@ def stage9_sep_crossmatch_summary(report: Dict[str, Any] | None) -> Dict[str, An
             "match_count": formal_match.get("match_count"),
             "source_match_ratio": formal_match.get("source_match_ratio"),
             "unmatched_ratio": formal.get("unmatched_ratio"),
+            "source_recovery_ratio": source_recovery.get(
+                "source_match_ratio"
+            ),
             "distance_p50_px": formal_match.get("distance_p50_px"),
             "distance_p95_px": formal_match.get("distance_p95_px"),
         },
@@ -2330,6 +2355,144 @@ def build_source_wing_feather_candidate(
         )
         return feathered.astype(np.float32, copy=False), support, report
     except (IndexError, TypeError, ValueError, FloatingPointError) as error:
+        report["reason"] = str(error)
+        return None, None, report
+
+
+def build_independent_source_presence_candidate(
+    original_display: np.ndarray,
+    starless_display: np.ndarray,
+    stabilized_stars: np.ndarray,
+    current_support_mask: np.ndarray,
+    cfg: Any,
+    *,
+    spatial_scale: Dict[str, Any] | None,
+    strength: float = 0.90,
+) -> tuple[np.ndarray | None, np.ndarray | None, Dict[str, Any]]:
+    """Restore compact O-B residuals missed by the frozen Stage9 catalog."""
+
+    report: Dict[str, Any] = {
+        "schema": "starun.stage9-independent-source-presence.v1",
+        "status": "unavailable",
+        "available": False,
+        "changed": False,
+        "reason_code": "stage9_independent_source_presence_unavailable",
+        "membership_source": "independent_sep_detection_on_same_source_O",
+        "recursive_dilation": False,
+    }
+    try:
+        if scipy_ndimage is None:
+            raise ValueError("scipy.ndimage unavailable")
+        original = _normalized(np.asarray(original_display))
+        starless = _normalized(np.asarray(starless_display))
+        stabilized = _normalized(np.asarray(stabilized_stars))
+        if not (original.shape == starless.shape == stabilized.shape):
+            raise ValueError("independent source-presence image shapes do not match")
+        spatial_shape = _pixel_peak(original).shape
+        current_support = np.asarray(current_support_mask, dtype=bool)
+        if current_support.shape != spatial_shape:
+            raise ValueError("independent source-presence support shape mismatch")
+
+        pixel_sha256 = hashlib.sha256(
+            np.ascontiguousarray(original, dtype=np.float32).tobytes()
+        ).hexdigest()
+        catalog = build_independent_sep_catalog(
+            original,
+            cfg,
+            role="O",
+            pixel_sha256=pixel_sha256,
+            spatial_scale=spatial_scale,
+        )
+        if catalog.get("status") != "ok":
+            raise ValueError(
+                str(catalog.get("reason") or "independent O catalog unavailable")
+            )
+        records = list(catalog.get("records") or [])
+        if not records:
+            raise ValueError("independent O catalog contains no compact sources")
+
+        source_support = np.zeros(spatial_shape, dtype=bool)
+        height, width = spatial_shape
+        for row in records:
+            x = float(row["x"])
+            y = float(row["y"])
+            radius = _bounded(float(row["fwhm_px"]) * 0.90, 2.5, 1.5, 5.5)
+            x_min = max(0, int(math.floor(x - radius)))
+            x_max = min(width, int(math.ceil(x + radius + 1.0)))
+            y_min = max(0, int(math.floor(y - radius)))
+            y_max = min(height, int(math.ceil(y + radius + 1.0)))
+            if x_min >= x_max or y_min >= y_max:
+                continue
+            yy, xx = np.ogrid[y_min:y_max, x_min:x_max]
+            source_support[y_min:y_max, x_min:x_max] |= (
+                (xx - x) ** 2 + (yy - y) ** 2 <= radius**2
+            )
+
+        residual = original - starless
+        residual_min = _bounded(
+            getattr(cfg, "stage9_independent_source_residual_min", 0.0015),
+            0.0015,
+            0.0002,
+            0.02,
+        )
+        denominator_floor = _bounded(
+            getattr(cfg, "stage9_unscreen_denominator_floor", 0.08),
+            0.08,
+            0.02,
+            0.25,
+        )
+        denominator = 1.0 - starless
+        reliable = (
+            source_support
+            & (_pixel_peak(residual) >= residual_min)
+            & (_pixel_floor(residual) >= -0.01)
+            & (_pixel_floor(denominator) >= denominator_floor)
+            & (_pixel_peak(original) < 0.995)
+        )
+        reliable = scipy_ndimage.binary_opening(
+            reliable,
+            structure=np.ones((2, 2), dtype=bool),
+        )
+        reliable_count = int(np.count_nonzero(reliable))
+        if reliable_count <= 0:
+            raise ValueError("independent O-B residual has no reliable compact pixels")
+
+        raw_unscreen = np.clip(
+            residual / np.maximum(denominator, denominator_floor),
+            0.0,
+            1.0,
+        ).astype(np.float32, copy=False)
+        bounded_strength = _bounded(strength, 0.90, 0.10, 0.95)
+        expanded_reliable = _expanded_spatial_mask(
+            stabilized,
+            reliable.astype(np.float32),
+        )
+        candidate = np.where(
+            expanded_reliable > 0.0,
+            np.maximum(stabilized, bounded_strength * raw_unscreen),
+            stabilized,
+        ).astype(np.float32, copy=False)
+        support = current_support | reliable
+        candidate *= _expanded_spatial_mask(candidate, support.astype(np.float32))
+        changed = bool(np.any(np.abs(candidate - stabilized) > 1e-7))
+        report.update(
+            status="ready",
+            available=True,
+            changed=changed,
+            reason_code="stage9_independent_source_presence_ready",
+            catalog_valid_count=int(catalog.get("valid_count", 0) or 0),
+            catalog_records_sha256=str(catalog.get("records_sha256") or ""),
+            source_support_pixel_count=int(np.count_nonzero(source_support)),
+            reliable_residual_pixel_count=reliable_count,
+            added_support_pixel_count=int(np.count_nonzero(reliable & ~current_support)),
+            support_pixel_count=int(np.count_nonzero(support)),
+            support_ratio=float(np.mean(support)),
+            residual_min=residual_min,
+            strength=bounded_strength,
+            semantics="same_source_compact_positive_O_minus_B_unscreen_residual",
+        )
+        return candidate, support, report
+    except (IndexError, KeyError, TypeError, ValueError, FloatingPointError) as error:
         report["reason"] = str(error)
         return None, None, report
 
@@ -7869,6 +8032,17 @@ def assess_stage9_psf_closure(
         )
         interval_min = ratio_median - u95
         interval_max = ratio_median + u95
+        source_fwhm_median = float(np.median(source_fwhm[candidate_mask]))
+        pixel_interval_min = (
+            ratio_median - pixel_interval_halfwidth_median
+            if pixel_interval_halfwidth_median is not None
+            else None
+        )
+        pixel_interval_max = (
+            ratio_median + pixel_interval_halfwidth_median
+            if pixel_interval_halfwidth_median is not None
+            else None
+        )
         strict_accepted = bool(ratio_min <= ratio_median <= ratio_max)
         boundary_intersects = bool(
             interval_max >= ratio_min and interval_min <= ratio_max
@@ -7876,17 +8050,33 @@ def assess_stage9_psf_closure(
         accepted_within_uncertainty = bool(
             not strict_accepted and boundary_intersects
         )
+        accepted_within_pixel_quantization = bool(
+            not strict_accepted
+            and not accepted_within_uncertainty
+            and source_fwhm_median <= 3.0
+            and pixel_sample_count >= int(math.ceil(group_count * 0.95))
+            and pixel_interval_min is not None
+            and pixel_interval_max is not None
+            and pixel_interval_max >= ratio_min
+            and pixel_interval_min <= ratio_max
+        )
         group_accepted = bool(
-            strict_accepted or accepted_within_uncertainty
+            strict_accepted
+            or accepted_within_uncertainty
+            or accepted_within_pixel_quantization
         )
         if accepted_within_uncertainty:
             uncertainty_advisory_groups.append(group_name)
+        elif accepted_within_pixel_quantization:
+            uncertainty_advisory_groups.append(
+                f"{group_name}:halfmax_pixel_quantization"
+            )
         group_report = {
             "status": "ok",
             "reference_sample_count": group_reference_count,
             "candidate_sample_count": group_count,
             "minimum_sample_count": required,
-            "source_fwhm_median_px": float(np.median(source_fwhm[candidate_mask])),
+            "source_fwhm_median_px": source_fwhm_median,
             "candidate_fwhm_median_px": float(
                 np.median(candidate_fwhm[candidate_mask])
             ),
@@ -7899,6 +8089,9 @@ def assess_stage9_psf_closure(
             "accepted_within_uncertainty": (
                 accepted_within_uncertainty
             ),
+            "accepted_within_pixel_quantization": (
+                accepted_within_pixel_quantization
+            ),
             "accepted": group_accepted,
             "decision": (
                 "accepted_strict"
@@ -7906,7 +8099,11 @@ def assess_stage9_psf_closure(
                 else (
                     "accepted_within_uncertainty"
                     if accepted_within_uncertainty
-                    else "rejected"
+                    else (
+                        "accepted_within_halfmax_pixel_quantization"
+                        if accepted_within_pixel_quantization
+                        else "rejected"
+                    )
                 )
             ),
             "measurement_uncertainty": {
@@ -7931,6 +8128,16 @@ def assess_stage9_psf_closure(
                 "u95_max": uncertainty_max,
                 "ratio_interval_95": [interval_min, interval_max],
                 "gate_interval_intersects": boundary_intersects,
+                "pixel_quantization_ratio_interval": [
+                    pixel_interval_min,
+                    pixel_interval_max,
+                ],
+                "pixel_quantization_gate_interval_intersects": bool(
+                    pixel_interval_min is not None
+                    and pixel_interval_max is not None
+                    and pixel_interval_max >= ratio_min
+                    and pixel_interval_min <= ratio_max
+                ),
             },
         }
         result["groups"][group_name] = group_report
@@ -7938,7 +8145,10 @@ def assess_stage9_psf_closure(
         metrics[f"star_psf_fwhm_u95_{group_name}"] = u95
         metrics[
             f"star_psf_fwhm_uncertainty_exemption_{group_name}"
-        ] = float(accepted_within_uncertainty)
+        ] = float(
+            accepted_within_uncertainty
+            or accepted_within_pixel_quantization
+        )
         if enabled and not group_accepted:
             issues.append(
                 f"star_psf_fwhm_ratio_{group_name} "

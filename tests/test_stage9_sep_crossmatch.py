@@ -262,6 +262,62 @@ class Stage9SepCrossmatchTests(unittest.TestCase):
         self.assertIn("source_match_ratio", report["failed_gates"])
         self.assertIn("unmatched_ratio", report["failed_gates"])
 
+    def test_candidate_only_provenance_cannot_hide_missing_source_stars(self):
+        original_coordinates = [
+            (float((index % 20) * 10), float((index // 20) * 10))
+            for index in range(160)
+        ]
+        candidate_coordinates = original_coordinates[:32]
+        catalogs = {
+            "O": _catalog("O", original_coordinates),
+            "B": _catalog("B", candidate_coordinates),
+            "C": _catalog("C", candidate_coordinates),
+        }
+
+        report = self._assess_with_catalogs(catalogs)
+
+        self.assertEqual(report["status"], "rejected")
+        self.assertEqual(
+            report["formal_set"]["crossmatch"]["source_match_ratio"],
+            1.0,
+        )
+        self.assertAlmostEqual(
+            report["formal_set"]["source_recovery"]["source_match_ratio"],
+            0.20,
+        )
+        self.assertIn("source_recovery_ratio", report["failed_gates"])
+
+    def test_independent_source_presence_restores_only_positive_o_minus_b_pixels(self):
+        original = np.full((3, 32, 32), 0.10, dtype=np.float32)
+        starless = original.copy()
+        original[:, 14:18, 14:18] = 0.40
+        stabilized = np.zeros_like(original)
+        support = np.zeros((32, 32), dtype=bool)
+        source_catalog = _catalog("O", [(15.5, 15.5)], [500.0])
+
+        with patch.object(
+            stage9_quality,
+            "build_independent_sep_catalog",
+            return_value=source_catalog,
+        ):
+            candidate, recovered_support, report = (
+                stage9_quality.build_independent_source_presence_candidate(
+                    original,
+                    starless,
+                    stabilized,
+                    support,
+                    self.cfg,
+                    spatial_scale=self.scale,
+                )
+            )
+
+        self.assertEqual(report["status"], "ready", report)
+        self.assertTrue(report["changed"])
+        self.assertGreater(report["added_support_pixel_count"], 0)
+        self.assertTrue(recovered_support[15, 15])
+        self.assertGreater(float(candidate[:, 15, 15].max()), 0.0)
+        self.assertEqual(float(candidate[:, 2, 2].max()), 0.0)
+
     def test_formal_ratio_and_distance_boundaries_are_inclusive(self):
         coordinates = [(float(index * 10), 20.0) for index in range(40)]
         c_coordinates = list(coordinates)

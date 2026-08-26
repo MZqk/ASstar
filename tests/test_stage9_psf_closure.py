@@ -350,6 +350,47 @@ class Stage9PsfClosureTests(unittest.TestCase):
             0.020,
         )
 
+    def test_small_weak_psf_accepts_one_halfmax_pixel_quantization_step(self):
+        source = _gaussian_field(
+            (128, 128),
+            self.coordinates,
+            sigma=1.0,
+        )
+        reference = self._reference(source)
+        source_fwhm = np.asarray(reference["_display_source_fwhm_px"])
+        source_area = np.asarray(reference["_display_source_halfmax_area_px"])
+        measurements = [
+            {
+                "status": "ok",
+                "fwhm_px": float(fwhm * 1.14),
+                "half_max_area": float(area * 1.14 * 1.14),
+                "saturated": False,
+                "offset_y": 0,
+                "offset_x": 0,
+            }
+            for fwhm, area in zip(source_fwhm, source_area)
+        ]
+
+        with patch.object(
+            stage9_quality,
+            "_measure_connected_halfmax_fwhm",
+            side_effect=measurements,
+        ):
+            result = stage9_quality.assess_stage9_psf_closure(
+                source,
+                reference,
+                self.cfg,
+            )
+
+        self.assertTrue(result["accepted"], result)
+        weak = result["groups"]["weak"]
+        self.assertFalse(weak["strict_accepted"])
+        self.assertTrue(weak["accepted_within_pixel_quantization"])
+        self.assertEqual(
+            weak["decision"],
+            "accepted_within_halfmax_pixel_quantization",
+        )
+
     def test_lower_boundary_uses_same_uncertainty_rule(self):
         result = self._closure_with_measured_ratio(0.9281)
 

@@ -189,6 +189,33 @@ class Stage7RenditionTests(unittest.TestCase):
             muted_report["metrics"]["saturation_median"],
         )
 
+    def test_rendition_reports_broad_non_background_saturation(self) -> None:
+        image, masks = self._scene()
+        narrow_subject = masks["subject_mask"].copy()
+        narrow_subject[12:32, 12:52] = 0.0
+        masks["subject_mask"] = narrow_subject
+        muted_signal = image.copy()
+        luma = (
+            0.2126 * muted_signal[0]
+            + 0.7152 * muted_signal[1]
+            + 0.0722 * muted_signal[2]
+        )
+        muted_signal[:, 12:32, 12:52] = luma[None, 12:32, 12:52]
+
+        report = stage7_stretch_metrics.measure_frozen_rendition_metrics(
+            muted_signal,
+            masks,
+        )
+
+        self.assertGreater(
+            report["non_background_signal_coverage"],
+            report["subject_coverage"],
+        )
+        self.assertLess(
+            report["metrics"]["non_background_saturation_median"],
+            report["metrics"]["saturation_median"],
+        )
+
     def test_subject_chroma_boost_preserves_luminance_background_and_headroom(self) -> None:
         image, masks = self._scene()
         rendered, metadata = (
@@ -256,6 +283,125 @@ class Stage7RenditionTests(unittest.TestCase):
         self.assertGreaterEqual(float(np.min(rendered)), 0.0)
         self.assertEqual(metadata["factor"], 6.0)
         self.assertEqual(metadata["newly_clipped_ratio"], 0.0)
+
+    def test_faint_signal_expansion_uses_frozen_non_background_boundary(self) -> None:
+        image, masks = self._scene()
+        explicit_subject = masks["subject_mask"].copy()
+        explicit_subject[12:32, 12:52] = 0.0
+        masks["subject_mask"] = explicit_subject
+
+        rendered, metadata = stage7_stretch_metrics.apply_subject_chroma_rendition(
+            image,
+            masks,
+            factor=2.0,
+            expand_faint_signal=True,
+        )
+
+        # This pixel is outside the narrow explicit subject mask but remains
+        # inside the independently frozen non-background signal region.
+        self.assertFalse(np.allclose(rendered[:, 20, 20], image[:, 20, 20]))
+        # Frozen sky background is still bit-for-bit outside the operation.
+        np.testing.assert_allclose(rendered[:, 4, 4], image[:, 4, 4])
+        self.assertTrue(metadata["non_background_signal_expansion_applied"])
+        self.assertEqual(metadata["non_background_signal_smoothing_passes"], 8)
+        self.assertEqual(metadata["non_background_signal_opening_passes"], 8)
+        self.assertEqual(metadata["chroma_smoothing_passes"], 6)
+        self.assertFalse(metadata["star_protection_applied"])
+        self.assertTrue(
+            metadata["star_protection_skipped_for_starless_expansion"]
+        )
+        self.assertTrue(metadata["background_unchanged"])
+
+    def test_starless_faint_signal_expansion_excludes_isolated_star_aperture(
+        self,
+    ) -> None:
+        image, masks = self._scene()
+        masks["background_mask"] = np.ones(
+            image.shape[1:], dtype=np.float32
+        )
+        masks["background_mask"][20:28, 20:28] = 0.0
+        masks["subject_mask"] = np.zeros(
+            image.shape[1:], dtype=np.float32
+        )
+        masks["core_mask"] = None
+        masks["nebula_mask"] = None
+        masks["faint_nebula_mask"] = None
+        masks["galaxy_signal_mask"] = None
+        masks["star_mask"] = np.zeros(image.shape[1:], dtype=np.float32)
+        masks["star_mask"][20:28, 20:28] = 1.0
+
+        rendered, metadata = (
+            stage7_stretch_metrics.apply_subject_chroma_rendition(
+                image,
+                masks,
+                factor=2.0,
+                expand_faint_signal=True,
+            )
+        )
+
+        np.testing.assert_allclose(rendered, image)
+        self.assertTrue(metadata["non_background_star_exclusion_applied"])
+        self.assertFalse(metadata["star_protection_applied"])
+        self.assertTrue(
+            metadata["star_protection_skipped_for_starless_expansion"]
+        )
+
+    def test_starless_expansion_does_not_reintroduce_aggregate_star_island(
+        self,
+    ) -> None:
+        image, masks = self._scene()
+        masks["background_mask"] = np.ones(
+            image.shape[1:], dtype=np.float32
+        )
+        masks["subject_mask"] = np.zeros(
+            image.shape[1:], dtype=np.float32
+        )
+        masks["subject_mask"][20:28, 20:28] = 1.0
+        masks["core_mask"] = None
+        masks["nebula_mask"] = None
+        masks["faint_nebula_mask"] = None
+        masks["galaxy_signal_mask"] = None
+        masks["star_mask"] = np.zeros(image.shape[1:], dtype=np.float32)
+        masks["star_mask"][20:28, 20:28] = 1.0
+
+        rendered, metadata = (
+            stage7_stretch_metrics.apply_subject_chroma_rendition(
+                image,
+                masks,
+                factor=4.0,
+                expand_faint_signal=True,
+            )
+        )
+
+        np.testing.assert_allclose(rendered, image)
+        self.assertEqual(metadata["subject_coverage"], 0.0)
+
+    def test_composite_tone_darkens_luminance_with_one_linked_rgb_gain(self) -> None:
+        image = np.asarray(
+            [
+                np.full((8, 8), 0.24),
+                np.full((8, 8), 0.18),
+                np.full((8, 8), 0.12),
+            ],
+            dtype=np.float32,
+        )
+        rendered, report = (
+            stage7_stretch_metrics.apply_composite_preserving_tone(
+                image,
+                source_background=0.18,
+                target_background=0.11,
+            )
+        )
+
+        self.assertTrue(report["linked_rgb_gain"])
+        self.assertGreater(report["gamma"], 1.0)
+        self.assertLess(float(np.median(rendered)), float(np.median(image)))
+        np.testing.assert_allclose(
+            rendered[0] / rendered[1],
+            image[0] / image[1],
+            atol=1e-6,
+        )
+        self.assertEqual(report["newly_clipped_ratio"], 0.0)
 
 
 if __name__ == "__main__":
