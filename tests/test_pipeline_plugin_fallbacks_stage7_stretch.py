@@ -1,38 +1,58 @@
 """Pipeline/plugin fallback tests for stage7 stretch."""
 
 from tests.pipeline_plugin_fallbacks_support import *  # noqa: F401,F403
+import stage8_color_rendition
 
 
 class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
-    def test_stage7_galaxy_vivid_factor_recovers_linked_stretch_chroma_loss(self):
-        processor = pipeline_module.StarunPostProcessor()
-
-        factor = processor._stage7_vivid_chroma_factor(
-            {"name": "galaxy_core_halo_balance"},
-            saturation_ratio=0.08,
-            saturation_goal=0.75,
+    def test_stage8_galaxy_chroma_factor_is_budget_bounded(self):
+        factor = stage8_color_rendition.target_aware_chroma_factor(
+            "galaxy_core_halo_balance",
+            subject_saturation=0.08,
+            effective_saturation_budget=0.40,
         )
 
-        self.assertEqual(factor, 6.0)
+        self.assertEqual(factor["factor"], 1.08)
 
-    def test_stage7_prefers_final_stage5_linear_over_deconv_checkpoint(self):
+    def test_stage6_accepts_only_frozen_final_stage5_linear(self):
         processor = self._new_processor()
         (processor.process_dir / "stage5_deconv.fit").write_bytes(b"mock")
         (processor.process_dir / "stage5_graxpert_deconv.fit").write_bytes(b"mock")
         (processor.process_dir / "stage5_linear.fit").write_bytes(b"mock")
-        stage7_module = sys.modules["stages.stage6_star_separation"]
+        (processor.process_dir / "stage4_color.fit").write_bytes(b"stage4")
+        (processor.process_dir / "stage5_input_linear.fit").write_bytes(b"baseline")
+        stage6_module = sys.modules["stages.stage6_star_separation"]
+        handoff_module = sys.modules["stage5_handoff"]
+        input_lineage = handoff_module.freeze_stage5_input_lineage(
+            processor,
+            upstream_loaded=True,
+            baseline_saved=True,
+        )
+        handoff_module.freeze_stage5_handoff(
+            processor,
+            origin=handoff_module.CURRENT_RUN_ORIGIN,
+            stage_status="ok",
+            deconvolution_integrity_ok=True,
+            denoise_integrity_ok=True,
+            input_lineage=input_lineage,
+        )
 
-        self.assertEqual(stage7_module._stage7_linear_source(processor), "stage5_linear")
+        source, mode, records = stage6_module._prepare_star_separation_source(
+            processor
+        )
 
-    def test_stage7_uses_graxpert_checkpoint_when_final_stage5_outputs_are_missing(self):
+        self.assertEqual(source, "stage5_linear")
+        self.assertEqual(mode, "linear_star_separation")
+        self.assertEqual(records[0]["source_stem"], "stage5_linear")
+
+    def test_stage6_rejects_graxpert_checkpoint_without_final_stage5_handoff(self):
         processor = self._new_processor()
         (processor.process_dir / "stage5_graxpert_deconv.fit").write_bytes(b"mock")
-        stage7_module = sys.modules["stages.stage6_star_separation"]
+        stage6_module = sys.modules["stages.stage6_star_separation"]
+        handoff_module = sys.modules["stage5_handoff"]
 
-        self.assertEqual(
-            stage7_module._stage7_linear_source(processor),
-            "stage5_graxpert_deconv",
-        )
+        with self.assertRaises(handoff_module.Stage5HandoffError):
+            stage6_module._prepare_star_separation_source(processor)
 
     def test_stage7_weak_object_tuning_uses_current_stretch_configuration(self):
         processor = self._new_processor()
@@ -176,7 +196,6 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
             "faint_boost": 0.0,
             "core_protection": 0.0,
             "shadow_chroma_damping": 0.0,
-            "faint_saturation_boost": 0.0,
             "star_mask_expand": 4,
             "star_faint_suppression": 0.85,
             "star_detail_suppression": 0.18,
@@ -222,7 +241,6 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
             "faint_boost": 0.012,
             "core_protection": 0.90,
             "shadow_chroma_damping": 0.28,
-            "faint_saturation_boost": 0.012,
         }
 
         pipeline_module.StarunPostProcessor._apply_stage7_bright_nebula_hdr_masked(
@@ -3983,17 +4001,17 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
                 "risk_score": 1.0,
             }
 
-        vivid_unsafe = attempt("a_oversaturated", 3.0, 0.059)
-        vivid_safe = attempt("z_vivid_safe", 0.90, 0.0)
+        color_heavy = attempt("a_oversaturated", 3.0, 0.059)
+        bounded = attempt("z_bounded", 0.90, 0.0)
 
         selected = min(
-            [vivid_unsafe, vivid_safe],
+            [color_heavy, bounded],
             key=processor._stage7_candidate_selection_key,
         )
 
-        self.assertEqual(selected["name"], "z_vivid_safe")
+        self.assertEqual(selected["name"], "z_bounded")
         self.assertEqual(
-            processor._stage7_presentation_score(vivid_unsafe)["utilities"][
+            processor._stage7_presentation_score(color_heavy)["utilities"][
                 "saturation_median"
             ],
             1.0,
@@ -4032,21 +4050,21 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
         self.assertEqual(report["profile"], "nebula")
         self.assertEqual(report["goals"]["saturation_median"], 0.90)
         self.assertLess(report["utilities"]["saturation_median"], 1.0)
-        self.assertEqual(report["absolute_subject_saturation_goal"], 0.30)
-        self.assertAlmostEqual(
-            report["absolute_subject_saturation_utility"],
-            0.11 / 0.30,
-        )
+        self.assertIsNone(report["absolute_subject_saturation_goal"])
+        self.assertIsNone(report["absolute_subject_saturation_utility"])
         self.assertEqual(
-            processor._stage7_vivid_chroma_factor(
-                attempt["adaptation"]["target_aware"],
-                absolute_subject_saturation=0.11,
-                absolute_subject_goal=0.30,
-            ),
-            4.0,
+            report["absolute_subject_saturation_role"],
+            "diagnostic_only_stage8_owns_goal",
         )
+        factor = stage8_color_rendition.target_aware_chroma_factor(
+            "bright_core_composite_reveal",
+            subject_saturation=0.11,
+            effective_saturation_budget=0.40,
+        )
+        self.assertEqual(factor["raw_factor"], 4.0)
+        self.assertEqual(factor["factor"], 4.0)
 
-    def test_m8_ranking_prefers_absolute_broad_signal_color_after_hard_gates(self):
+    def test_stage7_ranking_ignores_stage8_absolute_color_utility(self):
         processor = pipeline_module.StarunPostProcessor()
 
         def attempt(name, absolute_utility, score):
@@ -4064,13 +4082,13 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
             }
 
         pale = attempt("cand_b", 0.36, 0.95)
-        vivid = attempt("cand_vivid_safe", 0.74, 0.88)
+        color_rich = attempt("cand_display82", 0.74, 0.88)
         selected = min(
-            [pale, vivid],
+            [pale, color_rich],
             key=processor._stage7_candidate_selection_key,
         )
 
-        self.assertEqual(selected["name"], "cand_vivid_safe")
+        self.assertEqual(selected["name"], "cand_b")
 
     def test_stage7_forced_delivery_rejects_any_technical_damage(self):
         processor = pipeline_module.StarunPostProcessor()

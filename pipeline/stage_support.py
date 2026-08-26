@@ -1735,7 +1735,7 @@ class StageSupportMixin:
                 "stage7_cand_rescue_3",
                 "stage7_cand_rescue_2",
                 "stage7_cand_rescue_1",
-                "stage7_cand_vivid_safe",
+                "stage7_cand_composite_tone",
                 "stage7_cand_display90",
                 "stage7_cand_display86",
                 "stage7_cand_display82",

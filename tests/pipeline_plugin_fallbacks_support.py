@@ -1345,6 +1345,7 @@ class FakeProcessor(ReviewRegistryTestDouble):
 
     def _save_stage_output(self, _stem: str) -> bool:
         self.saved_image_pixels[_stem] = self.image_pixels.copy()
+        (self.process_dir / f"{_stem}.fit").write_bytes(b"mock-fit")
         return True
 
     def _read_fits_header_metadata(self, *_candidates: str):
@@ -1573,6 +1574,8 @@ def stage5_linear_denoise(processor: FakeProcessor) -> None:
             1.0,
         ).astype(np.float32)
         processor._stage5_test_star_field_installed = True
+    (processor.process_dir / "stage4_color.fit").write_bytes(b"mock-stage4-color")
+    processor.saved_image_pixels["stage4_color"] = processor.image_pixels.copy()
     processor.siril.get_image_pixeldata = (
         lambda preview=False: processor.image_pixels.copy()
     )

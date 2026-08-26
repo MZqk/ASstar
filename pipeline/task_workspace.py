@@ -712,6 +712,13 @@ def begin_task_run(
             normalized_resume.get("config_fingerprint") or ""
         ).strip():
             raise WorkspaceError("续跑记录缺少运行清单或配置指纹")
+        current_fingerprint = normalized_fingerprints.get(
+            f"stage{resume_stage}"
+        )
+        if not isinstance(current_fingerprint, Mapping) or str(
+            current_fingerprint.get("fingerprint") or ""
+        ) != str(normalized_resume.get("config_fingerprint") or ""):
+            raise WorkspaceError("续跑记录配置指纹与当前任务不一致")
         normalized_resume["semantic_context"] = _normalize_resume_semantic_context(
             normalized_resume.get("semantic_context"),
             stage_number=resume_stage,

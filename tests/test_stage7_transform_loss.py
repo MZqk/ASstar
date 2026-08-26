@@ -12,6 +12,7 @@ if str(PIPELINE_DIR) not in sys.path:
     sys.path.insert(0, str(PIPELINE_DIR))
 
 import stage7_stretch_metrics  # noqa: E402
+import stage8_color_rendition  # noqa: E402
 
 
 class Stage7TransformLossTests(unittest.TestCase):
@@ -132,7 +133,7 @@ class Stage7TransformLossTests(unittest.TestCase):
                 self.assertEqual(semantics["bundled_reference_version"], "1.4.4")
 
 
-class Stage7RenditionTests(unittest.TestCase):
+class Stage7MetricsAndStage8ColorRenditionTests(unittest.TestCase):
     @staticmethod
     def _scene() -> tuple[np.ndarray, dict[str, np.ndarray]]:
         height = width = 64
@@ -165,7 +166,7 @@ class Stage7RenditionTests(unittest.TestCase):
             muted - luminance[None, :, :]
         )
 
-        vivid_report = stage7_stretch_metrics.measure_frozen_rendition_metrics(
+        colorful_report = stage7_stretch_metrics.measure_frozen_rendition_metrics(
             image,
             masks,
         )
@@ -174,18 +175,18 @@ class Stage7RenditionTests(unittest.TestCase):
             masks,
         )
 
-        self.assertEqual(vivid_report["status"], "available")
-        self.assertEqual(vivid_report["mask_source"], "stage6_frozen_roi")
+        self.assertEqual(colorful_report["status"], "available")
+        self.assertEqual(colorful_report["mask_source"], "stage6_frozen_roi")
         self.assertEqual(
-            vivid_report["subject_coverage"],
+            colorful_report["subject_coverage"],
             muted_report["subject_coverage"],
         )
         self.assertEqual(
-            vivid_report["background_coverage"],
+            colorful_report["background_coverage"],
             muted_report["background_coverage"],
         )
         self.assertGreater(
-            vivid_report["metrics"]["saturation_median"],
+            colorful_report["metrics"]["saturation_median"],
             muted_report["metrics"]["saturation_median"],
         )
 
@@ -219,7 +220,7 @@ class Stage7RenditionTests(unittest.TestCase):
     def test_subject_chroma_boost_preserves_luminance_background_and_headroom(self) -> None:
         image, masks = self._scene()
         rendered, metadata = (
-            stage7_stretch_metrics.apply_subject_chroma_rendition(
+            stage8_color_rendition.apply_subject_chroma_rendition(
                 image,
                 masks,
                 factor=1.18,
@@ -255,8 +256,8 @@ class Stage7RenditionTests(unittest.TestCase):
             before["metrics"]["saturation_median"],
         )
 
-        with self.assertRaisesRegex(ValueError, "frozen Stage 6 ROI"):
-            stage7_stretch_metrics.apply_subject_chroma_rendition(
+        with self.assertRaisesRegex(ValueError, "valid frozen ROI"):
+            stage8_color_rendition.apply_subject_chroma_rendition(
                 image,
                 None,
                 factor=1.18,
@@ -264,7 +265,7 @@ class Stage7RenditionTests(unittest.TestCase):
 
     def test_high_factor_subject_chroma_is_still_luminance_and_gamut_bounded(self) -> None:
         image, masks = self._scene()
-        rendered, metadata = stage7_stretch_metrics.apply_subject_chroma_rendition(
+        rendered, metadata = stage8_color_rendition.apply_subject_chroma_rendition(
             image,
             masks,
             factor=6.0,
@@ -281,7 +282,7 @@ class Stage7RenditionTests(unittest.TestCase):
         np.testing.assert_allclose(rendered_luma, source_luma, atol=2e-7)
         self.assertLessEqual(float(np.max(rendered)), 0.995001)
         self.assertGreaterEqual(float(np.min(rendered)), 0.0)
-        self.assertEqual(metadata["factor"], 6.0)
+        self.assertEqual(metadata["factor"], 4.0)
         self.assertEqual(metadata["newly_clipped_ratio"], 0.0)
 
     def test_faint_signal_expansion_uses_frozen_non_background_boundary(self) -> None:
@@ -290,7 +291,7 @@ class Stage7RenditionTests(unittest.TestCase):
         explicit_subject[12:32, 12:52] = 0.0
         masks["subject_mask"] = explicit_subject
 
-        rendered, metadata = stage7_stretch_metrics.apply_subject_chroma_rendition(
+        rendered, metadata = stage8_color_rendition.apply_subject_chroma_rendition(
             image,
             masks,
             factor=2.0,
@@ -299,7 +300,7 @@ class Stage7RenditionTests(unittest.TestCase):
 
         # This pixel is outside the narrow explicit subject mask but remains
         # inside the independently frozen non-background signal region.
-        self.assertFalse(np.allclose(rendered[:, 20, 20], image[:, 20, 20]))
+        self.assertFalse(np.allclose(rendered[:, 24, 30], image[:, 24, 30]))
         # Frozen sky background is still bit-for-bit outside the operation.
         np.testing.assert_allclose(rendered[:, 4, 4], image[:, 4, 4])
         self.assertTrue(metadata["non_background_signal_expansion_applied"])
@@ -330,21 +331,13 @@ class Stage7RenditionTests(unittest.TestCase):
         masks["star_mask"] = np.zeros(image.shape[1:], dtype=np.float32)
         masks["star_mask"][20:28, 20:28] = 1.0
 
-        rendered, metadata = (
-            stage7_stretch_metrics.apply_subject_chroma_rendition(
+        with self.assertRaisesRegex(ValueError, "insufficient support"):
+            stage8_color_rendition.apply_subject_chroma_rendition(
                 image,
                 masks,
                 factor=2.0,
                 expand_faint_signal=True,
             )
-        )
-
-        np.testing.assert_allclose(rendered, image)
-        self.assertTrue(metadata["non_background_star_exclusion_applied"])
-        self.assertFalse(metadata["star_protection_applied"])
-        self.assertTrue(
-            metadata["star_protection_skipped_for_starless_expansion"]
-        )
 
     def test_starless_expansion_does_not_reintroduce_aggregate_star_island(
         self,
@@ -364,17 +357,13 @@ class Stage7RenditionTests(unittest.TestCase):
         masks["star_mask"] = np.zeros(image.shape[1:], dtype=np.float32)
         masks["star_mask"][20:28, 20:28] = 1.0
 
-        rendered, metadata = (
-            stage7_stretch_metrics.apply_subject_chroma_rendition(
+        with self.assertRaisesRegex(ValueError, "insufficient support"):
+            stage8_color_rendition.apply_subject_chroma_rendition(
                 image,
                 masks,
                 factor=4.0,
                 expand_faint_signal=True,
             )
-        )
-
-        np.testing.assert_allclose(rendered, image)
-        self.assertEqual(metadata["subject_coverage"], 0.0)
 
     def test_composite_tone_darkens_luminance_with_one_linked_rgb_gain(self) -> None:
         image = np.asarray(

@@ -145,6 +145,35 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
                 any("流水线资源" in error for error in manifest["blocking_errors"])
             )
 
+    def test_new_pipeline_modules_are_required_by_build_and_preflight(self) -> None:
+        required_modules = ("stage5_handoff.py", "stage8_color_rendition.py")
+        build_script = (
+            Path(__file__).resolve().parents[1] / "build" / "build_macos_app.sh"
+        ).read_text(encoding="utf-8")
+        required_block = build_script.split(
+            "PIPELINE_REQUIRED_MODULES=(", 1
+        )[1].split(")", 1)[0]
+        for module_name in required_modules:
+            self.assertIn(module_name, capabilities.PIPELINE_REQUIRED_PATHS)
+            self.assertIn(module_name, required_block)
+
+        for module_name in required_modules:
+            with self.subTest(module=module_name), tempfile.TemporaryDirectory() as td:
+                layout = self._make_bundle_layout(Path(td))
+                (layout["pipeline"].parent / module_name).unlink()
+
+                manifest = self._manifest(layout, network_enabled=True)
+
+                pipeline = manifest["capabilities"]["pipeline"]
+                self.assertFalse(pipeline["available"])
+                self.assertIn(module_name, pipeline["missing_required_paths"])
+                self.assertTrue(
+                    any(
+                        "流水线资源" in error
+                        for error in manifest["blocking_errors"]
+                    )
+                )
+
     def test_offline_mode_allows_degraded_route_then_uses_complete_local_gaia(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             layout = self._make_bundle_layout(Path(td))

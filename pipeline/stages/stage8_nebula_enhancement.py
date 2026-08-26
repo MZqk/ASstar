@@ -23,8 +23,16 @@ from models import PipelineStage, StarSeparationState
 from pipeline_safety import color_safety_limits, clamp_saturation_boost
 from stage8_pixels import (
     stage8_mixed_nebula_composite_context,
+    stage8_restore_rgb_like,
     stage8_star_preserve_nebulosity_context,
     stage8_star_preserve_nebulosity_overlay,
+)
+from stage8_color_rendition import (
+    STAGE8_SUBJECT_CHROMA_SCHEMA,
+    apply_subject_chroma_rendition,
+    assess_subject_chroma_candidate,
+    subject_saturation_median,
+    target_aware_chroma_factor,
 )
 
 
@@ -134,6 +142,7 @@ def _write_stage8_color_quality_report(
     effective_saturation: float,
     applied_saturation: float,
     palette_report: Optional[Dict[str, Any]] = None,
+    subject_chroma_report: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Write the P0 report-only color baseline and measured ledger entry."""
     channel_profile = getattr(pipeline, "channel_profile", {}) or {}
@@ -200,6 +209,8 @@ def _write_stage8_color_quality_report(
             operation=(
                 "artistic_dualband_palette"
                 if bool((palette_report or {}).get("accepted", False))
+                else "masked_subject_chroma_rendition"
+                if bool((subject_chroma_report or {}).get("accepted", False))
                 else "masked_single_chroma_recovery"
                 if saturation_execution.get("applied", False)
                 else "structure_only_or_passthrough"
@@ -266,6 +277,399 @@ def _stage8_frozen_palette_selection(
     selection["automatic_palette"] = automatic
     selection["requested_palette"] = "auto" if manual is False else palette
     return selection, None
+
+
+def _stage8_write_subject_chroma_report(
+    pipeline,
+    *,
+    status: str,
+    reason_code: str,
+    **updates: Any,
+) -> Dict[str, Any]:
+    """Persist the Stage8 positive-chroma decision on every runtime route."""
+
+    report: Dict[str, Any] = {
+        "schema": STAGE8_SUBJECT_CHROMA_SCHEMA,
+        "status": str(status),
+        "accepted": False,
+        "role": "target_aware_subject_chroma",
+        "feeds_main_pipeline": False,
+        "reason_code": str(reason_code),
+        "output": None,
+    }
+    report.update(updates)
+    pipeline._stage8_subject_chroma_report = dict(report)
+    pipeline._write_stage_json("stage8_subject_chroma_report.json", report)
+    return report
+
+
+def _stage8_run_subject_chroma(
+    pipeline,
+    messages: List[str],
+    *,
+    base_stem: str,
+    channel_semantics: str,
+    processing_policy: str,
+    user_processing_mode: str,
+    external_override: bool,
+    requested_saturation_budget: float,
+    effective_saturation_budget: float,
+    generic_saturation_suppressed: bool,
+) -> Dict[str, Any]:
+    """Apply the single bounded broadband positive-chroma transaction."""
+
+    issues: List[str] = []
+    if not bool(
+        getattr(pipeline.cfg, "stage8_target_aware_chroma_enabled", True)
+    ):
+        issues.append("disabled_by_configuration")
+    if not bool(
+        getattr(pipeline.cfg, "stage8_nebula_saturation_enabled", True)
+    ):
+        issues.append("stage8_nebula_saturation_disabled")
+    if channel_semantics != BROADBAND_RGB_OSC:
+        issues.append("channel_semantics_not_broadband")
+    if str(user_processing_mode or "").strip().lower() != "auto":
+        issues.append("processing_mode_not_auto")
+    if str(processing_policy or "").strip().lower() != "full":
+        issues.append("processing_policy_not_full")
+    if not bool(getattr(pipeline, "_stage7_stretch_accepted", False)):
+        issues.append("stage7_stretch_not_accepted")
+    if str(getattr(pipeline, "_stage8_final_quality", "unknown")) != "ok":
+        issues.append("stage8_structure_quality_not_ok")
+    if external_override:
+        issues.append("external_starless_override")
+    if bool(getattr(pipeline, "_star_preserve_target_bypass", False)):
+        issues.append("star_preserve_route")
+    if not generic_saturation_suppressed:
+        issues.append("generic_saturation_budget_not_reserved")
+    try:
+        budget = float(effective_saturation_budget)
+    except (TypeError, ValueError):
+        budget = 0.0
+    if not np.isfinite(budget) or budget <= 0.0:
+        issues.append("saturation_budget_unavailable")
+        budget = 0.0
+
+    report: Dict[str, Any] = {
+        "schema": STAGE8_SUBJECT_CHROMA_SCHEMA,
+        "status": "skipped_ineligible",
+        "accepted": False,
+        "role": "target_aware_subject_chroma",
+        "feeds_main_pipeline": False,
+        "reason_code": issues[0] if issues else "eligible",
+        "source": f"{base_stem}.fit",
+        "output": None,
+        "eligibility": {
+            "eligible": not issues,
+            "issues": list(issues),
+            "channel_semantics": channel_semantics,
+            "processing_mode": user_processing_mode,
+            "processing_policy": processing_policy,
+            "stage7_accepted": bool(
+                getattr(pipeline, "_stage7_stretch_accepted", False)
+            ),
+            "stage8_quality": str(
+                getattr(pipeline, "_stage8_final_quality", "unknown")
+            ),
+            "external_override": bool(external_override),
+        },
+        "effective_saturation_budget": budget,
+        "requested_saturation_budget": float(requested_saturation_budget),
+        "generic_saturation_execution": {
+            "suppressed": bool(generic_saturation_suppressed),
+            "reason": (
+                "reserved_for_stage8_target_aware_subject_chroma"
+                if generic_saturation_suppressed
+                else "not_reserved"
+            ),
+            "runtime_execution": dict(
+                getattr(pipeline, "_stage8_saturation_execution", {}) or {}
+            ),
+        },
+        "transaction": {
+            "baseline": "stage8_pre_subject_chroma.fit",
+            "baseline_saved": False,
+            "candidate_saved": False,
+            "canonical_saved": False,
+            "rollback_performed": False,
+            "rollback_ok": None,
+        },
+    }
+
+    def finish() -> Dict[str, Any]:
+        pipeline._stage8_subject_chroma_report = dict(report)
+        pipeline._write_stage_json("stage8_subject_chroma_report.json", report)
+        return report
+
+    if issues:
+        messages.append(
+            "Stage8 target-aware subject chroma skipped: "
+            + ",".join(issues)
+        )
+        return finish()
+
+    try:
+        pipeline.cmd_with_check("load", base_stem)
+        if not pipeline._save_stage_output("stage8_pre_subject_chroma"):
+            report.update(
+                status="prohibited_baseline_save_failed",
+                reason_code="stage8_pre_subject_chroma_save_failed",
+            )
+            messages.append(
+                "Stage8 subject chroma prohibited: immutable baseline save failed"
+            )
+            return finish()
+        report["transaction"]["baseline_saved"] = True
+        image_data = pipeline.siril.get_image_pixeldata(preview=False)
+        if image_data is None:
+            raise RuntimeError("Stage8 subject chroma image buffer is empty")
+
+        generated_masks = pipeline._stage8_generate_starless_masks(image_data)
+        if not isinstance(generated_masks, dict):
+            raise ValueError("Stage8 subject chroma masks are unavailable")
+        background = np.asarray(generated_masks.get("background_mask"))
+        if background.ndim != 2:
+            raise ValueError("Stage8 background mask is invalid")
+        spatial_shape = tuple(int(value) for value in background.shape)
+        masks: Dict[str, Any] = {
+            key: np.array(value, copy=True)
+            for key, value in generated_masks.items()
+            if value is not None
+            and np.asarray(value).ndim == 2
+            and tuple(np.asarray(value).shape) == spatial_shape
+        }
+        frozen_masks = getattr(
+            pipeline,
+            "_stage7_frozen_rendition_masks",
+            {},
+        )
+        frozen_keys: List[str] = []
+        if isinstance(frozen_masks, dict):
+            for key, value in frozen_masks.items():
+                if value is None:
+                    continue
+                array = np.asarray(value)
+                if array.ndim != 2 or tuple(array.shape) != spatial_shape:
+                    continue
+                if not np.all(np.isfinite(array)):
+                    continue
+                masks[key] = np.array(array, dtype=np.float32, copy=True)
+                frozen_keys.append(str(key))
+        if masks.get("subject_mask") is None:
+            subject_layers = [
+                np.asarray(masks[name], dtype=np.float32)
+                for name in (
+                    "core_mask",
+                    "nebula_mask",
+                    "faint_nebula_mask",
+                    "galaxy_signal_mask",
+                )
+                if masks.get(name) is not None
+            ]
+            masks["subject_mask"] = (
+                np.maximum.reduce(subject_layers)
+                if subject_layers
+                else np.clip(
+                    1.0 - np.asarray(masks["background_mask"], dtype=np.float32),
+                    0.0,
+                    1.0,
+                )
+            ).astype(np.float32, copy=False)
+
+        profile_resolver = getattr(
+            pipeline,
+            "_stage7_target_stretch_profile",
+            None,
+        )
+        target_profile = (
+            profile_resolver() if callable(profile_resolver) else {}
+        )
+        if not isinstance(target_profile, dict):
+            target_profile = {}
+        profile_name = str(target_profile.get("name") or "generic_balanced")
+        baseline_saturation = subject_saturation_median(image_data, masks)
+        factor_report = target_aware_chroma_factor(
+            profile_name,
+            subject_saturation=baseline_saturation,
+            effective_saturation_budget=budget,
+        )
+        candidate_rgb, rendition = apply_subject_chroma_rendition(
+            image_data,
+            masks,
+            factor=float(factor_report["factor"]),
+            expand_faint_signal=(
+                profile_name.strip().lower()
+                == "bright_core_composite_reveal"
+            ),
+        )
+        quality_gate = assess_subject_chroma_candidate(rendition)
+        report.update(
+            target_profile=target_profile,
+            factor=factor_report,
+            masks={
+                "source": (
+                    "stage7_frozen_plus_stage8_generated"
+                    if frozen_keys
+                    else "stage8_generated"
+                ),
+                "frozen_keys": sorted(frozen_keys),
+            },
+            candidate=rendition,
+            quality_gate=quality_gate,
+        )
+        if not bool(quality_gate.get("accepted", False)):
+            pipeline.cmd_with_check("load", "stage8_pre_subject_chroma")
+            rollback_ok = bool(pipeline._save_stage_output("stage8_enhanced"))
+            report["transaction"].update(
+                rollback_performed=True,
+                rollback_ok=rollback_ok,
+                canonical_saved=rollback_ok,
+            )
+            report.update(
+                status=(
+                    "rejected_by_quality_gate"
+                    if rollback_ok
+                    else "rejected_rollback_failed"
+                ),
+                reason_code=(
+                    "stage8_subject_chroma_quality_gate_rejected"
+                    if rollback_ok
+                    else "stage8_subject_chroma_rollback_failed"
+                ),
+            )
+            if rollback_ok:
+                pipeline._stage8_final_source = "stage8_enhanced"
+                messages.append(
+                    "Stage8 subject chroma rejected; retained structure-only baseline: "
+                    + ",".join(
+                        str(item) for item in quality_gate.get("issues", [])
+                    )
+                )
+            else:
+                pipeline._stage8_final_quality = (
+                    "subject_chroma_rollback_failed"
+                )
+                pipeline._stage8_final_source = (
+                    "stage8_pre_subject_chroma"
+                )
+                pipeline._stage8_fallback_used = True
+                if hasattr(pipeline, "_require_review"):
+                    pipeline._require_review(
+                        8,
+                        "stage8_subject_chroma_rollback_failed",
+                    )
+                messages.append(
+                    "Stage8 subject chroma quality rejection could not restore "
+                    "a verified canonical checkpoint"
+                )
+            return finish()
+
+        restored = stage8_restore_rgb_like(
+            pipeline,
+            np.asarray(image_data),
+            candidate_rgb,
+        )
+        _stage8_set_image_pixels(
+            pipeline,
+            restored,
+            label="Stage8 target-aware subject chroma",
+        )
+        candidate_saved = pipeline._save_stage_output(
+            "stage8_subject_chroma_candidate"
+        )
+        report["transaction"]["candidate_saved"] = bool(candidate_saved)
+        if not candidate_saved:
+            raise RuntimeError("stage8_subject_chroma_candidate save failed")
+        canonical_saved = pipeline._save_stage_output("stage8_enhanced")
+        report["transaction"]["canonical_saved"] = bool(canonical_saved)
+        if not canonical_saved:
+            raise RuntimeError("Stage8 subject chroma canonical save failed")
+        report.update(
+            status="accepted",
+            accepted=True,
+            feeds_main_pipeline=True,
+            reason_code="accepted",
+            output="stage8_subject_chroma_candidate.fit",
+            final_source="stage8_enhanced.fit",
+        )
+        pipeline._stage8_final_source = "stage8_enhanced"
+        pipeline._stage8_saturation_execution = {
+            "schema": STAGE8_SUBJECT_CHROMA_SCHEMA,
+            "applied": True,
+            "method": "masked_subject_chroma_rendition",
+            "requested_amount": budget,
+            "applied_amount": budget,
+            "factor": float(factor_report["factor"]),
+            "target_profile": profile_name,
+            "generic_saturation_suppressed": bool(
+                generic_saturation_suppressed
+            ),
+            "suppression_reason": (
+                "reserved_for_stage8_target_aware_subject_chroma"
+                if generic_saturation_suppressed
+                else None
+            ),
+        }
+        messages.append(
+            "Stage8 target-aware subject chroma accepted "
+            f"(profile={profile_name}, factor={float(factor_report['factor']):.3f})"
+        )
+        return finish()
+    except (
+        AttributeError,
+        CommandError,
+        FloatingPointError,
+        IndexError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        SirilError,
+        TypeError,
+        ValueError,
+    ) as error:
+        report.update(
+            status="failed",
+            accepted=False,
+            feeds_main_pipeline=False,
+            reason_code="stage8_subject_chroma_failed",
+            error=str(error),
+        )
+        rollback_ok = False
+        if bool(report["transaction"].get("baseline_saved", False)):
+            report["transaction"]["rollback_performed"] = True
+            try:
+                pipeline.cmd_with_check("load", "stage8_pre_subject_chroma")
+                rollback_ok = bool(
+                    pipeline._save_stage_output("stage8_enhanced")
+                )
+            except (CommandError, SirilError):
+                rollback_ok = False
+        report["transaction"]["rollback_ok"] = rollback_ok
+        report["transaction"]["canonical_saved"] = rollback_ok
+        if rollback_ok:
+            report["status"] = "failed_rolled_back"
+            pipeline._stage8_final_source = "stage8_enhanced"
+            messages.append(
+                "Stage8 subject chroma failed and rolled back: "
+                f"{pipeline._short_text(error, 160)}"
+            )
+        else:
+            report["status"] = "failed_rollback_failed"
+            report["reason_code"] = "stage8_subject_chroma_rollback_failed"
+            pipeline._stage8_final_quality = "subject_chroma_rollback_failed"
+            pipeline._stage8_final_source = "stage8_pre_subject_chroma"
+            pipeline._stage8_fallback_used = True
+            if hasattr(pipeline, "_require_review"):
+                pipeline._require_review(
+                    8,
+                    "stage8_subject_chroma_rollback_failed",
+                )
+            messages.append(
+                "Stage8 subject chroma rollback failed: "
+                f"{pipeline._short_text(error, 160)}"
+            )
+        return finish()
 
 
 def _stage8_run_dualband_palette(
@@ -585,13 +989,22 @@ def _stage8_run_dualband_palette(
         report["transaction"]["rollback_ok"] = rollback_ok
         if rollback_ok:
             report["status"] = "failed_rolled_back"
+            report["reason_code"] = "stage8_palette_failed_rolled_back"
             messages.append(
                 "Stage8 dual-band palette failed and rolled back: "
                 f"{pipeline._short_text(error, 160)}"
             )
         else:
+            report["status"] = "failed_rollback_failed"
+            report["reason_code"] = "stage8_palette_rollback_failed"
             pipeline._stage8_final_quality = "palette_rollback_failed"
+            pipeline._stage8_final_source = "stage8_pre_palette"
             pipeline._stage8_fallback_used = True
+            if hasattr(pipeline, "_require_review"):
+                pipeline._require_review(
+                    8,
+                    "stage8_palette_rollback_failed",
+                )
             messages.append(
                 "Stage8 dual-band palette rollback failed: "
                 f"{pipeline._short_text(error, 160)}"
@@ -628,6 +1041,15 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
     pipeline._stage8_palette_report = {}
     pipeline._stage8_saturation_execution = {}
     pipeline._stage8_color_quality_report = {}
+    pipeline._stage8_subject_chroma_report = {}
+    _stage8_write_subject_chroma_report(
+        pipeline,
+        status="not_run",
+        reason_code="stage8_route_not_resolved",
+    )
+    channel_semantics = str(
+        getattr(pipeline, "_channel_semantics", "unknown") or "unknown"
+    )
     pipeline._stage8_subject_boundary_seam_report = {}
     stage8_initial_quality = "unknown"
     stage8_reject_reason = ""
@@ -714,6 +1136,26 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
             reason_code=review_reason_code,
             reason_text=review_reason_code,
         )
+        subject_chroma_report = _stage8_write_subject_chroma_report(
+            pipeline,
+            status="bypassed_with_stars_review",
+            reason_code=review_reason_code,
+            source=selected_source,
+        )
+        palette_report = _stage8_run_dualband_palette(
+            pipeline,
+            messages,
+            base_stem=str(pipeline._stage8_final_source),
+            channel_semantics=channel_semantics,
+            processing_policy="skip",
+            external_override=False,
+        )
+        handoff["color_rendition"] = {
+            "mode": "bypassed_with_stars_review",
+            "accepted": False,
+            "report": "stage8_subject_chroma_report.json",
+        }
+        pipeline._stage8_handoff = handoff
         pipeline.starless_file = None
         if target_bypass_stage7_rejected:
             decisive_status = (
@@ -739,6 +1181,8 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
             "handoff": handoff,
             "processing_mode": user_processing_mode,
             "failure_action": failure_action,
+            "subject_chroma": subject_chroma_report,
+            "dualband_palette": palette_report,
         }
         pipeline._write_stage_json("stage8_enhancement_report.json", report)
         messages.append(
@@ -753,6 +1197,28 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
             )
         if load_errors:
             messages.append("load_errors=" + " | ".join(load_errors))
+        if stage8_saved and hasattr(pipeline, "_create_stage_review_bundle"):
+            review = pipeline._create_stage_review_bundle(
+                "stage8_nebula_enhancement",
+                selected_source,
+                "stage8_review_with_stars",
+                context={
+                    "mode": "with_stars_review_passthrough",
+                    "dualband_palette": palette_report,
+                    "subject_chroma": subject_chroma_report,
+                },
+                candidates=[
+                    {
+                        "name": "with_stars_review_passthrough",
+                        "stem": "stage8_review_with_stars",
+                        "status": decisive_status,
+                        "selected": True,
+                    }
+                ],
+                selected_candidate="with_stars_review_passthrough",
+            )
+            if review.get("report_path"):
+                messages.append(f"review_bundle={review['report_path']}")
         elapsed = pipeline.log.stage_end(stage_label)
         if failure_action != "auto_fallback" and hasattr(
             pipeline, "_record_stage_policy_event"
@@ -772,7 +1238,10 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
             "；".join(messages),
             execution="safe_passthrough",
             reason_code=review_reason_code,
-            details={"stage8_handoff": handoff},
+            details={
+                "stage8_handoff": handoff,
+                "dualband_palette": palette_report,
+            },
             review_reasons=pipeline._stage_review_reasons(8),
         )
         return
@@ -780,9 +1249,6 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
     color_limits = color_safety_limits(
         getattr(pipeline, "pipeline_policy", {}) or {},
         getattr(pipeline, "color_calibration_report", {}) or {},
-    )
-    channel_semantics = str(
-        getattr(pipeline, "_channel_semantics", "unknown") or "unknown"
     )
     broadband_color_allowed = channel_semantics == BROADBAND_RGB_OSC
     physical_broadband_anchor = physical_broadband_anchor_accepted(
@@ -889,6 +1355,30 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                     else "star_preserve_target_bypass"
                 ),
             )
+            subject_chroma_report = _stage8_write_subject_chroma_report(
+                pipeline,
+                status="bypassed_star_preserve",
+                reason_code=(
+                    "star_preserve_secondary_nebulosity"
+                    if overlay_accepted
+                    else "star_preserve_target_bypass"
+                ),
+                source=f"{source_stem}.fit",
+            )
+            palette_report = _stage8_run_dualband_palette(
+                pipeline,
+                messages,
+                base_stem=str(pipeline._stage8_final_source),
+                channel_semantics=channel_semantics,
+                processing_policy="skip",
+                external_override=False,
+            )
+            handoff["color_rendition"] = {
+                "mode": "bypassed_star_preserve",
+                "accepted": False,
+                "report": "stage8_subject_chroma_report.json",
+            }
+            pipeline._stage8_handoff = handoff
             pipeline.starless_file = pipeline.process_dir / f"{pipeline._stage8_final_source}.fit"
             report = {
                 "stage": "stage8_nebula_enhancement",
@@ -907,6 +1397,8 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                 ),
                 "secondary_context": secondary_context,
                 "secondary_nebulosity_overlay": secondary_overlay,
+                "subject_chroma": subject_chroma_report,
+                "dualband_palette": palette_report,
                 "handoff": handoff,
             }
             pipeline._write_stage_json("stage8_enhancement_report.json", report)
@@ -924,7 +1416,11 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                     "stage8_nebula_enhancement",
                     source_stem,
                     "stage8_enhanced",
-                    context={"mode": report["mode"]},
+                    context={
+                        "mode": report["mode"],
+                        "dualband_palette": palette_report,
+                        "subject_chroma": subject_chroma_report,
+                    },
                     candidates=[
                         {
                             "name": (
@@ -967,6 +1463,7 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                 details={
                     "stage8_handoff": handoff,
                     "secondary_nebulosity_overlay": secondary_overlay,
+                    "dualband_palette": palette_report,
                 },
             )
             return
@@ -1096,6 +1593,25 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                     reason_code=reason_code,
                     reason_text=reason_text,
                 )
+                subject_chroma_report = _stage8_write_subject_chroma_report(
+                    pipeline,
+                    status="bypassed_background_only",
+                    reason_code=reason_code,
+                    source="stage8_input_starless.fit",
+                )
+                palette_report = _stage8_run_dualband_palette(
+                    pipeline,
+                    messages,
+                    base_stem="stage8_input_starless",
+                    channel_semantics=channel_semantics,
+                    processing_policy="background_only",
+                    external_override=bool(external_starless_source),
+                )
+                handoff["color_rendition"] = {
+                    "mode": "bypassed_background_only",
+                    "accepted": False,
+                    "report": "stage8_subject_chroma_report.json",
+                }
                 handoff["processing_policy"] = "background_only"
                 handoff["outcome_reason_code"] = (
                     "stage8_background_only_no_incremental_damage"
@@ -1107,6 +1623,7 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                     requested_saturation=float(pipeline.cfg.nebula_saturation),
                     effective_saturation=0.0,
                     applied_saturation=0.0,
+                    palette_report=palette_report,
                 )
                 payload = {
                     **stage8_guard_report,
@@ -1127,6 +1644,8 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                         "baseline instead of repeating Stage5/7/10 denoise"
                     ),
                     "color_quality": color_quality,
+                    "subject_chroma": subject_chroma_report,
+                    "dualband_palette": palette_report,
                     "handoff": handoff,
                     "final_quality": pipeline._stage8_final_quality,
                     "processing_mode": user_processing_mode,
@@ -1156,6 +1675,8 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                         context={
                             "mode": "background_only_passthrough",
                             "reason": reason_text,
+                            "dualband_palette": palette_report,
+                            "subject_chroma": subject_chroma_report,
                         },
                         candidates=[
                             {
@@ -1180,6 +1701,7 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                     details={
                         "reason_text": reason_text,
                         "stage8_handoff": handoff,
+                        "dualband_palette": palette_report,
                     },
                 )
                 return
@@ -1226,6 +1748,31 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                         or "stage8_input_guard_skip"
                     ),
                 )
+                subject_chroma_report = _stage8_write_subject_chroma_report(
+                    pipeline,
+                    status="bypassed_input_guard",
+                    reason_code=str(
+                        stage8_guard_report.get("reason_code")
+                        or "stage8_input_guard_skip"
+                    ),
+                    source="stage8_input_starless.fit",
+                )
+                palette_report = _stage8_run_dualband_palette(
+                    pipeline,
+                    messages,
+                    base_stem="stage8_input_starless",
+                    channel_semantics=channel_semantics,
+                    processing_policy=str(
+                        stage8_guard_report.get("processing_policy") or "skip"
+                    ),
+                    external_override=bool(external_starless_source),
+                )
+                handoff["color_rendition"] = {
+                    "mode": "bypassed_input_guard",
+                    "accepted": False,
+                    "report": "stage8_subject_chroma_report.json",
+                }
+                pipeline._stage8_handoff = handoff
                 messages.append(
                     "stage8 enhancement skipped by input guard: "
                     + (stage8_reject_reason or "unsafe starless input")
@@ -1236,6 +1783,7 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                     requested_saturation=float(pipeline.cfg.nebula_saturation),
                     effective_saturation=0.0,
                     applied_saturation=0.0,
+                    palette_report=palette_report,
                 )
                 guard_payload = {
                     **stage8_guard_report,
@@ -1248,6 +1796,8 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                     "handoff": handoff,
                     "final_quality": pipeline._stage8_final_quality,
                     "color_quality": color_quality,
+                    "subject_chroma": subject_chroma_report,
+                    "dualband_palette": palette_report,
                     "processing_mode": user_processing_mode,
                     "failure_action": failure_action,
                 }
@@ -1268,6 +1818,8 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                         context={
                             "mode": "input_guard_skip",
                             "reasons": guard_reasons,
+                            "dualband_palette": palette_report,
+                            "subject_chroma": subject_chroma_report,
                         },
                         candidates=[
                             {
@@ -1317,6 +1869,7 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                     details={
                         "reason_text": str(handoff.get("reason_text") or ""),
                         "stage8_handoff": handoff,
+                        "dualband_palette": palette_report,
                     },
                     review_reasons=pipeline._stage_review_reasons(8),
                 )
@@ -1374,6 +1927,26 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                 reason_code="stage8_baseline_save_failed",
                 reason_text="stage8_baseline_save_failed",
             )
+            subject_chroma_report = _stage8_write_subject_chroma_report(
+                pipeline,
+                status="prohibited_baseline_save_failed",
+                reason_code="stage8_baseline_save_failed",
+                source=f"{stage8_input_source}.fit",
+            )
+            palette_report = _stage8_run_dualband_palette(
+                pipeline,
+                messages,
+                base_stem=stage8_input_source,
+                channel_semantics=channel_semantics,
+                processing_policy="skip",
+                external_override=bool(external_starless_source),
+            )
+            handoff["color_rendition"] = {
+                "mode": "prohibited_baseline_save_failed",
+                "accepted": False,
+                "report": "stage8_subject_chroma_report.json",
+            }
+            pipeline._stage8_handoff = handoff
             failure_payload = {
                 "stage": "stage8_nebula_enhancement",
                 "status": "degraded",
@@ -1385,6 +1958,8 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                 "passthrough": True,
                 "final_quality": pipeline._stage8_final_quality,
                 "handoff": handoff,
+                "subject_chroma": subject_chroma_report,
+                "dualband_palette": palette_report,
             }
             pipeline._write_stage_json(
                 "stage8_quality.json",
@@ -1406,7 +1981,10 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                 "；".join(messages),
                 execution="safe_passthrough",
                 reason_code="stage8_baseline_save_failed",
-                details={"stage8_handoff": handoff},
+                details={
+                    "stage8_handoff": handoff,
+                    "dualband_palette": palette_report,
+                },
             )
             return
 
@@ -1453,6 +2031,37 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
     effective_plan.update(stage8_processing_plan or {})
     effective_plan["saturation"] = effective_stage8_saturation
     effective_plan["color_policy_limits"] = color_limits
+    resolved_processing_policy = str(
+        stage8_guard_report.get("processing_policy")
+        or ("limited" if stage8_limited_mode else incoming_policy)
+        or "full"
+    ).strip().lower()
+    subject_chroma_budget_reserved = bool(
+        getattr(
+            pipeline.cfg,
+            "stage8_target_aware_chroma_enabled",
+            True,
+        )
+        and getattr(
+            pipeline.cfg,
+            "stage8_nebula_saturation_enabled",
+            True,
+        )
+        and broadband_color_allowed
+        and user_processing_mode.strip().lower() == "auto"
+        and resolved_processing_policy == "full"
+        and not stage8_limited_mode
+        and not stage8_high_risk
+        and bool(getattr(pipeline, "_stage7_stretch_accepted", False))
+        and not bool(external_starless_source)
+        and effective_stage8_saturation > 0.0
+    )
+    if subject_chroma_budget_reserved:
+        effective_plan["saturation"] = 0.0
+        messages.append(
+            "Stage8 positive chroma budget reserved for the post-structure "
+            "target-aware subject transaction"
+        )
     stage8_processing_plan = effective_plan
     if effective_stage8_saturation != requested_saturation:
         messages.append(
@@ -1971,25 +2580,52 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
         messages.append("stage8_enhanced 输出保存失败")
     if pipeline._stage8_final_quality == "unknown":
         pipeline._stage8_final_quality = "ok" if status == "ok" else status
-    stage8_palette_report: Dict[str, Any] = {}
-    if channel_semantics == NARROWBAND_COMPOSITE:
-        stage8_palette_report = _stage8_run_dualband_palette(
-            pipeline,
-            messages,
-            base_stem=str(pipeline._stage8_final_source or "stage8_enhanced"),
-            channel_semantics=channel_semantics,
-            processing_policy="limited" if stage8_limited_mode else "full",
-            external_override=bool(external_starless_source),
-        )
-        if (
-            stage8_palette_report.get("status") == "failed"
-            and not bool(
-                (stage8_palette_report.get("transaction") or {}).get(
-                    "rollback_ok", False
-                )
+    stage8_subject_chroma_report = _stage8_run_subject_chroma(
+        pipeline,
+        messages,
+        base_stem=str(pipeline._stage8_final_source or "stage8_enhanced"),
+        channel_semantics=channel_semantics,
+        processing_policy=(
+            "limited" if stage8_limited_mode else resolved_processing_policy
+        ),
+        user_processing_mode=user_processing_mode,
+        external_override=bool(external_starless_source),
+        requested_saturation_budget=float(
+            getattr(pipeline.cfg, "nebula_saturation", requested_saturation)
+        ),
+        effective_saturation_budget=effective_stage8_saturation,
+        generic_saturation_suppressed=subject_chroma_budget_reserved,
+    )
+    if (
+        stage8_subject_chroma_report.get("status")
+        in {"failed", "failed_rollback_failed", "rejected_rollback_failed"}
+        and not bool(
+            (stage8_subject_chroma_report.get("transaction") or {}).get(
+                "rollback_ok", False
             )
-        ):
-            status = "degraded"
+        )
+    ):
+        status = "degraded"
+    stage8_palette_report = _stage8_run_dualband_palette(
+        pipeline,
+        messages,
+        base_stem=str(pipeline._stage8_final_source or "stage8_enhanced"),
+        channel_semantics=channel_semantics,
+        processing_policy=(
+            "limited" if stage8_limited_mode else resolved_processing_policy
+        ),
+        external_override=bool(external_starless_source),
+    )
+    if (
+        stage8_palette_report.get("status")
+        in {"failed", "failed_rollback_failed"}
+        and not bool(
+            (stage8_palette_report.get("transaction") or {}).get(
+                "rollback_ok", False
+            )
+        )
+    ):
+        status = "degraded"
     stage8_passthrough = pipeline._stage8_final_source == "stage8_input_starless"
     final_reason_code = ""
     final_reason_text = ""
@@ -2032,6 +2668,34 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                 "physical_parent": "stage8_pre_palette.fit",
             }
         )
+    elif bool(stage8_subject_chroma_report.get("accepted", False)):
+        handoff.update(
+            {
+                "color_role": "target_aware_subject_chroma",
+                "color_rendition": {
+                    "mode": "masked_subject_chroma_rendition",
+                    "accepted": True,
+                    "report": "stage8_subject_chroma_report.json",
+                    "factor": (
+                        stage8_subject_chroma_report.get("factor") or {}
+                    ).get("factor"),
+                },
+            }
+        )
+    else:
+        handoff["color_rendition"] = {
+            "mode": str(
+                stage8_subject_chroma_report.get("status")
+                or "skipped"
+            ),
+            "accepted": False,
+            "report": "stage8_subject_chroma_report.json",
+        }
+    handoff["subject_chroma"] = {
+        "status": stage8_subject_chroma_report.get("status"),
+        "accepted": bool(stage8_subject_chroma_report.get("accepted", False)),
+        "report": "stage8_subject_chroma_report.json",
+    }
     pipeline._stage8_handoff = handoff
     saturation_execution = dict(
         getattr(pipeline, "_stage8_saturation_execution", {}) or {}
@@ -2053,12 +2717,18 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
         effective_saturation=effective_stage8_saturation,
         applied_saturation=applied_saturation,
         palette_report=stage8_palette_report,
+        subject_chroma_report=stage8_subject_chroma_report,
     )
     handoff["color_contract"] = color_quality_report.get("contract")
     handoff["color_quality_report"] = "stage8_color_quality_report.json"
     handoff["saturation_execution"] = saturation_execution
     pipeline._stage8_handoff = handoff
     enhancement_report_value = locals().get("enhancement_report")
+    if not isinstance(enhancement_report_value, dict) or not enhancement_report_value:
+        enhancement_report_value = {
+            "stage": "stage8_nebula_enhancement",
+            "status": status,
+        }
     if isinstance(enhancement_report_value, dict) and enhancement_report_value:
         enhancement_report_value["final_quality"] = pipeline._stage8_final_quality
         enhancement_report_value["final_source"] = pipeline._stage8_final_source
@@ -2073,6 +2743,13 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
             getattr(pipeline.cfg, "stage8_quality_retry_max", 1) or 0
         )
         enhancement_report_value["substeps"] = {
+            "target_aware_subject_chroma": bool(
+                getattr(
+                    pipeline.cfg,
+                    "stage8_target_aware_chroma_enabled",
+                    True,
+                )
+            ),
             "nebula_saturation": bool(
                 getattr(pipeline.cfg, "stage8_nebula_saturation_enabled", True)
             ),
@@ -2090,6 +2767,9 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
             ),
         }
         enhancement_report_value["dualband_palette"] = stage8_palette_report or None
+        enhancement_report_value["subject_chroma"] = (
+            stage8_subject_chroma_report
+        )
         enhancement_report_value["color_quality"] = color_quality_report
         enhancement_report_value["handoff"] = handoff
         pipeline._write_stage_json(
@@ -2120,6 +2800,12 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
         "stage8_artistic_palette": str(
             stage8_palette_report.get("palette") or "none"
         ),
+        "stage8_subject_chroma_status": str(
+            stage8_subject_chroma_report.get("status") or "unknown"
+        ),
+        "stage8_subject_chroma_applied": str(
+            bool(stage8_subject_chroma_report.get("accepted", False))
+        ).lower(),
         "channel_semantics": channel_semantics,
     }
     for key, value in summary_fields.items():
@@ -2178,6 +2864,21 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                     "selected": False,
                 }
             )
+        if bool(stage8_subject_chroma_report.get("accepted", False)):
+            stage8_candidates.append(
+                {
+                    "name": "target_aware_subject_chroma",
+                    "stem": "stage8_subject_chroma_candidate",
+                    "status": str(
+                        stage8_subject_chroma_report.get("status")
+                        or "accepted"
+                    ),
+                    "factor": (
+                        stage8_subject_chroma_report.get("factor") or {}
+                    ).get("factor"),
+                    "selected": False,
+                }
+            )
         stage8_candidates.append(
             {
                 "name": "final",
@@ -2198,6 +2899,7 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                 "color_policy_limits": color_limits,
                 "channel_semantics": channel_semantics,
                 "dualband_palette": stage8_palette_report or None,
+                "subject_chroma": stage8_subject_chroma_report,
                 "handoff": handoff,
             },
             candidates=stage8_candidates,
@@ -2223,6 +2925,7 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
             "processing_mode": user_processing_mode,
             "failure_action": failure_action,
             "dualband_palette": stage8_palette_report or None,
+            "subject_chroma": stage8_subject_chroma_report,
         },
         review_reasons=pipeline._stage_review_reasons(8),
     )

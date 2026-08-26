@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from pipeline import run_manifest
+from pipeline import stage5_handoff
 from pipeline.models import (
     ImageFeatures,
     InputProfile,
@@ -72,9 +73,31 @@ class ProcessingParameterPassthroughTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
+    def _freeze_current_stage5_handoff(self) -> dict:
+        (self.pipeline.process_dir / "stage4_color.fit").write_bytes(b"stage4")
+        (self.pipeline.process_dir / "stage5_input_linear.fit").write_bytes(
+            b"baseline"
+        )
+        input_lineage = stage5_handoff.freeze_stage5_input_lineage(
+            self.pipeline,
+            upstream_loaded=True,
+            baseline_saved=True,
+        )
+        return stage5_handoff.freeze_stage5_handoff(
+            self.pipeline,
+            origin=stage5_handoff.CURRENT_RUN_ORIGIN,
+            stage_status="ok",
+            deconvolution_integrity_ok=True,
+            denoise_integrity_ok=True,
+            input_lineage=input_lineage,
+        )
+
     def test_project_default_env_enables_stage5_denoise(self) -> None:
         runtime = ProcessorRuntimeMixin()
-        runtime.cfg = PipelineConfig(denoise_enabled=False)
+        runtime.cfg = PipelineConfig(
+            denoise_enabled=False,
+            stage8_target_aware_chroma_enabled=False,
+        )
         runtime._force_denoise_enabled = None
         runtime.log = self.pipeline.log
         runtime._sync_logger_level = lambda: None
@@ -85,11 +108,38 @@ class ProcessingParameterPassthroughTests(unittest.TestCase):
 
             self.assertEqual(os.environ["STARUN_DENOISE_ENABLE"], "1")
             self.assertTrue(runtime.cfg.denoise_enabled)
+            self.assertEqual(
+                os.environ["STARUN_STAGE8_TARGET_AWARE_CHROMA_ENABLE"],
+                "1",
+            )
+            self.assertTrue(runtime.cfg.stage8_target_aware_chroma_enabled)
+            for retired in (
+                "STARUN_STAGE4_NBN_ENABLE",
+                "STARUN_STAGE4_NBN_STRENGTH",
+                "STARUN_STAGE4_NBN_GAIN_LIMIT",
+                "STARUN_STAGE4_NBN_LINE_RATIO_DRIFT_MAX",
+            ):
+                self.assertNotIn(retired, os.environ)
             self.assertNotIn("STARUN_STAGE4_LOCAL_STAR_WB_ENABLE", os.environ)
             self.assertNotIn(
                 "STARUN_STAGE4_LOCAL_STAR_WB_GAIN_LIMIT",
                 os.environ,
             )
+
+    def test_stage8_target_aware_chroma_env_override_is_applied(self) -> None:
+        runtime = ProcessorRuntimeMixin()
+        runtime.cfg = PipelineConfig(stage8_target_aware_chroma_enabled=True)
+        runtime.log = self.pipeline.log
+        runtime._sync_logger_level = lambda: None
+
+        with patch.dict(
+            os.environ,
+            {"STARUN_STAGE8_TARGET_AWARE_CHROMA_ENABLE": "0"},
+            clear=True,
+        ):
+            runtime._apply_runtime_env_overrides()
+
+        self.assertFalse(runtime.cfg.stage8_target_aware_chroma_enabled)
 
     def test_stage7_luma_noise_growth_env_is_loaded_and_clamped(self) -> None:
         runtime = ProcessorRuntimeMixin()
@@ -212,6 +262,7 @@ class ProcessingParameterPassthroughTests(unittest.TestCase):
         self.assertFalse(any(command[0] == "platesolve" for command in self.pipeline.commands))
 
     def test_stage5_user_preserve_keeps_linear_artifact_and_diagnostics(self) -> None:
+        (self.pipeline.process_dir / "stage4_color.fit").write_bytes(b"stage4")
         self.pipeline.cfg.stage5_processing_mode = "preserve"
         self.pipeline._export_linear_intermediate = lambda: True
         reports = {}
@@ -230,6 +281,7 @@ class ProcessingParameterPassthroughTests(unittest.TestCase):
 
     def test_stage6_user_preserve_establishes_starless_bypass_state(self) -> None:
         (self.pipeline.process_dir / "stage5_linear.fit").touch()
+        self._freeze_current_stage5_handoff()
         self.pipeline.cfg.stage6_processing_mode = "preserve"
 
         stage6_star_separation.run_stage6_star_separation(self.pipeline)
@@ -246,6 +298,7 @@ class ProcessingParameterPassthroughTests(unittest.TestCase):
 
     def test_stage6_user_preserve_never_falls_through_when_save_fails(self) -> None:
         (self.pipeline.process_dir / "stage5_linear.fit").touch()
+        self._freeze_current_stage5_handoff()
         self.pipeline.cfg.stage6_processing_mode = "preserve"
         original_save = self.pipeline._save_stage_output
         self.pipeline._save_stage_output = lambda stem: (

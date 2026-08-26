@@ -121,11 +121,7 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "STARUN_STAGE4_SPCC_NB_G_BANDWIDTH_NM",
         "STARUN_STAGE4_SPCC_NB_B_WAVELENGTH_NM",
         "STARUN_STAGE4_SPCC_NB_B_BANDWIDTH_NM",
-        "STARUN_STAGE4_NBN_ENABLE",
         "STARUN_STAGE4_NBN_MAPPING_CONFIDENCE_MIN",
-        "STARUN_STAGE4_NBN_STRENGTH",
-        "STARUN_STAGE4_NBN_GAIN_LIMIT",
-        "STARUN_STAGE4_NBN_LINE_RATIO_DRIFT_MAX",
         "STARUN_GAIA_ASTRO_CATALOG",
         "STARUN_STAGE4_FILTER_HINT",
         "STARUN_STAGE4_OFFLINE_FALLBACK_MODE",
@@ -200,6 +196,7 @@ PROJECT_ENV_ALLOWED_KEYS = frozenset(
         "STARUN_STAGE7_STARLESS_REPAIR_CHROMA_DELTA_MIN",
         "STARUN_STAGE7_STARMASK_DIFFUSE_RESIDUAL_RATIO_MAX",
         "STARUN_STAGE8_FORCE_CONSERVATIVE_AFTER_STAGE7_REPAIR",
+        "STARUN_STAGE8_TARGET_AWARE_CHROMA_ENABLE",
         "STARUN_STAGE8_LOCAL_ADJUSTMENT_ENGINE_ENABLE",
         "STARUN_STAGE8_LOCAL_CURVE_OPACITY",
         "STARUN_STAGE8_LIMITED_SATURATION_MAX",
@@ -1238,25 +1235,6 @@ class ProcessorRuntimeMixin:
                     "keeping current setting"
                 )
 
-        stage4_nbn_raw = os.getenv("STARUN_STAGE4_NBN_ENABLE")
-        if stage4_nbn_raw is not None:
-            parsed = self._parse_env_bool(
-                stage4_nbn_raw,
-                getattr(
-                    self.cfg,
-                    "stage4_narrowband_normalization_enabled",
-                    True,
-                ),
-            )
-            self.cfg.stage4_narrowband_normalization_enabled = parsed
-            if stage4_nbn_raw.strip().lower() not in (
-                ENV_TRUE_VALUES | ENV_FALSE_VALUES
-            ):
-                self.log.warn(
-                    "STARUN_STAGE4_NBN_ENABLE has invalid value; "
-                    "keeping current setting"
-                )
-
         stage4_spcc_raw = os.getenv("STARUN_SPCC_ENABLE")
         if stage4_spcc_raw is not None:
             parsed = self._parse_env_bool(
@@ -1326,13 +1304,6 @@ class ProcessorRuntimeMixin:
             (
                 "STARUN_STAGE4_NBN_MAPPING_CONFIDENCE_MIN",
                 "stage4_nbn_mapping_confidence_min",
-                float,
-            ),
-            ("STARUN_STAGE4_NBN_STRENGTH", "stage4_nbn_strength", float),
-            ("STARUN_STAGE4_NBN_GAIN_LIMIT", "stage4_nbn_gain_limit", float),
-            (
-                "STARUN_STAGE4_NBN_LINE_RATIO_DRIFT_MAX",
-                "stage4_nbn_line_ratio_drift_max",
                 float,
             ),
             ("STARUN_STAGE4_SPCC_TIMEOUT_SEC", "stage4_spcc_timeout_sec", int),
@@ -1753,6 +1724,7 @@ class ProcessorRuntimeMixin:
             ("STARUN_STAGE7_STARLESS_STRUCTURE_GATE_ENABLE", "stage7_starless_structure_gate_enabled"),
             ("STARUN_STAGE7_QUANTILE_FALLBACK_ENABLE", "stage7_quantile_fallback_enabled"),
             ("STARUN_STAGE8_FORCE_CONSERVATIVE_AFTER_STAGE7_REPAIR", "stage8_force_conservative_after_stage7_repair"),
+            ("STARUN_STAGE8_TARGET_AWARE_CHROMA_ENABLE", "stage8_target_aware_chroma_enabled"),
             ("STARUN_STAGE8_LOCAL_ADJUSTMENT_ENGINE_ENABLE", "stage8_local_adjustment_engine_enabled"),
             ("STARUN_STAGE9_SASP_STAR_STRETCH_ENABLE", "stage9_sasp_star_stretch_enabled"),
             ("STARUN_STAGE9_NB_TO_RGB_STARS_ENABLE", "stage9_nb_to_rgb_stars_enabled"),
@@ -2410,6 +2382,9 @@ class ProcessorRuntimeMixin:
                                 "actual_sha256": actual_sha256,
                                 "run_manifest_hash": resume.get(
                                     "run_manifest_hash"
+                                ),
+                                "config_fingerprint": resume.get(
+                                    "config_fingerprint"
                                 ),
                                 "detail": (
                                     "task-run manifest, stage contract, and "
@@ -3417,11 +3392,10 @@ class ProcessorRuntimeMixin:
                     or {}
                 ),
                 "artistic_hoo": dict(
-                    (getattr(self, "color_calibration_report", {}) or {}).get(
-                        "artistic_hoo",
-                        {},
-                    )
-                    or {}
+                    getattr(self, "_stage8_palette_report", {}) or {}
+                ),
+                "subject_chroma": dict(
+                    getattr(self, "_stage8_subject_chroma_report", {}) or {}
                 ),
             },
             "star_separation": {

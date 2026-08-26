@@ -52,6 +52,7 @@ from models import (  # noqa: E402
     PipelineStage,
 )
 import stage9_quality  # noqa: E402
+import stage5_handoff  # noqa: E402
 import stage7_quality  # noqa: E402
 import stage7_stretch_metrics  # noqa: E402
 import stage7_repair  # noqa: E402
@@ -3479,6 +3480,7 @@ class PipelineStageSmokeTests(unittest.TestCase):
         )
 
     def test_stage5_linear_denoise_smoke(self) -> None:
+        (self.process_dir / "stage4_color.fit").write_bytes(b"stage4")
         self.pipeline._export_linear_intermediate = lambda: True
         self.pipeline._active_policy_name = lambda: "generic_low_snr_safe"
         self.pipeline._active_target_type = lambda: "generic_low_snr_safe"
@@ -3507,6 +3509,21 @@ class PipelineStageSmokeTests(unittest.TestCase):
 
     def test_stage6_star_separation_source_is_always_linear(self) -> None:
         (self.process_dir / "stage5_linear.fit").touch()
+        (self.process_dir / "stage4_color.fit").write_bytes(b"stage4")
+        (self.process_dir / "stage5_input_linear.fit").write_bytes(b"baseline")
+        input_lineage = stage5_handoff.freeze_stage5_input_lineage(
+            self.pipeline,
+            upstream_loaded=True,
+            baseline_saved=True,
+        )
+        handoff = stage5_handoff.freeze_stage5_handoff(
+            self.pipeline,
+            origin=stage5_handoff.CURRENT_RUN_ORIGIN,
+            stage_status="ok",
+            deconvolution_integrity_ok=True,
+            denoise_integrity_ok=True,
+            input_lineage=input_lineage,
+        )
 
         source, mode, records = stage6_star_separation._prepare_star_separation_source(
             self.pipeline
@@ -3516,13 +3533,48 @@ class PipelineStageSmokeTests(unittest.TestCase):
         self.assertEqual(mode, "linear_star_separation")
         self.assertEqual(self.pipeline.stretched_name, "stage5_linear")
         self.assertFalse(any(command[0] == "asinh" for command in self.pipeline.commands))
-        self.assertEqual(records, [{
-            "mode": "linear_star_separation",
-            "source_stem": "stage5_linear",
-            "status": "selected",
-            "method": "linear",
-            "domain": "linear",
-        }])
+        self.assertEqual(records[0]["source_stem"], "stage5_linear")
+        self.assertEqual(records[0]["source_lineage"], handoff)
+
+    def test_stage6_rejects_older_checkpoint_without_stage5_handoff(self) -> None:
+        (self.process_dir / "stage5_graxpert_deconv.fit").touch()
+        (self.process_dir / "stage4_color.fit").touch()
+        (self.process_dir / "working.fit").touch()
+        reports = {}
+        metadata = {}
+        self.pipeline._write_stage_json = (
+            lambda name, payload: reports.__setitem__(name, payload)
+        )
+        original_record_stage = self.pipeline._record_stage
+
+        def capture_record_stage(*args, **kwargs):
+            metadata.update(kwargs)
+            return original_record_stage(*args, **kwargs)
+
+        self.pipeline._record_stage = capture_record_stage
+
+        with self.assertRaises(stage6_star_separation.SirilError):
+            stage6_star_separation.run_stage6_star_separation(self.pipeline)
+
+        report = reports["stage6_starless_quality.json"]
+        self.assertEqual(report["mode"], "upstream_source_rejected")
+        self.assertEqual(
+            report["reason_code"],
+            stage5_handoff.REASON_LINEAGE_UNVERIFIED,
+        )
+        self.assertEqual(self.pipeline.results[-1][1], "failed")
+        self.assertEqual(metadata["components"]["input_source"]["status"], "failed")
+        self.assertTrue(metadata["components"]["input_source"]["fatal"])
+        self.assertTrue(
+            metadata["details"]["stage8_handoff"]["restricted_downstream"]
+        )
+        self.assertFalse((self.process_dir / "stage6_passthrough.fit").exists())
+        self.assertFalse(
+            any(
+                command and command[0] in {"script", "pyscript", "syqon"}
+                for command in self.pipeline.commands
+            )
+        )
 
     def test_stage8_nebula_enhancement_smoke(self) -> None:
         self.pipeline.cfg.stage8_masked_enhancement_enabled = True

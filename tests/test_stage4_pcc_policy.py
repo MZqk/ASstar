@@ -70,7 +70,6 @@ def _pipeline(shape=(3, 64, 64)):
         stage4_spcc_narrowband_g_bandwidth_nm=30.0,
         stage4_spcc_narrowband_b_wavelength_nm=500.70,
         stage4_spcc_narrowband_b_bandwidth_nm=30.0,
-        stage4_narrowband_normalization_enabled=True,
         stage4_nbn_mapping_confidence_min=0.85,
         stage4_pcc_timeout_sec=180,
         stage4_pcc_quality_gate_enabled=True,
@@ -441,23 +440,13 @@ class Stage4PccPolicyTests(unittest.TestCase):
             r"^[0-9a-f]{64}$",
         )
 
-    def test_stage4_reuses_one_mapping_for_spcc_and_hoo(self):
+    def test_stage4_freezes_one_mapping_for_spcc_and_stage8_palette(self):
         pipeline, saved, _commands, _results = _stage4_integration_fixture(
             filter_name="Ha+OIII dual-band"
         )
-        captured = {}
-
         def spcc_success(**_kwargs):
             saved[stage4.SPCC_CANDIDATE_STEM] = pipeline.current.copy()
             return True, "spcc narrowband ok"
-
-        def hoo_derivative(_pipeline, mapping):
-            captured["mapping"] = mapping
-            return False, {
-                "status": "skipped_test",
-                "accepted": False,
-                "mapping": mapping,
-            }, "HOO skipped by test"
 
         pipeline._run_stage4_spcc_once = spcc_success
         original_resolver = stage4.resolve_dual_narrowband_mapping
@@ -468,11 +457,6 @@ class Stage4PccPolicyTests(unittest.TestCase):
                 "resolve_dual_narrowband_mapping",
                 wraps=original_resolver,
             ) as resolver,
-            patch.object(
-                stage4,
-                "_stage4_run_narrowband_normalization",
-                hoo_derivative,
-            ),
         ):
             stage4.run_stage4_color_calibration(pipeline)
 
@@ -482,8 +466,6 @@ class Stage4PccPolicyTests(unittest.TestCase):
             pipeline.channel_profile["narrowband_mapping"],
             mapping,
         )
-        self.assertEqual(captured["mapping"], mapping)
-        self.assertIs(captured["mapping"], mapping)
         self.assertEqual(
             pipeline.color_calibration_report["spcc"]["parameters"]["mapping"],
             mapping,
@@ -491,6 +473,18 @@ class Stage4PccPolicyTests(unittest.TestCase):
         self.assertEqual(
             pipeline.color_calibration_report["channel_mapping"],
             mapping,
+        )
+        self.assertEqual(
+            pipeline.color_calibration_report["artistic_hoo"][
+                "mapping_evidence"
+            ],
+            mapping,
+        )
+        self.assertEqual(
+            pipeline.color_calibration_report["artistic_hoo"][
+                "stage8_report"
+            ],
+            "stage8_palette_report.json",
         )
 
     def test_stage8_uses_frozen_mapping_not_changed_header(self):
@@ -2852,7 +2846,7 @@ class Stage4PccPolicyTests(unittest.TestCase):
             "spcc_exception_pcc_fallback",
         )
 
-    def test_narrowband_hoo_derivative_does_not_feed_main_pipeline(self):
+    def test_narrowband_hoo_is_delegated_to_stage8_without_pixel_derivative(self):
         pipeline, saved, _commands, _results = _stage4_integration_fixture(
             filter_name="Ha+OIII dual-band"
         )
@@ -2863,10 +2857,6 @@ class Stage4PccPolicyTests(unittest.TestCase):
             saved[stage4.SPCC_CANDIDATE_STEM] = pipeline.current.copy()
             return True, "spcc narrowband ok"
 
-        def hoo_derivative(_pipeline, _metadata):
-            _pipeline.current = np.clip(_pipeline.current * 1.5, 0.0, 1.0)
-            return True, {"accepted": True, "status": "accepted"}, "HOO accepted"
-
         pipeline._run_stage4_spcc_once = spcc_success
         pipeline._run_stage4_pcc_once = lambda **_kwargs: self.fail(
             "narrowband must not invoke PCC"
@@ -2874,7 +2864,6 @@ class Stage4PccPolicyTests(unittest.TestCase):
 
         with (
             patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False),
-            patch.object(stage4, "_stage4_run_narrowband_normalization", hoo_derivative),
         ):
             stage4.run_stage4_color_calibration(pipeline)
 
@@ -2885,12 +2874,7 @@ class Stage4PccPolicyTests(unittest.TestCase):
                 saved[stage4.PHYSICAL_COLOR_STEM],
             )
         )
-        self.assertFalse(
-            np.allclose(
-                saved[stage4.HOO_ARTISTIC_STEM],
-                saved[stage4.PHYSICAL_COLOR_STEM],
-            )
-        )
+        self.assertNotIn("stage4_hoo_artistic", saved)
         report = pipeline.color_calibration_report
         self.assertEqual(report["method"], "SPCC_NARROWBAND")
         self.assertEqual(
@@ -2898,6 +2882,15 @@ class Stage4PccPolicyTests(unittest.TestCase):
             "shadow_skipped_physical_color_accepted",
         )
         self.assertFalse(report["artistic_hoo"]["feeds_main_pipeline"])
+        self.assertEqual(
+            report["artistic_hoo"]["status"],
+            "delegated_to_stage8",
+        )
+        self.assertEqual(
+            report["artistic_hoo"]["stage8_report"],
+            "stage8_palette_report.json",
+        )
+        self.assertIsNone(report["artistic_hoo"]["output"])
         self.assertEqual(
             report["artistic_hoo"]["physical_parent"],
             "stage4_physical_color.fit",
@@ -2922,15 +2915,8 @@ class Stage4PccPolicyTests(unittest.TestCase):
             )
             return True, "pcc degraded ok"
 
-        def hoo_derivative(_pipeline, _metadata):
-            _pipeline.current = np.clip(_pipeline.current * 1.5, 0.0, 1.0)
-            return True, {"accepted": True, "status": "accepted"}, "HOO accepted"
-
         pipeline._run_stage4_pcc_once = pcc_success
-        with (
-            patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False),
-            patch.object(stage4, "_stage4_run_narrowband_normalization", hoo_derivative),
-        ):
+        with patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False):
             stage4.run_stage4_color_calibration(pipeline)
 
         report = pipeline.color_calibration_report
@@ -2957,8 +2943,10 @@ class Stage4PccPolicyTests(unittest.TestCase):
         self.assertTrue(
             np.allclose(saved["stage4_color"], saved[stage4.PCC_CANDIDATE_STEM])
         )
-        self.assertFalse(
-            np.allclose(saved["stage4_color"], saved[stage4.HOO_ARTISTIC_STEM])
+        self.assertNotIn("stage4_hoo_artistic", saved)
+        self.assertEqual(
+            report["artistic_hoo"]["status"],
+            "delegated_to_stage8",
         )
         self.assertEqual(results[-1][0][1], "degraded")
         self.assertTrue(results[-1][1]["fallback_used"])
@@ -2988,14 +2976,7 @@ class Stage4PccPolicyTests(unittest.TestCase):
             return True, "pcc collapsed lines"
 
         pipeline._run_stage4_pcc_once = pcc_success
-        with (
-            patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False),
-            patch.object(
-                stage4,
-                "_stage4_run_narrowband_normalization",
-                return_value=(False, {"accepted": False}, "not applied"),
-            ),
-        ):
+        with patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False):
             stage4.run_stage4_color_calibration(pipeline)
 
         report = pipeline.color_calibration_report
@@ -3062,156 +3043,6 @@ class Stage4PccPolicyTests(unittest.TestCase):
             "narrowband_channel_gain_ratio_exceeded",
             report["issues"],
         )
-
-    def test_narrowband_physical_restore_failure_uses_pre_color_for_main_pipeline(self):
-        pipeline, saved, _commands, results = _stage4_integration_fixture(
-            filter_name="Ha+OIII dual-band"
-        )
-        original_command = pipeline.cmd_with_check
-
-        def command(*args, **kwargs):
-            if args[:2] == ("load", stage4.PHYSICAL_COLOR_STEM):
-                raise stage4.CommandError("physical checkpoint unreadable")
-            return original_command(*args, **kwargs)
-
-        def spcc_success(**_kwargs):
-            saved[stage4.SPCC_CANDIDATE_STEM] = pipeline.current.copy()
-            return True, "spcc narrowband ok"
-
-        def hoo_derivative(_pipeline, _metadata):
-            _pipeline.current = np.clip(_pipeline.current * 1.5, 0.0, 1.0)
-            return True, {"accepted": True, "status": "accepted"}, "HOO accepted"
-
-        pipeline.cmd_with_check = command
-        pipeline._run_stage4_spcc_once = spcc_success
-
-        with (
-            patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False),
-            patch.object(stage4, "_stage4_run_narrowband_normalization", hoo_derivative),
-        ):
-            stage4.run_stage4_color_calibration(pipeline)
-
-        report = pipeline.color_calibration_report
-        self.assertTrue(report["requires_review"])
-        self.assertEqual(report["method"], "PRESERVE_INPUT")
-        self.assertFalse(report["physical_color"]["accepted"])
-        self.assertEqual(
-            report["physical_color"]["main_pipeline_restore"]["source"],
-            "stage4_pre_pcc.fit",
-        )
-        self.assertTrue(
-            report["physical_color"]["main_pipeline_restore"]["fallback_used"]
-        )
-        self.assertTrue(
-            np.allclose(saved["stage4_color"], saved[stage4.PCC_CHECKPOINT_STEM])
-        )
-        self.assertFalse(
-            np.allclose(saved["stage4_color"], saved[stage4.HOO_ARTISTIC_STEM])
-        )
-        self.assertEqual(results[-1][0][1], "degraded")
-        self.assertTrue(results[-1][1]["fallback_used"])
-
-    def test_narrowband_restore_uses_in_memory_pre_color_after_file_failures(self):
-        pipeline, saved, _commands, results = _stage4_integration_fixture(
-            filter_name="Ha+OIII dual-band"
-        )
-        original_command = pipeline.cmd_with_check
-
-        def command(*args, **kwargs):
-            if args[:2] in {
-                ("load", stage4.PHYSICAL_COLOR_STEM),
-                ("load", stage4.PCC_CHECKPOINT_STEM),
-            }:
-                raise stage4.CommandError("checkpoint unreadable")
-            return original_command(*args, **kwargs)
-
-        def spcc_success(**_kwargs):
-            saved[stage4.SPCC_CANDIDATE_STEM] = pipeline.current.copy()
-            return True, "spcc narrowband ok"
-
-        def hoo_derivative(_pipeline, _metadata):
-            _pipeline.current = np.clip(_pipeline.current * 1.5, 0.0, 1.0)
-            return True, {"accepted": True, "status": "accepted"}, "HOO accepted"
-
-        pipeline.cmd_with_check = command
-        pipeline._run_stage4_spcc_once = spcc_success
-
-        with (
-            patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False),
-            patch.object(stage4, "_stage4_run_narrowband_normalization", hoo_derivative),
-        ):
-            stage4.run_stage4_color_calibration(pipeline)
-
-        report = pipeline.color_calibration_report
-        self.assertEqual(
-            report["physical_color"]["main_pipeline_restore"]["source"],
-            "in_memory_pre_color",
-        )
-        self.assertTrue(report["requires_review"])
-        self.assertTrue(
-            np.allclose(saved["stage4_color"], saved["stage3_bgremoved"])
-        )
-        self.assertFalse(
-            np.allclose(saved["stage4_color"], saved[stage4.HOO_ARTISTIC_STEM])
-        )
-        self.assertEqual(results[-1][0][1], "degraded")
-        self.assertTrue(results[-1][1]["fallback_used"])
-
-    def test_narrowband_restore_failure_blocks_main_output_when_no_safe_source_exists(self):
-        pipeline, saved, _commands, results = _stage4_integration_fixture(
-            filter_name="Ha+OIII dual-band"
-        )
-        original_command = pipeline.cmd_with_check
-
-        def command(*args, **kwargs):
-            if args[:2] in {
-                ("load", stage4.PHYSICAL_COLOR_STEM),
-                ("load", stage4.PCC_CHECKPOINT_STEM),
-            }:
-                raise stage4.CommandError("checkpoint unreadable")
-            return original_command(*args, **kwargs)
-
-        def spcc_success(**_kwargs):
-            saved[stage4.SPCC_CANDIDATE_STEM] = pipeline.current.copy()
-            return True, "spcc narrowband ok"
-
-        def hoo_derivative(_pipeline, _metadata):
-            _pipeline.current = np.clip(_pipeline.current * 1.5, 0.0, 1.0)
-            return True, {"accepted": True, "status": "accepted"}, "HOO accepted"
-
-        pipeline.cmd_with_check = command
-        pipeline._run_stage4_spcc_once = spcc_success
-        pipeline.siril.set_image_pixeldata = lambda _pixels: (_ for _ in ()).throw(
-            RuntimeError("in-memory restore rejected")
-        )
-
-        with (
-            patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False),
-            patch.object(stage4, "_stage4_run_narrowband_normalization", hoo_derivative),
-            self.assertRaisesRegex(
-                RuntimeError,
-                "immutable pre-color baseline could not be restored",
-            ),
-        ):
-            stage4.run_stage4_color_calibration(pipeline)
-
-        self.assertNotIn("stage4_color", saved)
-        self.assertIsNone(pipeline.color_calibration_report["outputs"]["color"])
-        self.assertEqual(pipeline.color_calibration_report["status"], "failed")
-        self.assertTrue(pipeline.color_calibration_report["main_output_blocked"])
-        self.assertEqual(
-            pipeline.color_calibration_report["components"]["color_calibration"][
-                "status"
-            ],
-            "failed",
-        )
-        self.assertFalse(
-            pipeline.color_calibration_report["physical_color"][
-                "feeds_main_pipeline"
-            ]
-        )
-        self.assertEqual(results[-1][0][1], "failed")
-        self.assertEqual(results[-1][1]["reason_code"], "stage4_main_output_blocked")
 
     def test_retired_local_star_report_is_emitted_after_auto_reference_rejection(self):
         pipeline, _saved, _commands, _results = _stage4_integration_fixture()

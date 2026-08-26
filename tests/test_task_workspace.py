@@ -768,6 +768,33 @@ class TaskWorkspaceTests(unittest.TestCase):
         self.assertEqual(discovery.kind, InputKind.PRODUCT_TASK)
         self.assertEqual(discovery.resume_after_stage, 5)
 
+    def test_begin_run_rejects_resume_fingerprint_mismatched_with_current_run(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            _, source_record, workspace = self._workspace(Path(td))
+            fingerprints = task_plan.build_resume_fingerprints(
+                input_fingerprint=source_record["fingerprint"],
+                stage_config={stage: {"value": stage} for stage in range(1, 6)},
+            )
+            self._write_checkpoints(workspace, fingerprints)
+            inspection = inspect_task_workspace(
+                workspace.root,
+                current_resume_fingerprints=fingerprints,
+            )
+            resume_record = dict(inspection["resume_record"])
+            resume_record["config_fingerprint"] = "tampered-fingerprint"
+
+            with self.assertRaisesRegex(
+                WorkspaceError,
+                "配置指纹与当前任务不一致",
+            ):
+                begin_task_run(
+                    workspace=workspace,
+                    source_record=source_record,
+                    run_id="mismatched-resume-fingerprint",
+                    resume_record=resume_record,
+                    checkpoint_fingerprints=fingerprints,
+                )
+
     def test_corrupt_stage5_falls_back_to_verified_stage2(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             _, source_record, workspace = self._workspace(Path(td))

@@ -18,14 +18,24 @@ except ImportError:  # Direct execution from the pipeline directory.
     from models import PipelineConfig  # type: ignore[no-redef]
 
 
-PROCESSING_PARAMETERS_SCHEMA = "starun.processing-parameters.v6"
+PROCESSING_PARAMETERS_SCHEMA = "starun.processing-parameters.v7"
+LEGACY_PROCESSING_PARAMETERS_SCHEMA_V6 = "starun.processing-parameters.v6"
 LEGACY_PROCESSING_PARAMETERS_SCHEMA_V5 = "starun.processing-parameters.v5"
 LEGACY_PROCESSING_PARAMETERS_SCHEMA_V4 = "starun.processing-parameters.v4"
 SUPPORTED_PROCESSING_PARAMETERS_SCHEMAS = frozenset(
     {
         PROCESSING_PARAMETERS_SCHEMA,
+        LEGACY_PROCESSING_PARAMETERS_SCHEMA_V6,
         LEGACY_PROCESSING_PARAMETERS_SCHEMA_V5,
         LEGACY_PROCESSING_PARAMETERS_SCHEMA_V4,
+    }
+)
+LEGACY_STAGE4_HOO_PIXEL_FIELDS = frozenset(
+    {
+        "stage4_narrowband_normalization_enabled",
+        "stage4_nbn_strength",
+        "stage4_nbn_gain_limit",
+        "stage4_nbn_line_ratio_drift_max",
     }
 )
 LEGACY_STAGE3_PROCESSING_FIELDS = frozenset(
@@ -334,8 +344,6 @@ PROCESSING_PARAMETER_SPECS: Tuple[ParameterSpec, ...] = (
     ParameterSpec("stage4_spcc_narrowband_g_bandwidth_nm", 4, "G/OIII 带宽", "expert", "float", 1.0, 100.0, 0.5, 1, suffix=" nm"),
     ParameterSpec("stage4_spcc_narrowband_b_wavelength_nm", 4, "B/OIII 中心波长", "expert", "float", 300.0, 900.0, 0.1, 2, suffix=" nm"),
     ParameterSpec("stage4_spcc_narrowband_b_bandwidth_nm", 4, "B/OIII 带宽", "expert", "float", 1.0, 100.0, 0.5, 1, suffix=" nm"),
-    ParameterSpec("stage4_narrowband_normalization_enabled", 4, "窄带归一化", "expert", "bool"),
-    ParameterSpec("stage4_nbn_strength", 4, "窄带归一化强度", "expert", "float", 0.0, 1.0, 0.05, 2),
     _spec(
         "stage4_pcc_channel_gain_ratio_max", 4, "诊断 · 校色通道增益跨度",
         "float", 1.10, 10.0, 0.10, 2, suffix="×", section="diagnostics",
@@ -1134,12 +1142,6 @@ PROCESSING_PARAMETER_SPECS += (
     _spec("stage7_bright_nebula_star_faint_suppression", 7, "弱信号抑制", "float", 0.0, 1.0, 0.05, 2),
     _spec("stage7_bright_nebula_star_detail_suppression", 7, "细节抑制", "float", 0.0, 0.60, 0.01, 2),
     _spec(
-        "stage7_vivid_subject_chroma_enabled", 7, "安全主体增色", "bool",
-        section="algorithm",
-        depends_on=(("stage7_rendition_intent", ("vivid_safe",)),),
-        help="仅增强冻结主体区域的低频色度，并逐像素限制到可用 RGB 余量。",
-    ),
-    _spec(
         "stage7_chroma_rescue_max_attempts", 7, "色度救援次数", "int",
         0, 3, 1, 0, section="fallback",
     ),
@@ -1155,6 +1157,18 @@ PROCESSING_PARAMETER_SPECS += (
             ("保留输入", "preserve"),
         ),
         help="只作为增强上限；上游安全门仍可继续降级。",
+    ),
+    _spec(
+        "stage8_target_aware_chroma_enabled",
+        8,
+        "主体低频增色",
+        "bool",
+        section="algorithm",
+        depends_on=(
+            ("stage8_processing_mode", ("auto",)),
+            ("stage8_nebula_saturation_enabled", (True,)),
+        ),
+        help="仅在完整 Stage 8 增强中对冻结主体区域做保亮度、保余量的低频色度增强。",
     ),
     _spec("stage8_nebula_saturation_enabled", 8, "启用星云饱和度", "bool", section="execution", depends_on=(("stage8_processing_mode", ("auto", "limited")),)),
     _spec("stage8_background_denoise_enabled", 8, "启用背景降噪", "bool", section="execution", depends_on=(("stage8_processing_mode", ("auto", "limited", "background_only")),)),
@@ -1216,7 +1230,7 @@ PROCESSING_GATE_PARAMETER_SPECS: Tuple[ParameterSpec, ...] = (
     _gate("stage3_walking_noise_score_min", 3, "Walking Noise 评分下限", "float", 0.25, 0.90, 0.01, 2),
     _gate("stage3_pattern_score_growth_max", 3, "方向噪声增长上限", "float", 0.02, 0.40, 0.01, 2),
 
-    # Stage 4: geometry, narrowband normalization and color-candidate rollback.
+    # Stage 4: geometry, narrowband mapping and color-candidate rollback.
     _gate("stage4_auto_reference_background_sample_target", 4, "自动参考背景样点目标", "int", 16, 64, 1),
     _gate("stage4_auto_reference_background_sample_min", 4, "自动参考背景样点下限", "int", 16, 40, 1),
     _gate("stage4_auto_reference_holdout_ratio", 4, "自动参考留出比例", "float", 0.20, 0.40, 0.01, 2),
@@ -1235,8 +1249,6 @@ PROCESSING_GATE_PARAMETER_SPECS: Tuple[ParameterSpec, ...] = (
     _gate("stage4_auto_geometry_confidence_min", 4, "自动几何置信度", "float", 0.0, 1.0, 0.01, 2),
     _gate("stage4_auto_geometry_scale_residual_max", 4, "WCS 比例残差", "float", 0.01, 0.25, 0.01, 2),
     _gate("stage4_nbn_mapping_confidence_min", 4, "窄带映射置信度", "float", 0.70, 0.99, 0.01, 2),
-    _gate("stage4_nbn_gain_limit", 4, "窄带通道增益上限", "float", 1.01, 1.15, 0.01, 2, suffix="×"),
-    _gate("stage4_nbn_line_ratio_drift_max", 4, "Ha/OIII 比例漂移", "float", 0.04, 0.20, 0.01, 2),
     # Stage 5: denoise strength cap and shared candidate acceptance gates.
     _gate("denoise_safety_max", 5, "降噪强度安全上限", "float", 0.20, 0.55, 0.01, 2),
     _gate("stage5_multiscale_detail_retention_min", 5, "主体细节保留下限", "float", 0.70, 0.98, 0.01, 2),
@@ -1474,7 +1486,6 @@ _GATE_PROFILE_RULES: Dict[
     # sample construction stay on their static safe behavior.
     "stage4_auto_geometry_confidence_min": (PROFILE_SCALE_LOWER, 0.0, 1.0),
     "stage4_auto_geometry_scale_residual_max": (PROFILE_SCALE_UPPER, 0.0, None),
-    "stage4_nbn_line_ratio_drift_max": (PROFILE_SCALE_UPPER, 0.0, 1.0),
     # Stage 5: measured detail/noise acceptance; denoise strength stays fixed.
     "stage5_multiscale_detail_retention_min": (PROFILE_SCALE_LOWER, 0.0, 1.0),
     "stage5_multiscale_noise_reduction_min": (PROFILE_SCALE_LOWER, 0.0, 1.0),
@@ -1609,7 +1620,6 @@ _GATE_PROFILE_EXCLUDED_FIELDS = frozenset(
         "stage4_auto_reference_texture_growth_max",
         "stage4_auto_reference_target_chroma_drift_max",
         "stage4_nbn_mapping_confidence_min",
-        "stage4_nbn_gain_limit",
         "denoise_safety_max",
         "stage7_galaxy_roi_halo_gate_enabled",
         "stage6_syqon_regional_texture_ratio_max",
@@ -2024,7 +2034,7 @@ def normalize_processing_parameters(
     if raw_schema not in SUPPORTED_PROCESSING_PARAMETERS_SCHEMAS:
         raise ValueError(
             "不支持的处理参数 schema："
-            f"{raw.get('schema')!r}；仅接受 starun.processing-parameters.v4/v5/v6"
+            f"{raw.get('schema')!r}；仅接受 starun.processing-parameters.v4/v5/v6/v7"
         )
     gate_profile = str(
         raw.get("gate_profile", GATE_PROFILE_DEFAULT) or GATE_PROFILE_DEFAULT
@@ -2045,6 +2055,7 @@ def normalize_processing_parameters(
     normalized = default_processing_parameters()
     normalized["general"] = _normalize_general(general, adjustments=adjustments)
     normalized["gate_profile"] = gate_profile
+    migrated_stage8_target_aware_chroma: bool | None = None
     stages_raw = raw.get("stages", {})
     if not isinstance(stages_raw, Mapping):
         raise ValueError("stages 必须是映射")
@@ -2075,6 +2086,36 @@ def normalize_processing_parameters(
             raise ValueError(f"Stage {stage} overrides 必须是映射")
         overrides_raw = dict(overrides_source)
         if (
+            stage == 8
+            and raw_schema == LEGACY_PROCESSING_PARAMETERS_SCHEMA_V6
+            and "stage8_target_aware_chroma_enabled" in overrides_raw
+        ):
+            raise ValueError(
+                "Stage 8 包含未知参数：stage8_target_aware_chroma_enabled"
+            )
+        if (
+            stage == 4
+            and raw_schema
+            in {
+                LEGACY_PROCESSING_PARAMETERS_SCHEMA_V4,
+                LEGACY_PROCESSING_PARAMETERS_SCHEMA_V5,
+                LEGACY_PROCESSING_PARAMETERS_SCHEMA_V6,
+            }
+        ):
+            for field in sorted(
+                LEGACY_STAGE4_HOO_PIXEL_FIELDS.intersection(overrides_raw)
+            ):
+                requested = overrides_raw.pop(field)
+                adjustments.append(
+                    {
+                        "stage": 4,
+                        "field": field,
+                        "requested": requested,
+                        "effective": "retired_stage8_palette_only",
+                        "reason": "legacy_stage4_hoo_pixel_field_removed_in_v7",
+                    }
+                )
+        if (
             stage == 3
             and raw_schema
             in {
@@ -2095,6 +2136,29 @@ def normalize_processing_parameters(
                         "reason": "legacy_stage3_field_removed_in_v6",
                     }
                 )
+        if (
+            stage == 7
+            and raw_schema == LEGACY_PROCESSING_PARAMETERS_SCHEMA_V6
+            and "stage7_vivid_subject_chroma_enabled" in overrides_raw
+        ):
+            requested = overrides_raw.pop(
+                "stage7_vivid_subject_chroma_enabled"
+            )
+            migrated_value, _field_adjustments = _coerce_value(
+                SPECS_BY_FIELD["stage8_target_aware_chroma_enabled"],
+                requested,
+                validate_paths=validate_paths,
+            )
+            migrated_stage8_target_aware_chroma = bool(migrated_value)
+            adjustments.append(
+                {
+                    "stage": 8,
+                    "field": "stage8_target_aware_chroma_enabled",
+                    "requested": requested,
+                    "effective": migrated_stage8_target_aware_chroma,
+                    "reason": "v6_stage7_vivid_subject_chroma_migrated_to_stage8",
+                }
+            )
         allowed_fields = {
             spec.field
             for spec in SPECS_BY_STAGE[stage]
@@ -2113,6 +2177,14 @@ def normalize_processing_parameters(
             clean_overrides[field] = clean_value
             for record in field_adjustments:
                 adjustments.append({"stage": stage, **record})
+        if (
+            stage == 8
+            and migrated_stage8_target_aware_chroma is not None
+            and "stage8_target_aware_chroma_enabled" not in clean_overrides
+        ):
+            clean_overrides[
+                "stage8_target_aware_chroma_enabled"
+            ] = migrated_stage8_target_aware_chroma
         if (
             raw_schema == LEGACY_PROCESSING_PARAMETERS_SCHEMA_V4
             and stage == 9
@@ -2358,6 +2430,7 @@ __all__ = [
     "PROCESSING_PARAMETERS_SCHEMA",
     "LEGACY_PROCESSING_PARAMETERS_SCHEMA_V4",
     "LEGACY_PROCESSING_PARAMETERS_SCHEMA_V5",
+    "LEGACY_PROCESSING_PARAMETERS_SCHEMA_V6",
     "SUPPORTED_PROCESSING_PARAMETERS_SCHEMAS",
     "PROCESSING_PARAMETER_SPECS",
     "ParameterSpec",

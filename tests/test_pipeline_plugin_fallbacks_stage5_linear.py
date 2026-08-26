@@ -4,6 +4,43 @@ from tests.pipeline_plugin_fallbacks_support import *  # noqa: F401,F403
 
 
 class PipelinePluginFallbackStage5LinearTests(PipelinePluginFallbackTestBase):
+    def test_stage5_load_failure_cannot_publish_current_buffer_handoff(self):
+        processor = self._new_processor()
+        processor.cfg.stage5_processing_mode = "preserve"
+        processor.fail_commands.add("load")
+
+        stage5_linear_denoise(processor)
+
+        handoff = processor._stage5_linear_handoff
+        self.assertEqual(processor.results[-1][1], "failed")
+        self.assertFalse(handoff["accepted"])
+        self.assertFalse(handoff["input_integrity_ok"])
+        self.assertFalse(
+            handoff["input_lineage"]["upstream"]["load_verified"]
+        )
+        self.assertNotIn("stage5_input_linear", processor.saved_image_pixels)
+
+    def test_stage5_baseline_save_failure_cannot_publish_handoff(self):
+        processor = self._new_processor()
+        processor.cfg.stage5_processing_mode = "preserve"
+        save_stage_output = processor._save_stage_output
+        processor._save_stage_output = lambda stem: (
+            False
+            if stem == "stage5_input_linear"
+            else save_stage_output(stem)
+        )
+
+        stage5_linear_denoise(processor)
+
+        handoff = processor._stage5_linear_handoff
+        self.assertTrue((processor.process_dir / "stage5_linear.fit").is_file())
+        self.assertEqual(processor.results[-1][1], "failed")
+        self.assertFalse(handoff["accepted"])
+        self.assertFalse(handoff["input_integrity_ok"])
+        self.assertFalse(
+            handoff["input_lineage"]["baseline"]["save_verified"]
+        )
+
     def test_stage5_low_noise_guard_skips_enabled_denoise_candidates(self):
         processor = self._new_processor()
         processor.cfg.stage5_deconvolution_enabled = False

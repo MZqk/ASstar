@@ -4,6 +4,53 @@ from tests.pipeline_plugin_fallbacks_support import *  # noqa: F401,F403
 
 
 class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBase):
+    def _subject_chroma_processor(self):
+        processor = self._new_processor()
+        processor.cfg.stage8_target_aware_chroma_enabled = True
+        processor.cfg.stage8_nebula_saturation_enabled = True
+        processor._channel_semantics = "broadband_rgb_osc"
+        processor._stage7_stretch_accepted = True
+        processor._stage8_final_quality = "ok"
+        processor._star_preserve_target_bypass = False
+        processor._stage7_target_stretch_profile = lambda: {
+            "name": "generic_balanced"
+        }
+        height, width = 96, 128
+        subject = np.zeros((height, width), dtype=np.float32)
+        subject[20:76, 24:104] = 1.0
+        background = 1.0 - subject
+        image = np.full((3, height, width), 0.08, dtype=np.float32)
+        image[:, subject > 0.5] = np.asarray(
+            (0.42, 0.25, 0.14),
+            dtype=np.float32,
+        )[:, None]
+        processor.image_pixels = image.copy()
+        processor.saved_image_pixels["stage8_enhanced"] = image.copy()
+        (processor.process_dir / "stage8_enhanced.fit").write_bytes(b"mock")
+        masks = {
+            "subject_mask": subject,
+            "nebula_mask": subject,
+            "faint_nebula_mask": np.zeros_like(subject),
+            "core_mask": np.zeros_like(subject),
+            "background_mask": background,
+            "star_mask": np.zeros_like(subject),
+        }
+        processor._stage7_frozen_rendition_masks = {
+            key: np.array(value, copy=True) for key, value in masks.items()
+        }
+        processor._stage8_generate_starless_masks = lambda _image: {
+            key: np.array(value, copy=True) for key, value in masks.items()
+        }
+        processor.siril.get_image_pixeldata = (
+            lambda preview=False: processor.image_pixels.copy()
+        )
+        processor._set_current_image_pixeldata = lambda image, **_kwargs: setattr(
+            processor,
+            "image_pixels",
+            np.asarray(image).copy(),
+        )
+        return processor
+
     def _star_preserve_nebulosity_processor(self):
         processor = self._new_processor()
         processor._star_preserve_target_bypass = True
@@ -86,6 +133,15 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
             "star_preserve_secondary_nebulosity",
         )
         self.assertFalse(processor._stage8_handoff["passthrough"])
+        palette_report = processor.stage_json_reports[
+            "stage8_palette_report.json"
+        ]
+        self.assertEqual(
+            palette_report["schema"],
+            "starun.stage8-dualband-palette.v2",
+        )
+        self.assertFalse(palette_report["accepted"])
+        self.assertEqual(report["dualband_palette"], palette_report)
         self.assertEqual(processor.results[-1][1], "ok")
         self.assertEqual(
             processor.result_metadata[-1]["execution"],
@@ -106,6 +162,259 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
         )
         self.assertEqual(processor._stage8_final_quality, "star_preserve_bypass")
         self.assertTrue(processor._stage8_handoff["passthrough"])
+
+    def test_stage8_subject_chroma_transaction_is_bounded_and_audited(self):
+        runtime = sys.modules["stages.stage8_nebula_enhancement"]
+        processor = self._subject_chroma_processor()
+        baseline = processor.image_pixels.copy()
+        report = runtime._stage8_run_subject_chroma(
+            processor,
+            [],
+            base_stem="stage8_enhanced",
+            channel_semantics="broadband_rgb_osc",
+            processing_policy="full",
+            user_processing_mode="auto",
+            external_override=False,
+            requested_saturation_budget=0.40,
+            effective_saturation_budget=0.40,
+            generic_saturation_suppressed=True,
+        )
+
+        self.assertEqual(report["schema"], "starun.stage8-subject-chroma.v1")
+        self.assertTrue(report["accepted"], report)
+        self.assertTrue(report["feeds_main_pipeline"])
+        self.assertEqual(report["requested_saturation_budget"], 0.40)
+        self.assertEqual(report["effective_saturation_budget"], 0.40)
+        self.assertEqual(
+            report["generic_saturation_execution"]["reason"],
+            "reserved_for_stage8_target_aware_subject_chroma",
+        )
+        candidate = processor.saved_image_pixels[
+            "stage8_subject_chroma_candidate"
+        ]
+        baseline_luma = (
+            0.2126 * baseline[0] + 0.7152 * baseline[1] + 0.0722 * baseline[2]
+        )
+        candidate_luma = (
+            0.2126 * candidate[0]
+            + 0.7152 * candidate[1]
+            + 0.0722 * candidate[2]
+        )
+        np.testing.assert_allclose(candidate_luma, baseline_luma, atol=1e-6)
+        background = report["candidate"]["background_unchanged"]
+        self.assertTrue(background)
+        self.assertEqual(
+            processor._stage8_saturation_execution["method"],
+            "masked_subject_chroma_rendition",
+        )
+        self.assertTrue(
+            processor._stage8_saturation_execution[
+                "generic_saturation_suppressed"
+            ]
+        )
+
+    def test_stage8_subject_chroma_requires_reserved_budget(self):
+        runtime = sys.modules["stages.stage8_nebula_enhancement"]
+        processor = self._subject_chroma_processor()
+        report = runtime._stage8_run_subject_chroma(
+            processor,
+            [],
+            base_stem="stage8_enhanced",
+            channel_semantics="broadband_rgb_osc",
+            processing_policy="full",
+            user_processing_mode="auto",
+            external_override=False,
+            requested_saturation_budget=0.40,
+            effective_saturation_budget=0.40,
+            generic_saturation_suppressed=False,
+        )
+
+        self.assertFalse(report["accepted"])
+        self.assertEqual(report["status"], "skipped_ineligible")
+        self.assertIn(
+            "generic_saturation_budget_not_reserved",
+            report["eligibility"]["issues"],
+        )
+        self.assertNotIn(
+            "stage8_pre_subject_chroma",
+            processor.saved_image_pixels,
+        )
+
+    def test_stage8_high_risk_generic_saturation_does_not_double_consume(self):
+        processor = self._new_processor()
+        processor.cfg.stage8_target_aware_chroma_enabled = True
+        processor.cfg.stage8_nebula_saturation_enabled = True
+        processor._stage7_stretch_accepted = True
+        processor._stage7_stretch_output = "stage7_stretched"
+        processor.saved_image_pixels["stage7_stretched"] = (
+            processor.image_pixels.copy()
+        )
+        (processor.process_dir / "stage7_stretched.fit").write_bytes(b"mock")
+        processor._stage7_halo_residue_score = lambda: 1.0
+        processor._stage7_effective_halo_threshold = lambda: 0.35
+
+        stage8_nebula_enhancement(processor)
+
+        report = processor.stage_json_reports[
+            "stage8_subject_chroma_report.json"
+        ]
+        self.assertEqual(report["status"], "skipped_ineligible")
+        self.assertIn(
+            "generic_saturation_budget_not_reserved",
+            report["eligibility"]["issues"],
+        )
+        runtime_execution = report["generic_saturation_execution"][
+            "runtime_execution"
+        ]
+        self.assertTrue(runtime_execution.get("applied", False))
+        self.assertNotIn(
+            "stage8_subject_chroma_candidate",
+            processor.saved_image_pixels,
+        )
+
+    def test_stage8_subject_chroma_rollback_failure_is_review_only(self):
+        runtime = sys.modules["stages.stage8_nebula_enhancement"]
+        for failure_mode in ("quality_reject", "exception"):
+            with self.subTest(failure_mode=failure_mode):
+                processor = self._subject_chroma_processor()
+                original_save = processor._save_stage_output
+
+                def save(stem):
+                    if stem == "stage8_enhanced":
+                        return False
+                    return original_save(stem)
+
+                processor._save_stage_output = save
+                if failure_mode == "quality_reject":
+                    patcher = patch.object(
+                        runtime,
+                        "assess_subject_chroma_candidate",
+                        return_value={
+                            "accepted": False,
+                            "status": "rejected",
+                            "issues": ["forced_reject"],
+                        },
+                    )
+                else:
+                    patcher = patch.object(
+                        runtime,
+                        "apply_subject_chroma_rendition",
+                        side_effect=RuntimeError("forced failure"),
+                    )
+                with patcher:
+                    report = runtime._stage8_run_subject_chroma(
+                        processor,
+                        [],
+                        base_stem="stage8_enhanced",
+                        channel_semantics="broadband_rgb_osc",
+                        processing_policy="full",
+                        user_processing_mode="auto",
+                        external_override=False,
+                        requested_saturation_budget=0.40,
+                        effective_saturation_budget=0.40,
+                        generic_saturation_suppressed=True,
+                    )
+
+                self.assertIn("rollback_failed", report["status"])
+                self.assertEqual(
+                    processor._stage8_final_quality,
+                    "subject_chroma_rollback_failed",
+                )
+                self.assertEqual(
+                    processor._stage8_final_source,
+                    "stage8_pre_subject_chroma",
+                )
+                self.assertTrue(processor._stage8_fallback_used)
+                self.assertIn(
+                    "stage8_subject_chroma_rollback_failed",
+                    processor._stage_review_reasons(8),
+                )
+
+    def test_stage8_palette_never_runs_on_background_or_preserve_policy(self):
+        runtime = sys.modules["stages.stage8_nebula_enhancement"]
+        for policy in ("background_only", "preserve"):
+            with self.subTest(policy=policy):
+                processor = self._dualband_palette_processor(
+                    requested_palette="auto"
+                )
+                processor.saved_image_pixels["stage8_enhanced"] = (
+                    processor.image_pixels.copy()
+                )
+                processor.cmd_calls.clear()
+                report = runtime._stage8_run_dualband_palette(
+                    processor,
+                    [],
+                    base_stem="stage8_enhanced",
+                    channel_semantics="narrowband_composite",
+                    processing_policy=policy,
+                    external_override=False,
+                )
+
+                self.assertEqual(report["status"], "skipped_ineligible")
+                self.assertIn(
+                    "stage8_policy_not_full",
+                    report["eligibility"]["issues"],
+                )
+                self.assertNotIn(
+                    "stage8_pre_palette",
+                    processor.saved_image_pixels,
+                )
+                self.assertFalse(
+                    any(call[:1] == ("load",) for call in processor.cmd_calls)
+                )
+
+    def test_stage8_palette_rollback_failure_is_review_only(self):
+        runtime = sys.modules["stages.stage8_nebula_enhancement"]
+        processor = self._dualband_palette_processor(requested_palette="auto")
+        processor.saved_image_pixels["stage8_enhanced"] = (
+            processor.image_pixels.copy()
+        )
+        original_save = processor._save_stage_output
+
+        def save(stem):
+            if stem in {"stage8_palette_selected", "stage8_enhanced"}:
+                return False
+            return original_save(stem)
+
+        processor._save_stage_output = save
+
+        def palette_candidate(image, *, palette, **_kwargs):
+            return np.asarray(image).copy(), {
+                "accepted": True,
+                "palette": palette,
+                "synthetic_sii": palette != "HOO",
+                "warnings": [],
+                "metrics": {
+                    "subject_background_chroma_separation_gain": 0.02,
+                    "subject_saturation_p50_gain": 0.01,
+                    "luminance_drift_p95": 0.0,
+                    "clip_growth": 0.0,
+                },
+            }
+
+        with patch.object(
+            runtime,
+            "build_dualband_palette_candidate",
+            side_effect=palette_candidate,
+        ):
+            report = runtime._stage8_run_dualband_palette(
+                processor,
+                [],
+                base_stem="stage8_enhanced",
+                channel_semantics="narrowband_composite",
+                processing_policy="full",
+                external_override=False,
+            )
+
+        self.assertEqual(report["status"], "failed_rollback_failed")
+        self.assertEqual(report["reason_code"], "stage8_palette_rollback_failed")
+        self.assertEqual(processor._stage8_final_source, "stage8_pre_palette")
+        self.assertEqual(processor._stage8_final_quality, "palette_rollback_failed")
+        self.assertTrue(processor._stage8_fallback_used)
+        self.assertIn(
+            "stage8_palette_rollback_failed",
+            processor._stage_review_reasons(8),
+        )
 
     def test_stage8_mixed_nebula_saturation_is_bounded_above_galaxy_route(self):
         galaxy_name, galaxy_bands = (
@@ -206,6 +515,16 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
         report = processor.stage_json_reports["stage8_enhancement_report.json"]
         self.assertEqual(report["mode"], "with_stars_review_passthrough")
         self.assertFalse(report["starless_enhancement_applied"])
+        palette_report = processor.stage_json_reports[
+            "stage8_palette_report.json"
+        ]
+        self.assertFalse(palette_report["accepted"])
+        self.assertFalse(palette_report["feeds_main_pipeline"])
+        self.assertIn(
+            "stage8_policy_not_full",
+            palette_report["eligibility"]["issues"],
+        )
+        self.assertEqual(report["dualband_palette"], palette_report)
 
     def test_stage8_applies_blue_guard_when_starless_layer_is_too_blue(self):
         processor = self._new_processor()
@@ -493,6 +812,9 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
         self.assertEqual(status, "ok")
         self.assertIn("Starless 后特征", message)
         self.assertIn("object_area=0.330", message)
+        report = processor.stage_json_reports["stage8_enhancement_report.json"]
+        self.assertIn("target_aware_subject_chroma", report["substeps"])
+        self.assertTrue(report["substeps"]["target_aware_subject_chroma"])
 
     def test_stage8_conservative_skip_status_survives_additional_guard_reasons(self):
         processor = self._new_processor()
@@ -551,6 +873,15 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
             processor.stage_json_reports["stage8_color_quality_report.json"]["status"],
             "reported",
         )
+        palette_report = processor.stage_json_reports[
+            "stage8_palette_report.json"
+        ]
+        self.assertFalse(palette_report["accepted"])
+        self.assertIn(
+            "stage8_policy_not_full",
+            palette_report["eligibility"]["issues"],
+        )
+        self.assertEqual(report["dualband_palette"], palette_report)
 
     def test_stage8_input_guard_classifies_conservative_skip_with_other_reasons(self):
         probe = SimpleNamespace(
@@ -1036,6 +1367,15 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
         )
         report = processor.stage_json_reports["stage8_enhancement_report.json"]
         self.assertEqual(report["mode"], "baseline_save_failed_safe_passthrough")
+        palette_report = processor.stage_json_reports[
+            "stage8_palette_report.json"
+        ]
+        self.assertFalse(palette_report["accepted"])
+        self.assertIn(
+            "stage8_structural_quality_not_ok",
+            palette_report["eligibility"]["issues"],
+        )
+        self.assertEqual(report["dualband_palette"], palette_report)
 
     def test_stage8_builtin_saturation_fallback_is_reported_as_internal_processing(self):
         processor = self._new_processor()
@@ -1047,6 +1387,15 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
         self.assertIn("内置 Starless satu", message)
         self.assertIn("内置 Starless unsharp", message)
         self.assertNotIn("插件未命中", message)
+        palette_report = processor.stage_json_reports[
+            "stage8_palette_report.json"
+        ]
+        self.assertEqual(palette_report["status"], "skipped_ineligible")
+        self.assertFalse(palette_report["accepted"])
+        self.assertIn(
+            "channel_semantics_not_narrowband_composite",
+            palette_report["eligibility"]["issues"],
+        )
 
     def test_stage8_uses_builtin_without_siril_command_probe_when_api_unavailable_by_default(self):
         processor = self._new_processor()

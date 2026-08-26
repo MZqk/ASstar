@@ -367,6 +367,17 @@ class PipelineStage1InputFilteringTests(unittest.TestCase):
             linear_path.write_bytes(b"linear-fit")
             probe = _LinearResumeProbe(pipeline_module, work_dir)
             probe._task_resume_checkpoint_path = linear_path
+            probe._trusted_input_provenance = {
+                "verified": True,
+                "checkpoint": "stage5",
+                "state": "linear",
+                "semantic_context_status": "verified",
+                "run_manifest_hash": "run-manifest-sha256",
+                "config_fingerprint": "config-sha256",
+                "actual_sha256": pipeline_module.run_manifest.sha256_file(
+                    linear_path
+                ),
+            }
 
             pipeline_module.StarunPostProcessor._prepare_linear_resume_input(probe)
 
@@ -374,6 +385,22 @@ class PipelineStage1InputFilteringTests(unittest.TestCase):
             self.assertEqual(probe.linear_intermediate_path, linear_path)
             self.assertEqual(probe._stage1_input_mode, "linear_resume")
             self.assertTrue((work_dir / "process" / "working.fit").is_file())
+            self.assertEqual(
+                (work_dir / "process" / "stage5_linear.fit").read_bytes(),
+                b"linear-fit",
+            )
+            handoff = pipeline_module.run_manifest.load_json(
+                work_dir / "process" / "stage5_stage6_handoff.json"
+            )
+            self.assertTrue(handoff["accepted"])
+            self.assertEqual(handoff["origin"], "verified_stage5_resume")
+            self.assertTrue(handoff["deconvolution_integrity_ok"])
+            self.assertTrue(handoff["denoise_integrity_ok"])
+            self.assertTrue(handoff["resume"]["provenance_verified"])
+            self.assertEqual(
+                handoff["resume"]["config_fingerprint"],
+                "config-sha256",
+            )
             self.assertIn(("load", "working"), probe.cmd_calls)
             self.assertEqual(len(probe.stage_records), 1)
             name, status, message = probe.stage_records[0]

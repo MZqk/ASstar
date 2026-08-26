@@ -1214,15 +1214,15 @@ class Stage7SubjectBrightnessSelectionTests(unittest.TestCase):
             advisories=[],
             risk=0.00001,
         )
-        vivid = attempt(
-            "cand_vivid_safe",
+        higher_brightness = attempt(
+            "cand_display82",
             higher_p50,
             score=0.81,
             advisories=["background_chroma_load_growth"],
             risk=0.02,
         )
         winner = min(
-            [vivid, display70],
+            [higher_brightness, display70],
             key=Stage6ServiceMixin._stage7_candidate_selection_key,
         )
 
@@ -1241,6 +1241,11 @@ class Display90Stage9ContractTests(unittest.TestCase):
             "params": {"calibration": calibration},
         }
         transfer = _stage7_matched_domain_transfer_contract(selected, {})
+        self.assertEqual(
+            transfer["schema"],
+            stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V3,
+        )
+        self.assertEqual(len(transfer["chain_contract"]["steps"]), 1)
         with tempfile.TemporaryDirectory() as td:
             pipeline = types.SimpleNamespace(
                 _stage7_matched_domain_transfer=transfer,
@@ -1266,20 +1271,36 @@ class Display90Stage9ContractTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(stage9_pixels, stage7_pixels)
 
-    def test_vivid_safe_child_preserves_display_parent_transfer(self) -> None:
-        image = _linear_rgb()
-        calibration = _calibration(image, strength=0.82)
-        selected = {
-            "name": "cand_vivid_safe",
-            "method": "vivid_safe_chroma",
-            "params": {
-                "parent_name": "cand_display82",
-                "parent_candidate": {
-                    "name": "cand_display82",
-                    "method": stretch_metrics.DISPLAY_LUMINANCE_VECTOR_METHOD,
-                    "params": {"calibration": calibration},
-                },
+        tampered = {
+            **transfer,
+            "chain_contract": {
+                **transfer["chain_contract"],
+                "sha256": "0" * 64,
             },
+        }
+        with tempfile.TemporaryDirectory() as td:
+            rejected = stage9_star_remixing._stage9_resolve_matched_domain_transfer(
+                types.SimpleNamespace(
+                    _stage7_matched_domain_transfer=tampered,
+                    _stage7_closed_form_mtf_reference=None,
+                    process_dir=Path(td),
+                )
+            )
+        self.assertEqual(rejected["status"], "unavailable")
+        self.assertEqual(rejected["reason_code"], "stage9_display90_transfer_invalid")
+
+    def test_composite_tone_v3_replays_exact_authenticated_chain(self) -> None:
+        image = _linear_rgb()
+        parent_calibration = _calibration(image, strength=0.82)
+        calibration = stretch_metrics.build_composite_tone_calibration(
+            parent_calibration,
+            source_background=0.18,
+            target_background=0.11,
+        )
+        selected = {
+            "name": "cand_composite_tone",
+            "method": stretch_metrics.COMPOSITE_TONE_TRANSFER_METHOD,
+            "params": {"calibration": calibration},
         }
         transfer = _stage7_matched_domain_transfer_contract(selected, {})
         with tempfile.TemporaryDirectory() as td:
@@ -1292,19 +1313,42 @@ class Display90Stage9ContractTests(unittest.TestCase):
                 pipeline
             )
 
-        self.assertEqual(transfer["selected_candidate_id"], "cand_vivid_safe")
-        self.assertEqual(transfer["tone_candidate_id"], "cand_display82")
+        self.assertEqual(
+            transfer["schema"],
+            stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V3,
+        )
+        self.assertEqual(transfer["selected_candidate_id"], "cand_composite_tone")
+        self.assertEqual(transfer["tone_candidate_id"], "cand_composite_tone")
         self.assertEqual(resolved["status"], "ready", resolved)
-        self.assertEqual(resolved["tone_candidate_id"], "cand_display82")
+        self.assertEqual(resolved["tone_candidate_id"], "cand_composite_tone")
         stage9_pixels = stage9_star_remixing._stage9_apply_matched_domain_transfer(
             image,
             resolved,
         )
-        expected = stretch_metrics.apply_display90_linked_rgb_stretch(
+        expected = stretch_metrics.apply_composite_tone_transfer(
             image,
             calibration,
         )
         np.testing.assert_array_equal(stage9_pixels, expected)
+
+        corrupted = dict(transfer)
+        corrupted["chain_contract"] = {
+            **dict(transfer["chain_contract"]),
+            "sha256": "0" * 64,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            rejected = stage9_star_remixing._stage9_resolve_matched_domain_transfer(
+                types.SimpleNamespace(
+                    _stage7_matched_domain_transfer=corrupted,
+                    _stage7_closed_form_mtf_reference=None,
+                    process_dir=Path(td),
+                )
+            )
+        self.assertEqual(rejected["status"], "unavailable")
+        self.assertEqual(
+            rejected["reason_code"],
+            "stage9_composite_tone_transfer_invalid",
+        )
 
     def test_stage9_replays_legacy_v1_display_transfer_without_semantic_upgrade(
         self,
@@ -1319,11 +1363,16 @@ class Display90Stage9ContractTests(unittest.TestCase):
             "method": stretch_metrics.DISPLAY90_LEGACY_METHOD,
             "params": {"calibration": legacy},
         }
-        transfer = _stage7_matched_domain_transfer_contract(selected, {})
+        generated = _stage7_matched_domain_transfer_contract(selected, {})
         self.assertEqual(
-            transfer["schema"],
-            stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V1,
+            generated["schema"],
+            stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V3,
         )
+        transfer = dict(generated)
+        transfer["schema"] = (
+            stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V1
+        )
+        transfer.pop("chain_contract", None)
         with tempfile.TemporaryDirectory() as td:
             pipeline = types.SimpleNamespace(
                 _stage7_matched_domain_transfer=transfer,
@@ -1346,6 +1395,154 @@ class Display90Stage9ContractTests(unittest.TestCase):
             ),
             stretch_metrics.apply_display90_linked_rgb_stretch(image, legacy),
         )
+
+    def test_closed_form_mtf_uses_v3_single_step_and_rejects_tamper(self) -> None:
+        image = _linear_rgb()
+        params = {
+            "mtf_shadows": 0.01,
+            "mtf_midtones": 0.22,
+            "mtf_highlights": 0.98,
+        }
+        reference = {
+            "schema": "starun.stage7-mtf-reference.v1",
+            "status": "active",
+            "active_anchor": {
+                "candidate": "cand_b",
+                "method": "closed_form_linked_mtf",
+                "params": params,
+            },
+        }
+        transfer = _stage7_matched_domain_transfer_contract(
+            {"name": "cand_b", "method": "linked_mtf", "params": params},
+            reference,
+        )
+        self.assertEqual(
+            transfer["schema"],
+            stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V3,
+        )
+        self.assertEqual(
+            [step["method"] for step in transfer["chain_contract"]["steps"]],
+            ["closed_form_linked_mtf"],
+        )
+        with tempfile.TemporaryDirectory() as td:
+            resolved = stage9_star_remixing._stage9_resolve_matched_domain_transfer(
+                types.SimpleNamespace(
+                    _stage7_matched_domain_transfer=transfer,
+                    _stage7_closed_form_mtf_reference=reference,
+                    process_dir=Path(td),
+                )
+            )
+        self.assertEqual(resolved["status"], "ready", resolved)
+        np.testing.assert_array_equal(
+            stage9_star_remixing._stage9_apply_matched_domain_transfer(
+                image,
+                resolved,
+            ),
+            stretch_metrics.apply_linked_mtf(
+                image,
+                params["mtf_shadows"],
+                params["mtf_midtones"],
+                params["mtf_highlights"],
+            ),
+        )
+
+        forged_winner = copy.deepcopy(transfer)
+        forged_winner["selected_candidate_id"] = "cand_a"
+        forged_winner["tone_candidate_id"] = "cand_a"
+        with tempfile.TemporaryDirectory() as td:
+            forged_rejected = (
+                stage9_star_remixing._stage9_resolve_matched_domain_transfer(
+                    types.SimpleNamespace(
+                        _stage7_matched_domain_transfer=forged_winner,
+                        _stage7_closed_form_mtf_reference=reference,
+                        process_dir=Path(td),
+                    )
+                )
+            )
+        self.assertEqual(forged_rejected["status"], "unavailable")
+        self.assertEqual(
+            forged_rejected["reason_code"],
+            "stage9_matched_domain_transfer_invalid",
+        )
+
+        tampered = {
+            **transfer,
+            "chain_contract": {
+                **transfer["chain_contract"],
+                "steps": [
+                    {
+                        **transfer["chain_contract"]["steps"][0],
+                        "params": {**params, "mtf_midtones": 0.23},
+                    }
+                ],
+            },
+        }
+        with tempfile.TemporaryDirectory() as td:
+            rejected = stage9_star_remixing._stage9_resolve_matched_domain_transfer(
+                types.SimpleNamespace(
+                    _stage7_matched_domain_transfer=tampered,
+                    _stage7_closed_form_mtf_reference=reference,
+                    process_dir=Path(td),
+                )
+            )
+        self.assertEqual(rejected["status"], "unavailable")
+        self.assertEqual(
+            rejected["reason_code"],
+            "stage9_matched_domain_transfer_invalid",
+        )
+
+    def test_non_cand_b_winner_cannot_borrow_closed_form_mtf_reference(self) -> None:
+        params = {
+            "mtf_shadows": 0.01,
+            "mtf_midtones": 0.22,
+            "mtf_highlights": 0.98,
+        }
+        reference = {
+            "schema": "starun.stage7-mtf-reference.v1",
+            "status": "active",
+            "active_anchor": {
+                "candidate": "cand_b",
+                "method": "closed_form_linked_mtf",
+                "params": params,
+            },
+        }
+
+        transfer = _stage7_matched_domain_transfer_contract(
+            {
+                "name": "cand_a",
+                "method": "asinh",
+                "params": {"asinh_stretch": 2.2, "asinh_offset": 0.002},
+            },
+            reference,
+        )
+
+        self.assertEqual(transfer["status"], "unavailable")
+        self.assertEqual(transfer["selected_candidate_id"], "cand_a")
+        self.assertNotIn("chain_contract", transfer)
+
+    def test_cand_b_params_must_match_closed_form_mtf_reference(self) -> None:
+        selected_params = {
+            "mtf_shadows": 0.01,
+            "mtf_midtones": 0.22,
+            "mtf_highlights": 0.98,
+        }
+        reference = {
+            "schema": "starun.stage7-mtf-reference.v1",
+            "status": "active",
+            "active_anchor": {
+                "candidate": "cand_b",
+                "method": "closed_form_linked_mtf",
+                "params": {**selected_params, "mtf_midtones": 0.24},
+            },
+        }
+
+        transfer = _stage7_matched_domain_transfer_contract(
+            {"name": "cand_b", "method": "linked_mtf", "params": selected_params},
+            reference,
+        )
+
+        self.assertEqual(transfer["status"], "unavailable")
+        self.assertNotIn("chain_contract", transfer)
 
     def test_corrupt_or_missing_display90_contract_never_uses_mtf(self) -> None:
         image = _linear_rgb()

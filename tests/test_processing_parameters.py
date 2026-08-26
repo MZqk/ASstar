@@ -24,6 +24,7 @@ from pipeline.processing_parameters import (
     GATE_PROFILE_UNLIMITED,
     LEGACY_PROCESSING_PARAMETERS_SCHEMA_V4,
     LEGACY_PROCESSING_PARAMETERS_SCHEMA_V5,
+    LEGACY_PROCESSING_PARAMETERS_SCHEMA_V6,
     PROCESSING_PARAMETERS_SCHEMA,
     PROCESSING_GATE_PARAMETER_SPECS,
     PROCESSING_PARAMETER_SPECS,
@@ -42,6 +43,10 @@ from pipeline.processing_parameters import (
 class ProcessingParameterContractTests(unittest.TestCase):
     def test_current_registry_and_failure_actions(self) -> None:
         payload = default_processing_parameters()
+        self.assertEqual(
+            PROCESSING_PARAMETERS_SCHEMA,
+            "starun.processing-parameters.v7",
+        )
         self.assertEqual(payload["schema"], PROCESSING_PARAMETERS_SCHEMA)
         for stage in range(2, 10):
             spec = SPECS_BY_FIELD[f"stage{stage}_failure_action"]
@@ -97,6 +102,36 @@ class ProcessingParameterContractTests(unittest.TestCase):
                 "stage4_auto_reference_global_white_enabled"
             ].default
         )
+        chroma_spec = SPECS_BY_FIELD["stage8_target_aware_chroma_enabled"]
+        self.assertEqual(chroma_spec.stage, 8)
+        self.assertTrue(chroma_spec.default)
+        self.assertNotIn(
+            "stage8_target_aware_chroma_enabled",
+            payload["stages"]["8"]["overrides"],
+        )
+        self.assertTrue(
+            effective_parameter_value(
+                payload,
+                "stage8_target_aware_chroma_enabled",
+            )
+        )
+        self.assertEqual(chroma_spec.label, "主体低频增色")
+        self.assertEqual(
+            chroma_spec.depends_on,
+            (
+                ("stage8_processing_mode", ("auto",)),
+                ("stage8_nebula_saturation_enabled", (True,)),
+            ),
+        )
+        self.assertIn("stage4_nbn_mapping_confidence_min", SPECS_BY_FIELD)
+        for retired_field in (
+            "stage4_narrowband_normalization_enabled",
+            "stage4_nbn_strength",
+            "stage4_nbn_gain_limit",
+            "stage4_nbn_line_ratio_drift_max",
+            "stage7_vivid_subject_chroma_enabled",
+        ):
+            self.assertNotIn(retired_field, SPECS_BY_FIELD)
 
     def test_stage5_auto_denoise_is_enabled_by_default(self) -> None:
         payload = default_processing_parameters()
@@ -213,7 +248,105 @@ class ProcessingParameterContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "未知参数"):
             normalize_processing_parameters(current)
 
-    def test_v6_contract_includes_general_stage1_stage9_and_stage10_controls(self) -> None:
+    def test_v6_vivid_subject_chroma_override_migrates_to_stage8(self) -> None:
+        payload = default_processing_parameters()
+        payload["schema"] = LEGACY_PROCESSING_PARAMETERS_SCHEMA_V6
+        payload["stages"]["7"]["overrides"][
+            "stage7_vivid_subject_chroma_enabled"
+        ] = False
+
+        normalized, adjustments = normalize_processing_parameters(payload)
+
+        self.assertEqual(normalized["schema"], PROCESSING_PARAMETERS_SCHEMA)
+        self.assertNotIn(
+            "stage7_vivid_subject_chroma_enabled",
+            normalized["stages"]["7"]["overrides"],
+        )
+        self.assertFalse(
+            normalized["stages"]["8"]["overrides"][
+                "stage8_target_aware_chroma_enabled"
+            ]
+        )
+        self.assertIn(
+            "v6_stage7_vivid_subject_chroma_migrated_to_stage8",
+            {str(item.get("reason") or "") for item in adjustments},
+        )
+
+        cfg = PipelineConfig()
+        _normalized, _adjustments, fields = apply_processing_parameters_to_config(
+            cfg,
+            payload,
+        )
+        self.assertFalse(cfg.stage8_target_aware_chroma_enabled)
+        self.assertIn("stage8_target_aware_chroma_enabled", fields)
+
+    def test_v6_rejects_v7_target_aware_chroma_migration_collision(self) -> None:
+        payload = default_processing_parameters()
+        payload["schema"] = LEGACY_PROCESSING_PARAMETERS_SCHEMA_V6
+        payload["stages"]["7"]["overrides"][
+            "stage7_vivid_subject_chroma_enabled"
+        ] = False
+        payload["stages"]["8"]["overrides"][
+            "stage8_target_aware_chroma_enabled"
+        ] = True
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Stage 8 包含未知参数：stage8_target_aware_chroma_enabled",
+        ):
+            normalize_processing_parameters(payload)
+
+    def test_v7_rejects_retired_stage7_vivid_subject_chroma_field(self) -> None:
+        payload = default_processing_parameters()
+        payload["stages"]["7"]["overrides"][
+            "stage7_vivid_subject_chroma_enabled"
+        ] = True
+
+        with self.assertRaisesRegex(ValueError, "未知参数"):
+            normalize_processing_parameters(payload)
+
+    def test_v6_strips_retired_stage4_hoo_pixel_fields(self) -> None:
+        retired = {
+            "stage4_narrowband_normalization_enabled": False,
+            "stage4_nbn_strength": 0.35,
+            "stage4_nbn_gain_limit": 1.04,
+            "stage4_nbn_line_ratio_drift_max": 0.08,
+        }
+        payload = default_processing_parameters()
+        payload["schema"] = LEGACY_PROCESSING_PARAMETERS_SCHEMA_V6
+        payload["stages"]["4"]["overrides"].update(retired)
+        payload["stages"]["4"]["overrides"][
+            "stage4_nbn_mapping_confidence_min"
+        ] = 0.91
+
+        normalized, adjustments = normalize_processing_parameters(payload)
+
+        self.assertEqual(
+            normalized["stages"]["4"]["overrides"],
+            {"stage4_nbn_mapping_confidence_min": 0.91},
+        )
+        removed = {
+            str(item["field"])
+            for item in adjustments
+            if item.get("reason")
+            == "legacy_stage4_hoo_pixel_field_removed_in_v7"
+        }
+        self.assertEqual(removed, set(retired))
+
+    def test_v7_rejects_retired_stage4_hoo_pixel_fields(self) -> None:
+        for field, value in (
+            ("stage4_narrowband_normalization_enabled", True),
+            ("stage4_nbn_strength", 0.55),
+            ("stage4_nbn_gain_limit", 1.08),
+            ("stage4_nbn_line_ratio_drift_max", 0.12),
+        ):
+            with self.subTest(field=field):
+                payload = default_processing_parameters()
+                payload["stages"]["4"]["overrides"][field] = value
+                with self.assertRaisesRegex(ValueError, "未知参数"):
+                    normalize_processing_parameters(payload)
+
+    def test_v7_contract_includes_general_stage1_stage9_and_stage10_controls(self) -> None:
         payload = default_processing_parameters()
         self.assertEqual(payload["schema"], PROCESSING_PARAMETERS_SCHEMA)
         self.assertEqual(set(payload["stages"]), {str(i) for i in range(1, 11)})
@@ -391,7 +524,7 @@ class ProcessingParameterContractTests(unittest.TestCase):
                 )
                 for stage in range(2, 10)
             },
-            {2: 4, 3: 18, 4: 20, 5: 4, 6: 32, 7: 52, 8: 17, 9: 84},
+            {2: 4, 3: 18, 4: 18, 5: 4, 6: 32, 7: 52, 8: 17, 9: 84},
         )
         gate_fields = {spec.field for spec in PROCESSING_GATE_PARAMETER_SPECS}
         self.assertTrue(

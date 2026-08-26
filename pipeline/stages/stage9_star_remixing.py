@@ -4234,6 +4234,8 @@ def _stage9_resolve_matched_domain_transfer(pipeline) -> Dict[str, Any]:
     )
     transfer_source = "runtime"
     reference_source = "runtime"
+    active_transfer_schema = ""
+    active_chain_contract: Dict[str, Any] = {}
     process_dir = getattr(pipeline, "process_dir", None)
     report_path = (
         process_dir / "stage7_stretch_quality.json"
@@ -4265,9 +4267,12 @@ def _stage9_resolve_matched_domain_transfer(pipeline) -> Dict[str, Any]:
             or ""
         )
         transfer_schema = str(transfer.get("schema") or "")
+        active_transfer_schema = transfer_schema
+        active_chain_contract = dict(transfer.get("chain_contract") or {})
         if transfer_schema not in {
             stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V1,
             stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V2,
+            stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V3,
         }:
             return {
                 "status": "unavailable",
@@ -4280,14 +4285,112 @@ def _stage9_resolve_matched_domain_transfer(pipeline) -> Dict[str, Any]:
                 "reason": "Stage7 matched-domain transfer schema is invalid",
                 "selected_candidate_id": selected_candidate_id,
             }
+        if method == stage7_stretch_metrics.COMPOSITE_TONE_TRANSFER_METHOD:
+            if transfer_schema != (
+                stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V3
+            ):
+                return {
+                    "status": "unavailable",
+                    "reason_code": "stage9_composite_tone_transfer_invalid",
+                    "reason": "composite tone requires matched-domain schema v3",
+                    "selected_candidate_id": selected_candidate_id,
+                }
+            tone_candidate_id = str(
+                transfer.get("tone_candidate_id")
+                or selected_candidate_id
+                or ""
+            )
+            if not tone_candidate_id.startswith("cand_composite"):
+                return {
+                    "status": "unavailable",
+                    "reason_code": "stage9_composite_tone_transfer_invalid",
+                    "reason": (
+                        "composite tone transfer does not match the selected "
+                        "Stage7 candidate"
+                    ),
+                    "selected_candidate_id": selected_candidate_id,
+                }
+            calibration = dict(transfer.get("calibration") or {})
+            try:
+                parent_calibration, tone_contract = (
+                    stage7_stretch_metrics.rebuild_composite_tone_transfer(
+                        calibration
+                    )
+                )
+                expected_steps = [
+                    {
+                        "index": 0,
+                        "method": (
+                            stage7_stretch_metrics.DISPLAY_LUMINANCE_VECTOR_METHOD
+                        ),
+                        "calibration_schema": parent_calibration.get("schema"),
+                        "lut_contract": dict(
+                            calibration.get("parent_lut_contract") or {}
+                        ),
+                    },
+                    {
+                        "index": 1,
+                        "method": "linked_rec709_luminance_power",
+                        "tone": {
+                            key: value
+                            for key, value in tone_contract.items()
+                            if key != "chain_contract"
+                        },
+                    },
+                ]
+                chain_contract = (
+                    stage7_stretch_metrics.validate_matched_domain_chain_contract(
+                        dict(transfer.get("chain_contract") or {}),
+                        expected_steps=expected_steps,
+                    )
+                )
+            except (KeyError, TypeError, ValueError, FloatingPointError) as error:
+                return {
+                    "status": "unavailable",
+                    "reason_code": "stage9_composite_tone_transfer_invalid",
+                    "reason": (
+                        "composite tone authentication failed: "
+                        f"{error}"
+                    ),
+                    "selected_candidate_id": selected_candidate_id,
+                }
+            if (
+                transfer.get("fallback_to_linked_mtf_allowed") is not False
+            ):
+                return {
+                    "status": "unavailable",
+                    "reason_code": "stage9_composite_tone_transfer_invalid",
+                    "reason": (
+                        "composite tone matched-domain chain contract is invalid"
+                    ),
+                    "selected_candidate_id": selected_candidate_id,
+                }
+            return {
+                "status": "ready",
+                "method": method,
+                "source": transfer_source,
+                "selected_candidate_id": selected_candidate_id,
+                "tone_candidate_id": tone_candidate_id,
+                "calibration": calibration,
+                "chain_contract": chain_contract,
+                "fallback_to_linked_mtf_allowed": False,
+            }
         if method in stage7_stretch_metrics.DISPLAY_LUT_METHODS:
+            calibration = dict(transfer.get("calibration") or {})
+            calibration_method = str(calibration.get("method") or "")
             expected_method = (
                 stage7_stretch_metrics.DISPLAY90_LEGACY_METHOD
                 if transfer_schema
                 == stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V1
+                else calibration_method
+                if transfer_schema
+                == stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V3
                 else stage7_stretch_metrics.DISPLAY_LUMINANCE_VECTOR_METHOD
             )
-            if method != expected_method:
+            if (
+                method != expected_method
+                or expected_method not in stage7_stretch_metrics.DISPLAY_LUT_METHODS
+            ):
                 return {
                     "status": "unavailable",
                     "reason_code": "stage9_display90_transfer_invalid",
@@ -4308,13 +4411,29 @@ def _stage9_resolve_matched_domain_transfer(pipeline) -> Dict[str, Any]:
                     "reason": "Display90 transfer does not match the selected candidate",
                     "selected_candidate_id": selected_candidate_id,
                 }
-            calibration = dict(transfer.get("calibration") or {})
             try:
                 _lut, lut_contract = (
                     stage7_stretch_metrics.rebuild_display90_linked_lut(
                         calibration
                     )
                 )
+                chain_contract = None
+                if transfer_schema == (
+                    stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V3
+                ):
+                    chain_contract = (
+                        stage7_stretch_metrics.validate_matched_domain_chain_contract(
+                            dict(transfer.get("chain_contract") or {}),
+                            expected_steps=[
+                                {
+                                    "index": 0,
+                                    "method": method,
+                                    "calibration_schema": calibration.get("schema"),
+                                    "lut_contract": lut_contract,
+                                }
+                            ],
+                        )
+                    )
             except (KeyError, TypeError, ValueError, FloatingPointError) as error:
                 return {
                     "status": "unavailable",
@@ -4342,6 +4461,7 @@ def _stage9_resolve_matched_domain_transfer(pipeline) -> Dict[str, Any]:
                 "tone_candidate_id": tone_candidate_id,
                 "calibration": calibration,
                 "lut_contract": lut_contract,
+                "chain_contract": chain_contract,
                 "fallback_to_linked_mtf_allowed": False,
             }
         if method == "closed_form_linked_mtf":
@@ -4349,6 +4469,32 @@ def _stage9_resolve_matched_domain_transfer(pipeline) -> Dict[str, Any]:
             reference_source = str(
                 transfer.get("source") or transfer_source
             )
+            if active_transfer_schema == (
+                stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V3
+            ):
+                active_anchor = (
+                    dict(reference.get("active_anchor") or {})
+                    if isinstance(reference, dict)
+                    else {}
+                )
+                if (
+                    selected_candidate_id != "cand_b"
+                    or transfer.get("tone_candidate_id") != "cand_b"
+                    or not isinstance(reference, dict)
+                    or reference.get("status") != "active"
+                    or str(active_anchor.get("candidate") or "") != "cand_b"
+                    or str(active_anchor.get("method") or "")
+                    != "closed_form_linked_mtf"
+                    or dict(active_anchor.get("params") or {}) != params
+                ):
+                    return {
+                        "status": "unavailable",
+                        "reason_code": "stage9_matched_domain_transfer_invalid",
+                        "reason": (
+                            "linked-MTF v3 winner/reference binding is invalid"
+                        ),
+                        "selected_candidate_id": selected_candidate_id or None,
+                    }
         else:
             return {
                 "status": "unavailable",
@@ -4398,6 +4544,37 @@ def _stage9_resolve_matched_domain_transfer(pipeline) -> Dict[str, Any]:
             "reason": "Stage7 linked-MTF anchor parameters are invalid",
             "selected_candidate_id": selected_candidate_id or None,
         }
+    chain_contract = None
+    if active_transfer_schema == (
+        stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V3
+    ):
+        try:
+            chain_contract = (
+                stage7_stretch_metrics.validate_matched_domain_chain_contract(
+                    active_chain_contract,
+                    expected_steps=[
+                        {
+                            "index": 0,
+                            "method": "closed_form_linked_mtf",
+                            "params": params,
+                        }
+                    ],
+                )
+            )
+        except (TypeError, ValueError) as error:
+            return {
+                "status": "unavailable",
+                "reason_code": "stage9_matched_domain_transfer_invalid",
+                "reason": f"linked-MTF chain authentication failed: {error}",
+                "selected_candidate_id": selected_candidate_id or None,
+            }
+        if transfer.get("fallback_to_linked_mtf_allowed") is not False:
+            return {
+                "status": "unavailable",
+                "reason_code": "stage9_matched_domain_transfer_invalid",
+                "reason": "linked-MTF v3 exact-chain contract is invalid",
+                "selected_candidate_id": selected_candidate_id or None,
+            }
     return {
         "status": "ready",
         "method": "closed_form_linked_mtf",
@@ -4408,7 +4585,11 @@ def _stage9_resolve_matched_domain_transfer(pipeline) -> Dict[str, Any]:
             "mtf_midtones": midtones,
             "mtf_highlights": highlights,
         },
-        "fallback_to_linked_mtf_allowed": True,
+        "chain_contract": chain_contract,
+        "fallback_to_linked_mtf_allowed": bool(
+            active_transfer_schema
+            != stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V3
+        ),
     }
 
 
@@ -4421,6 +4602,11 @@ def _stage9_apply_matched_domain_transfer(
     method = str(transfer.get("method") or "")
     if transfer.get("status") != "ready":
         raise ValueError("Stage7 matched-domain transfer is not ready")
+    if method == stage7_stretch_metrics.COMPOSITE_TONE_TRANSFER_METHOD:
+        return stage7_stretch_metrics.apply_composite_tone_transfer(
+            image,
+            dict(transfer.get("calibration") or {}),
+        )
     if method in stage7_stretch_metrics.DISPLAY_LUT_METHODS:
         return stage7_stretch_metrics.apply_display90_linked_rgb_stretch(
             image,

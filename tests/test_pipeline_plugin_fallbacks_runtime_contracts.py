@@ -617,6 +617,14 @@ class PipelinePluginFallbackRuntimeContractTests(PipelinePluginFallbackTestBase)
             allowed,
         )
         self.assertIn("STARUN_STAGE8_LIMITED_SATURATION_MAX", allowed)
+        self.assertIn("STARUN_STAGE8_TARGET_AWARE_CHROMA_ENABLE", allowed)
+        for retired in (
+            "STARUN_STAGE4_NBN_ENABLE",
+            "STARUN_STAGE4_NBN_STRENGTH",
+            "STARUN_STAGE4_NBN_GAIN_LIMIT",
+            "STARUN_STAGE4_NBN_LINE_RATIO_DRIFT_MAX",
+        ):
+            self.assertNotIn(retired, allowed)
         self.assertIn("STARUN_STAGE8_LIMITED_CORE_EXCLUSION_EXPAND", allowed)
         self.assertIn(
             "STARUN_STAGE8_LIMITED_HALO_TEXTURE_GROWTH_MAX",

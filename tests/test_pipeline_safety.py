@@ -36,6 +36,7 @@ from pipeline_safety import (  # noqa: E402
     should_skip_final_denoise,
 )
 from models import StarSeparationState  # noqa: E402
+import stage5_handoff  # noqa: E402
 from stages.stage7_stretching import run_stage7_stretching  # noqa: E402
 from stages.stage6_star_separation import run_stage6_star_separation  # noqa: E402
 from stages.stage8_nebula_enhancement import run_stage8_nebula_enhancement  # noqa: E402
@@ -65,6 +66,8 @@ class _StarPreservePipeline:
         self.process_dir = process_dir
         self.process_dir.mkdir(parents=True, exist_ok=True)
         (self.process_dir / "stage5_linear.fit").write_bytes(b"FIT")
+        (self.process_dir / "stage4_color.fit").write_bytes(b"STAGE4")
+        (self.process_dir / "stage5_input_linear.fit").write_bytes(b"STAGE5-INPUT")
         self.cfg = SimpleNamespace(
             stage6_star_preserve_target_bypass_enabled=True,
         )
@@ -85,6 +88,19 @@ class _StarPreservePipeline:
         self._stage8_fallback_used = False
         self._stage9_final_source = ""
         self._review_requirements: dict[tuple[int, str], dict[str, object]] = {}
+        input_lineage = stage5_handoff.freeze_stage5_input_lineage(
+            self,
+            upstream_loaded=True,
+            baseline_saved=True,
+        )
+        stage5_handoff.freeze_stage5_handoff(
+            self,
+            origin=stage5_handoff.CURRENT_RUN_ORIGIN,
+            stage_status="ok",
+            deconvolution_integrity_ok=True,
+            denoise_integrity_ok=True,
+            input_lineage=input_lineage,
+        )
 
     def _clear_stage_reviews(self, stage: int) -> None:
         self._review_requirements = {

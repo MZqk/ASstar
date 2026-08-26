@@ -7,6 +7,7 @@ from models import PipelineStage, StarSeparationState
 from pipeline_safety import should_bypass_star_separation
 from sirilpy.exceptions import CommandError, SirilError
 import scene_support
+import stage5_handoff
 import stage7_repair
 import stage7_quality
 import syqon_starless
@@ -935,31 +936,6 @@ def _apply_starmask_cleanup_hard_gate(
     return quality
 
 
-def _select_stage7_source(pipeline) -> str:
-    source_stem = pipeline.stretched_name or "stage7_stretched"
-    if pipeline.process_dir and (pipeline.process_dir / f"{source_stem}.fit").exists():
-        return source_stem
-    for fallback in (
-        "stage5_linear",
-        "stage5_graxpert_deconv",
-        "stage5_deconv",
-        "stage4_color",
-        "stage3_bgremoved",
-        "stage1_prepared",
-        "working",
-    ):
-        if pipeline.process_dir and (pipeline.process_dir / f"{fallback}.fit").exists():
-            pipeline.log.info(
-                "[Stage6] Stretch output not available; using linear starless-first input: "
-                f"{fallback}"
-            )
-            pipeline.stretched_name = fallback
-            pipeline._stage7_starless_first_source = fallback
-            return fallback
-    pipeline.stretched_name = source_stem
-    return source_stem
-
-
 _QUALITY_FAILURE_CODES = {
     "residual_stars": "RESIDUAL_GLOBAL",
     "compact_residual_stars": "RESIDUAL_COMPACT",
@@ -1238,24 +1214,9 @@ def _stage6_bright_core_with_stars_fallback_contract(
     }
 
 
-def _stage7_linear_source(pipeline) -> str:
-    for stem in (
-        "stage5_linear",
-        "stage5_graxpert_deconv",
-        "stage5_deconv",
-        "stage4_color",
-        "stage3_bgremoved",
-        "stage2_corrected",
-        "stage1_prepared",
-        "working",
-    ):
-        if pipeline.process_dir and (pipeline.process_dir / f"{stem}.fit").exists():
-            return stem
-    return _select_stage7_source(pipeline)
-
-
 def _prepare_star_separation_source(pipeline) -> Tuple[str, str, List[Dict[str, Any]]]:
-    linear_source = _stage7_linear_source(pipeline)
+    lineage = stage5_handoff.verify_stage5_handoff(pipeline)
+    linear_source = stage5_handoff.STAGE5_SOURCE_STEM
     records: List[Dict[str, Any]] = [
         {
             "mode": "linear_star_separation",
@@ -1263,12 +1224,25 @@ def _prepare_star_separation_source(pipeline) -> Tuple[str, str, List[Dict[str, 
             "status": "selected",
             "method": "linear",
             "domain": "linear",
+            "source_lineage": lineage,
         }
     ]
-    pipeline.cmd_with_check("load", linear_source)
-    pipeline._save_stage_output("stage6_input")
+    try:
+        pipeline.cmd_with_check("cd", f'"{pipeline.process_dir}"')
+        pipeline.cmd_with_check("load", linear_source)
+    except (CommandError, SirilError) as error:
+        raise stage5_handoff.Stage5HandoffError(
+            stage5_handoff.REASON_SOURCE_UNAVAILABLE,
+            f"canonical Stage 5 source cannot be loaded: {error}",
+        ) from error
+    if not pipeline._save_stage_output("stage6_input"):
+        raise stage5_handoff.Stage5HandoffError(
+            stage5_handoff.REASON_INPUT_CHECKPOINT_FAILED,
+            "Stage 6 immutable input checkpoint could not be saved",
+        )
 
     pipeline.stretched_name = linear_source
+    pipeline._stage7_starless_first_source = linear_source
     return linear_source, "linear_star_separation", records
 
 
@@ -1328,9 +1302,93 @@ def run_stage6_star_separation(pipeline) -> None:
         "accepted": False,
         "status": "not_evaluated",
     }
-    selected_source_stem, star_separation_mode, mode_input_records = (
-        _prepare_star_separation_source(pipeline)
-    )
+    try:
+        selected_source_stem, star_separation_mode, mode_input_records = (
+            _prepare_star_separation_source(pipeline)
+        )
+    except stage5_handoff.Stage5HandoffError as error:
+        reason_code = str(
+            error.reason_code or stage5_handoff.REASON_LINEAGE_UNVERIFIED
+        )
+        detail = str(error.detail or error)
+        source_lineage = stage5_handoff.public_handoff(
+            getattr(pipeline, "_stage5_linear_handoff", None)
+        )
+        pipeline.starless_file = None
+        pipeline.starmask_file = None
+        pipeline._stage7_starless_skipped = True
+        pipeline._stage8_conservative_mode = True
+        pipeline._star_separation_state = StarSeparationState.REJECTED.value
+        pipeline._stage8_handoff.update(
+            {
+                "requested_policy": "skip",
+                "processing_policy": "skip",
+                "source_stem": None,
+                "passthrough": False,
+                "restricted_downstream": True,
+                "reason_code": reason_code,
+                "reason_text": detail,
+                "reasons": [
+                    {
+                        "code": reason_code,
+                        "source_stage": 5,
+                        "error": detail,
+                    }
+                ],
+                "quality_status": "failed",
+            }
+        )
+        pipeline._require_review(6, reason_code)
+        pipeline._write_stage_json(
+            "stage6_starless_quality.json",
+            {
+                "attempts": [],
+                "shared_scene_support": shared_scene_support_summary,
+                "selected": None,
+                "galaxy_roi": pipeline._stage6_galaxy_roi_diagnostics,
+                "mode": "upstream_source_rejected",
+                "star_separation_state": pipeline._star_separation_state,
+                "star_separation_mode": None,
+                "input_domain": "linear",
+                "selected_source_stem": None,
+                "source_lineage": source_lineage,
+                "stage8_conservative_mode": True,
+                "stage8_handoff": pipeline._stage8_handoff,
+                "reason_code": reason_code,
+                "error": detail,
+                "bright_core_with_stars_fallback": (
+                    pipeline._bright_core_with_stars_fallback
+                ),
+            },
+        )
+        elapsed = pipeline.log.stage_end(stage_label)
+        pipeline._record_stage(
+            stage_label,
+            "failed",
+            elapsed,
+            f"Stage 6 refused an unverified Stage 5 source: {detail}",
+            execution="completed",
+            reason_code=reason_code,
+            details={
+                "output": None,
+                "source_lineage": source_lineage,
+                "stage8_handoff": pipeline._stage8_handoff,
+                "star_separation_state": pipeline._star_separation_state,
+            },
+            components={
+                "input_source": {
+                    "status": "failed",
+                    "fatal": True,
+                    "reason_code": reason_code,
+                    "fallback_used": False,
+                    "message": detail,
+                }
+            },
+            review_reasons=pipeline._stage_review_reasons(6),
+        )
+        raise SirilError(
+            f"Stage 6 upstream source rejected ({reason_code}): {detail}"
+        ) from error
     if not legacy_scene_support and getattr(pipeline, "process_dir", None) is not None:
         try:
             stage6_source_pixels = pipeline.siril.get_image_pixeldata(preview=False)

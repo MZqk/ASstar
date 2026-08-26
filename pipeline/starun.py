@@ -37,6 +37,7 @@ import review_bundle
 import run_manifest
 import scene_support
 import scunet_denoise
+import stage5_handoff
 import syqon_starless
 import sasp_runner
 import stage7_quality
@@ -945,6 +946,7 @@ class StarunPostProcessor(
         self._stage8_handoff: Dict[str, Any] = {}
         self._stage8_artistic_palette_applied: bool = False
         self._stage8_palette_report: Dict[str, Any] = {}
+        self._stage8_subject_chroma_report: Dict[str, Any] = {}
         self._stage8_saturation_execution: Dict[str, Any] = {}
         self._stage8_color_quality_report: Dict[str, Any] = {}
         self._stage8_subject_boundary_seam_report: Dict[str, Any] = {}
@@ -1007,6 +1009,7 @@ class StarunPostProcessor(
         self._checkpoint_retention_report: Dict[str, Any] = {}
         self._formal_checkpoint_publish_failures: List[Dict[str, Any]] = []
         self._stage5_denoise_applied: bool = False
+        self._stage5_linear_handoff: Dict[str, Any] = {}
         self._saturation_boost_applied: float = 0.0
         self._color_adjustment_ledger: List[Dict[str, Any]] = []
         self._debug_quality_metric_index: int = 0
@@ -1498,6 +1501,8 @@ class StarunPostProcessor(
         if not manifest_value or not self.process_dir:
             return
         try:
+            if stage_number == 5:
+                stage5_handoff.verify_stage5_handoff(self)
             contract = task_workspace.stage_contract(stage_number)
             artifact = self.process_dir / contract.primary_artifact
             auxiliary_artifacts = None
@@ -1800,6 +1805,15 @@ class StarunPostProcessor(
             raise SirilError(
                 "Stage 5 续跑缺少 task-run manifest 中已验签的规范断点"
             )
+        provenance = getattr(self, "_trusted_input_provenance", None)
+        if not isinstance(provenance, Mapping) or not (
+            provenance.get("verified") is True
+            and str(provenance.get("checkpoint") or "") == "stage5"
+            and str(provenance.get("state") or "").lower() == "linear"
+            and str(provenance.get("semantic_context_status") or "")
+            == "verified"
+        ):
+            raise SirilError("Stage 5 续跑来源缺少已验签的完整 lineage")
 
         self.source_file = linear_path
         self.linear_intermediate_path = linear_path
@@ -1807,9 +1821,33 @@ class StarunPostProcessor(
         self._stage1_registration_stats = None
 
         working_file = self.process_dir / "working.fit"
+        canonical_linear_file = self.process_dir / STAGE5_LINEAR_INPUT_NAME
         shutil.copy2(linear_path, working_file)
+        shutil.copy2(linear_path, canonical_linear_file)
+        materialized_sha256 = run_manifest.sha256_file(canonical_linear_file)
+        if not materialized_sha256 or materialized_sha256 != str(
+            provenance.get("actual_sha256") or ""
+        ):
+            raise SirilError("Stage 5 续跑断点复制后 SHA-256 不一致")
+        downstream_handoff = stage5_handoff.freeze_stage5_handoff(
+            self,
+            origin=stage5_handoff.VERIFIED_RESUME_ORIGIN,
+            stage_status="verified_resume",
+            deconvolution_integrity_ok=True,
+            denoise_integrity_ok=True,
+            provenance=provenance,
+        )
+        if downstream_handoff.get("accepted") is not True:
+            raise SirilError(
+                "Stage 5 续跑 handoff 无法验收: "
+                + str(
+                    downstream_handoff.get("detail")
+                    or downstream_handoff.get("reason_code")
+                    or "unknown error"
+                )
+            )
         self.log.info(f"线性续跑输入: {linear_path.name}")
-        self.log.info("已复制线性输入到处理目录")
+        self.log.info("已复制并验签为本轮 stage5_linear 输入")
 
         self.cmd_with_check("cd", f'"{self.process_dir}"')
         self.cmd_with_check("load", "working")
@@ -2666,6 +2704,7 @@ class StarunPostProcessor(
             self._stage8_conservative_mode = False
             self._stage8_artistic_palette_applied = False
             self._stage8_palette_report = {}
+            self._stage8_subject_chroma_report = {}
             self._stage8_saturation_execution = {}
             self._stage8_color_quality_report = {}
             self._stage8_subject_boundary_seam_report = {}
@@ -2704,6 +2743,7 @@ class StarunPostProcessor(
             self._last_syqon_exchange_report = {}
             self._star_preserve_target_bypass = False
             self._stage5_denoise_applied = False
+            self._stage5_linear_handoff = {}
             self._saturation_boost_applied = 0.0
             self._color_adjustment_ledger = []
             self.results = []

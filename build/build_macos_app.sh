@@ -42,6 +42,8 @@ PIPELINE_REQUIRED_MODULES=(
   input_discovery.py
   task_workspace.py
   processing_parameters.py
+  stage5_handoff.py
+  stage8_color_rendition.py
   ui_preview.py
 )
 LOCAL_TEMPLATE="$PROJECT_ROOT/resources/config.1.4.ini.template"

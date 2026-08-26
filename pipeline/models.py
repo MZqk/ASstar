@@ -212,11 +212,7 @@ class PipelineConfig:
     stage4_spcc_narrowband_g_bandwidth_nm: float = 30.0  # 双窄带物理校色 G/OIII 带宽
     stage4_spcc_narrowband_b_wavelength_nm: float = 500.70  # HOO 的 B 与 G 使用同一 OIII 中心波长
     stage4_spcc_narrowband_b_bandwidth_nm: float = 30.0  # HOO 的 B 与 G 使用同一 OIII 带宽
-    stage4_narrowband_normalization_enabled: bool = True  # 仅生成隔离的 HOO 艺术派生图，不作为后续物理主链输入
     stage4_nbn_mapping_confidence_min: float = 0.85  # 低于此置信度时保留输入，不猜测窄带通道含义
-    stage4_nbn_strength: float = 0.55  # HOO 通道跨度与背景中和的保守混合强度
-    stage4_nbn_gain_limit: float = 1.08  # 单通道最大归一化增益/衰减范围
-    stage4_nbn_line_ratio_drift_max: float = 0.12  # Ha/OIII 信号比例最大相对漂移
     stage4_pcc_timeout_sec: int = 180  # SPCC 异常后的 Gaia PCC 只尝试一次；双窄带结果仅作降级基础校色，达到该秒数即终止
     stage4_pcc_quality_gate_enabled: bool = True  # 兼容字段：仅控制旧质量指标的 accepted 诊断值，不再参与 Stage4 路由
     stage4_pcc_channel_gain_ratio_max: float = 10.0  # SPCC/PCC 三通道相对增益跨度诊断线；仅 advisory，不参与路由
@@ -244,7 +240,6 @@ class PipelineConfig:
     stage7_display90_strength: float = 0.90  # GUI linked 显示曲线正式候选的保留强度，运行时钳制 0.50–0.95
     stage7_display90_reference_chroma_load_ratio_max: float = 1.05  # 已认证窄带 Display90 相对真实 GUI D 背景色度负载的最大比值
     stage7_display90_reference_chroma_load_absolute_max: float = 0.30  # GUI D 参考匹配豁免仍允许的候选背景绝对色度负载硬上限
-    stage7_vivid_subject_chroma_enabled: bool = True  # 仅对冻结主体 ROI 的低频色度做保亮度、保余量增强
     stage7_chroma_rescue_max_attempts: int = 3  # 截断固定色度救援安全阶梯；0 表示不尝试
     asinh_stretch: float = 3.0      # Asinh 拉伸强度（越大整体越亮）
     asinh_offset: float = 0.001     # Asinh 偏移，影响暗部起拉位置
@@ -265,6 +260,7 @@ class PipelineConfig:
     # 阶段 8: 星云饱和度
     stage8_processing_mode: str = "auto"  # auto/limited/background_only/preserve，仅作为上限
     stage8_failure_action: str = "auto_fallback"  # 决定性失败：auto_fallback/preserve_review/stop
+    stage8_target_aware_chroma_enabled: bool = True  # 完整增强时对冻结主体 ROI 做保亮度、保余量的低频色度增强
     stage8_nebula_saturation_enabled: bool = True  # 独立控制星云饱和度子步骤
     stage8_background_denoise_enabled: bool = True  # 独立控制背景降噪子步骤
     stage8_faint_nebula_boost_enabled: bool = True  # 独立控制暗弱星云提升子步骤

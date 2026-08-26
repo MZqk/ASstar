@@ -11,6 +11,7 @@ import numpy as np
 
 from models import PipelineStage
 import stage5_deconvolution_quality
+import stage5_handoff
 import stage8_pixels
 from noise_model import (
     assess_denoise_candidate,
@@ -1119,6 +1120,8 @@ def run_stage5_linear_denoise(pipeline) -> None:
     """
     stage_name = PipelineStage.LINEAR_DENOISE.label
     pipeline._clear_stage_reviews(5)
+    pipeline._stage5_linear_handoff = {}
+    pipeline._stage5_input_lineage = {}
     pipeline.log.stage_start(stage_name)
     status = "ok"
     messages: List[str] = []
@@ -1175,19 +1178,69 @@ def run_stage5_linear_denoise(pipeline) -> None:
     denoise_integrity_ok = True
     denoise_input = "stage5_input_linear"
     final_stem = "stage5_linear"
+    upstream_loaded = False
+    baseline_saved = False
+    process_dir = getattr(pipeline, "process_dir", None)
+    upstream_path = (
+        Path(process_dir) / stage5_handoff.STAGE5_UPSTREAM_ARTIFACT
+        if process_dir is not None
+        else None
+    )
+    baseline_path = (
+        Path(process_dir) / stage5_handoff.STAGE5_INPUT_ARTIFACT
+        if process_dir is not None
+        else None
+    )
+    baseline_path_ready = baseline_path is not None
+    if baseline_path is not None and baseline_path.exists():
+        try:
+            baseline_path.unlink()
+        except OSError as error:
+            baseline_path_ready = False
+            status = "degraded"
+            messages.append(
+                "stale stage5_input_linear cleanup failed: "
+                f"{pipeline._short_text(error, 160)}"
+            )
 
-    try:
-        pipeline.cmd_with_check("load", "stage4_color")
-        messages.append("loaded stage4_color")
-    except (CommandError, SirilError) as e:
+    if upstream_path is None or not upstream_path.is_file():
         status = "degraded"
-        messages.append(f"load stage4_color failed, using current image: {pipeline._short_text(e, 160)}")
+        messages.append("canonical stage4_color.fit is unavailable; Stage5 input rejected")
+    else:
+        try:
+            pipeline.cmd_with_check("load", stage5_handoff.STAGE5_UPSTREAM_STEM)
+            upstream_loaded = True
+            messages.append("loaded canonical stage4_color")
+        except (CommandError, SirilError) as e:
+            status = "degraded"
+            messages.append(
+                "load canonical stage4_color failed; current image rejected: "
+                f"{pipeline._short_text(e, 160)}"
+            )
 
-    try:
-        pipeline.cmd_with_check("save", "stage5_input_linear")
-    except (CommandError, SirilError) as e:
-        pipeline.log.warn(f"stage5 baseline save failed: {e}")
-        messages.append(f"stage5 input baseline save failed: {pipeline._short_text(e, 160)}")
+    if upstream_loaded and baseline_path_ready:
+        baseline_saved = bool(
+            pipeline._save_stage_output(stage5_handoff.STAGE5_INPUT_STEM)
+        )
+        if not baseline_saved:
+            status = "degraded"
+            messages.append("stage5 input baseline save failed")
+    else:
+        messages.append(
+            "stage5 input baseline save skipped because canonical input was not verified"
+        )
+
+    stage5_input_lineage = stage5_handoff.freeze_stage5_input_lineage(
+        pipeline,
+        upstream_loaded=upstream_loaded,
+        baseline_saved=baseline_saved,
+    )
+    if stage5_input_lineage.get("accepted") is not True:
+        status = "degraded"
+        messages.append(
+            "Stage5 input baseline rejected: "
+            + str(stage5_input_lineage.get("detail") or "unknown error")
+        )
 
     before_adaptive = (
         pipeline._adaptive_features_current()
@@ -1195,6 +1248,8 @@ def run_stage5_linear_denoise(pipeline) -> None:
         else {}
     )
     try:
+        if stage5_input_lineage.get("accepted") is not True:
+            raise RuntimeError("verified stage5_input_linear baseline unavailable")
         stage5_input_linear_pixels = _stage5_current_pixels(pipeline)
         pipeline._stage5_input_linear_pixels = stage5_input_linear_pixels
         noise_model_report = build_noise_model_report(
@@ -1297,25 +1352,54 @@ def run_stage5_linear_denoise(pipeline) -> None:
         getattr(pipeline.cfg, "stage5_denoise_backend_policy", "auto_chain")
     )
     if processing_mode == "preserve":
+        preserve_reload_ok = False
         try:
-            pipeline.cmd_with_check("load", "stage5_input_linear")
+            if stage5_input_lineage.get("accepted") is not True:
+                raise SirilError("verified stage5_input_linear baseline unavailable")
+            pipeline.cmd_with_check("load", stage5_handoff.STAGE5_INPUT_STEM)
+            preserve_reload_ok = True
         except (CommandError, SirilError) as error:
             status = "degraded"
             messages.append(
-                "Stage5 preserve reload failed; current immutable-equivalent "
-                f"linear image retained: {pipeline._short_text(error, 160)}"
+                "Stage5 preserve reload failed; current image cannot be treated "
+                f"as the frozen baseline: {pipeline._short_text(error, 160)}"
             )
         linear_saved = pipeline._save_stage_output("stage5_linear")
         linear_export_ok = pipeline._export_linear_intermediate()
         if not linear_saved or not linear_export_ok:
             status = "degraded"
+        downstream_handoff = stage5_handoff.freeze_stage5_handoff(
+            pipeline,
+            origin=stage5_handoff.CURRENT_RUN_ORIGIN,
+            stage_status=status,
+            deconvolution_integrity_ok=bool(linear_saved and preserve_reload_ok),
+            denoise_integrity_ok=bool(linear_saved and preserve_reload_ok),
+            input_lineage=stage5_input_lineage,
+        )
+        if downstream_handoff.get("accepted") is not True:
+            status = "failed"
+            messages.append(
+                "Stage5 canonical handoff rejected: "
+                + str(
+                    downstream_handoff.get("detail")
+                    or downstream_handoff.get("reason_code")
+                    or "unknown error"
+                )
+            )
         pipeline._stage5_denoise_applied = False
         messages.append(
             "用户选择保留 Stage4 线性结果；反卷积与降噪候选未执行"
         )
         preserve_deconvolution_component = {
             "status": "skipped",
-            "reason_code": "user_preserve",
+            "reason_code": (
+                "user_preserve"
+                if downstream_handoff.get("accepted") is True
+                else str(
+                    downstream_handoff.get("reason_code")
+                    or stage5_handoff.REASON_LINEAGE_UNVERIFIED
+                )
+            ),
             "fallback_used": False,
         }
         pipeline._stage5_deconvolution_acceptance = {
@@ -1326,7 +1410,11 @@ def run_stage5_linear_denoise(pipeline) -> None:
             "component": dict(preserve_deconvolution_component),
             "local_star_guard": local_star_guard,
             "attempts": [],
-            "integrity_ok": True,
+            "integrity_ok": bool(
+                stage5_input_lineage.get("accepted") is True
+                and preserve_reload_ok
+                and linear_saved
+            ),
         }
         report = {
             "stage": "stage5_linear",
@@ -1334,9 +1422,12 @@ def run_stage5_linear_denoise(pipeline) -> None:
             "failure_action": failure_action,
             "denoise_backend_policy": denoise_backend_policy,
             "execution": "safe_passthrough",
-            "reason_code": "user_preserve",
+            "reason_code": preserve_deconvolution_component["reason_code"],
             "input": "stage5_input_linear",
             "linear_output": "stage5_linear" if linear_saved else None,
+            "downstream_handoff": stage5_handoff.public_handoff(
+                downstream_handoff
+            ),
             "noise_model_report": noise_model_report,
             "target_structure_mask": target_structure_report,
             "star_reference": star_reference_report,
@@ -1344,7 +1435,11 @@ def run_stage5_linear_denoise(pipeline) -> None:
                 **preserve_deconvolution_component,
                 "local_star_guard": local_star_guard,
                 "local_star_guard_attempts": [],
-                "integrity_ok": True,
+                "integrity_ok": bool(
+                    stage5_input_lineage.get("accepted") is True
+                    and preserve_reload_ok
+                    and linear_saved
+                ),
             },
             "denoise": {"status": "skipped", "reason_code": "user_preserve"},
             "status": status,
@@ -1359,16 +1454,35 @@ def run_stage5_linear_denoise(pipeline) -> None:
             "；".join(messages),
             execution="safe_passthrough",
             upstream_passthrough=True,
-            reason_code="user_preserve",
+            reason_code=(
+                "user_preserve"
+                if downstream_handoff.get("accepted") is True
+                else str(
+                    downstream_handoff.get("reason_code")
+                    or stage5_handoff.REASON_LINEAGE_UNVERIFIED
+                )
+            ),
             details={
                 "output": "stage5_linear" if linear_saved else None,
                 "diagnostics_complete": True,
+                "downstream_handoff": stage5_handoff.public_handoff(
+                    downstream_handoff
+                ),
             },
             components={
                 "deconvolution": preserve_deconvolution_component,
                 "denoise": {
                     "status": "skipped",
                     "reason_code": "user_preserve",
+                    "fallback_used": False,
+                },
+                "linear_handoff": {
+                    "status": (
+                        "accepted"
+                        if downstream_handoff.get("accepted") is True
+                        else "failed"
+                    ),
+                    "reason_code": downstream_handoff.get("reason_code"),
                     "fallback_used": False,
                 },
             },
@@ -2075,6 +2189,41 @@ def run_stage5_linear_denoise(pipeline) -> None:
     else:
         stage_reason_code = ""
 
+    downstream_handoff = stage5_handoff.freeze_stage5_handoff(
+        pipeline,
+        origin=stage5_handoff.CURRENT_RUN_ORIGIN,
+        stage_status=status,
+        deconvolution_integrity_ok=bool(
+            linear_saved and deconv_integrity_ok
+        ),
+        denoise_integrity_ok=bool(
+            linear_saved and denoise_integrity_ok
+        ),
+        input_lineage=stage5_input_lineage,
+    )
+    components["linear_handoff"] = {
+        "status": (
+            "accepted"
+            if downstream_handoff.get("accepted") is True
+            else "failed"
+        ),
+        "reason_code": downstream_handoff.get("reason_code"),
+        "fallback_used": False,
+    }
+    if downstream_handoff.get("accepted") is not True:
+        status = "failed"
+        stage_reason_code = str(
+            downstream_handoff.get("reason_code")
+            or stage5_handoff.REASON_LINEAGE_UNVERIFIED
+        )
+        messages.append(
+            "Stage5 canonical handoff rejected: "
+            + str(
+                downstream_handoff.get("detail")
+                or stage_reason_code
+            )
+        )
+
     pipeline._write_stage_json(
         "stage5_denoise_attempts.json",
         {
@@ -2098,6 +2247,9 @@ def run_stage5_linear_denoise(pipeline) -> None:
             "input": "stage4_color",
             "linear_output": "stage5_linear",
             "final_linear_source": final_stem,
+            "downstream_handoff": stage5_handoff.public_handoff(
+                downstream_handoff
+            ),
             "processing_order": [
                 "load stage4_color",
                 "save stage5_input_linear",
@@ -2243,6 +2395,9 @@ def run_stage5_linear_denoise(pipeline) -> None:
             "failure_action": failure_action,
             "denoise_backend_policy": denoise_backend_policy,
             "failure_policy_reason": policy_abort_reason or None,
+            "downstream_handoff": stage5_handoff.public_handoff(
+                downstream_handoff
+            ),
         },
         components=components,
         review_reasons=pipeline._stage_review_reasons(5),

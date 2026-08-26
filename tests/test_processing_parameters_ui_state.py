@@ -145,6 +145,46 @@ class ProcessingParameterUiStateTests(unittest.TestCase):
         self.assertIn("1 项自定义", headers[5].text)
         self.assertIn("专家配置已生效", headers[5].text)
 
+    def test_stage8_target_aware_chroma_dependency_follows_full_saturation(
+        self,
+    ) -> None:
+        field = "stage8_target_aware_chroma_enabled"
+        control = _Widget()
+        auto_check = _Widget()
+        row_label = _Widget()
+        payload = default_processing_parameters()
+        proxy = SimpleNamespace(
+            _stage_parameter_controls={field: control},
+            processing_parameters=payload,
+            _stage_parameter_effective_labels={},
+            _stage_parameter_auto_checks={field: auto_check},
+            _stage_parameter_row_widgets={field: (row_label, _Widget())},
+        )
+
+        gui_module.StarunGui._refresh_processing_parameter_dependencies(proxy)
+        self.assertTrue(control.enabled)
+        self.assertTrue(auto_check.enabled)
+        self.assertTrue(row_label.enabled)
+
+        payload["stages"]["8"]["mode"] = "limited"
+        gui_module.StarunGui._refresh_processing_parameter_dependencies(proxy)
+        self.assertFalse(control.enabled)
+        self.assertFalse(auto_check.enabled)
+        self.assertFalse(row_label.enabled)
+
+        payload["stages"]["8"]["mode"] = "auto"
+        payload["stages"]["8"]["overrides"][
+            "stage8_nebula_saturation_enabled"
+        ] = False
+        gui_module.StarunGui._refresh_processing_parameter_dependencies(proxy)
+        self.assertFalse(control.enabled)
+
+        payload["stages"]["8"]["overrides"][
+            "stage8_nebula_saturation_enabled"
+        ] = True
+        gui_module.StarunGui._refresh_processing_parameter_dependencies(proxy)
+        self.assertTrue(control.enabled)
+
 
 if __name__ == "__main__":
     unittest.main()

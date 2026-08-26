@@ -33,7 +33,6 @@ from device_geometry import (
 )
 from models import PipelineStage
 from narrowband_normalization import (
-    normalize_dual_narrowband_candidate,
     resolve_dual_narrowband_mapping,
     select_filter_header_evidence,
     validate_narrowband_channel_mapping,
@@ -126,7 +125,6 @@ PCC_CHECKPOINT_STEM = "stage4_pre_pcc"
 PCC_CANDIDATE_STEM = "stage4_pcc_candidate"
 SPCC_CANDIDATE_STEM = "stage4_spcc_candidate"
 PHYSICAL_COLOR_STEM = "stage4_physical_color"
-HOO_ARTISTIC_STEM = "stage4_hoo_artistic"
 LOCAL_SPCC_DIRNAME = "siril_cat1_healpix8_xpsamp"
 LOCAL_SPCC_FILE_PATTERN = "siril_cat1_healpix8_xpsamp_*.dat"
 LOCAL_SPCC_FILE_PREFIX = "siril_cat1_healpix8_xpsamp_"
@@ -3077,127 +3075,6 @@ def _stage4_apply_auto_reference_candidate(
         return False, report
 
 
-def _stage4_run_narrowband_normalization(
-    pipeline,
-    mapping: Dict[str, Any],
-) -> tuple[bool, Dict[str, Any], str]:
-    report: Dict[str, Any] = {
-        "schema": "starun.narrowband-normalization.v1",
-        "status": "not_run",
-        "accepted": False,
-    }
-    if not bool(
-        getattr(pipeline.cfg, "stage4_narrowband_normalization_enabled", True)
-    ):
-        report.update(status="disabled", issues=["disabled_by_configuration"])
-        return False, report, "narrowband normalization disabled"
-    mapping_confidence_min = float(
-        getattr(
-            pipeline.cfg,
-            "stage4_nbn_mapping_confidence_min",
-            0.85,
-        )
-    )
-    mapping_validation = validate_narrowband_channel_mapping(
-        mapping,
-        confidence_min=mapping_confidence_min,
-    )
-    if not mapping_validation["valid"]:
-        report.update(
-            status="skipped_unconfirmed_mapping",
-            mapping=mapping,
-            issues=list(mapping_validation["issues"]),
-        )
-        return (
-            False,
-            report,
-            "narrowband normalization skipped: Ha/OIII mapping unconfirmed",
-        )
-    baseline_saved = pipeline._save_stage_output("stage4_pre_nbn")
-    if not baseline_saved:
-        report.update(
-            status="prohibited",
-            issues=["immutable_baseline_save_failed"],
-        )
-        return (
-            False,
-            report,
-            "narrowband normalization prohibited: immutable baseline save failed",
-        )
-    try:
-        image_data = pipeline.siril.get_image_pixeldata(preview=False)
-        candidate, report = normalize_dual_narrowband_candidate(
-            image_data,
-            mapping=mapping,
-            mapping_confidence_min=mapping_confidence_min,
-            strength=float(
-                getattr(pipeline.cfg, "stage4_nbn_strength", 0.55)
-            ),
-            gain_limit=float(
-                getattr(pipeline.cfg, "stage4_nbn_gain_limit", 1.08)
-            ),
-            line_ratio_drift_max=float(
-                getattr(
-                    pipeline.cfg,
-                    "stage4_nbn_line_ratio_drift_max",
-                    0.12,
-                )
-            ),
-        )
-        report["transaction"]["baseline_saved"] = True
-        if not bool(report.get("accepted")):
-            return (
-                False,
-                report,
-                "narrowband normalization candidate rejected: "
-                + ",".join(report.get("issues") or []),
-            )
-        _stage4_write_image_pixels(pipeline, candidate)
-        if not pipeline._save_stage_output("stage4_nbn_candidate"):
-            raise RuntimeError("stage4_nbn_candidate save failed")
-        report["transaction"].update(
-            candidate_saved=True,
-            rollback_performed=False,
-        )
-        metrics = report.get("metrics") or {}
-        return (
-            True,
-            report,
-            "narrowband normalization accepted "
-            f"(background_improvement={float(metrics.get('background_color_improvement', 0.0)):.4f}, "
-            f"line_ratio_drift={float(metrics.get('ha_oiii_ratio_drift', 0.0)):.3f})",
-        )
-    except (
-        AttributeError,
-        CommandError,
-        OSError,
-        RuntimeError,
-        SirilError,
-        TypeError,
-        ValueError,
-    ) as error:
-        report.update(
-            status="failed",
-            accepted=False,
-            error=str(error),
-        )
-        try:
-            pipeline.cmd_with_check("load", "stage4_pre_nbn")
-            report.setdefault("transaction", {}).update(
-                rollback_performed=True,
-            )
-        except (CommandError, SirilError) as rollback_error:
-            report.setdefault("transaction", {}).update(
-                rollback_performed=False,
-                rollback_error=str(rollback_error),
-            )
-        return (
-            False,
-            report,
-            f"narrowband normalization unavailable; baseline restored: {error}",
-        )
-
-
 def run_stage4_color_calibration(pipeline) -> None:
     """Stage 4: plate solve, SPCC-first physical color, then bounded fallbacks."""
     stage_label = PipelineStage.COLOR_CALIBRATION.label
@@ -3287,10 +3164,13 @@ def run_stage4_color_calibration(pipeline) -> None:
     }
     pcc_fallback_used = False
     artistic_hoo_report: Dict[str, Any] = {
+        "schema": "starun.stage4-artistic-delegation.v1",
         "role": "artistic_derivative",
         "status": "not_applicable",
+        "accepted": False,
         "feeds_main_pipeline": False,
         "output": None,
+        "stage8_report": "stage8_palette_report.json",
     }
     physical_saved = False
     artistic_saved = False
@@ -4754,153 +4634,64 @@ def run_stage4_color_calibration(pipeline) -> None:
                 hard_degraded = True
                 requires_review = True
                 status = "degraded"
+                artistic_hoo_report = {
+                    "schema": "starun.stage4-artistic-delegation.v1",
+                    "status": "delegation_source_unavailable",
+                    "accepted": False,
+                    "role": "artistic_derivative",
+                    "source_parent": None,
+                    "physical_parent": None,
+                    "parent_calibration_role": narrowband_main_parent_role,
+                    "mapping_evidence": channel_mapping,
+                    "output": None,
+                    "feeds_main_pipeline": False,
+                    "stage8_report": "stage8_palette_report.json",
+                    "reason": (
+                        "Stage8 HOO palette source is unavailable because the "
+                        "Stage4 main color checkpoint could not be frozen"
+                    ),
+                }
                 messages.append(
                     "dual-narrowband main color checkpoint unavailable; "
-                    "isolated HOO derivative skipped"
+                    "Stage8 HOO palette delegation has no source"
                 )
             else:
-                (
-                    narrowband_normalized,
-                    narrowband_normalization_report,
-                    narrowband_message,
-                ) = _stage4_run_narrowband_normalization(
-                    pipeline,
-                    channel_mapping,
+                artistic_hoo_report = {
+                    "schema": "starun.stage4-artistic-delegation.v1",
+                    "status": "delegated_to_stage8",
+                    "accepted": False,
+                    "role": "artistic_derivative",
+                    "source_parent": f"{narrowband_main_parent_stem}.fit",
+                    "physical_parent": (
+                        f"{PHYSICAL_COLOR_STEM}.fit"
+                        if narrowband_parent_is_physical
+                        else None
+                    ),
+                    "parent_calibration_role": narrowband_main_parent_role,
+                    "mapping_evidence": channel_mapping,
+                    "output": None,
+                    "feeds_main_pipeline": False,
+                    "stage8_report": "stage8_palette_report.json",
+                    "reason": (
+                        "Stage4 freezes physical channel semantics only; the "
+                        "sole HOO artistic pixel route is Stage8 palette"
+                    ),
+                }
+                physical_main_restore_report.update(
+                    required=False,
+                    restored=False,
+                    source=f"{narrowband_main_parent_stem}.fit",
+                    source_role=narrowband_main_parent_role,
+                    reason="no Stage4 artistic mutation was performed",
                 )
-                narrowband_normalization_report = dict(
-                    narrowband_normalization_report
+                messages.append(
+                    "HOO artistic rendition delegated to Stage8 palette; "
+                    "Stage4 main color pixels remain unchanged"
                 )
-                narrowband_normalization_report.update(
-                    {
-                        "role": "artistic_derivative",
-                        "source_parent": f"{narrowband_main_parent_stem}.fit",
-                        "physical_parent": (
-                            f"{PHYSICAL_COLOR_STEM}.fit"
-                            if narrowband_parent_is_physical
-                            else None
-                        ),
-                        "parent_calibration_role": narrowband_main_parent_role,
-                        "feeds_main_pipeline": False,
-                    }
-                )
-                messages.append(narrowband_message)
-                if narrowband_normalized:
-                    artistic_saved = pipeline._save_stage_output(HOO_ARTISTIC_STEM)
-                    narrowband_normalization_report["artistic_output"] = (
-                        f"{HOO_ARTISTIC_STEM}.fit" if artistic_saved else None
-                    )
-                    if artistic_saved:
-                        artistic_hoo_report = {
-                            **narrowband_normalization_report,
-                            "status": "accepted",
-                            "output": f"{HOO_ARTISTIC_STEM}.fit",
-                        }
-                        messages.append(
-                            "isolated HOO artistic derivative saved; main pipeline "
-                            f"restores {narrowband_main_parent_role} parent"
-                        )
-                    else:
-                        artistic_hoo_report = {
-                            **narrowband_normalization_report,
-                            "status": "accepted_output_save_failed",
-                            "output": None,
-                        }
-                        messages.append("isolated HOO artistic derivative save failed")
-                else:
-                    artistic_hoo_report = {
-                        **narrowband_normalization_report,
-                        "output": None,
-                    }
-                pipeline._stage4_narrowband_normalization_report = (
-                    narrowband_normalization_report
-                )
-                pipeline._write_stage_json(
-                    "stage4_narrowband_normalization.json",
-                    artistic_hoo_report,
-                )
-                physical_main_restore_report["required"] = True
-                try:
-                    pipeline.cmd_with_check("load", narrowband_main_parent_stem)
-                    physical_main_restore_report.update(
-                        restored=True,
-                        source=f"{narrowband_main_parent_stem}.fit",
-                        source_role=narrowband_main_parent_role,
-                    )
-                    messages.append(
-                        "restored dual-narrowband main branch after HOO derivative: "
-                        f"{narrowband_main_parent_role}"
-                    )
-                except (CommandError, SirilError) as error:
-                    hard_degraded = True
-                    requires_review = True
-                    status = "degraded"
-                    physical_main_restore_report["physical_restore_error"] = str(
-                        error
-                    )
-                    messages.append(
-                        "dual-narrowband main branch restore after HOO derivative failed: "
-                        f"{error}"
-                    )
-                    try:
-                        pipeline.cmd_with_check("load", PCC_CHECKPOINT_STEM)
-                        physical_main_restore_report.update(
-                            restored=True,
-                            source=f"{PCC_CHECKPOINT_STEM}.fit",
-                            fallback_used=True,
-                        )
-                        color_method = "PRESERVE_INPUT"
-                        color_warning = "physical_branch_restore_fallback_pre_color"
-                        color_confidence = min(color_confidence, 0.35)
-                        policy_status = "physical_restore_fallback_review_required"
-                        messages.append(
-                            "calibrated branch unavailable; restored immutable pre-color "
-                            "checkpoint before main output"
-                        )
-                    except (CommandError, SirilError) as fallback_error:
-                        physical_main_restore_report["pre_color_restore_error"] = str(
-                            fallback_error
-                        )
-                        if before_chw is not None and restore_before_pixels is not None:
-                            try:
-                                _stage4_write_image_pixels(
-                                    pipeline,
-                                    restore_before_pixels(before_chw.copy()),
-                                )
-                                physical_main_restore_report.update(
-                                    restored=True,
-                                    source="in_memory_pre_color",
-                                    fallback_used=True,
-                                )
-                                color_method = "PRESERVE_INPUT"
-                                color_warning = (
-                                    "physical_branch_restore_fallback_in_memory_pre_color"
-                                )
-                                color_confidence = min(color_confidence, 0.25)
-                                policy_status = (
-                                    "physical_restore_fallback_review_required"
-                                )
-                                messages.append(
-                                    "physical and file checkpoints unavailable; restored "
-                                    "in-memory pre-color pixels before main output"
-                                )
-                            except (
-                                AttributeError,
-                                CommandError,
-                                SirilError,
-                                RuntimeError,
-                                TypeError,
-                                ValueError,
-                            ) as memory_error:
-                                physical_main_restore_report[
-                                    "in_memory_restore_error"
-                                ] = str(memory_error)
-                        if not physical_main_restore_report["restored"]:
-                            main_output_blocked = True
-                            status = "failed"
-                            messages.append(
-                                "stage4_color prohibited: no verified calibrated or "
-                                "pre-color source could be restored"
-                            )
+            narrowband_normalization_report = dict(artistic_hoo_report)
+            pipeline._stage4_narrowband_normalization_report = dict(
+                artistic_hoo_report
+            )
 
     strict_core_evidence = stage7_quality.strict_bright_core_target_evidence(
         _stage4_active_target_type(pipeline),
@@ -5162,15 +4953,15 @@ def run_stage4_color_calibration(pipeline) -> None:
         },
         "artistic_hoo": {
             "status": (
-                "applied"
-                if artistic_hoo_report.get("status") == "accepted"
+                "delegated"
+                if artistic_hoo_report.get("status") == "delegated_to_stage8"
                 else "failed"
                 if artistic_hoo_report.get("status")
-                == "accepted_output_save_failed"
+                == "delegation_source_unavailable"
                 else "skipped"
             ),
             "method": (
-                "HOO_DETERMINISTIC_MAPPING"
+                "DELEGATED_TO_STAGE8_PALETTE"
                 if channel_policy.get("kind") == "narrowband_composite"
                 else None
             ),
@@ -5178,6 +4969,7 @@ def run_stage4_color_calibration(pipeline) -> None:
             "input": artistic_hoo_report.get("source_parent")
             or artistic_hoo_report.get("physical_parent"),
             "output": artistic_hoo_report.get("output"),
+            "report": artistic_hoo_report.get("stage8_report"),
             "fallback_used": False,
             "feeds_main_pipeline": False,
         },

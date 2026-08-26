@@ -85,7 +85,6 @@ STAGE7_CANDIDATE_RANKING_FIELDS = (
     "technical_safety",
     "stretch_saturated_penalty",
     "subject_brightness_floor",
-    "absolute_subject_saturation_utility_capped",
     "continuous_quality_score",
     "subject_brightness_goals_capped_tiebreaker",
     "subject_brightness_utility_capped_tiebreaker",
@@ -495,21 +494,67 @@ def _stage7_matched_domain_transfer_contract(
     selected_method = str(selected.get("method") or "")
     tone_candidate = selected
     tone_candidate_id = selected_name
-    if selected_method == "vivid_safe_chroma":
-        parent = dict((selected.get("params") or {}).get("parent_candidate") or {})
-        if parent:
-            tone_candidate = parent
-            tone_candidate_id = str(
-                (selected.get("params") or {}).get("parent_name")
-                or selected.get("tone_parent")
-                or parent.get("name")
-                or ""
-            )
     tone_method = str(tone_candidate.get("method") or "")
     calibration = copy.deepcopy(
         (tone_candidate.get("params") or {}).get("calibration") or {}
     )
     calibration_method = str(calibration.get("method") or "")
+    if (
+        selected_method
+        == stage7_stretch_metrics.COMPOSITE_TONE_TRANSFER_METHOD
+        or calibration_method
+        == stage7_stretch_metrics.COMPOSITE_TONE_TRANSFER_METHOD
+    ):
+        try:
+            parent_calibration, tone_contract = (
+                stage7_stretch_metrics.rebuild_composite_tone_transfer(
+                    calibration
+                )
+            )
+        except (KeyError, TypeError, ValueError, FloatingPointError) as error:
+            return {
+                **base,
+                "method": stage7_stretch_metrics.COMPOSITE_TONE_TRANSFER_METHOD,
+                "reason": f"selected composite tone contract is invalid: {error}",
+            }
+        chain_contract = (
+            stage7_stretch_metrics.build_matched_domain_chain_contract(
+                [
+                    {
+                        "index": 0,
+                        "method": (
+                            stage7_stretch_metrics.DISPLAY_LUMINANCE_VECTOR_METHOD
+                        ),
+                        "calibration_schema": parent_calibration.get("schema"),
+                        "lut_contract": dict(
+                            calibration.get("parent_lut_contract") or {}
+                        ),
+                    },
+                    {
+                        "index": 1,
+                        "method": "linked_rec709_luminance_power",
+                        "tone": {
+                            key: value
+                            for key, value in tone_contract.items()
+                            if key != "chain_contract"
+                        },
+                    },
+                ]
+            )
+        )
+        return {
+            **base,
+            "schema": (
+                stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V3
+            ),
+            "status": "active",
+            "method": stage7_stretch_metrics.COMPOSITE_TONE_TRANSFER_METHOD,
+            "source": "selected_stage7_composite_tone_candidate",
+            "tone_candidate_id": tone_candidate_id,
+            "calibration": calibration,
+            "chain_contract": chain_contract,
+            "fallback_to_linked_mtf_allowed": False,
+        }
     if (
         tone_method in stage7_stretch_metrics.DISPLAY_LUT_METHODS
         or calibration_method in stage7_stretch_metrics.DISPLAY_LUT_METHODS
@@ -541,13 +586,22 @@ def _stage7_matched_domain_transfer_contract(
                 "method": display_method or None,
                 "reason": f"selected Display90 contract is invalid: {error}",
             }
+        chain_contract = (
+            stage7_stretch_metrics.build_matched_domain_chain_contract(
+                [
+                    {
+                        "index": 0,
+                        "method": display_method,
+                        "calibration_schema": calibration.get("schema"),
+                        "lut_contract": lut_contract,
+                    }
+                ]
+            )
+        )
         return {
             **base,
             "schema": (
-                stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V1
-                if calibration.get("schema")
-                == stage7_stretch_metrics.DISPLAY90_STRETCH_SCHEMA_V1
-                else stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V2
+                stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V3
             ),
             "status": "active",
             "method": display_method,
@@ -555,26 +609,62 @@ def _stage7_matched_domain_transfer_contract(
             "tone_candidate_id": tone_candidate_id,
             "calibration": calibration,
             "lut_contract": lut_contract,
+            "chain_contract": chain_contract,
             "fallback_to_linked_mtf_allowed": False,
         }
 
     reference = dict(closed_form_mtf_reference or {})
     active_anchor = dict(reference.get("active_anchor") or {})
-    params = dict(active_anchor.get("params") or {})
-    if reference.get("status") != "active" or not params:
+    selected_params = dict(selected.get("params") or {})
+    anchor_params = dict(active_anchor.get("params") or {})
+    if selected_name != "cand_b" or selected_method != "linked_mtf":
+        return {
+            **base,
+            "method": selected_method or None,
+            "reason": (
+                "selected Stage7 candidate has no exact matched-domain "
+                "transfer contract"
+            ),
+        }
+    if (
+        reference.get("status") != "active"
+        or str(active_anchor.get("candidate") or "") != "cand_b"
+        or str(active_anchor.get("method") or "")
+        != "closed_form_linked_mtf"
+        or not selected_params
+        or anchor_params != selected_params
+    ):
         return {
             **base,
             "method": "closed_form_linked_mtf",
-            "reason": "closed-form linked-MTF reference is unavailable",
+            "reason": (
+                "selected cand_b does not match the authenticated "
+                "closed-form linked-MTF reference"
+            ),
         }
     return {
         **base,
+        "schema": (
+            stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V3
+        ),
         "status": "active",
         "method": "closed_form_linked_mtf",
-        "source": "candidate_b_closed_form_reference",
-        "params": params,
+        "source": "selected_candidate_b_closed_form_reference",
+        "tone_candidate_id": selected_name,
+        "params": selected_params,
+        "chain_contract": (
+            stage7_stretch_metrics.build_matched_domain_chain_contract(
+                [
+                    {
+                        "index": 0,
+                        "method": "closed_form_linked_mtf",
+                        "params": selected_params,
+                    }
+                ]
+            )
+        ),
         "reference_schema": reference.get("schema"),
-        "fallback_to_linked_mtf_allowed": True,
+        "fallback_to_linked_mtf_allowed": False,
     }
 
 
@@ -903,9 +993,6 @@ class Stage6ServiceMixin:
         shadow_chroma_damping = _clamp_float(
             float(params.get("shadow_chroma_damping", 0.28)), 0.0, 0.60
         )
-        faint_saturation_boost = _clamp_float(
-            float(params.get("faint_saturation_boost", 0.026)), 0.0, 0.08
-        )
         star_mask_expand = int(
             _clamp_float(float(params.get("star_mask_expand", 4)), 1.0, 8.0)
         )
@@ -955,18 +1042,6 @@ class Stage6ServiceMixin:
         chroma_damp = 1.0 - shadow_chroma_damping * bg_chroma_weight
         for idx in range(3):
             result[idx] = new_gray + (result[idx] - new_gray) * chroma_damp
-
-        new_gray = (0.2126 * result[0] + 0.7152 * result[1] + 0.0722 * result[2]).astype(np.float32)
-        sat_weight = np.clip(faint_mask * (1.0 - 0.90 * shadow_weight) * (1.0 - core_mask), 0.0, 1.0)
-        if star_protection is not None:
-            sat_weight *= np.clip(
-                1.0 - star_faint_suppression * star_protection,
-                0.0,
-                1.0,
-            )
-        sat_gain = 1.0 + faint_saturation_boost * sat_weight
-        for idx in range(3):
-            result[idx] = new_gray + (result[idx] - new_gray) * sat_gain
 
         new_gray = (0.2126 * result[0] + 0.7152 * result[1] + 0.0722 * result[2]).astype(np.float32)
         highlight = np.maximum(new_gray - core_floor, 0.0)
@@ -1153,61 +1228,31 @@ class Stage6ServiceMixin:
                     label="Stage7 Display90 linked LUT",
                 )
                 return True, method
-            if method == "vivid_safe_chroma":
-                parent = dict(params.get("parent_candidate") or {})
-                if not parent or str(parent.get("method") or "") == method:
-                    raise ValueError("vivid-safe parent candidate is invalid")
-                replay_ok, replay_used = self._execute_stage7_stretch_candidate(
-                    parent,
-                    starmask_image_data=starmask_image_data,
-                    frozen_masks=frozen_masks,
-                )
-                if not replay_ok:
-                    raise RuntimeError(
-                        f"vivid-safe parent replay failed: {replay_used}"
-                    )
+            if method == stage7_stretch_metrics.COMPOSITE_TONE_TRANSFER_METHOD:
                 image_data = self.siril.get_image_pixeldata(preview=False)
                 if image_data is None:
-                    raise RuntimeError("vivid-safe parent pixel buffer is empty")
-                rendition_source = np.asarray(image_data)
-                composite_tone = None
-                tone_source_background = params.get(
-                    "composite_tone_source_background"
+                    raise RuntimeError("composite-tone source pixel buffer is empty")
+                source = np.asarray(image_data)
+                calibration = dict(params.get("calibration") or {})
+                rendered_rgb = stage7_stretch_metrics.apply_composite_tone_transfer(
+                    source,
+                    calibration,
                 )
-                tone_target_background = params.get(
-                    "composite_tone_target_background"
-                )
-                if (
-                    tone_source_background is not None
-                    and tone_target_background is not None
-                ):
-                    rendition_source, composite_tone = (
-                        stage7_stretch_metrics.apply_composite_preserving_tone(
-                            rendition_source,
-                            source_background=float(tone_source_background),
-                            target_background=float(tone_target_background),
-                        )
-                    )
-                rendered_rgb, rendition = (
-                    stage7_stretch_metrics.apply_subject_chroma_rendition(
-                        rendition_source,
-                        frozen_masks,
-                        factor=float(params.get("factor", 1.08)),
-                        expand_faint_signal=composite_tone is not None,
-                    )
-                )
-                if composite_tone is not None:
-                    rendition["composite_tone"] = composite_tone
                 restored = self._stage8_restore_rgb_like(
-                    np.asarray(image_data),
+                    source,
                     rendered_rgb,
                 )
                 self._set_current_image_pixeldata(
                     restored,
-                    label="Stage7 vivid-safe subject chroma",
+                    label="Stage7 composite preserving tone",
                 )
-                self._stage7_last_vivid_chroma_execution = rendition
-                return True, "vivid_safe_chroma"
+                self._stage7_last_composite_tone_execution = {
+                    "schema": stage7_stretch_metrics.COMPOSITE_TONE_CALIBRATION_SCHEMA,
+                    "status": "applied",
+                    "method": method,
+                    "calibration": calibration,
+                }
+                return True, method
             if method == "autostretch":
                 self.cmd_with_check("autostretch")
                 return True, "autostretch"
@@ -1668,32 +1713,19 @@ class Stage6ServiceMixin:
         calibration_name = str(
             candidate.get("calibration_candidate") or candidate.get("name") or ""
         )
-        composite_vivid = bool(
-            str(candidate.get("method") or "") == "vivid_safe_chroma"
-            and str((target_stretch or {}).get("name") or "").strip().lower()
-            == "bright_core_composite_reveal"
-        )
         preview_target_attainment = _stage7_preview_target_attainment(
             calibration_name,
             pixel_stats,
             dict(candidate.get("adaptation") or {}),
-            min_ratio=(
-                0.55
-                if composite_vivid
-                else getattr(
-                    self.cfg,
-                    "stage7_preview_target_p50_min_ratio",
-                    0.90,
-                )
+            min_ratio=getattr(
+                self.cfg,
+                "stage7_preview_target_p50_min_ratio",
+                0.90,
             ),
-            hard_min_ratio=(
-                0.45
-                if composite_vivid
-                else getattr(
-                    self.cfg,
-                    "stage7_preview_target_p50_hard_min_ratio",
-                    0.80,
-                )
+            hard_min_ratio=getattr(
+                self.cfg,
+                "stage7_preview_target_p50_hard_min_ratio",
+                0.80,
             ),
             max_ratio=getattr(
                 self.cfg,
@@ -3323,17 +3355,6 @@ class Stage6ServiceMixin:
         return max(0.0, value)
 
 
-    @staticmethod
-    def _stage7_absolute_subject_saturation_goal(
-        profile_name: Any,
-    ) -> Optional[float]:
-        """Set an absolute colour goal only for the resolved Lagoon/Trifid profile."""
-
-        if str(profile_name or "").strip().lower() == "bright_core_composite_reveal":
-            return 0.30
-        return None
-
-
     @classmethod
     def _stage7_presentation_score_v6(
         cls,
@@ -3444,24 +3465,6 @@ class Stage6ServiceMixin:
             else:
                 utilities[name] = _clamp_float(ratio / goal, 0.0, 1.0)
         absolute_saturation = cls._stage7_absolute_subject_saturation(attempt)
-        absolute_saturation_goal = cls._stage7_absolute_subject_saturation_goal(
-            profile_name
-        )
-        absolute_saturation_utility = None
-        if absolute_saturation_goal is not None:
-            absolute_saturation_utility = (
-                _clamp_float(
-                    (absolute_saturation or 0.0) / absolute_saturation_goal,
-                    0.0,
-                    1.0,
-                )
-                if absolute_saturation is not None
-                else 0.0
-            )
-            utilities["saturation_median"] = min(
-                utilities["saturation_median"],
-                absolute_saturation_utility,
-            )
         presentation = sum(
             utilities[name] * weights[name] for name in weights
         )
@@ -3571,8 +3574,9 @@ class Stage6ServiceMixin:
             "goals": goals,
             "utilities": utilities,
             "absolute_subject_saturation": absolute_saturation,
-            "absolute_subject_saturation_goal": absolute_saturation_goal,
-            "absolute_subject_saturation_utility": absolute_saturation_utility,
+            "absolute_subject_saturation_goal": None,
+            "absolute_subject_saturation_utility": None,
+            "absolute_subject_saturation_role": "diagnostic_only_stage8_owns_goal",
             "safety": safety_values,
             "missing_metrics": missing,
             "saturation_p95_role": "gate_and_diagnostic_only",
@@ -4030,26 +4034,12 @@ class Stage6ServiceMixin:
             score = 0.0
         if not math.isfinite(score):
             score = 0.0
-        try:
-            absolute_saturation_utility = float(
-                report.get("absolute_subject_saturation_utility", 0.0) or 0.0
-            )
-        except (TypeError, ValueError):
-            absolute_saturation_utility = 0.0
-        if not math.isfinite(absolute_saturation_utility):
-            absolute_saturation_utility = 0.0
-        absolute_saturation_utility = _clamp_float(
-            absolute_saturation_utility,
-            0.0,
-            1.0,
-        )
         return (
             status_penalty,
             final_penalty,
             technical_penalty,
             stretch_saturated_penalty,
             brightness_floor_penalty,
-            -absolute_saturation_utility,
             -score,
             -brightness_goal_count,
             -brightness_utility,
@@ -4708,7 +4698,6 @@ class Stage6ServiceMixin:
                         "faint_boost": 0.018,
                         "core_protection": 0.72,
                         "shadow_chroma_damping": 0.28,
-                        "faint_saturation_boost": 0.026,
                         "star_mask_expand": int(
                             getattr(
                                 self.cfg,
@@ -4756,7 +4745,6 @@ class Stage6ServiceMixin:
                             "faint_boost": 0.026,
                             "core_protection": 0.80,
                             "shadow_chroma_damping": 0.20,
-                            "faint_saturation_boost": 0.040,
                         },
                         "reason": (
                             "reveal Lagoon and Trifid in one physical field while "
@@ -4840,7 +4828,6 @@ class Stage6ServiceMixin:
                         "faint_boost": 0.012,
                         "core_protection": 0.84,
                         "shadow_chroma_damping": 0.38,
-                        "faint_saturation_boost": 0.014,
                     },
                     "cand_b_ghs_amount": 1.02,
                     "reason": "lift faint surrounding signal without crushing dark dust lanes",
@@ -4880,81 +4867,6 @@ class Stage6ServiceMixin:
                     }
                 )
         return profile
-
-
-    def _stage7_vivid_chroma_factor(
-        self,
-        target_stretch: Dict[str, Any],
-        *,
-        saturation_ratio: Optional[float] = None,
-        saturation_goal: Optional[float] = None,
-        absolute_subject_saturation: Optional[float] = None,
-        absolute_subject_goal: Optional[float] = None,
-    ) -> float:
-        """Return the bounded target-aware colour factor for vivid-safe."""
-
-        profile_name = str(target_stretch.get("name") or "").strip().lower()
-        channel_semantics = str(
-            getattr(self, "_channel_semantics", "unknown") or "unknown"
-        ).strip().lower()
-        if (
-            channel_semantics == "narrowband_composite"
-            and profile_name
-            in {
-                "bright_core_protect",
-                "widefield_nebulosity",
-                "widefield_faint_signal",
-                "widefield_subject_separation",
-                "dark_nebula_separation",
-                "generic_balanced",
-            }
-        ):
-            return 1.18
-        if profile_name == "bright_core_composite_reveal":
-            try:
-                absolute = float(absolute_subject_saturation)
-                absolute_goal = float(absolute_subject_goal)
-            except (TypeError, ValueError):
-                absolute = 0.0
-                absolute_goal = 0.0
-            if (
-                math.isfinite(absolute)
-                and math.isfinite(absolute_goal)
-                and absolute > 1e-6
-                and absolute_goal > 0.0
-            ):
-                compensated = 1.0 + 2.0 * max(
-                    0.0,
-                    absolute_goal / absolute - 1.0,
-                )
-                # The Stage 7 physical-color vector gate remains unchanged and
-                # is the final authority.  After compact star/catalog islands
-                # are removed from the broad-signal mask, M8 has enough vector
-                # headroom for a stronger bounded recovery without printing
-                # aperture topology into the image.
-                return max(1.12, min(4.0, compensated))
-            return 1.12
-        if profile_name in {
-            "bright_core_protect",
-            "widefield_nebulosity",
-            "widefield_faint_signal",
-            "widefield_subject_separation",
-            "dark_nebula_separation",
-        }:
-            return 1.12
-        if profile_name == "galaxy_core_halo_balance":
-            try:
-                ratio = float(saturation_ratio)
-                goal = min(float(saturation_goal), 0.50)
-            except (TypeError, ValueError):
-                ratio = 0.0
-                goal = 0.0
-            if math.isfinite(ratio) and math.isfinite(goal) and ratio > 1e-6:
-                return max(1.08, min(6.0, goal / ratio))
-            return 1.08
-        if profile_name == "star_colour_preserve":
-            return 1.06
-        return 1.08
 
 
     def _stage7_conditional_candidate_a(
@@ -6164,7 +6076,8 @@ class Stage6ServiceMixin:
         self._stage7_destructive_core_rejected = False
         self._stage7_bright_core_integrity_rejected_reasons = []
         self._stage7_revoked_pair_id = None
-        self._stage7_last_vivid_chroma_execution = {}
+        self._stage7_last_composite_tone_execution = {}
+        self._stage7_frozen_rendition_masks = {}
         self._stage7_stretch_fallback_reason = None
         self._stage7_review_source = None
         self._stage7_background_color_review_required = False
@@ -6447,6 +6360,11 @@ class Stage6ServiceMixin:
                 ),
                 "frozen_once": True,
             }
+        self._stage7_frozen_rendition_masks = {
+            key: np.array(value, copy=True)
+            for key, value in (frozen_background_masks or {}).items()
+            if isinstance(value, np.ndarray)
+        }
         active_target_type = str(
             self._active_target_type() or "generic_low_snr_safe"
             if hasattr(self, "_active_target_type")
@@ -6487,7 +6405,8 @@ class Stage6ServiceMixin:
             "stage7 primary stretch candidates: stage7_cand_a, stage7_cand_b, "
             "optional stage7_cand_display70/82/90; "
             "galaxy routes also evaluate stage7_cand_display86; "
-            "preview=stage7_preview_ref; vivid-safe and chroma rescue are conditional"
+            "preview=stage7_preview_ref; composite tone and negative-only "
+            "background chroma rescue are conditional; positive chroma is Stage8-owned"
         )
         messages.append(
             "stage7 Starless structure gate="
@@ -6874,13 +6793,21 @@ class Stage6ServiceMixin:
                     )
                     break
 
-        vivid_parent_attempts = [
+        composite_parent_attempts = [
             attempt
             for attempt in attempts
             if attempt.get("status") == "ok"
             and attempt.get("stem")
             and bool(attempt.get("allowed_as_final", False))
-            and str(attempt.get("method") or "") != "vivid_safe_chroma"
+            and str(attempt.get("method") or "")
+            == stage7_stretch_metrics.DISPLAY_LUMINANCE_VECTOR_METHOD
+            and str(
+                ((attempt.get("params") or {}).get("calibration") or {}).get(
+                    "schema"
+                )
+                or ""
+            )
+            == stage7_stretch_metrics.DISPLAY90_STRETCH_SCHEMA_V2
             and (
                 ((attempt.get("rendition_metrics") or {}).get("candidate") or {}).get(
                     "status"
@@ -6889,132 +6816,117 @@ class Stage6ServiceMixin:
             )
         ]
         if (
-            rendition_intent == "vivid_safe"
-            and bool(
-                getattr(self.cfg, "stage7_vivid_subject_chroma_enabled", True)
-            )
-            and str(
+            str(
                 getattr(self.cfg, "stage7_processing_mode", "auto") or "auto"
             ).strip().lower()
             == "auto"
-            and vivid_parent_attempts
-            and candidate_policy in {"auto_display90", "auto_dual"}
-            and preview_rendition_metrics.get("status") == "available"
+            and str((target_stretch or {}).get("name") or "").strip().lower()
+            == "bright_core_composite_reveal"
+            and composite_parent_attempts
+            and candidate_policy in {"auto_display90", "display90_only"}
         ):
-            vivid_parent = min(
-                vivid_parent_attempts,
+            composite_parent = min(
+                composite_parent_attempts,
                 key=self._stage7_candidate_selection_key,
             )
-            score_report = vivid_parent.get("presentation_score") or {}
-            saturation_ratio = self._stage7_retention_ratio(
-                vivid_parent,
-                "saturation_median",
-            )
-            saturation_goal = float(
-                (score_report.get("goals") or {}).get(
-                    "saturation_median",
-                    0.80,
-                )
-            )
-            safety_headroom = float(
-                score_report.get("safety_headroom", 0.0) or 0.0
-            )
-            absolute_subject_saturation = (
-                self._stage7_absolute_subject_saturation(vivid_parent)
-            )
-            absolute_subject_goal = (
-                self._stage7_absolute_subject_saturation_goal(
-                    (target_stretch or {}).get("name")
-                )
-            )
-            absolute_subject_below_goal = bool(
-                absolute_subject_goal is not None
-                and (
-                    absolute_subject_saturation is None
-                    or absolute_subject_saturation < absolute_subject_goal
-                )
-            )
             parent_rendition_metrics = (
-                ((vivid_parent.get("rendition_metrics") or {}).get("candidate") or {}).get(
+                (
+                    (composite_parent.get("rendition_metrics") or {}).get(
+                        "candidate"
+                    )
+                    or {}
+                ).get(
                     "metrics"
                 )
                 or {}
             )
-            if (
-                (
-                    saturation_ratio is None
-                    or saturation_ratio < saturation_goal
-                    or absolute_subject_below_goal
+            try:
+                source_background = float(
+                    parent_rendition_metrics.get("background_median")
                 )
-                and safety_headroom >= 0.15
-            ):
-                vivid_factor = self._stage7_vivid_chroma_factor(
-                    target_stretch,
-                    saturation_ratio=saturation_ratio,
-                    saturation_goal=saturation_goal,
-                    absolute_subject_saturation=absolute_subject_saturation,
-                    absolute_subject_goal=absolute_subject_goal,
-                )
-                vivid_candidate = {
-                    "name": "cand_vivid_safe",
-                    "stem": "stage7_cand_vivid_safe",
-                    "method": "vivid_safe_chroma",
+            except (TypeError, ValueError):
+                source_background = float("nan")
+            if math.isfinite(source_background) and source_background > 0.11:
+                try:
+                    composite_calibration = (
+                        stage7_stretch_metrics.build_composite_tone_calibration(
+                            dict(
+                                (composite_parent.get("params") or {}).get(
+                                    "calibration"
+                                )
+                                or {}
+                            ),
+                            source_background=source_background,
+                            target_background=0.11,
+                        )
+                    )
+                except (KeyError, TypeError, ValueError, FloatingPointError) as error:
+                    composite_calibration = None
+                    messages.append(
+                        "stage7 composite tone calibration was unavailable "
+                        f"(parent={composite_parent.get('name')}, "
+                        f"reason={self._short_text(error, 140)})"
+                    )
+                composite_candidate = {
+                    "name": "cand_composite_tone",
+                    "stem": "stage7_cand_composite_tone",
+                    "method": (
+                        stage7_stretch_metrics.COMPOSITE_TONE_TRANSFER_METHOD
+                    ),
                     "params": {
-                        "factor": vivid_factor,
-                        "absolute_subject_saturation": absolute_subject_saturation,
-                        "absolute_subject_saturation_goal": absolute_subject_goal,
-                        "composite_tone_source_background": (
-                            parent_rendition_metrics.get("background_median")
-                            if absolute_subject_goal is not None
-                            else None
-                        ),
-                        "composite_tone_target_background": (
-                            0.11 if absolute_subject_goal is not None else None
-                        ),
-                        "parent_name": vivid_parent.get("name"),
+                        "calibration": composite_calibration,
+                        "parent_name": composite_parent.get("name"),
                         "parent_candidate": {
-                            "name": vivid_parent.get("name"),
-                            "method": vivid_parent.get("method"),
-                            "params": dict(vivid_parent.get("params") or {}),
+                            "name": composite_parent.get("name"),
+                            "method": composite_parent.get("method"),
+                            "params": dict(
+                                composite_parent.get("params") or {}
+                            ),
                         },
                     },
-                    "adaptation": vivid_parent.get("adaptation"),
+                    "adaptation": composite_parent.get("adaptation"),
                     "calibration_candidate": str(
-                        vivid_parent.get("calibration_candidate")
-                        or vivid_parent.get("name")
+                        composite_parent.get("calibration_candidate")
+                        or composite_parent.get("name")
                         or ""
                     ),
-                    "tone_parent": str(vivid_parent.get("name") or ""),
+                    "tone_parent": str(composite_parent.get("name") or ""),
                 }
-                vivid_attempt = self._stage7_evaluate_stretch_candidate(
-                    vivid_candidate,
-                    source_stem=source_stem,
-                    baseline_quality=baseline_quality,
-                    baseline_image_data=baseline_image_data,
-                    starmask_image_data=starmask_image_data,
-                    baseline_background_quality=baseline_background_quality,
-                    frozen_background_masks=frozen_background_masks,
-                    target_stretch=target_stretch,
-                    preview_pixel_stats=preview_pixel_stats,
-                    preview_quality_metrics=preview_quality_metrics,
-                    preview_rendition_metrics=preview_rendition_metrics,
-                    target_local_reference_data=target_local_reference_data,
-                    target_local_reference_available=target_local_reference_available,
-                )
-                vivid_attempt["tone_parent"] = str(
-                    vivid_parent.get("name") or ""
-                )
-                vivid_attempt["vivid_chroma_execution"] = dict(
-                    getattr(self, "_stage7_last_vivid_chroma_execution", {})
-                    or {}
-                )
-                attempts.append(vivid_attempt)
-                messages.append(
-                    "stage7 vivid-safe subject chroma candidate evaluated "
-                    f"(parent={vivid_parent.get('name')}, "
-                    f"factor={vivid_factor:.2f}, "
-                    f"accepted={str(bool(vivid_attempt.get('allowed_as_final'))).lower()})"
-                )
+                if composite_calibration is not None:
+                    composite_attempt = self._stage7_evaluate_stretch_candidate(
+                        composite_candidate,
+                        source_stem=source_stem,
+                        baseline_quality=baseline_quality,
+                        baseline_image_data=baseline_image_data,
+                        starmask_image_data=starmask_image_data,
+                        baseline_background_quality=baseline_background_quality,
+                        frozen_background_masks=frozen_background_masks,
+                        target_stretch=target_stretch,
+                        preview_pixel_stats=preview_pixel_stats,
+                        preview_quality_metrics=preview_quality_metrics,
+                        preview_rendition_metrics=preview_rendition_metrics,
+                        target_local_reference_data=target_local_reference_data,
+                        target_local_reference_available=target_local_reference_available,
+                    )
+                    composite_attempt["tone_parent"] = str(
+                        composite_parent.get("name") or ""
+                    )
+                    composite_attempt["composite_tone_execution"] = dict(
+                        getattr(
+                            self,
+                            "_stage7_last_composite_tone_execution",
+                            {},
+                        )
+                        or {}
+                    )
+                    attempts.append(composite_attempt)
+                    messages.append(
+                        "stage7 composite tone candidate evaluated "
+                        f"(parent={composite_parent.get('name')}, "
+                        f"background={source_background:.4f}->0.1100, "
+                        "color=unchanged, "
+                        f"accepted={str(bool(composite_attempt.get('allowed_as_final'))).lower()})"
+                    )
 
         accepted_before_chroma_rescue = [
             attempt
