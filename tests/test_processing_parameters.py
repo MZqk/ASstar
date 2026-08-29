@@ -399,13 +399,13 @@ class ProcessingParameterContractTests(unittest.TestCase):
             normalized["stages"]["9"]["overrides"][
                 "stage9_psf_recovery_target_min"
             ],
-            0.50,
+            0.97,
         )
         self.assertEqual(
             normalized["stages"]["9"]["overrides"][
                 "stage9_psf_recovery_target_max"
             ],
-            1.50,
+            1.05,
         )
         self.assertEqual(normalized["stages"]["10"]["mode"], "preserve")
         self.assertEqual(
@@ -524,7 +524,7 @@ class ProcessingParameterContractTests(unittest.TestCase):
                 )
                 for stage in range(2, 10)
             },
-            {2: 4, 3: 18, 4: 18, 5: 4, 6: 32, 7: 52, 8: 17, 9: 84},
+            {2: 4, 3: 18, 4: 18, 5: 4, 6: 32, 7: 62, 8: 26, 9: 84},
         )
         gate_fields = {spec.field for spec in PROCESSING_GATE_PARAMETER_SPECS}
         self.assertTrue(
@@ -730,10 +730,7 @@ class ProcessingParameterContractTests(unittest.TestCase):
             cfg.stage9_highlight_clip_ratio_max,
             SPECS_BY_FIELD["stage9_highlight_clip_ratio_max"].maximum,
         )
-        self.assertEqual(
-            records["stage5_multiscale_detail_retention_min"]["source"],
-            "expert_override",
-        )
+        self.assertNotIn("stage5_multiscale_detail_retention_min", records)
         self.assertEqual(
             records["stage9_psf_fwhm_ratio_min"]["static_baseline"],
             0.93,

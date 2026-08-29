@@ -24,7 +24,8 @@ from typing import Callable, Mapping, MutableMapping, Sequence
 RUNTIME_CAPABILITIES_SCHEMA = "starun.runtime-capabilities.v1"
 RUNTIME_CAPABILITIES_NAME = "runtime-capabilities.json"
 RUNTIME_CAPABILITIES_ENV = "STARUN_RUNTIME_CAPABILITIES_MANIFEST"
-SPCC_OPERATIONAL_CACHE_SCHEMA = "starun.stage4-spcc-operational-cache.v1"
+SPCC_OPERATIONAL_CACHE_SCHEMA = "starun.stage4-spcc-operational-cache.v2"
+LEGACY_SPCC_OPERATIONAL_CACHE_SCHEMA = "starun.stage4-spcc-operational-cache.v1"
 STAGE4_COLOR_DECISION_SCHEMA = "starun.stage4-color-capability-decision.v2"
 RUN_STATE_SCHEMA = "starun.run-state.v2"
 RUN_STATE_NAME = "run-state.json"
@@ -62,12 +63,18 @@ PIPELINE_REQUIRED_PATHS = (
     "stage4_auto_reference.py",
     "stage4_evidence.py",
     "scene_support.py",
+    "final_artifact_identity.py",
+    "presentation_quality.py",
+    "spatial_background_lineage.py",
     "stage5_handoff.py",
     "stages/stage5_linear_denoise.py",
     "stages/stage7_stretching.py",
     "stages/stage6_star_separation.py",
     "stages/stage8_nebula_enhancement.py",
+    "stage8_handoff.py",
     "stage8_color_rendition.py",
+    "stage8_starless_finish.py",
+    "star_halo_guard.py",
     "stages/stage9_star_remixing.py",
     "stages/stage10_export.py",
     "configs/policies",
@@ -581,7 +588,7 @@ def apply_stage4_spcc_operational_timeout_cache(
     cache_key: str,
     evidence: Mapping[str, object],
 ) -> None:
-    """Route a known timed-out online SPCC runtime directly to PCC fallback."""
+    """Route a known unusable online SPCC runtime directly to PCC fallback."""
     decisions = manifest.get("decisions")
     if not isinstance(decisions, MutableMapping):
         return
@@ -594,9 +601,17 @@ def apply_stage4_spcc_operational_timeout_cache(
     if not isinstance(commands, MutableMapping) or not bool(commands.get("spcc")):
         return
 
+    evidence_status = str(evidence.get("status") or "timeout").strip().lower()
+    cache_status = (
+        "operational_transient_failure_cached"
+        if evidence_status == "online_transient_exhausted"
+        else "operational_timeout_cached"
+    )
+    reason_code = cache_status
     cache_record = {
         "schema": SPCC_OPERATIONAL_CACHE_SCHEMA,
-        "status": "operational_timeout_cached",
+        "compatible_schemas": [LEGACY_SPCC_OPERATIONAL_CACHE_SCHEMA],
+        "status": cache_status,
         "cache_key": str(cache_key),
         "scope": "application_session",
         "evidence": dict(evidence),
@@ -619,15 +634,15 @@ def apply_stage4_spcc_operational_timeout_cache(
         skipped.append("spcc")
     decision["skip_photometric_commands"] = skipped
     reasons = [str(value) for value in decision.get("reason_codes", ()) if str(value)]
-    if "operational_timeout_cached" not in reasons:
-        reasons.append("operational_timeout_cached")
+    if reason_code not in reasons:
+        reasons.append(reason_code)
     decision["reason_codes"] = reasons
     manifest["status"] = "degraded_allowed"
     degraded = [
         str(value) for value in manifest.get("degraded_reasons", ()) if str(value)
     ]
-    if "operational_timeout_cached" not in degraded:
-        degraded.append("operational_timeout_cached")
+    if reason_code not in degraded:
+        degraded.append(reason_code)
     manifest["degraded_reasons"] = degraded
     manifest["updated_at"] = utc_now()
 

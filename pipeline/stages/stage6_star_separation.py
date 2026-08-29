@@ -1,4 +1,5 @@
 """Star separation and star-mask preparation."""
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -10,6 +11,7 @@ import scene_support
 import stage5_handoff
 import stage7_repair
 import stage7_quality
+import star_halo_guard
 import syqon_starless
 
 
@@ -656,11 +658,24 @@ def _stage8_handoff_from_stage6(
             if str(code).upper() in _STAGE6_DEFINITE_QUALITY_REJECTION_CODES
         ]
         if definite_failure_codes:
-            add_reason(
-                "star_separation_quality_rejected",
-                quality_status=quality_status,
-                failure_codes=definite_failure_codes,
-            )
+            if "SUBJECT_CHROMA_COLLAPSE" in definite_failure_codes:
+                add_reason(
+                    "stage6_subject_chroma_collapse",
+                    quality_status=quality_status,
+                    failure_codes=definite_failure_codes,
+                )
+            elif "SUBJECT_CHROMA_LINEAGE_UNVERIFIED" in definite_failure_codes:
+                add_reason(
+                    "stage6_subject_chroma_lineage_unverified",
+                    quality_status=quality_status,
+                    failure_codes=definite_failure_codes,
+                )
+            else:
+                add_reason(
+                    "star_separation_quality_rejected",
+                    quality_status=quality_status,
+                    failure_codes=definite_failure_codes,
+                )
         else:
             add_reason(
                 "star_separation_unavailable",
@@ -947,6 +962,8 @@ _QUALITY_FAILURE_CODES = {
     "bright_core_integrity": "BRIGHT_CORE_INTEGRITY",
     "starmask_coverage": "STARMASK_COVERAGE",
     "starmask_coverage_unavailable": "STARMASK_COVERAGE_UNAVAILABLE",
+    "subject_chroma_collapse": "SUBJECT_CHROMA_COLLAPSE",
+    "subject_chroma_lineage_unverified": "SUBJECT_CHROMA_LINEAGE_UNVERIFIED",
 }
 
 _STAGE6_DEFINITE_QUALITY_REJECTION_CODES = frozenset(
@@ -959,6 +976,8 @@ _STAGE6_DEFINITE_QUALITY_REJECTION_CODES = frozenset(
         "GALAXY_CORE_DAMAGE",
         "BRIGHT_CORE_INTEGRITY",
         "STARMASK_COVERAGE",
+        "SUBJECT_CHROMA_COLLAPSE",
+        "SUBJECT_CHROMA_LINEAGE_UNVERIFIED",
         "SCRIPT_CONTRACT",
         "TILE_ARTIFACT",
     }
@@ -983,6 +1002,74 @@ def _stage7_quality_selection_key(pipeline, quality: Optional[Dict[str, Any]]) -
     return (0 if status == "ok" else 1, pipeline._stage7_quality_score(quality))
 
 
+def _stage6_subject_chroma_failure_code(
+    quality: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    lineage = (
+        quality.get("subject_chroma_lineage")
+        if isinstance(quality, dict)
+        else None
+    )
+    if not isinstance(lineage, dict) or not bool(lineage.get("hard_failed", False)):
+        return None
+    reason_code = str(lineage.get("reason_code") or "")
+    if reason_code == "stage6_subject_chroma_collapse":
+        return "SUBJECT_CHROMA_COLLAPSE"
+    return "SUBJECT_CHROMA_LINEAGE_UNVERIFIED"
+
+
+def _stage6_chroma_retry_passed(quality: Optional[Dict[str, Any]]) -> bool:
+    lineage = (
+        quality.get("subject_chroma_lineage")
+        if isinstance(quality, dict)
+        else None
+    )
+    return bool(
+        isinstance(quality, dict)
+        and str(quality.get("status") or "").lower() == "ok"
+        and isinstance(lineage, dict)
+        and lineage.get("accepted") is True
+        and not lineage.get("hard_failed", True)
+    )
+
+
+def _stage6_chroma_retry_plan(
+    quality: Optional[Dict[str, Any]],
+    *,
+    retry_max: int,
+    syqon_available: bool,
+    failure_action: str,
+) -> Dict[str, Any]:
+    failure_code = _stage6_subject_chroma_failure_code(quality)
+    configured_retry_max = max(int(retry_max), 0)
+    eligible = failure_code == "SUBJECT_CHROMA_COLLAPSE"
+    should_attempt = bool(
+        eligible
+        and configured_retry_max >= 1
+        and syqon_available
+        and str(failure_action) == "auto_fallback"
+    )
+    if failure_code is None:
+        status = "not_triggered"
+    elif should_attempt:
+        status = "ready"
+    elif failure_code == "SUBJECT_CHROMA_LINEAGE_UNVERIFIED":
+        status = "direct_reject_unverified_lineage"
+    elif configured_retry_max < 1:
+        status = "blocked_by_retry_limit"
+    elif not syqon_available:
+        status = "blocked_backend_unavailable"
+    else:
+        status = "blocked_by_failure_action"
+    return {
+        "triggered": failure_code is not None,
+        "failure_code": failure_code,
+        "eligible": eligible,
+        "should_attempt": should_attempt,
+        "status": status,
+        "configured_retry_max": configured_retry_max,
+        "attempt_limit": 1 if should_attempt else 0,
+    }
 def _stage6_can_retain_hard_failed_pair(
     final_quality_failure: Dict[str, Any],
     *,
@@ -1647,6 +1734,14 @@ def run_stage6_star_separation(pipeline) -> None:
         starmask_cleanup_records: List[Dict[str, Any]] = []
         repair_records: List[Dict[str, Any]] = []
         starless_pixel_repair_records: List[Dict[str, Any]] = []
+        chroma_retry: Dict[str, Any] = {
+            "profile": syqon_starless.SYQON_CHROMA_RECOVERY_PROFILE.manifest(),
+            "eligible": False,
+            "attempted": False,
+            "accepted": False,
+            "status": "not_triggered",
+        }
+        chroma_retry_terminal_failure = False
         bright_core_retry: Dict[str, Any] = {
             "profile": syqon_starless.SYQON_BRIGHT_CORE_RECOVERY_PROFILE.manifest(),
             "eligible": False,
@@ -1836,11 +1931,152 @@ def run_stage6_star_separation(pipeline) -> None:
         quality_records.append(selected_quality)
         parameter_retries_done = 0
 
-        initial_bright_core = selected_quality.get("bright_core_integrity") or {}
-        bright_core_retry_plan = _stage6_bright_core_retry_plan(
+        chroma_retry_plan = _stage6_chroma_retry_plan(
             selected_quality,
             retry_max=getattr(pipeline.cfg, "stage7_quality_retry_max", 0),
             syqon_available=syqon_script is not None,
+            failure_action=failure_action,
+        )
+        initial_chroma_failure = chroma_retry_plan["failure_code"]
+        if bool(chroma_retry_plan["triggered"]):
+            configured_retry_max = chroma_retry_plan["configured_retry_max"]
+            chroma_retry.update(
+                {
+                    "eligible": chroma_retry_plan["eligible"],
+                    "status": chroma_retry_plan["status"],
+                    "initial_attempt": selected_quality.get("attempt"),
+                    "initial_failure_code": initial_chroma_failure,
+                    "configured_retry_max": configured_retry_max,
+                    "attempt_limit": chroma_retry_plan["attempt_limit"],
+                    "failure_action": failure_action,
+                }
+            )
+            selected_quality["final_selection_state"] = (
+                "rejected_subject_chroma_lineage"
+            )
+            should_retry_chroma = bool(chroma_retry_plan["should_attempt"])
+            if should_retry_chroma:
+                recovery_profile = syqon_starless.SYQON_CHROMA_RECOVERY_PROFILE
+                chroma_snapshot = pipeline._stage7_snapshot_current_outputs(
+                    "before_chroma_linked_mtf_recovery"
+                )
+                chroma_retry.update(attempted=True, status="running")
+                parameter_retries_done = 1
+                stage_messages.append(
+                    "SUBJECT_CHROMA_COLLAPSE hard rejection; retrying once with "
+                    "zenith_chroma_linked_mtf_recovery (linked MTF, FP32)"
+                )
+                retry_used = pipeline._stage7_try_syqon_variant(
+                    syqon_script,
+                    attempt_name="chroma_linked_mtf_recovery",
+                    profile=recovery_profile,
+                )
+                if retry_used:
+                    starless_used = retry_used
+                    syqon_profile = recovery_profile
+                    if not pipeline.starless_file:
+                        pipeline.cmd_with_check("save", "starless")
+                        pipeline.starless_file = pipeline.process_dir / "starless.fit"
+                    pipeline._stage7_prepare_starmask()
+                    retry_cleanup = pipeline._stage7_clean_starmask(
+                        label="chroma_linked_mtf_recovery"
+                    )
+                    starmask_cleanup_records.append(retry_cleanup)
+                    if retry_cleanup.get("status") == "applied":
+                        syqon_starless.record_syqon_derived_generation(
+                            pipeline,
+                            generation="clean",
+                            details={
+                                "starmask_cleanup": retry_cleanup.get("metrics") or {},
+                                "profile_id": recovery_profile.profile_id,
+                            },
+                        )
+                    retry_quality = pipeline._stage7_quality_assessment(
+                        "chroma_linked_mtf_recovery",
+                        tool_label=str(retry_used),
+                        source_stem=selected_source_stem,
+                    )
+                    retry_quality = _apply_starmask_cleanup_hard_gate(
+                        retry_quality,
+                        retry_cleanup,
+                    )
+                    retry_quality["retry_profile"] = recovery_profile.manifest()
+                    quality_records.append(retry_quality)
+                    retry_safe = _stage6_chroma_retry_passed(retry_quality)
+                    chroma_retry.update(
+                        {
+                            "accepted": retry_safe,
+                            "status": "accepted" if retry_safe else "rejected",
+                            "quality_status": retry_quality.get("status"),
+                            "quality_after": retry_quality,
+                        }
+                    )
+                    if retry_safe:
+                        selected_quality["final_selection_state"] = (
+                            "superseded_by_chroma_linked_mtf_recovery"
+                        )
+                        retry_quality["final_selection_state"] = "selected"
+                        selected_quality = retry_quality
+                        starmask_cleanup = retry_cleanup
+                        stage_messages.append(
+                            "zenith_chroma_linked_mtf_recovery passed the full "
+                            "Stage 6 quality contract"
+                        )
+                    else:
+                        retry_quality["final_selection_state"] = (
+                            "rejected_subject_chroma_or_quality"
+                        )
+                        try:
+                            pipeline._stage7_restore_snapshot(chroma_snapshot)
+                            chroma_retry["rollback"] = "restored_initial_pair"
+                        except (OSError, RuntimeError, ValueError) as error:
+                            chroma_retry["rollback"] = "failed"
+                            chroma_retry["rollback_error"] = str(error)
+                        chroma_retry_terminal_failure = True
+                        stage_messages.append(
+                            "linked-MTF chroma recovery failed the full Stage 6 "
+                            "recheck; candidate rolled back and will be rejected"
+                        )
+                else:
+                    try:
+                        pipeline._stage7_restore_snapshot(chroma_snapshot)
+                        chroma_retry["rollback"] = "restored_initial_pair"
+                    except (OSError, RuntimeError, ValueError) as error:
+                        chroma_retry["rollback"] = "failed"
+                        chroma_retry["rollback_error"] = str(error)
+                    chroma_retry_terminal_failure = True
+                    chroma_retry.update(
+                        {
+                            "status": "failed",
+                            "failure_reason": (
+                                getattr(pipeline, "_last_plugin_script_error", None)
+                                or "SyQon linked-MTF recovery unavailable"
+                            ),
+                        }
+                    )
+                    stage_messages.append(
+                        "zenith_chroma_linked_mtf_recovery failed or timed out; "
+                        "the desaturated baseline pair remains rejected"
+                    )
+            else:
+                chroma_retry_terminal_failure = True
+                chroma_retry["status"] = chroma_retry_plan["status"]
+                stage_messages.append(
+                    f"{initial_chroma_failure} cannot enter the Starless main "
+                    f"chain (retry_status={chroma_retry['status']})"
+                )
+
+        initial_bright_core = selected_quality.get("bright_core_integrity") or {}
+        bright_core_retry_plan = _stage6_bright_core_retry_plan(
+            selected_quality,
+            retry_max=(
+                0
+                if parameter_retries_done or chroma_retry_terminal_failure
+                else getattr(pipeline.cfg, "stage7_quality_retry_max", 0)
+            ),
+            syqon_available=(
+                syqon_script is not None and not chroma_retry_terminal_failure
+            ),
         )
         if bool(bright_core_retry_plan["triggered"]):
             bright_core_retry.update(
@@ -2106,6 +2342,8 @@ def run_stage6_star_separation(pipeline) -> None:
             selected_quality
             and pixel_repair_trigger.get("triggered")
             and not bright_core_retry_terminal_failure
+            and not chroma_retry_terminal_failure
+            and _stage6_subject_chroma_failure_code(selected_quality) is None
             and bool(getattr(pipeline.cfg, "stage7_starless_pixel_repair_enabled", True))
             and failure_action == "auto_fallback"
         ):
@@ -2317,11 +2555,19 @@ def run_stage6_star_separation(pipeline) -> None:
         quality_failure_codes = list(
             dict.fromkeys(final_quality_failure["failure_codes"])
         )
+        quality_rejection_reason_code = (
+            "stage6_subject_chroma_collapse"
+            if "SUBJECT_CHROMA_COLLAPSE" in quality_failure_codes
+            else "stage6_subject_chroma_lineage_unverified"
+            if "SUBJECT_CHROMA_LINEAGE_UNVERIFIED" in quality_failure_codes
+            else "star_separation_quality_rejected"
+        )
         quality_gate_passed = bool(
             selected_quality
             and selected_quality.get("status") == "ok"
             and not final_quality_failure["hard_failed"]
             and not bright_core_retry_terminal_failure
+            and not chroma_retry_terminal_failure
             and pipeline.starless_file
             and not cleanup_hard_failed
         )
@@ -2373,7 +2619,7 @@ def run_stage6_star_separation(pipeline) -> None:
         if not separation_accepted:
             pipeline._stage7_starless_skipped = True
             if quality_rejected:
-                pipeline._require_review(6, "star_separation_quality_rejected")
+                pipeline._require_review(6, quality_rejection_reason_code)
                 if hasattr(pipeline, "_record_stage_policy_event"):
                     pipeline._record_stage_policy_event(
                         6,
@@ -2471,6 +2717,74 @@ def run_stage6_star_separation(pipeline) -> None:
             else:
                 quality_record["final_selection_state"] = "not_selected"
 
+        selected_chroma_lineage = (
+            selected_quality.get("subject_chroma_lineage")
+            if isinstance(selected_quality, dict)
+            else None
+        )
+        chroma_attempts = [
+            {
+                "attempt": record.get("attempt"),
+                "tool_label": record.get("tool_label"),
+                "source_stem": record.get("source_stem"),
+                "retry_profile": record.get("retry_profile"),
+                "final_selection_state": record.get("final_selection_state"),
+                "lineage": record.get("subject_chroma_lineage"),
+            }
+            for record in quality_records
+            if isinstance(record, dict)
+        ]
+        pipeline._write_stage_json(
+            "stage6_subject_chroma_lineage.json",
+            {
+                "schema": stage7_quality.STAGE6_SUBJECT_CHROMA_SCHEMA,
+                "run_id": str(getattr(pipeline, "_run_id", "") or ""),
+                "status": (
+                    selected_chroma_lineage.get("status")
+                    if isinstance(selected_chroma_lineage, dict)
+                    else (
+                        "not_applicable"
+                        if pipeline._star_separation_state == "target_bypass"
+                        else "unverified"
+                    )
+                ),
+                "accepted": (
+                    bool(selected_chroma_lineage.get("accepted", False))
+                    if isinstance(selected_chroma_lineage, dict)
+                    else pipeline._star_separation_state == "target_bypass"
+                ),
+                "hard_failed": (
+                    bool(selected_chroma_lineage.get("hard_failed", True))
+                    if isinstance(selected_chroma_lineage, dict)
+                    else pipeline._star_separation_state != "target_bypass"
+                ),
+                "reason_code": (
+                    selected_chroma_lineage.get("reason_code")
+                    if isinstance(selected_chroma_lineage, dict)
+                    else (
+                        None
+                        if pipeline._star_separation_state == "target_bypass"
+                        else "stage6_subject_chroma_lineage_unverified"
+                    )
+                ),
+                "source_stem": selected_source_stem,
+                "star_separation_state": pipeline._star_separation_state,
+                "attempts": chroma_attempts,
+                "selected": selected_chroma_lineage,
+                "selected_attempt": (
+                    selected_quality.get("attempt")
+                    if isinstance(selected_quality, dict)
+                    else None
+                ),
+                "chroma_retry": chroma_retry,
+                "quality_failure_codes": quality_failure_codes,
+                "rejection_reason_code": (
+                    quality_rejection_reason_code if quality_rejected else None
+                ),
+                "shared_scene_support": shared_scene_support_summary,
+            },
+        )
+
         pipeline._write_stage_json(
             "stage6_starless_quality.json",
             {
@@ -2497,7 +2811,7 @@ def run_stage6_star_separation(pipeline) -> None:
                 "automatic_quality_retries": parameter_retries_done,
                 "quality_failure_codes": quality_failure_codes,
                 "rejection_reason_code": (
-                    "star_separation_quality_rejected"
+                    quality_rejection_reason_code
                     if quality_rejected
                     else None
                 ),
@@ -2506,6 +2820,16 @@ def run_stage6_star_separation(pipeline) -> None:
                     (selected_quality or {}).get("bright_core_integrity")
                 ),
                 "bright_core_retry": bright_core_retry,
+                "chroma_retry": chroma_retry,
+                "subject_chroma_lineage_report": {
+                    "schema": stage7_quality.STAGE6_SUBJECT_CHROMA_SCHEMA,
+                    "artifact": "stage6_subject_chroma_lineage.json",
+                    "selected_status": (
+                        selected_chroma_lineage.get("status")
+                        if isinstance(selected_chroma_lineage, dict)
+                        else None
+                    ),
+                },
                 "bright_core_with_stars_fallback": (
                     pipeline._bright_core_with_stars_fallback
                 ),
@@ -2547,6 +2871,47 @@ def run_stage6_star_separation(pipeline) -> None:
                     "fall back safely: "
                     f"{pair_handoff.get('reason', 'unknown error')}"
                 )
+            if pipeline.starmask_file is not None:
+                guard_report = star_halo_guard.persist_stage6_guard(
+                    pipeline,
+                    starless_path=pipeline.process_dir / "stage6_starless.fit",
+                    starmask_path=Path(pipeline.starmask_file),
+                )
+            else:
+                guard_report = {
+                    "schema": star_halo_guard.SCHEMA,
+                    "status": "failed",
+                    "reason_code": "stage6_star_halo_guard_starmask_unavailable",
+                }
+            pipeline._stage6_star_halo_guard_report = dict(guard_report)
+            pipeline._stage8_handoff["star_halo_guard"] = {
+                "status": guard_report.get("status"),
+                "reason_code": guard_report.get("reason_code"),
+                "report": star_halo_guard.REPORT_NAME,
+                "artifact": guard_report.get("artifact"),
+                "artifact_sha256": guard_report.get("artifact_sha256"),
+            }
+            if str(guard_report.get("status") or "") in {
+                "failed",
+                "hard_failed",
+            }:
+                pipeline._stage8_handoff["restricted_downstream"] = True
+                pipeline._stage8_handoff["processing_policy"] = "limited"
+                pipeline._stage8_handoff["quality_status"] = "degraded"
+                pipeline._stage8_conservative_mode = True
+                pipeline._require_review(
+                    6,
+                    str(guard_report.get("reason_code") or "stage6_star_halo_guard_failed"),
+                )
+                stage_messages.append(
+                    "stage6 star-halo guard restricted Stage8: "
+                    + str(guard_report.get("reason_code") or "unknown")
+                )
+            else:
+                stage_messages.append(
+                    "stage6 star-halo guard frozen for Stage8 "
+                    f"(coverage={float((guard_report.get('metrics') or {}).get('coverage', 0.0)):.4f})"
+                )
         if stage_saved and hasattr(pipeline, "_create_stage_review_bundle"):
             review = pipeline._create_stage_review_bundle(
                 "stage6_star_separation",
@@ -2566,12 +2931,20 @@ def run_stage6_star_separation(pipeline) -> None:
         elapsed = pipeline.log.stage_end(stage_label)
         if stage_saved:
             selected_status = str((selected_quality or {}).get("status", "ok")).lower()
+            halo_guard_status = str(
+                (
+                    getattr(pipeline, "_stage6_star_halo_guard_report", {})
+                    or {}
+                ).get("status")
+                or ""
+            )
             stage_status = (
                 "ok"
                 if (
                     separation_accepted
                     and selected_status == "ok"
                     and not selected_advisories
+                    and halo_guard_status not in {"failed", "hard_failed"}
                 )
                 else "degraded"
             )

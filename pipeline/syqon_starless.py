@@ -29,7 +29,7 @@ except ImportError:
 ENV_SYQON_TIMEOUT_KEY = "STARUN_SYQON_TIMEOUT_SEC"
 ENV_SYQON_MODEL_DIR_KEY = "STARUN_SYQON_MODEL_DIR"
 SYQON_MODEL_BUNDLE_REL = Path("syqon_starless")
-SYQON_EXCHANGE_SCHEMA = "starun.syqon-pixel-exchange.v2"
+SYQON_EXCHANGE_SCHEMA = "starun.syqon-pixel-exchange.v3"
 SYQON_SELECTED_SCHEMA = "starun.syqon-selected-pair.v1"
 SYQON_ATTEMPT_SCHEMA = "starun.syqon-attempt.v1"
 STAGE6_PAIR_HANDOFF_SCHEMA = "starun.stage6-pair-handoff.v1"
@@ -110,6 +110,13 @@ class SyQonAttemptProfile:
 
 
 SYQON_BASELINE_PROFILE = SyQonAttemptProfile(profile_id="zenith_baseline")
+SYQON_CHROMA_RECOVERY_PROFILE = replace(
+    SYQON_BASELINE_PROFILE,
+    profile_id="zenith_chroma_linked_mtf_recovery",
+    use_amp=False,
+    stretch_method="mtf",
+    linked_stretch=True,
+)
 SYQON_CPU_RECOVERY_PROFILE = replace(
     SYQON_BASELINE_PROFILE,
     profile_id="zenith_cpu_recovery",
@@ -457,6 +464,85 @@ def assess_syqon_exchange_pixels(
     }
     report["source_stats"] = source_stats
     report["output_stats"] = output_stats
+
+    def channels_first(values: np.ndarray) -> Optional[np.ndarray]:
+        array = np.asarray(values)
+        if array.ndim == 2:
+            return array[None, :, :]
+        if array.ndim != 3:
+            return None
+        if array.shape[0] in (1, 3) and array.shape[-1] not in (1, 3):
+            return array
+        if array.shape[-1] in (1, 3):
+            return np.moveaxis(array, -1, 0)
+        if array.shape[0] in (1, 3):
+            return array
+        return None
+
+    source_channels = channels_first(source)
+    output_channels = channels_first(output)
+    channel_diagnostics: Dict[str, Any] = {
+        "status": "unavailable",
+        "used_for_gate": False,
+        "reason": "unsupported_channel_layout",
+    }
+    if (
+        source_channels is not None
+        and output_channels is not None
+        and source_channels.shape == output_channels.shape
+    ):
+        channel_names = ("r", "g", "b") if source_channels.shape[0] == 3 else ("mono",)
+
+        def channel_stats(values: np.ndarray) -> Dict[str, Dict[str, float]]:
+            return {
+                name: {
+                    "p01": float(np.quantile(values[index], 0.01)),
+                    "p50": float(np.quantile(values[index], 0.50)),
+                    "p99": float(np.quantile(values[index], 0.99)),
+                }
+                for index, name in enumerate(channel_names)
+            }
+
+        channel_diagnostics = {
+            "status": "available",
+            "used_for_gate": False,
+            "channel_count": int(source_channels.shape[0]),
+            "source": channel_stats(source_channels),
+            "output": channel_stats(output_channels),
+        }
+        if source_channels.shape[0] == 3:
+            source_peak = np.max(source_channels, axis=0)
+            output_peak = np.max(output_channels, axis=0)
+            source_saturation = (
+                (source_peak - np.min(source_channels, axis=0))
+                / np.maximum(source_peak, 1e-6)
+            )
+            output_saturation = (
+                (output_peak - np.min(output_channels, axis=0))
+                / np.maximum(output_peak, 1e-6)
+            )
+            source_rg = source_channels[0] - source_channels[1]
+            source_bg = source_channels[2] - source_channels[1]
+            output_rg = output_channels[0] - output_channels[1]
+            output_bg = output_channels[2] - output_channels[1]
+            source_energy = float(
+                np.sqrt(np.mean(source_rg * source_rg + source_bg * source_bg))
+            )
+            output_energy = float(
+                np.sqrt(np.mean(output_rg * output_rg + output_bg * output_bg))
+            )
+            channel_diagnostics["chroma"] = {
+                "source_saturation_p50": float(np.median(source_saturation)),
+                "source_saturation_p95": float(np.quantile(source_saturation, 0.95)),
+                "output_saturation_p50": float(np.median(output_saturation)),
+                "output_saturation_p95": float(np.quantile(output_saturation, 0.95)),
+                "source_opponent_rms": source_energy,
+                "output_opponent_rms": output_energy,
+                "opponent_energy_retention": (
+                    output_energy / source_energy if source_energy > 1e-8 else None
+                ),
+            }
+    report["channel_diagnostics"] = channel_diagnostics
 
     source_median = source_stats["p50"]
     output_median = output_stats["p50"]

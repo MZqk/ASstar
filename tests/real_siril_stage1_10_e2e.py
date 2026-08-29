@@ -35,8 +35,9 @@ from tests import manual_core_pipeline_smoke as core_smoke  # noqa: E402
 
 
 EXPECTED_STAGES = tuple(range(1, 11))
-FINAL_QUALITY_SCHEMA = "starun.final-quality.v2"
-SYQON_EXCHANGE_SCHEMA = "starun.syqon-pixel-exchange.v2"
+FINAL_QUALITY_SCHEMA = "starun.final-quality.v4"
+SYQON_EXCHANGE_SCHEMA = "starun.syqon-pixel-exchange.v3"
+STAGE6_SUBJECT_CHROMA_SCHEMA = "starun.stage6-subject-chroma-lineage.v1"
 SYQON_SELECTED_SCHEMA = "starun.syqon-selected-pair.v1"
 SYQON_COMMIT_STOP_REASONS = frozenset(
     {"CONTRACT_VALID_PAIR_COMMITTED", "DERIVED_GENERATION_COMMITTED"}
@@ -247,7 +248,7 @@ def _validate_syqon_exchange(work_dir: Path, report: object) -> list[str]:
 
     errors: list[str] = []
     if str(report.get("schema") or "") != SYQON_EXCHANGE_SCHEMA:
-        errors.append("SyQon exchange 不是 starun.syqon-pixel-exchange.v2")
+        errors.append("SyQon exchange 不是 starun.syqon-pixel-exchange.v3")
     if report.get("accepted") is not True or str(
         report.get("status") or ""
     ).lower() != "accepted":
@@ -311,6 +312,23 @@ def _validate_syqon_exchange(work_dir: Path, report: object) -> list[str]:
     return errors
 
 
+def _validate_stage6_subject_chroma(report: object) -> list[str]:
+    if not isinstance(report, Mapping):
+        return ["缺少可解析的 process/stage6_subject_chroma_lineage.json"]
+    errors: list[str] = []
+    if str(report.get("schema") or "") != STAGE6_SUBJECT_CHROMA_SCHEMA:
+        errors.append("Stage 6 主体色度报告 schema 无效")
+    selected = report.get("selected")
+    if not isinstance(selected, Mapping):
+        errors.append("Stage 6 主体色度报告缺少 selected lineage")
+        return errors
+    if selected.get("accepted") is not True or selected.get("hard_failed") is not False:
+        errors.append("Stage 6 主体色度 lineage 未正式验收")
+    if str(selected.get("status") or "") not in {"ok", "not_applicable"}:
+        errors.append("Stage 6 主体色度 lineage 状态不可正式交付")
+    return errors
+
+
 def verify_e2e_artifacts(work_dir: Path) -> tuple[bool, list[str]]:
     verified, details = core_smoke.verify_result_manifest(work_dir)
     if not verified:
@@ -354,6 +372,25 @@ def verify_e2e_artifacts(work_dir: Path) -> tuple[bool, list[str]]:
         errors.append("流水线 issues 不是规范对象数组")
     if result_issue_labels:
         errors.append("流水线仍有 error/fatal issues：" + ", ".join(result_issue_labels))
+
+    delivery_gates = result.get("delivery_gates")
+    if not isinstance(delivery_gates, Mapping):
+        errors.append("pipeline-result.json 缺少科学/表现双门 delivery_gates")
+    else:
+        if str(delivery_gates.get("schema") or "") != (
+            "starun.final-delivery-gates.v1"
+        ):
+            errors.append("delivery_gates schema 无效")
+        if delivery_gates.get("legacy_delivery_contract") is not False:
+            errors.append("本轮正式验收不接受 legacy_delivery_contract")
+        for name in ("scientific", "presentation", "artifacts", "review"):
+            gate = delivery_gates.get(name)
+            if not isinstance(gate, Mapping) or gate.get("accepted") is not True:
+                errors.append(f"正式交付要求 delivery_gates.{name}.accepted=true")
+        if delivery_gates.get("formal_delivery_accepted") is not True:
+            errors.append("正式交付要求 formal_delivery_accepted=true")
+    if result.get("delivery_eligible") is not True:
+        errors.append("正式交付要求 pipeline-result.delivery_eligible=true")
 
     actual_steps = result.get("actual_steps")
     if not isinstance(actual_steps, list):
@@ -484,7 +521,7 @@ def verify_e2e_artifacts(work_dir: Path) -> tuple[bool, list[str]]:
         errors.append("缺少可解析的 process/final_quality_report.json")
     else:
         if str(final_quality.get("schema") or "") != FINAL_QUALITY_SCHEMA:
-            errors.append("最终质量报告不是 starun.final-quality.v2")
+            errors.append("最终质量报告不是 starun.final-quality.v4")
         if str(final_quality.get("status") or "") != "ok":
             errors.append("最终质量报告 status 不是 ok")
         if str(final_quality.get("final_quality") or "") != "ok":
@@ -503,6 +540,10 @@ def verify_e2e_artifacts(work_dir: Path) -> tuple[bool, list[str]]:
         work_dir / "process/stage6_syqon_exchange.json"
     )
     errors.extend(_validate_syqon_exchange(work_dir, syqon_exchange))
+    subject_chroma = run_manifest.load_json(
+        work_dir / "process/stage6_subject_chroma_lineage.json"
+    )
+    errors.extend(_validate_stage6_subject_chroma(subject_chroma))
 
     if errors:
         return False, details + errors

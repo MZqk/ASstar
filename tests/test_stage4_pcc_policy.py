@@ -628,7 +628,7 @@ class Stage4PccPolicyTests(unittest.TestCase):
         self.assertEqual(len(attempts), 1)
         self.assertEqual(attempts[0]["max_attempts"], 1)
 
-    def test_spcc_runner_is_exactly_one_attempt(self):
+    def test_spcc_timeout_does_not_retry(self):
         pipeline = _pipeline()
         calls = []
 
@@ -658,10 +658,48 @@ class Stage4PccPolicyTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["timeout_sec"], 300)
         self.assertEqual(calls[0]["catalog"], "gaia")
-        self.assertEqual(attempts[0]["max_attempts"], 1)
+        self.assertEqual(attempts[0]["max_attempts"], 2)
         self.assertEqual(attempts[0]["configured_timeout_sec"], 300)
         self.assertEqual(attempts[0]["timeout_policy"], "online_unverified_cap")
         self.assertTrue(attempts[0]["online_unverified_cap_applied"])
+
+    def test_spcc_transient_504_retries_once_with_fresh_budget(self):
+        pipeline = _pipeline()
+        calls = []
+        outcomes = iter(
+            (
+                (False, "HTTP 504 while downloading Gaia XP; siril-cli exit=-11"),
+                (True, "spcc command ok"),
+            )
+        )
+
+        def run_once(**kwargs):
+            calls.append(kwargs)
+            return next(outcomes)
+
+        pipeline._run_stage4_spcc_once = run_once
+        pipeline.log = SimpleNamespace(
+            warn=lambda *_args: None,
+            info=lambda *_args: None,
+        )
+        with (
+            patch.dict(os.environ, {"STARUN_NETWORK_MODE": "1"}, clear=False),
+            patch.object(stage4.time, "sleep"),
+        ):
+            ok, _detail, attempts = stage4._stage4_run_spcc(
+                pipeline,
+                phase="linear_broadband",
+                catalog="gaia",
+                args=("-oscsensor=x",),
+                narrowband=False,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["timeout_sec"], 300)
+        self.assertEqual(calls[1]["timeout_sec"], 120)
+        self.assertEqual(attempts[0]["failure_class"], "transient_network")
+        self.assertEqual(attempts[1]["status"], "ok")
 
     def test_spcc_online_unverified_timeout_respects_lower_user_budget(self):
         pipeline = _pipeline()
@@ -1565,7 +1603,10 @@ class Stage4PccPolicyTests(unittest.TestCase):
             )
             with patch.dict(
                 os.environ,
-                {stage4.RUNTIME_CAPABILITIES_ENV: str(manifest_path)},
+                {
+                    stage4.RUNTIME_CAPABILITIES_ENV: str(manifest_path),
+                    "STARUN_NETWORK_MODE": "1",
+                },
                 clear=False,
             ):
                 decision = stage4._stage4_runtime_color_decision(pipeline)

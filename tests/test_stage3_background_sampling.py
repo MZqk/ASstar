@@ -16,6 +16,7 @@ if str(PIPELINE_DIR) not in sys.path:
     sys.path.insert(0, str(PIPELINE_DIR))
 
 from background_sampling import (  # noqa: E402
+    assess_background_direction_reversal,
     assess_background_process,
     assess_compound_background_validation,
     assess_single_background_validation,
@@ -24,8 +25,12 @@ from background_sampling import (  # noqa: E402
     build_safe_background_samples,
     measure_background_validation,
     pattern_candidate_gate,
+    project_stage3_neutral_axis_poly1,
+    project_stage3_spatial_opponent_poly1,
     select_background_route,
     split_background_sample_points,
+    verify_stage3_neutral_axis_persistence,
+    verify_stage3_spatial_opponent_persistence,
 )
 from image_metrics import measure_stage3_signal_preservation  # noqa: E402
 
@@ -55,6 +60,323 @@ def _compound_grid_points(*, height: int, width: int):
 
 
 class Stage3BackgroundSamplingTests(unittest.TestCase):
+    @staticmethod
+    def _spatial_opponent_fixture(*, layout: str = "chw", reverse: bool = False):
+        height, width = 97, 113
+        y, x = np.mgrid[:height, :width]
+        xn = x / (width - 1)
+        yn = y / (height - 1)
+        luma = 0.38 + 0.012 * xn + 0.007 * yn
+        rg = 0.018 * (xn - 0.5) - 0.010 * (yn - 0.5)
+        bg = np.full_like(luma, -0.012)
+        green = luma - 0.2126 * rg - 0.0722 * bg
+        baseline = np.stack((green + rg, green, green + bg)).astype(np.float32)
+        neutral = (baseline + (0.006 * (xn - 0.5))[None, :, :]).astype(
+            np.float32
+        )
+        d_rg = (1.0 if reverse else -1.0) * rg
+        correction_green = -0.2126 * d_rg
+        proposal = baseline.astype(np.float64)
+        proposal[0] += correction_green + d_rg
+        proposal[1] += correction_green
+        proposal[2] += correction_green
+        proposal += (0.009 * (xn - 0.5) - 0.004 * (yn - 0.5))[None, :, :]
+        proposal = proposal.astype(np.float32)
+        points = [
+            (
+                (cell_x + 0.5) / 5.0 * (width - 1),
+                (cell_y + 0.5) / 4.0 * (height - 1),
+            )
+            for cell_y in range(4)
+            for cell_x in range(5)
+        ]
+        validation_indices = {0, 4, 15, 19}
+        fit_points = [
+            point for index, point in enumerate(points)
+            if index not in validation_indices
+        ]
+        validation_points = [
+            point for index, point in enumerate(points)
+            if index in validation_indices
+        ]
+        if layout == "hwc":
+            baseline = np.moveaxis(baseline, 0, -1)
+            neutral = np.moveaxis(neutral, 0, -1)
+            proposal = np.moveaxis(proposal, 0, -1)
+        return baseline, neutral, proposal, fit_points, validation_points
+
+    @staticmethod
+    def _neutral_axis_fixture(*, layout: str = "chw"):
+        height, width = 65, 81
+        y, x = np.mgrid[:height, :width]
+        xn = x / (width - 1)
+        yn = y / (height - 1)
+        luminance = 0.42 + 0.015 * xn + 0.008 * yn
+        baseline = np.stack(
+            (
+                luminance + 0.035,
+                luminance,
+                luminance - 0.025,
+            ),
+            axis=0,
+        ).astype(np.float32)
+        proposal = baseline.astype(np.float64)
+        proposal[0] += 0.012 + 0.060 * xn - 0.025 * yn
+        proposal[1] += -0.018 + 0.040 * xn - 0.015 * yn
+        proposal[2] += 0.025 + 0.020 * xn - 0.005 * yn
+        proposal = proposal.astype(np.float32)
+        points = [
+            (
+                (cell_x + 0.5) / 4.0 * (width - 1),
+                (cell_y + 0.5) / 4.0 * (height - 1),
+            )
+            for cell_y in range(4)
+            for cell_x in range(4)
+        ]
+        fit_points = points[:12]
+        validation_points = points[12:]
+        if layout == "hwc":
+            baseline = np.moveaxis(baseline, 0, -1)
+            proposal = np.moveaxis(proposal, 0, -1)
+        return baseline, proposal, fit_points, validation_points
+
+    def test_neutral_axis_projection_preserves_opponent_channels_chw(self):
+        baseline, proposal, fit_points, validation_points = (
+            self._neutral_axis_fixture()
+        )
+
+        candidate, report = project_stage3_neutral_axis_poly1(
+            baseline,
+            proposal,
+            fit_points,
+            validation_points,
+            patch_radius=2,
+        )
+
+        self.assertIsNotNone(candidate, report)
+        self.assertTrue(report["accepted"], report)
+        self.assertEqual(report["model"]["rank"], 3)
+        self.assertLessEqual(report["model"]["condition_number"], 1.0e6)
+        np.testing.assert_allclose(
+            candidate[0] - candidate[1],
+            baseline[0] - baseline[1],
+            rtol=0.0,
+            atol=report["invariants"]["opponent_tolerance"],
+        )
+        np.testing.assert_allclose(
+            candidate[2] - candidate[1],
+            baseline[2] - baseline[1],
+            rtol=0.0,
+            atol=report["invariants"]["opponent_tolerance"],
+        )
+        np.testing.assert_allclose(
+            candidate[:, 32, 40],
+            baseline[:, 32, 40],
+            rtol=0.0,
+            atol=2.0e-7,
+        )
+
+    def test_neutral_axis_projection_supports_hwc_and_is_deterministic(self):
+        baseline, proposal, fit_points, validation_points = (
+            self._neutral_axis_fixture(layout="hwc")
+        )
+
+        first, first_report = project_stage3_neutral_axis_poly1(
+            baseline,
+            proposal,
+            fit_points,
+            validation_points,
+            patch_radius=2,
+        )
+        second, second_report = project_stage3_neutral_axis_poly1(
+            baseline,
+            proposal,
+            fit_points,
+            validation_points,
+            patch_radius=2,
+        )
+
+        np.testing.assert_array_equal(first, second)
+        self.assertEqual(first_report["model"], second_report["model"])
+        self.assertEqual(first.shape, baseline.shape)
+
+    def test_neutral_axis_projection_fails_closed_on_rank_and_headroom(self):
+        baseline, proposal, fit_points, validation_points = (
+            self._neutral_axis_fixture()
+        )
+        collinear = [(float(index * 5), 20.0) for index in range(8)]
+
+        candidate, rank_report = project_stage3_neutral_axis_poly1(
+            baseline,
+            proposal,
+            collinear,
+            validation_points,
+            patch_radius=2,
+        )
+        self.assertIsNone(candidate)
+        self.assertEqual(
+            rank_report["reason_code"],
+            "stage3_neutral_axis_fit_rank_failed",
+        )
+
+        low_headroom = baseline.copy()
+        low_headroom[:, :, :20] = 1.0e-5
+        x_normalized = np.linspace(
+            0.0,
+            1.0,
+            low_headroom.shape[-1],
+            dtype=np.float32,
+        )[None, None, :]
+        headroom_proposal = low_headroom + 0.20 * (x_normalized - 0.5)
+        candidate, headroom_report = project_stage3_neutral_axis_poly1(
+            low_headroom,
+            headroom_proposal,
+            fit_points,
+            validation_points,
+            patch_radius=2,
+        )
+        self.assertIsNone(candidate)
+        self.assertIn(
+            headroom_report["reason_code"],
+            {
+                "stage3_neutral_axis_headroom_fraction_exceeded",
+                "stage3_neutral_axis_sample_headroom_attenuated",
+            },
+        )
+
+    def test_neutral_axis_persistence_rejects_opponent_drift(self):
+        baseline, proposal, fit_points, validation_points = (
+            self._neutral_axis_fixture()
+        )
+        candidate, projection = project_stage3_neutral_axis_poly1(
+            baseline,
+            proposal,
+            fit_points,
+            validation_points,
+            patch_radius=2,
+        )
+        accepted, report = verify_stage3_neutral_axis_persistence(
+            baseline,
+            candidate,
+        )
+        self.assertTrue(accepted, report)
+
+        drifted = candidate.copy()
+        drifted[0, 4, 5] += np.float32(1.0e-4)
+        accepted, report = verify_stage3_neutral_axis_persistence(
+            baseline,
+            drifted,
+        )
+        self.assertFalse(accepted)
+        self.assertIn(
+            "persisted opponent-channel drift exceeds tolerance",
+            report["issues"],
+        )
+
+    def test_spatial_opponent_projection_selects_rg_only_at_zero_luma(self):
+        baseline, neutral, proposal, fit_points, validation_points = (
+            self._spatial_opponent_fixture()
+        )
+
+        candidate, report = project_stage3_spatial_opponent_poly1(
+            baseline,
+            neutral,
+            proposal,
+            fit_points,
+            validation_points,
+            patch_radius=2,
+        )
+
+        self.assertIsNotNone(candidate, report)
+        self.assertEqual(report["selected_components"], ["R-G"])
+        self.assertEqual(report["components"]["B-G"]["status"], "not_required")
+        rec709 = np.asarray((0.2126, 0.7152, 0.0722), dtype=np.float64)
+        np.testing.assert_allclose(
+            np.tensordot(rec709, candidate - neutral, axes=(0, 0)),
+            0.0,
+            rtol=0.0,
+            atol=report["invariants"]["tolerance"],
+        )
+        np.testing.assert_allclose(
+            candidate[2] - candidate[1],
+            neutral[2] - neutral[1],
+            rtol=0.0,
+            atol=report["invariants"]["tolerance"],
+        )
+        np.testing.assert_allclose(
+            candidate[:, candidate.shape[1] // 2, candidate.shape[2] // 2],
+            neutral[:, neutral.shape[1] // 2, neutral.shape[2] // 2],
+            rtol=0.0,
+            atol=2.0e-7,
+        )
+        accepted, persistence = verify_stage3_spatial_opponent_persistence(
+            neutral,
+            candidate,
+            report,
+        )
+        self.assertTrue(accepted, persistence)
+
+    def test_spatial_opponent_projection_supports_hwc(self):
+        baseline, neutral, proposal, fit_points, validation_points = (
+            self._spatial_opponent_fixture(layout="hwc")
+        )
+        candidate, report = project_stage3_spatial_opponent_poly1(
+            baseline,
+            neutral,
+            proposal,
+            fit_points,
+            validation_points,
+            patch_radius=2,
+        )
+        self.assertIsNotNone(candidate, report)
+        self.assertEqual(candidate.shape, baseline.shape)
+        self.assertEqual(report["selected_components"], ["R-G"])
+
+    def test_spatial_opponent_projection_rejects_wrong_direction(self):
+        baseline, neutral, proposal, fit_points, validation_points = (
+            self._spatial_opponent_fixture(reverse=True)
+        )
+        candidate, report = project_stage3_spatial_opponent_poly1(
+            baseline,
+            neutral,
+            proposal,
+            fit_points,
+            validation_points,
+            patch_radius=2,
+        )
+        self.assertIsNone(candidate)
+        self.assertEqual(
+            report["reason_code"],
+            "stage3_spatial_opponent_lineage_unverified",
+        )
+        self.assertIn("R-G", report["unresolved_components"])
+
+    def test_heldout_direction_gate_allows_zero_but_rejects_reversal(self):
+        baseline = _gradient_image(seed=77)
+        height, width = baseline.shape
+        y, x = np.mgrid[:height, :width]
+        points = _compound_grid_points(height=height, width=width)[::4]
+        flattened = baseline - 0.060 * x / (width - 1) - 0.025 * y / (
+            height - 1
+        )
+        reversed_gradient = baseline - 0.120 * x / (width - 1)
+
+        accepted, report = assess_background_direction_reversal(
+            baseline,
+            flattened,
+            points,
+            patch_radius=4,
+        )
+        self.assertTrue(accepted, report)
+        accepted, report = assess_background_direction_reversal(
+            baseline,
+            reversed_gradient,
+            points,
+            patch_radius=4,
+        )
+        self.assertFalse(accepted)
+        self.assertTrue(report["component_reversals"] or report["vector_reversed"])
+
     def test_safe_samples_are_spatial_and_avoid_nebula_and_stars(self):
         image = _gradient_image()
         height, width = image.shape
@@ -240,6 +562,119 @@ class Stage3BackgroundSamplingTests(unittest.TestCase):
         self.assertGreaterEqual(search["scene_support_star_fraction"], 0.15)
         self.assertGreater(report["rejection_counts"]["shared_catalog_star"], 0)
 
+    def test_dense_star_masked_statistics_recovers_without_shrinking_catalog_mask(self):
+        rng = np.random.default_rng(59)
+        height, width = 256, 320
+        y, x = np.mgrid[:height, :width]
+        base = (
+            0.04
+            + 0.02 * x / (width - 1)
+            + 0.01 * y / (height - 1)
+            + rng.normal(0.0, 0.0003, (height, width))
+        )
+        image = np.stack((base + 0.002, base, base - 0.001)).astype(
+            np.float32
+        )
+        catalog = []
+        for star_y in range(8, height, 18):
+            for star_x in range(8, width, 18):
+                catalog.append(
+                    {
+                        "x": float(star_x),
+                        "y": float(star_y),
+                        "fwhm_px": 1.2,
+                    }
+                )
+                image[:, star_y, star_x] += np.float32(0.15)
+        valid = np.ones((height, width), dtype=np.uint8)
+        saturation = np.zeros((height, width), dtype=np.uint8)
+
+        strict_points, strict_report = build_safe_background_samples(
+            image,
+            candidate_refinement=False,
+            shared_valid_mask=valid,
+            shared_saturation_map=saturation,
+            shared_star_catalog=catalog,
+        )
+        points, report = build_safe_background_samples(
+            image,
+            preserve_regular_grid=True,
+            masked_catalog_statistics=True,
+            shared_valid_mask=valid,
+            shared_saturation_map=saturation,
+            shared_star_catalog=catalog,
+        )
+
+        self.assertEqual(strict_points, [])
+        self.assertGreater(
+            strict_report["rejection_counts"]["shared_catalog_star"],
+            0,
+        )
+        self.assertEqual(report["status"], "ready")
+        self.assertEqual(len(points), 40)
+        self.assertEqual(
+            report["mask_evidence"]["schema_version"],
+            "starun.stage3-sample-masks.v2",
+        )
+        self.assertEqual(
+            report["dense_star_masked_sampling"]["schema_version"],
+            "starun.stage3-dense-star-sampling.v1",
+        )
+        self.assertGreaterEqual(report["coverage"]["quadrants"], 3)
+        self.assertGreaterEqual(report["coverage"]["grid_cells"], 8)
+        self.assertIn("_masked_pixel_support_mask", report)
+        for sample in report["selected_samples"]:
+            self.assertGreaterEqual(sample["masked_support_fraction"], 0.80)
+            self.assertEqual(sample["hard_exclusion_fraction"], 0.0)
+            overlaps = sample["mask_overlap_fractions"]
+            self.assertEqual(overlaps["shared_invalid"], 0.0)
+            self.assertEqual(overlaps["shared_saturated"], 0.0)
+            self.assertEqual(overlaps["coverage"], 0.0)
+            self.assertEqual(overlaps["positive_structure_nebulosity"], 0.0)
+            self.assertEqual(overlaps["bright_core"], 0.0)
+            self.assertEqual(overlaps["dark_structure"], 0.0)
+            self.assertLessEqual(sample["point_source_mask_fraction"], 0.20)
+            self.assertFalse(overlaps["outer_halo_enforced"])
+            self.assertIn(sample["channel_count"], {1, 3})
+            self.assertEqual(
+                len(sample["channel_medians"]),
+                sample["channel_count"],
+            )
+
+    def test_masked_validation_reuses_frozen_pixel_support(self):
+        image = _gradient_image(seed=60)
+        points = _compound_grid_points(
+            height=image.shape[0],
+            width=image.shape[1],
+        )[::4]
+        support = np.ones_like(image, dtype=bool)
+        changed = image.copy()
+        for raw_x, raw_y in points:
+            x = int(round(raw_x))
+            y = int(round(image.shape[0] - 1 - raw_y))
+            support[y, x] = False
+            changed[y, x] += 0.5
+
+        baseline = measure_background_validation(
+            image,
+            points,
+            patch_radius=4,
+            minimum_count=4,
+            support_mask=support,
+        )
+        candidate = measure_background_validation(
+            changed,
+            points,
+            patch_radius=4,
+            minimum_count=4,
+            support_mask=support,
+        )
+
+        self.assertEqual(baseline["status"], "ready")
+        self.assertTrue(baseline["masked_support"])
+        self.assertEqual(baseline["robust_span"], candidate["robust_span"])
+        self.assertEqual(baseline["median"], candidate["median"])
+
     def test_dark_patch_refinement_is_deterministic_and_keeps_frozen_thresholds(self):
         image = _gradient_image(seed=31)
         height, width = image.shape
@@ -266,6 +701,21 @@ class Stage3BackgroundSamplingTests(unittest.TestCase):
         self.assertGreater(len(first_points), len(baseline_points))
         self.assertEqual(first_report["thresholds"], baseline_report["thresholds"])
         self.assertEqual(len(first_points), len(set(first_points)))
+        self.assertEqual(
+            len(first_report["selected_samples"]),
+            len(first_points),
+        )
+        self.assertEqual(
+            [sample["point"] for sample in first_report["selected_samples"]],
+            [list(point) for point in first_points],
+        )
+        self.assertIn(
+            "dark_patch_refinement",
+            {
+                sample["source"]
+                for sample in first_report["selected_samples"]
+            },
+        )
 
         top_left_points = [
             (point_x, height - 1 - point_y)
@@ -281,6 +731,44 @@ class Stage3BackgroundSamplingTests(unittest.TestCase):
             for right_x, right_y in top_left_points[index + 1 :]
         )
         self.assertGreaterEqual(observed_spacing, minimum_spacing)
+
+    def test_recovery_refinement_preserves_regular_grid_evidence(self):
+        image = _gradient_image(seed=66)
+        height, width = image.shape
+        y, x = np.mgrid[:height, :width]
+        image += 0.10 * np.exp(
+            -((x - width * 0.52) ** 2 + (y - height * 0.47) ** 2)
+            / (2 * 42**2)
+        )
+
+        first_points, first_report = build_safe_background_samples(
+            image,
+            preserve_regular_grid=True,
+        )
+        second_points, second_report = build_safe_background_samples(
+            image,
+            preserve_regular_grid=True,
+        )
+
+        self.assertEqual(first_points, second_points)
+        self.assertEqual(first_report, second_report)
+        self.assertTrue(first_report["preserve_regular_grid"])
+        regular_samples = [
+            sample
+            for sample in first_report["selected_samples"]
+            if sample["source"] == "regular_grid"
+        ]
+        regular_cells = {tuple(sample["grid_cell"]) for sample in regular_samples}
+        regular_quadrants = {
+            (
+                int(sample["point"][0] >= width / 2),
+                int(sample["point"][1] >= height / 2),
+            )
+            for sample in regular_samples
+        }
+        self.assertGreaterEqual(len(regular_samples), 4)
+        self.assertGreaterEqual(len(regular_cells), 4)
+        self.assertGreaterEqual(len(regular_quadrants), 3)
 
     def test_dark_patch_refinement_stays_disabled_for_sky_limited_structure(self):
         rng = np.random.default_rng(91)
@@ -350,6 +838,77 @@ class Stage3BackgroundSamplingTests(unittest.TestCase):
         )
         self.assertEqual((fit, validation), ([], []))
         self.assertEqual(report["status"], "insufficient_samples")
+
+    def test_recovery_split_keeps_regular_grid_validation_provenance(self):
+        image = _gradient_image(seed=63)
+        height, width = image.shape
+        points = _compound_grid_points(height=height, width=width)
+        sources = [
+            "regular_grid" if index % 2 == 0 else "dark_patch_refinement"
+            for index in range(len(points))
+        ]
+
+        fit, validation, report = split_background_sample_points(
+            points,
+            image,
+            point_sources=sources,
+            minimum_regular_validation=4,
+        )
+
+        self.assertEqual(report["status"], "ready")
+        self.assertTrue(report["regular_validation_ready"])
+        self.assertGreaterEqual(
+            report["validation_source_counts"]["regular_grid"],
+            4,
+        )
+        self.assertGreaterEqual(
+            report["validation_regular_coverage"]["quadrants"],
+            3,
+        )
+        self.assertGreaterEqual(
+            report["validation_regular_coverage"]["grid_cells"],
+            4,
+        )
+        self.assertFalse(set(fit) & set(validation))
+
+    def test_recovery_split_fails_closed_without_regular_grid_provenance(self):
+        image = _gradient_image(seed=64)
+        height, width = image.shape
+        points = _compound_grid_points(height=height, width=width)
+        sources = ["dark_patch_refinement"] * len(points)
+        for index in (0, 1, 2):
+            sources[index] = "regular_grid"
+
+        fit, validation, report = split_background_sample_points(
+            points,
+            image,
+            point_sources=sources,
+            minimum_regular_validation=4,
+        )
+
+        self.assertEqual((fit, validation), ([], []))
+        self.assertEqual(report["status"], "insufficient_safe_coverage")
+        self.assertFalse(report["regular_validation_ready"])
+        self.assertEqual(
+            report["reason"],
+            "regular-grid validation provenance is insufficient",
+        )
+
+    def test_outer_halo_protection_reports_stable_method(self):
+        image = _gradient_image(seed=65)
+
+        _points, report = build_safe_background_samples(
+            image,
+            protection_policy={"protect_outer_halo": True},
+        )
+
+        outer_halo = report["mask_evidence"]["layers"]["outer_halo"]
+        self.assertTrue(outer_halo["requested"])
+        self.assertTrue(outer_halo["applied"])
+        self.assertEqual(
+            outer_halo["method"],
+            "low_threshold_connected_positive_residual_growth",
+        )
 
     def test_compound_validation_requires_improvement_and_bounded_drift(self):
         height, width = 512, 640

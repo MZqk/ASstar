@@ -17,6 +17,8 @@ import numpy as np
 from channel_semantics import BROADBAND_RGB_OSC
 from color_quality_metrics import physical_broadband_anchor_accepted
 import stage7_quality
+import star_halo_guard
+import spatial_background_lineage
 from image_metrics import (
     _box_blur_gray,
     _clamp_float,
@@ -32,6 +34,7 @@ from local_adjustments import (
     feather_mask,
 )
 from models import ImageFeatures, QualityMetrics
+from stage8_starless_finish import pixel_sha256
 
 _FINAL_COMPACT_HALO_NEAR_LIMIT_FACTOR = 1.10
 _FINAL_GLOBAL_HALO_SAFE_FACTOR = 0.75
@@ -592,7 +595,7 @@ def stage8_generate_starless_masks(pipeline, image_data: np.ndarray) -> Dict[str
         "faint_nebula": float(np.mean(faint_nebula_mask > 0.12)),
         "background": float(np.mean(background_mask > 0.50)),
     }
-    return {
+    return star_halo_guard.apply_guard_to_masks(pipeline, {
         "rgb": rgb,
         "gray": gray,
         "bg_median": bg_median,
@@ -609,7 +612,7 @@ def stage8_generate_starless_masks(pipeline, image_data: np.ndarray) -> Dict[str
         "faint_nebula_mask": faint_nebula_mask,
         "background_mask": background_mask,
         "coverage": coverage,
-    }
+    })
 
 
 def _stage8_smoothstep(
@@ -768,6 +771,202 @@ def stage8_large_galaxy_structure_masks(
         }
     )
     routed["large_galaxy_disk_report"] = report
+    return routed, report
+
+
+def stage8_target_structure_masks(
+    pipeline,
+    masks: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Route Stage 8 structure through a target-aware, protected soft mask.
+
+    The returned support is the only region in which a target-aware Stage 8
+    structure transaction may change pixels.  Core, catalogued-star, and
+    frozen halo guards are removed *after* feathering so the protection cannot
+    be blurred back into a guarded region.
+    """
+
+    target_type = (
+        str(pipeline._active_target_type() or "").strip().lower()
+        if hasattr(pipeline, "_active_target_type")
+        else ""
+    )
+    gray = np.asarray(masks.get("gray"))
+    if gray.ndim != 2:
+        gray = np.asarray(masks.get("nebula_mask"))
+    if gray.ndim != 2:
+        return None, {
+            "schema": "starun.stage8-target-structure-mask.v1",
+            "status": "unavailable",
+            "available": False,
+            "reason": "target_structure_mask_shape_unavailable",
+            "target_type": target_type,
+        }
+    height, width = gray.shape
+    min_side = min(height, width)
+    profile: Dict[str, Any]
+    routed = dict(masks)
+    geometry_report: Dict[str, Any] = {}
+    if target_type == "large_galaxy":
+        galaxy_masks, geometry_report = stage8_large_galaxy_structure_masks(
+            pipeline,
+            masks,
+        )
+        if galaxy_masks is None:
+            return None, geometry_report
+        routed = galaxy_masks
+        subject = np.asarray(
+            routed["enhancement_subject_weight"], dtype=np.float32
+        )
+        outer = np.asarray(
+            routed["enhancement_outer_weight"], dtype=np.float32
+        )
+        requested_scale = getattr(
+            pipeline.cfg,
+            "stage8_large_galaxy_structure_scale_max",
+            0.50,
+        )
+        try:
+            requested_scale = float(requested_scale)
+        except (TypeError, ValueError):
+            requested_scale = 0.50
+        if not math.isfinite(requested_scale):
+            requested_scale = 0.50
+        profile = {
+            "route": "large_galaxy_elliptical_soft_v1",
+            "scale_max": float(np.clip(requested_scale, 0.0, 0.50)),
+            "feather_ratio": 0.004,
+            "feather_min": 8,
+            "feather_max": 16,
+            "subject_formula": "stage7_elliptical_disk",
+        }
+    elif target_type in {"emission_nebula", "emission_nebula_widefield"}:
+        nebula = np.asarray(masks["nebula_mask"], dtype=np.float32)
+        faint = np.asarray(
+            masks.get("faint_nebula_mask", np.zeros_like(nebula)),
+            dtype=np.float32,
+        )
+        subject = np.maximum(nebula, 0.60 * faint)
+        outer = np.maximum(0.60 * nebula, faint)
+        requested_scale = getattr(
+            pipeline.cfg,
+            "stage8_emission_structure_scale_max",
+            0.45,
+        )
+        try:
+            requested_scale = float(requested_scale)
+        except (TypeError, ValueError):
+            requested_scale = 0.45
+        if not math.isfinite(requested_scale):
+            requested_scale = 0.45
+        profile = {
+            "route": "emission_nebula_target_soft_v1",
+            "scale_max": float(np.clip(requested_scale, 0.0, 0.45)),
+            "feather_ratio": 0.008,
+            "feather_min": 12,
+            "feather_max": 24,
+            "subject_formula": "max(nebula,0.60*faint)",
+        }
+    elif target_type == "bright_emission_reflection_nebula":
+        nebula = np.asarray(masks["nebula_mask"], dtype=np.float32)
+        faint = np.asarray(
+            masks.get("faint_nebula_mask", np.zeros_like(nebula)),
+            dtype=np.float32,
+        )
+        subject = np.maximum(nebula, 0.75 * faint)
+        outer = np.maximum(0.75 * nebula, faint)
+        requested_scale = getattr(
+            pipeline.cfg,
+            "stage8_bright_composite_structure_scale_max",
+            0.40,
+        )
+        try:
+            requested_scale = float(requested_scale)
+        except (TypeError, ValueError):
+            requested_scale = 0.40
+        if not math.isfinite(requested_scale):
+            requested_scale = 0.40
+        profile = {
+            "route": "bright_composite_target_soft_v1",
+            "scale_max": float(np.clip(requested_scale, 0.0, 0.40)),
+            "feather_ratio": 0.010,
+            "feather_min": 16,
+            "feather_max": 32,
+            "subject_formula": "max(nebula,0.75*faint)",
+        }
+    else:
+        return None, {
+            "schema": "starun.stage8-target-structure-mask.v1",
+            "status": "not_applicable",
+            "available": False,
+            "reason": "target_has_no_structure_retry_route",
+            "target_type": target_type,
+        }
+
+    feather_radius = int(
+        np.clip(
+            round(min_side * float(profile["feather_ratio"])),
+            int(profile["feather_min"]),
+            int(profile["feather_max"]),
+        )
+    )
+    subject = pipeline._stage8_soften_mask(subject, passes=feather_radius)
+    outer = pipeline._stage8_soften_mask(outer, passes=feather_radius)
+    zeros = np.zeros((height, width), dtype=np.float32)
+    core = np.asarray(masks.get("core_mask", zeros), dtype=np.float32)
+    stars = np.asarray(masks.get("star_mask", zeros), dtype=np.float32)
+    halo = np.asarray(
+        masks.get("star_halo_guard_mask", zeros), dtype=np.float32
+    )
+    guard = np.maximum.reduce(
+        [
+            np.clip(core, 0.0, 1.0),
+            np.clip(stars, 0.0, 1.0),
+            np.clip(halo, 0.0, 1.0),
+        ]
+    )
+    protection = np.clip(1.0 - guard, 0.0, 1.0)
+    subject = np.clip(subject * protection, 0.0, 1.0)
+    outer = np.clip(outer * protection, 0.0, 1.0)
+    support = np.maximum(subject, outer)
+    routed.update(
+        nebula_mask=subject.astype(np.float32, copy=False),
+        faint_nebula_mask=outer.astype(np.float32, copy=False),
+        background_mask=np.clip(1.0 - support, 0.0, 1.0).astype(
+            np.float32, copy=False
+        ),
+        enhancement_subject_weight=subject.astype(np.float32, copy=False),
+        enhancement_outer_weight=outer.astype(np.float32, copy=False),
+        enhancement_support_weight=support.astype(np.float32, copy=False),
+        mask_route=str(profile["route"]),
+        target_structure_scale_max=float(profile["scale_max"]),
+    )
+    routed["coverage"] = {
+        **dict(masks.get("coverage") or {}),
+        "nebula": float(np.mean(subject > 0.05)),
+        "faint_nebula": float(np.mean(outer > 0.05)),
+        "enhancement_support": float(np.mean(support > 0.0)),
+        "protected_core_star_halo": float(np.mean(guard > 0.0)),
+    }
+    report = {
+        "schema": "starun.stage8-target-structure-mask.v1",
+        "status": "ready",
+        "available": True,
+        "accepted": True,
+        "reason": "accepted",
+        "target_type": target_type,
+        "route": str(profile["route"]),
+        "subject_formula": str(profile["subject_formula"]),
+        "structure_scale_max": float(profile["scale_max"]),
+        "feather_radius_ratio": float(profile["feather_ratio"]),
+        "feather_radius_pixels": feather_radius,
+        "guard_sources": ["core_mask", "star_mask", "star_halo_guard_mask"],
+        "coverage": dict(routed["coverage"]),
+        "geometry": dict(geometry_report.get("geometry") or {}),
+    }
+    routed["target_structure_mask_report"] = report
+    if geometry_report:
+        routed["large_galaxy_disk_report"] = geometry_report
     return routed, report
 
 
@@ -1194,7 +1393,7 @@ def stage8_enhancement_quality_report(pipeline) -> Dict[str, Any]:
     if bool(subject_boundary_seam.get("applicable", False)):
         if not bool(subject_boundary_seam.get("available", False)):
             issues.append(
-                "large_galaxy_subject_boundary_gate_unavailable="
+                "subject_boundary_gate_unavailable="
                 + str(subject_boundary_seam.get("reason") or "unknown")
             )
         elif str(subject_boundary_seam.get("status") or "") == "hard_failed":
@@ -1325,6 +1524,73 @@ def rollback_stage8_to_input(pipeline) -> bool:
         pipeline.log.warn(f"Stage8 rollback to input failed: {e}")
         return False
 
+
+def _stage10_verified_formal_stage8_safe_passthrough(pipeline) -> bool:
+    """Trust Stage8 safe passthrough only after Stage9 reverified its v3 identity."""
+
+    handoff = getattr(pipeline, "_stage8_handoff", None)
+    verification = getattr(
+        pipeline,
+        "_stage9_stage8_handoff_verification",
+        None,
+    )
+    if not isinstance(handoff, dict) or not isinstance(verification, dict):
+        return False
+    safe_record = handoff.get("safe_passthrough_color_only")
+    safe_record = safe_record if isinstance(safe_record, dict) else {}
+    preflight = safe_record.get("preflight")
+    final_validation = safe_record.get("final_validation")
+    source_artifact = handoff.get("source_artifact")
+    verified_artifact = verification.get("artifact")
+    if not (
+        isinstance(preflight, dict)
+        and isinstance(final_validation, dict)
+        and isinstance(source_artifact, dict)
+        and isinstance(verified_artifact, dict)
+    ):
+        return False
+    expected_sha256 = str(verified_artifact.get("expected_sha256") or "")
+    actual_sha256 = str(verified_artifact.get("actual_sha256") or "")
+    expected_pixel_sha256 = str(
+        verified_artifact.get("expected_pixel_sha256") or ""
+    )
+    actual_pixel_sha256 = str(
+        verified_artifact.get("actual_pixel_sha256") or ""
+    )
+    return bool(
+        str(handoff.get("schema") or "") == "starun.stage8-handoff.v3"
+        and str(handoff.get("processing_route") or "")
+        == "safe_passthrough_color_only"
+        and handoff.get("formal_eligible") is True
+        and handoff.get("restricted_downstream") is False
+        and handoff.get("lineage_verified") is True
+        and handoff.get("passthrough") is True
+        and safe_record.get("color_gate_verified") is True
+        and preflight.get("accepted") is True
+        and not list(preflight.get("issues") or [])
+        and final_validation.get("accepted") is True
+        and not list(final_validation.get("issues") or [])
+        and str(verification.get("schema") or "")
+        == "starun.stage9-stage8-handoff-verification.v1"
+        and verification.get("verified") is True
+        and verification.get("review_only") is False
+        and str(verification.get("status") or "") == "verified"
+        and str(verification.get("processing_route") or "")
+        == "safe_passthrough_color_only"
+        and verification.get("formal_eligible") is True
+        and not list(verification.get("issues") or [])
+        and bool(expected_sha256)
+        and expected_sha256 == actual_sha256
+        and expected_sha256 == str(source_artifact.get("sha256") or "")
+        and expected_sha256 == str(handoff.get("artifact_sha256") or "")
+        and bool(expected_pixel_sha256)
+        and expected_pixel_sha256 == actual_pixel_sha256
+        and expected_pixel_sha256
+        == str(source_artifact.get("pixel_sha256") or "")
+        and expected_pixel_sha256 == str(handoff.get("pixel_sha256") or "")
+    )
+
+
 def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any]:
     image_data = pipeline._read_image_by_stem(stem)
     issues: List[str] = []
@@ -1353,6 +1619,32 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
                 issues.append("final_image_non_finite_pixels")
     except (TypeError, ValueError) as error:
         issues.append(f"final_image_validation_failed:{error}")
+    spatial_lineage_path = (
+        Path(pipeline.process_dir) / "stage3_spatial_background_lineage.json"
+        if getattr(pipeline, "process_dir", None) is not None
+        else None
+    )
+    final_spatial_background = (
+        spatial_background_lineage.assess_final_spatial_background(
+            pipeline.process_dir,
+            image_data,
+        )
+        if spatial_lineage_path is not None
+        and spatial_lineage_path.is_file()
+        else {
+            "schema": spatial_background_lineage.FINAL_SCHEMA,
+            "status": "unavailable",
+            "accepted": False,
+            "reason_code": "stage3_spatial_background_lineage_unavailable",
+            "issues": ["stage3_spatial_background_lineage_unavailable"],
+            "components": {},
+        }
+    )
+    if not bool(final_spatial_background.get("accepted", False)):
+        issues.extend(
+            list(final_spatial_background.get("issues") or [])
+            or ["final_spatial_background_gradient_unresolved"]
+        )
     unmasked_metrics = pipeline._background_quality_metrics(image_data)
     metrics = dict(unmasked_metrics or {})
     final_masks: Optional[Dict[str, Any]] = None
@@ -1371,23 +1663,25 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
             "_stage10_quality_frozen_background_sampling",
             None,
         )
-        if isinstance(frozen_masks, dict) and frozen_masks:
+        authenticated_sampling = bool(
+            isinstance(frozen_sampling, dict)
+            and frozen_sampling.get("schema")
+            == "starun.stage10-authenticated-background-support.v1"
+            and frozen_sampling.get("status") == "accepted"
+            and frozen_sampling.get("accepted") is True
+            and frozen_sampling.get("candidate_independent") is True
+        )
+        if (
+            isinstance(frozen_masks, dict)
+            and frozen_masks
+            and authenticated_sampling
+        ):
             final_masks = frozen_masks
-            final_signal_excluded_background_sampling = (
-                dict(frozen_sampling)
-                if isinstance(frozen_sampling, dict)
-                else {
-                    "status": "available",
-                    "method": "frozen_signal_excluded_background_mask_v2",
-                }
-            )
+            final_signal_excluded_background_sampling = dict(frozen_sampling)
         else:
-            final_masks, final_signal_excluded_background_sampling = (
-                build_signal_excluded_background_masks(pipeline, image_data)
-            )
-            pipeline._stage10_quality_frozen_background_masks = final_masks
-            pipeline._stage10_quality_frozen_background_sampling = dict(
-                final_signal_excluded_background_sampling
+            raise ValueError(
+                "authenticated candidate-independent frozen background "
+                "evidence is unavailable"
             )
         coverage_value = final_signal_excluded_background_sampling.get(
             "coverage_gt_0_50"
@@ -1412,20 +1706,16 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
         FloatingPointError,
     ) as error:
         final_masks = None
-        try:
-            pipeline._stage10_quality_frozen_background_masks = None
-            pipeline._stage10_quality_frozen_background_sampling = None
-        except AttributeError:
-            pass
         final_signal_excluded_background_metrics = {}
         final_signal_excluded_background_sampling = {
-            "status": "unavailable",
-            "method": "darkest_35_percent_fallback",
+            "schema": "starun.stage10-authenticated-background-support.v1",
+            "status": "rejected",
+            "accepted": False,
+            "candidate_independent": True,
             "error": str(error),
         }
-        advisories.append(
-            "signal_excluded_background_sampling_unavailable "
-            "(advisory; darkest 35% fallback retained)"
+        issues.append(
+            "authenticated_frozen_background_sampling_unavailable"
         )
 
     baseline_metrics: Dict[str, Any] = {}
@@ -1435,6 +1725,10 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
     )
     if baseline_stem and baseline_stem != stem:
         try:
+            if final_masks is None:
+                raise ValueError(
+                    "authenticated shared background mask is unavailable"
+                )
             baseline_image = pipeline._read_image_by_stem(baseline_stem)
             baseline_metrics = pipeline._background_quality_metrics(
                 baseline_image,
@@ -1691,6 +1985,17 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
     conservative_stage8_skip = (
         str(getattr(pipeline, "_stage8_final_quality", "")) == "conservative_skipped"
     )
+    stage8_fallback_used = bool(
+        getattr(pipeline, "_stage8_fallback_used", False)
+    )
+    verified_formal_stage8_safe_passthrough = (
+        _stage10_verified_formal_stage8_safe_passthrough(pipeline)
+    )
+    stage8_fallback_requires_review = bool(
+        stage8_fallback_used
+        and not conservative_stage8_skip
+        and not verified_formal_stage8_safe_passthrough
+    )
     active_target_type = (
         pipeline._active_target_type()
         if hasattr(pipeline, "_active_target_type")
@@ -1750,8 +2055,11 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
         and compact_residual_coverage
         <= _FINAL_COMPACT_RESIDUAL_COVERAGE_SAFE_MAX
         and stage7_status == "ok"
-        and str(getattr(pipeline, "_stage8_final_quality", "")) == "ok"
-        and not bool(getattr(pipeline, "_stage8_fallback_used", False))
+        and (
+            str(getattr(pipeline, "_stage8_final_quality", "")) == "ok"
+            or verified_formal_stage8_safe_passthrough
+        )
+        and not stage8_fallback_requires_review
         and not bypassed_bad_starless
         and stage9_contract_known
         and stage9_stars_required
@@ -1767,10 +2075,7 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
         and not compact_halo_target_aware_exempted
     )
     strict_gate = (
-        (
-            bool(getattr(pipeline, "_stage8_fallback_used", False))
-            and not conservative_stage8_skip
-        )
+        stage8_fallback_requires_review
         or bypassed_bad_starless
         or stage9_missing_required_stars
         or stage9_starmask_preparation_failed
@@ -2208,6 +2513,11 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
         "stage9_stars_application_mode": str(
             getattr(pipeline, "_stage9_stars_application_mode", "unknown")
         ),
+        "stage8_fallback_used": stage8_fallback_used,
+        "stage8_verified_formal_safe_passthrough": (
+            verified_formal_stage8_safe_passthrough
+        ),
+        "stage8_fallback_requires_review": stage8_fallback_requires_review,
         "stage8_conservative_skipped": conservative_stage8_skip,
         "stage4_bright_core_color_integrity": stage4_core_color_integrity,
     }
@@ -2239,7 +2549,7 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
             "status": "not_requested",
         }
     return {
-        "schema": "starun.final-quality.v2",
+        "schema": "starun.final-quality.v4",
         "stage": "stage10_final_quality",
         "file": f"{stem}.fit",
         "policy": pipeline._active_policy_name() if hasattr(pipeline, "_active_policy_name") else "",
@@ -2250,6 +2560,7 @@ def final_quality_report(pipeline, stem: str = "stage10_final") -> Dict[str, Any
         "needs_conservative_rerun": bool(hard_issues),
         "strict_gate": strict_gate,
         "stage4_bright_core_color_integrity": stage4_core_color_integrity,
+        "spatial_background_gradient": final_spatial_background,
         "metrics": normalized_metrics,
         "warnings": warnings,
         "hard_issues": hard_issues,
@@ -2636,6 +2947,13 @@ def apply_stage8_masked_pixel_enhancement(
         == "limited"
     )
     mask_route = "generic_nebula_threshold_v1"
+    target_mask_report: Dict[str, Any] = {
+        "schema": "starun.stage8-target-structure-mask.v1",
+        "status": "not_applicable",
+        "available": False,
+        "reason": "target_has_no_structure_retry_route",
+        "target_type": target_type,
+    }
     large_galaxy_report: Dict[str, Any] = {
         "schema": "starun.stage8-large-galaxy-mask.v1",
         "route": mask_route,
@@ -2645,23 +2963,34 @@ def apply_stage8_masked_pixel_enhancement(
         "geometry": {},
         "coverage": {},
     }
-    if target_type == "large_galaxy":
-        routed_masks, large_galaxy_report = (
-            stage8_large_galaxy_structure_masks(pipeline, masks)
+    target_structure_types = {
+        "large_galaxy",
+        "emission_nebula",
+        "emission_nebula_widefield",
+        "bright_emission_reflection_nebula",
+    }
+    if target_type in target_structure_types:
+        routed_masks, target_mask_report = stage8_target_structure_masks(
+            pipeline,
+            masks,
         )
-        mask_route = str(large_galaxy_report.get("route") or mask_route)
+        mask_route = str(target_mask_report.get("route") or mask_route)
         if routed_masks is not None:
             masks = routed_masks
-        if limited_mode or routed_masks is None:
+            large_galaxy_report = dict(
+                routed_masks.get("large_galaxy_disk_report") or large_galaxy_report
+            )
+        if target_type == "large_galaxy" and (limited_mode or routed_masks is None):
             reason = (
                 "large_galaxy_limited_safe_passthrough"
                 if limited_mode
                 else "large_galaxy_geometry_unavailable="
-                + str(large_galaxy_report.get("reason") or "unknown")
+                + str(target_mask_report.get("reason") or "unknown")
             )
             messages = [f"{label} {reason}; Stage 8 input preserved"]
             diagnostics = {
                 "mask_route": mask_route,
+                "target_structure_mask": target_mask_report,
                 "large_galaxy_disk": large_galaxy_report,
                 "mask_coverage": dict(masks.get("coverage", {}))
                 if routed_masks is not None
@@ -2701,6 +3030,46 @@ def apply_stage8_masked_pixel_enhancement(
                 },
             }
             return np.array(image_data, copy=True), diagnostics, messages
+        if routed_masks is None:
+            reason = "target_structure_mask_unavailable=" + str(
+                target_mask_report.get("reason") or "unknown"
+            )
+            messages = [f"{label} {reason}; Stage 8 input preserved"]
+            return np.array(image_data, copy=True), {
+                "mask_route": mask_route,
+                "target_structure_mask": target_mask_report,
+                "large_galaxy_disk": large_galaxy_report,
+                "mask_coverage": {},
+                "masked_metrics": {},
+                "protection_actions": messages,
+                "local_adjustment_engine": {
+                    "schema": LOCAL_ADJUSTMENT_SCHEMA,
+                    "status": "passthrough",
+                    "accepted": False,
+                    "reason": reason,
+                },
+                "saturation_execution": {
+                    "requested": float(plan.get("saturation", 0.0) or 0.0),
+                    "applied": False,
+                    "applied_amount": 0.0,
+                    "effective_amount_mean": 0.0,
+                    "effect_status": "passthrough",
+                    "passes": 0,
+                    "position": "not_applied",
+                    "method": "none",
+                },
+                "structure_execution": {
+                    "source": mask_route,
+                    "scale": 0.0,
+                    "faint_nebula_boost": 0.0,
+                    "nebula_contrast": 0.0,
+                    "independent_from_saturation": True,
+                },
+                "processing_scope": {
+                    "mode": "target_mask_passthrough",
+                    "reason": reason,
+                },
+            }, messages
     base = masks["rgb"]
     gray = masks["gray"]
     core = masks["core_mask"]
@@ -2751,6 +3120,11 @@ def apply_stage8_masked_pixel_enhancement(
 
     saturation = _clamp_float(plan.get("saturation", pipeline.cfg.nebula_saturation), 0.0, 0.65)
     structure_scale = _clamp_float(plan.get("structure_scale", 1.0), 0.0, 1.0)
+    if target_type in target_structure_types:
+        structure_scale = min(
+            structure_scale,
+            float(masks.get("target_structure_scale_max", 1.0)),
+        )
     unsharp_amount = min(
         _clamp_float(plan.get("unsharp_amount", 0.35), 0.0, 0.60),
         float(pipeline.cfg.stage8_masked_unsharp_amount_max),
@@ -2826,7 +3200,7 @@ def apply_stage8_masked_pixel_enhancement(
         contrast_strength = 0.0
     signal_weight = np.clip(
         nebula_effect
-        if target_type == "large_galaxy"
+        if target_type in target_structure_types
         else nebula_effect + 0.60 * faint_effect,
         0.0,
         1.0,
@@ -2879,7 +3253,7 @@ def apply_stage8_masked_pixel_enhancement(
         blue_weight = np.clip(
             (
                 nebula_effect
-                if target_type == "large_galaxy"
+                if target_type in target_structure_types
                 else nebula_effect + 0.45 * faint_effect
             )
             * core_guard
@@ -2905,7 +3279,7 @@ def apply_stage8_masked_pixel_enhancement(
         signal_weight = np.clip(
             (
                 nebula_effect
-                if target_type == "large_galaxy"
+                if target_type in target_structure_types
                 else nebula_effect + 0.30 * faint_effect
             )
             * background_guard,
@@ -2937,7 +3311,7 @@ def apply_stage8_masked_pixel_enhancement(
             blue_weight = np.clip(
                 (
                     nebula_effect
-                    if target_type == "large_galaxy"
+                    if target_type in target_structure_types
                     else nebula_effect + 0.45 * faint_effect
                 )
                 * core_guard
@@ -2953,7 +3327,7 @@ def apply_stage8_masked_pixel_enhancement(
         plugin_weight = np.clip(
             (
                 0.34 * nebula_effect
-                if target_type == "large_galaxy"
+                if target_type in target_structure_types
                 else 0.34 * nebula_effect + 0.16 * faint_effect
             )
             * core_guard
@@ -2995,7 +3369,7 @@ def apply_stage8_masked_pixel_enhancement(
             "limited_weak_signal"
             if limited_mode
             else "nebula"
-            if target_type == "large_galaxy"
+            if target_type in target_structure_types
             else "faint_nebula"
         )
         subject_mask_name = (
@@ -3156,6 +3530,21 @@ def apply_stage8_masked_pixel_enhancement(
         result = result + (base - result) * soft_core_edge[None, :, :]
         result[:, limited_core_hard > 0.50] = base[:, limited_core_hard > 0.50]
 
+    target_support = None
+    if target_type in target_structure_types:
+        target_support = np.asarray(
+            masks.get(
+                "enhancement_support_weight",
+                np.maximum(nebula_effect, faint_effect),
+            ),
+            dtype=np.float32,
+        ) > 0.0
+        # Target-aware processing is a closed spatial transaction.  This final
+        # assignment covers every operation above (including background
+        # denoise and a local recipe) and makes the out-of-mask identity
+        # invariant independent of individual operation implementations.
+        result[:, ~target_support] = base[:, ~target_support]
+
     result = np.clip(result, 0.0, 1.0)
     scope_delta = np.max(np.abs(result - base), axis=0)
     processing_scope = {
@@ -3194,6 +3583,31 @@ def apply_stage8_masked_pixel_enhancement(
         )
 
     restored = pipeline._stage8_restore_rgb_like(image_data, result)
+    outside_target_change = 0.0
+    if target_support is not None:
+        source_array = np.asarray(image_data)
+        restored_array = np.asarray(restored)
+        if source_array.ndim == 3 and source_array.shape[0] in (1, 3):
+            restored_array[:, ~target_support] = source_array[:, ~target_support]
+            outside_target_change = float(
+                np.max(
+                    np.abs(
+                        restored_array[:, ~target_support].astype(np.float64)
+                        - source_array[:, ~target_support].astype(np.float64)
+                    )
+                )
+            ) if np.any(~target_support) else 0.0
+        elif source_array.ndim == 3 and source_array.shape[-1] in (1, 3):
+            restored_array[~target_support, :] = source_array[~target_support, :]
+            outside_target_change = float(
+                np.max(
+                    np.abs(
+                        restored_array[~target_support, :].astype(np.float64)
+                        - source_array[~target_support, :].astype(np.float64)
+                    )
+                )
+            ) if np.any(~target_support) else 0.0
+        restored = restored_array
     saturation_operations = [
         operation
         for operation in local_adjustment_report.get("operations", [])
@@ -3246,6 +3660,7 @@ def apply_stage8_masked_pixel_enhancement(
     )
     diagnostics = {
         "mask_route": mask_route,
+        "target_structure_mask": target_mask_report,
         "large_galaxy_disk": large_galaxy_report,
         "mask_coverage": coverage,
         "masked_metrics": pipeline._stage8_masked_metrics(restored, masks),
@@ -3280,6 +3695,14 @@ def apply_stage8_masked_pixel_enhancement(
         },
         "processing_scope": processing_scope,
     }
+    if target_support is not None:
+        diagnostics["processing_scope"].update(
+            {
+                "target_support_coverage": float(np.mean(target_support)),
+                "outside_target_max_abs_change": outside_target_change,
+                "outside_target_bitwise_same": outside_target_change == 0.0,
+            }
+        )
     messages.append(
         f"{label} masked Starless enhancement "
         f"(sat={saturation:.3f}, structure_scale={structure_scale:.3f}, "
@@ -3615,12 +4038,19 @@ def stage8_subject_boundary_seam_report(
     *,
     mask_route_override: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Detect enhancement seams at the fitted large-galaxy disk boundary."""
+    """Detect enhancement seams at a galaxy or diffuse-nebula subject boundary."""
     target_type = (
         str(pipeline._active_target_type() or "").strip().lower()
-        if hasattr(pipeline, "_active_target_type")
+    if hasattr(pipeline, "_active_target_type")
         else ""
     )
+    applicable_target_types = {
+        "large_galaxy",
+        "emission_nebula",
+        "emission_nebula_widefield",
+        "bright_emission_reflection_nebula",
+    }
+    applicable = target_type in applicable_target_types
     route = (
         "large_galaxy_elliptical_soft_v1"
         if target_type == "large_galaxy"
@@ -3628,44 +4058,46 @@ def stage8_subject_boundary_seam_report(
     )
     if mask_route_override:
         route = str(mask_route_override).strip()
-    luma_limit = float(
-        getattr(
-            pipeline.cfg,
-            "stage8_subject_boundary_luma_residual_max",
-            0.0035,
-        )
+
+    def locked_upper_limit(field: str, maximum: float) -> float:
+        try:
+            requested = float(getattr(pipeline.cfg, field, maximum))
+        except (AttributeError, TypeError, ValueError):
+            requested = maximum
+        if not math.isfinite(requested):
+            requested = maximum
+        return float(np.clip(requested, 0.0, maximum))
+
+    luma_limit = locked_upper_limit(
+        "stage8_subject_boundary_luma_residual_max",
+        0.0035,
     )
-    chroma_limit = float(
-        getattr(
-            pipeline.cfg,
-            "stage8_subject_boundary_chroma_residual_max",
-            0.0020,
-        )
+    chroma_limit = locked_upper_limit(
+        "stage8_subject_boundary_chroma_residual_max",
+        0.0020,
     )
-    ratio_limit = float(
-        getattr(
-            pipeline.cfg,
-            "stage8_subject_boundary_residual_ratio_max",
-            1.60,
-        )
+    ratio_limit = locked_upper_limit(
+        "stage8_subject_boundary_residual_ratio_max",
+        1.60,
     )
     report: Dict[str, Any] = {
-        "schema": "starun.stage8-subject-boundary-seam.v1",
-        "applicable": target_type == "large_galaxy",
+        "schema": "starun.stage8-subject-boundary-seam.v2",
+        "applicable": applicable,
         "available": False,
-        "accepted": target_type != "large_galaxy",
-        "status": "not_applicable" if target_type != "large_galaxy" else "unavailable",
+        "accepted": not applicable,
+        "status": "not_applicable" if not applicable else "unavailable",
         "reason": (
-            "target_is_not_large_galaxy"
-            if target_type != "large_galaxy"
+            "target_has_no_subject_boundary_contract"
+            if not applicable
             else "not_measured"
         ),
         "mask_route": route,
         "analysis_grid": {"max_side": 1024, "smoothing": "3x_3x3_box"},
         "region_definition": {
-            "boundary": "0.05 < disk_weight < 0.95",
+            "boundary": "0.05 < disk_weight < 0.80",
             "interior": "disk_weight >= 0.80",
             "minimum_samples": 64,
+            "regions_are_disjoint": True,
         },
         "thresholds": {
             "boundary_luma_residual_p95_max": luma_limit,
@@ -3679,7 +4111,7 @@ def stage8_subject_boundary_seam_report(
         "coverage": {},
         "seam_detected": False,
     }
-    if target_type != "large_galaxy":
+    if not applicable:
         return report
     if baseline_data is None or candidate_data is None:
         report["reason"] = "required_image_data_unavailable"
@@ -3690,101 +4122,41 @@ def stage8_subject_boundary_seam_report(
         if baseline_rgb.shape != candidate_rgb.shape:
             report["reason"] = "baseline_candidate_shape_mismatch"
             return report
-        if route in {
-            "generic_nebula_threshold_v1",
-            "legacy_generic_nebula_threshold_v1",
-        }:
-            legacy_masks = pipeline._stage8_generate_starless_masks(baseline_rgb)
-            disk_weight = np.asarray(
-                legacy_masks["nebula_mask"],
-                dtype=np.float32,
+        # Build the guard in its canonical full-resolution domain, then use
+        # the same deterministic stride as the analysis image.  Rebuilding
+        # from a 1024-side proxy would invalidate halo lineage and could also
+        # redefine the subject boundary between execution and verification.
+        full_masks = pipeline._stage8_generate_starless_masks(baseline_data)
+        routed_masks, target_mask_report = stage8_target_structure_masks(
+            pipeline,
+            full_masks,
+        )
+        if routed_masks is None:
+            report["reason"] = "target_structure_mask_unavailable=" + str(
+                target_mask_report.get("reason") or "unknown"
             )
-            report["geometry"] = {
-                "source": "legacy_generic_nebula_threshold_reconstruction"
-            }
-            report["coverage"] = dict(legacy_masks.get("coverage") or {})
-        else:
-            execution_diagnostics = getattr(
-                pipeline,
-                "_last_stage8_masked_diagnostics",
-                {},
-            ) or {}
-            execution_disk = execution_diagnostics.get("large_galaxy_disk") or {}
-            execution_route = str(
-                execution_diagnostics.get("mask_route") or ""
-            )
-            if (
-                execution_route == "large_galaxy_elliptical_soft_v1"
-                and str(execution_disk.get("status") or "") == "unavailable"
-            ):
-                report["reason"] = (
-                    "large_galaxy_geometry_unavailable="
-                    + str(execution_disk.get("reason") or "unknown")
-                )
-                return report
-            geometry = dict(execution_disk.get("geometry") or {})
-            coverage = dict(execution_disk.get("coverage") or {})
-            if geometry:
-                full_rgb = _to_rgb_float_fullres(baseline_data)
-                height, width = full_rgb.shape[1:]
-                step = max(1, int(math.ceil(max(height, width) / 1024.0)))
-                yy, xx = np.indices(baseline_rgb.shape[1:])
-                dx = xx.astype(np.float32) * step - float(geometry["center_x"])
-                dy = yy.astype(np.float32) * step - float(geometry["center_y"])
-                major_vector = np.asarray(
-                    geometry["major_axis_vector"],
-                    dtype=np.float64,
-                )
-                minor_vector = np.asarray(
-                    geometry["minor_axis_vector"],
-                    dtype=np.float64,
-                )
-                major_coord = (
-                    dx * float(major_vector[0])
-                    + dy * float(major_vector[1])
-                )
-                minor_coord = (
-                    dx * float(minor_vector[0])
-                    + dy * float(minor_vector[1])
-                )
-                rho = np.sqrt(
-                    np.square(major_coord / float(geometry["major_radius"]))
-                    + np.square(minor_coord / float(geometry["minor_radius"]))
-                )
-                disk_weight = 1.0 - _stage8_smoothstep(rho, 0.72, 1.15)
-            else:
-                full_masks = pipeline._stage8_generate_starless_masks(
-                    baseline_data
-                )
-                routed_masks, disk_report = (
-                    stage8_large_galaxy_structure_masks(
-                        pipeline,
-                        full_masks,
-                    )
-                )
-                geometry = dict(disk_report.get("geometry") or {})
-                coverage = dict(disk_report.get("coverage") or {})
-                if routed_masks is None:
-                    report["reason"] = (
-                        "large_galaxy_geometry_unavailable="
-                        + str(disk_report.get("reason") or "unknown")
-                    )
-                    return report
-                full_weight = np.asarray(
-                    routed_masks["enhancement_subject_weight"],
-                    dtype=np.float32,
-                )
-                step = max(
-                    1,
-                    int(math.ceil(max(full_weight.shape) / 1024.0)),
-                )
-                disk_weight = full_weight[::step, ::step]
-            report["geometry"] = geometry
-            report["coverage"] = coverage
+            return report
+        full_weight = np.asarray(
+            routed_masks["enhancement_subject_weight"],
+            dtype=np.float32,
+        )
+        step = max(1, int(math.ceil(max(full_weight.shape) / 1024.0)))
+        disk_weight = full_weight[::step, ::step]
+        route = str(target_mask_report.get("route") or route)
+        if mask_route_override:
+            route = str(mask_route_override).strip()
+        report["mask_route"] = route
+        report["geometry"] = {
+            **dict(target_mask_report.get("geometry") or {}),
+            "analysis_stride": step,
+            "source": "full_resolution_target_aware_guarded_mask",
+        }
+        report["coverage"] = dict(target_mask_report.get("coverage") or {})
+        report["target_structure_mask"] = target_mask_report
         if disk_weight.shape != baseline_rgb.shape[1:]:
             report["reason"] = "disk_weight_shape_mismatch"
             return report
-        boundary_region = (disk_weight > 0.05) & (disk_weight < 0.95)
+        boundary_region = (disk_weight > 0.05) & (disk_weight < 0.80)
         interior_region = disk_weight >= 0.80
         boundary_count = int(np.count_nonzero(boundary_region))
         interior_count = int(np.count_nonzero(interior_region))
@@ -3877,26 +4249,20 @@ def stage8_subject_boundary_seam_report(
                 )
             ),
         }
-        luma_seam = boundary_luma > luma_limit and luma_ratio > ratio_limit
-        chroma_seam = (
-            boundary_chroma > chroma_limit and chroma_ratio > ratio_limit
+        # The subject-boundary contract is stricter than the shared Stage 7/9
+        # advisory envelope: every published limit is a transactional hard
+        # limit.  In particular, a weakened retry must not be accepted merely
+        # because its absolute residual dropped below the nominal limit while
+        # the boundary/interior concentration still exceeds 1.60.  Keep the
+        # shared gate details for diagnostics, but decide the transaction from
+        # the locked Stage 8 limits themselves.
+        luma_seam = bool(
+            boundary_luma > luma_limit or luma_ratio > ratio_limit
         )
-        hard_failed = bool(
-            (
-                luma_seam
-                and (
-                    gates["boundary_luma_residual_p95"]["hard_failed"]
-                    or gates["boundary_luma_to_interior_ratio"]["hard_failed"]
-                )
-            )
-            or (
-                chroma_seam
-                and (
-                    gates["boundary_chroma_residual_p95"]["hard_failed"]
-                    or gates["boundary_chroma_to_interior_ratio"]["hard_failed"]
-                )
-            )
+        chroma_seam = bool(
+            boundary_chroma > chroma_limit or chroma_ratio > ratio_limit
         )
+        hard_failed = bool(luma_seam or chroma_seam)
         seam_detected = bool(luma_seam or chroma_seam)
         report.update(
             {
@@ -3927,6 +4293,366 @@ def stage8_subject_boundary_seam_report(
     except (IndexError, KeyError, TypeError, ValueError, FloatingPointError) as error:
         report["reason"] = str(error)
         return report
+
+
+def stage8_subject_boundary_retry_candidate(
+    pipeline,
+    baseline_data: np.ndarray,
+    candidate_data: np.ndarray,
+    *,
+    seam_report: Optional[Dict[str, Any]] = None,
+    retained_delta: float = 1.0,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Attenuate a verified delta more strongly at the subject boundary.
+
+    The retry never invokes the originating plugin again.  It applies a
+    deterministic, continuous scale map to the already projected delta.  The
+    boundary cap is solved from the failed absolute/ratio gates, while the
+    caller searches a fixed strongest-first retained-delta ladder.  Pixels
+    outside the guarded subject support are restored exactly.
+    """
+
+    report: Dict[str, Any] = {
+        "schema": "starun.stage8-subject-boundary-retry.v1",
+        "status": "unavailable",
+        "accepted": False,
+        "mode": "adaptive_subject_boundary_delta_scaling",
+        "retained_delta": float(retained_delta),
+        "boundary_scale": 0.0,
+        "interior_scale": 0.0,
+        "feather_passes": 3,
+        "mask_route": str((seam_report or {}).get("mask_route") or ""),
+    }
+    try:
+        baseline_rgb = _to_rgb_float_fullres(baseline_data)
+        candidate_rgb = _to_rgb_float_fullres(candidate_data)
+        if baseline_rgb.shape != candidate_rgb.shape:
+            raise ValueError("baseline_candidate_shape_mismatch")
+
+        retained = float(retained_delta)
+        if retained not in {1.0, 0.75, 0.50, 0.25}:
+            raise ValueError("retained_delta_not_in_certified_ladder")
+        masks = pipeline._stage8_generate_starless_masks(baseline_data)
+        routed_masks, target_mask_report = stage8_target_structure_masks(
+            pipeline,
+            masks,
+        )
+        if routed_masks is None:
+            raise ValueError(
+                "target_structure_mask_unavailable:"
+                + str(target_mask_report.get("reason") or "unknown")
+            )
+        masks = routed_masks
+        subject_weight = np.asarray(
+            masks["enhancement_subject_weight"],
+            dtype=np.float32,
+        )
+        mask_route = str(target_mask_report.get("route") or "")
+        if subject_weight.shape != baseline_rgb.shape[1:]:
+            raise ValueError("subject_weight_shape_mismatch")
+        if not bool(np.all(np.isfinite(subject_weight))):
+            raise ValueError("subject_weight_nonfinite")
+        subject_weight = np.clip(subject_weight, 0.0, 1.0)
+        supported = subject_weight > 0.05
+        boundary = supported & (subject_weight < 0.80)
+        interior = subject_weight >= 0.80
+        if int(np.count_nonzero(boundary)) < 64:
+            raise ValueError("insufficient_boundary_samples")
+        if int(np.count_nonzero(interior)) < 64:
+            raise ValueError("insufficient_interior_samples")
+
+        metrics = dict((seam_report or {}).get("metrics") or {})
+        thresholds = dict((seam_report or {}).get("thresholds") or {})
+        luma_limit = float(
+            thresholds.get("boundary_luma_residual_p95_max", 0.0035)
+        )
+        chroma_limit = float(
+            thresholds.get("boundary_chroma_residual_p95_max", 0.0020)
+        )
+        ratio_limit = float(
+            thresholds.get("boundary_to_interior_ratio_max", 1.60)
+        )
+        cap_candidates = [1.0]
+        for metric_name, limit in (
+            ("boundary_luma_residual_p95", luma_limit),
+            ("boundary_chroma_residual_p95", chroma_limit),
+            ("boundary_luma_to_interior_ratio", ratio_limit),
+            ("boundary_chroma_to_interior_ratio", ratio_limit),
+        ):
+            value = float(metrics.get(metric_name, 0.0) or 0.0)
+            if value > limit and value > 1e-12:
+                cap_candidates.append(limit / value)
+        analytic_boundary_cap = float(
+            np.clip(min(cap_candidates) * 0.98, 0.02, 1.0)
+        )
+        boundary_scale = analytic_boundary_cap * retained
+        interior_scale = retained
+        raw_scale = np.zeros(subject_weight.shape, dtype=np.float32)
+        raw_scale[boundary] = boundary_scale
+        raw_scale[interior] = interior_scale
+        scale_map = raw_scale
+        for _ in range(3):
+            scale_map = _box_blur_gray(scale_map)
+        scale_map = np.clip(scale_map, 0.0, interior_scale).astype(np.float32)
+        # Feathering must never leak an enhancement outside the guarded
+        # subject support.  This also makes the rollback identity explicit.
+        scale_map[~supported] = 0.0
+
+        delta = candidate_rgb - baseline_rgb
+        retry_rgb = baseline_rgb + delta * scale_map[None, :, :]
+        retry = stage8_restore_rgb_like(pipeline, baseline_data, retry_rgb)
+        retry_rgb = _to_rgb_float_fullres(retry)
+        outside_max = float(
+            np.max(np.abs(retry_rgb[:, ~supported] - baseline_rgb[:, ~supported]))
+        ) if np.any(~supported) else 0.0
+        if outside_max > 1e-7:
+            raise ValueError("retry_changed_pixels_outside_subject_support")
+        report.update(
+            status="ready",
+            accepted=True,
+            mask_route=mask_route,
+            target_structure_mask=target_mask_report,
+            analytic_boundary_cap=analytic_boundary_cap,
+            boundary_scale=boundary_scale,
+            interior_scale=interior_scale,
+            subject_support_coverage=float(np.mean(supported)),
+            boundary_pixel_count=int(np.count_nonzero(boundary)),
+            interior_pixel_count=int(np.count_nonzero(interior)),
+            scale_min=float(np.min(scale_map[supported])),
+            scale_p50=float(np.median(scale_map[supported])),
+            scale_p95=float(np.percentile(scale_map[supported], 95.0)),
+            scale_max=float(np.max(scale_map[supported])),
+            outside_subject_max_abs_change=outside_max,
+        )
+        return retry, report
+    except (IndexError, KeyError, TypeError, ValueError, FloatingPointError) as error:
+        report["reason"] = str(error)
+        return np.array(baseline_data, copy=True), report
+
+
+def stage8_frozen_sky_visible_noise_report(
+    pipeline,
+    baseline_data: np.ndarray,
+    candidate_data: np.ndarray,
+) -> Dict[str, Any]:
+    """Measure display-visible high-frequency noise on Stage 3 frozen sky."""
+
+    try:
+        requested_growth_max = float(
+            getattr(
+                pipeline.cfg,
+                "stage8_frozen_sky_visible_noise_growth_max",
+                1.10,
+            )
+        )
+    except (AttributeError, TypeError, ValueError):
+        requested_growth_max = 1.10
+    if not math.isfinite(requested_growth_max):
+        requested_growth_max = 1.10
+    growth_max = float(np.clip(requested_growth_max, 1.0, 1.10))
+    report: Dict[str, Any] = {
+        "schema": "starun.stage8-frozen-sky-visible-noise.v1",
+        "status": "unavailable",
+        "available": False,
+        "accepted": False,
+        "growth_max": growth_max,
+        "reason": "stage3_frozen_sky_lineage_unverified",
+    }
+    process_dir = getattr(pipeline, "process_dir", None)
+    lineage_path = (
+        Path(process_dir) / "stage3_spatial_background_lineage.json"
+        if process_dir is not None
+        else None
+    )
+    handoff = getattr(pipeline, "_stage8_handoff", {}) or {}
+    lineage_required = bool(
+        (lineage_path is not None and lineage_path.is_file())
+        or handoff.get("stage3_spatial_background")
+        or handoff.get("stage3_spatial_lineage")
+    )
+    if not lineage_required:
+        return report
+    lineage = spatial_background_lineage.load_lineage(process_dir)
+    if not bool(lineage.get("accepted", False)):
+        report.update(
+            status="unavailable",
+            accepted=False,
+            reason="stage3_frozen_sky_lineage_unverified",
+            lineage={
+                key: value
+                for key, value in lineage.items()
+                if key != "support_mask"
+            },
+        )
+        return report
+    try:
+        baseline_rgb = _to_rgb_float_fullres(baseline_data)
+        candidate_rgb = _to_rgb_float_fullres(candidate_data)
+        if baseline_rgb.shape != candidate_rgb.shape:
+            raise ValueError("baseline_candidate_shape_mismatch")
+        support = np.asarray(lineage["support_mask"], dtype=bool)
+        if support.shape != baseline_rgb.shape[1:]:
+            raise ValueError("frozen_sky_support_shape_mismatch")
+        if int(np.count_nonzero(support)) < 64:
+            raise ValueError("frozen_sky_support_too_small")
+
+        def measure(rgb: np.ndarray) -> Dict[str, float]:
+            luma = (
+                0.2126 * rgb[0]
+                + 0.7152 * rgb[1]
+                + 0.0722 * rgb[2]
+            ).astype(np.float32)
+            residual = luma - _box_blur_gray(luma)
+            values = np.asarray(residual[support], dtype=np.float32)
+            median = float(np.median(values))
+            sigma = float(1.4826 * np.median(np.abs(values - median)))
+            sky_median = float(np.median(luma[support]))
+            return {
+                "sky_median": sky_median,
+                "residual_median": median,
+                "sigma": sigma,
+                "visible_noise_score": sigma / max(sky_median, 0.015),
+            }
+
+        baseline = measure(baseline_rgb)
+        candidate = measure(candidate_rgb)
+        baseline_score = float(baseline["visible_noise_score"])
+        candidate_score = float(candidate["visible_noise_score"])
+        growth = (
+            1.0
+            if baseline_score <= 1e-9 and candidate_score <= 1e-9
+            else candidate_score / max(baseline_score, 1e-9)
+        )
+        accepted = bool(math.isfinite(growth) and growth <= growth_max)
+        report.update(
+            status="ok" if accepted else "hard_failed",
+            available=True,
+            accepted=accepted,
+            reason="accepted" if accepted else "visible_noise_growth_exceeded",
+            support_sha256=lineage.get("support_sha256"),
+            support_pixel_count=int(np.count_nonzero(support)),
+            baseline=baseline,
+            candidate=candidate,
+            growth=float(growth),
+        )
+        return report
+    except (IndexError, KeyError, TypeError, ValueError, FloatingPointError) as error:
+        report.update(status="unavailable", accepted=False, reason=str(error))
+        return report
+
+def stage8_outside_target_identity_report(
+    baseline_data: Any,
+    candidate_data: Any,
+    masks: Optional[Dict[str, Any]],
+    *,
+    target_type: str,
+) -> Dict[str, Any]:
+    """Independently prove exact identity outside the frozen target support."""
+
+    applicable_types = {
+        "large_galaxy",
+        "emission_nebula",
+        "emission_nebula_widefield",
+        "bright_emission_reflection_nebula",
+    }
+    report: Dict[str, Any] = {
+        "schema": "starun.stage8-outside-target-identity.v1",
+        "status": "unavailable",
+        "available": False,
+        "applicable": target_type in applicable_types,
+        "accepted": False,
+        "reason": "outside_target_identity_evidence_unavailable",
+        "target_type": target_type,
+    }
+    if target_type not in applicable_types:
+        report.update(
+            status="not_applicable",
+            available=True,
+            accepted=True,
+            reason="target_has_no_closed_structure_route",
+        )
+        return report
+    try:
+        if not isinstance(masks, dict):
+            raise ValueError("target_structure_masks_unavailable")
+        support_value = masks.get("enhancement_support_weight")
+        if support_value is None:
+            raise ValueError("target_structure_support_unavailable")
+        baseline_array = np.asarray(baseline_data)
+        candidate_array = np.asarray(candidate_data)
+        if baseline_array.shape != candidate_array.shape:
+            raise ValueError("baseline_candidate_shape_mismatch")
+        if baseline_array.dtype != candidate_array.dtype:
+            raise ValueError("baseline_candidate_dtype_mismatch")
+        if not bool(np.all(np.isfinite(baseline_array))) or not bool(
+            np.all(np.isfinite(candidate_array))
+        ):
+            raise ValueError("baseline_candidate_nonfinite_pixels")
+
+        def exact_chw(array: np.ndarray) -> tuple[np.ndarray, str]:
+            if array.ndim == 2:
+                return array[np.newaxis, :, :], "mono_hw"
+            if array.ndim != 3:
+                raise ValueError("baseline_candidate_layout_unsupported")
+            if array.shape[0] in {1, 3, 4}:
+                return array, "channels_first"
+            if array.shape[-1] in {1, 3, 4}:
+                return np.moveaxis(array, -1, 0), "channels_last"
+            raise ValueError("baseline_candidate_layout_unsupported")
+
+        baseline_chw, baseline_layout = exact_chw(baseline_array)
+        candidate_chw, candidate_layout = exact_chw(candidate_array)
+        if baseline_layout != candidate_layout:
+            raise ValueError("baseline_candidate_layout_mismatch")
+        support = np.asarray(support_value, dtype=np.float32)
+        if support.shape != baseline_chw.shape[1:]:
+            raise ValueError("target_structure_support_shape_mismatch")
+        if not bool(np.all(np.isfinite(support))):
+            raise ValueError("target_structure_support_nonfinite")
+        outside = support <= 0.0
+        outside_count = int(np.count_nonzero(outside))
+        if outside_count < 1:
+            raise ValueError("outside_target_support_empty")
+        baseline_outside = np.ascontiguousarray(baseline_chw[:, outside])
+        candidate_outside = np.ascontiguousarray(candidate_chw[:, outside])
+        baseline_sha = pixel_sha256(baseline_outside)
+        candidate_sha = pixel_sha256(candidate_outside)
+        exact_identity = bool(
+            np.array_equal(baseline_outside, candidate_outside)
+            and baseline_sha == candidate_sha
+        )
+        max_abs_change = float(
+            np.max(
+                np.abs(
+                    candidate_outside.astype(np.longdouble)
+                    - baseline_outside.astype(np.longdouble)
+                )
+            )
+        )
+        report.update(
+            status="ok" if exact_identity else "hard_failed",
+            available=True,
+            accepted=exact_identity,
+            reason=(
+                "exact_outside_target_identity"
+                if exact_identity
+                else "outside_target_pixels_changed"
+            ),
+            mask_route=str(masks.get("mask_route") or ""),
+            pixel_dtype=str(baseline_array.dtype),
+            pixel_layout=baseline_layout,
+            support_pixel_count=int(np.count_nonzero(~outside)),
+            outside_pixel_count=outside_count,
+            baseline_outside_pixel_sha256=baseline_sha,
+            candidate_outside_pixel_sha256=candidate_sha,
+            exact_pixel_identity=exact_identity,
+            max_abs_change=max_abs_change,
+        )
+        return report
+    except (IndexError, TypeError, ValueError, FloatingPointError) as error:
+        report["reason"] = str(error)
+        return report
+
 
 def stage8_quality_assessment(
     pipeline,
@@ -3994,11 +4720,29 @@ def stage8_quality_assessment(
                 "reason": "required image data unavailable",
             },
             "subject_boundary_seam": {
-                "schema": "starun.stage8-subject-boundary-seam.v1",
-                "applicable": target_type == "large_galaxy",
+                "schema": "starun.stage8-subject-boundary-seam.v2",
+                "applicable": target_type in {
+                    "large_galaxy",
+                    "emission_nebula",
+                    "emission_nebula_widefield",
+                    "bright_emission_reflection_nebula",
+                },
                 "available": False,
                 "accepted": False,
                 "status": "unavailable",
+                "reason": "required image data unavailable",
+            },
+            "outside_target_identity": {
+                "schema": "starun.stage8-outside-target-identity.v1",
+                "status": "unavailable",
+                "available": False,
+                "applicable": target_type in {
+                    "large_galaxy",
+                    "emission_nebula",
+                    "emission_nebula_widefield",
+                    "bright_emission_reflection_nebula",
+                },
+                "accepted": False,
                 "reason": "required image data unavailable",
             },
             "protection_actions": getattr(
@@ -4019,9 +4763,20 @@ def stage8_quality_assessment(
         if baseline_data is not None
         else None
     )
-    if target_type == "large_galaxy" and masks is not None:
-        routed_masks, _ = stage8_large_galaxy_structure_masks(pipeline, masks)
+    if target_type in {
+        "large_galaxy",
+        "emission_nebula",
+        "emission_nebula_widefield",
+        "bright_emission_reflection_nebula",
+    } and masks is not None:
+        routed_masks, _ = stage8_target_structure_masks(pipeline, masks)
         masks = routed_masks
+    outside_target_identity = stage8_outside_target_identity_report(
+        baseline_data,
+        candidate_data,
+        masks,
+        target_type=target_type,
+    )
     baseline_masked_metrics = pipeline._stage8_masked_metrics(baseline_data, masks)
     candidate_masked_metrics = pipeline._stage8_masked_metrics(candidate_data, masks)
     subject_boundary_seam = stage8_subject_boundary_seam_report(
@@ -4031,6 +4786,14 @@ def stage8_quality_assessment(
     )
     pipeline._stage8_subject_boundary_seam_report = dict(
         subject_boundary_seam
+    )
+    frozen_sky_visible_noise = stage8_frozen_sky_visible_noise_report(
+        pipeline,
+        baseline_data,
+        candidate_data,
+    )
+    pipeline._stage8_frozen_sky_visible_noise_report = dict(
+        frozen_sky_visible_noise
     )
 
     saturation_growth = (
@@ -4063,6 +4826,40 @@ def stage8_quality_assessment(
     advisories: List[str] = []
     quality_gates: Dict[str, Dict[str, Any]] = {}
 
+    if not bool(outside_target_identity.get("accepted", False)):
+        issues.append(
+            "outside_target_pixel_identity_gate_failed="
+            + str(outside_target_identity.get("reason") or "unknown")
+        )
+    if bool(outside_target_identity.get("applicable", False)):
+        quality_gates["outside_target_pixel_identity"] = {
+            "value": bool(
+                outside_target_identity.get("exact_pixel_identity", False)
+            ),
+            "accepted_limit": True,
+            "accepted": bool(outside_target_identity.get("accepted", False)),
+            "hard_failed": not bool(
+                outside_target_identity.get("accepted", False)
+            ),
+            "advisory": False,
+        }
+
+    if not bool(frozen_sky_visible_noise.get("accepted", False)):
+        issues.append(
+            "frozen_sky_visible_noise_gate_failed="
+            + str(frozen_sky_visible_noise.get("reason") or "unknown")
+        )
+    if bool(frozen_sky_visible_noise.get("available", False)):
+        growth_value = float(frozen_sky_visible_noise.get("growth", math.inf))
+        growth_limit = float(frozen_sky_visible_noise.get("growth_max", 1.10))
+        quality_gates["frozen_sky_visible_noise_growth"] = {
+            "value": growth_value,
+            "accepted_limit": growth_limit,
+            "accepted": growth_value <= growth_limit,
+            "hard_failed": growth_value > growth_limit,
+            "advisory": False,
+        }
+
     execution_diagnostics = getattr(
         pipeline,
         "_last_stage8_masked_diagnostics",
@@ -4083,7 +4880,7 @@ def stage8_quality_assessment(
         seam_status = str(subject_boundary_seam.get("status") or "unavailable")
         if not bool(subject_boundary_seam.get("available", False)):
             issues.append(
-                "large_galaxy_subject_boundary_gate_unavailable="
+                "subject_boundary_gate_unavailable="
                 + str(subject_boundary_seam.get("reason") or "unknown")
             )
         elif seam_status == "hard_failed":
@@ -4254,6 +5051,8 @@ def stage8_quality_assessment(
         },
         "limited_halo_texture": halo_texture_report,
         "subject_boundary_seam": subject_boundary_seam,
+        "outside_target_identity": outside_target_identity,
+        "frozen_sky_visible_noise": frozen_sky_visible_noise,
         "local_issues": issues,
         "local_advisories": advisories,
         "quality_gates": quality_gates,
@@ -4284,6 +5083,8 @@ def stage8_quality_assessment(
         "large_galaxy_disk": execution_disk_report,
         "limited_halo_texture": halo_texture_report,
         "subject_boundary_seam": subject_boundary_seam,
+        "outside_target_identity": outside_target_identity,
+        "frozen_sky_visible_noise": frozen_sky_visible_noise,
         "protection_actions": getattr(
             pipeline,
             "_last_stage8_masked_diagnostics",
@@ -4317,6 +5118,106 @@ def stage8_conservative_rerun(pipeline, original_saturation: float) -> Dict[str,
         "issues": [],
     }
     try:
+        # A boundary-seam failure is a spatial defect, so a second global
+        # strength reduction cannot improve its boundary/interior ratio.  Reuse
+        # the already verified Stage 8 proposal and attenuate its delta with the
+        # dedicated boundary feather instead.  This is deliberately exclusive:
+        # if the adaptive reprojection still fails, the caller rolls the whole
+        # structural transaction back to stage8_input_starless.
+        initial_assessment = pipeline._stage8_quality_assessment()
+        initial_seam = dict(initial_assessment.get("subject_boundary_seam") or {})
+        if bool(initial_seam.get("seam_detected")):
+            pipeline.cmd_with_check("load", "stage8_input_starless")
+            baseline_data = pipeline.siril.get_image_pixeldata(preview=False)
+            if baseline_data is None:
+                raise RuntimeError("stage8 adaptive boundary baseline is empty")
+            pipeline.cmd_with_check("load", "stage8_enhanced")
+            candidate_data = pipeline.siril.get_image_pixeldata(preview=False)
+            if candidate_data is None:
+                raise RuntimeError("stage8 adaptive boundary candidate is empty")
+            baseline_transaction = np.array(baseline_data, copy=True)
+            candidate_transaction = np.array(candidate_data, copy=True)
+            retry_attempts: List[Dict[str, Any]] = []
+            for retained_delta in (1.0, 0.75, 0.50, 0.25):
+                retry_candidate, retry_projection = (
+                    stage8_subject_boundary_retry_candidate(
+                        pipeline,
+                        baseline_transaction,
+                        candidate_transaction,
+                        seam_report=initial_seam,
+                        retained_delta=retained_delta,
+                    )
+                )
+                pipeline._set_current_image_pixeldata(
+                    retry_candidate,
+                    label=(
+                        "stage8 adaptive subject-boundary retry "
+                        f"retained={retained_delta:.2f}"
+                    ),
+                )
+                pipeline._save_stage_output("stage8_enhanced")
+                assessment = pipeline._stage8_quality_assessment()
+                accepted = bool(
+                    retry_projection.get("accepted", False)
+                    and assessment.get("status") == "ok"
+                )
+                retry_attempts.append(
+                    {
+                        "retained_delta": retained_delta,
+                        "projection": retry_projection,
+                        "assessment": assessment,
+                        "accepted": accepted,
+                    }
+                )
+                if accepted:
+                    pipeline._save_stage_output("stage8_conservative_enhanced")
+                    result.update(
+                        {
+                            "status": "ok",
+                            "mode": "analytic_boundary_retained_delta_search",
+                            "initial_subject_boundary_seam": initial_seam,
+                            "selected_retained_delta": retained_delta,
+                            "retry_projection": retry_projection,
+                            "retry_attempts": retry_attempts,
+                            "assessment": assessment,
+                        }
+                    )
+                    return result
+
+            # The whole ladder belongs to one transaction.  No candidate may
+            # survive a failed gate, and restoring the frozen baseline here
+            # prevents a later handler from observing the last weak retry.
+            pipeline._set_current_image_pixeldata(
+                baseline_transaction,
+                label="stage8 subject-boundary retry exact rollback",
+            )
+            pipeline._save_stage_output("stage8_enhanced")
+            pipeline._save_stage_output("stage8_conservative_enhanced")
+            result.update(
+                {
+                    "status": "poor",
+                    "mode": "analytic_boundary_retained_delta_search",
+                    "initial_subject_boundary_seam": initial_seam,
+                    "retry_attempts": retry_attempts,
+                    "rollback": {
+                        "status": "restored",
+                        "source": "stage8_input_starless",
+                        "pixel_identity": bool(
+                            np.array_equal(
+                                np.asarray(
+                                    pipeline.siril.get_image_pixeldata(
+                                        preview=False
+                                    )
+                                ),
+                                baseline_transaction,
+                            )
+                        ),
+                    },
+                    "assessment": initial_assessment,
+                }
+            )
+            return result
+
         pipeline.cmd_with_check("load", "stage8_input_starless")
         if masked_enhancement_enabled:
             image_data = pipeline.siril.get_image_pixeldata(preview=False)
@@ -4395,7 +5296,7 @@ def stage8_conservative_rerun(pipeline, original_saturation: float) -> Dict[str,
             }
         )
         return result
-    except (CommandError, SirilError) as e:
+    except (CommandError, SirilError, RuntimeError, TypeError, ValueError) as e:
         result["issues"].append(pipeline._short_text(e, 180))
         return result
 

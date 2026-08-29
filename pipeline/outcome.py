@@ -1,7 +1,8 @@
 """Canonical Starun stage and run outcome semantics.
 
-The pipeline writes v2 payloads.  Historical v1 payloads are normalized only
-after their existing manifest hash has been verified by the caller.
+The pipeline writes v2 payloads. Historical v1 and v3 payloads are normalized
+only after their existing manifest hash has been verified by the caller; v3 is
+read-only legacy evidence and can never regain formal-delivery eligibility.
 """
 
 from __future__ import annotations
@@ -12,13 +13,18 @@ from typing import Any, Iterable, Mapping, Sequence
 
 PIPELINE_RESULT_SCHEMA_V1 = "starun.pipeline-result.v1"
 PIPELINE_RESULT_SCHEMA_V2 = "starun.pipeline-result.v2"
+PIPELINE_RESULT_SCHEMA_V3 = "starun.pipeline-result.v3"
 PIPELINE_STAGE_DETAIL_SCHEMA_V1 = "starun.pipeline-stage-detail.v1"
 PIPELINE_STAGE_DETAIL_SCHEMA_V2 = "starun.pipeline-stage-detail.v2"
 RUN_STATE_SCHEMA_V1 = "starun.run-state.v1"
 RUN_STATE_SCHEMA_V2 = "starun.run-state.v2"
 
 SUPPORTED_PIPELINE_RESULT_SCHEMAS = frozenset(
-    {PIPELINE_RESULT_SCHEMA_V1, PIPELINE_RESULT_SCHEMA_V2}
+    {
+        PIPELINE_RESULT_SCHEMA_V1,
+        PIPELINE_RESULT_SCHEMA_V2,
+        PIPELINE_RESULT_SCHEMA_V3,
+    }
 )
 SUPPORTED_RUN_STATE_SCHEMAS = frozenset(
     {RUN_STATE_SCHEMA_V1, RUN_STATE_SCHEMA_V2}
@@ -238,7 +244,7 @@ def _legacy_review_requirements(payload: Mapping[str, Any]) -> list[dict[str, An
 
 
 def normalize_pipeline_result(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Normalize a verified v1/v2 result into the v2 in-memory contract."""
+    """Normalize a verified v1/v2/v3 result into the v2 in-memory contract."""
 
     source_schema = str(payload.get("schema") or "")
     if source_schema not in SUPPORTED_PIPELINE_RESULT_SCHEMAS:
@@ -262,7 +268,10 @@ def normalize_pipeline_result(payload: Mapping[str, Any]) -> dict[str, Any]:
             step.setdefault("issues", [])
             steps.append(step)
     raw_reviews = normalized.get("review_requirements")
-    if source_schema == PIPELINE_RESULT_SCHEMA_V2 and isinstance(raw_reviews, list):
+    if source_schema in {
+        PIPELINE_RESULT_SCHEMA_V2,
+        PIPELINE_RESULT_SCHEMA_V3,
+    } and isinstance(raw_reviews, list):
         reviews = deduplicate_review_requirements(
             value for value in raw_reviews if isinstance(value, Mapping)
         )
@@ -276,9 +285,23 @@ def normalize_pipeline_result(payload: Mapping[str, Any]) -> dict[str, Any]:
     normalized.update(summary)
     normalized["schema"] = PIPELINE_RESULT_SCHEMA_V2
     normalized["source_schema"] = source_schema
-    normalized["legacy_inferred"] = source_schema == PIPELINE_RESULT_SCHEMA_V1
+    normalized["legacy_inferred"] = source_schema != PIPELINE_RESULT_SCHEMA_V2
     normalized["actual_steps"] = steps
     normalized["review_requirements"] = reviews
+    if source_schema == PIPELINE_RESULT_SCHEMA_V3:
+        raw_delivery_gates = normalized.get("delivery_gates")
+        delivery_gates = (
+            deepcopy(dict(raw_delivery_gates))
+            if isinstance(raw_delivery_gates, Mapping)
+            else {}
+        )
+        delivery_gates.update(
+            legacy_delivery_contract=True,
+            formal_delivery_accepted=False,
+        )
+        normalized["delivery_gates"] = delivery_gates
+        normalized["delivery_eligible"] = False
+        normalized["legacy_schema_read_only"] = True
     return normalized
 
 
@@ -361,6 +384,7 @@ __all__ = [
     "FINAL_STATUSES",
     "PIPELINE_RESULT_SCHEMA_V1",
     "PIPELINE_RESULT_SCHEMA_V2",
+    "PIPELINE_RESULT_SCHEMA_V3",
     "PIPELINE_STAGE_DETAIL_SCHEMA_V1",
     "PIPELINE_STAGE_DETAIL_SCHEMA_V2",
     "RUN_STATE_SCHEMA_V1",

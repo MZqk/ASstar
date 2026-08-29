@@ -1,13 +1,16 @@
 """Deterministic, report-only multiscale noise measurements."""
 from __future__ import annotations
 
+import hashlib
+import json
 import math
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional
 
 import numpy as np
 
 
-NOISE_MODEL_SCHEMA = "starun.multiscale-noise-model.v1"
+NOISE_MODEL_SCHEMA = "starun.multiscale-noise-model.v2"
+NOISE_MODEL_VALIDATION_SCHEMA = "starun.multiscale-noise-model-validation.v1"
 DEFAULT_MAX_SIDE = 1024
 DEFAULT_SCALES = (1, 2, 4, 8, 16)
 
@@ -170,6 +173,204 @@ def _signal_noise_curve(
     return curve
 
 
+def noise_model_pixel_sha256(image: Any) -> str:
+    """Return a canonical full-resolution CHW float32 pixel digest."""
+
+    source = _as_chw_view(image)
+    original_dtype = source.dtype
+    canonical = np.ascontiguousarray(source.astype("<f4", copy=True))
+    if np.issubdtype(original_dtype, np.integer):
+        canonical /= max(1.0, float(np.iinfo(original_dtype).max))
+    digest = hashlib.sha256()
+    digest.update(str(tuple(int(value) for value in canonical.shape)).encode("ascii"))
+    digest.update(canonical.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def noise_model_mask_sha256(mask: Any) -> str:
+    """Bind a frozen two-dimensional support mask including its shape."""
+
+    canonical = np.asarray(mask, dtype=bool)
+    if canonical.ndim != 2 or canonical.size == 0:
+        raise ValueError("noise model background mask must be a nonempty 2-D array")
+    packed = np.packbits(
+        np.ascontiguousarray(canonical).reshape(-1),
+        bitorder="little",
+    )
+    digest = hashlib.sha256()
+    digest.update(str(tuple(int(value) for value in canonical.shape)).encode("ascii"))
+    digest.update(packed.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _model_digest_payload(report: Mapping[str, Any]) -> Dict[str, Any]:
+    """Select immutable measurement fields covered by the model digest."""
+
+    return {
+        "schema": report.get("schema"),
+        "source_checkpoint": report.get("source_checkpoint"),
+        "channel_semantics": report.get("channel_semantics"),
+        "input": report.get("input"),
+        "background": report.get("background"),
+        "aggregate": report.get("aggregate"),
+        "scales": report.get("scales"),
+    }
+
+
+def noise_model_digest_sha256(report: Mapping[str, Any]) -> str:
+    """Return the canonical digest for immutable model measurements."""
+
+    encoded = json.dumps(
+        _model_digest_payload(report),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_noise_model_report(
+    report: Any,
+    *,
+    image: Any,
+    background_mask: Any,
+    source_checkpoint: str,
+) -> Dict[str, Any]:
+    """Validate all bindings and every sigma consumed by the denoiser."""
+
+    issues: list[str] = []
+    payload = dict(report) if isinstance(report, Mapping) else {}
+    expected_shape = [int(value) for value in _as_chw_view(image).shape]
+    mask = np.asarray(background_mask, dtype=bool)
+    spatial_shape = tuple(expected_shape[-2:])
+    if mask.shape != spatial_shape:
+        issues.append("background_mask_shape_mismatch")
+    elif int(np.count_nonzero(mask)) < 64:
+        issues.append("background_mask_support_insufficient")
+
+    if payload.get("schema") != NOISE_MODEL_SCHEMA:
+        issues.append("noise_model_schema_mismatch")
+    if str(payload.get("source_checkpoint") or "") != str(source_checkpoint):
+        issues.append("noise_model_source_checkpoint_mismatch")
+
+    input_binding = payload.get("input")
+    if not isinstance(input_binding, Mapping):
+        issues.append("noise_model_input_binding_missing")
+    else:
+        if list(input_binding.get("shape_chw") or []) != expected_shape:
+            issues.append("noise_model_input_shape_mismatch")
+        expected_pixel_sha = str(input_binding.get("pixel_sha256") or "")
+        if (
+            len(expected_pixel_sha) != 64
+            or expected_pixel_sha != noise_model_pixel_sha256(image)
+        ):
+            issues.append("noise_model_input_pixel_sha256_mismatch")
+
+    background_binding = payload.get("background")
+    if not isinstance(background_binding, Mapping):
+        issues.append("noise_model_background_binding_missing")
+    elif mask.shape == spatial_shape:
+        expected_mask_sha = str(background_binding.get("mask_sha256") or "")
+        if (
+            len(expected_mask_sha) != 64
+            or expected_mask_sha != noise_model_mask_sha256(mask)
+        ):
+            issues.append("noise_model_background_mask_sha256_mismatch")
+
+    scales = payload.get("scales")
+    scale_count = len(scales) if isinstance(scales, list) else 0
+    if not isinstance(scales, list) or not scales:
+        issues.append("noise_model_scales_missing")
+    else:
+        channel_count = int(expected_shape[0])
+        seen_equivalent_radii: set[int] = set()
+        for index, scale in enumerate(scales):
+            if not isinstance(scale, Mapping):
+                issues.append(f"noise_model_scale_{index}_invalid")
+                continue
+            try:
+                sample_radius = int(scale.get("radius_pixels_in_sample"))
+                equivalent_radius = int(
+                    scale.get("equivalent_radius_input_pixels")
+                )
+                luma_sigma = float(scale.get("luma_sigma"))
+            except (TypeError, ValueError):
+                issues.append(f"noise_model_scale_{index}_invalid")
+                continue
+            if sample_radius <= 0 or equivalent_radius <= 0:
+                issues.append(f"noise_model_scale_{index}_radius_invalid")
+            if equivalent_radius in seen_equivalent_radii:
+                issues.append(f"noise_model_scale_{index}_radius_duplicate")
+            seen_equivalent_radii.add(equivalent_radius)
+            if not math.isfinite(luma_sigma) or luma_sigma <= 0.0:
+                issues.append(f"noise_model_scale_{index}_luma_sigma_invalid")
+            channel_sigma = scale.get("channel_sigma")
+            channel_sigma_valid = bool(
+                isinstance(channel_sigma, list)
+                and len(channel_sigma) >= channel_count
+            )
+            if channel_sigma_valid:
+                try:
+                    channel_sigma_valid = all(
+                        math.isfinite(float(value)) and float(value) > 0.0
+                        for value in channel_sigma[:channel_count]
+                    )
+                except (TypeError, ValueError):
+                    channel_sigma_valid = False
+            if not channel_sigma_valid:
+                issues.append(f"noise_model_scale_{index}_channel_sigma_invalid")
+            if channel_count >= 3:
+                opponent = scale.get("opponent_sigma")
+                if not isinstance(opponent, Mapping):
+                    issues.append(
+                        f"noise_model_scale_{index}_opponent_sigma_missing"
+                    )
+                else:
+                    for key in ("r_minus_g", "b_minus_g"):
+                        try:
+                            sigma = float(opponent.get(key))
+                        except (TypeError, ValueError):
+                            sigma = float("nan")
+                        if not math.isfinite(sigma) or sigma <= 0.0:
+                            issues.append(
+                                f"noise_model_scale_{index}_{key}_sigma_invalid"
+                            )
+
+    expected_digest = str(payload.get("model_digest_sha256") or "")
+    try:
+        actual_digest = noise_model_digest_sha256(payload)
+    except (TypeError, ValueError):
+        actual_digest = ""
+    if (
+        len(expected_digest) != 64
+        or not actual_digest
+        or expected_digest != actual_digest
+    ):
+        issues.append("noise_model_digest_sha256_mismatch")
+
+    unique_issues = list(dict.fromkeys(issues))
+    return {
+        "schema": NOISE_MODEL_VALIDATION_SCHEMA,
+        "status": "accepted" if not unique_issues else "rejected",
+        "accepted": not unique_issues,
+        "issues": unique_issues,
+        "source_checkpoint": source_checkpoint,
+        "input_pixel_sha256": (
+            (payload.get("input") or {}).get("pixel_sha256")
+            if isinstance(payload.get("input"), Mapping)
+            else None
+        ),
+        "background_mask_sha256": (
+            (payload.get("background") or {}).get("mask_sha256")
+            if isinstance(payload.get("background"), Mapping)
+            else None
+        ),
+        "model_digest_sha256": expected_digest or None,
+        "scale_count": scale_count,
+    }
+
+
 def build_noise_model_report(
     image: Any,
     *,
@@ -177,13 +378,42 @@ def build_noise_model_report(
     channel_semantics: str = "unknown",
     max_side: int = DEFAULT_MAX_SIDE,
     scales: Optional[Iterable[int]] = None,
+    background_mask: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """Measure noise without mutating the supplied image or selecting a denoiser."""
     chw = _as_chw_view(image)
     input_shape = [int(value) for value in chw.shape]
     sampled, sample_step = _bounded_sample(chw, max_side=max_side)
     luma = _luminance(sampled)
-    mask, background = _background_mask(luma)
+    if background_mask is None:
+        mask, background = _background_mask(luma)
+        background["source"] = "candidate_quantile_fallback"
+        background["mask_sha256"] = None
+        background["full_resolution_sample_count"] = None
+    else:
+        full_mask = np.asarray(background_mask, dtype=bool)
+        if full_mask.shape != tuple(input_shape[-2:]):
+            raise ValueError(
+                "noise model background mask shape changed: "
+                f"mask={full_mask.shape}, image={tuple(input_shape[-2:])}"
+            )
+        if int(np.count_nonzero(full_mask)) < 64:
+            raise ValueError("noise model background mask has insufficient support")
+        mask = full_mask[::sample_step, ::sample_step].copy()
+        mask &= np.isfinite(luma)
+        if int(np.count_nonzero(mask)) < 32:
+            raise ValueError(
+                "noise model sampled background mask has insufficient support"
+            )
+        background = {
+            "method": "frozen_stage3_spatial_background_lineage",
+            "source": "stage3_spatial_background_lineage",
+            "fallback_used": False,
+            "sample_count": int(np.count_nonzero(mask)),
+            "coverage": float(np.mean(mask)),
+            "full_resolution_sample_count": int(np.count_nonzero(full_mask)),
+            "mask_sha256": noise_model_mask_sha256(full_mask),
+        }
     radii = _scale_radii(luma.shape, scales or DEFAULT_SCALES)
 
     current_luma = luma.copy()
@@ -200,6 +430,16 @@ def build_noise_model_report(
         channel_detail = current_channels - smoothed_channels
         if first_luma_residual is None:
             first_luma_residual = luma_detail
+        opponent_sigma: Dict[str, float] = {}
+        if channel_detail.shape[0] >= 3:
+            opponent_sigma = {
+                "r_minus_g": _mad_sigma(
+                    (channel_detail[0] - channel_detail[1])[mask]
+                ),
+                "b_minus_g": _mad_sigma(
+                    (channel_detail[2] - channel_detail[1])[mask]
+                ),
+            }
         scale_reports.append(
             {
                 "radius_pixels_in_sample": radius,
@@ -209,6 +449,7 @@ def build_noise_model_report(
                     _mad_sigma(channel_detail[index][mask])
                     for index in range(channel_detail.shape[0])
                 ],
+                "opponent_sigma": opponent_sigma,
                 "background_detail_energy": float(
                     np.mean(np.square(luma_detail[mask], dtype=np.float64))
                 ),
@@ -236,7 +477,7 @@ def build_noise_model_report(
         else "luminance"
     )
 
-    return {
+    report = {
         "schema": NOISE_MODEL_SCHEMA,
         "mode": "report_only",
         "applied_to_pixels": False,
@@ -248,6 +489,7 @@ def build_noise_model_report(
             "sampled_shape_chw": [int(value) for value in sampled.shape],
             "sample_step": sample_step,
             "max_side": int(max_side),
+            "pixel_sha256": noise_model_pixel_sha256(image),
         },
         "background": background,
         "aggregate": {
@@ -269,6 +511,8 @@ def build_noise_model_report(
             "reason": "Batch A records measurements only",
         },
     }
+    report["model_digest_sha256"] = noise_model_digest_sha256(report)
+    return report
 
 
 def _full_float_chw(image: Any) -> tuple[np.ndarray, np.ndarray]:
@@ -304,15 +548,21 @@ def _soft_threshold_multiscale(
     background_mask: np.ndarray,
     *,
     radii: Iterable[int],
+    frozen_sigmas: Iterable[float],
     threshold_multiplier: float,
     strength: float,
 ) -> tuple[np.ndarray, list[Dict[str, Any]]]:
     current = np.asarray(component, dtype=np.float32).copy()
     reports: list[Dict[str, Any]] = []
-    for radius in _scale_radii(component.shape, radii):
+    resolved_radii = _scale_radii(component.shape, radii)
+    resolved_sigmas = [float(value) for value in frozen_sigmas]
+    if len(resolved_sigmas) != len(resolved_radii):
+        raise ValueError("frozen noise model scale count does not match denoiser radii")
+    for radius, sigma in zip(resolved_radii, resolved_sigmas):
+        if not math.isfinite(sigma) or sigma <= 0.0:
+            raise ValueError("frozen noise model sigma must be finite and positive")
         smooth = _box_blur(current, radius)
         detail = current - smooth
-        sigma = _mad_sigma(detail[background_mask])
         threshold = sigma * max(0.0, threshold_multiplier) * strength
         magnitude = np.abs(detail)
         retained = np.maximum(magnitude - threshold, 0.0)
@@ -322,6 +572,7 @@ def _soft_threshold_multiscale(
             {
                 "radius_pixels": radius,
                 "sigma": sigma,
+                "sigma_source": "frozen_multiscale_noise_model",
                 "threshold": threshold,
                 "retained_detail_ratio": float(
                     np.mean(retained[background_mask])
@@ -335,6 +586,9 @@ def _soft_threshold_multiscale(
 def _quality_metrics(
     before: np.ndarray,
     after: np.ndarray,
+    *,
+    background_mask: Optional[np.ndarray] = None,
+    signal_mask: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     before_luma = _luminance(before)
     after_luma = _luminance(after)
@@ -346,8 +600,33 @@ def _quality_metrics(
         float(value)
         for value in np.quantile(values, (0.005, 0.45, 0.70, 0.97, 0.99))
     )
+    background_source = "quantile_fallback"
+    signal_source = "quantile_fallback"
     background = finite & (before_luma >= q005) & (before_luma <= q45)
     signal = finite & (before_luma >= q70) & (before_luma <= q97)
+    if background_mask is not None:
+        frozen_background = np.asarray(background_mask, dtype=bool)
+        if frozen_background.shape != before_luma.shape:
+            raise ValueError(
+                "frozen background mask shape changed: "
+                f"mask={frozen_background.shape}, image={before_luma.shape}"
+            )
+        frozen_background &= finite
+        if int(np.count_nonzero(frozen_background)) < 64:
+            raise ValueError("frozen background mask has insufficient support")
+        background = frozen_background
+        background_source = "stage3_spatial_background_lineage"
+    if signal_mask is not None:
+        frozen_signal = np.asarray(signal_mask, dtype=bool)
+        if frozen_signal.shape != before_luma.shape:
+            raise ValueError(
+                "frozen signal mask shape changed: "
+                f"mask={frozen_signal.shape}, image={before_luma.shape}"
+            )
+        frozen_signal &= finite
+        if int(np.count_nonzero(frozen_signal)) >= 64:
+            signal = frozen_signal
+            signal_source = "stage5_frozen_target_structure"
     bright = finite & (before_luma >= q99)
     if np.count_nonzero(background) < 64:
         background = finite & (before_luma <= q70)
@@ -407,6 +686,8 @@ def _quality_metrics(
         "clip_growth": after_clip - before_clip,
         "background_sample_count": int(np.count_nonzero(background)),
         "signal_sample_count": int(np.count_nonzero(signal)),
+        "background_mask_source": background_source,
+        "signal_mask_source": signal_source,
     }
 
 
@@ -414,9 +695,11 @@ def assess_denoise_candidate(
     before_image: Any,
     after_image: Any,
     *,
-    detail_retention_min: float = 0.82,
-    noise_reduction_min: float = 0.05,
+    detail_retention_min: float = 0.90,
+    noise_reduction_min: float = 0.12,
     chroma_noise_growth_max: float = 1.05,
+    background_mask: Optional[np.ndarray] = None,
+    signal_mask: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """使用同一组指标验收任意 Stage 5 线性降噪候选。"""
     _before_source, before = _full_float_chw(before_image)
@@ -427,7 +710,12 @@ def assess_denoise_candidate(
             f"before={before.shape}, after={after.shape}"
         )
 
-    metrics = _quality_metrics(before, after)
+    metrics = _quality_metrics(
+        before,
+        after,
+        background_mask=background_mask,
+        signal_mask=signal_mask,
+    )
     metrics["finite"] = bool(
         np.all(np.isfinite(np.asarray(after_image)))
     )
@@ -499,6 +787,50 @@ def assess_denoise_candidate(
     }
 
 
+def _frozen_component_sigmas(
+    report: Mapping[str, Any],
+    *,
+    component: str,
+    radii: Iterable[int],
+    image_shape: tuple[int, int],
+) -> tuple[list[float], list[Dict[str, int]]]:
+    """Map requested full-resolution radii to nearest frozen model scales."""
+
+    scale_records = list(report.get("scales") or [])
+    requested_radii = _scale_radii(image_shape, radii)
+    sigmas: list[float] = []
+    mappings: list[Dict[str, int]] = []
+    for radius in requested_radii:
+        selected = min(
+            scale_records,
+            key=lambda record: (
+                abs(
+                    int(record["equivalent_radius_input_pixels"])
+                    - int(radius)
+                ),
+                int(record["equivalent_radius_input_pixels"]),
+            ),
+        )
+        if component == "luma":
+            sigma = float(selected["luma_sigma"])
+        elif component == "red_minus_green":
+            sigma = float(selected["opponent_sigma"]["r_minus_g"])
+        elif component == "blue_minus_green":
+            sigma = float(selected["opponent_sigma"]["b_minus_g"])
+        else:
+            raise ValueError(f"unsupported frozen noise component: {component}")
+        sigmas.append(sigma)
+        mappings.append(
+            {
+                "denoiser_radius_pixels": int(radius),
+                "model_equivalent_radius_input_pixels": int(
+                    selected["equivalent_radius_input_pixels"]
+                ),
+            }
+        )
+    return sigmas, mappings
+
+
 def multiscale_denoise_candidate(
     image: Any,
     *,
@@ -506,13 +838,17 @@ def multiscale_denoise_candidate(
     radii: Iterable[int] = (1, 2, 4),
     luma_threshold_multiplier: float = 1.35,
     chroma_threshold_multiplier: float = 1.90,
-    detail_retention_min: float = 0.82,
-    noise_reduction_min: float = 0.05,
+    detail_retention_min: float = 0.90,
+    noise_reduction_min: float = 0.12,
     chroma_noise_growth_max: float = 1.05,
+    background_mask: Optional[np.ndarray] = None,
+    signal_mask: Optional[np.ndarray] = None,
+    noise_model_report: Optional[Dict[str, Any]] = None,
 ) -> tuple[np.ndarray, Dict[str, Any]]:
     """Build and gate a deterministic linear denoise candidate."""
     source, before = _full_float_chw(image)
     luma = _luminance(before)
+    candidate_radii = tuple(_scale_radii(luma.shape, radii))
     finite_luma = luma[np.isfinite(luma)]
     if finite_luma.size < 128:
         raise ValueError("insufficient image pixels")
@@ -525,41 +861,147 @@ def multiscale_denoise_candidate(
         & (luma >= q005)
         & (luma <= q45)
     )
+    background_source = "quantile_fallback"
+    if background_mask is not None:
+        frozen_background = np.asarray(background_mask, dtype=bool)
+        if frozen_background.shape != luma.shape:
+            raise ValueError(
+                "frozen background mask shape changed: "
+                f"mask={frozen_background.shape}, image={luma.shape}"
+            )
+        frozen_background &= np.isfinite(luma)
+        if int(np.count_nonzero(frozen_background)) < 64:
+            raise ValueError("frozen background mask has insufficient support")
+        background = frozen_background
+        background_source = "stage3_spatial_background_lineage"
     if np.count_nonzero(background) < 64:
         raise ValueError("insufficient background pixels")
+
+    low_noise_probe = assess_denoise_candidate(
+        before,
+        before,
+        detail_retention_min=detail_retention_min,
+        noise_reduction_min=noise_reduction_min,
+        chroma_noise_growth_max=chroma_noise_growth_max,
+        background_mask=(background if background_mask is not None else None),
+        signal_mask=signal_mask,
+    )
+    if low_noise_probe.get("status") == "skipped_low_noise":
+        return _restore_like(source, before), {
+            "schema": "starun.multiscale-denoise-candidate.v1",
+            "status": "skipped_low_noise",
+            "accepted": False,
+            "algorithm": "luma_opponent_chroma_multiscale_soft_threshold",
+            "strength": max(0.10, min(1.0, float(strength))),
+            "radii": list(candidate_radii),
+            "component_scales": {},
+            "metrics": low_noise_probe["metrics"],
+            "limits": low_noise_probe["limits"],
+            "issues": low_noise_probe["issues"],
+            "quality_gate_schema": low_noise_probe["schema"],
+            "frozen_context": {
+                "background_mask_source": background_source,
+                "background_sample_count": int(np.count_nonzero(background)),
+                "noise_model_verified": False,
+                "noise_model_consumed": False,
+                "reason": "verified_low_noise_skip",
+            },
+            "transaction": {
+                "baseline": "stage5_pre_denoise.fit",
+                "candidate": None,
+                "rollback_required_on_rejection": False,
+            },
+        }
+
+    frozen_noise_model = dict(noise_model_report or {})
+    noise_model_validation = validate_noise_model_report(
+        frozen_noise_model,
+        image=before,
+        background_mask=background,
+        source_checkpoint="stage5_pre_denoise.fit",
+    )
+    if noise_model_validation.get("accepted") is not True:
+        raise ValueError(
+            "frozen noise model rejected: "
+            + ",".join(noise_model_validation.get("issues") or ["unknown"])
+        )
+
     safe_strength = max(0.10, min(1.0, float(strength)))
     signal_weight = np.clip(
         (luma - q45) / max(q95 - q45, 1e-6),
         0.0,
         1.0,
     )
-    blend = safe_strength * (1.0 - 0.78 * signal_weight)
+    signal_source = "luminance_quantile"
+    frozen_signal: Optional[np.ndarray] = None
+    if signal_mask is not None:
+        candidate_signal = np.asarray(signal_mask, dtype=bool)
+        if candidate_signal.shape != luma.shape:
+            raise ValueError(
+                "frozen signal mask shape changed: "
+                f"mask={candidate_signal.shape}, image={luma.shape}"
+            )
+        candidate_signal &= np.isfinite(luma)
+        if int(np.count_nonzero(candidate_signal)) >= 64:
+            frozen_signal = candidate_signal
+            feathered_signal = _box_blur(candidate_signal.astype(np.float32), 3)
+            signal_weight = np.maximum(signal_weight, feathered_signal)
+            signal_source = "stage5_frozen_target_structure"
+    blend = safe_strength * (1.0 - 0.92 * signal_weight)
+
+    luma_sigmas, luma_mappings = _frozen_component_sigmas(
+        frozen_noise_model,
+        component="luma",
+        radii=candidate_radii,
+        image_shape=luma.shape,
+    )
 
     filtered_luma, luma_scales = _soft_threshold_multiscale(
         luma,
         background,
-        radii=radii,
+        radii=candidate_radii,
+        frozen_sigmas=luma_sigmas,
         threshold_multiplier=luma_threshold_multiplier,
         strength=safe_strength,
     )
+    for scale_report, mapping in zip(luma_scales, luma_mappings):
+        scale_report.update(mapping)
     component_reports: Dict[str, Any] = {"luma": luma_scales}
     if before.shape[0] >= 3:
         red_green = before[0] - before[1]
         blue_green = before[2] - before[1]
+        red_green_sigmas, red_green_mappings = _frozen_component_sigmas(
+            frozen_noise_model,
+            component="red_minus_green",
+            radii=candidate_radii,
+            image_shape=luma.shape,
+        )
         filtered_rg, rg_scales = _soft_threshold_multiscale(
             red_green,
             background,
-            radii=radii,
+            radii=candidate_radii,
+            frozen_sigmas=red_green_sigmas,
             threshold_multiplier=chroma_threshold_multiplier,
             strength=safe_strength,
+        )
+        for scale_report, mapping in zip(rg_scales, red_green_mappings):
+            scale_report.update(mapping)
+        blue_green_sigmas, blue_green_mappings = _frozen_component_sigmas(
+            frozen_noise_model,
+            component="blue_minus_green",
+            radii=candidate_radii,
+            image_shape=luma.shape,
         )
         filtered_bg, bg_scales = _soft_threshold_multiscale(
             blue_green,
             background,
-            radii=radii,
+            radii=candidate_radii,
+            frozen_sigmas=blue_green_sigmas,
             threshold_multiplier=chroma_threshold_multiplier,
             strength=safe_strength,
         )
+        for scale_report, mapping in zip(bg_scales, blue_green_mappings):
+            scale_report.update(mapping)
         green = filtered_luma - 0.2126 * filtered_rg - 0.0722 * filtered_bg
         filtered = np.stack(
             (green + filtered_rg, green, green + filtered_bg),
@@ -584,6 +1026,8 @@ def multiscale_denoise_candidate(
         detail_retention_min=detail_retention_min,
         noise_reduction_min=noise_reduction_min,
         chroma_noise_growth_max=chroma_noise_growth_max,
+        background_mask=(background if background_mask is not None else None),
+        signal_mask=frozen_signal,
     )
     report = {
         "schema": "starun.multiscale-denoise-candidate.v1",
@@ -591,12 +1035,41 @@ def multiscale_denoise_candidate(
         "accepted": gate["accepted"],
         "algorithm": "luma_opponent_chroma_multiscale_soft_threshold",
         "strength": safe_strength,
-        "radii": [int(value) for value in radii],
+        "radii": list(candidate_radii),
         "component_scales": component_reports,
         "metrics": gate["metrics"],
         "limits": gate["limits"],
         "issues": gate["issues"],
         "quality_gate_schema": gate["schema"],
+        "frozen_context": {
+            "background_mask_source": background_source,
+            "background_sample_count": int(np.count_nonzero(background)),
+            "signal_mask_source": signal_source,
+            "signal_sample_count": int(
+                np.count_nonzero(frozen_signal)
+                if frozen_signal is not None
+                else 0
+            ),
+            "noise_model_schema": frozen_noise_model.get("schema"),
+            "noise_model_source_checkpoint": frozen_noise_model.get(
+                "source_checkpoint"
+            ),
+            "noise_model_scale_count": len(
+                frozen_noise_model.get("scales") or []
+            ),
+            "noise_model_verified": True,
+            "noise_model_consumed": True,
+            "noise_model_input_pixel_sha256": (
+                frozen_noise_model.get("input") or {}
+            ).get("pixel_sha256"),
+            "noise_model_background_mask_sha256": (
+                frozen_noise_model.get("background") or {}
+            ).get("mask_sha256"),
+            "noise_model_digest_sha256": frozen_noise_model.get(
+                "model_digest_sha256"
+            ),
+            "noise_model_validation": noise_model_validation,
+        },
         "transaction": {
             "baseline": "stage5_pre_denoise.fit",
             "candidate": "stage5_multiscale_candidate.fit",
@@ -607,7 +1080,12 @@ def multiscale_denoise_candidate(
 
 
 __all__ = [
+    "NOISE_MODEL_SCHEMA",
     "assess_denoise_candidate",
     "build_noise_model_report",
     "multiscale_denoise_candidate",
+    "noise_model_digest_sha256",
+    "noise_model_mask_sha256",
+    "noise_model_pixel_sha256",
+    "validate_noise_model_report",
 ]

@@ -26,6 +26,7 @@ import syqon_starless
 import stage7_quality
 import stage7_repair
 import stage8_pixels
+import stage8_starless_finish
 import stage9_quality
 from image_metrics import (
     _box_blur_gray,
@@ -1084,12 +1085,40 @@ class StageSupportMixin:
         with source_path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
+        fingerprint = None
+        fingerprint_reader = getattr(self, "_fits_stage_fingerprint", None)
+        if callable(fingerprint_reader):
+            try:
+                fingerprint = fingerprint_reader(source_path)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                fingerprint = None
+        fits_data_sha256 = (
+            str(fingerprint.get("data_sha256") or "") or None
+            if isinstance(fingerprint, dict)
+            else None
+        )
+        try:
+            decoded_pixel_sha256 = (
+                stage8_starless_finish.persisted_fits_decoded_pixel_sha256(
+                    source_path
+                )
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            decoded_pixel_sha256 = None
         return {
             "status": "locked",
             "source_stem": source_stem,
             "path": str(source_path),
             "bytes": int(source_path.stat().st_size),
             "sha256": digest.hexdigest(),
+            "fits_data_sha256": fits_data_sha256,
+            "fits_data_sha256_method": (
+                stage8_starless_finish.FITS_DATA_SHA256_METHOD
+            ),
+            "decoded_pixel_sha256": decoded_pixel_sha256,
+            "decoded_pixel_sha256_method": (
+                stage8_starless_finish.DECODED_PIXEL_SHA256_METHOD
+            ),
         }
 
 
@@ -1106,6 +1135,14 @@ class StageSupportMixin:
         if (
             current.get("sha256") != expected.get("sha256")
             or current.get("bytes") != expected.get("bytes")
+            or current.get("fits_data_sha256")
+            != expected.get("fits_data_sha256")
+            or current.get("decoded_pixel_sha256")
+            != expected.get("decoded_pixel_sha256")
+            or current.get("fits_data_sha256_method")
+            != expected.get("fits_data_sha256_method")
+            or current.get("decoded_pixel_sha256_method")
+            != expected.get("decoded_pixel_sha256_method")
         ):
             return {
                 "status": "rejected",

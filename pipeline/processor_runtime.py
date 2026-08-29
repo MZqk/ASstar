@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 import numpy as np
 
 import cosmic_clarity
+import final_artifact_identity
 import plugin_runner
 import sasp_runner
 import scunet_denoise
@@ -29,6 +30,7 @@ import stage7_quality
 import stage7_repair
 import stage8_pixels
 import outcome
+import presentation_quality
 from channel_semantics import channel_shape_dict, classify_channel_semantics
 from dualband_palette import PALETTE_CHANNELS, resolve_palette_selection
 from input_profile import infer_input_profile
@@ -3317,6 +3319,126 @@ class ProcessorRuntimeMixin:
             failure_reason=failure_reason,
         )
         status = str(outcome_summary["status"])
+        formal_suffixes = {
+            ".fit",
+            ".fits",
+            ".fts",
+            ".tif",
+            ".tiff",
+            ".png",
+        }
+        candidate_formal_output_records = {
+            name: dict(record)
+            for name, record in outputs.items()
+            if Path(str(name)).suffix.lower() in formal_suffixes
+            and "result_review" not in str(name).lower()
+            and not str(name).lower().startswith("result_linear")
+            and isinstance(record, dict)
+            and int(record.get("size") or 0) > 0
+            and len(str(record.get("sha256") or "")) == 64
+        }
+        artifact_identity_report = final_artifact_identity.verify_formal_artifacts(
+            work_dir=Path(self.work_dir),
+            process_dir=(
+                Path(self.process_dir)
+                if getattr(self, "process_dir", None) is not None
+                else None
+            ),
+            outputs=outputs,
+            output_format=getattr(
+                getattr(self, "cfg", None),
+                "output_format",
+                "fit",
+            ),
+            formal_basenames=getattr(
+                self,
+                "_final_output_basenames",
+                (),
+            ),
+        )
+        identity_report_root = (
+            Path(self.process_dir)
+            if getattr(self, "process_dir", None) is not None
+            else Path(self.work_dir)
+        )
+        try:
+            run_manifest.atomic_write_json(
+                identity_report_root / "final_artifact_identity_report.json",
+                artifact_identity_report,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            artifact_identity_report = dict(artifact_identity_report)
+            artifact_identity_report.update(
+                status="rejected",
+                accepted=False,
+                issues=list(artifact_identity_report.get("issues") or [])
+                + [f"identity_report_write_failed:{error}"],
+            )
+        verified_formal_names = set(
+            str(name)
+            for name in artifact_identity_report.get("formal_outputs") or []
+        )
+        formal_output_records = {
+            name: record
+            for name, record in candidate_formal_output_records.items()
+            if name in verified_formal_names
+        }
+        scientific_quality_accepted = bool(
+            getattr(self, "_scientific_quality_accepted", False)
+        )
+        presentation_quality_accepted = bool(
+            getattr(self, "_presentation_quality_accepted", False)
+        )
+        artifact_identity_accepted = bool(
+            artifact_identity_report.get("accepted") is True
+            and formal_output_records
+            and not bool(getattr(self, "_final_output_review_only", False))
+        )
+        formal_delivery_accepted = bool(
+            status in {"success", "partial_success"}
+            and scientific_quality_accepted
+            and presentation_quality_accepted
+            and artifact_identity_accepted
+            and not review_requirements
+            and not bool(outcome_summary.get("review_required", False))
+        )
+        delivery_gates = {
+            "schema": presentation_quality.DELIVERY_GATES_SCHEMA,
+            "legacy_delivery_contract": False,
+            "scientific": {
+                "accepted": scientific_quality_accepted,
+                "report": "final_quality_report.json",
+            },
+            "presentation": {
+                "accepted": presentation_quality_accepted,
+                "report": "presentation_quality_report.json",
+                "status": str(
+                    (
+                        getattr(self, "_presentation_quality_report", {})
+                        or {}
+                    ).get("status", "unavailable")
+                ),
+            },
+            "artifacts": {
+                "accepted": artifact_identity_accepted,
+                "formal_count": len(formal_output_records),
+                "formal_outputs": sorted(formal_output_records),
+                "identity": "stage10_decoded_pixel_chain_v1",
+                "report": "final_artifact_identity_report.json",
+                "source_pixel_sha256": (
+                    (artifact_identity_report.get("source") or {}).get(
+                        "pixel_sha256"
+                    )
+                ),
+                "issues": list(artifact_identity_report.get("issues") or []),
+            },
+            "review": {
+                "accepted": not review_requirements
+                and not bool(outcome_summary.get("review_required", False)),
+                "requirement_count": len(review_requirements),
+            },
+            "formal_delivery_accepted": formal_delivery_accepted,
+        }
         manifest: Dict[str, Any] = {
             "schema": outcome.PIPELINE_RESULT_SCHEMA_V2,
             "run_id": getattr(self, "_run_id", None),
@@ -3452,6 +3574,8 @@ class ProcessorRuntimeMixin:
                 getattr(self, "_stage_policy_events", []) or []
             ),
             "outputs": outputs,
+            "delivery_gates": delivery_gates,
+            "delivery_eligible": formal_delivery_accepted,
             "retention": dict(
                 getattr(self, "_checkpoint_retention_report", {}) or {}
             ),

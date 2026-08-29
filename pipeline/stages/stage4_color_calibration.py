@@ -118,6 +118,8 @@ SPCC_TIMEOUT_MAX_SEC = 300
 SPCC_ONLINE_UNVERIFIED_TIMEOUT_DEFAULT_SEC = 300
 SPCC_ONLINE_UNVERIFIED_TIMEOUT_MIN_SEC = 30
 SPCC_ONLINE_UNVERIFIED_TIMEOUT_MAX_SEC = 300
+SPCC_TRANSIENT_RETRY_TIMEOUT_MAX_SEC = 120
+SPCC_TRANSIENT_RETRY_MAX = 1
 SPCC_ONLINE_CIRCUIT_ENV = "STARUN_STAGE4_SPCC_ONLINE_CIRCUIT_OPEN"
 SPCC_OPERATIONAL_CACHE_ENV = "STARUN_STAGE4_SPCC_OPERATIONAL_CACHE_STATUS"
 SPCC_OPERATIONAL_CACHE_KEY_ENV = "STARUN_STAGE4_SPCC_OPERATIONAL_CACHE_KEY"
@@ -135,6 +137,14 @@ MIN_LOCAL_CATALOG_FILE_BYTES = 1024
 SPCC_IMPRECISE_LOG_MARKERS = (
     "the photometric color calibration seems to have found an imprecise solution",
     "测光法色彩校准似乎不能精确校准",
+)
+SPCC_TRANSIENT_NETWORK_PATTERNS = (
+    re.compile(r"(?:http(?:/\d(?:\.\d)?)?\s*)?(?:408|429|500|502|503|504)\b", re.I),
+    re.compile(r"connection (?:reset|refused|aborted|closed)", re.I),
+    re.compile(r"(?:temporary|transient) (?:network|download|server|catalog)", re.I),
+    re.compile(r"(?:tls|ssl).*(?:eof|handshake|connection|closed)", re.I),
+    re.compile(r"(?:dns|name resolution|resolve host|host lookup)", re.I),
+    re.compile(r"(?:timed out|timeout).*(?:download|http|network|catalog)", re.I),
 )
 SPCC_CAPABILITY_SCHEMA = "starun.stage4-spcc-capabilities.v1"
 RUNTIME_CAPABILITIES_SCHEMA = "starun.runtime-capabilities.v1"
@@ -1455,6 +1465,27 @@ class _Stage4SpccDeviceMetadataMissing(ValueError):
     pass
 
 
+def _stage4_spcc_transient_network_failure(detail: str) -> Optional[str]:
+    """Classify only explicit online transport/server evidence as retryable."""
+
+    normalized = str(detail or "").strip()
+    if not normalized:
+        return None
+    for pattern in SPCC_TRANSIENT_NETWORK_PATTERNS:
+        match = pattern.search(normalized)
+        if match:
+            return match.group(0).strip().lower()
+    return None
+
+
+def _stage4_spcc_retry_delay(pipeline) -> float:
+    try:
+        delay = float(getattr(pipeline.cfg, "retry_delay", 1.0) or 0.0)
+    except (TypeError, ValueError):
+        delay = 1.0
+    return max(0.0, min(delay, 10.0))
+
+
 def _stage4_run_spcc(
     pipeline,
     *,
@@ -1515,6 +1546,11 @@ def _stage4_run_spcc(
         )
         timeout_policy = "online_unverified_cap"
     command = "spcc " + " ".join(args)
+    max_attempts = (
+        1 + SPCC_TRANSIENT_RETRY_MAX
+        if catalog == SPCC_CATALOG
+        else 1
+    )
     attempt: Dict[str, Any] = {
         "label": f"catalog:{catalog}",
         "phase": phase,
@@ -1529,7 +1565,7 @@ def _stage4_run_spcc(
         ),
         "spcc_readiness": spcc_readiness,
         "attempt": 1,
-        "max_attempts": 1,
+        "max_attempts": max_attempts,
         "narrowband": bool(narrowband),
     }
 
@@ -1594,29 +1630,71 @@ def _stage4_run_spcc(
 
     test_runner = getattr(pipeline, "_run_stage4_spcc_once", None)
     if callable(test_runner):
-        try:
-            ok, detail = test_runner(
-                timeout_sec=timeout_sec,
-                catalog=catalog,
-                args=tuple(args),
-                narrowband=bool(narrowband),
+        attempts: List[Dict[str, Any]] = []
+        for attempt_index in range(1, max_attempts + 1):
+            current = dict(attempt)
+            current["attempt"] = attempt_index
+            current_timeout = (
+                timeout_sec
+                if attempt_index == 1
+                else min(timeout_sec, SPCC_TRANSIENT_RETRY_TIMEOUT_MAX_SEC)
             )
-        except (OSError, RuntimeError, TypeError, ValueError) as error:
-            ok, detail = False, str(error)
-        if ok and _stage4_spcc_output_is_imprecise(str(detail)):
-            attempt["precision_warning"] = "spcc_imprecise_solution"
-            attempt["precision_warning_policy"] = (
-                "advisory_only_reduce_downstream_saturation_budget"
+            current["timeout_sec"] = current_timeout
+            if attempt_index > 1:
+                current["timeout_policy"] = "online_transient_retry_cap"
+                current["retry_of_attempt"] = attempt_index - 1
+            try:
+                ok, detail = test_runner(
+                    timeout_sec=current_timeout,
+                    catalog=catalog,
+                    args=tuple(args),
+                    narrowband=bool(narrowband),
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                ok, detail = False, str(error)
+            detail_text = str(detail)
+            timed_out = bool(
+                not ok
+                and re.search(
+                    r"(?:^|\b)(?:timeout|timed out)(?:\b|$)",
+                    detail_text,
+                    re.I,
+                )
             )
-        detail_text = str(detail)
-        timed_out = bool(
-            not ok
-            and re.search(r"(?:^|\b)(?:timeout|timed out)(?:\b|$)", detail_text, re.I)
-        )
-        attempt["status"] = "ok" if ok else "timeout" if timed_out else "failed"
-        if not ok:
-            attempt["error"] = detail_text
-        return bool(ok), detail_text, [attempt]
+            transient = (
+                _stage4_spcc_transient_network_failure(detail_text)
+                if not ok and not timed_out and catalog == SPCC_CATALOG
+                else None
+            )
+            current["status"] = (
+                "ok" if ok else "timeout" if timed_out else "failed"
+            )
+            if ok and _stage4_spcc_output_is_imprecise(detail_text):
+                current["precision_warning"] = "spcc_imprecise_solution"
+                current["precision_warning_policy"] = (
+                    "advisory_only_reduce_downstream_saturation_budget"
+                )
+            if not ok:
+                current["error"] = detail_text
+            if transient:
+                current["failure_class"] = "transient_network"
+                current["transient_evidence"] = transient
+            attempts.append(current)
+            if ok:
+                return True, detail_text, attempts
+            if not transient or attempt_index >= max_attempts:
+                if transient and attempt_index >= max_attempts:
+                    current["reason_code"] = "online_transient_exhausted"
+                return False, detail_text, attempts
+            delay = _stage4_spcc_retry_delay(pipeline)
+            current["retry"] = {
+                "status": "scheduled",
+                "delay_sec": delay,
+                "checkpoint": f"{PCC_CHECKPOINT_STEM}.fit",
+                "candidate_cleanup": "required",
+            }
+            if delay > 0.0:
+                time.sleep(delay)
 
     cli = _stage4_resolve_siril_cli()
     process_dir = Path(getattr(pipeline, "process_dir", "") or "")
@@ -1629,88 +1707,164 @@ def _stage4_run_spcc(
         attempt["error"] = reason
         return False, f"SPCC {phase} failed: {reason}", [attempt]
 
-    script_path = process_dir / ".stage4_spcc_once.ssf"
     candidate_path = process_dir / f"{SPCC_CANDIDATE_STEM}.fit"
-    try:
-        candidate_path.unlink(missing_ok=True)
-        escaped_dir = str(process_dir).replace('"', '\\"')
-        script_path.write_text(
-            "\n".join(
-                (
-                    "requires 1.4.0",
-                    f'cd "{escaped_dir}"',
-                    f"load {PCC_CHECKPOINT_STEM}",
-                    command,
-                    f"save {SPCC_CANDIDATE_STEM}",
-                    "close",
-                )
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-    except OSError as error:
-        attempt["error"] = f"unable to prepare SPCC script: {error}"
-        return False, f"SPCC {phase} failed: {attempt['error']}", [attempt]
-
-    cli_command = [str(cli), "-d", str(process_dir)]
+    checkpoint_path = process_dir / f"{PCC_CHECKPOINT_STEM}.fit"
+    checkpoint_sha256 = _stage4_file_sha256(checkpoint_path)
+    escaped_dir = str(process_dir).replace('"', '\\"')
     ini_path = os.getenv("STARUN_SIRIL_CONFIG", "").strip()
-    if ini_path:
-        cli_command.extend(("-i", ini_path))
-    cli_command.extend(("-s", str(script_path)))
-    attempt["runner"] = "independent_siril_cli"
-    attempt["cli"] = str(cli)
-    pipeline.log.info(
-        "SPCC 单次 "
-        + ("离线" if catalog == SPCC_LOCAL_CATALOG else "在线")
-        + f" Gaia DR3 校色开始（timeout={timeout_sec}s, policy={timeout_policy}）"
-    )
-    try:
-        completed = subprocess.run(
-            cli_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-            timeout=timeout_sec,
-            env=os.environ.copy(),
+    attempts = []
+    for attempt_index in range(1, max_attempts + 1):
+        current = dict(attempt)
+        current["attempt"] = attempt_index
+        current_timeout = (
+            timeout_sec
+            if attempt_index == 1
+            else min(timeout_sec, SPCC_TRANSIENT_RETRY_TIMEOUT_MAX_SEC)
         )
-    except subprocess.TimeoutExpired:
-        attempt.update(status="timeout", error=f"timeout after {timeout_sec}s")
-        pipeline.log.warn(f"SPCC 单次尝试超时（{timeout_sec}s），转 PCC 回退")
-        return False, f"SPCC {phase} timed out after {timeout_sec}s", [attempt]
-    except (OSError, subprocess.SubprocessError) as error:
-        attempt["error"] = str(error)
-        return False, f"SPCC {phase} failed: {error}", [attempt]
-    finally:
+        current["timeout_sec"] = current_timeout
+        current["runner"] = "independent_siril_cli"
+        current["cli"] = str(cli)
+        if attempt_index > 1:
+            current["timeout_policy"] = "online_transient_retry_cap"
+            current["retry_of_attempt"] = attempt_index - 1
+        script_path = process_dir / f".stage4_spcc_attempt_{attempt_index}.ssf"
         try:
-            script_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+            candidate_path.unlink(missing_ok=True)
+            script_path.write_text(
+                "\n".join(
+                    (
+                        "requires 1.4.0",
+                        f'cd "{escaped_dir}"',
+                        f"load {PCC_CHECKPOINT_STEM}",
+                        command,
+                        f"save {SPCC_CANDIDATE_STEM}",
+                        "close",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        except OSError as error:
+            current["error"] = f"unable to prepare SPCC script: {error}"
+            attempts.append(current)
+            return False, f"SPCC {phase} failed: {current['error']}", attempts
 
-    output = completed.stdout or ""
-    output_lines = [line.strip() for line in output.splitlines() if line.strip()]
-    if output_lines:
-        attempt["output_tail"] = " | ".join(output_lines[-8:])
-    if completed.returncode != 0:
-        attempt["error"] = f"siril-cli exit={completed.returncode}"
-        return False, f"SPCC {phase} failed: {attempt['error']}", [attempt]
-    if _stage4_spcc_output_is_imprecise(output):
-        # Siril emits this advisory when either fitted colour-ratio deviation
-        # exceeds 0.1.  It is useful evidence, but not sufficient on its own to
-        # reject a candidate: the caller still measures channel gains,
-        # background chroma, clipping, dynamic range, stellar temperature and
-        # target colour drift against the unchanged pre-colour checkpoint.
-        attempt["precision_warning"] = "spcc_imprecise_solution"
-        attempt["precision_warning_policy"] = (
-            "advisory_only_reduce_downstream_saturation_budget"
+        cli_command = [str(cli), "-d", str(process_dir)]
+        if ini_path:
+            cli_command.extend(("-i", ini_path))
+        cli_command.extend(("-s", str(script_path)))
+        pipeline.log.info(
+            "SPCC "
+            + ("离线" if catalog == SPCC_LOCAL_CATALOG else "在线")
+            + f" Gaia DR3 校色尝试 {attempt_index}/{max_attempts} "
+            + f"（timeout={current_timeout}s, policy={current['timeout_policy']}）"
         )
-    if not candidate_path.is_file() or candidate_path.stat().st_size <= 0:
-        attempt["error"] = "SPCC candidate output missing"
-        return False, f"SPCC {phase} failed: {attempt['error']}", [attempt]
+        try:
+            completed = subprocess.run(
+                cli_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+                timeout=current_timeout,
+                env=os.environ.copy(),
+            )
+        except subprocess.TimeoutExpired:
+            current.update(
+                status="timeout",
+                error=f"timeout after {current_timeout}s",
+            )
+            attempts.append(current)
+            pipeline.log.warn(
+                f"SPCC 尝试超时（{current_timeout}s），转 PCC 回退"
+            )
+            return (
+                False,
+                f"SPCC {phase} timed out after {current_timeout}s",
+                attempts,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            current["error"] = str(error)
+            attempts.append(current)
+            return False, f"SPCC {phase} failed: {error}", attempts
+        finally:
+            try:
+                script_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
-    attempt["status"] = "ok"
-    attempt["output"] = candidate_path.name
-    return True, command, [attempt]
+        output = completed.stdout or ""
+        output_lines = [
+            line.strip() for line in output.splitlines() if line.strip()
+        ]
+        if output_lines:
+            current["output_tail"] = " | ".join(output_lines[-8:])
+        if completed.returncode != 0:
+            current["error"] = f"siril-cli exit={completed.returncode}"
+            transient = (
+                _stage4_spcc_transient_network_failure(output)
+                if catalog == SPCC_CATALOG
+                else None
+            )
+            if transient:
+                current["failure_class"] = "transient_network"
+                current["transient_evidence"] = transient
+            attempts.append(current)
+            if not transient or attempt_index >= max_attempts:
+                if transient and attempt_index >= max_attempts:
+                    current["reason_code"] = "online_transient_exhausted"
+                return (
+                    False,
+                    f"SPCC {phase} failed: {current['error']}",
+                    attempts,
+                )
+
+            recovery: Dict[str, Any] = {
+                "checkpoint": checkpoint_path.name,
+                "checkpoint_sha256": checkpoint_sha256,
+                "candidate_removed": False,
+                "status": "failed",
+            }
+            try:
+                candidate_path.unlink(missing_ok=True)
+                recovery["candidate_removed"] = not candidate_path.exists()
+            except OSError as error:
+                recovery["error"] = str(error)
+            current_checkpoint_sha256 = _stage4_file_sha256(checkpoint_path)
+            if (
+                not checkpoint_sha256
+                or current_checkpoint_sha256 != checkpoint_sha256
+                or not recovery["candidate_removed"]
+            ):
+                recovery["error"] = recovery.get("error") or (
+                    "immutable checkpoint or candidate cleanup verification failed"
+                )
+                current["retry"] = recovery
+                current["reason_code"] = "spcc_retry_checkpoint_verification_failed"
+                return False, f"SPCC {phase} retry recovery failed", attempts
+            delay = _stage4_spcc_retry_delay(pipeline)
+            recovery.update(status="ok", delay_sec=delay)
+            current["retry"] = recovery
+            if delay > 0.0:
+                time.sleep(delay)
+            continue
+
+        if _stage4_spcc_output_is_imprecise(output):
+            current["precision_warning"] = "spcc_imprecise_solution"
+            current["precision_warning_policy"] = (
+                "advisory_only_reduce_downstream_saturation_budget"
+            )
+        if not candidate_path.is_file() or candidate_path.stat().st_size <= 0:
+            current["error"] = "SPCC candidate output missing"
+            attempts.append(current)
+            return False, f"SPCC {phase} failed: {current['error']}", attempts
+
+        current["status"] = "ok"
+        current["output"] = candidate_path.name
+        attempts.append(current)
+        return True, command, attempts
+
+    return False, f"SPCC {phase} exhausted", attempts
 
 
 def _stage4_resolve_siril_cli() -> Optional[Path]:

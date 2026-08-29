@@ -1881,7 +1881,7 @@ class PipelinePluginFallbackRuntimeContractTests(PipelinePluginFallbackTestBase)
         stage3_identity = identity["stage_algorithms"]["stage3_background"]
 
         self.assertEqual(identity["schema"], "starun.software-identity.v1")
-        self.assertEqual(stage3_identity["algorithm_contract_version"], "1.3.0")
+        self.assertEqual(stage3_identity["algorithm_contract_version"], "1.7.0")
         self.assertEqual(len(stage3_identity["source_sha256"]), 64)
         self.assertEqual(
             set(stage3_identity["source_files"]),

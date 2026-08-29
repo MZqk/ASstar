@@ -2,12 +2,17 @@
 """Tests for cross-stage target, color, and denoise safety rules."""
 from __future__ import annotations
 
+import hashlib
+import json
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+
+import numpy as np
+from astropy.io import fits
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +42,8 @@ from pipeline_safety import (  # noqa: E402
 )
 from models import StarSeparationState  # noqa: E402
 import stage5_handoff  # noqa: E402
+import spatial_background_lineage  # noqa: E402
+from stage8_starless_finish import pixel_sha256  # noqa: E402
 from stages.stage7_stretching import run_stage7_stretching  # noqa: E402
 from stages.stage6_star_separation import run_stage6_star_separation  # noqa: E402
 from stages.stage8_nebula_enhancement import run_stage8_nebula_enhancement  # noqa: E402
@@ -65,9 +72,31 @@ class _StarPreservePipeline:
     def __init__(self, process_dir: Path) -> None:
         self.process_dir = process_dir
         self.process_dir.mkdir(parents=True, exist_ok=True)
-        (self.process_dir / "stage5_linear.fit").write_bytes(b"FIT")
-        (self.process_dir / "stage4_color.fit").write_bytes(b"STAGE4")
-        (self.process_dir / "stage5_input_linear.fit").write_bytes(b"STAGE5-INPUT")
+        height, width = 96, 128
+        y, x = np.mgrid[:height, :width]
+        diffuse = 0.04 + 0.12 * np.exp(
+            -(((x - 63.5) / 28.0) ** 2 + ((y - 47.5) / 20.0) ** 2)
+        )
+        self.image_pixels = np.stack(
+            (diffuse * 1.20, diffuse * 0.92, diffuse * 0.75),
+            axis=0,
+        ).astype(np.float32)
+        for row, col in (
+            (20, 25),
+            (20, 102),
+            (35, 55),
+            (35, 72),
+            (60, 55),
+            (60, 72),
+            (75, 25),
+            (75, 102),
+        ):
+            self.image_pixels[:, row, col] = (0.80, 0.75, 0.70)
+        self.saved_image_pixels: dict[str, np.ndarray] = {}
+        self._loaded_source: str | None = None
+        self._seed_image("stage5_linear")
+        self._seed_image("stage4_color")
+        self._seed_image("stage5_input_linear")
         self.cfg = SimpleNamespace(
             stage6_star_preserve_target_bypass_enabled=True,
         )
@@ -88,6 +117,25 @@ class _StarPreservePipeline:
         self._stage8_fallback_used = False
         self._stage9_final_source = ""
         self._review_requirements: dict[tuple[int, str], dict[str, object]] = {}
+        self.target_profile = {
+            "primary_target": {
+                "name": "NGC6910",
+                "type": "open_cluster",
+                "frozen": True,
+            },
+            "secondary_labels": [
+                "bright_core",
+                "large_nebulosity",
+                "emission_red",
+            ],
+        }
+        self.siril = SimpleNamespace(
+            get_image_pixeldata=(
+                lambda preview=False: np.array(self.image_pixels, copy=True)
+            ),
+            set_image_pixeldata=self._set_image_pixeldata,
+        )
+        self._write_spatial_lineage()
         input_lineage = stage5_handoff.freeze_stage5_input_lineage(
             self,
             upstream_loaded=True,
@@ -99,8 +147,158 @@ class _StarPreservePipeline:
             stage_status="ok",
             deconvolution_integrity_ok=True,
             denoise_integrity_ok=True,
+            formal_eligible=True,
             input_lineage=input_lineage,
         )
+
+    def _seed_image(
+        self,
+        stem: str,
+        pixels: np.ndarray | None = None,
+    ) -> None:
+        values = np.array(
+            self.image_pixels if pixels is None else pixels,
+            copy=True,
+        )
+        self.saved_image_pixels[stem] = values
+        (self.process_dir / f"{stem}.fit").write_bytes(b"FIT")
+
+    def _set_image_pixeldata(self, pixels: object) -> None:
+        self.image_pixels = np.asarray(pixels).copy()
+
+    def _set_current_image_pixeldata(
+        self,
+        pixels: object,
+        **_kwargs: object,
+    ) -> None:
+        self._set_image_pixeldata(pixels)
+
+    def _write_spatial_lineage(self) -> None:
+        height, width = self.image_pixels.shape[1:]
+        support = np.ones((height, width), dtype=np.uint8)
+        points = [
+            (
+                (cell_x + 0.5) / 4.0 * (width - 1),
+                (cell_y + 0.5) / 4.0 * (height - 1),
+            )
+            for cell_y in range(4)
+            for cell_x in range(4)
+        ]
+        support_path = (
+            self.process_dir / "stage3_spatial_background_support.fit"
+        )
+        input_path = self.process_dir / "stage3_bg_input.fit"
+        output_path = self.process_dir / "stage3_bgremoved.fit"
+        fits.PrimaryHDU(support).writeto(support_path)
+        fits.PrimaryHDU(self.image_pixels).writeto(input_path)
+        fits.PrimaryHDU(self.image_pixels).writeto(output_path)
+        reference_metrics = (
+            spatial_background_lineage.measure_spatial_background_planes(
+                self.image_pixels,
+                support.astype(bool),
+                points,
+                patch_radius=2,
+            )
+        )
+        reference_plane = {
+            name: {
+                "coefficients": list(component.get("coefficients") or []),
+                "slope_span": component.get("slope_span"),
+                "slope_significance_sigma": component.get(
+                    "slope_significance_sigma"
+                ),
+            }
+            for name, component in reference_metrics.items()
+        }
+        lineage = spatial_background_lineage.seal_lineage({
+            "schema": spatial_background_lineage.LINEAGE_SCHEMA,
+            "status": "accepted",
+            "accepted": True,
+            "review_required": False,
+            "run_id": "pipeline-safety-fixture",
+            "processing_route": "verified_noop",
+            "image_shape": [height, width],
+            "channel_layout": "rgb_chw",
+            "support_artifact": support_path.name,
+            "support_kind": "candidate_independent_full_sky_mask",
+            "support_pixel_count": int(np.count_nonzero(support)),
+            "support_coverage": 1.0,
+            "sample_patch_support_pixel_count": int(
+                np.count_nonzero(
+                    spatial_background_lineage.build_sample_patch_support(
+                        support.shape,
+                        points,
+                        support.astype(bool),
+                        patch_radius=2,
+                    )[0]
+                )
+            ),
+            "sample_patch_min_support_pixel_count": 25,
+            "support_sha256": hashlib.sha256(
+                support_path.read_bytes()
+            ).hexdigest(),
+            "stage3_input_sha256": hashlib.sha256(
+                input_path.read_bytes()
+            ).hexdigest(),
+            "stage3_input_pixel_sha256": (
+                spatial_background_lineage._array_sha256(self.image_pixels)
+            ),
+            "stage3_output_sha256": hashlib.sha256(
+                output_path.read_bytes()
+            ).hexdigest(),
+            "stage3_output_pixel_sha256": (
+                spatial_background_lineage._array_sha256(self.image_pixels)
+            ),
+            "fit_points": [list(point) for point in points[:12]],
+            "validation_points": [list(point) for point in points[12:]],
+            "patch_radius": 2,
+            "reference_metrics": reference_metrics,
+            "reference_plane": {
+                "coordinate_system": "normalized_image_xy",
+                "components": reference_plane,
+                "sha256": spatial_background_lineage._json_sha256(
+                    reference_plane
+                ),
+            },
+            "projection_schema": None,
+            "projection_reason_code": None,
+            "selected_components": [],
+            "unresolved_components": [],
+        })
+        (self.process_dir / "stage3_spatial_background_lineage.json").write_text(
+            json.dumps(lineage),
+            encoding="utf-8",
+        )
+        candidate_path = self.process_dir / "stage7_spatial_reference.fit"
+        fits.PrimaryHDU(self.image_pixels).writeto(candidate_path)
+        spatial = spatial_background_lineage.assess_stage7_spatial_chroma(
+            self.process_dir,
+            self.image_pixels,
+            self.image_pixels,
+            transform_identity={
+                "status": "ok",
+                "method": "synthetic_authenticated_tone",
+                "digest": "pipeline-safety",
+            },
+        )
+        reference = spatial_background_lineage.build_stage7_display_reference(
+            self.process_dir,
+            {
+                "name": "synthetic_pipeline_safety",
+                "file": candidate_path.name,
+                "spatial_chroma_quality": spatial,
+            },
+            {
+                "status": "active",
+                "schema": "starun.stage7-matched-domain-transfer.v4",
+                "method": "synthetic_authenticated_tone",
+                "chain_contract": {"sha256": "pipeline-safety"},
+            },
+        )
+        (
+            self.process_dir
+            / spatial_background_lineage.STAGE7_REFERENCE_NAME
+        ).write_text(json.dumps(reference), encoding="utf-8")
 
     def _clear_stage_reviews(self, stage: int) -> None:
         self._review_requirements = {
@@ -138,15 +336,38 @@ class _StarPreservePipeline:
 
     def cmd_with_check(self, *args: object) -> None:
         self.commands.append(args)
-        if args and args[0] == "save" and len(args) > 1:
-            (self.process_dir / f"{args[1]}.fit").write_bytes(b"FIT")
+        if args and args[0] == "load" and len(args) > 1:
+            stem = str(args[1])
+            source_path = self.process_dir / f"{stem}.fit"
+            pixels = self.saved_image_pixels.get(stem)
+            if not source_path.is_file() or pixels is None:
+                raise CommandError(f"missing image source: {stem}")
+            self.image_pixels = np.array(pixels, copy=True)
+            self._loaded_source = stem
+        elif args and args[0] == "save" and len(args) > 1:
+            self._seed_image(str(args[1]))
 
     def _save_stage_output(self, stem: str) -> bool:
-        (self.process_dir / f"{stem}.fit").write_bytes(b"FIT")
+        if self._loaded_source is None:
+            return False
+        self._seed_image(stem)
         return True
 
+    def _read_image_by_stem(self, stem: str):
+        path = self.process_dir / f"{stem}.fit"
+        pixels = self.saved_image_pixels.get(stem)
+        if not path.is_file() or pixels is None:
+            return None
+        return np.array(pixels, copy=True)
+
+    def _fits_stage_fingerprint(self, path: Path) -> dict[str, str] | None:
+        pixels = self.saved_image_pixels.get(path.stem)
+        if pixels is None:
+            return None
+        return {"data_sha256": pixel_sha256(pixels)}
+
     def _active_target_type(self) -> str:
-        return "globular_cluster"
+        return "open_cluster"
 
     @staticmethod
     def _short_text(value: object, limit: int) -> str:
@@ -279,20 +500,41 @@ class PipelineSafetyTests(unittest.TestCase):
             self.assertFalse(any(command[0] == "script" for command in pipeline.commands))
 
             pipeline.stretched_name = "stage7_stretched"
-            (pipeline.process_dir / "stage7_stretched.fit").write_bytes(b"FIT")
+            pipeline._seed_image("stage7_stretched")
             pipeline._stage7_stretch_accepted = True
             pipeline._stage7_stretch_output = "stage7_stretched"
             run_stage8_nebula_enhancement(pipeline)
 
-            self.assertEqual(pipeline._stage8_final_quality, "star_preserve_bypass")
+            self.assertEqual(
+                pipeline._stage8_final_quality,
+                "star_preserve_secondary_nebulosity",
+            )
             stage8_report = pipeline.reports["stage8_enhancement_report.json"]
-            self.assertEqual(stage8_report["mode"], "star_preserve_target_bypass")
-            self.assertEqual(pipeline.records[-1][1], "skipped")
+            self.assertEqual(
+                stage8_report["mode"],
+                "star_preserve_secondary_nebulosity",
+            )
+            self.assertTrue(
+                stage8_report["secondary_nebulosity_overlay"]["accepted"]
+            )
+            self.assertEqual(
+                stage8_report["handoff"]["processing_route"],
+                "star_preserve_secondary_nebulosity",
+            )
+            self.assertTrue(stage8_report["handoff"]["formal_eligible"])
+            self.assertFalse(stage8_report["handoff"]["restricted_downstream"])
+            self.assertEqual(pipeline.records[-1][1], "ok")
 
             run_stage9_star_remixing(pipeline)
 
             self.assertEqual(pipeline.records[-1][1], "skipped")
-            self.assertEqual(pipeline._stage9_final_source, "stage8_enhanced")
+            self.assertEqual(pipeline._stage9_final_source, "stage9_remixed")
+            self.assertEqual(
+                pipeline._stage9_stars_application_mode,
+                "stars_not_required",
+            )
+            self.assertTrue(pipeline._stage9_remix_formally_accepted)
+            self.assertFalse(pipeline._stage9_output_withheld)
             self.assertTrue((pipeline.process_dir / "stage9_remixed.fit").exists())
 
     def test_target_bypass_rejected_stage7_keeps_with_stars_review_path(self) -> None:
@@ -302,9 +544,7 @@ class PipelineSafetyTests(unittest.TestCase):
             pipeline._stage7_stretch_accepted = False
             pipeline._stage7_stretch_output = None
             pipeline._stage7_review_source = "stage7_review_with_stars"
-            (pipeline.process_dir / "stage7_review_with_stars.fit").write_bytes(
-                b"FIT"
-            )
+            pipeline._seed_image("stage7_review_with_stars")
 
             command_start = len(pipeline.commands)
             run_stage8_nebula_enhancement(pipeline)
@@ -335,8 +575,10 @@ class PipelineSafetyTests(unittest.TestCase):
             self.assertFalse(pipeline._stage9_stars_required)
             self.assertEqual(
                 pipeline._stage9_stars_application_mode,
-                "not_required_star_preserve_review",
+                "with_stars_review_fallback",
             )
+            self.assertTrue(pipeline._stage9_output_contains_stars)
+            self.assertFalse(pipeline._stage9_output_withheld)
             self.assertEqual(pipeline.records[-1][1], "degraded")
 
     def test_target_bypass_rejected_stage7_withholds_when_no_with_stars_source(self) -> None:
@@ -348,20 +590,9 @@ class PipelineSafetyTests(unittest.TestCase):
             pipeline._stage7_review_source = "missing_stage7_review_with_stars"
             pipeline._stage6_passthrough_source = "missing_stage6_passthrough"
             (pipeline.process_dir / "stage6_passthrough.fit").unlink()
-            original_cmd_with_check = pipeline.cmd_with_check
-
-            def checked_cmd_with_check(*args: object) -> None:
-                if args and args[0] == "load" and len(args) > 1:
-                    pipeline.commands.append(args)
-                    source_path = pipeline.process_dir / f"{args[1]}.fit"
-                    if not source_path.exists():
-                        raise CommandError(
-                            f"missing with-stars source: {args[1]}"
-                        )
-                    return
-                original_cmd_with_check(*args)
-
-            pipeline.cmd_with_check = checked_cmd_with_check
+            pipeline.saved_image_pixels.pop("stage6_passthrough", None)
+            (pipeline.process_dir / "stage5_linear.fit").unlink()
+            pipeline.saved_image_pixels.pop("stage5_linear", None)
 
             command_start = len(pipeline.commands)
             run_stage8_nebula_enhancement(pipeline)
@@ -384,11 +615,10 @@ class PipelineSafetyTests(unittest.TestCase):
 
             run_stage9_star_remixing(pipeline)
 
-            self.assertTrue(pipeline._stage9_bypassed_bad_starless)
             self.assertTrue(pipeline._stage9_output_withheld)
             self.assertEqual(
                 pipeline._stage9_stars_application_mode,
-                "with_stars_review_source_unavailable",
+                "withheld_no_with_stars_review_source",
             )
             self.assertEqual(pipeline.records[-1][1], "failed")
             self.assertFalse(
@@ -448,8 +678,10 @@ class PipelineSafetyTests(unittest.TestCase):
             self.assertFalse(pipeline._stage9_stars_applied)
             self.assertEqual(
                 pipeline._stage9_stars_application_mode,
-                "not_applied_star_separation_unavailable",
+                "with_stars_review_fallback",
             )
+            self.assertTrue(pipeline._stage9_output_contains_stars)
+            self.assertFalse(pipeline._stage9_remix_formally_accepted)
             self.assertTrue((pipeline.process_dir / "stage9_remixed.fit").exists())
 
 

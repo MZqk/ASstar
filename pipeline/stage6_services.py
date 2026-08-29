@@ -12,7 +12,7 @@ import time
 import traceback
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -26,6 +26,7 @@ import stage7_quality
 import stage7_repair
 import stage7_stretch_metrics
 import stage8_pixels
+import spatial_background_lineage
 import ui_preview
 from image_metrics import (
     _box_blur_gray,
@@ -494,11 +495,180 @@ def _stage7_matched_domain_transfer_contract(
     selected_method = str(selected.get("method") or "")
     tone_candidate = selected
     tone_candidate_id = selected_name
-    tone_method = str(tone_candidate.get("method") or "")
+    tone_method = selected_method
     calibration = copy.deepcopy(
         (tone_candidate.get("params") or {}).get("calibration") or {}
     )
     calibration_method = str(calibration.get("method") or "")
+    if selected_method == "background_chroma_rescue":
+        selected_params = dict(selected.get("params") or {})
+        parent = dict(selected_params.get("parent_candidate") or {})
+        parent_name = str(parent.get("name") or "")
+        parent_method = str(parent.get("method") or "")
+        parent_params = dict(parent.get("params") or {})
+        mask_contract = dict(selected_params.get("mask_contract") or {})
+        reference = dict(closed_form_mtf_reference or {})
+        active_anchor = dict(reference.get("active_anchor") or {})
+        try:
+            rescue_strength = float(selected_params["strength"])
+        except (KeyError, TypeError, ValueError):
+            rescue_strength = float("nan")
+        mask_sha = str(mask_contract.get("container_sha256") or "")
+        array_sha = str(mask_contract.get("array_sha256") or "")
+        mask_shape = mask_contract.get("shape")
+        try:
+            valid_mask_shape = bool(
+                isinstance(mask_shape, list)
+                and len(mask_shape) == 2
+                and all(int(value) > 0 for value in mask_shape)
+            )
+        except (TypeError, ValueError):
+            valid_mask_shape = False
+        valid_mask_contract = bool(
+            mask_contract.get("schema")
+            == stage7_stretch_metrics.STAGE7_CHROMA_RESCUE_MASK_SCHEMA
+            and str(mask_contract.get("array_key") or "") == "chroma_keep"
+            and Path(str(mask_contract.get("file") or "")).name
+            == str(mask_contract.get("file") or "")
+            and str(mask_contract.get("file") or "").endswith(".npz")
+            and re.fullmatch(r"[0-9a-f]{64}", mask_sha)
+            and re.fullmatch(r"[0-9a-f]{64}", array_sha)
+            and valid_mask_shape
+            and str(mask_contract.get("dtype") or "") == "float32"
+        )
+        if not (
+            parent_name == "cand_b"
+            and parent_method == "linked_mtf"
+            and str(selected.get("calibration_candidate") or "") == "cand_b"
+            and reference.get("status") == "active"
+            and str(active_anchor.get("candidate") or "") == "cand_b"
+            and str(active_anchor.get("method") or "")
+            == "closed_form_linked_mtf"
+            and dict(active_anchor.get("params") or {}) == parent_params
+            and parent_params
+            and math.isfinite(rescue_strength)
+            and 0.10 <= rescue_strength <= 0.90
+            and valid_mask_contract
+        ):
+            return {
+                **base,
+                "method": (
+                    stage7_stretch_metrics.STAGE7_BACKGROUND_CHROMA_RESCUE_METHOD
+                ),
+                "reason": (
+                    "selected background chroma rescue lacks an authenticated "
+                    "cand_b parent or frozen mask contract"
+                ),
+            }
+        rescue_contract = {
+            "strength": rescue_strength,
+            "mask_contract": mask_contract,
+        }
+        chain_contract = (
+            stage7_stretch_metrics.build_matched_domain_chain_contract(
+                [
+                    {
+                        "index": 0,
+                        "method": "closed_form_linked_mtf",
+                        "params": parent_params,
+                    },
+                    {
+                        "index": 1,
+                        "method": "frozen_background_chroma_rescue",
+                        **rescue_contract,
+                    },
+                ]
+            )
+        )
+        return {
+            **base,
+            "schema": (
+                stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V3
+            ),
+            "status": "active",
+            "method": (
+                stage7_stretch_metrics.STAGE7_BACKGROUND_CHROMA_RESCUE_METHOD
+            ),
+            "source": "selected_stage7_background_chroma_rescue",
+            "tone_candidate_id": "cand_b",
+            "parent_candidate_id": "cand_b",
+            "params": parent_params,
+            "rescue": rescue_contract,
+            "chain_contract": chain_contract,
+            "fallback_to_linked_mtf_allowed": False,
+        }
+    if selected_method == "adaptive_quantile":
+        try:
+            validated = (
+                stage7_stretch_metrics.validate_adaptive_quantile_calibration(
+                    calibration
+                )
+            )
+        except (KeyError, TypeError, ValueError, FloatingPointError) as error:
+            return {
+                **base,
+                "schema": (
+                    stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V4
+                ),
+                "method": "linked_piecewise_linear_quantile_curve",
+                "reason": (
+                    "selected adaptive-quantile contract is invalid: "
+                    f"{error}"
+                ),
+            }
+        curve_contract = dict(validated.get("curve_contract") or {})
+        source_binding = dict(validated.get("source_binding") or {})
+        winner_payload = {
+            "schema": stage7_stretch_metrics.ADAPTIVE_QUANTILE_WINNER_SCHEMA,
+            "selected_candidate_id": selected_name,
+            "tone_candidate_id": tone_candidate_id,
+            "candidate_method": selected_method,
+            "transfer_method": "linked_piecewise_linear_quantile_curve",
+            "calibration_sha256": validated.get("calibration_sha256"),
+            "curve_sha256": curve_contract.get("sha256"),
+            "source_binding_sha256": source_binding.get("sha256"),
+        }
+        winner_binding = {
+            **winner_payload,
+            "sha256": stage7_stretch_metrics.canonical_json_sha256(
+                winner_payload
+            ),
+        }
+        chain_contract = (
+            stage7_stretch_metrics.build_matched_domain_chain_contract(
+                [
+                    {
+                        "index": 0,
+                        "method": "linked_piecewise_linear_quantile_curve",
+                        "calibration_schema": calibration.get("schema"),
+                        "calibration_sha256": validated.get(
+                            "calibration_sha256"
+                        ),
+                        "curve_sha256": curve_contract.get("sha256"),
+                        "source_binding_sha256": source_binding.get(
+                            "sha256"
+                        ),
+                        "winner_sha256": winner_binding.get("sha256"),
+                    }
+                ]
+            )
+        )
+        return {
+            **base,
+            "schema": (
+                stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V4
+            ),
+            "status": "active",
+            "method": "linked_piecewise_linear_quantile_curve",
+            "source": "selected_stage7_adaptive_quantile_candidate",
+            "tone_candidate_id": tone_candidate_id,
+            "calibration": calibration,
+            "curve_contract": curve_contract,
+            "source_binding": source_binding,
+            "winner_binding": winner_binding,
+            "chain_contract": chain_contract,
+            "fallback_to_linked_mtf_allowed": False,
+        }
     if (
         selected_method
         == stage7_stretch_metrics.COMPOSITE_TONE_TRANSFER_METHOD
@@ -615,9 +785,9 @@ def _stage7_matched_domain_transfer_contract(
 
     reference = dict(closed_form_mtf_reference or {})
     active_anchor = dict(reference.get("active_anchor") or {})
-    selected_params = dict(selected.get("params") or {})
+    selected_params = dict(tone_candidate.get("params") or {})
     anchor_params = dict(active_anchor.get("params") or {})
-    if selected_name != "cand_b" or selected_method != "linked_mtf":
+    if tone_candidate_id != "cand_b" or tone_method != "linked_mtf":
         return {
             **base,
             "method": selected_method or None,
@@ -650,7 +820,7 @@ def _stage7_matched_domain_transfer_contract(
         "status": "active",
         "method": "closed_form_linked_mtf",
         "source": "selected_candidate_b_closed_form_reference",
-        "tone_candidate_id": selected_name,
+        "tone_candidate_id": tone_candidate_id,
         "params": selected_params,
         "chain_contract": (
             stage7_stretch_metrics.build_matched_domain_chain_contract(
@@ -1409,6 +1579,272 @@ class Stage6ServiceMixin:
         return pixels, pixel_stats
 
 
+    @staticmethod
+    def _stage7_expected_tone_map(
+        candidate: Mapping[str, Any],
+        baseline_image_data: Optional[np.ndarray],
+    ) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+        """Replay an authenticated automatic tone chain for noise accounting."""
+
+        if not isinstance(candidate, Mapping):
+            return None, {
+                "method": None,
+                "status": "unavailable",
+                "reason": "tone-map candidate contract is not a mapping",
+            }
+        method = str(candidate.get("method") or "").strip()
+        params = dict(candidate.get("params") or {})
+        identity: Dict[str, Any] = {
+            "method": method or None,
+            "status": "unavailable",
+            "reason": "authenticated numpy replay is unavailable",
+        }
+        if baseline_image_data is None:
+            identity["reason"] = "baseline pixels unavailable"
+            return None, identity
+        try:
+            source = np.asarray(baseline_image_data)
+            if method in stage7_stretch_metrics.DISPLAY_LUT_METHODS:
+                calibration = dict(params.get("calibration") or {})
+                expected = stage7_stretch_metrics.apply_display90_linked_rgb_stretch(
+                    source,
+                    calibration,
+                )
+                digest = dict(calibration.get("lut_contract") or {}).get("sha256")
+            elif method == stage7_stretch_metrics.COMPOSITE_TONE_TRANSFER_METHOD:
+                calibration = dict(params.get("calibration") or {})
+                expected = stage7_stretch_metrics.apply_composite_tone_transfer(
+                    source,
+                    calibration,
+                )
+                digest = dict(calibration.get("chain_contract") or {}).get("sha256")
+            elif method == "adaptive_quantile":
+                calibration = dict(params.get("calibration") or {})
+                expected = stage7_stretch_metrics.apply_adaptive_quantile_stretch(
+                    source,
+                    calibration,
+                )
+                digest = dict(
+                    calibration.get("curve_contract") or {}
+                ).get("sha256")
+            elif method in {"iterative_masked_mtf", "dual_stage_mtf_ghs"}:
+                calibration = dict(params.get("calibration") or {})
+                expected = stage7_stretch_metrics.apply_conditional_linked_rgb_stretch(
+                    source,
+                    calibration,
+                )
+                digest = dict(calibration.get("lut_contract") or {}).get("sha256")
+            elif method == "linked_mtf":
+                expected = stage7_stretch_metrics.apply_linked_mtf(
+                    source,
+                    shadows=float(params.get("mtf_shadows", 0.0)),
+                    midtones=float(params.get("mtf_midtones", 0.5)),
+                    highlights=float(params.get("mtf_highlights", 1.0)),
+                )
+                digest = hashlib.sha256(
+                    json.dumps(
+                        {
+                            "method": method,
+                            "shadows": params.get("mtf_shadows", 0.0),
+                            "midtones": params.get("mtf_midtones", 0.5),
+                            "highlights": params.get("mtf_highlights", 1.0),
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+            else:
+                return None, identity
+            values = np.asarray(expected)
+            if not np.all(np.isfinite(values)):
+                raise ValueError("authenticated replay produced non-finite pixels")
+            identity.update(
+                status="authenticated",
+                reason=None,
+                digest=str(digest or "") or None,
+            )
+            return values, identity
+        except (KeyError, TypeError, ValueError, FloatingPointError) as error:
+            identity["reason"] = str(error)
+            return None, identity
+
+
+    def _stage7_freeze_presentation_reference(
+        self,
+        selected: Dict[str, Any],
+        *,
+        source_stem: str,
+        matched_domain_transfer: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Persist the accepted Stage 7 pixels as an internal SHA-bound ruler."""
+
+        schema = "starun.stage7-presentation-reference.v1"
+        unavailable: Dict[str, Any] = {
+            "schema": schema,
+            "status": "unavailable",
+            "accepted": False,
+            "reference_only": True,
+            "formal_output": False,
+            "reason_code": "stage7_presentation_reference_unavailable",
+            "source_artifact": {},
+            "artifact": {},
+        }
+        try:
+            if self.process_dir is None:
+                raise ValueError("process directory unavailable")
+            selected_identity = dict(selected.get("artifact_identity") or {})
+            selected_stem = str(selected.get("stem") or "")
+            selected_method = str(selected.get("method") or "")
+            if not selected_stem:
+                raise ValueError("selected Stage7 candidate identity unavailable")
+            current = self.siril.get_image_pixeldata(preview=False)
+            if current is None:
+                raise ValueError("selected Stage7 pixel buffer unavailable")
+            selected_pixel_sha = stage7_stretch_metrics.stage7_pixel_sha256(
+                np.asarray(current)
+            )
+            if (
+                not selected_identity.get("pixel_sha256")
+                or selected_identity.get("pixel_sha256")
+                != selected_pixel_sha
+            ):
+                raise ValueError("selected Stage7 pixel identity mismatch")
+            selected_path = Path(self.process_dir) / f"{selected_stem}.fit"
+            selected_container_sha = self._sha256_file(selected_path)
+            if (
+                not selected_container_sha
+                or selected_container_sha
+                != selected_identity.get("container_sha256")
+            ):
+                raise ValueError("selected Stage7 container identity mismatch")
+
+            profile_name = str(
+                (
+                    (selected.get("adaptation") or {}).get("target_aware")
+                    or {}
+                ).get("name")
+                or ""
+            ).strip().lower()
+            stars_required = profile_name != "star_colour_preserve"
+            matched = dict(matched_domain_transfer or {})
+            if stars_required and matched.get("status") != "active":
+                raise ValueError(
+                    "star-bearing route lacks an active matched-domain contract"
+                )
+            matched_summary = {
+                "schema": matched.get("schema"),
+                "status": matched.get("status"),
+                "method": matched.get("method"),
+                "chain_sha256": (
+                    (matched.get("chain_contract") or {}).get("sha256")
+                ),
+                "winner_sha256": (
+                    (matched.get("winner_binding") or {}).get("sha256")
+                ),
+                "stars_required": stars_required,
+            }
+            if stars_required and not matched_summary.get("chain_sha256"):
+                raise ValueError("matched-domain chain digest unavailable")
+
+            if not self._save_stage_output("stage7_presentation_reference"):
+                raise ValueError("presentation reference FIT save failed")
+            reference_path = (
+                Path(self.process_dir) / "stage7_presentation_reference.fit"
+            )
+            reference_container_sha = self._sha256_file(reference_path)
+            persisted = self._read_image_by_stem(
+                "stage7_presentation_reference"
+            )
+            if persisted is None:
+                raise ValueError("presentation reference FIT reload failed")
+            reference_pixel_sha = (
+                stage7_stretch_metrics.stage7_pixel_sha256(persisted)
+            )
+            if reference_pixel_sha != selected_pixel_sha:
+                raise ValueError("presentation reference pixel identity mismatch")
+            if not reference_container_sha:
+                raise ValueError("presentation reference container hash unavailable")
+
+            linear_source = copy.deepcopy(
+                getattr(self, "_stage7_source_binding", {}) or {}
+            )
+            if (
+                str(linear_source.get("stem") or "") != source_stem
+                or not linear_source.get("pixel_sha256")
+            ):
+                raise ValueError("Stage6 source binding unavailable")
+            selected_summary = {
+                "id": str(selected.get("name") or ""),
+                "method": selected_method,
+                "stem": selected_stem,
+                "file": selected_path.name,
+                "container_sha256": selected_container_sha,
+                "pixel_sha256": selected_pixel_sha,
+            }
+            source_binding_payload = {
+                "linear_source": linear_source,
+                "selected_candidate": selected_summary,
+                "matched_domain": matched_summary,
+            }
+            source_binding_sha = (
+                stage7_stretch_metrics.canonical_json_sha256(
+                    source_binding_payload
+                )
+            )
+            report = {
+                "schema": schema,
+                "status": "ready",
+                "accepted": True,
+                "reference_only": True,
+                "formal_output": False,
+                "reason_code": "stage7_presentation_reference_frozen",
+                "profile": profile_name or None,
+                "source_artifact": selected_summary,
+                "linear_source": linear_source,
+                "selected_candidate": selected_summary,
+                "matched_domain": matched_summary,
+                "artifact": {
+                    "stem": "stage7_presentation_reference",
+                    "file": reference_path.name,
+                    "container_sha256": reference_container_sha,
+                    "pixel_sha256": reference_pixel_sha,
+                    "shape": [int(value) for value in np.asarray(persisted).shape],
+                    "dtype": str(np.asarray(persisted).dtype),
+                },
+                "source_binding_sha256": source_binding_sha,
+            }
+            report["report_sha256"] = (
+                stage7_stretch_metrics.canonical_json_sha256(report)
+            )
+            self._write_stage_json(
+                "stage7_presentation_reference.json",
+                report,
+            )
+            self._stage7_presentation_reference_report = copy.deepcopy(
+                report
+            )
+            return report
+        except (
+            AttributeError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            report = {
+                **unavailable,
+                "reason": self._short_text(error, 200),
+            }
+            self._write_stage_json(
+                "stage7_presentation_reference.json",
+                report,
+            )
+            self._stage7_presentation_reference_report = copy.deepcopy(
+                report
+            )
+            return report
+
+
     def _stage7_evaluate_stretch_candidate(
         self,
         candidate: Dict[str, Any],
@@ -1685,6 +2121,30 @@ class Stage6ServiceMixin:
                 dict(preview_rendition_metrics or {}),
             ),
         }
+        subject_chroma_retention = (
+            stage7_stretch_metrics.assess_subject_chroma_retention(
+                candidate_rendition_metrics,
+                dict(preview_rendition_metrics or {}),
+                self.cfg,
+                profile_name=str(target_stretch.get("name") or ""),
+                channel_semantics=str(
+                    getattr(self, "_channel_semantics", "unknown")
+                    or "unknown"
+                ),
+            )
+        )
+        quality_gates["subject_chroma_retention"] = (
+            subject_chroma_retention
+        )
+        if not bool(subject_chroma_retention.get("accepted", False)):
+            quality_ok = False
+            issues = [
+                *issues,
+                *list(subject_chroma_retention.get("issues") or []),
+            ]
+        advisories.extend(
+            subject_chroma_retention.get("advisories") or []
+        )
         subject_brightness = (
             stage7_stretch_metrics.subject_brightness_selection(
                 candidate_rendition_metrics,
@@ -1896,12 +2356,20 @@ class Stage6ServiceMixin:
         quality_gates["background"] = background_quality_gate.get(
             "quality_gates"
         )
+        expected_tone_map, expected_tone_identity = (
+            self._stage7_expected_tone_map(candidate, baseline_image_data)
+        )
+        parameter_mode = str(
+            ((candidate.get("adaptation") or {}).get("parameter_mode") or "auto")
+        ).strip().lower()
         luma_noise_quality = (
             stage7_stretch_metrics.assess_frozen_background_luma_noise_growth(
                 baseline_image_data,
                 candidate_image_data,
                 frozen_background_masks,
                 self.cfg,
+                expected_candidate=expected_tone_map,
+                transform_identity=expected_tone_identity,
             )
             if baseline_image_data is not None
             and candidate_image_data is not None
@@ -1920,6 +2388,28 @@ class Stage6ServiceMixin:
                 },
             }
         )
+        if expected_tone_map is None and parameter_mode != "manual":
+            luma_noise_quality.update(
+                status="unavailable",
+                accepted=False,
+                gate_semantics="authenticated_transform_unavailable",
+                transform_identity=dict(expected_tone_identity or {}),
+                issues=["background_luma_noise_transform_replay_unavailable"],
+            )
+            luma_noise_quality["quality_gate"] = {
+                "status": "unavailable",
+                "advisory": False,
+                "hard_failed": True,
+                "value": None,
+                "accepted_limit": float(
+                    getattr(
+                        self.cfg,
+                        "stage7_stretch_luma_noise_growth_max",
+                        1.25,
+                    )
+                ),
+                "reason_code": "stage7_tone_map_replay_unavailable",
+            }
         if not bool(luma_noise_quality.get("accepted", False)):
             quality_ok = False
             issues = [
@@ -1930,6 +2420,42 @@ class Stage6ServiceMixin:
         quality_gates["background_luma_noise_growth"] = (
             luma_noise_quality.get("quality_gate")
         )
+        spatial_lineage_path = (
+            Path(self.process_dir) / "stage3_spatial_background_lineage.json"
+            if self.process_dir is not None
+            else None
+        )
+        spatial_chroma_quality = (
+            spatial_background_lineage.assess_stage7_spatial_chroma(
+                self.process_dir,
+                candidate_image_data,
+                expected_tone_map,
+                transform_identity=expected_tone_identity,
+            )
+            if spatial_lineage_path is not None
+            and spatial_lineage_path.is_file()
+            and candidate_image_data is not None
+            else {
+                "schema": spatial_background_lineage.STAGE7_SCHEMA,
+                "status": "not_applicable",
+                "accepted": True,
+                "issues": [],
+                "components": {},
+            }
+        )
+        if not bool(spatial_chroma_quality.get("accepted", False)):
+            quality_ok = False
+            issues = [
+                *issues,
+                *list(spatial_chroma_quality.get("issues") or []),
+            ]
+        quality_gates["spatial_background_chroma"] = {
+            "status": spatial_chroma_quality.get("status"),
+            "hard_failed": not bool(
+                spatial_chroma_quality.get("accepted", False)
+            ),
+            "accepted_limit": 1.25,
+        }
         if not bool(local_quality.get("accepted", True)):
             quality_ok = False
             issues = [*issues, *list(local_quality.get("issues") or [])]
@@ -1956,11 +2482,43 @@ class Stage6ServiceMixin:
             starless_structure_quality.get("risk_score", 0.0) or 0.0
         )
         candidate_saved = self._save_stage_output(stem)
+        candidate_path = (
+            Path(self.process_dir) / f"{stem}.fit"
+            if candidate_saved and self.process_dir is not None
+            else None
+        )
+        artifact_identity = {
+            "stem": stem if candidate_saved else None,
+            "file": f"{stem}.fit" if candidate_saved else None,
+            "container_sha256": (
+                self._sha256_file(candidate_path)
+                if candidate_path is not None
+                else None
+            ),
+            "pixel_sha256": (
+                stage7_stretch_metrics.stage7_pixel_sha256(
+                    candidate_image_data
+                )
+                if candidate_image_data is not None
+                else None
+            ),
+            "shape": (
+                [int(value) for value in np.asarray(candidate_image_data).shape]
+                if candidate_image_data is not None
+                else None
+            ),
+            "dtype": (
+                str(np.asarray(candidate_image_data).dtype)
+                if candidate_image_data is not None
+                else None
+            ),
+        }
         attempt = {
             **common,
             "file": f"{stem}.fit" if candidate_saved else None,
             "stem": stem if candidate_saved else None,
             "status": "ok" if candidate_saved else "failed",
+            "artifact_identity": artifact_identity,
             "used": used_or_error,
             "quality_ok": quality_ok,
             "diagnostics": issues,
@@ -1976,6 +2534,7 @@ class Stage6ServiceMixin:
             "pixel_stats": pixel_stats,
             "preview_retention": preview_retention,
             "rendition_metrics": rendition_metrics,
+            "subject_chroma_retention": subject_chroma_retention,
             "subject_brightness_selection": subject_brightness,
             "visibility_gate": visibility_gate,
             "preview_target_attainment": preview_target_attainment,
@@ -1988,6 +2547,7 @@ class Stage6ServiceMixin:
             "starless_structure_quality": starless_structure_quality,
             "background_quality_gate": background_quality_gate,
             "luma_noise_quality": luma_noise_quality,
+            "spatial_chroma_quality": spatial_chroma_quality,
             "transform_loss": transform_loss,
             "transform_loss_gate": transform_loss_gate,
             "risk_score": risk_score,
@@ -4560,6 +5120,57 @@ class Stage6ServiceMixin:
                     (masks.get("coverage") or {}).get("faint_nebula", 0.0)
                 ),
             },
+            "_chroma_keep": np.asarray(chroma_keep, dtype=np.float32),
+        }
+
+
+    def _stage7_persist_chroma_rescue_mask(
+        self,
+        rescue_name: str,
+        chroma_keep: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Persist and bind the exact spatial mask needed for Stage9 replay."""
+
+        if self.process_dir is None:
+            raise ValueError("Stage7 process directory is unavailable")
+        safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", str(rescue_name))
+        if not safe_name:
+            raise ValueError("Stage7 chroma-rescue mask name is unavailable")
+        values = np.ascontiguousarray(np.asarray(chroma_keep), dtype="<f4")
+        if (
+            values.ndim != 2
+            or values.size == 0
+            or not np.all(np.isfinite(values))
+            or np.any(values < 0.0)
+            or np.any(values > 1.0)
+        ):
+            raise ValueError("Stage7 chroma-rescue mask is invalid")
+        mask_path = (
+            Path(self.process_dir) / f"stage7_{safe_name}_chroma_keep.npz"
+        )
+        temporary_path = mask_path.with_suffix(".npz.tmp")
+        try:
+            with temporary_path.open("wb") as handle:
+                np.savez_compressed(handle, chroma_keep=values)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, mask_path)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+        container_sha = self._sha256_file(mask_path)
+        if not container_sha:
+            raise ValueError("Stage7 chroma-rescue mask hash is unavailable")
+        return {
+            "schema": stage7_stretch_metrics.STAGE7_CHROMA_RESCUE_MASK_SCHEMA,
+            "file": mask_path.name,
+            "array_key": "chroma_keep",
+            "container_sha256": container_sha,
+            "array_sha256": (
+                stage7_stretch_metrics.stage7_float_array_sha256(values)
+            ),
+            "shape": [int(value) for value in values.shape],
+            "dtype": str(values.dtype),
         }
 
 
@@ -6031,6 +6642,9 @@ class Stage6ServiceMixin:
         self,
         baseline_image_data: Optional[np.ndarray],
         stretch_adaptation: Dict[str, Any],
+        *,
+        frozen_background_masks: Optional[Dict[str, Any]] = None,
+        preview_rendition_metrics: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         """Build the deterministic last-resort curve from measured quantiles."""
         if baseline_image_data is None:
@@ -6043,6 +6657,21 @@ class Stage6ServiceMixin:
             baseline_image_data,
             stretch_adaptation,
             self.cfg,
+            source_stem=str(
+                getattr(self, "_stage7_stretch_source", None)
+                or "stage6_starless"
+            ),
+            frozen_masks=frozen_background_masks,
+            linked_preview=preview_rendition_metrics,
+            profile_name=str(
+                (
+                    stretch_adaptation.get("target_aware") or {}
+                ).get("name")
+                or ""
+            ),
+            channel_semantics=str(
+                getattr(self, "_channel_semantics", "unknown") or "unknown"
+            ),
         )
         if calibration.get("status") != "ok":
             return None, calibration
@@ -6078,6 +6707,12 @@ class Stage6ServiceMixin:
         self._stage7_revoked_pair_id = None
         self._stage7_last_composite_tone_execution = {}
         self._stage7_frozen_rendition_masks = {}
+        self._stage7_source_binding = {}
+        self._stage7_presentation_reference_report = {
+            "schema": "starun.stage7-presentation-reference.v1",
+            "status": "not_run",
+            "accepted": False,
+        }
         self._stage7_stretch_fallback_reason = None
         self._stage7_review_source = None
         self._stage7_background_color_review_required = False
@@ -6124,6 +6759,35 @@ class Stage6ServiceMixin:
         source_pixel_domain = dict(
             baseline_pixel_stats.get("pixel_domain") or {}
         )
+        source_artifact_path = None
+        if self.process_dir is not None:
+            for suffix in (".fit", ".fits"):
+                candidate_path = Path(self.process_dir) / f"{source_stem}{suffix}"
+                if candidate_path.is_file():
+                    source_artifact_path = candidate_path
+                    break
+        self._stage7_source_binding = {
+            "stem": source_stem,
+            "file": (
+                source_artifact_path.name
+                if source_artifact_path is not None
+                else None
+            ),
+            "container_sha256": (
+                self._sha256_file(source_artifact_path)
+                if source_artifact_path is not None
+                else None
+            ),
+            "pixel_sha256": (
+                stage7_stretch_metrics.stage7_pixel_sha256(
+                    baseline_image_data
+                )
+            ),
+            "shape": [
+                int(value) for value in np.asarray(baseline_image_data).shape
+            ],
+            "dtype": str(np.asarray(baseline_image_data).dtype),
+        }
         messages.append(
             "stage7 pixel domain canonicalized "
             f"source_dtype={source_pixel_domain.get('source_dtype', 'unknown')} "
@@ -6190,6 +6854,8 @@ class Stage6ServiceMixin:
                             "nebula_mask",
                             "faint_nebula_mask",
                             "galaxy_signal_mask",
+                            "limited_core_exclusion_mask",
+                            "star_halo_guard_mask",
                         }
                     }
                     subject_layers = [
@@ -6418,6 +7084,8 @@ class Stage6ServiceMixin:
                 "stage7_cand_*.fit",
                 "stage7_with_stars_hdr*.fit",
                 "stage7_preview_ref.fit",
+                "stage7_presentation_reference.fit",
+                "stage7_presentation_reference.json",
                 "stage7_selected*.fit",
                 "stage7_stretched.fit",
             ):
@@ -6952,6 +7620,8 @@ class Stage6ServiceMixin:
                 self._stage7_quantile_fallback_candidate(
                     baseline_image_data,
                     stretch_adaptation,
+                    frozen_background_masks=frozen_background_masks,
+                    preview_rendition_metrics=preview_rendition_metrics,
                 )
             )
             stretch_adaptation["quantile_fallback"] = quantile_calibration
@@ -7051,6 +7721,19 @@ class Stage6ServiceMixin:
                                     strength=rescue_strength,
                                     frozen_masks=frozen_background_masks,
                                 )
+                            )
+                            rescue_chroma_keep = np.asarray(
+                                rescue_adaptation.pop("_chroma_keep"),
+                                dtype=np.float32,
+                            )
+                            rescue_mask_contract = (
+                                self._stage7_persist_chroma_rescue_mask(
+                                    rescue_name,
+                                    rescue_chroma_keep,
+                                )
+                            )
+                            rescue_adaptation["mask_contract"] = dict(
+                                rescue_mask_contract
                             )
                             self._set_current_image_pixeldata(
                                 rescued_data,
@@ -7325,12 +8008,23 @@ class Stage6ServiceMixin:
                             quality_gates["background"] = (
                                 background_quality_gate.get("quality_gates")
                             )
+                            (
+                                rescue_expected_tone_map,
+                                rescue_expected_tone_identity,
+                            ) = self._stage7_expected_tone_map(
+                                rescue_root_candidate,
+                                baseline_image_data,
+                            )
                             luma_noise_quality = (
                                 stage7_stretch_metrics.assess_frozen_background_luma_noise_growth(
                                     baseline_image_data,
                                     rescued_image_data,
                                     frozen_background_masks,
                                     self.cfg,
+                                    expected_candidate=rescue_expected_tone_map,
+                                    transform_identity=(
+                                        rescue_expected_tone_identity
+                                    ),
                                 )
                                 if baseline_image_data is not None
                                 else {
@@ -7366,6 +8060,51 @@ class Stage6ServiceMixin:
                             quality_gates[
                                 "background_luma_noise_growth"
                             ] = luma_noise_quality.get("quality_gate")
+                            spatial_lineage_path = (
+                                Path(self.process_dir)
+                                / "stage3_spatial_background_lineage.json"
+                                if self.process_dir is not None
+                                else None
+                            )
+                            spatial_chroma_quality = (
+                                spatial_background_lineage.assess_stage7_spatial_chroma(
+                                    self.process_dir,
+                                    rescued_image_data,
+                                    rescue_expected_tone_map,
+                                    transform_identity=(
+                                        rescue_expected_tone_identity
+                                    ),
+                                )
+                                if spatial_lineage_path is not None
+                                and spatial_lineage_path.is_file()
+                                else {
+                                    "schema": spatial_background_lineage.STAGE7_SCHEMA,
+                                    "status": "not_applicable",
+                                    "accepted": True,
+                                    "issues": [],
+                                    "components": {},
+                                }
+                            )
+                            if not bool(
+                                spatial_chroma_quality.get("accepted", False)
+                            ):
+                                quality_ok = False
+                                issues = [
+                                    *issues,
+                                    *list(
+                                        spatial_chroma_quality.get("issues")
+                                        or []
+                                    ),
+                                ]
+                            quality_gates["spatial_background_chroma"] = {
+                                "status": spatial_chroma_quality.get("status"),
+                                "hard_failed": not bool(
+                                    spatial_chroma_quality.get(
+                                        "accepted", False
+                                    )
+                                ),
+                                "accepted_limit": 1.25,
+                            }
                             if not bool(local_quality.get("accepted", True)):
                                 quality_ok = False
                                 issues = [
@@ -7552,6 +8291,46 @@ class Stage6ServiceMixin:
                                     )
                                 ),
                             }
+                            subject_chroma_retention = (
+                                stage7_stretch_metrics.assess_subject_chroma_retention(
+                                    candidate_rendition_metrics,
+                                    dict(preview_rendition_metrics or {}),
+                                    self.cfg,
+                                    profile_name=str(
+                                        target_stretch.get("name") or ""
+                                    ),
+                                    channel_semantics=str(
+                                        getattr(
+                                            self,
+                                            "_channel_semantics",
+                                            "unknown",
+                                        )
+                                        or "unknown"
+                                    ),
+                                )
+                            )
+                            quality_gates["subject_chroma_retention"] = (
+                                subject_chroma_retention
+                            )
+                            if not bool(
+                                subject_chroma_retention.get(
+                                    "accepted", False
+                                )
+                            ):
+                                quality_ok = False
+                                issues = [
+                                    *issues,
+                                    *list(
+                                        subject_chroma_retention.get(
+                                            "issues"
+                                        )
+                                        or []
+                                    ),
+                                ]
+                            advisories.extend(
+                                subject_chroma_retention.get("advisories")
+                                or []
+                            )
                             subject_brightness = (
                                 stage7_stretch_metrics.subject_brightness_selection(
                                     candidate_rendition_metrics,
@@ -7576,6 +8355,38 @@ class Stage6ServiceMixin:
                                     "stage7_subject_brightness_floor_unmet",
                                 ]
                             rescue_saved = self._save_stage_output(rescue_stem)
+                            rescue_path = (
+                                Path(self.process_dir) / f"{rescue_stem}.fit"
+                                if rescue_saved and self.process_dir is not None
+                                else None
+                            )
+                            rescue_artifact_identity = {
+                                "stem": rescue_stem if rescue_saved else None,
+                                "file": (
+                                    f"{rescue_stem}.fit"
+                                    if rescue_saved
+                                    else None
+                                ),
+                                "container_sha256": (
+                                    self._sha256_file(rescue_path)
+                                    if rescue_path is not None
+                                    else None
+                                ),
+                                "pixel_sha256": (
+                                    stage7_stretch_metrics.stage7_pixel_sha256(
+                                        rescued_image_data
+                                    )
+                                ),
+                                "shape": [
+                                    int(value)
+                                    for value in np.asarray(
+                                        rescued_image_data
+                                    ).shape
+                                ],
+                                "dtype": str(
+                                    np.asarray(rescued_image_data).dtype
+                                ),
+                            }
                             rescue_attempt = {
                                 "name": rescue_name,
                                 "file": f"{rescue_stem}.fit" if rescue_saved else None,
@@ -7585,9 +8396,29 @@ class Stage6ServiceMixin:
                                     "source_candidate": rescue_source,
                                     "frozen_source": source_stem,
                                     "strength": rescue_strength,
+                                    "parent_candidate": {
+                                        "name": str(
+                                            rescue_source_attempt.get("name")
+                                            or ""
+                                        ),
+                                        "method": str(
+                                            rescue_source_attempt.get("method")
+                                            or ""
+                                        ),
+                                        "params": copy.deepcopy(
+                                            rescue_source_attempt.get("params")
+                                            or {}
+                                        ),
+                                    },
+                                    "mask_contract": dict(
+                                        rescue_mask_contract
+                                    ),
                                 },
                                 "adaptation": rescue_adaptation,
                                 "status": "ok" if rescue_saved else "failed",
+                                "artifact_identity": (
+                                    rescue_artifact_identity
+                                ),
                                 "used": (
                                     "replayed from frozen source then applied "
                                     "background-only luminance-preserving chroma rescue"
@@ -7600,6 +8431,9 @@ class Stage6ServiceMixin:
                                     )
                                 ),
                                 "quality_gates": quality_gates,
+                                "spatial_chroma_quality": (
+                                    spatial_chroma_quality
+                                ),
                                 "metrics": quality_metrics_dict or None,
                                 "adaptive_metrics": (
                                     self._adaptive_features_from_image(
@@ -7611,6 +8445,9 @@ class Stage6ServiceMixin:
                                 "pixel_stats": pixel_stats,
                                 "preview_retention": preview_retention,
                                 "rendition_metrics": rendition_metrics,
+                                "subject_chroma_retention": (
+                                    subject_chroma_retention
+                                ),
                                 "subject_brightness_selection": (
                                     subject_brightness
                                 ),
@@ -7989,6 +8826,36 @@ class Stage6ServiceMixin:
         self._stage7_matched_domain_transfer = copy.deepcopy(
             matched_domain_transfer
         )
+        stage7_spatial_reference: Dict[str, Any] = {
+            "schema": spatial_background_lineage.STAGE7_REFERENCE_SCHEMA,
+            "status": "not_applicable",
+            "accepted": True,
+            "issues": [],
+        }
+        stage3_spatial_lineage_path = (
+            Path(self.process_dir) / "stage3_spatial_background_lineage.json"
+            if self.process_dir is not None
+            else None
+        )
+        if (
+            best_attempt is not None
+            and stage3_spatial_lineage_path is not None
+            and stage3_spatial_lineage_path.is_file()
+        ):
+            stage7_spatial_reference = (
+                spatial_background_lineage.build_stage7_display_reference(
+                    self.process_dir,
+                    best_attempt,
+                    matched_domain_transfer,
+                    stars_required=not bool(
+                        getattr(self, "_star_preserve_target_bypass", False)
+                    ),
+                )
+            )
+            self._write_stage_json(
+                spatial_background_lineage.STAGE7_REFERENCE_NAME,
+                stage7_spatial_reference,
+            )
         selection_summary = {
             "strategy": "hard_gate_then_quality_rank_with_safe_review",
             "ranking_policy": STAGE7_CANDIDATE_RANKING_POLICY,
@@ -8022,7 +8889,8 @@ class Stage6ServiceMixin:
                 self._stage7_forced_delivery_reasons
             ),
             "technical_floor": (
-                "finite_shape_dynamic_range_clip_core_structure_and_curve_contract"
+                "finite_shape_dynamic_range_clip_core_structure_frozen_chroma_"
+                "absolute_visible_noise_and_curve_contract"
             ),
             "matched_domain_transfer_method": matched_domain_transfer.get(
                 "method"
@@ -8093,6 +8961,7 @@ class Stage6ServiceMixin:
                 "stretch_adaptation": stretch_adaptation,
                 "closed_form_mtf_reference": closed_form_mtf_reference,
                 "matched_domain_transfer": matched_domain_transfer,
+                "spatial_background_reference": stage7_spatial_reference,
                 "attempts": attempts,
                 "selected": best_attempt,
                 "galaxy_roi": copy.deepcopy(
@@ -8128,6 +8997,7 @@ class Stage6ServiceMixin:
                     {
                         "name": item.get("name"),
                         "file": item.get("file"),
+                        "artifact_identity": item.get("artifact_identity"),
                         "method": item.get("method"),
                         "params": item.get("params"),
                         "adaptation": item.get("adaptation"),
@@ -8137,6 +9007,9 @@ class Stage6ServiceMixin:
                         "visibility_gate": item.get("visibility_gate"),
                         "preview_target_attainment": item.get("preview_target_attainment"),
                         "rendition_metrics": item.get("rendition_metrics"),
+                        "subject_chroma_retention": item.get(
+                            "subject_chroma_retention"
+                        ),
                         "presentation_score": item.get("presentation_score"),
                         "presentation_score_v6": item.get(
                             "presentation_score_v6"
@@ -8241,6 +9114,34 @@ class Stage6ServiceMixin:
             return False, False, messages, ""
 
         self.cmd_with_check("load", str(best_attempt["stem"]))
+        presentation_reference = self._stage7_freeze_presentation_reference(
+            best_attempt,
+            source_stem=source_stem,
+            matched_domain_transfer=matched_domain_transfer,
+        )
+        if not bool(presentation_reference.get("accepted", False)):
+            reason = str(
+                presentation_reference.get("reason")
+                or presentation_reference.get("reason_code")
+                or "unavailable"
+            )
+            messages.append(
+                "stage7 presentation reference freeze failed: "
+                f"{self._short_text(reason, 180)}"
+            )
+            self._require_review(
+                7,
+                "stage7_presentation_reference_unavailable",
+            )
+            try:
+                self.cmd_with_check("load", source_stem)
+            except (CommandError, SirilError):
+                pass
+            return False, False, messages, ""
+        messages.append(
+            "stage7_presentation_reference=ready "
+            f"pixel_sha256={str((presentation_reference.get('artifact') or {}).get('pixel_sha256') or '')[:12]}"
+        )
         self.log.info(
             "[Stage7] selected="
             f"{best_attempt.get('name')} risk={best_attempt.get('risk_score')}"

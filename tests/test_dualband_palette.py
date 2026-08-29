@@ -226,12 +226,29 @@ class DualbandPaletteCandidateTests(unittest.TestCase):
         candidate, report = build_dualband_palette_candidate(
             image,
             palette="SHO",
+            subject_chroma_separation_gain_min=-1.0,
+            subject_saturation_input_ratio_min=0.10,
+            subject_saturation_absolute_min=0.01,
             **masks,
         )
 
         np.testing.assert_array_equal(image, original)
         self.assertFalse(np.shares_memory(candidate, image))
-        self.assertTrue(report["accepted"], report)
+        self.assertFalse(report["accepted"], report)
+        self.assertEqual(
+            report["limits"][
+                "subject_background_chroma_separation_gain_min_exclusive"
+            ],
+            1.0e-4,
+        )
+        self.assertEqual(
+            report["limits"]["subject_saturation_input_ratio_min"],
+            0.50,
+        )
+        self.assertEqual(
+            report["limits"]["subject_saturation_absolute_min"],
+            0.08,
+        )
         self.assertEqual(report["role"], "artistic_false_color")
         self.assertTrue(report["synthetic_sii"])
         self.assertEqual(report["formula"]["mode"], "regular")
@@ -253,6 +270,88 @@ class DualbandPaletteCandidateTests(unittest.TestCase):
         )
         background = masks["background_mask"] >= 0.80
         np.testing.assert_array_equal(candidate[:, background], image[:, background])
+        json.dumps(report)
+
+    def test_candidate_preserves_core_star_and_halo_guards_exactly(self) -> None:
+        image, masks = self._fixture()
+        star = np.zeros_like(masks["core_mask"])
+        halo = np.zeros_like(star)
+        star[28:33, 30:35] = 1.0
+        halo[25:36, 27:38] = 1.0
+
+        candidate, report = build_dualband_palette_candidate(
+            image,
+            palette="HOO",
+            star_mask=star,
+            star_halo_guard_mask=halo,
+            **masks,
+        )
+
+        protected = (
+            np.maximum.reduce((masks["core_mask"], star, halo))
+            >= 1.0 - 1e-6
+        )
+        np.testing.assert_array_equal(candidate[:, protected], image[:, protected])
+        self.assertEqual(
+            report["mask_contract"]["guard_sources"],
+            ["core_mask", "star_mask", "star_halo_guard_mask"],
+        )
+
+    def test_candidate_rejects_nonpositive_subject_background_chroma_gain(
+        self,
+    ) -> None:
+        height, width = 64, 96
+        image = np.full((3, height, width), 0.2, dtype=np.float32)
+        subject = np.zeros((height, width), dtype=np.float32)
+        subject[16:48, 24:72] = 1.0
+        background = 1.0 - subject
+
+        _candidate, report = build_dualband_palette_candidate(
+            image,
+            palette="SHO",
+            core_mask=np.zeros_like(subject),
+            nebula_mask=subject,
+            faint_nebula_mask=np.zeros_like(subject),
+            background_mask=background,
+        )
+
+        self.assertFalse(report["accepted"], report)
+        self.assertIn(
+            "subject_background_chroma_separation_gain_unmet",
+            report["issues"],
+        )
+        self.assertTrue(
+            report["metrics"]["subject_saturation_p50_floor_passed"]
+        )
+        self.assertEqual(
+            report["subject_chroma_closure"]["selected_scale"],
+            1.40,
+        )
+        json.dumps(report)
+
+    def test_candidate_uses_weakest_bounded_subject_chroma_closure(self) -> None:
+        image, masks = self._fixture()
+
+        _candidate, report = build_dualband_palette_candidate(
+            image,
+            palette="HOO",
+            **masks,
+        )
+
+        closure = report["subject_chroma_closure"]
+        self.assertLessEqual(closure["selected_scale"], 1.40)
+        self.assertEqual(closure["scope"], "frozen_subject_mask_only")
+        self.assertEqual(closure["selection"], "weakest_passing_scale")
+        attempts = closure["attempts"]
+        self.assertGreaterEqual(len(attempts), 1)
+        if report["accepted"]:
+            self.assertTrue(attempts[-1]["clears_chroma_contract"])
+            self.assertTrue(
+                report["metrics"][
+                    "subject_background_chroma_separation_gain"
+                ]
+                > 1.0e-4
+            )
         json.dumps(report)
 
     def test_quality_excess_within_fifty_percent_is_warning_only(self) -> None:

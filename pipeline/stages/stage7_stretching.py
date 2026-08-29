@@ -1,13 +1,91 @@
 """Stretch selection and execution."""
 import copy
-from typing import List
+from pathlib import Path
+from typing import Any, Dict, List
+
+import numpy as np
 
 import display_rendition
 from managed_output import audit_display_visibility
 from models import PipelineStage, StarSeparationState
 import scene_support
 from sirilpy.exceptions import CommandError, SirilError
+import stage7_stretch_metrics
 import syqon_starless
+
+
+def _bind_stage7_formal_presentation_reference(
+    pipeline,
+    output_stem: str,
+) -> Dict[str, Any]:
+    """Bind the frozen internal ruler to the canonical formal Stage 7 FIT."""
+
+    report = copy.deepcopy(
+        getattr(pipeline, "_stage7_presentation_reference_report", {}) or {}
+    )
+    if report.get("status") != "ready" or not report.get("accepted"):
+        return report
+    try:
+        if pipeline.process_dir is None:
+            raise ValueError("process directory unavailable")
+        output_path = Path(pipeline.process_dir) / f"{output_stem}.fit"
+        container_sha = pipeline._sha256_file(output_path)
+        pixels = pipeline.siril.get_image_pixeldata(preview=False)
+        if not container_sha or pixels is None:
+            raise ValueError("formal Stage7 artifact identity unavailable")
+        pixel_sha = stage7_stretch_metrics.stage7_pixel_sha256(
+            np.asarray(pixels)
+        )
+        reference_pixel_sha = str(
+            (report.get("artifact") or {}).get("pixel_sha256") or ""
+        )
+        if not reference_pixel_sha or pixel_sha != reference_pixel_sha:
+            raise ValueError("formal Stage7 pixels differ from frozen reference")
+        formal_source = {
+            "stem": output_stem,
+            "file": output_path.name,
+            "container_sha256": container_sha,
+            "pixel_sha256": pixel_sha,
+        }
+        report["source_artifact"] = formal_source
+        binding_payload = {
+            "linear_source": report.get("linear_source"),
+            "selected_candidate": report.get("selected_candidate"),
+            "matched_domain": report.get("matched_domain"),
+            "formal_source_artifact": formal_source,
+        }
+        report["source_binding_sha256"] = (
+            stage7_stretch_metrics.canonical_json_sha256(binding_payload)
+        )
+        unsigned = dict(report)
+        unsigned.pop("report_sha256", None)
+        report["report_sha256"] = (
+            stage7_stretch_metrics.canonical_json_sha256(unsigned)
+        )
+        pipeline._write_stage_json(
+            "stage7_presentation_reference.json",
+            report,
+        )
+        pipeline._stage7_presentation_reference_report = copy.deepcopy(
+            report
+        )
+        return report
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+        report.update(
+            status="unavailable",
+            accepted=False,
+            reason_code="stage7_formal_source_binding_failed",
+            reason=pipeline._short_text(error, 180),
+        )
+        report.pop("report_sha256", None)
+        pipeline._write_stage_json(
+            "stage7_presentation_reference.json",
+            report,
+        )
+        pipeline._stage7_presentation_reference_report = copy.deepcopy(
+            report
+        )
+        return report
 
 
 def _run_with_stars_review_stretch(
@@ -31,15 +109,6 @@ def _run_with_stars_review_stretch(
     review_reason = str(
         reason_code or f"star_separation_{separation_state}"
     )
-    preserve_frozen_bright_core_source = bool(
-        source_stem == "stage6_input"
-        and review_reason
-        in {
-            "bright_core_starless_rejected_after_recovery",
-            "stage4_bright_core_color_integrity_unresolved",
-            "stage7_bright_core_integrity_rejected",
-        }
-    )
     pipeline._stage7_stretch_accepted = False
     pipeline._stage7_stretch_output = None
     pipeline._stage7_stretch_forced_delivery = False
@@ -48,6 +117,11 @@ def _run_with_stars_review_stretch(
     pipeline._stage7_background_color_review_gate = {
         "status": "not_run",
         "requires_review": False,
+    }
+    pipeline._stage7_presentation_reference_report = {
+        "schema": "starun.stage7-presentation-reference.v1",
+        "status": "not_run",
+        "accepted": False,
     }
     pipeline._stage7_review_source = None
     display_contract = {}
@@ -66,23 +140,11 @@ def _run_with_stars_review_stretch(
     saved = False
     try:
         pipeline.cmd_with_check("load", source_stem)
-        if preserve_frozen_bright_core_source:
-            messages.append(
-                "strict bright-core review source preserved without Siril "
-                "autostretch; observer mapping is frozen separately"
-            )
-        else:
-            try:
-                pipeline.cmd_with_check("autostretch", "-linked")
-                messages.append(
-                    "linked autostretch applied for non-strict review preview"
-                )
-            except (CommandError, SirilError) as error:
-                pipeline.cmd_with_check("load", source_stem)
-                messages.append(
-                    "review autostretch failed; retained linear passthrough: "
-                    f"{pipeline._short_text(error, 160)}"
-                )
+        messages.append(
+            "trusted with-stars review FITS preserved without Siril autostretch; "
+            "the linked observer mapping is frozen separately for previews and "
+            "the Stage10 catalog audit"
+        )
         saved = pipeline._save_stage_output("stage7_review_with_stars")
         if saved:
             pipeline.stretched_name = "stage7_review_with_stars"
@@ -272,6 +334,11 @@ def run_stage7_stretching(pipeline) -> None:
     pipeline._stage7_background_color_review_gate = {
         "status": "not_run",
         "requires_review": False,
+    }
+    pipeline._stage7_presentation_reference_report = {
+        "schema": "starun.stage7-presentation-reference.v1",
+        "status": "not_run",
+        "accepted": False,
     }
     stretched = False
     stage_degraded = False
@@ -511,6 +578,40 @@ def run_stage7_stretching(pipeline) -> None:
     pipeline.stretched_name = "stage7_stretched"
     # 拉伸后必须保存，后续 Stage8/9 需要按名加载。
     stage_saved = pipeline._save_stage_output(pipeline.stretched_name) if stretched else False
+    presentation_reference = (
+        _bind_stage7_formal_presentation_reference(
+            pipeline,
+            pipeline.stretched_name,
+        )
+        if stage_saved
+        else dict(
+            getattr(
+                pipeline,
+                "_stage7_presentation_reference_report",
+                {},
+            )
+            or {}
+        )
+    )
+    presentation_contract_required = bool(
+        presentation_reference.get("status") != "not_run"
+    )
+    presentation_reference_ready = bool(
+        not presentation_contract_required
+        or (
+            presentation_reference.get("status") == "ready"
+            and presentation_reference.get("accepted") is True
+        )
+    )
+    if stage_saved and not presentation_reference_ready:
+        pipeline._require_review(
+            7,
+            "stage7_presentation_reference_unavailable",
+        )
+        messages.append(
+            "Stage7 formal source was saved but its presentation reference "
+            "binding failed; formal acceptance withheld"
+        )
     # A degraded result remains unsafe unless the stretch service explicitly
     # marks it as a rescue that re-passed every Stage 7 quality gate.
     validated_rescue = bool(
@@ -527,6 +628,7 @@ def run_stage7_stretching(pipeline) -> None:
     pipeline._stage7_stretch_accepted = bool(
         stretched
         and stage_saved
+        and presentation_reference_ready
         and (not stage_degraded or validated_rescue)
         and not forced_delivery
     )
@@ -580,7 +682,7 @@ def run_stage7_stretching(pipeline) -> None:
     )
     elapsed = pipeline.log.stage_end(stage_label)
     message_text = "；".join(messages)
-    if stretched and stage_saved:
+    if stretched and stage_saved and pipeline._stage7_stretch_accepted:
         status = 'degraded' if forced_delivery else (
             'degraded' if stage_degraded and not validated_rescue else 'ok'
         )
@@ -614,6 +716,7 @@ def run_stage7_stretching(pipeline) -> None:
             },
             details={
                 "background_color_review_gate": background_color_review_gate,
+                "presentation_reference": presentation_reference,
                 "background_color_review_required": bool(
                     getattr(
                         pipeline,
@@ -638,6 +741,27 @@ def run_stage7_stretching(pipeline) -> None:
                     )
                     or {}
                 ),
+            },
+            review_reasons=pipeline._stage_review_reasons(7),
+        )
+    elif stretched and stage_saved and not presentation_reference_ready:
+        if message_text:
+            message_text = (
+                f"{message_text}；Stage7 表现参照或正式源绑定失败，"
+                "仅允许复核"
+            )
+        else:
+            message_text = "Stage7 表现参照或正式源绑定失败，仅允许复核"
+        pipeline._record_stage(
+            stage_label,
+            "degraded",
+            elapsed,
+            message_text,
+            execution="safe_passthrough",
+            reason_code="stage7_presentation_reference_unavailable",
+            details={
+                "background_color_review_gate": background_color_review_gate,
+                "presentation_reference": presentation_reference,
             },
             review_reasons=pipeline._stage_review_reasons(7),
         )

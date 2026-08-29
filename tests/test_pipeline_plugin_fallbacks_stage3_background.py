@@ -1,5 +1,8 @@
 """Pipeline/plugin fallback tests for stage3 background."""
 
+import copy
+import math
+
 from tests.pipeline_plugin_fallbacks_support import *  # noqa: F401,F403
 
 
@@ -15,6 +18,184 @@ def _accepted_stage3_pixel_gate(*_args: Any, **kwargs: Any):
         "profile": profile,
         "effective_thresholds": {"profile": profile},
     }
+
+
+def _stage3_recovery_sample_reports(*, height: int = 512, width: int = 640):
+    points = [
+        (
+            (cell_x + fraction) / 4.0 * (width - 1),
+            (cell_y + fraction) / 4.0 * (height - 1),
+        )
+        for cell_y in range(4)
+        for cell_x in range(4)
+        for fraction in (0.30, 0.70)
+    ]
+    sources = [
+        "regular_grid" if index % 2 == 0 else "dark_patch_refinement"
+        for index in range(len(points))
+    ]
+    shared = {
+        "valid_mask": "applied",
+        "saturation_map": "applied",
+        "star_catalog": "applied",
+    }
+    masks = {
+        "source_mask_fraction": 0.34,
+        "usable_sky_fraction": 0.60,
+    }
+    mask_evidence = {
+        "applied_to_sampling": True,
+        "usable_sky_fraction": 0.60,
+    }
+    thresholds = {
+        "brightness_quantile_max": 0.70,
+        "texture_quantile_max": 0.55,
+    }
+    full_sky_support = np.ones((height, width), dtype=bool)
+    base = {
+        "status": "insufficient_safe_coverage",
+        "sample_count": 0,
+        "selected_candidate_count": 9,
+        "safe_candidate_count": 9,
+        "minimum_count": 12,
+        "coverage": {
+            "quadrants": 4,
+            "grid_cells": 7,
+            "available_grid_cells": 7,
+            "x_span_ratio": 0.90,
+            "y_span_ratio": 0.65,
+        },
+        "masks": masks,
+        "mask_evidence": mask_evidence,
+        "shared_scene_support": shared,
+        "thresholds": thresholds,
+        "selected_samples": [],
+        "rejection_counts": {"shared_catalog_star": 190},
+        "candidate_independent_sky_support": {
+            "status": "available",
+            "pixel_count": height * width,
+            "coverage": 1.0,
+        },
+        "_candidate_independent_sky_support_mask": full_sky_support,
+    }
+    refined = {
+        **base,
+        "status": "ready",
+        "sample_count": len(points),
+        "selected_candidate_count": len(points),
+        "safe_candidate_count": 83,
+        "coverage": {
+            "quadrants": 4,
+            "grid_cells": 16,
+            "available_grid_cells": 16,
+            "x_span_ratio": 0.90,
+            "y_span_ratio": 0.84,
+        },
+        "selected_candidate_sources": {
+            "regular_grid": 16,
+            "dark_patch_refinement": 16,
+        },
+        "selected_samples": [
+            {
+                "point": list(point),
+                "source": source,
+                "grid_cell": [0, 0],
+            }
+            for point, source in zip(points, sources)
+        ],
+    }
+    return points, base, refined
+
+
+def _stage3_dense_recovery_sample_reports(*, height: int = 512, width: int = 640):
+    points, base, refined = _stage3_recovery_sample_reports(
+        height=height,
+        width=width,
+    )
+    base = copy.deepcopy(base)
+    refined = copy.deepcopy(refined)
+    base.update(
+        candidate_count=240,
+        base_candidate_count=240,
+        rejection_counts={"shared_catalog_star": 235, "exclusion_masked": 5},
+    )
+    base["masks"] = {
+        "source_mask_fraction": 0.42805,
+        "usable_sky_fraction": 0.5670248,
+    }
+    base["mask_evidence"] = {
+        "applied_to_sampling": True,
+        "usable_sky_fraction": 0.3637058,
+        "strict_unmasked_sky_fraction": 0.3637058,
+        "nonstellar_sky_fraction": 0.5670248,
+        "layers": {
+            "scene_support_stars": {
+                "available": True,
+                "applied": True,
+                "pixel_fraction": 0.4592845,
+                "method": "scene_support_catalog_2_5x_fwhm",
+            }
+        },
+    }
+    refined.update(
+        masks=copy.deepcopy(base["masks"]),
+        mask_evidence={
+            **copy.deepcopy(base["mask_evidence"]),
+            "usable_sky_fraction": 0.5670248,
+            "effective_usable_sky_fraction": 0.5670248,
+            "effective_definition": (
+                "nonstellar_sky_with_catalog_points_masked_in_sample_statistics"
+            ),
+            "masked_catalog_statistics": {
+                "schema_version": "starun.stage3-dense-star-sampling.v1",
+                "minimum_patch_support_fraction": 0.80,
+                "support_mask_sha256": "support-sha",
+                "catalog_mask_sha256": "catalog-sha",
+                "siril_recalculate": False,
+            },
+        },
+        base_candidate_count=400,
+        candidate_count=400,
+        masked_catalog_statistics=True,
+        dense_star_masked_sampling={
+            "schema_version": "starun.stage3-dense-star-sampling.v1",
+            "status": "ready",
+            "minimum_patch_support_fraction": 0.80,
+            "selected_support_fraction_min": 0.81,
+            "siril_recalculate": False,
+        },
+        _masked_pixel_support_mask=np.ones((height, width), dtype=bool),
+    )
+    refined["selected_samples"] = [
+        {
+            "point": list(point),
+            "source": source,
+            "grid_cell": [
+                min(3, int(point[0] * 4 / width)),
+                min(3, int(point[1] * 4 / height)),
+            ],
+            "sample_size": 25,
+            "masked_support_count": 510,
+            "masked_support_fraction": 0.816,
+            "shared_star_fraction": 0.12,
+            "compact_source_fraction": 0.064,
+            "point_source_mask_fraction": 0.184,
+            "hard_exclusion_fraction": 0.0,
+            "channel_count": 1,
+            "channel_medians": [0.055],
+            "native_luminance_mean": 0.055,
+            "native_luminance_min": 0.040,
+            "native_luminance_max": 0.070,
+        }
+        for point, source in zip(
+            points,
+            (
+                "regular_grid" if index % 2 == 0 else "dark_patch_refinement"
+                for index in range(len(points))
+            ),
+        )
+    ]
+    return points, base, refined
 
 
 class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase):
@@ -996,6 +1177,16 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
                     },
                 ),
             ),
+            patch.object(
+                stage3_module,
+                "_stage3_write_spatial_background_lineage",
+                return_value={
+                    "status": "accepted",
+                    "accepted": True,
+                    "review_required": False,
+                    "issues": [],
+                },
+            ),
         ):
             stage3_module.run_stage3_background_extraction(processor)
         background_attempts = [
@@ -1117,9 +1308,9 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
         self.assertIsNone(processor.report["fallback_reason"])
         self.assertEqual(
             processor.report["schema_version"],
-            "starun.stage3-background-quality.v5",
+            "starun.stage3-background-quality.v9",
         )
-        self.assertEqual(processor.report["algorithm_contract_version"], "1.3.0")
+        self.assertEqual(processor.report["algorithm_contract_version"], "1.7.0")
         self.assertIn("spatial_coverage", processor.report["decision_thresholds"])
         self.assertEqual(processor.report["selection"]["status"], "ready")
         self.assertTrue(
@@ -1152,6 +1343,406 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
         self.assertEqual(processor.results[-1][1], "ok")
         self.assertFalse(processor.result_metadata[-1]["fallback_used"])
         self.assertTrue(processor.report["backup_used"])
+
+    def test_stage3_diffuse_sample_recovery_uses_strict_polynomial_only(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        processor = Stage3CompoundFake(external_success=True)
+        processor.cfg.stage3_gate_profile = "output_first"
+        processor.target_profile = {
+            "target_type": "emission_nebula_widefield",
+            "object_stats": {
+                "object_area_ratio": 0.30,
+                "nebulosity_area_ratio": 0.42,
+            },
+        }
+        processor.pipeline_policy["stage3_background"] = {
+            "protect_nebulosity": True,
+            "reject_samples_on_nebula": True,
+        }
+        processor.metrics["polynomial"].update(
+            gradient_score=0.02,
+            dirty_background_score=0.12,
+            chroma_noise_score=0.02,
+        )
+        points, base_report, refined_report = _stage3_recovery_sample_reports()
+
+        with (
+            patch.object(
+                stage3_module,
+                "build_safe_background_samples",
+                side_effect=[([], base_report), (points, refined_report)],
+            ),
+            patch.object(
+                stage3_module,
+                "analyze_directional_pattern_noise",
+                return_value={
+                    "status": "ok",
+                    "detected": False,
+                    "pattern_score": 0.05,
+                    "walking_noise_score": 0.04,
+                },
+            ),
+            patch.object(
+                stage3_module,
+                "_stage3_theoretical_plugin_candidates",
+                return_value=[("mock-graxpert", ("gxp",), "graxpert")],
+            ),
+        ):
+            stage3_module.run_stage3_background_extraction(processor)
+
+        subsky_calls = [
+            call for call in processor.cmd_calls if call and call[0] == "subsky"
+        ]
+        self.assertEqual(subsky_calls, [("subsky", "1", "-existing")])
+        self.assertFalse(any(call[0] == "gxp" for call in processor.cmd_calls))
+        self.assertEqual(processor.report["configured_gate_profile"], "output_first")
+        self.assertEqual(processor.report["effective_gate_profile"], "strict")
+        self.assertEqual(
+            processor.report["builtin_order_reason"],
+            "conservative_sample_recovery_polynomial_degree_1_only",
+        )
+        self.assertEqual(
+            processor.report["compound_fallback"]["status"],
+            "not_required",
+        )
+        self.assertEqual(
+            processor.report["safe_samples"]["recovery"]["status"],
+            "applied",
+        )
+        self.assertTrue(
+            processor.report["safe_samples"]["fit_validation_split"]
+            ["regular_validation_ready"]
+        )
+        self.assertEqual(
+            processor.report["reason_code"],
+            "stage3_safe_sample_recovery_applied",
+        )
+        self.assertEqual(processor.results[-1][1], "ok")
+
+    def test_stage3_dense_star_recovery_uses_masked_bg_samples(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        processor = Stage3CompoundFake(external_success=True)
+        processor.cfg.stage3_gate_profile = "output_first"
+        processor.target_profile = {
+            "target_type": "emission_nebula_widefield",
+            "object_stats": {
+                "object_area_ratio": 0.30,
+                "nebulosity_area_ratio": 0.42,
+            },
+        }
+        processor.pipeline_policy["stage3_background"] = {
+            "protect_nebulosity": True,
+            "reject_samples_on_nebula": True,
+        }
+        processor.metrics["polynomial"].update(
+            gradient_score=0.02,
+            dirty_background_score=0.12,
+            chroma_noise_score=0.02,
+        )
+        points, base_report, refined_report = (
+            _stage3_dense_recovery_sample_reports()
+        )
+
+        with (
+            patch.object(
+                stage3_module,
+                "build_safe_background_samples",
+                side_effect=[([], base_report), (points, refined_report)],
+            ) as sample_builder,
+            patch.object(
+                stage3_module,
+                "analyze_directional_pattern_noise",
+                return_value={
+                    "status": "ok",
+                    "detected": False,
+                    "pattern_score": 0.05,
+                    "walking_noise_score": 0.04,
+                },
+            ),
+            patch.object(
+                stage3_module,
+                "_stage3_theoretical_plugin_candidates",
+                return_value=[("mock-graxpert", ("gxp",), "graxpert")],
+            ),
+        ):
+            stage3_module.run_stage3_background_extraction(processor)
+
+        self.assertEqual(sample_builder.call_count, 2)
+        self.assertFalse(
+            sample_builder.call_args_list[0].kwargs["candidate_refinement"]
+        )
+        self.assertTrue(
+            sample_builder.call_args_list[1].kwargs[
+                "masked_catalog_statistics"
+            ]
+        )
+        self.assertEqual(
+            [call for call in processor.cmd_calls if call[0] == "subsky"],
+            [("subsky", "1", "-existing")],
+        )
+        self.assertTrue(processor.siril.set_calls)
+        self.assertFalse(processor.siril.set_calls[0]["recalculate"])
+        recovery = processor.report["safe_samples"]["recovery"]
+        self.assertEqual(recovery["status"], "applied")
+        self.assertEqual(
+            recovery["reason_code"],
+            "stage3_dense_star_masked_sampling_applied",
+        )
+        self.assertEqual(recovery["recovery_mode"], "masked_catalog_statistics")
+        self.assertAlmostEqual(
+            recovery["strict_unmasked_sky_fraction"],
+            0.3637058,
+        )
+        self.assertAlmostEqual(recovery["nonstellar_sky_fraction"], 0.5670248)
+        self.assertEqual(
+            processor.report["reason_code"],
+            "stage3_safe_sample_recovery_applied",
+        )
+        self.assertTrue(
+            processor.report["safe_samples"]["fit_validation_split"][
+                "regular_validation_ready"
+            ]
+        )
+        self.assertEqual(processor.results[-1][1], "ok")
+
+    def test_stage3_rgb_recovery_projects_single_subsky_to_neutral_axis(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        processor = Stage3CompoundFake(external_success=True)
+        processor.cfg.stage3_gate_profile = "output_first"
+        processor.target_profile = {
+            "target_type": "emission_nebula_widefield",
+            "object_stats": {
+                "object_area_ratio": 0.30,
+                "nebulosity_area_ratio": 0.42,
+            },
+        }
+        processor.pipeline_policy["stage3_background"] = {
+            "protect_nebulosity": True,
+            "reject_samples_on_nebula": True,
+        }
+        baseline_luma = processor.images["baseline"].copy()
+        baseline_rgb = np.stack(
+            (
+                baseline_luma + np.float32(0.030),
+                baseline_luma,
+                baseline_luma - np.float32(0.015),
+            ),
+            axis=0,
+        ).astype(np.float32)
+        height, width = baseline_luma.shape
+        y, x = np.mgrid[:height, :width]
+        common_correction = (
+            -0.048 * (x / (width - 1) - 0.5)
+            - 0.020 * (y / (height - 1) - 0.5)
+        )
+        raw_proposal = baseline_rgb.astype(np.float64)
+        raw_proposal += common_correction[None, :, :]
+        raw_proposal += np.asarray((0.020, -0.012, 0.008))[:, None, None]
+        processor.images["baseline"] = baseline_rgb
+        processor.images["polynomial"] = raw_proposal.astype(np.float32)
+        for state in ("single_rbf", "compound", "plugin"):
+            mono = processor.images[state]
+            processor.images[state] = np.stack((mono, mono, mono), axis=0)
+        processor.metrics["polynomial"].update(
+            gradient_score=0.02,
+            dirty_background_score=0.12,
+            chroma_noise_score=0.02,
+        )
+        points, base_report, refined_report = _stage3_recovery_sample_reports()
+
+        with (
+            patch.object(
+                stage3_module,
+                "build_safe_background_samples",
+                side_effect=[([], base_report), (points, refined_report)],
+            ),
+            patch.object(
+                stage3_module,
+                "analyze_directional_pattern_noise",
+                return_value={
+                    "status": "ok",
+                    "detected": False,
+                    "pattern_score": 0.05,
+                    "walking_noise_score": 0.04,
+                },
+            ),
+            patch.object(
+                stage3_module,
+                "_stage3_theoretical_plugin_candidates",
+                return_value=[("mock-graxpert", ("gxp",), "graxpert")],
+            ),
+        ):
+            stage3_module.run_stage3_background_extraction(processor)
+
+        subsky_calls = [
+            call for call in processor.cmd_calls if call and call[0] == "subsky"
+        ]
+        self.assertEqual(subsky_calls, [("subsky", "1", "-existing")])
+        self.assertIn(
+            "stage3_candidate_neutral_axis_poly1",
+            processor.saved_images,
+        )
+        output = processor.saved_images["stage3_bgremoved"]
+        tolerance = processor.report["neutral_axis_projection"]["invariants"][
+            "opponent_tolerance"
+        ]
+        np.testing.assert_allclose(
+            output[0] - output[1],
+            baseline_rgb[0] - baseline_rgb[1],
+            rtol=0.0,
+            atol=tolerance,
+        )
+        np.testing.assert_allclose(
+            output[2] - output[1],
+            baseline_rgb[2] - baseline_rgb[1],
+            rtol=0.0,
+            atol=tolerance,
+        )
+        self.assertGreaterEqual(processor.siril.image_lock_entries, 1)
+        self.assertEqual(processor.report["model_used"], "neutral-axis-poly1")
+        self.assertEqual(
+            processor.report["neutral_axis_projection"]["schema"],
+            "starun.stage3-neutral-axis-projection.v1",
+        )
+        self.assertTrue(
+            processor.report["final_output_validation"]
+            ["neutral_axis_persistence"]["accepted"]
+        )
+        self.assertEqual(
+            processor.report["reason_code"],
+            "stage3_safe_sample_recovery_applied",
+        )
+        self.assertEqual(processor.results[-1][1], "ok")
+
+    def test_stage3_diffuse_recovery_strict_warning_rolls_back_without_backup(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        processor = Stage3CompoundFake(external_success=True)
+        processor.cfg.stage3_gate_profile = "output_first"
+        processor.target_profile = {
+            "target_type": "emission_nebula_widefield",
+            "object_stats": {
+                "object_area_ratio": 0.30,
+                "nebulosity_area_ratio": 0.42,
+            },
+        }
+        processor.pipeline_policy["stage3_background"] = {
+            "protect_nebulosity": True,
+        }
+        points, base_report, refined_report = _stage3_recovery_sample_reports()
+
+        with (
+            patch.object(
+                stage3_module,
+                "build_safe_background_samples",
+                side_effect=[([], base_report), (points, refined_report)],
+            ),
+            patch.object(
+                stage3_module,
+                "analyze_directional_pattern_noise",
+                return_value={
+                    "status": "ok",
+                    "detected": False,
+                    "pattern_score": 0.05,
+                    "walking_noise_score": 0.04,
+                },
+            ),
+            patch.object(
+                stage3_module,
+                "_stage3_theoretical_plugin_candidates",
+                return_value=[("mock-graxpert", ("gxp",), "graxpert")],
+            ),
+        ):
+            stage3_module.run_stage3_background_extraction(processor)
+
+        subsky_calls = [
+            call for call in processor.cmd_calls if call and call[0] == "subsky"
+        ]
+        self.assertEqual(subsky_calls, [("subsky", "1", "-existing")])
+        self.assertFalse(any(call[0] == "gxp" for call in processor.cmd_calls))
+        self.assertIsNone(processor.report["model_used"])
+        self.assertTrue(processor.report["review_required"])
+        self.assertEqual(
+            processor.report["reason_code"],
+            "stage3_conservative_recovery_candidate_rejected",
+        )
+        self.assertEqual(processor.state, "baseline")
+        self.assertEqual(processor.results[-1][1], "degraded")
+
+    def test_stage3_diffuse_recovery_eligibility_is_fail_closed(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        _points, base_template, _refined = _stage3_recovery_sample_reports()
+
+        for case in (
+            "linearity_unknown",
+            "usable_sky_below_minimum",
+            "star_catalog_untrusted",
+            "directional_pattern_detected",
+            "graxpert_only",
+        ):
+            with self.subTest(case=case):
+                processor = Stage3CompoundFake(external_success=True)
+                processor.target_profile = {
+                    "target_type": "emission_nebula_widefield",
+                    "object_stats": {
+                        "object_area_ratio": 0.30,
+                        "nebulosity_area_ratio": 0.42,
+                    },
+                }
+                processor.pipeline_policy["stage3_background"] = {
+                    "protect_nebulosity": True,
+                }
+                base_report = copy.deepcopy(base_template)
+                pattern_detected = False
+                if case == "linearity_unknown":
+                    processor.input_profile = {
+                        "state": "unknown",
+                        "safe_for_linear_steps": False,
+                    }
+                elif case == "usable_sky_below_minimum":
+                    base_report["mask_evidence"]["usable_sky_fraction"] = 0.49
+                elif case == "star_catalog_untrusted":
+                    base_report["shared_scene_support"]["star_catalog"] = (
+                        "unavailable"
+                    )
+                elif case == "directional_pattern_detected":
+                    pattern_detected = True
+                elif case == "graxpert_only":
+                    processor.cfg.stage3_backend_policy = "graxpert_only"
+
+                with (
+                    patch.object(
+                        stage3_module,
+                        "build_safe_background_samples",
+                        return_value=([], base_report),
+                    ) as sample_builder,
+                    patch.object(
+                        stage3_module,
+                        "analyze_directional_pattern_noise",
+                        return_value={
+                            "status": "ok",
+                            "detected": pattern_detected,
+                            "pattern_score": 0.70 if pattern_detected else 0.05,
+                            "walking_noise_score": 0.04,
+                        },
+                    ),
+                ):
+                    stage3_module.run_stage3_background_extraction(processor)
+
+                self.assertEqual(sample_builder.call_count, 1)
+                self.assertFalse(
+                    any(call[0] == "subsky" for call in processor.cmd_calls)
+                )
+                recovery = processor.report["safe_samples"]["recovery"]
+                self.assertEqual(recovery["status"], "ineligible")
+                self.assertEqual(
+                    recovery["reason_code"],
+                    "stage3_safe_sample_recovery_ineligible",
+                )
+                self.assertEqual(
+                    processor.report["reason_code"],
+                    "insufficient_source_masked_true_sky_support",
+                )
+                self.assertTrue(processor.report["review_required"])
 
     def test_stage3_compound_soft_profile_records_missing_hard_gate_evidence(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
@@ -1342,6 +1933,535 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
             "background_accepted_with_soft_warnings",
         )
         self.assertEqual(processor._stage_review_reasons(3), [])
+
+    def test_stage3_verified_noop_audit_allows_only_below_three_sigma(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        accepted_gate = {"accepted": True}
+        baseline_validation = {
+            "status": "ready",
+            "robust_span": 0.040,
+            "patch_mad_median": 0.002,
+            "patch_median_uncertainty": 0.001,
+            "patch_radius": 3,
+        }
+        candidate_validation = {
+            "status": "ready",
+            "robust_span": 0.039,
+            "patch_mad_median": 0.002,
+            "patch_median_uncertainty": 0.001,
+            "patch_radius": 3,
+        }
+        attempt = {
+            "label": "bounded-poly",
+            "status": "rejected",
+            "candidate_stem": "stage3_candidate_bounded_poly",
+            "candidate_checkpoint": {
+                "status": "accepted",
+                "accepted": True,
+            },
+            "hard_gate_metrics_available": True,
+            "pixel_integrity_gate": accepted_gate,
+            "target_fidelity_gate": accepted_gate,
+            "pattern_quality_gate": accepted_gate,
+            "directional_gradient_gate": accepted_gate,
+            "color_shift_gate": accepted_gate,
+            "validation": candidate_validation,
+            "validation_gate": {
+                "accepted": False,
+                "baseline_span": 0.040,
+                "candidate_span": 0.039,
+                "span_improvement": 0.001,
+                "sampling_uncertainty_3sigma": 0.006,
+                "material_improvement": False,
+                "span_not_worse": True,
+                "background_rms_not_worse": True,
+                "hard_issues": [
+                    "held-out span improvement is below sampling uncertainty"
+                ],
+            },
+            "gate_warnings": [],
+        }
+        process = {
+            "linear_input": {"confirmed": True},
+            "true_sky_support": {"supported": True},
+            "hard_block_reasons": [],
+        }
+        pattern = {"status": "ok", "detected": False}
+        route = {"requires_review": False}
+
+        accepted = stage3_module._stage3_verified_noop_candidate_audit(
+            process,
+            pattern,
+            route,
+            [attempt],
+            baseline_validation=baseline_validation,
+        )
+        target_rejected = copy.deepcopy(attempt)
+        target_rejected["target_fidelity_gate"] = {"accepted": False}
+        rejected = stage3_module._stage3_verified_noop_candidate_audit(
+            process,
+            pattern,
+            route,
+            [target_rejected],
+            baseline_validation=baseline_validation,
+        )
+        sky_limited = copy.deepcopy(process)
+        sky_limited["true_sky_support"]["supported"] = False
+        sky_rejected = stage3_module._stage3_verified_noop_candidate_audit(
+            sky_limited,
+            pattern,
+            route,
+            [attempt],
+            baseline_validation=baseline_validation,
+        )
+        missing_validation = copy.deepcopy(attempt)
+        missing_validation.pop("validation_gate")
+        incomplete_rejected = (
+            stage3_module._stage3_verified_noop_candidate_audit(
+                process,
+                pattern,
+                route,
+                [attempt, missing_validation],
+                baseline_validation=baseline_validation,
+            )
+        )
+        save_failed = copy.deepcopy(attempt)
+        save_failed.update(
+            status="candidate_save_failed",
+            candidate_stem=None,
+            candidate_checkpoint={"status": "rejected", "accepted": False},
+            failure_reason="candidate checkpoint save failed",
+        )
+        save_rejected = stage3_module._stage3_verified_noop_candidate_audit(
+            process,
+            pattern,
+            route,
+            [attempt, save_failed],
+            baseline_validation=baseline_validation,
+        )
+
+        self.assertTrue(accepted["eligible"], accepted)
+        self.assertFalse(rejected["eligible"], rejected)
+        self.assertEqual(rejected["candidate_blockers"], ["bounded-poly"])
+        self.assertFalse(sky_rejected["eligible"], sky_rejected)
+        self.assertFalse(incomplete_rejected["eligible"], incomplete_rejected)
+        self.assertEqual(incomplete_rejected["assessed_candidate_count"], 2)
+        self.assertFalse(save_rejected["eligible"], save_rejected)
+        self.assertFalse(
+            save_rejected["candidates"][1]["technical_checks"]
+            ["candidate_checkpoint_saved"]
+        )
+
+        accepted_candidate = copy.deepcopy(attempt)
+        accepted_candidate.update(status="accepted", candidate_stem="accepted")
+        accepted_candidate["validation_gate"]["accepted"] = True
+        accepted_rejected = stage3_module._stage3_verified_noop_candidate_audit(
+            process,
+            pattern,
+            route,
+            [accepted_candidate],
+            baseline_validation=baseline_validation,
+        )
+        self.assertFalse(accepted_rejected["eligible"], accepted_rejected)
+
+        for field in (
+            "span_improvement",
+            "sampling_uncertainty_3sigma",
+        ):
+            missing = copy.deepcopy(attempt)
+            missing["validation_gate"].pop(field)
+            missing_result = stage3_module._stage3_verified_noop_candidate_audit(
+                process,
+                pattern,
+                route,
+                [missing],
+                baseline_validation=baseline_validation,
+            )
+            self.assertFalse(missing_result["eligible"], missing_result)
+
+        nonfinite = copy.deepcopy(attempt)
+        nonfinite["validation_gate"]["span_improvement"] = math.nan
+        nonfinite_result = stage3_module._stage3_verified_noop_candidate_audit(
+            process,
+            pattern,
+            route,
+            [nonfinite],
+            baseline_validation=baseline_validation,
+        )
+        self.assertFalse(nonfinite_result["eligible"], nonfinite_result)
+
+        contradictory = copy.deepcopy(attempt)
+        contradictory["validation_gate"]["sampling_uncertainty_3sigma"] = 0.1
+        contradiction_result = (
+            stage3_module._stage3_verified_noop_candidate_audit(
+                process,
+                pattern,
+                route,
+                [contradictory],
+                baseline_validation=baseline_validation,
+            )
+        )
+        self.assertFalse(contradiction_result["eligible"], contradiction_result)
+
+    def test_stage3_restored_noop_pixel_gate_requires_exact_identity(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        baseline = np.full((3, 32, 40), 0.125, dtype=np.float32)
+        exact_ok, exact_report = (
+            stage3_module._stage3_restored_noop_pixel_gate(
+                baseline,
+                baseline.copy(),
+                gate_profile="strict",
+            )
+        )
+        mutated = baseline.copy()
+        mutated[0, 0, 0] = np.nextafter(
+            mutated[0, 0, 0],
+            np.float32(1.0),
+        )
+        mutated_ok, mutated_report = (
+            stage3_module._stage3_restored_noop_pixel_gate(
+                baseline,
+                mutated,
+                gate_profile="strict",
+            )
+        )
+
+        self.assertTrue(exact_ok, exact_report)
+        self.assertTrue(exact_report["pixel_exact"])
+        self.assertFalse(mutated_ok, mutated_report)
+        self.assertFalse(mutated_report["pixel_exact"])
+
+    def test_stage3_verified_noop_absolute_background_gate_is_fail_closed(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        ready = {
+            "status": "ready",
+            "sample_count": 8,
+            "expected_count": 8,
+            "minimum": 0.010,
+            "p10": 0.012,
+            "median": 0.018,
+            "p90": 0.024,
+            "maximum": 0.030,
+            "robust_span": 0.012,
+            "supported_pixel_count": 800,
+            "low_clip_count": 0,
+            "high_clip_count": 0,
+        }
+
+        accepted = stage3_module._stage3_absolute_background_gate(ready)
+        self.assertTrue(accepted["accepted"], accepted)
+
+        for field, value in (
+            ("minimum", 0.0),
+            ("maximum", 1.0),
+            ("low_clip_count", 1),
+            ("high_clip_count", 1),
+        ):
+            with self.subTest(field=field):
+                rejected_payload = dict(ready)
+                rejected_payload[field] = value
+                rejected = stage3_module._stage3_absolute_background_gate(
+                    rejected_payload
+                )
+                self.assertFalse(rejected["accepted"], rejected)
+
+        missing = dict(ready)
+        missing.pop("p10")
+        self.assertFalse(
+            stage3_module._stage3_absolute_background_gate(missing)["accepted"]
+        )
+        nonfinite = dict(ready)
+        nonfinite["median"] = math.nan
+        self.assertFalse(
+            stage3_module._stage3_absolute_background_gate(nonfinite)["accepted"]
+        )
+
+    def test_stage3_verified_noop_restores_exact_baseline_and_stays_formal(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        processor = Stage3CompoundFake()
+        processor.cfg.stage3_gate_profile = "output_first"
+        candidate_audit = {
+            "schema": "starun.stage3-verified-noop-candidate-audit.v1",
+            "status": "eligible",
+            "eligible": True,
+            "candidates": [{"label": "subsky-poly-existing"}],
+        }
+        noop_report = {
+            "schema": "starun.stage3-verified-noop.v1",
+            "status": "accepted",
+            "accepted": True,
+            "checks": {
+                "pixel_exact": True,
+                "true_sky_support": True,
+                "absolute_background": True,
+                "target_fidelity": True,
+                "directional_pattern": True,
+                "directional_gradient": True,
+            },
+        }
+
+        with (
+            patch.object(
+                stage3_module,
+                "_stage3_try_background_command",
+                return_value=(False, "fixture_candidate_rejected"),
+            ),
+            patch.object(
+                stage3_module,
+                "_stage3_verified_noop_candidate_audit",
+                return_value=candidate_audit,
+            ),
+            patch.object(
+                stage3_module,
+                "_stage3_verify_restored_noop",
+                return_value=noop_report,
+            ),
+        ):
+            stage3_module.run_stage3_background_extraction(processor)
+
+        self.assertEqual(processor.state, "baseline")
+        self.assertEqual(processor.results[-1][1], "ok")
+        self.assertEqual(
+            processor.result_metadata[-1]["reason_code"],
+            "verified_noop_below_sampling_uncertainty",
+        )
+        self.assertEqual(
+            processor.result_metadata[-1]["execution"],
+            "skipped",
+        )
+        self.assertTrue(processor.report["verified_noop"]["accepted"])
+        self.assertFalse(processor.report["review_required"])
+
+    def test_stage3_verified_noop_rejects_persisted_output_pixel_mutation(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        processor = Stage3CompoundFake()
+        baseline = processor.images["baseline"].copy()
+        processor._save_stage_output("stage3_bgremoved")
+        mutated = processor.saved_images["stage3_bgremoved"].copy()
+        mutated[0, 0] = np.nextafter(mutated[0, 0], np.float32(1.0))
+        processor.saved_images["stage3_bgremoved"] = mutated
+
+        report = stage3_module._stage3_verify_persisted_noop_output(
+            processor,
+            baseline_image=baseline,
+            output_stem="stage3_bgremoved",
+        )
+
+        self.assertFalse(report["accepted"], report)
+        self.assertFalse(report["checks"]["pixels_exact"])
+        self.assertNotEqual(
+            report["baseline_pixel_sha256"],
+            report["persisted_pixel_sha256"],
+        )
+
+    def test_stage3_pre_candidate_preserve_is_review_only_not_verified_noop(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        processor = Stage3CompoundFake()
+        processor.cfg.stage3_processing_mode = "preserve"
+
+        stage3_module.run_stage3_background_extraction(processor)
+
+        self.assertEqual(processor.state, "baseline")
+        self.assertEqual(processor.results[-1][1], "degraded")
+        self.assertEqual(
+            processor.result_metadata[-1]["reason_code"],
+            "stage3_passthrough_requires_verified_noop",
+        )
+        self.assertTrue(processor.report["review_required"])
+        self.assertFalse(
+            processor.report["spatial_background_lineage"]["accepted"]
+        )
+        self.assertIn(
+            "stage3_passthrough_requires_verified_noop",
+            processor._stage_review_reasons(3),
+        )
+
+    def test_stage3_selected_correction_save_failure_is_review_required(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        processor = Stage3CompoundFake()
+        original_save = processor._save_stage_output
+
+        def fail_final_save(stem: str) -> bool:
+            if stem == "stage3_bgremoved":
+                return False
+            return original_save(stem)
+
+        processor._save_stage_output = fail_final_save
+        stage3_module.run_stage3_background_extraction(processor)
+
+        self.assertEqual(processor.results[-1][1], "degraded")
+        self.assertTrue(processor.report["review_required"])
+        self.assertEqual(
+            processor.report["reason_code"],
+            "stage3_output_save_failed",
+        )
+        self.assertIn(
+            "stage3_output_save_failed",
+            processor._stage_review_reasons(3),
+        )
+
+    def test_stage3_formal_lineage_binds_input_output_support_and_reference_plane(
+        self,
+    ):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            height, width = 96, 128
+            yy, xx = np.mgrid[:height, :width]
+            mono = (
+                0.05
+                + 0.02 * xx / (width - 1)
+                + 0.01 * yy / (height - 1)
+            ).astype(np.float32)
+            image = np.stack((mono, mono * 0.98, mono * 1.02))
+            fits.PrimaryHDU(image).writeto(root / "stage3_bg_input.fit")
+            fits.PrimaryHDU(image).writeto(root / "stage3_bgremoved.fit")
+            points = [
+                (
+                    (cell_x + 0.5) / 4.0 * (width - 1),
+                    (cell_y + 0.5) / 4.0 * (height - 1),
+                )
+                for cell_y in range(4)
+                for cell_x in range(4)
+            ]
+            reports = {}
+
+            def write_report(name, payload):
+                reports[name] = payload
+                (root / name).write_text(
+                    json.dumps(payload),
+                    encoding="utf-8",
+                )
+
+            pipeline = SimpleNamespace(
+                process_dir=root,
+                work_dir=root / "test-run",
+                _write_stage_json=write_report,
+            )
+
+            report = stage3_module._stage3_write_spatial_background_lineage(
+                pipeline,
+                baseline_image=image,
+                fit_points=points[:12],
+                validation_points=points[12:],
+                patch_radius=3,
+                support_mask=np.ones((height, width), dtype=bool),
+                projection={},
+                review_required=False,
+                processing_route="verified_noop",
+            )
+
+            self.assertTrue(report["accepted"], report)
+            self.assertEqual(report["processing_route"], "verified_noop")
+            self.assertEqual(len(report["stage3_input_pixel_sha256"]), 64)
+            self.assertEqual(len(report["stage3_output_pixel_sha256"]), 64)
+            self.assertEqual(len(report["support_sha256"]), 64)
+            self.assertEqual(len(report["reference_plane"]["sha256"]), 64)
+            self.assertIn("luma", report["reference_plane"]["components"])
+            self.assertEqual(
+                report["support_kind"],
+                "candidate_independent_full_sky_mask",
+            )
+            self.assertEqual(report["support_pixel_count"], height * width)
+            self.assertEqual(report["support_coverage"], 1.0)
+            self.assertLess(
+                report["sample_patch_support_pixel_count"],
+                report["support_pixel_count"],
+            )
+
+            self.assertEqual(
+                reports["stage3_spatial_background_lineage.json"],
+                report,
+            )
+            loaded = stage3_module.spatial_background_lineage.load_lineage(root)
+            self.assertTrue(loaded["accepted"], loaded)
+            with fits.open(
+                root / "stage3_bg_input.fit",
+                mode="update",
+                memmap=False,
+            ) as hdul:
+                hdul[0].data[0, 0, 0] += np.float32(0.001)
+                hdul.flush()
+            tampered = stage3_module.spatial_background_lineage.load_lineage(root)
+            self.assertFalse(tampered["accepted"])
+            self.assertIn("input SHA mismatch", " ".join(tampered["issues"]))
+
+    def test_stage3_formal_lineage_rejects_missing_full_sky_support(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = np.full((3, 32, 40), 0.05, dtype=np.float32)
+            fits.PrimaryHDU(image).writeto(root / "stage3_bg_input.fit")
+            fits.PrimaryHDU(image).writeto(root / "stage3_bgremoved.fit")
+            points = [(4.0, 4.0), (20.0, 4.0), (35.0, 4.0), (4.0, 26.0)]
+            pipeline = SimpleNamespace(
+                process_dir=root,
+                work_dir=root / "test-run",
+                _write_stage_json=lambda _name, _payload: None,
+            )
+
+            rejected = stage3_module._stage3_write_spatial_background_lineage(
+                pipeline,
+                baseline_image=image,
+                fit_points=points[:3],
+                validation_points=points[3:],
+                patch_radius=2,
+                support_mask=None,
+                projection={},
+                review_required=False,
+                processing_route="verified_noop",
+            )
+
+            self.assertFalse(rejected["accepted"], rejected)
+            self.assertIn("candidate-independent sky support", rejected["issues"][0])
+
+    def test_stage3_verified_noop_lineage_rejects_output_pixel_mutation(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            height, width = 96, 128
+            yy, xx = np.mgrid[:height, :width]
+            mono = (
+                0.05
+                + 0.02 * xx / (width - 1)
+                + 0.01 * yy / (height - 1)
+            ).astype(np.float32)
+            image = np.stack((mono, mono * 0.98, mono * 1.02))
+            mutated = image.copy()
+            mutated[0, 0, 0] = np.nextafter(
+                mutated[0, 0, 0],
+                np.float32(1.0),
+            )
+            fits.PrimaryHDU(image).writeto(root / "stage3_bg_input.fit")
+            fits.PrimaryHDU(mutated).writeto(root / "stage3_bgremoved.fit")
+            points = [
+                (
+                    (cell_x + 0.5) / 4.0 * (width - 1),
+                    (cell_y + 0.5) / 4.0 * (height - 1),
+                )
+                for cell_y in range(4)
+                for cell_x in range(4)
+            ]
+            pipeline = SimpleNamespace(
+                process_dir=root,
+                work_dir=root / "test-run",
+                _write_stage_json=lambda _name, _payload: None,
+            )
+
+            rejected = stage3_module._stage3_write_spatial_background_lineage(
+                pipeline,
+                baseline_image=image,
+                fit_points=points[:12],
+                validation_points=points[12:],
+                patch_radius=3,
+                support_mask=np.ones((height, width), dtype=bool),
+                projection={},
+                review_required=False,
+                processing_route="verified_noop",
+            )
+
+            self.assertFalse(rejected["accepted"], rejected)
+            self.assertIn("pixel identity mismatch", rejected["issues"][0])
 
     def test_stage3_final_consistency_warning_requires_review_without_rollback(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]
@@ -1634,6 +2754,167 @@ class PipelinePluginFallbackStage3BackgroundTests(PipelinePluginFallbackTestBase
         self.assertEqual(report["observed_count"], 19)
         self.assertEqual(report["siril_rejected_count"], 1)
         self.assertGreaterEqual(report["observed_coverage"]["grid_cells"], 8)
+
+    def test_stage3_masked_bg_samples_disable_recalculation_and_roundtrip(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        state = {"samples": [], "recalculate": None}
+
+        def set_samples(samples, **kwargs):
+            state["samples"] = list(samples)
+            state["recalculate"] = kwargs.get("recalculate")
+            return True
+
+        processor = SimpleNamespace(
+            cfg=SimpleNamespace(stage3_safe_sample_min_count=8),
+            log=FakeLogger(),
+            siril=SimpleNamespace(
+                clear_image_bgsamples=lambda: state.update(samples=[]),
+                set_image_bgsamples=set_samples,
+                get_image_bgsamples=lambda: list(state["samples"]),
+            ),
+        )
+        points = [
+            (float(x), float(y))
+            for y in (20, 100, 180)
+            for x in (20, 100, 180, 260)
+        ][:10]
+        records = [
+            {
+                "point": list(point),
+                "sample_size": 25,
+                "channel_count": 3,
+                "channel_medians": [0.04, 0.05, 0.06],
+                "native_luminance_mean": 0.05,
+                "native_luminance_min": 0.03,
+                "native_luminance_max": 0.07,
+            }
+            for point in points
+        ]
+
+        accepted, report = stage3_module._stage3_install_safe_background_samples(
+            processor,
+            points,
+            minimum_count=8,
+            sample_contract="dense_star_masked_fit",
+            sample_records=records,
+            masked_statistics=True,
+        )
+
+        self.assertTrue(accepted, report)
+        self.assertFalse(state["recalculate"])
+        self.assertTrue(report["roundtrip_verified"])
+        self.assertEqual(
+            report["statistics_mode"],
+            "masked_native_channel_bg_sample",
+        )
+        self.assertIsNotNone(report["statistics_sha256"])
+
+    def test_stage3_masked_bg_sample_statistic_drift_fails_closed(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        state = {"samples": []}
+
+        def set_samples(samples, **_kwargs):
+            state["samples"] = list(samples)
+            return True
+
+        def drifted_samples():
+            samples = list(state["samples"])
+            if samples:
+                samples[0].median = (0.20, 0.05, 0.06)
+            return samples
+
+        processor = SimpleNamespace(
+            cfg=SimpleNamespace(stage3_safe_sample_min_count=8),
+            log=FakeLogger(),
+            siril=SimpleNamespace(
+                clear_image_bgsamples=lambda: state.update(samples=[]),
+                set_image_bgsamples=set_samples,
+                get_image_bgsamples=drifted_samples,
+            ),
+        )
+        points = [
+            (float(x), float(y))
+            for y in (20, 100, 180)
+            for x in (20, 100, 180, 260)
+        ][:10]
+        records = [
+            {
+                "point": list(point),
+                "sample_size": 25,
+                "channel_count": 3,
+                "channel_medians": [0.04, 0.05, 0.06],
+                "native_luminance_mean": 0.05,
+                "native_luminance_min": 0.03,
+                "native_luminance_max": 0.07,
+            }
+            for point in points
+        ]
+
+        accepted, report = stage3_module._stage3_install_safe_background_samples(
+            processor,
+            points,
+            minimum_count=8,
+            sample_records=records,
+            masked_statistics=True,
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(
+            report["reason_code"],
+            "stage3_dense_star_bg_sample_roundtrip_failed",
+        )
+        self.assertEqual(state["samples"], [])
+
+    def test_stage3_masked_bg_samples_pad_sirilpy_144_transport(self):
+        stage3_module = sys.modules["stages.stage3_background_extraction"]
+        state = {"samples": [], "transmitted_count": 0}
+
+        def set_samples(samples, **_kwargs):
+            state["transmitted_count"] = len(samples)
+            state["samples"] = list(samples[:-1])
+            return True
+
+        set_samples.__module__ = "sirilpy.connection"
+        processor = SimpleNamespace(
+            cfg=SimpleNamespace(stage3_safe_sample_min_count=8),
+            log=FakeLogger(),
+            siril=SimpleNamespace(
+                clear_image_bgsamples=lambda: state.update(samples=[]),
+                set_image_bgsamples=set_samples,
+                get_image_bgsamples=lambda: list(state["samples"]),
+            ),
+        )
+        points = [
+            (float(x), float(y))
+            for y in (20, 100, 180)
+            for x in (20, 100, 180, 260)
+        ][:10]
+        records = [
+            {
+                "point": list(point),
+                "sample_size": 25,
+                "channel_count": 3,
+                "channel_medians": [0.04, 0.05, 0.06],
+                "native_luminance_mean": 0.05,
+                "native_luminance_min": 0.03,
+                "native_luminance_max": 0.07,
+            }
+            for point in points
+        ]
+
+        accepted, report = stage3_module._stage3_install_safe_background_samples(
+            processor,
+            points,
+            minimum_count=8,
+            sample_records=records,
+            masked_statistics=True,
+        )
+
+        self.assertTrue(accepted, report)
+        self.assertEqual(state["transmitted_count"], len(points) + 1)
+        self.assertTrue(report["transport_padding_applied"])
+        self.assertEqual(report["transmitted_count"], len(points) + 1)
+        self.assertEqual(report["observed_count"], len(points))
 
     def test_stage3_compound_fit_uses_its_own_sample_minimum(self):
         stage3_module = sys.modules["stages.stage3_background_extraction"]

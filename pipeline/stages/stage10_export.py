@@ -1,4 +1,5 @@
 """Stage 10 final denoise and export."""
+import hashlib
 import math
 import shutil
 import time
@@ -26,7 +27,9 @@ from pipeline_safety import (
     color_safety_limits,
     should_skip_final_denoise,
 )
+import presentation_quality
 from save_utils import export_final_outputs
+import spatial_background_lineage
 import stage8_pixels
 import stage9_quality
 
@@ -44,6 +47,123 @@ _STAGE10_QUALITY_SIGNAL_CORRELATION_MIN = 0.995
 _STAGE10_QUALITY_SIGNAL_FLUX_RATIO_MIN = 0.98
 _STAGE10_QUALITY_SIGNAL_FLUX_RATIO_MAX = 1.02
 _STAGE10_QUALITY_CORE_CLIP_GROWTH_MAX = 0.001
+
+
+def _stage10_mask_sha256(mask: np.ndarray) -> str:
+    canonical = np.ascontiguousarray(np.asarray(mask, dtype="<f4"))
+    digest = hashlib.sha256()
+    digest.update(
+        str(tuple(int(value) for value in canonical.shape)).encode("ascii")
+    )
+    digest.update(canonical.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _stage10_freeze_authenticated_background_masks(
+    pipeline,
+) -> Dict[str, Any]:
+    """Bind the Stage 10 noise gate to pre-candidate Stage 3/6 support."""
+
+    report: Dict[str, Any] = {
+        "schema": "starun.stage10-authenticated-background-support.v1",
+        "status": "rejected",
+        "accepted": False,
+        "candidate_independent": True,
+        "method": "stage3_sky_intersect_stage6_frozen_masks",
+        "issues": [],
+        "masks": {},
+    }
+    try:
+        lineage = spatial_background_lineage.load_lineage(
+            getattr(pipeline, "process_dir", None)
+        )
+        if lineage.get("accepted") is not True:
+            raise ValueError(
+                "authenticated Stage 3 spatial background lineage is unavailable"
+            )
+        support = np.asarray(lineage.get("support_mask"), dtype=np.float32)
+        if support.ndim != 2 or not np.all(np.isfinite(support)):
+            raise ValueError("authenticated Stage 3 sky support is invalid")
+        support = np.clip(support, 0.0, 1.0)
+
+        frozen = getattr(pipeline, "_stage7_frozen_rendition_masks", None)
+        if not isinstance(frozen, dict) or not frozen:
+            raise ValueError("Stage 6 frozen rendition masks are unavailable")
+        stage6_background = np.asarray(
+            frozen.get("background_mask"),
+            dtype=np.float32,
+        )
+        if (
+            stage6_background.shape != support.shape
+            or not np.all(np.isfinite(stage6_background))
+        ):
+            raise ValueError("Stage 6 frozen background mask is invalid")
+
+        masks: Dict[str, np.ndarray] = {
+            "background_mask": np.clip(
+                support * np.clip(stage6_background, 0.0, 1.0),
+                0.0,
+                1.0,
+            ).astype(np.float32, copy=False)
+        }
+        for name in (
+            "core_mask",
+            "nebula_mask",
+            "faint_nebula_mask",
+            "galaxy_signal_mask",
+            "limited_core_exclusion_mask",
+            "star_halo_guard_mask",
+            "star_mask",
+            "subject_mask",
+            "shared_valid_mask",
+            "original_saturation_map",
+            "saturation_map",
+        ):
+            raw = frozen.get(name)
+            if raw is None:
+                continue
+            value = np.asarray(raw, dtype=np.float32)
+            if value.shape != support.shape or not np.all(np.isfinite(value)):
+                raise ValueError(f"Stage 6 frozen {name} is invalid")
+            masks[name] = np.clip(value, 0.0, 1.0).astype(
+                np.float32,
+                copy=True,
+            )
+
+        exclusive = stage8_pixels._stage8_exclusive_background_weight(
+            masks,
+            masks["background_mask"],
+        )
+        coverage = float(np.mean(exclusive > 0.50))
+        if not math.isfinite(coverage) or coverage <= 0.01:
+            raise ValueError(
+                "authenticated frozen background coverage is insufficient: "
+                f"{coverage:.6f}<=0.010000"
+            )
+
+        mask_records = {
+            name: {
+                "shape": [int(value) for value in mask.shape],
+                "sha256": _stage10_mask_sha256(mask),
+            }
+            for name, mask in sorted(masks.items())
+        }
+        report.update(
+            status="accepted",
+            accepted=True,
+            issues=[],
+            coverage_gt_0_50=coverage,
+            stage3_support_sha256=lineage.get("support_sha256"),
+            stage3_lineage_chain_digest=lineage.get("chain_digest"),
+            masks=mask_records,
+        )
+        pipeline._stage10_quality_frozen_background_masks = masks
+        pipeline._stage10_quality_frozen_background_sampling = dict(report)
+    except (KeyError, TypeError, ValueError, FloatingPointError) as error:
+        report["issues"] = [str(error)]
+        pipeline._stage10_quality_frozen_background_masks = None
+        pipeline._stage10_quality_frozen_background_sampling = dict(report)
+    return report
 
 
 def _metric_value(metrics: Dict[str, Any], name: str) -> float:
@@ -77,6 +197,76 @@ def _config_value(cfg: Any, name: str, default: float, lower: float, upper: floa
     if not math.isfinite(value):
         value = default
     return max(lower, min(upper, value))
+
+
+def _stage10_stage9_contract_state(
+    pipeline,
+    *,
+    final_source: str,
+    final_loaded: bool,
+) -> Dict[str, Any]:
+    """Resolve the explicit Stage9 delivery contract for the loaded source."""
+
+    required_fields = (
+        "_stage9_stars_required",
+        "_stage9_stars_applied",
+        "_stage9_output_contains_stars",
+        "_stage9_remix_formally_accepted",
+        "_stage9_star_delivery_contract_accepted",
+        "_stage9_final_source",
+    )
+    missing_fields = [
+        name for name in required_fields if not hasattr(pipeline, name)
+    ]
+    declared_source = str(
+        getattr(pipeline, "_stage9_final_source", "") or ""
+    )
+    source_matched = bool(
+        final_loaded
+        and declared_source
+        and declared_source == str(final_source or "")
+    )
+    known = bool(not missing_fields and source_matched)
+    stars_required = bool(
+        getattr(pipeline, "_stage9_stars_required", False)
+    )
+    stars_applied = bool(
+        getattr(pipeline, "_stage9_stars_applied", False)
+    )
+    output_contains_stars = bool(
+        getattr(pipeline, "_stage9_output_contains_stars", False)
+    )
+    remix_formally_accepted = bool(
+        getattr(pipeline, "_stage9_remix_formally_accepted", False)
+    )
+    delivery_contract_accepted = bool(
+        getattr(
+            pipeline,
+            "_stage9_star_delivery_contract_accepted",
+            False,
+        )
+    )
+    formal = bool(
+        known
+        and remix_formally_accepted
+        and delivery_contract_accepted
+        and output_contains_stars
+        and (not stars_required or stars_applied)
+    )
+    return {
+        "schema": "starun.stage10-stage9-contract-state.v1",
+        "known": known,
+        "formal": formal,
+        "missing_fields": missing_fields,
+        "declared_source": declared_source or None,
+        "loaded_source": str(final_source or "") or None,
+        "source_matched": source_matched,
+        "remix_formally_accepted": remix_formally_accepted,
+        "delivery_contract_accepted": delivery_contract_accepted,
+        "stars_required": stars_required,
+        "stars_applied": stars_applied,
+        "output_contains_stars": output_contains_stars,
+    }
 
 
 def _stage10_stage9_local_color_saturation_guard(
@@ -1277,6 +1467,7 @@ def _stage10_star_visibility_reference(
     final_pixels: np.ndarray,
     *,
     restore_stem: str,
+    display_contract: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
     """Resolve a dimension-checked frozen catalog for final star audits."""
     final_shape = _stage10_spatial_shape(final_pixels)
@@ -1308,16 +1499,17 @@ def _stage10_star_visibility_reference(
             and np.all((x >= 0) & (x < final_shape[1]))
         ):
             return primary, {
-                "schema": "starun.stage10-star-catalog-resolution.v1",
+                "schema": "starun.stage10-star-catalog-resolution.v2",
                 "status": "ready",
                 "source": "stage9_frozen_star_reference",
                 "star_count": int(y.size),
                 "spatial_shape": list(final_shape),
+                "audit_domain": "stage9_authenticated_display_domain",
             }
 
     stage5_report = getattr(pipeline, "_stage5_star_reference_report", None)
     resolution: Dict[str, Any] = {
-        "schema": "starun.stage10-star-catalog-resolution.v1",
+        "schema": "starun.stage10-star-catalog-resolution.v2",
         "status": "unavailable",
         "source": "stage5_frozen_star_reference",
         "reason": "validated Stage9 catalog and signed Stage5 fallback are unavailable",
@@ -1354,6 +1546,18 @@ def _stage10_star_visibility_reference(
                 "Stage5/final spatial shape mismatch: "
                 f"{source_shape}!={final_shape}"
             )
+        source_reference_pixels = np.asarray(source_pixels)
+        audit_domain = "native_stage5_linear_domain"
+        display_contract_name = None
+        if display_contract is not None:
+            if not display_rendition.validate_review_contract(display_contract):
+                raise RuntimeError("review display contract is invalid")
+            source_reference_pixels = display_rendition.apply_review_contract(
+                source_reference_pixels,
+                display_contract,
+            )
+            audit_domain = "shared_review_display_contract"
+            display_contract_name = str(display_contract.get("name") or "") or None
         filtered = [
             star
             for star in stars
@@ -1417,7 +1621,7 @@ def _stage10_star_visibility_reference(
         }
         catalog = stage9_quality.enrich_star_reference_with_display_psf(
             catalog,
-            np.asarray(source_pixels),
+            source_reference_pixels,
             pipeline.cfg,
         )
         contrast = np.asarray(
@@ -1462,7 +1666,10 @@ def _stage10_star_visibility_reference(
             star_count=int(y.size),
             source_checkpoint="stage5_input_linear.fit",
             source_shape=list(source_shape),
+            audit_domain=audit_domain,
+            display_contract=display_contract_name,
         )
+        resolution.pop("reason", None)
         return catalog, resolution
     except (
         AttributeError,
@@ -1502,6 +1709,30 @@ def run_stage10_export(pipeline) -> None:
     pipeline._stage10_quality_frozen_background_masks = None
     pipeline._stage10_quality_frozen_background_sampling = None
     pipeline._stage10_quality_baseline_stem = ""
+    stage10_background_support = (
+        _stage10_freeze_authenticated_background_masks(pipeline)
+    )
+    pipeline._write_stage_json(
+        "stage10_background_support.json",
+        stage10_background_support,
+    )
+    messages.append(
+        "authenticated_background_support="
+        f"{stage10_background_support.get('status', 'rejected')}"
+    )
+    if stage10_background_support.get("accepted") is not True:
+        pipeline._require_review(
+            10,
+            "stage10_authenticated_background_support_unavailable",
+            details={
+                "issues": list(stage10_background_support.get("issues") or [])
+            },
+        )
+    pipeline._presentation_quality_report = presentation_quality.unavailable_presentation_report(
+        "stage10_not_evaluated"
+    )
+    pipeline._presentation_quality_accepted = False
+    pipeline._scientific_quality_accepted = False
     processing_mode = _stage10_config_choice(
         pipeline.cfg,
         "stage10_processing_mode",
@@ -1632,6 +1863,8 @@ def run_stage10_export(pipeline) -> None:
         pipeline._require_review(9, "stage9_required_stars_not_applied")
     if stage9_starmask_stretch_failed:
         pipeline._require_review(9, "stage9_starmask_stretch_failed")
+    if stage9_contract_known and not stage9_remix_formally_accepted:
+        pipeline._require_review(9, "stage9_remix_not_formally_accepted")
     if stage6_quality_hard_failed_retained:
         pipeline._require_review(6, "stage6_quality_hard_failed_retained")
     if stage7_forced_delivery:
@@ -1837,6 +2070,32 @@ def run_stage10_export(pipeline) -> None:
     else:
         pipeline.log.warn("使用来源未确认的 Siril 当前图像生成复核产物")
 
+    stage9_contract_state = _stage10_stage9_contract_state(
+        pipeline,
+        final_source=final_file,
+        final_loaded=final_loaded,
+    )
+    stage9_contract_known = bool(stage9_contract_state["known"])
+    if not stage9_contract_known:
+        pipeline._require_review(9, "stage9_formal_contract_unavailable")
+        review_only_output = True
+        messages.append(
+            "Stage9 formal delivery contract is unavailable for the loaded "
+            "source; terminal denoise is disabled and only review output is "
+            "allowed"
+        )
+    elif not bool(stage9_contract_state["formal"]):
+        pipeline._require_review(9, "stage9_delivery_contract_not_formal")
+        review_only_output = True
+        messages.append(
+            "Stage9 delivery contract is not formal for the loaded source; "
+            "terminal denoise is disabled and only review output is allowed"
+        )
+    stage9_review_reasons = set(pipeline._stage_review_reasons(9))
+    review_only_output = bool(
+        review_only_output or pipeline._review_requirements_payload()
+    )
+
     def handle_decisive_failure(
         reason: str,
         *,
@@ -1935,6 +2194,9 @@ def run_stage10_export(pipeline) -> None:
         if (
             preserve_mode
             or not final_saturation_enabled
+            or review_only_output
+            or not stage9_contract_known
+            or not bool(stage9_contract_state["formal"])
             or bool(
                 getattr(pipeline, "_skip_stage10_color_adjustments", False)
             )
@@ -1954,6 +2216,15 @@ def run_stage10_export(pipeline) -> None:
         messages.append("Stage10 preserve mode skipped final saturation")
     elif not final_saturation_enabled:
         messages.append("Stage10 final saturation disabled by task configuration")
+    elif (
+        review_only_output
+        or not stage9_contract_known
+        or not bool(stage9_contract_state["formal"])
+    ):
+        messages.append(
+            "Stage10 final saturation skipped because the loaded source or "
+            "run is review-only"
+        )
     elif bool(getattr(pipeline, "_skip_stage10_color_adjustments", False)):
         messages.append(
             "Stage10 color adjustment skipped by input-state review guard"
@@ -2098,6 +2369,7 @@ def run_stage10_export(pipeline) -> None:
     denoise_plan["processing_mode"] = processing_mode
     denoise_plan["backend_policy"] = denoise_backend_policy
     denoise_plan["final_denoise_enabled"] = final_denoise_enabled
+    denoise_plan["stage9_contract"] = dict(stage9_contract_state)
     if denoise_backend_policy == "scunet_only":
         final_denoise_script = None
         final_denoise_executable_args = None
@@ -2613,7 +2885,9 @@ def run_stage10_export(pipeline) -> None:
     stage10_applied_saturation = 0.0
     stage10_saturation_failed = False
     stage10_color_rebalance_blocked_reason = (
-        "preserve_review"
+        "review_only_output"
+        if review_only_output
+        else "preserve_review"
         if preserve_review_triggered
         else "denoise_safety_failure"
         if denoise_effective_status == "protection_failed"
@@ -2622,6 +2896,8 @@ def run_stage10_export(pipeline) -> None:
     if (
         abs(effective_final_saturation) > 1e-8
         and not stage10_color_rebalance_blocked_reason
+        and stage9_contract_known
+        and bool(stage9_contract_state["formal"])
     ):
         try:
             pipeline.log.info("最终降噪后执行预算内色彩补偿...")
@@ -2931,6 +3207,131 @@ def run_stage10_export(pipeline) -> None:
             if policy_outcome == "terminal":
                 return
 
+    pipeline._scientific_quality_accepted = bool(
+        final_quality_gate_status == "ok"
+        and str(final_quality.get("status") or "").strip().lower() == "ok"
+        and str(final_quality.get("final_quality") or "").strip().lower()
+        == "ok"
+        and final_quality.get("needs_conservative_rerun") is False
+        and not list(final_quality.get("issues") or [])
+    )
+    presentation_reason_code = ""
+    if stage_saved and pipeline._scientific_quality_accepted:
+        try:
+            final_presentation_pixels = pipeline._read_image_by_stem(
+                "stage10_final"
+            )
+            stage7_presentation_pixels = pipeline._read_image_by_stem(
+                "stage7_presentation_reference"
+            )
+            if final_presentation_pixels is None:
+                raise RuntimeError("stage10_final pixels unavailable")
+            if stage7_presentation_pixels is None:
+                raise RuntimeError(
+                    "stage7_presentation_reference pixels unavailable"
+                )
+            reference_verification = (
+                presentation_quality.verify_stage7_presentation_reference(
+                    getattr(
+                        pipeline,
+                        "_stage7_presentation_reference_report",
+                        {},
+                    ),
+                    stage7_presentation_pixels,
+                    Path(pipeline.process_dir)
+                    / "stage7_presentation_reference.fit",
+                )
+            )
+            profile_name = ""
+            profile_getter = getattr(
+                pipeline,
+                "_stage7_target_stretch_profile",
+                None,
+            )
+            if callable(profile_getter):
+                profile_record = profile_getter()
+                if isinstance(profile_record, dict):
+                    profile_name = str(profile_record.get("name") or "")
+            stars_application_mode = str(
+                getattr(pipeline, "_stage9_stars_application_mode", "") or ""
+            )
+            stars_not_required_verified = bool(
+                not stage9_stars_required
+                and stage9_remix_formally_accepted
+                and stars_application_mode == "stars_not_required"
+                and not pipeline._stage_review_reasons(9)
+            )
+            presentation_report = (
+                presentation_quality.build_presentation_quality_report(
+                    stage7_presentation_pixels,
+                    final_presentation_pixels,
+                    getattr(
+                        pipeline,
+                        "_stage7_frozen_rendition_masks",
+                        None,
+                    ),
+                    pipeline.cfg,
+                    target_type=active_target_type,
+                    profile_name=profile_name,
+                    stage9_quality=getattr(
+                        pipeline,
+                        "_stage9_selected_remix_quality",
+                        None,
+                    ),
+                    stars_required=stage9_stars_required,
+                    stars_not_required_verified=(
+                        stars_not_required_verified
+                    ),
+                    scientific_report=final_quality,
+                )
+            )
+            presentation_report["reference_verification"] = (
+                reference_verification
+            )
+            pipeline.cmd_with_check("load", "stage10_final")
+        except (
+            AttributeError,
+            CommandError,
+            OSError,
+            RuntimeError,
+            SirilError,
+            TypeError,
+            ValueError,
+        ) as error:
+            presentation_report = (
+                presentation_quality.unavailable_presentation_report(
+                    str(error)
+                )
+            )
+            try:
+                pipeline.cmd_with_check("load", "stage10_final")
+            except (CommandError, SirilError):
+                pass
+    else:
+        presentation_report = presentation_quality.unavailable_presentation_report(
+            "scientific_quality_gate_not_accepted"
+        )
+    pipeline._presentation_quality_report = dict(presentation_report)
+    pipeline._presentation_quality_accepted = bool(
+        presentation_report.get("accepted", False)
+    )
+    pipeline._write_stage_json(
+        "presentation_quality_report.json",
+        presentation_report,
+    )
+    messages.append(
+        "presentation_quality="
+        f"{presentation_report.get('status', 'unavailable')}"
+    )
+    if not pipeline._presentation_quality_accepted:
+        presentation_reason_code = "presentation_quality_requires_review"
+        review_only_output = True
+        status = "degraded" if status == "ok" else status
+        pipeline._require_review(10, presentation_reason_code)
+        pipeline.log.warn(
+            "Stage10 表现门未通过；本轮只允许导出 result_review*"
+        )
+
     managed_export_enabled = bool(
         getattr(pipeline.cfg, "stage10_managed_output_enabled", True)
     )
@@ -2938,10 +3339,11 @@ def run_stage10_export(pipeline) -> None:
     managed_export_report: Optional[Dict[str, Any]] = None
     stage10_star_reference: Optional[Dict[str, Any]] = None
     stage10_star_catalog_resolution: Dict[str, Any] = {
-        "schema": "starun.stage10-star-catalog-resolution.v1",
+        "schema": "starun.stage10-star-catalog-resolution.v2",
         "status": "not_required" if not stage9_stars_required else "not_run",
     }
     stage10_pre_export_visibility: Optional[Dict[str, Any]] = None
+    review_display_contract: Optional[Dict[str, Any]] = None
     if managed_export_enabled or review_only_output:
         try:
             if stage_saved:
@@ -2983,15 +3385,165 @@ def run_stage10_export(pipeline) -> None:
                 strict_stop=failure_action == "stop",
             )
             return
+        star_audit_pixels = managed_pixels
+        star_audit_domain = "native_final_pixel_domain"
+        review_catalog_audit = bool(
+            review_only_output
+            and stage9_contract_known
+            and stage9_output_contains_stars
+            and final_loaded
+            and final_file == preferred_final_source
+        )
+        if review_catalog_audit:
+            try:
+                # Verify a real frozen catalog before allowing a very flat
+                # linear review source to receive an observer-only mapping.
+                # Generic compact peaks are deliberately not consulted here.
+                preliminary_reference, preliminary_resolution = (
+                    _stage10_star_visibility_reference(
+                        pipeline,
+                        managed_pixels,
+                        restore_stem=(
+                            "stage10_final" if stage_saved else final_file
+                        ),
+                    )
+                )
+                stage10_star_reference = preliminary_reference
+                stage10_star_catalog_resolution = preliminary_resolution
+                if (
+                    preliminary_reference is None
+                    or preliminary_resolution.get("status") != "ready"
+                ):
+                    raise RuntimeError(
+                        "trusted with-stars review catalog is unavailable: "
+                        + str(
+                            preliminary_resolution.get("reason")
+                            or "catalog lineage could not be verified"
+                        )
+                    )
+                preliminary_star_count = int(
+                    preliminary_resolution.get("star_count") or 0
+                )
+                if preliminary_star_count < 16:
+                    raise RuntimeError(
+                        "trusted with-stars review catalog has fewer than "
+                        f"16 stars: {preliminary_star_count}"
+                    )
+                review_input_visibility = audit_display_visibility(
+                    managed_pixels,
+                    target_type=active_target_type,
+                    stars_required=False,
+                    pixel_coordinate_domain="siril_pixel_buffer_bottom_up",
+                    star_visibility_config=pipeline.cfg,
+                )
+                review_display_contract = display_rendition.build_review_contract(
+                    managed_pixels,
+                    reason=(
+                        final_source_review_reason
+                        or "stage10_review_only_catalog_audit"
+                    ),
+                    source_stem="stage10_final",
+                    input_visibility=review_input_visibility,
+                )
+                if (
+                    not display_rendition.validate_review_contract(
+                        review_display_contract
+                    )
+                    and review_input_visibility.get("exposure_state")
+                    == "unmappable"
+                    and bool(
+                        (review_input_visibility.get("metrics") or {}).get(
+                            "underexposed"
+                        )
+                    )
+                    and not bool(
+                        (review_input_visibility.get("metrics") or {}).get(
+                            "overexposed"
+                        )
+                    )
+                ):
+                    # A linear galaxy can be too compressed to satisfy the
+                    # pre-map extended-subject proxy even though its signed
+                    # catalog and with-stars lineage are valid.  Freeze the
+                    # bounded linked mapping, then require the mapped galaxy
+                    # and all catalog visibility gates to pass below.
+                    review_display_contract = (
+                        display_rendition.build_linked_review_contract(
+                            managed_pixels,
+                            reason=(
+                                final_source_review_reason
+                                or "stage10_review_only_catalog_audit"
+                            ),
+                            source_stem="stage10_final",
+                            input_visibility=review_input_visibility,
+                        )
+                    )
+                    review_display_contract["selection_evidence"] = {
+                        "mode": "trusted_catalog_underexposed_linear_review",
+                        "catalog_source": preliminary_resolution.get(
+                            "source"
+                        ),
+                        "catalog_star_count": preliminary_star_count,
+                        "native_subject_proxy": "unmappable",
+                        "post_mapping_subject_gate_required": True,
+                        "compact_peaks_used": False,
+                    }
+                if not display_rendition.validate_review_contract(
+                    review_display_contract
+                ):
+                    raise RuntimeError("review display contract validation failed")
+                star_audit_pixels = display_rendition.apply_review_contract(
+                    managed_pixels,
+                    review_display_contract,
+                )
+                star_audit_domain = "shared_review_display_contract"
+            except (RuntimeError, TypeError, ValueError) as error:
+                diagnostic_audit = audit_display_visibility(
+                    managed_pixels,
+                    target_type=active_target_type,
+                    stars_required=True,
+                    star_reference=None,
+                    pixel_coordinate_domain="siril_pixel_buffer_bottom_up",
+                    star_visibility_config=pipeline.cfg,
+                )
+                pipeline._write_stage_json(
+                    "stage10_pre_export_visibility.json",
+                    {
+                        "schema": "starun.stage10-pre-export-visibility.v2",
+                        "audit_domain": "native_final_pixel_diagnostic_only",
+                        "delivery_scope": "review_only",
+                        "display_contract": {
+                            "status": "unavailable",
+                            "error": str(error),
+                        },
+                        "catalog_resolution": (
+                            stage10_star_catalog_resolution
+                        ),
+                        "audit": diagnostic_audit,
+                    },
+                )
+                _stage10_terminal_failure(
+                    pipeline,
+                    stage_label,
+                    messages,
+                    reason_code="required_stars_catalog_visibility_failed",
+                    reason=f"review-only star audit mapping unavailable: {error}",
+                    action=failure_action,
+                    strict_stop=failure_action == "stop",
+                )
+                return
         stage10_star_reference, stage10_star_catalog_resolution = (
             _stage10_star_visibility_reference(
                 pipeline,
-                managed_pixels,
+                star_audit_pixels,
                 restore_stem="stage10_final" if stage_saved else final_file,
+                display_contract=(
+                    review_display_contract if review_catalog_audit else None
+                ),
             )
         )
         stage10_pre_export_visibility = audit_display_visibility(
-            managed_pixels,
+            star_audit_pixels,
             target_type=active_target_type,
             stars_required=True,
             star_reference=stage10_star_reference,
@@ -3001,7 +3553,23 @@ def run_stage10_export(pipeline) -> None:
         pipeline._write_stage_json(
             "stage10_pre_export_visibility.json",
             {
-                "schema": "starun.stage10-pre-export-visibility.v1",
+                "schema": "starun.stage10-pre-export-visibility.v2",
+                "audit_domain": star_audit_domain,
+                "delivery_scope": (
+                    "review_only" if review_catalog_audit else "formal"
+                ),
+                "display_contract": (
+                    {
+                        "schema": review_display_contract.get("schema"),
+                        "name": review_display_contract.get("name"),
+                        "mode": review_display_contract.get("mode"),
+                        "observer_only": review_display_contract.get(
+                            "observer_only"
+                        ),
+                    }
+                    if review_display_contract is not None
+                    else None
+                ),
                 "catalog_resolution": stage10_star_catalog_resolution,
                 "audit": stage10_pre_export_visibility,
             },
@@ -3038,7 +3606,6 @@ def run_stage10_export(pipeline) -> None:
             )
             return
 
-    review_display_contract: Optional[Dict[str, Any]] = None
     if review_only_output:
         pipeline._review_display_route = True
         frozen_contract = dict(
@@ -3047,7 +3614,9 @@ def run_stage10_export(pipeline) -> None:
         contract_reason = str(
             frozen_contract.get("reason") or "stage10_review_only_output"
         )
-        if managed_pixels is not None:
+        if review_display_contract is not None:
+            frozen_contract = dict(review_display_contract)
+        elif managed_pixels is not None:
             try:
                 input_visibility = audit_display_visibility(
                     managed_pixels,
@@ -3630,6 +4199,8 @@ def run_stage10_export(pipeline) -> None:
         if failure_policy_reason
         else final_quality_reason_code
         if final_quality_reason_code
+        else presentation_reason_code
+        if presentation_reason_code
         else denoise_fallback_reason
         if stage_denoise_fallback_used
         else "final_source_recovery"
@@ -3648,6 +4219,8 @@ def run_stage10_export(pipeline) -> None:
         pipeline._require_review(10, final_source_review_reason)
     if final_quality_reason_code:
         pipeline._require_review(10, final_quality_reason_code)
+    if review_only_output and status == "ok":
+        status = "degraded"
 
     elapsed = pipeline.log.stage_end(stage_label)
     pipeline._record_stage(
@@ -3702,6 +4275,16 @@ def run_stage10_export(pipeline) -> None:
             "retained_unverified_current_image": not final_loaded,
             "final_quality_gate_status": final_quality_gate_status,
             "final_quality_gate_error": final_quality_gate_error or None,
+            "scientific_quality_accepted": bool(
+                pipeline._scientific_quality_accepted
+            ),
+            "presentation_quality_status": str(
+                presentation_report.get("status") or "unavailable"
+            ),
+            "presentation_quality_accepted": bool(
+                pipeline._presentation_quality_accepted
+            ),
+            "presentation_quality_report": "presentation_quality_report.json",
             "final_quality_severity": final_quality.get("severity"),
             "final_quality_warning_count": len(
                 final_quality.get("warnings") or []

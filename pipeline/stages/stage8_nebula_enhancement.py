@@ -1,4 +1,6 @@
 """Stage 8 starless nebula enhancement."""
+import json
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -21,11 +23,24 @@ from dualband_palette import (
 from image_metrics import format_feature_summary
 from models import PipelineStage, StarSeparationState
 from pipeline_safety import color_safety_limits, clamp_saturation_boost
+import run_manifest
+from stage8_handoff import (
+    seal_stage8_handoff,
+    verify_stage8_handoff_integrity,
+)
+import stage7_stretch_metrics
+import star_halo_guard
+import spatial_background_lineage
 from stage8_pixels import (
+    stage8_large_galaxy_structure_masks,
     stage8_mixed_nebula_composite_context,
+    stage8_outside_target_identity_report,
     stage8_restore_rgb_like,
     stage8_star_preserve_nebulosity_context,
     stage8_star_preserve_nebulosity_overlay,
+    stage8_subject_boundary_retry_candidate,
+    stage8_subject_boundary_seam_report,
+    stage8_target_structure_masks,
 )
 from stage8_color_rendition import (
     STAGE8_SUBJECT_CHROMA_SCHEMA,
@@ -34,6 +49,105 @@ from stage8_color_rendition import (
     subject_saturation_median,
     target_aware_chroma_factor,
 )
+from stage8_starless_finish import (
+    DECODED_PIXEL_SHA256_METHOD,
+    FITS_DATA_SHA256_METHOD,
+    STAGE8_STARLESS_FINISH_SCHEMA,
+    assess_finish_candidate,
+    canonical_decoded_pixel_sha256,
+    pixel_sha256,
+    persisted_fits_decoded_pixel_sha256,
+    project_linked_luminance_candidate,
+    project_luminance_locked_color_candidate,
+)
+
+
+STAGE8_HANDOFF_SCHEMA = "starun.stage8-handoff.v3"
+
+_STAGE8_LIMITED_SAFE_REASON_CODES = {
+    "bright_nebula_halo_advisory",
+    "stage6_quality_advisory",
+    "stage6_starless_pixel_repair_accepted",
+    "user_stage8_cap=limited",
+}
+
+
+def _write_stage8_handoff(
+    pipeline,
+    handoff: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Seal, self-verify, and persist the exact Stage 8 handoff record."""
+
+    sealed = seal_stage8_handoff(handoff)
+    verification = verify_stage8_handoff_integrity(sealed)
+    if verification.get("accepted") is not True:
+        raise RuntimeError("stage8_handoff_writer_self_verification_failed")
+    pipeline._stage8_handoff = sealed
+    pipeline._write_stage_json("stage8_handoff.json", sealed)
+    return sealed
+
+
+def _stage8_source_identity(pipeline, source_stem: Optional[str]) -> Dict[str, Any]:
+    """Resolve the persisted Stage8 artifact identity without changing images."""
+
+    stem = str(source_stem or "").strip()
+    filename = f"{stem}.fit" if stem else None
+    process_dir = getattr(pipeline, "process_dir", None)
+    path = process_dir / filename if process_dir is not None and filename else None
+    container_sha256 = (
+        run_manifest.sha256_file(path)
+        if path is not None and path.is_file()
+        else None
+    )
+    fits_data_digest = None
+    decoded_pixel_digest = None
+    fingerprint = None
+    fingerprint_reader = getattr(pipeline, "_fits_stage_fingerprint", None)
+    if callable(fingerprint_reader) and path is not None and path.is_file():
+        try:
+            fingerprint = fingerprint_reader(path)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            fingerprint = None
+    if isinstance(fingerprint, dict):
+        fits_data_digest = str(fingerprint.get("data_sha256") or "") or None
+    if path is not None and path.is_file():
+        try:
+            decoded_pixel_digest = persisted_fits_decoded_pixel_sha256(path)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            decoded_pixel_digest = None
+    if fits_data_digest is None or decoded_pixel_digest is None:
+        saved = getattr(pipeline, "saved_image_pixels", None)
+        if isinstance(saved, dict) and stem in saved:
+            try:
+                if fits_data_digest is None:
+                    fits_data_digest = pixel_sha256(saved[stem])
+                if decoded_pixel_digest is None:
+                    decoded_pixel_digest = canonical_decoded_pixel_sha256(
+                        saved[stem]
+                    )
+            except (TypeError, ValueError):
+                pass
+    identity_status = (
+        "verified"
+        if container_sha256 and fits_data_digest and decoded_pixel_digest
+        else "container_verified"
+        if container_sha256
+        else "unavailable"
+    )
+    return {
+        "artifact": filename,
+        "sha256": container_sha256,
+        # ``pixel_sha256`` remains the v3 FITS logical-data identity for
+        # compatibility.  The decoded buffer uses its own explicitly named
+        # digest domain and must never be compared directly with this value.
+        "pixel_sha256": fits_data_digest,
+        "pixel_sha256_method": FITS_DATA_SHA256_METHOD,
+        "fits_data_sha256": fits_data_digest,
+        "fits_data_sha256_method": FITS_DATA_SHA256_METHOD,
+        "decoded_pixel_sha256": decoded_pixel_digest,
+        "decoded_pixel_sha256_method": DECODED_PIXEL_SHA256_METHOD,
+        "identity_status": identity_status,
+    }
 
 
 def _set_stage8_handoff(
@@ -43,6 +157,8 @@ def _set_stage8_handoff(
     passthrough: bool,
     restricted_downstream: bool,
     final_quality: str,
+    processing_route: str = "review_only",
+    formal_eligible: bool = False,
     reason_code: str = "",
     reason_text: str = "",
 ) -> Dict[str, Any]:
@@ -60,20 +176,1204 @@ def _set_stage8_handoff(
         for item in reasons
     ):
         reasons.append({"code": reason_code, "source_stage": 8})
+    source_identity = _stage8_source_identity(pipeline, source_stem)
+    input_stem = str(getattr(pipeline, "_stage8_input_source", "") or "")
+    input_identity = _stage8_source_identity(pipeline, input_stem)
+    source_verified = bool(
+        source_identity.get("sha256")
+        and source_identity.get("fits_data_sha256")
+        and source_identity.get("decoded_pixel_sha256")
+    )
+    input_verified = bool(
+        not input_stem
+        or (
+            input_identity.get("sha256")
+            and input_identity.get("fits_data_sha256")
+            and input_identity.get("decoded_pixel_sha256")
+        )
+    )
+    lineage_verified = bool(source_verified and input_verified)
+    cumulative = dict(
+        getattr(pipeline, "_stage8_final_cumulative_quality_report", {}) or {}
+    )
+    cumulative_required = processing_route in {
+        "structure_enhanced",
+        "safe_passthrough_color_only",
+    }
+    cumulative_verified = bool(
+        not cumulative_required
+        or (
+            cumulative.get("schema")
+            == "starun.stage8-final-cumulative-quality.v1"
+            and cumulative.get("status") == "accepted"
+            and cumulative.get("accepted") is True
+            and cumulative.get("fresh_evaluation") is True
+            and not list(cumulative.get("issues") or [])
+        )
+    )
+    effective_restricted_downstream = bool(
+        restricted_downstream
+        or (cumulative_required and not cumulative_verified)
+    )
+    effective_formal_eligible = bool(
+        formal_eligible
+        and not effective_restricted_downstream
+        and lineage_verified
+        and cumulative_verified
+        and processing_route
+        in {
+            "structure_enhanced",
+            "safe_passthrough_color_only",
+            "star_preserve_secondary_nebulosity",
+        }
+    )
     handoff.update(
         {
-            "schema": "starun.stage8-handoff.v1",
+            "schema": STAGE8_HANDOFF_SCHEMA,
             "source_stem": source_stem,
             "passthrough": bool(passthrough),
-            "restricted_downstream": bool(restricted_downstream),
+            "restricted_downstream": effective_restricted_downstream,
+            "processing_route": str(processing_route),
+            "formal_eligible": effective_formal_eligible,
             "reason_code": effective_reason_code,
             "reason_text": effective_reason_text,
             "reasons": reasons,
             "final_quality": final_quality,
+            "source_artifact": source_identity,
+            "artifact_sha256": source_identity.get("sha256"),
+            "pixel_sha256": source_identity.get("pixel_sha256"),
+            "pixel_sha256_method": source_identity.get("pixel_sha256_method"),
+            "fits_data_sha256": source_identity.get("fits_data_sha256"),
+            "fits_data_sha256_method": source_identity.get(
+                "fits_data_sha256_method"
+            ),
+            "decoded_pixel_sha256": source_identity.get(
+                "decoded_pixel_sha256"
+            ),
+            "decoded_pixel_sha256_method": source_identity.get(
+                "decoded_pixel_sha256_method"
+            ),
+            "lineage": {
+                "input_stem": input_stem or None,
+                "input_artifact": input_identity if input_stem else None,
+                "output_stem": source_stem,
+                "output_artifact": source_identity,
+            },
+            "starless_finish_report": "stage8_starless_finish_report.json",
+            "final_cumulative_quality_report": (
+                "stage8_final_cumulative_quality.json"
+                if cumulative_required
+                else None
+            ),
+            "final_cumulative_quality_verified": cumulative_verified,
         }
     )
-    pipeline._stage8_handoff = handoff
-    return handoff
+    handoff["lineage_verified"] = lineage_verified
+    return _write_stage8_handoff(pipeline, handoff)
+
+
+def _stage8_review_requirements_through_stage8(pipeline) -> List[Dict[str, Any]]:
+    """Return persisted review requirements that already block formal Stage8."""
+
+    payload_builder = getattr(pipeline, "_review_requirements_payload", None)
+    if callable(payload_builder):
+        try:
+            payload = payload_builder(through_stage=8)
+        except (TypeError, ValueError):
+            payload = []
+        if isinstance(payload, list):
+            return [dict(item) for item in payload if isinstance(item, dict)]
+    reasons: List[Dict[str, Any]] = []
+    reason_reader = getattr(pipeline, "_stage_review_reasons", None)
+    if callable(reason_reader):
+        for stage in range(1, 9):
+            try:
+                stage_reasons = reason_reader(stage)
+            except (TypeError, ValueError):
+                stage_reasons = []
+            reasons.extend(
+                {"stage": stage, "code": str(code)}
+                for code in (stage_reasons or [])
+                if str(code).strip()
+            )
+    return reasons
+
+
+def _stage8_limited_safe_passthrough_eligibility(
+    pipeline,
+    *,
+    stage8_guard_report: Dict[str, Any],
+    final_source: str,
+    final_quality: str,
+    user_processing_mode: str,
+    external_override: bool,
+) -> Dict[str, Any]:
+    """Separate an upstream advisory from a retained scientific hard failure."""
+
+    incoming = dict(getattr(pipeline, "_stage8_handoff", {}) or {})
+    guard = dict(stage8_guard_report or {})
+    reason_codes = {
+        str(item.get("code") or "").strip()
+        for item in (incoming.get("reasons") or [])
+        if isinstance(item, dict) and str(item.get("code") or "").strip()
+    }
+    primary_reason = str(
+        guard.get("reason_code") or incoming.get("reason_code") or ""
+    ).strip()
+    if primary_reason:
+        reason_codes.add(primary_reason)
+
+    metrics = dict(incoming.get("metrics") or {})
+    metric_pairs = (
+        ("residual_star_score", "residual_star_hard_limit"),
+        ("starless_noise_gain", "starless_noise_gain_hard_limit"),
+        ("effective_halo_residue_score", "halo_residue_hard_limit"),
+    )
+    metric_evidence_complete = True
+    upstream_hard_metric_clear = True
+    metric_checks: Dict[str, Any] = {}
+    for value_name, limit_name in metric_pairs:
+        try:
+            value = float(metrics[value_name])
+            limit = float(metrics[limit_name])
+            accepted = bool(np.isfinite(value) and np.isfinite(limit) and value <= limit)
+        except (KeyError, TypeError, ValueError):
+            value = None
+            limit = None
+            accepted = False
+            metric_evidence_complete = False
+        upstream_hard_metric_clear = bool(upstream_hard_metric_clear and accepted)
+        metric_checks[value_name] = {
+            "value": value,
+            "hard_limit": limit,
+            "accepted": accepted,
+        }
+
+    review_requirements = _stage8_review_requirements_through_stage8(pipeline)
+    reason_codes_supported = bool(
+        reason_codes
+        and reason_codes.issubset(_STAGE8_LIMITED_SAFE_REASON_CODES)
+    )
+    if not reason_codes and str(user_processing_mode).strip().lower() == "limited":
+        reason_codes_supported = True
+    checks = {
+        "limited_policy": str(guard.get("processing_policy") or "").lower()
+        == "limited",
+        "guard_status": str(guard.get("status") or "").lower() == "ok",
+        "guard_hard_reasons_clear": not list(guard.get("hard_reasons") or []),
+        "guard_subject_reasons_clear": not list(
+            guard.get("subject_reasons") or []
+        ),
+        "upstream_quality_ok": str(incoming.get("quality_status") or "").lower()
+        == "ok",
+        "upstream_reason_is_safe": reason_codes_supported,
+        "upstream_hard_metric_evidence_complete": metric_evidence_complete,
+        "upstream_hard_metrics_clear": upstream_hard_metric_clear,
+        "final_candidate_ready": (
+            str(final_source) == "stage8_enhanced"
+            and str(final_quality) == "ok"
+        ),
+        "processing_mode_safe": str(user_processing_mode).strip().lower()
+        in {"auto", "limited"},
+        "no_external_override": not bool(external_override),
+        "review_requirement_free": not review_requirements,
+    }
+    issues = [name for name, accepted in checks.items() if not accepted]
+    return {
+        "schema": "starun.stage8-limited-safe-passthrough-eligibility.v1",
+        "status": "eligible" if not issues else "rejected",
+        "accepted": not issues,
+        "checks": checks,
+        "issues": issues,
+        "reason_codes": sorted(reason_codes),
+        "upstream_hard_metrics": metric_checks,
+        "review_requirements": review_requirements,
+    }
+
+
+def _stage8_safe_passthrough_preflight(
+    pipeline,
+    *,
+    source_mode: str = "structure_rollback",
+    eligibility: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Verify an exact structure rollback before any color-only transaction."""
+
+    report: Dict[str, Any] = {
+        "schema": "starun.stage8-safe-passthrough-preflight.v1",
+        "status": "rejected",
+        "accepted": False,
+        "route": "safe_passthrough_color_only",
+        "source_mode": str(source_mode),
+        "eligibility": dict(eligibility or {}),
+        "checks": {},
+        "issues": [],
+    }
+    try:
+        baseline = pipeline._read_image_by_stem("stage8_input_starless")
+        canonical = pipeline._read_image_by_stem("stage8_enhanced")
+        if baseline is None or canonical is None:
+            raise ValueError("safe_passthrough_pixels_unavailable")
+        baseline_array = np.asarray(baseline)
+        canonical_array = np.asarray(canonical)
+        baseline_identity = _stage8_source_identity(
+            pipeline, "stage8_input_starless"
+        )
+        canonical_identity = _stage8_source_identity(pipeline, "stage8_enhanced")
+        rollback_identity = bool(
+            baseline_array.shape == canonical_array.shape
+            and np.array_equal(baseline_array, canonical_array)
+            and baseline_identity.get("pixel_sha256")
+            and baseline_identity.get("pixel_sha256")
+            == canonical_identity.get("pixel_sha256")
+        )
+        report["checks"]["exact_structure_rollback"] = {
+            "accepted": rollback_identity,
+            "baseline": baseline_identity,
+            "canonical": canonical_identity,
+        }
+
+        presentation = dict(
+            getattr(pipeline, "_stage7_presentation_reference_report", {}) or {}
+        )
+        presentation_path = (
+            Path(pipeline.process_dir) / "stage7_presentation_reference.json"
+            if getattr(pipeline, "process_dir", None) is not None
+            else None
+        )
+        if not presentation and presentation_path is not None:
+            presentation = json.loads(presentation_path.read_text(encoding="utf-8"))
+        unsigned_presentation = dict(presentation)
+        expected_report_sha = str(
+            unsigned_presentation.pop("report_sha256", "") or ""
+        )
+        source_artifact = dict(presentation.get("source_artifact") or {})
+        selected_candidate = dict(presentation.get("selected_candidate") or {})
+        baseline_presentation_pixel_sha = (
+            stage7_stretch_metrics.stage7_pixel_sha256(baseline_array)
+        )
+        binding_payload = {
+            "linear_source": presentation.get("linear_source"),
+            "selected_candidate": presentation.get("selected_candidate"),
+            "matched_domain": presentation.get("matched_domain"),
+            "formal_source_artifact": source_artifact,
+        }
+        presentation_accepted = bool(
+            presentation.get("schema")
+            == "starun.stage7-presentation-reference.v1"
+            and presentation.get("status") == "ready"
+            and presentation.get("accepted") is True
+            and presentation.get("reference_only") is True
+            and expected_report_sha
+            == stage7_stretch_metrics.canonical_json_sha256(
+                unsigned_presentation
+            )
+            and str(presentation.get("source_binding_sha256") or "")
+            == stage7_stretch_metrics.canonical_json_sha256(binding_payload)
+            and source_artifact.get("container_sha256")
+            and source_artifact.get("pixel_sha256")
+            and selected_candidate.get("container_sha256")
+            and selected_candidate.get("pixel_sha256")
+            and source_artifact.get("pixel_sha256")
+            == baseline_presentation_pixel_sha
+            and selected_candidate.get("pixel_sha256")
+            == baseline_presentation_pixel_sha
+        )
+        report["checks"]["stage7_presentation_reference"] = {
+            "accepted": presentation_accepted,
+            "schema": presentation.get("schema"),
+            "status": presentation.get("status"),
+            "source_binding_sha256": presentation.get("source_binding_sha256"),
+            "report_sha256": expected_report_sha or None,
+            "expected_pixel_sha256": source_artifact.get("pixel_sha256"),
+            "actual_pixel_sha256": baseline_presentation_pixel_sha,
+        }
+
+        spatial = spatial_background_lineage.assess_final_spatial_background(
+            getattr(pipeline, "process_dir", None),
+            baseline_array,
+        )
+        report["checks"]["spatial_background"] = spatial
+        seam = stage8_subject_boundary_seam_report(
+            pipeline,
+            baseline_array,
+            baseline_array,
+        )
+        report["checks"]["subject_boundary_seam"] = seam
+        masks = pipeline._stage8_generate_starless_masks(baseline_array)
+        halo = star_halo_guard.assess_candidate(
+            baseline_array,
+            baseline_array,
+            masks.get("star_halo_guard_mask"),
+            mode="color",
+        )
+        report["checks"]["star_halo"] = halo
+        finite = bool(np.all(np.isfinite(baseline_array)))
+        clipping = {
+            "accepted": finite,
+            "finite": finite,
+            "clip_ratio": float(
+                np.mean((baseline_array <= 0.0) | (baseline_array >= 1.0))
+            ),
+            "clip_growth": 0.0,
+        }
+        report["checks"]["clipping"] = clipping
+        checks = {
+            "exact_structure_rollback": rollback_identity,
+            "stage7_presentation_reference": presentation_accepted,
+            "spatial_background": bool(spatial.get("accepted", False)),
+            "subject_boundary_seam": bool(seam.get("accepted", False)),
+            "star_halo": bool(halo.get("accepted", False)),
+            "clipping": bool(clipping.get("accepted", False)),
+        }
+        report["issues"] = [name for name, accepted in checks.items() if not accepted]
+        report["accepted"] = not report["issues"]
+        report["status"] = "accepted" if report["accepted"] else "rejected"
+    except (
+        AttributeError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as error:
+        report["issues"] = [str(error)]
+    pipeline._stage8_safe_passthrough_color_only_preflight = dict(report)
+    pipeline._write_stage_json("stage8_safe_passthrough_preflight.json", report)
+    return report
+
+
+def _stage8_frozen_color_masks(
+    pipeline,
+    image_data: np.ndarray,
+) -> tuple[Dict[str, Any], List[str]]:
+    """Rebuild the same frozen Stage 7/8 ROI set used by color transactions."""
+
+    generated_masks = pipeline._stage8_generate_starless_masks(image_data)
+    if not isinstance(generated_masks, dict):
+        raise ValueError("Stage8 color masks are unavailable")
+    background = np.asarray(generated_masks.get("background_mask"))
+    if background.ndim != 2:
+        raise ValueError("Stage8 background mask is invalid")
+    spatial_shape = tuple(int(value) for value in background.shape)
+    masks: Dict[str, Any] = {
+        key: np.array(value, copy=True)
+        for key, value in generated_masks.items()
+        if value is not None
+        and np.asarray(value).ndim == 2
+        and tuple(np.asarray(value).shape) == spatial_shape
+    }
+    frozen_masks = getattr(pipeline, "_stage7_frozen_rendition_masks", {})
+    frozen_keys: List[str] = []
+    if isinstance(frozen_masks, dict):
+        for key, value in frozen_masks.items():
+            if value is None:
+                continue
+            array = np.asarray(value)
+            if array.ndim != 2 or tuple(array.shape) != spatial_shape:
+                continue
+            if not np.all(np.isfinite(array)):
+                continue
+            masks[key] = np.array(array, dtype=np.float32, copy=True)
+            frozen_keys.append(str(key))
+    if masks.get("subject_mask") is None:
+        subject_layers = [
+            np.asarray(masks[name], dtype=np.float32)
+            for name in (
+                "core_mask",
+                "nebula_mask",
+                "faint_nebula_mask",
+                "galaxy_signal_mask",
+            )
+            if masks.get(name) is not None
+        ]
+        masks["subject_mask"] = (
+            np.maximum.reduce(subject_layers)
+            if subject_layers
+            else np.clip(
+                1.0 - np.asarray(masks["background_mask"], dtype=np.float32),
+                0.0,
+                1.0,
+            )
+        ).astype(np.float32, copy=False)
+    return masks, sorted(frozen_keys)
+
+
+def _stage8_mutation_union_outside_identity(
+    pipeline,
+    baseline_array: np.ndarray,
+    candidate_array: np.ndarray,
+    *,
+    subject_chroma_report: Dict[str, Any],
+    palette_report: Dict[str, Any],
+    include_structure: bool,
+) -> Dict[str, Any]:
+    """Verify exact pixels outside every independently authorized mutation ROI."""
+
+    target_type = (
+        str(pipeline._active_target_type() or "").strip().lower()
+        if hasattr(pipeline, "_active_target_type")
+        else ""
+    )
+    baseline_shape = np.asarray(baseline_array).shape
+    if len(baseline_shape) == 2:
+        spatial_shape = tuple(int(value) for value in baseline_shape)
+    elif len(baseline_shape) == 3:
+        spatial_shape = tuple(int(value) for value in baseline_shape[-2:])
+    else:
+        raise ValueError("stage8_mutation_union_pixel_layout_unsupported")
+    allowed = np.zeros(spatial_shape, dtype=bool)
+    support_sources: List[str] = []
+    structure_mask_report: Dict[str, Any] = {}
+    structure_target_types = {
+        "large_galaxy",
+        "emission_nebula",
+        "emission_nebula_widefield",
+        "bright_emission_reflection_nebula",
+    }
+    needs_masks = bool(
+        (include_structure and target_type in structure_target_types)
+        or subject_chroma_report.get("accepted", False)
+        or palette_report.get("accepted", False)
+    )
+    masks: Dict[str, Any] = {}
+    frozen_keys: List[str] = []
+    if needs_masks:
+        masks, frozen_keys = _stage8_frozen_color_masks(
+            pipeline,
+            baseline_array,
+        )
+    if include_structure and target_type in structure_target_types:
+        routed_masks, structure_mask_report = stage8_target_structure_masks(
+            pipeline,
+            dict(masks),
+        )
+        if routed_masks is None:
+            raise ValueError(
+                "stage8_mutation_union_structure_support_unavailable:"
+                + str(structure_mask_report.get("reason") or "unknown")
+            )
+        structure_support = np.asarray(
+            routed_masks.get("enhancement_support_weight"),
+            dtype=np.float32,
+        )
+        if structure_support.shape != spatial_shape:
+            raise ValueError("stage8_mutation_union_structure_shape_mismatch")
+        allowed |= structure_support > 0.0
+        support_sources.append("target_structure_weight")
+
+    if bool(subject_chroma_report.get("accepted", False)):
+        subject_support = np.asarray(
+            masks.get("subject_mask"),
+            dtype=np.float32,
+        )
+        if subject_support.shape != spatial_shape or not np.all(
+            np.isfinite(subject_support)
+        ):
+            raise ValueError("stage8_mutation_union_subject_support_invalid")
+        # The color transaction independently proves exact identity outside
+        # this frozen ROI.  Use the whole frozen ROI here rather than the
+        # narrower structure mask; candidate pixels never define permission.
+        allowed |= subject_support > 1.0e-6
+        support_sources.append("frozen_subject_chroma_roi")
+
+    if bool(palette_report.get("accepted", False)):
+        core = np.asarray(masks.get("core_mask"), dtype=np.float32)
+        nebula = np.asarray(masks.get("nebula_mask"), dtype=np.float32)
+        faint = np.asarray(masks.get("faint_nebula_mask"), dtype=np.float32)
+        background = np.asarray(
+            masks.get("background_mask"),
+            dtype=np.float32,
+        )
+        stars = np.asarray(masks.get("star_mask"), dtype=np.float32)
+        halo = np.asarray(
+            masks.get("star_halo_guard_mask"),
+            dtype=np.float32,
+        )
+        if any(
+            value.shape != spatial_shape
+            for value in (core, nebula, faint, background, stars, halo)
+        ):
+            raise ValueError("stage8_mutation_union_palette_support_invalid")
+        palette_strength = float(
+            np.clip(
+                float(
+                    getattr(
+                        pipeline.cfg,
+                        "stage8_dualband_palette_strength",
+                        0.85,
+                    )
+                ),
+                0.10,
+                1.0,
+            )
+        )
+        palette_weight = np.clip(
+            np.maximum(nebula, faint)
+            * (1.0 - background)
+            * (1.0 - np.maximum.reduce((core, stars, halo))),
+            0.0,
+            1.0,
+        ) * palette_strength
+        palette_weight[background >= 0.80] = 0.0
+        palette_weight[palette_weight <= 0.01] = 0.0
+        allowed |= palette_weight > 0.0
+        support_sources.append("dualband_palette_subject_roi")
+
+    identity_masks = {
+        "enhancement_support_weight": allowed.astype(np.float32),
+        "mask_route": "accepted_mutation_roi_union_v1",
+    }
+    report = stage8_outside_target_identity_report(
+        baseline_array,
+        candidate_array,
+        identity_masks,
+        target_type=target_type,
+    )
+    report.update(
+        operation_support_contract=(
+            "candidate_independent_frozen_roi_union_v1"
+        ),
+        support_sources=support_sources,
+        frozen_mask_keys=frozen_keys,
+        structure_included=bool(include_structure),
+        structure_mask_report=structure_mask_report,
+        mutation_support_pixel_count=int(np.count_nonzero(allowed)),
+        mutation_support_coverage=float(np.mean(allowed)),
+        mutation_support_sha256=pixel_sha256(
+            np.ascontiguousarray(allowed.astype(np.uint8))
+        ),
+    )
+    if not support_sources and np.array_equal(baseline_array, candidate_array):
+        report["reason"] = "exact_verified_noop_identity"
+    return report
+
+
+def _stage8_quality_with_mutation_union(
+    pipeline,
+    *,
+    baseline_stem: str,
+    candidate_stem: str,
+    subject_chroma_report: Dict[str, Any],
+    palette_report: Dict[str, Any],
+    include_structure: bool,
+) -> Dict[str, Any]:
+    """Rebind only the outside-pixel gate to the accepted mutation ledger."""
+
+    try:
+        quality = dict(
+            pipeline._stage8_quality_assessment(
+                baseline_stem=baseline_stem,
+                candidate_stem=candidate_stem,
+            )
+        )
+    except TypeError:
+        # Small test doubles and historical runtime shims exposed the older
+        # no-keyword form.  The production method accepts the explicit stems.
+        quality = dict(pipeline._stage8_quality_assessment())
+    baseline = pipeline._read_image_by_stem(baseline_stem)
+    candidate = pipeline._read_image_by_stem(candidate_stem)
+    if baseline is None or candidate is None:
+        return quality
+    outside_identity = _stage8_mutation_union_outside_identity(
+        pipeline,
+        np.asarray(baseline),
+        np.asarray(candidate),
+        subject_chroma_report=subject_chroma_report,
+        palette_report=palette_report,
+        include_structure=include_structure,
+    )
+    outside_issue_prefix = "outside_target_pixel_identity_gate_failed="
+    issues = [
+        str(issue)
+        for issue in list(quality.get("issues") or [])
+        if not str(issue).startswith(outside_issue_prefix)
+    ]
+    if not bool(outside_identity.get("accepted", False)):
+        issues.append(
+            outside_issue_prefix
+            + str(outside_identity.get("reason") or "unknown")
+        )
+    quality["outside_target_identity"] = outside_identity
+    quality["issues"] = issues
+    quality["local_issues"] = list(issues)
+    quality_gates = dict(quality.get("quality_gates") or {})
+    if bool(outside_identity.get("applicable", False)):
+        outside_accepted = bool(outside_identity.get("accepted", False))
+        quality_gates["outside_target_pixel_identity"] = {
+            "value": bool(
+                outside_identity.get("exact_pixel_identity", False)
+            ),
+            "accepted_limit": True,
+            "accepted": outside_accepted,
+            "hard_failed": not outside_accepted,
+            "advisory": False,
+        }
+    quality["quality_gates"] = quality_gates
+    quality["status"] = "ok" if not issues else "poor"
+    quality["mutation_union_revalidation"] = {
+        "schema": "starun.stage8-mutation-union-revalidation.v1",
+        "status": "accepted" if not issues else "rejected",
+        "accepted": not issues,
+        "include_structure": bool(include_structure),
+        "support_sources": list(outside_identity.get("support_sources") or []),
+        "support_sha256": outside_identity.get("mutation_support_sha256"),
+    }
+    return quality
+
+
+def _stage8_nonmutating_color_terminal(
+    report: Dict[str, Any],
+    *,
+    expected_schema: str,
+    skipped_status: str,
+    rejected_status: str,
+    require_canonical_restore: bool,
+) -> Dict[str, Any]:
+    """Verify that a Stage8 color transaction reached a safe no-op terminal."""
+
+    value = report if isinstance(report, dict) else {}
+    status = str(value.get("status") or "")
+    transaction = value.get("transaction")
+    transaction = transaction if isinstance(transaction, dict) else {}
+    eligibility = value.get("eligibility")
+    eligibility = eligibility if isinstance(eligibility, dict) else {}
+    common = bool(
+        value.get("schema") == expected_schema
+        and value.get("accepted") is False
+        and value.get("feeds_main_pipeline") is False
+    )
+    skipped = bool(
+        common
+        and status == skipped_status
+        and eligibility.get("eligible") is False
+        and transaction.get("baseline_saved") is False
+        and transaction.get("candidate_saved") is False
+        and transaction.get("rollback_performed") is False
+    )
+    rejected = bool(
+        common
+        and status == rejected_status
+        and transaction.get("baseline_saved") is True
+        and transaction.get("candidate_saved") is False
+        and transaction.get("rollback_performed") is True
+        and transaction.get("rollback_ok") is True
+        and (
+            not require_canonical_restore
+            or transaction.get("canonical_saved") is True
+        )
+    )
+    return {
+        "schema": "starun.stage8-nonmutating-color-terminal.v1",
+        "status": "verified" if skipped or rejected else "unverified",
+        "accepted": bool(skipped or rejected),
+        "report_schema": value.get("schema"),
+        "report_status": status or None,
+        "terminal_mode": (
+            "ineligible_without_mutation"
+            if skipped
+            else "quality_rejected_and_rolled_back"
+            if rejected
+            else None
+        ),
+    }
+
+
+def _stage8_safe_passthrough_final_validation(
+    pipeline,
+    *,
+    subject_chroma_report: Dict[str, Any],
+    palette_report: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Re-run every independent gate on the color-only output."""
+
+    preflight = dict(
+        getattr(
+            pipeline,
+            "_stage8_safe_passthrough_color_only_preflight",
+            {},
+        )
+        or {}
+    )
+    report: Dict[str, Any] = {
+        "schema": "starun.stage8-safe-passthrough-final.v1",
+        "status": "rejected",
+        "accepted": False,
+        "route": "safe_passthrough_color_only",
+        "preflight": preflight,
+        "checks": {},
+        "issues": [],
+    }
+    try:
+        baseline = pipeline._read_image_by_stem("stage8_input_starless")
+        candidate = pipeline._read_image_by_stem("stage8_enhanced")
+        if baseline is None or candidate is None:
+            raise ValueError("safe_passthrough_final_pixels_unavailable")
+        baseline_array = np.asarray(baseline)
+        candidate_array = np.asarray(candidate)
+        color_operation_accepted = bool(
+            subject_chroma_report.get("accepted", False)
+            or palette_report.get("accepted", False)
+        )
+        exact_color_identity = bool(
+            baseline_array.shape == candidate_array.shape
+            and np.array_equal(baseline_array, candidate_array)
+        )
+        subject_noop = _stage8_nonmutating_color_terminal(
+            subject_chroma_report,
+            expected_schema=STAGE8_SUBJECT_CHROMA_SCHEMA,
+            skipped_status="skipped_ineligible",
+            rejected_status="rejected_by_quality_gate",
+            require_canonical_restore=True,
+        )
+        palette_noop = _stage8_nonmutating_color_terminal(
+            palette_report,
+            expected_schema=DUALBAND_PALETTE_SCHEMA,
+            skipped_status="skipped_ineligible",
+            rejected_status="rejected_by_palette_quality_gate",
+            require_canonical_restore=False,
+        )
+        limited_verified_noop = bool(
+            preflight.get("source_mode") == "limited_safe_passthrough"
+            and preflight.get("accepted") is True
+            and exact_color_identity
+        )
+        post_cumulative_verified_noop = bool(
+            preflight.get("source_mode")
+            == "post_cumulative_structure_rollback"
+            and preflight.get("accepted") is True
+            and exact_color_identity
+            and subject_noop.get("accepted") is True
+            and palette_noop.get("accepted") is True
+        )
+        color_accepted = bool(
+            color_operation_accepted
+            or limited_verified_noop
+            or post_cumulative_verified_noop
+        )
+        quality = _stage8_quality_with_mutation_union(
+            pipeline,
+            baseline_stem="stage8_input_starless",
+            candidate_stem="stage8_enhanced",
+            subject_chroma_report=subject_chroma_report,
+            palette_report=palette_report,
+            include_structure=False,
+        )
+        outside_target_identity = dict(
+            quality.get("outside_target_identity") or {}
+        )
+        spatial = spatial_background_lineage.assess_final_spatial_background(
+            getattr(pipeline, "process_dir", None),
+            candidate_array,
+        )
+        masks = pipeline._stage8_generate_starless_masks(baseline_array)
+        halo = star_halo_guard.assess_candidate(
+            baseline_array,
+            candidate_array,
+            masks.get("star_halo_guard_mask"),
+            mode="color",
+        )
+        finite_and_shape = bool(
+            baseline_array.shape == candidate_array.shape
+            and np.all(np.isfinite(candidate_array))
+        )
+        report["checks"] = {
+            "preflight": bool(preflight.get("accepted", False)),
+            "color": {
+                "accepted": color_accepted,
+                "mode": (
+                    "bounded_color_operation"
+                    if color_operation_accepted
+                    else "verified_pixel_identity"
+                    if limited_verified_noop
+                    else "verified_color_noop_after_structure_rollback"
+                    if post_cumulative_verified_noop
+                    else "unverified"
+                ),
+                "exact_pixel_identity": exact_color_identity,
+                "subject_chroma": bool(
+                    subject_chroma_report.get("accepted", False)
+                ),
+                "palette": bool(palette_report.get("accepted", False)),
+                "nonmutating_terminal_evidence": {
+                    "subject_chroma": subject_noop,
+                    "palette": palette_noop,
+                },
+            },
+            "background_seam_clip_presentation": quality,
+            "outside_target_pixel_identity": outside_target_identity,
+            "spatial_background": spatial,
+            "star_halo": halo,
+            "artifact": {
+                "accepted": finite_and_shape,
+                "identity": _stage8_source_identity(
+                    pipeline, "stage8_enhanced"
+                ),
+            },
+        }
+        checks = {
+            "preflight": bool(preflight.get("accepted", False)),
+            "color": color_accepted,
+            "background_seam_clip_presentation": quality.get("status") == "ok",
+            "outside_target_pixel_identity": bool(
+                outside_target_identity.get("accepted", False)
+            ),
+            "spatial_background": bool(spatial.get("accepted", False)),
+            "star_halo": bool(halo.get("accepted", False)),
+            "artifact": finite_and_shape,
+        }
+        report["issues"] = [name for name, accepted in checks.items() if not accepted]
+        report["accepted"] = not report["issues"]
+        report["status"] = "accepted" if report["accepted"] else "rejected"
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+        report["issues"] = [str(error)]
+    pipeline._stage8_safe_passthrough_color_only_final = dict(report)
+    pipeline._write_stage_json("stage8_safe_passthrough_final.json", report)
+    return report
+
+
+def _stage8_final_cumulative_validation(
+    pipeline,
+    *,
+    subject_chroma_report: Dict[str, Any],
+    palette_report: Dict[str, Any],
+    starless_finish_report: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Re-run every Stage8 gate on the final persisted pixel accumulation.
+
+    Local acceptance of structure, Starless finish, chroma, and palette
+    transactions is intentionally insufficient here.  Every measurement is
+    recomputed from the immutable Stage8 input to the final canonical FITS so
+    two individually safe deltas cannot cumulatively cross a hard limit.
+    """
+
+    report: Dict[str, Any] = {
+        "schema": "starun.stage8-final-cumulative-quality.v1",
+        "status": "rejected",
+        "accepted": False,
+        "evaluation_scope": (
+            "stage8_input_starless_to_final_persisted_pixels"
+        ),
+        "fresh_evaluation": True,
+        "baseline": "stage8_input_starless.fit",
+        "candidate": "stage8_enhanced.fit",
+        "checks": {},
+        "issues": [],
+        "mutation_ledger": {
+            "starless_finish": {
+                "status": starless_finish_report.get("status"),
+                "accepted": bool(starless_finish_report.get("accepted", False)),
+                "accepted_steps": list(
+                    starless_finish_report.get("accepted_steps") or []
+                ),
+            },
+            "subject_chroma": {
+                "status": subject_chroma_report.get("status"),
+                "accepted": bool(subject_chroma_report.get("accepted", False)),
+            },
+            "palette": {
+                "status": palette_report.get("status"),
+                "accepted": bool(palette_report.get("accepted", False)),
+                "palette": palette_report.get("palette"),
+            },
+        },
+    }
+    try:
+        baseline = pipeline._read_image_by_stem("stage8_input_starless")
+        candidate = pipeline._read_image_by_stem("stage8_enhanced")
+        if baseline is None or candidate is None:
+            raise ValueError("stage8_final_cumulative_pixels_unavailable")
+        baseline_array = np.asarray(baseline)
+        candidate_array = np.asarray(candidate)
+        shape_dtype_finite = bool(
+            baseline_array.shape == candidate_array.shape
+            and baseline_array.dtype == candidate_array.dtype
+            and np.all(np.isfinite(baseline_array))
+            and np.all(np.isfinite(candidate_array))
+        )
+        baseline_identity = _stage8_source_identity(
+            pipeline,
+            "stage8_input_starless",
+        )
+        candidate_identity = _stage8_source_identity(
+            pipeline,
+            "stage8_enhanced",
+        )
+        artifact_accepted = bool(
+            shape_dtype_finite
+            and baseline_identity.get("identity_status") == "verified"
+            and candidate_identity.get("identity_status") == "verified"
+            and candidate_identity.get("sha256")
+            and candidate_identity.get("fits_data_sha256")
+            and candidate_identity.get("decoded_pixel_sha256")
+        )
+        artifact = {
+            "accepted": artifact_accepted,
+            "shape_dtype_finite": shape_dtype_finite,
+            "baseline": baseline_identity,
+            "candidate": candidate_identity,
+        }
+
+        # Do not reuse the pre-finish structure report.  The production
+        # assessment rebuilds the target mask from the immutable input and
+        # compares it with the final persisted candidate.
+        safe_preflight = dict(
+            getattr(
+                pipeline,
+                "_stage8_safe_passthrough_color_only_preflight",
+                {},
+            )
+            or {}
+        )
+        safe_color_only = bool(
+            safe_preflight.get("accepted", False)
+            and str(safe_preflight.get("source_mode") or "")
+            in {
+                "structure_rollback",
+                "limited_safe_passthrough",
+                "post_cumulative_structure_rollback",
+            }
+        )
+        quality = _stage8_quality_with_mutation_union(
+            pipeline,
+            baseline_stem="stage8_input_starless",
+            candidate_stem="stage8_enhanced",
+            subject_chroma_report=subject_chroma_report,
+            palette_report=palette_report,
+            include_structure=not safe_color_only,
+        )
+        seam = dict(quality.get("subject_boundary_seam") or {})
+        frozen_noise = dict(quality.get("frozen_sky_visible_noise") or {})
+        outside_identity = dict(quality.get("outside_target_identity") or {})
+        quality_accepted = bool(
+            str(quality.get("status") or "") == "ok"
+            and not list(quality.get("issues") or [])
+        )
+        seam_accepted = bool(
+            seam.get("accepted", False)
+            and str(seam.get("status") or "") != "hard_failed"
+            and (
+                seam.get("available", False)
+                or (
+                    seam.get("applicable") is False
+                    and str(seam.get("status") or "") == "not_applicable"
+                )
+            )
+        )
+        frozen_noise_accepted = bool(
+            frozen_noise.get("available", False)
+            and frozen_noise.get("accepted", False)
+        )
+        outside_identity_accepted = bool(
+            outside_identity.get("available", False)
+            and outside_identity.get("accepted", False)
+        )
+
+        spatial = spatial_background_lineage.assess_final_spatial_background(
+            getattr(pipeline, "process_dir", None),
+            candidate_array,
+        )
+        masks = pipeline._stage8_generate_starless_masks(baseline_array)
+        if not isinstance(masks, dict):
+            raise ValueError("stage8_final_cumulative_masks_unavailable")
+        halo = star_halo_guard.assess_candidate(
+            baseline_array,
+            candidate_array,
+            masks.get("star_halo_guard_mask"),
+            mode="color",
+        )
+
+        channel_profile = getattr(pipeline, "channel_profile", {}) or {}
+        if not isinstance(channel_profile, dict) or not channel_profile:
+            channel_profile = {
+                "kind": str(
+                    getattr(pipeline, "_channel_semantics", "unknown")
+                    or "unknown"
+                )
+            }
+        contract = resolve_color_contract(
+            channel_profile=channel_profile,
+            color_report=getattr(pipeline, "color_calibration_report", {}) or {},
+            palette_report=palette_report,
+        )
+        color_presentation = build_color_quality_report(
+            baseline_array,
+            candidate_array,
+            stage="stage8_final_cumulative_preflight",
+            baseline_name="stage8_input_starless.fit",
+            candidate_name="stage8_enhanced.fit",
+            contract=contract,
+            masks=masks,
+            operation="final_cumulative_color_presentation_preflight",
+        )
+        color_presentation["mode"] = "final_cumulative_preflight"
+        color_presentation["used_for_gate"] = True
+        color_presentation["accepted"] = bool(
+            str(color_presentation.get("status") or "") == "reported"
+            and not list(color_presentation.get("issues") or [])
+        )
+
+        report["checks"] = {
+            "artifact": artifact,
+            "subject_boundary_seam": seam,
+            "frozen_sky_visible_noise": frozen_noise,
+            "outside_target_pixel_identity": outside_identity,
+            "background_clipping_contrast_presentation": quality,
+            "spatial_background": spatial,
+            "star_halo": halo,
+            "color_presentation_preflight": color_presentation,
+        }
+        checks = {
+            "artifact": artifact_accepted,
+            "subject_boundary_seam": seam_accepted,
+            "frozen_sky_visible_noise": frozen_noise_accepted,
+            "outside_target_pixel_identity": outside_identity_accepted,
+            "background_clipping_contrast_presentation": quality_accepted,
+            "spatial_background": bool(spatial.get("accepted", False)),
+            "star_halo": bool(halo.get("accepted", False)),
+            "color_presentation_preflight": bool(
+                color_presentation.get("accepted", False)
+            ),
+        }
+        report["issues"] = [
+            name for name, accepted in checks.items() if not accepted
+        ]
+        report["accepted"] = not report["issues"]
+        report["status"] = "accepted" if report["accepted"] else "rejected"
+    except (
+        AttributeError,
+        FloatingPointError,
+        IndexError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        report["issues"] = [str(error)]
+    return report
+
+
+def _stage8_exact_final_cumulative_rollback(pipeline) -> Dict[str, Any]:
+    """Restore and independently prove Stage8's immutable input identity."""
+
+    report: Dict[str, Any] = {
+        "target": "stage8_input_starless",
+        "canonical": "stage8_enhanced",
+        "status": "failed",
+        "accepted": False,
+        "attempted": True,
+    }
+    try:
+        rollback = getattr(pipeline, "_rollback_stage8_to_input", None)
+        if callable(rollback):
+            rollback_invoked = bool(rollback())
+        else:
+            pipeline.cmd_with_check("load", "stage8_input_starless")
+            rollback_invoked = bool(
+                pipeline._save_stage_output("stage8_enhanced")
+            )
+        baseline = pipeline._read_image_by_stem("stage8_input_starless")
+        canonical = pipeline._read_image_by_stem("stage8_enhanced")
+        if baseline is None or canonical is None:
+            raise ValueError("stage8_final_cumulative_rollback_pixels_unavailable")
+        baseline_array = np.asarray(baseline)
+        canonical_array = np.asarray(canonical)
+        baseline_identity = _stage8_source_identity(
+            pipeline,
+            "stage8_input_starless",
+        )
+        canonical_identity = _stage8_source_identity(
+            pipeline,
+            "stage8_enhanced",
+        )
+        exact_pixels = bool(
+            baseline_array.shape == canonical_array.shape
+            and baseline_array.dtype == canonical_array.dtype
+            and np.array_equal(baseline_array, canonical_array)
+            and pixel_sha256(baseline_array) == pixel_sha256(canonical_array)
+        )
+        exact_persisted_identity = bool(
+            baseline_identity.get("fits_data_sha256")
+            and baseline_identity.get("fits_data_sha256")
+            == canonical_identity.get("fits_data_sha256")
+            and baseline_identity.get("decoded_pixel_sha256")
+            and baseline_identity.get("decoded_pixel_sha256")
+            == canonical_identity.get("decoded_pixel_sha256")
+        )
+        accepted = bool(
+            rollback_invoked and exact_pixels and exact_persisted_identity
+        )
+        report.update(
+            status="restored" if accepted else "failed",
+            accepted=accepted,
+            rollback_invoked=rollback_invoked,
+            exact_pixels=exact_pixels,
+            exact_persisted_identity=exact_persisted_identity,
+            baseline=baseline_identity,
+            canonical=canonical_identity,
+        )
+    except (
+        AttributeError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        report["error"] = str(error)
+    return report
+
+
+def _stage8_enforce_final_cumulative_validation(
+    pipeline,
+    *,
+    subject_chroma_report: Dict[str, Any],
+    palette_report: Dict[str, Any],
+    starless_finish_report: Dict[str, Any],
+    defer_review_on_exact_rollback: bool = False,
+) -> Dict[str, Any]:
+    """Persist the final cumulative gate and fail closed on rejection."""
+
+    report = _stage8_final_cumulative_validation(
+        pipeline,
+        subject_chroma_report=subject_chroma_report,
+        palette_report=palette_report,
+        starless_finish_report=starless_finish_report,
+    )
+    if not bool(report.get("accepted", False)):
+        report["rejected_candidate_identity"] = _stage8_source_identity(
+            pipeline,
+            "stage8_enhanced",
+        )
+        rollback = _stage8_exact_final_cumulative_rollback(pipeline)
+        report["rollback"] = rollback
+        if bool(rollback.get("accepted", False)):
+            pipeline._stage8_final_source = "stage8_input_starless"
+            pipeline._stage8_final_quality = "final_cumulative_qa_rejected"
+            reason_code = "stage8_final_cumulative_qa_rejected"
+        else:
+            pipeline._stage8_final_quality = (
+                "final_cumulative_qa_rollback_failed"
+            )
+            pipeline._stage8_fallback_used = True
+            reason_code = "stage8_final_cumulative_qa_rollback_failed"
+        pipeline._stage8_fallback_used = True
+        report["reason_code"] = reason_code
+        review_deferred = bool(
+            defer_review_on_exact_rollback
+            and rollback.get("accepted", False)
+        )
+        report["review_deferred_for_safe_passthrough"] = review_deferred
+        if not review_deferred and hasattr(pipeline, "_require_review"):
+            pipeline._require_review(8, reason_code)
+    else:
+        report["reason_code"] = "accepted"
+    pipeline._stage8_final_cumulative_quality_report = dict(report)
+    pipeline._write_stage_json(
+        "stage8_final_cumulative_quality.json",
+        report,
+    )
+    return report
 
 
 def _load_stage8_input(
@@ -143,8 +1443,9 @@ def _write_stage8_color_quality_report(
     applied_saturation: float,
     palette_report: Optional[Dict[str, Any]] = None,
     subject_chroma_report: Optional[Dict[str, Any]] = None,
+    vectra_report: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Write the P0 report-only color baseline and measured ledger entry."""
+    """Write the final Stage8 color and star-halo gating ledger entry."""
     channel_profile = getattr(pipeline, "channel_profile", {}) or {}
     if not isinstance(channel_profile, dict) or not channel_profile:
         channel_profile = {
@@ -177,8 +1478,8 @@ def _write_stage8_color_quality_report(
             "schema": "starun.color-quality-report.v1",
             "stage": "stage8",
             "status": "unavailable",
-            "mode": "report_only",
-            "used_for_gate": False,
+            "mode": "transactional_gate",
+            "used_for_gate": True,
             "baseline": "stage8_input_starless.fit",
             "candidate": f"{final_source}.fit",
             "contract": contract,
@@ -209,6 +1510,8 @@ def _write_stage8_color_quality_report(
             operation=(
                 "artistic_dualband_palette"
                 if bool((palette_report or {}).get("accepted", False))
+                else "vectra_exclusive_color_route"
+                if bool((vectra_report or {}).get("accepted", False))
                 else "masked_subject_chroma_rendition"
                 if bool((subject_chroma_report or {}).get("accepted", False))
                 else "masked_single_chroma_recovery"
@@ -217,6 +1520,95 @@ def _write_stage8_color_quality_report(
             ),
         )
         report["saturation_execution"] = saturation_execution
+        halo_gate = star_halo_guard.assess_candidate(
+            baseline,
+            candidate,
+            (masks or {}).get("star_halo_guard_mask")
+            if isinstance(masks, dict)
+            else None,
+            mode="color",
+        )
+        report["mode"] = "transactional_gate"
+        report["used_for_gate"] = True
+        report["star_halo_local_gate"] = halo_gate
+        if not bool(halo_gate.get("accepted", False)):
+            report["status"] = "rejected"
+            report.setdefault("issues", []).extend(
+                list(halo_gate.get("issues") or [])
+            )
+    guard_report = dict(
+        getattr(pipeline, "_stage8_star_halo_guard_report", {}) or {}
+    )
+    guard_metrics = (
+        dict(guard_report.get("metrics") or {})
+        if isinstance(guard_report.get("metrics"), dict)
+        else {}
+    )
+    guard_components = list(guard_metrics.get("components") or [])
+    hard_components = [
+        dict(component)
+        for component in guard_components
+        if isinstance(component, dict) and bool(component.get("hard_anomaly", False))
+    ]
+    report["guard_lineage"] = {
+        "verified": bool(
+            getattr(pipeline, "_stage8_star_halo_guard_verified", False)
+        ),
+        "schema": guard_report.get("schema"),
+        "run_id": guard_report.get("run_id"),
+        "status": guard_report.get("status"),
+        "reason_code": guard_report.get("reason_code"),
+        "artifact": guard_report.get("artifact"),
+        "artifact_sha256": guard_report.get("artifact_sha256"),
+        "source": dict(guard_report.get("source") or {}),
+    }
+    report["component_anomalies"] = {
+        "component_count": int(guard_metrics.get("component_count", 0) or 0),
+        "hard_anomaly_count": int(
+            guard_metrics.get("hard_anomaly_count", len(hard_components)) or 0
+        ),
+        "components": hard_components,
+    }
+    finish_report = dict(
+        getattr(pipeline, "_stage8_starless_finish_report", {}) or {}
+    )
+    finish_retries = []
+    for step in list(finish_report.get("steps") or []):
+        if not isinstance(step, dict):
+            continue
+        finish_retries.append(
+            {
+                "name": step.get("name") or step.get("step"),
+                "status": step.get("status"),
+                "weakened_retry": dict(step.get("weakened_retry") or {}),
+            }
+        )
+    palette_retries = []
+    for palette_candidate in list((palette_report or {}).get("candidates") or []):
+        if not isinstance(palette_candidate, dict):
+            continue
+        palette_retries.append(
+            {
+                "palette": palette_candidate.get("palette"),
+                "status": palette_candidate.get("status"),
+                "weakened_retry": dict(
+                    palette_candidate.get("weakened_retry") or {}
+                ),
+            }
+        )
+    report["weakened_retry"] = {
+        "starless_finish_steps": finish_retries,
+        "subject_chroma": dict(
+            (subject_chroma_report or {}).get("weakened_retry") or {}
+        ),
+        "vectra": dict((vectra_report or {}).get("weakened_retry") or {}),
+        "palette": dict((palette_report or {}).get("weakened_retry") or {}),
+        "palette_candidates": palette_retries,
+    }
+    report["final_pixel_identity"] = _stage8_source_identity(
+        pipeline,
+        final_source,
+    )
     ledger = list(getattr(pipeline, "_color_adjustment_ledger", []) or [])
     entry = report.get("ledger_entry")
     if isinstance(entry, dict):
@@ -225,6 +1617,22 @@ def _write_stage8_color_quality_report(
     report["cross_stage_ledger"] = list(ledger)
     pipeline._stage8_color_quality_report = dict(report)
     pipeline._write_stage_json("stage8_color_quality_report.json", report)
+    handoff = dict(getattr(pipeline, "_stage8_handoff", {}) or {})
+    if handoff:
+        handoff["color_contract"] = report.get("contract")
+        handoff["color_quality_report"] = "stage8_color_quality_report.json"
+        handoff["color_gate"] = {
+            "report": "stage8_color_quality_report.json",
+            "used_for_gate": bool(report.get("used_for_gate", False)),
+            "status": report.get("status"),
+            "guard_lineage_verified": bool(
+                (report.get("guard_lineage") or {}).get("verified", False)
+            ),
+            "final_pixel_identity": dict(
+                report.get("final_pixel_identity") or {}
+            ),
+        }
+        _write_stage8_handoff(pipeline, handoff)
     return report
 
 
@@ -239,6 +1647,588 @@ def _stage8_set_image_pixels(pipeline, pixels, *, label: str) -> None:
             pipeline.siril.set_image_pixeldata(pixels)
         return
     pipeline.siril.set_image_pixeldata(pixels)
+
+
+def _stage8_write_starless_finish_report(
+    pipeline,
+    *,
+    status: str,
+    reason_code: str,
+    **updates: Any,
+) -> Dict[str, Any]:
+    """Persist the Stage8-owned post-structure Starless finish decision."""
+
+    report: Dict[str, Any] = {
+        "schema": STAGE8_STARLESS_FINISH_SCHEMA,
+        "status": str(status),
+        "accepted": False,
+        "reason_code": str(reason_code),
+        "source": None,
+        "final_source": None,
+        "steps": [],
+        "color_route": {"selected": "none", "reason": reason_code},
+    }
+    previous = getattr(pipeline, "_stage8_starless_finish_report", None)
+    if isinstance(previous, dict):
+        report.update(previous)
+    report.update(updates)
+    pipeline._stage8_starless_finish_report = dict(report)
+    pipeline._write_stage_json("stage8_starless_finish_report.json", report)
+    return report
+
+
+def _stage8_finish_masks(pipeline, image_data: np.ndarray) -> Dict[str, Any]:
+    masks = pipeline._stage8_generate_starless_masks(image_data)
+    if not isinstance(masks, dict):
+        raise ValueError("Stage8 finish masks are unavailable")
+    target_type = (
+        str(pipeline._active_target_type() or "").strip().lower()
+        if hasattr(pipeline, "_active_target_type")
+        else ""
+    )
+    if target_type == "large_galaxy":
+        masks, disk_report = stage8_large_galaxy_structure_masks(
+            pipeline,
+            masks,
+        )
+        if not bool(disk_report.get("available", False)):
+            raise ValueError(
+                "large_galaxy_structure_mask_unavailable:"
+                + str(disk_report.get("reason") or "unknown")
+            )
+        masks["galaxy_signal_mask"] = np.asarray(
+            masks.get("nebula_mask"),
+            dtype=np.float32,
+        )
+    return masks
+
+
+def _stage8_restore_finish_step(pipeline, baseline_stem: str) -> tuple[bool, Optional[str]]:
+    try:
+        pipeline.cmd_with_check("load", baseline_stem)
+        return True, None
+    except (CommandError, SirilError) as error:
+        return False, str(error)
+
+
+def _stage8_run_starless_finish_step(
+    pipeline,
+    messages: List[str],
+    *,
+    step_id: str,
+    step_key: str,
+    command_candidates: List[tuple[str, tuple[str, ...]]],
+    base_stem: str,
+    mode: str,
+    effective_saturation_budget: float = 0.0,
+) -> Dict[str, Any]:
+    """Run, project, gate, persist and exactly roll back one plugin step."""
+
+    pre_stem = f"stage8_pre_{step_id}"
+    candidate_stem = f"stage8_{step_id}_candidate"
+    step: Dict[str, Any] = {
+        "id": step_id,
+        "mode": mode,
+        "status": "skipped_unavailable",
+        "accepted": False,
+        "implementation": None,
+        "input": f"{base_stem}.fit",
+        "baseline": f"{pre_stem}.fit",
+        "candidate": f"{candidate_stem}.fit",
+        "output": None,
+        "transaction": {
+            "baseline_saved": False,
+            "candidate_saved": False,
+            "canonical_saved": False,
+            "rollback_performed": False,
+            "rollback_ok": None,
+        },
+    }
+    try:
+        pipeline.cmd_with_check("load", base_stem)
+        if not pipeline._save_stage_output(pre_stem):
+            step.update(
+                status="prohibited_baseline_save_failed",
+                reason_code="stage8_finish_baseline_save_failed",
+            )
+            return step
+        step["transaction"]["baseline_saved"] = True
+        baseline = pipeline.siril.get_image_pixeldata(preview=False)
+        if baseline is None:
+            raise RuntimeError("Stage8 finish baseline pixels are unavailable")
+        baseline = np.asarray(baseline, dtype=np.float32)
+        implementation = pipeline._run_first_available_command(
+            step_key,
+            command_candidates,
+        )
+        step["implementation"] = implementation
+        if not implementation:
+            _stage8_restore_finish_step(pipeline, pre_stem)
+            step["reason_code"] = "plugin_command_unavailable"
+            return step
+        plugin_output = pipeline.siril.get_image_pixeldata(preview=False)
+        if plugin_output is None:
+            raise RuntimeError("Stage8 finish plugin pixels are unavailable")
+        masks = _stage8_finish_masks(pipeline, baseline)
+        if mode == "color":
+            candidate, projection = project_luminance_locked_color_candidate(
+                baseline,
+                plugin_output,
+                masks,
+                effective_saturation_budget=effective_saturation_budget,
+            )
+        else:
+            candidate, projection = project_linked_luminance_candidate(
+                baseline,
+                plugin_output,
+                masks,
+            )
+        gate = assess_finish_candidate(
+            baseline,
+            candidate,
+            masks,
+            mode=mode,
+            highlight_clip_ratio_max=float(
+                getattr(pipeline.cfg, "stage8_highlight_clip_ratio_max", 0.012)
+            ),
+            texture_growth_max=float(
+                getattr(pipeline.cfg, "stage8_texture_artifact_growth_max", 1.25)
+            ),
+            effective_saturation_budget=effective_saturation_budget,
+        )
+        halo_gate = star_halo_guard.assess_candidate(
+            baseline,
+            candidate,
+            masks.get("star_halo_guard_mask"),
+            mode="color" if mode == "color" else "luminance",
+        )
+        if not bool(halo_gate.get("accepted", False)):
+            gate["accepted"] = False
+            gate["status"] = "rejected"
+            gate.setdefault("issues", []).extend(
+                list(halo_gate.get("issues") or [])
+            )
+        step["star_halo_local_gate"] = halo_gate
+        seam = stage8_subject_boundary_seam_report(
+            pipeline,
+            baseline,
+            candidate,
+        )
+        seam_failed = bool(
+            seam.get("applicable", False)
+            and (
+                not bool(seam.get("available", False))
+                or str(seam.get("status") or "") == "hard_failed"
+            )
+        )
+        if seam_failed:
+            gate["accepted"] = False
+            gate["status"] = "rejected"
+            gate.setdefault("issues", []).append(
+                "subject_boundary_gate_failed"
+            )
+        if (
+            not bool(gate.get("accepted", False))
+            and int(getattr(pipeline.cfg, "stage8_quality_retry_max", 1) or 0)
+            > 0
+        ):
+            reduced_candidate, boundary_retry = (
+                stage8_subject_boundary_retry_candidate(
+                    pipeline,
+                    baseline,
+                    candidate,
+                    seam_report=seam,
+                )
+            )
+            reduced_gate = assess_finish_candidate(
+                baseline,
+                reduced_candidate,
+                masks,
+                mode=mode,
+                highlight_clip_ratio_max=float(
+                    getattr(pipeline.cfg, "stage8_highlight_clip_ratio_max", 0.012)
+                ),
+                texture_growth_max=float(
+                    getattr(
+                        pipeline.cfg,
+                        "stage8_texture_artifact_growth_max",
+                        1.25,
+                    )
+                ),
+                effective_saturation_budget=effective_saturation_budget,
+            )
+            reduced_halo_gate = star_halo_guard.assess_candidate(
+                baseline,
+                reduced_candidate,
+                masks.get("star_halo_guard_mask"),
+                mode="color" if mode == "color" else "luminance",
+            )
+            if not bool(reduced_halo_gate.get("accepted", False)):
+                reduced_gate["accepted"] = False
+                reduced_gate["status"] = "rejected"
+                reduced_gate.setdefault("issues", []).extend(
+                    list(reduced_halo_gate.get("issues") or [])
+                )
+            reduced_seam = stage8_subject_boundary_seam_report(
+                pipeline,
+                baseline,
+                reduced_candidate,
+            )
+            reduced_seam_failed = bool(
+                reduced_seam.get("applicable", False)
+                and (
+                    not bool(reduced_seam.get("available", False))
+                    or str(reduced_seam.get("status") or "") == "hard_failed"
+                )
+            )
+            if reduced_seam_failed:
+                reduced_gate["accepted"] = False
+                reduced_gate["status"] = "rejected"
+                reduced_gate.setdefault("issues", []).append(
+                    "subject_boundary_gate_failed"
+                )
+            step["weakened_retry"] = {
+                "attempted": True,
+                "mode": "adaptive_subject_boundary_delta_scaling",
+                "delta_scale": {
+                    "boundary": 0.25,
+                    "interior": 0.50,
+                },
+                "boundary_retry": boundary_retry,
+                "quality_gate": reduced_gate,
+                "star_halo_local_gate": reduced_halo_gate,
+                "subject_boundary_seam": reduced_seam,
+                "candidate_pixel_sha256": pixel_sha256(reduced_candidate),
+                "accepted": bool(reduced_gate.get("accepted", False)),
+            }
+            if bool(reduced_gate.get("accepted", False)):
+                candidate = reduced_candidate
+                gate = reduced_gate
+                halo_gate = reduced_halo_gate
+                projection = dict(projection)
+                projection["weakened_retry_delta_scale"] = {
+                    "boundary": 0.25,
+                    "interior": 0.50,
+                }
+                seam = reduced_seam
+        step.update(
+            projection=projection,
+            quality_gate=gate,
+            subject_boundary_seam=seam,
+        )
+        if not bool(gate.get("accepted", False)):
+            rollback_ok, rollback_error = _stage8_restore_finish_step(
+                pipeline,
+                pre_stem,
+            )
+            step["transaction"].update(
+                rollback_performed=True,
+                rollback_ok=rollback_ok,
+            )
+            if rollback_error:
+                step["transaction"]["rollback_error"] = rollback_error
+            step.update(
+                status=("rejected_rolled_back" if rollback_ok else "rejected_rollback_failed"),
+                reason_code=(
+                    "stage8_finish_quality_gate_rejected"
+                    if rollback_ok
+                    else "stage8_finish_rollback_failed"
+                ),
+            )
+            return step
+        _stage8_set_image_pixels(
+            pipeline,
+            candidate,
+            label=f"Stage8 {step_id} projected candidate",
+        )
+        if not pipeline._save_stage_output(candidate_stem):
+            raise RuntimeError(f"{candidate_stem} save failed")
+        step["transaction"]["candidate_saved"] = True
+        pipeline.cmd_with_check("load", candidate_stem)
+        persisted = pipeline.siril.get_image_pixeldata(preview=False)
+        if persisted is None or pixel_sha256(persisted) != pixel_sha256(candidate):
+            raise RuntimeError(f"{candidate_stem} persisted pixel identity mismatch")
+        if not pipeline._save_stage_output("stage8_enhanced"):
+            raise RuntimeError("stage8_enhanced canonical save failed")
+        step["transaction"]["canonical_saved"] = True
+        step.update(
+            status="accepted",
+            accepted=True,
+            output="stage8_enhanced.fit",
+            candidate_pixel_sha256=pixel_sha256(candidate),
+        )
+        messages.append(
+            f"Stage8 {step_id} accepted via {implementation}"
+        )
+        return step
+    except (
+        AttributeError,
+        CommandError,
+        OSError,
+        RuntimeError,
+        SirilError,
+        TypeError,
+        ValueError,
+    ) as error:
+        rollback_ok, rollback_error = _stage8_restore_finish_step(
+            pipeline,
+            pre_stem if step["transaction"]["baseline_saved"] else base_stem,
+        )
+        step["transaction"].update(
+            rollback_performed=True,
+            rollback_ok=rollback_ok,
+        )
+        if rollback_error:
+            step["transaction"]["rollback_error"] = rollback_error
+        step.update(
+            status="failed_rolled_back" if rollback_ok else "failed_rollback_failed",
+            reason_code=(
+                "stage8_finish_step_failed"
+                if rollback_ok
+                else "stage8_finish_rollback_failed"
+            ),
+            error=str(error),
+        )
+        messages.append(
+            f"Stage8 {step_id} failed; rollback={'ok' if rollback_ok else 'failed'}"
+        )
+        return step
+
+
+def _stage8_run_starless_finish(
+    pipeline,
+    messages: List[str],
+    *,
+    base_stem: str,
+    channel_semantics: str,
+    processing_policy: str,
+    user_processing_mode: str,
+    external_override: bool,
+    vectra_route_selected: bool,
+    effective_saturation_budget: float,
+) -> Dict[str, Any]:
+    """Own every post-structure Starless plugin pixel mutation in Stage8."""
+
+    def restrict_after_rollback_failure() -> None:
+        pipeline._stage8_final_quality = "starless_finish_rollback_failed"
+        pipeline._stage8_fallback_used = True
+        handoff = dict(getattr(pipeline, "_stage8_handoff", {}) or {})
+        handoff.update(
+            restricted_downstream=True,
+            reason_code="stage8_starless_finish_rollback_failed",
+            reason_text="stage8_starless_finish_rollback_failed",
+        )
+        pipeline._stage8_handoff = handoff
+        if hasattr(pipeline, "_require_review"):
+            pipeline._require_review(
+                8,
+                "stage8_starless_finish_rollback_failed",
+            )
+
+    incoming_handoff = dict(getattr(pipeline, "_stage8_handoff", {}) or {})
+    issues: List[str] = []
+    if str(processing_policy or "").strip().lower() != "full":
+        issues.append("processing_policy_not_full")
+    if str(user_processing_mode or "").strip().lower() != "auto":
+        issues.append("processing_mode_not_auto")
+    if not bool(getattr(pipeline, "_stage7_stretch_accepted", False)):
+        issues.append("stage7_stretch_not_accepted")
+    if external_override:
+        issues.append("external_starless_override")
+    if bool(incoming_handoff.get("restricted_downstream", False)):
+        issues.append("upstream_handoff_restricted")
+    if bool(getattr(pipeline, "_star_preserve_target_bypass", False)):
+        issues.append("star_preserve_route")
+    safe_passthrough_color_only = bool(
+        (
+            getattr(
+                pipeline,
+                "_stage8_safe_passthrough_color_only_preflight",
+                {},
+            )
+            or {}
+        ).get("accepted", False)
+    )
+    if (
+        str(getattr(pipeline, "_stage8_final_quality", "unknown")) != "ok"
+        and not safe_passthrough_color_only
+    ):
+        issues.append("stage8_structure_quality_not_ok")
+
+    color_route = (
+        "dualband_palette"
+        if channel_semantics == NARROWBAND_COMPOSITE
+        else "vectra"
+        if vectra_route_selected
+        else "subject_chroma"
+        if channel_semantics == BROADBAND_RGB_OSC
+        else "none"
+    )
+    report = _stage8_write_starless_finish_report(
+        pipeline,
+        status="skipped_ineligible" if issues else "eligible",
+        reason_code=issues[0] if issues else "eligible",
+        source=f"{base_stem}.fit",
+        final_source=f"{base_stem}.fit",
+        eligibility={
+            "eligible": not issues,
+            "issues": issues,
+            "processing_policy": processing_policy,
+            "processing_mode": user_processing_mode,
+            "stage7_accepted": bool(
+                getattr(pipeline, "_stage7_stretch_accepted", False)
+            ),
+            "external_override": bool(external_override),
+        },
+        steps=[],
+        color_route={"selected": color_route, "reason": "runtime_contract"},
+    )
+    pipeline._stage8_vectra_applied = False
+    pipeline._stage8_vectra_report = {
+        "status": "not_selected",
+        "accepted": False,
+    }
+    if issues:
+        messages.append("Stage8 Starless finish skipped: " + ",".join(issues))
+        return report
+    if safe_passthrough_color_only:
+        # The exact rollback is the trusted structure state.  A color-only
+        # bypass must never re-enter Revela/Curves/Vectra plugin mutations;
+        # only the independently gated internal subject/palette transaction
+        # below may create a candidate from this point.
+        report.update(
+            status="skipped_safe_passthrough_color_only",
+            accepted=False,
+            reason_code="safe_passthrough_prohibits_starless_finish_plugins",
+            steps=[],
+            color_route={
+                "selected": color_route,
+                "reason": "safe_passthrough_internal_color_only",
+                "vectra_accepted": False,
+            },
+        )
+        pipeline._write_stage_json("stage8_starless_finish_report.json", report)
+        messages.append(
+            "Stage8 safe color-only passthrough skipped all Starless finish plugins"
+        )
+        return report
+    if not bool(getattr(pipeline.cfg, "workflow_plugin_probe_enabled", False)):
+        report.update(
+            status="skipped_disabled",
+            reason_code="workflow_plugin_probe_disabled",
+        )
+        pipeline._write_stage_json("stage8_starless_finish_report.json", report)
+        return report
+
+    current_stem = base_stem
+    steps: List[Dict[str, Any]] = []
+    for step_id, step_key, candidates in (
+        (
+            "revela",
+            "细节/结构增强2",
+            [
+                ("VeraLux Revela", ("veralux_revela",)),
+                ("Revela", ("revela",)),
+            ],
+        ),
+        (
+            "subject_curves",
+            "最终微调颜色",
+            [
+                ("VeraLux Curves", ("veralux_curves",)),
+                ("Curves", ("curves",)),
+            ],
+        ),
+    ):
+        step = _stage8_run_starless_finish_step(
+            pipeline,
+            messages,
+            step_id=step_id,
+            step_key=step_key,
+            command_candidates=candidates,
+            base_stem=current_stem,
+            mode="structure",
+        )
+        steps.append(step)
+        if bool(step.get("accepted", False)):
+            current_stem = "stage8_enhanced"
+        if str(step.get("status") or "").endswith("rollback_failed"):
+            restrict_after_rollback_failure()
+            report.update(
+                status="failed_rollback_failed",
+                reason_code="stage8_finish_rollback_failed",
+                accepted=False,
+                steps=steps,
+                final_source=f"{current_stem}.fit",
+            )
+            pipeline._write_stage_json("stage8_starless_finish_report.json", report)
+            return report
+
+    if vectra_route_selected:
+        vectra_step = _stage8_run_starless_finish_step(
+            pipeline,
+            messages,
+            step_id="vectra",
+            step_key="调色2（可选）",
+            command_candidates=[
+                ("VeraLux Vectra", ("veralux_vectra",)),
+                ("Vectra", ("vectra",)),
+            ],
+            base_stem=current_stem,
+            mode="color",
+            effective_saturation_budget=effective_saturation_budget,
+        )
+        steps.append(vectra_step)
+        pipeline._stage8_vectra_report = dict(vectra_step)
+        pipeline._stage8_vectra_applied = bool(vectra_step.get("accepted", False))
+        if pipeline._stage8_vectra_applied:
+            current_stem = "stage8_enhanced"
+            pipeline._stage8_saturation_execution = {
+                "schema": STAGE8_STARLESS_FINISH_SCHEMA,
+                "applied": True,
+                "method": "vectra_exclusive_color_route",
+                "requested_amount": float(effective_saturation_budget),
+                "applied_amount": float(effective_saturation_budget),
+                "passes": 1,
+                "generic_saturation_suppressed": True,
+                "suppression_reason": "reserved_for_stage8_vectra",
+            }
+
+    accepted_steps = [step for step in steps if bool(step.get("accepted", False))]
+    rollback_failed = any(
+        str(step.get("status") or "").endswith("rollback_failed")
+        for step in steps
+    )
+    if rollback_failed:
+        restrict_after_rollback_failure()
+    report.update(
+        status=(
+            "failed_rollback_failed"
+            if rollback_failed
+            else "accepted"
+            if accepted_steps
+            else "no_plugin_applied"
+        ),
+        accepted=bool(accepted_steps) and not rollback_failed,
+        reason_code=(
+            "stage8_finish_rollback_failed"
+            if rollback_failed
+            else "accepted"
+            if accepted_steps
+            else "plugin_commands_unavailable_or_rejected"
+        ),
+        steps=steps,
+        final_source=f"{current_stem}.fit",
+        accepted_steps=[str(step.get("id")) for step in accepted_steps],
+        color_route={
+            "selected": color_route,
+            "reason": "exclusive_stage8_color_route",
+            "vectra_accepted": bool(pipeline._stage8_vectra_applied),
+        },
+    )
+    pipeline._stage8_final_source = current_stem
+    pipeline._write_stage_json("stage8_starless_finish_report.json", report)
+    return report
 
 
 def _stage8_frozen_palette_selection(
@@ -315,6 +2305,7 @@ def _stage8_run_subject_chroma(
     requested_saturation_budget: float,
     effective_saturation_budget: float,
     generic_saturation_suppressed: bool,
+    vectra_route_selected: bool = False,
 ) -> Dict[str, Any]:
     """Apply the single bounded broadband positive-chroma transaction."""
 
@@ -335,10 +2326,25 @@ def _stage8_run_subject_chroma(
         issues.append("processing_policy_not_full")
     if not bool(getattr(pipeline, "_stage7_stretch_accepted", False)):
         issues.append("stage7_stretch_not_accepted")
-    if str(getattr(pipeline, "_stage8_final_quality", "unknown")) != "ok":
+    safe_passthrough_color_only = bool(
+        (
+            getattr(
+                pipeline,
+                "_stage8_safe_passthrough_color_only_preflight",
+                {},
+            )
+            or {}
+        ).get("accepted", False)
+    )
+    if (
+        str(getattr(pipeline, "_stage8_final_quality", "unknown")) != "ok"
+        and not safe_passthrough_color_only
+    ):
         issues.append("stage8_structure_quality_not_ok")
     if external_override:
         issues.append("external_starless_override")
+    if vectra_route_selected:
+        issues.append("vectra_exclusive_color_route")
     if bool(getattr(pipeline, "_star_preserve_target_bypass", False)):
         issues.append("star_preserve_route")
     if not generic_saturation_suppressed:
@@ -372,6 +2378,7 @@ def _stage8_run_subject_chroma(
             "stage8_quality": str(
                 getattr(pipeline, "_stage8_final_quality", "unknown")
             ),
+            "safe_passthrough_color_only": safe_passthrough_color_only,
             "external_override": bool(external_override),
         },
         "effective_saturation_budget": budget,
@@ -425,57 +2432,10 @@ def _stage8_run_subject_chroma(
         if image_data is None:
             raise RuntimeError("Stage8 subject chroma image buffer is empty")
 
-        generated_masks = pipeline._stage8_generate_starless_masks(image_data)
-        if not isinstance(generated_masks, dict):
-            raise ValueError("Stage8 subject chroma masks are unavailable")
-        background = np.asarray(generated_masks.get("background_mask"))
-        if background.ndim != 2:
-            raise ValueError("Stage8 background mask is invalid")
-        spatial_shape = tuple(int(value) for value in background.shape)
-        masks: Dict[str, Any] = {
-            key: np.array(value, copy=True)
-            for key, value in generated_masks.items()
-            if value is not None
-            and np.asarray(value).ndim == 2
-            and tuple(np.asarray(value).shape) == spatial_shape
-        }
-        frozen_masks = getattr(
+        masks, frozen_keys = _stage8_frozen_color_masks(
             pipeline,
-            "_stage7_frozen_rendition_masks",
-            {},
+            np.asarray(image_data),
         )
-        frozen_keys: List[str] = []
-        if isinstance(frozen_masks, dict):
-            for key, value in frozen_masks.items():
-                if value is None:
-                    continue
-                array = np.asarray(value)
-                if array.ndim != 2 or tuple(array.shape) != spatial_shape:
-                    continue
-                if not np.all(np.isfinite(array)):
-                    continue
-                masks[key] = np.array(array, dtype=np.float32, copy=True)
-                frozen_keys.append(str(key))
-        if masks.get("subject_mask") is None:
-            subject_layers = [
-                np.asarray(masks[name], dtype=np.float32)
-                for name in (
-                    "core_mask",
-                    "nebula_mask",
-                    "faint_nebula_mask",
-                    "galaxy_signal_mask",
-                )
-                if masks.get(name) is not None
-            ]
-            masks["subject_mask"] = (
-                np.maximum.reduce(subject_layers)
-                if subject_layers
-                else np.clip(
-                    1.0 - np.asarray(masks["background_mask"], dtype=np.float32),
-                    0.0,
-                    1.0,
-                )
-            ).astype(np.float32, copy=False)
 
         profile_resolver = getattr(
             pipeline,
@@ -504,6 +2464,47 @@ def _stage8_run_subject_chroma(
             ),
         )
         quality_gate = assess_subject_chroma_candidate(rendition)
+        candidate_pixels = stage8_restore_rgb_like(
+            pipeline,
+            np.asarray(image_data),
+            candidate_rgb,
+        )
+        halo_gate = star_halo_guard.assess_candidate(
+            image_data,
+            candidate_pixels,
+            masks.get("star_halo_guard_mask"),
+            mode="color",
+        )
+        weakened_retry: Dict[str, Any] = {"attempted": False}
+        if (
+            not bool(halo_gate.get("accepted", False))
+            and int(getattr(pipeline.cfg, "stage8_quality_retry_max", 1) or 0)
+            > 0
+        ):
+            baseline_pixels = np.asarray(image_data, dtype=np.float32)
+            reduced_pixels = baseline_pixels + 0.5 * (
+                np.asarray(candidate_pixels, dtype=np.float32) - baseline_pixels
+            )
+            reduced_halo_gate = star_halo_guard.assess_candidate(
+                baseline_pixels,
+                reduced_pixels,
+                masks.get("star_halo_guard_mask"),
+                mode="color",
+            )
+            weakened_retry = {
+                "attempted": True,
+                "delta_scale": 0.5,
+                "accepted": bool(reduced_halo_gate.get("accepted", False)),
+                "star_halo_local_gate": reduced_halo_gate,
+            }
+            if bool(reduced_halo_gate.get("accepted", False)):
+                candidate_pixels = reduced_pixels
+                halo_gate = reduced_halo_gate
+        if not bool(halo_gate.get("accepted", False)):
+            quality_gate["accepted"] = False
+            quality_gate.setdefault("issues", []).extend(
+                list(halo_gate.get("issues") or [])
+            )
         report.update(
             target_profile=target_profile,
             factor=factor_report,
@@ -517,6 +2518,8 @@ def _stage8_run_subject_chroma(
             },
             candidate=rendition,
             quality_gate=quality_gate,
+            star_halo_local_gate=halo_gate,
+            weakened_retry=weakened_retry,
         )
         if not bool(quality_gate.get("accepted", False)):
             pipeline.cmd_with_check("load", "stage8_pre_subject_chroma")
@@ -565,14 +2568,9 @@ def _stage8_run_subject_chroma(
                 )
             return finish()
 
-        restored = stage8_restore_rgb_like(
-            pipeline,
-            np.asarray(image_data),
-            candidate_rgb,
-        )
         _stage8_set_image_pixels(
             pipeline,
-            restored,
+            candidate_pixels,
             label="Stage8 target-aware subject chroma",
         )
         candidate_saved = pipeline._save_stage_output(
@@ -703,7 +2701,20 @@ def _stage8_run_dualband_palette(
             getattr(pipeline.cfg, "stage4_nbn_mapping_confidence_min", 0.85)
         ),
         processing_policy=processing_policy,
-        stage8_quality=str(getattr(pipeline, "_stage8_final_quality", "unknown")),
+        stage8_quality=(
+            "ok"
+            if bool(
+                (
+                    getattr(
+                        pipeline,
+                        "_stage8_safe_passthrough_color_only_preflight",
+                        {},
+                    )
+                    or {}
+                ).get("accepted", False)
+            )
+            else str(getattr(pipeline, "_stage8_final_quality", "unknown"))
+        ),
         stage7_accepted=bool(
             getattr(pipeline, "_stage7_stretch_accepted", False)
         ),
@@ -783,7 +2794,10 @@ def _stage8_run_dualband_palette(
         image_data = pipeline.siril.get_image_pixeldata(preview=False)
         if image_data is None:
             raise RuntimeError("Stage8 dual-band palette image buffer is empty")
-        masks = pipeline._stage8_generate_starless_masks(image_data)
+        masks, frozen_mask_keys = _stage8_frozen_color_masks(
+            pipeline,
+            image_data,
+        )
         manual_override = bool(selection.get("manual_override", False))
         primary_palette = str(selection["palette"]).upper()
         palette_order: List[str] = []
@@ -809,6 +2823,8 @@ def _stage8_run_dualband_palette(
                     nebula_mask=masks["nebula_mask"],
                     faint_nebula_mask=masks["faint_nebula_mask"],
                     background_mask=masks["background_mask"],
+                    star_mask=masks.get("star_mask"),
+                    star_halo_guard_mask=masks.get("star_halo_guard_mask"),
                     strength=float(
                         getattr(
                             pipeline.cfg,
@@ -837,8 +2853,67 @@ def _stage8_run_dualband_palette(
                             0.50,
                         )
                     ),
+                    subject_chroma_separation_gain_min=1.0e-4,
+                    subject_saturation_input_ratio_min=float(
+                        getattr(
+                            pipeline.cfg,
+                            "stage8_palette_subject_saturation_input_ratio_min",
+                            0.50,
+                        )
+                    ),
+                    subject_saturation_absolute_min=float(
+                        getattr(
+                            pipeline.cfg,
+                            "stage8_palette_subject_saturation_absolute_min",
+                            0.08,
+                        )
+                    ),
                 )
             )
+            halo_gate = star_halo_guard.assess_candidate(
+                image_data,
+                candidate_pixels,
+                masks.get("star_halo_guard_mask"),
+                mode="color",
+            )
+            weakened_retry: Dict[str, Any] = {"attempted": False}
+            if (
+                not bool(halo_gate.get("accepted", False))
+                and int(
+                    getattr(pipeline.cfg, "stage8_quality_retry_max", 1) or 0
+                )
+                > 0
+            ):
+                baseline_pixels = np.asarray(image_data, dtype=np.float32)
+                reduced_pixels = baseline_pixels + 0.5 * (
+                    np.asarray(candidate_pixels, dtype=np.float32)
+                    - baseline_pixels
+                )
+                reduced_halo_gate = star_halo_guard.assess_candidate(
+                    baseline_pixels,
+                    reduced_pixels,
+                    masks.get("star_halo_guard_mask"),
+                    mode="color",
+                )
+                weakened_retry = {
+                    "attempted": True,
+                    "delta_scale": 0.5,
+                    "accepted": bool(
+                        reduced_halo_gate.get("accepted", False)
+                    ),
+                    "star_halo_local_gate": reduced_halo_gate,
+                }
+                if bool(reduced_halo_gate.get("accepted", False)):
+                    candidate_pixels = reduced_pixels
+                    halo_gate = reduced_halo_gate
+            candidate_report["star_halo_local_gate"] = halo_gate
+            candidate_report["frozen_mask_keys"] = frozen_mask_keys
+            candidate_report["weakened_retry"] = weakened_retry
+            if not bool(halo_gate.get("accepted", False)):
+                candidate_report["accepted"] = False
+                candidate_report.setdefault("issues", []).extend(
+                    list(halo_gate.get("issues") or [])
+                )
             metrics = candidate_report.get("metrics") or {}
             separation_gain = float(
                 metrics.get(
@@ -852,9 +2927,7 @@ def _stage8_run_dualband_palette(
             )
             luma_drift = float(metrics.get("luminance_drift_p95", 1.0) or 0.0)
             clip_growth = float(metrics.get("clip_growth", 1.0) or 0.0)
-            chroma_gain_passed = bool(
-                manual_override or separation_gain > 1.0e-4
-            )
+            chroma_gain_passed = bool(separation_gain > 1.0e-4)
             selection_score = (
                 -separation_gain,
                 -subject_gain,
@@ -867,10 +2940,8 @@ def _stage8_run_dualband_palette(
                     candidate_report.get("accepted", False)
                     and chroma_gain_passed
                 ),
-                "subject_chroma_gain_required": not manual_override,
-                "subject_chroma_gain_min_exclusive": (
-                    1.0e-4 if not manual_override else None
-                ),
+                "subject_chroma_gain_required": True,
+                "subject_chroma_gain_min_exclusive": 1.0e-4,
                 "subject_chroma_gain_passed": chroma_gain_passed,
                 "selection_score": [float(value) for value in selection_score],
                 "candidate_order": candidate_index,
@@ -1041,8 +3112,20 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
     pipeline._stage8_palette_report = {}
     pipeline._stage8_saturation_execution = {}
     pipeline._stage8_color_quality_report = {}
+    pipeline._stage8_final_cumulative_quality_report = {}
     pipeline._stage8_subject_chroma_report = {}
+    pipeline._stage8_starless_finish_report = {}
+    pipeline._stage8_vectra_applied = False
+    pipeline._stage8_vectra_report = {
+        "status": "not_run",
+        "accepted": False,
+    }
     _stage8_write_subject_chroma_report(
+        pipeline,
+        status="not_run",
+        reason_code="stage8_route_not_resolved",
+    )
+    _stage8_write_starless_finish_report(
         pipeline,
         status="not_run",
         reason_code="stage8_route_not_resolved",
@@ -1265,6 +3348,42 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
         )
     effective_stage8_saturation = 0.0
     incoming_handoff = dict(getattr(pipeline, "_stage8_handoff", {}) or {})
+    spatial_lineage_path = (
+        Path(pipeline.process_dir) / "stage3_spatial_background_lineage.json"
+        if getattr(pipeline, "process_dir", None) is not None
+        else None
+    )
+    stage3_spatial_lineage = (
+        spatial_background_lineage.load_lineage(pipeline.process_dir)
+        if spatial_lineage_path is not None and spatial_lineage_path.is_file()
+        else {
+            "schema": spatial_background_lineage.LINEAGE_SCHEMA,
+            "status": "unavailable",
+            "accepted": False,
+            "issues": ["stage3_spatial_background_lineage_unavailable"],
+        }
+    )
+    if not bool(stage3_spatial_lineage.get("accepted", False)):
+        incoming_handoff.update(
+            requested_policy="background_only",
+            processing_policy="background_only",
+            restricted_downstream=True,
+            reason_code="stage3_spatial_opponent_lineage_unverified",
+            reason_text=(
+                "Stage3 spatial background lineage is unresolved; positive "
+                "Stage8 structure enhancement is prohibited"
+            ),
+            quality_status="restricted",
+        )
+        pipeline._stage8_handoff = incoming_handoff
+        pipeline._stage8_conservative_mode = True
+        pipeline._require_review(
+            8,
+            "stage3_spatial_opponent_lineage_unverified",
+        )
+        messages.append(
+            "Stage3 spatial background lineage unresolved; Stage8 restricted"
+        )
     incoming_policy = str(
         incoming_handoff.get("processing_policy")
         or incoming_handoff.get("requested_policy")
@@ -1337,12 +3456,25 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                 else "star_preserve_bypass"
             )
             pipeline._stage8_fallback_used = False
+            spatial_lineage_verified = bool(
+                stage3_spatial_lineage.get("accepted", False)
+                and stage3_spatial_lineage.get("support_sha256")
+            )
+            star_preserve_formal = bool(
+                overlay_accepted and stage8_saved and spatial_lineage_verified
+            )
             handoff = _set_stage8_handoff(
                 pipeline,
                 source_stem=pipeline._stage8_final_source,
                 passthrough=not overlay_accepted,
-                restricted_downstream=False,
+                restricted_downstream=not star_preserve_formal,
                 final_quality=pipeline._stage8_final_quality,
+                processing_route=(
+                    "star_preserve_secondary_nebulosity"
+                    if overlay_accepted
+                    else "review_only"
+                ),
+                formal_eligible=star_preserve_formal,
                 reason_code=(
                     "star_preserve_secondary_nebulosity"
                     if overlay_accepted
@@ -1355,6 +3487,21 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                     else "star_preserve_target_bypass"
                 ),
             )
+            handoff["spatial_background_lineage"] = {
+                "schema": stage3_spatial_lineage.get("schema"),
+                "status": stage3_spatial_lineage.get("status"),
+                "accepted": spatial_lineage_verified,
+                "support_sha256": stage3_spatial_lineage.get("support_sha256"),
+                "issues": list(stage3_spatial_lineage.get("issues") or []),
+            }
+            if not star_preserve_formal:
+                handoff["formal_eligible"] = False
+                handoff["restricted_downstream"] = True
+                if hasattr(pipeline, "_require_review"):
+                    pipeline._require_review(
+                        8,
+                        "star_preserve_stage8_formal_handoff_unverified",
+                    )
             subject_chroma_report = _stage8_write_subject_chroma_report(
                 pipeline,
                 status="bypassed_star_preserve",
@@ -1378,7 +3525,10 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                 "accepted": False,
                 "report": "stage8_subject_chroma_report.json",
             }
-            pipeline._stage8_handoff = handoff
+            handoff["star_preserve_secondary_nebulosity"] = dict(
+                secondary_overlay
+            )
+            handoff = _write_stage8_handoff(pipeline, handoff)
             pipeline.starless_file = pipeline.process_dir / f"{pipeline._stage8_final_source}.fit"
             report = {
                 "stage": "stage8_nebula_enhancement",
@@ -1748,6 +3898,14 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                         or "stage8_input_guard_skip"
                     ),
                 )
+                if handoff.get("formal_eligible") is not True:
+                    pipeline._require_review(
+                        8,
+                        str(
+                            handoff.get("reason_code")
+                            or "stage8_input_guard_skip"
+                        ),
+                    )
                 subject_chroma_report = _stage8_write_subject_chroma_report(
                     pipeline,
                     status="bypassed_input_guard",
@@ -1842,8 +4000,6 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                     if decisive_guard_failure and failure_action == "stop"
                     else "degraded"
                     if decisive_guard_failure and failure_action == "preserve_review"
-                    else "ok"
-                    if conservative_skip
                     else "degraded"
                 )
                 if decisive_guard_failure and failure_action != "auto_fallback":
@@ -2036,6 +4192,20 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
         or ("limited" if stage8_limited_mode else incoming_policy)
         or "full"
     ).strip().lower()
+    vectra_route_selected = bool(
+        getattr(pipeline.cfg, "optional_color_transform_enabled", False)
+        and getattr(pipeline.cfg, "workflow_plugin_probe_enabled", False)
+        and global_color_rebalance_allowed
+        and broadband_color_allowed
+        and not physical_broadband_anchor
+        and user_processing_mode.strip().lower() == "auto"
+        and resolved_processing_policy == "full"
+        and not stage8_limited_mode
+        and not stage8_high_risk
+        and bool(getattr(pipeline, "_stage7_stretch_accepted", False))
+        and not bool(external_starless_source)
+        and effective_stage8_saturation > 0.0
+    )
     subject_chroma_budget_reserved = bool(
         getattr(
             pipeline.cfg,
@@ -2054,14 +4224,24 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
         and not stage8_high_risk
         and bool(getattr(pipeline, "_stage7_stretch_accepted", False))
         and not bool(external_starless_source)
+        and not vectra_route_selected
         and effective_stage8_saturation > 0.0
     )
-    if subject_chroma_budget_reserved:
+    positive_chroma_budget_reserved = bool(
+        subject_chroma_budget_reserved or vectra_route_selected
+    )
+    if positive_chroma_budget_reserved:
         effective_plan["saturation"] = 0.0
-        messages.append(
-            "Stage8 positive chroma budget reserved for the post-structure "
-            "target-aware subject transaction"
-        )
+        if vectra_route_selected:
+            messages.append(
+                "Stage8 positive chroma budget reserved exclusively for the "
+                "post-structure Vectra transaction"
+            )
+        else:
+            messages.append(
+                "Stage8 positive chroma budget reserved for the post-structure "
+                "target-aware subject transaction"
+            )
     stage8_processing_plan = effective_plan
     if effective_stage8_saturation != requested_saturation:
         messages.append(
@@ -2094,17 +4274,10 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
     if not sasp_api_used and pipeline.cfg.workflow_plugin_probe_enabled:
         messages.append("SASP Siril 深加工命令不可用，跳过实验性 sasp_* 命令探测")
 
-    if (
-        pipeline.cfg.optional_color_transform_enabled
-        and global_color_rebalance_allowed
-        and not stage8_restricted_mode
-    ):
-        pipeline._run_first_available_command(
-            "调色1（可选）",
-            [
-                ("SASP Selective Color Correction", ("sasp_selective_color_correction",)),
-                ("Selective Color Correction", ("selective_color_correction",)),
-            ],
+    if vectra_route_selected:
+        messages.append(
+            "optional color transform deferred to the exclusive Stage8 "
+            "Vectra transaction"
         )
     elif (
         pipeline.cfg.optional_color_transform_enabled
@@ -2580,6 +4753,93 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
         messages.append("stage8_enhanced 输出保存失败")
     if pipeline._stage8_final_quality == "unknown":
         pipeline._stage8_final_quality = "ok" if status == "ok" else status
+    safe_passthrough_preflight: Dict[str, Any] = {
+        "schema": "starun.stage8-safe-passthrough-preflight.v1",
+        "status": "not_applicable",
+        "accepted": False,
+        "route": "safe_passthrough_color_only",
+    }
+    limited_safe_passthrough_eligibility = (
+        _stage8_limited_safe_passthrough_eligibility(
+            pipeline,
+            stage8_guard_report=stage8_guard_report,
+            final_source=str(pipeline._stage8_final_source),
+            final_quality=str(pipeline._stage8_final_quality),
+            user_processing_mode=user_processing_mode,
+            external_override=bool(external_starless_source),
+        )
+        if stage8_limited_mode
+        else {
+            "schema": (
+                "starun.stage8-limited-safe-passthrough-eligibility.v1"
+            ),
+            "status": "not_applicable",
+            "accepted": False,
+            "checks": {},
+            "issues": [],
+        }
+    )
+    full_rollback_candidate = bool(
+        pipeline._stage8_final_source == "stage8_input_starless"
+        and not stage8_limited_mode
+        and resolved_processing_policy == "full"
+        and user_processing_mode == "auto"
+        and not bool(external_starless_source)
+        and not _stage8_review_requirements_through_stage8(pipeline)
+    )
+    limited_safe_candidate = bool(
+        limited_safe_passthrough_eligibility.get("accepted", False)
+    )
+    if full_rollback_candidate or limited_safe_candidate:
+        safe_passthrough_preflight = _stage8_safe_passthrough_preflight(
+            pipeline,
+            source_mode=(
+                "limited_safe_passthrough"
+                if limited_safe_candidate
+                else "structure_rollback"
+            ),
+            eligibility=(
+                limited_safe_passthrough_eligibility
+                if limited_safe_candidate
+                else None
+            ),
+        )
+        if bool(safe_passthrough_preflight.get("accepted", False)):
+            messages.append(
+                "Stage8 exact structure identity passed independent preflight; "
+                + (
+                    "limited advisory safe passthrough enabled"
+                    if limited_safe_candidate
+                    else "bounded color-only route enabled"
+                )
+            )
+        else:
+            messages.append(
+                "Stage8 color-only passthrough prohibited: "
+                + ",".join(
+                    str(item)
+                    for item in safe_passthrough_preflight.get("issues", [])[:3]
+                )
+            )
+    stage8_starless_finish_report = _stage8_run_starless_finish(
+        pipeline,
+        messages,
+        base_stem=str(pipeline._stage8_final_source or "stage8_enhanced"),
+        channel_semantics=channel_semantics,
+        processing_policy=(
+            "limited" if stage8_limited_mode else resolved_processing_policy
+        ),
+        user_processing_mode=user_processing_mode,
+        external_override=bool(external_starless_source),
+        vectra_route_selected=vectra_route_selected,
+        effective_saturation_budget=effective_stage8_saturation,
+    )
+    if stage8_starless_finish_report.get("status") == "failed_rollback_failed":
+        status = "degraded"
+        pipeline._stage8_final_quality = "starless_finish_rollback_failed"
+        pipeline._stage8_fallback_used = True
+        if hasattr(pipeline, "_require_review"):
+            pipeline._require_review(8, "stage8_starless_finish_rollback_failed")
     stage8_subject_chroma_report = _stage8_run_subject_chroma(
         pipeline,
         messages,
@@ -2594,7 +4854,8 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
             getattr(pipeline.cfg, "nebula_saturation", requested_saturation)
         ),
         effective_saturation_budget=effective_stage8_saturation,
-        generic_saturation_suppressed=subject_chroma_budget_reserved,
+        generic_saturation_suppressed=positive_chroma_budget_reserved,
+        vectra_route_selected=vectra_route_selected,
     )
     if (
         stage8_subject_chroma_report.get("status")
@@ -2626,10 +4887,318 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
         )
     ):
         status = "degraded"
-    stage8_passthrough = pipeline._stage8_final_source == "stage8_input_starless"
+    safe_passthrough_final: Dict[str, Any] = {
+        "schema": "starun.stage8-safe-passthrough-final.v1",
+        "status": "not_applicable",
+        "accepted": False,
+        "route": "safe_passthrough_color_only",
+    }
+    post_cumulative_safe_passthrough_used = False
+    structure_cumulative_rejection: Dict[str, Any] = {}
+    if bool(safe_passthrough_preflight.get("accepted", False)):
+        safe_passthrough_final = _stage8_safe_passthrough_final_validation(
+            pipeline,
+            subject_chroma_report=stage8_subject_chroma_report,
+            palette_report=stage8_palette_report,
+        )
+        if bool(safe_passthrough_final.get("accepted", False)):
+            pipeline._stage8_final_quality = "safe_passthrough_color_only"
+            pipeline._stage8_final_source = "stage8_enhanced"
+            pipeline._stage8_fallback_used = True
+            messages.append(
+                "Stage8 safe_passthrough_color_only passed all independent gates"
+            )
+        else:
+            # A failed color-only candidate is never allowed to weaken the
+            # exact structure rollback.  Restore that canonical input and keep
+            # the handoff review-only.
+            rollback_ok = pipeline._rollback_stage8_to_input()
+            pipeline._stage8_final_source = "stage8_input_starless"
+            pipeline._stage8_final_quality = "poor"
+            pipeline._stage8_fallback_used = True
+            safe_passthrough_final["rollback"] = {
+                "status": "restored" if rollback_ok else "failed",
+                "source": "stage8_input_starless",
+            }
+            if hasattr(pipeline, "_require_review"):
+                pipeline._require_review(
+                    8,
+                    "stage8_safe_passthrough_color_only_rejected",
+                )
+            status = "degraded"
+    final_cumulative_quality: Dict[str, Any] = {
+        "schema": "starun.stage8-final-cumulative-quality.v1",
+        "status": "not_applicable",
+        "accepted": False,
+        "evaluation_scope": (
+            "stage8_input_starless_to_final_persisted_pixels"
+        ),
+        "fresh_evaluation": False,
+        "issues": [],
+    }
+    final_cumulative_candidate = bool(
+        pipeline._stage8_final_source == "stage8_enhanced"
+        and not _stage8_review_requirements_through_stage8(pipeline)
+        and (
+            bool(safe_passthrough_final.get("accepted", False))
+            or (
+                not stage8_limited_mode
+                and pipeline._stage8_final_quality == "ok"
+            )
+        )
+    )
+    if final_cumulative_candidate:
+        structure_candidate_cumulative = bool(
+            not safe_passthrough_final.get("accepted", False)
+            and not stage8_limited_mode
+            and pipeline._stage8_final_quality == "ok"
+        )
+        final_cumulative_quality = (
+            _stage8_enforce_final_cumulative_validation(
+                pipeline,
+                subject_chroma_report=stage8_subject_chroma_report,
+                palette_report=stage8_palette_report,
+                starless_finish_report=stage8_starless_finish_report,
+                defer_review_on_exact_rollback=structure_candidate_cumulative,
+            )
+        )
+        if bool(final_cumulative_quality.get("accepted", False)):
+            messages.append(
+                "Stage8 final cumulative pixels passed fresh full QA"
+            )
+        else:
+            status = "degraded"
+            messages.append(
+                "Stage8 final cumulative pixels rejected; "
+                + str(
+                    (
+                        final_cumulative_quality.get("rollback") or {}
+                    ).get("status")
+                    or "review_only"
+                )
+                + ": "
+                + ",".join(
+                    str(item)
+                    for item in final_cumulative_quality.get("issues", [])[:3]
+                )
+            )
+            retry_eligible = bool(
+                structure_candidate_cumulative
+                and (
+                    final_cumulative_quality.get("rollback") or {}
+                ).get("accepted", False)
+                and final_cumulative_quality.get(
+                    "review_deferred_for_safe_passthrough", False
+                )
+                and pipeline._stage8_final_source == "stage8_input_starless"
+                and resolved_processing_policy == "full"
+                and user_processing_mode == "auto"
+                and not bool(external_starless_source)
+                and not _stage8_review_requirements_through_stage8(pipeline)
+            )
+            if retry_eligible:
+                structure_cumulative_rejection = dict(
+                    final_cumulative_quality
+                )
+                pipeline._write_stage_json(
+                    "stage8_structure_cumulative_quality.json",
+                    structure_cumulative_rejection,
+                )
+                safe_passthrough_preflight = (
+                    _stage8_safe_passthrough_preflight(
+                        pipeline,
+                        source_mode="post_cumulative_structure_rollback",
+                    )
+                )
+                if bool(safe_passthrough_preflight.get("accepted", False)):
+                    # The rejected structure/plugin delta is gone.  Re-run
+                    # only the bounded internal color transaction from the
+                    # exact Stage7 pixels; do not re-enter any plugin.
+                    stage8_starless_finish_report = (
+                        _stage8_run_starless_finish(
+                            pipeline,
+                            messages,
+                            base_stem="stage8_input_starless",
+                            channel_semantics=channel_semantics,
+                            processing_policy=resolved_processing_policy,
+                            user_processing_mode=user_processing_mode,
+                            external_override=bool(external_starless_source),
+                            vectra_route_selected=vectra_route_selected,
+                            effective_saturation_budget=(
+                                effective_stage8_saturation
+                            ),
+                        )
+                    )
+                    stage8_subject_chroma_report = (
+                        _stage8_run_subject_chroma(
+                            pipeline,
+                            messages,
+                            base_stem="stage8_input_starless",
+                            channel_semantics=channel_semantics,
+                            processing_policy=resolved_processing_policy,
+                            user_processing_mode=user_processing_mode,
+                            external_override=bool(external_starless_source),
+                            requested_saturation_budget=float(
+                                getattr(
+                                    pipeline.cfg,
+                                    "nebula_saturation",
+                                    requested_saturation,
+                                )
+                            ),
+                            effective_saturation_budget=(
+                                effective_stage8_saturation
+                            ),
+                            generic_saturation_suppressed=(
+                                positive_chroma_budget_reserved
+                            ),
+                            vectra_route_selected=vectra_route_selected,
+                        )
+                    )
+                    stage8_palette_report = _stage8_run_dualband_palette(
+                        pipeline,
+                        messages,
+                        base_stem="stage8_input_starless",
+                        channel_semantics=channel_semantics,
+                        processing_policy=resolved_processing_policy,
+                        external_override=bool(external_starless_source),
+                    )
+                    safe_passthrough_final = (
+                        _stage8_safe_passthrough_final_validation(
+                            pipeline,
+                            subject_chroma_report=(
+                                stage8_subject_chroma_report
+                            ),
+                            palette_report=stage8_palette_report,
+                        )
+                    )
+                    if bool(safe_passthrough_final.get("accepted", False)):
+                        pipeline._stage8_final_source = "stage8_enhanced"
+                        pipeline._stage8_final_quality = (
+                            "safe_passthrough_color_only"
+                        )
+                        pipeline._stage8_fallback_used = True
+                        final_cumulative_quality = (
+                            _stage8_enforce_final_cumulative_validation(
+                                pipeline,
+                                subject_chroma_report=(
+                                    stage8_subject_chroma_report
+                                ),
+                                palette_report=stage8_palette_report,
+                                starless_finish_report=(
+                                    stage8_starless_finish_report
+                                ),
+                            )
+                        )
+                        post_cumulative_safe_passthrough_used = bool(
+                            final_cumulative_quality.get("accepted", False)
+                        )
+                        if post_cumulative_safe_passthrough_used:
+                            messages.append(
+                                "Stage8 cumulative structure rejection "
+                                "recovered through exact rollback and "
+                                "independently gated color-only passthrough"
+                            )
+                    else:
+                        rollback_ok = pipeline._rollback_stage8_to_input()
+                        pipeline._stage8_final_source = "stage8_input_starless"
+                        pipeline._stage8_final_quality = "poor"
+                        safe_passthrough_final["rollback"] = {
+                            "status": "restored" if rollback_ok else "failed",
+                            "source": "stage8_input_starless",
+                        }
+                        if hasattr(pipeline, "_require_review"):
+                            pipeline._require_review(
+                                8,
+                                "stage8_safe_passthrough_color_only_rejected",
+                            )
+                else:
+                    if hasattr(pipeline, "_require_review"):
+                        pipeline._require_review(
+                            8,
+                            "stage8_safe_passthrough_color_only_rejected",
+                        )
+    else:
+        pipeline._stage8_final_cumulative_quality_report = dict(
+            final_cumulative_quality
+        )
+        pipeline._write_stage_json(
+            "stage8_final_cumulative_quality.json",
+            final_cumulative_quality,
+        )
+    stage8_starless_finish_report.update(
+        final_source=f"{pipeline._stage8_final_source}.fit",
+        final_source_identity=_stage8_source_identity(
+            pipeline,
+            pipeline._stage8_final_source,
+        ),
+        downstream_color_route={
+            "palette_accepted": bool(stage8_palette_report.get("accepted", False)),
+            "vectra_selected": bool(vectra_route_selected),
+            "vectra_accepted": bool(
+                getattr(pipeline, "_stage8_vectra_applied", False)
+            ),
+            "subject_chroma_accepted": bool(
+                stage8_subject_chroma_report.get("accepted", False)
+            ),
+        },
+    )
+    pipeline._stage8_starless_finish_report = dict(
+        stage8_starless_finish_report
+    )
+    pipeline._write_stage_json(
+        "stage8_starless_finish_report.json",
+        stage8_starless_finish_report,
+    )
+    source_stem_passthrough = (
+        pipeline._stage8_final_source == "stage8_input_starless"
+    )
+    spatial_lineage_verified = bool(
+        stage3_spatial_lineage.get("accepted", False)
+        and stage3_spatial_lineage.get("support_sha256")
+    )
+    review_requirement_free = not _stage8_review_requirements_through_stage8(
+        pipeline
+    )
+    safe_passthrough_formal = bool(
+        safe_passthrough_final.get("accepted", False)
+        and final_cumulative_quality.get("accepted", False)
+        and pipeline._stage8_final_source == "stage8_enhanced"
+        and review_requirement_free
+    )
+    stage8_passthrough = bool(source_stem_passthrough or safe_passthrough_formal)
+    structure_formal = bool(
+        not stage8_limited_mode
+        and not source_stem_passthrough
+        and pipeline._stage8_final_quality == "ok"
+        and final_cumulative_quality.get("accepted", False)
+        and review_requirement_free
+    )
+    processing_route = (
+        "safe_passthrough_color_only"
+        if safe_passthrough_formal
+        else "structure_enhanced"
+        if structure_formal
+        else "review_only"
+    )
+    formal_eligible = bool(
+        spatial_lineage_verified
+        and (safe_passthrough_formal or structure_formal)
+    )
     final_reason_code = ""
     final_reason_text = ""
-    if stage8_passthrough and not str(
+    if str(final_cumulative_quality.get("status") or "") == "rejected":
+        final_reason_code = str(
+            final_cumulative_quality.get("reason_code")
+            or "stage8_final_cumulative_qa_rejected"
+        )
+        final_reason_text = final_reason_code
+    elif post_cumulative_safe_passthrough_used:
+        final_reason_code = (
+            "stage8_structure_cumulative_rollback_"
+            "safe_passthrough_accepted"
+        )
+        final_reason_text = final_reason_code
+    elif stage8_passthrough and not str(
         (getattr(pipeline, "_stage8_handoff", {}) or {}).get("reason_code") or ""
     ):
         final_reason_code = "stage8_enhancement_quality_rollback"
@@ -2638,18 +5207,45 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
         pipeline,
         source_stem=pipeline._stage8_final_source,
         passthrough=stage8_passthrough,
-        restricted_downstream=bool(
-            stage8_limited_mode
-            or pipeline._stage8_fallback_used
-            or stage8_passthrough
-            or pipeline._stage8_final_quality != "ok"
-        ),
+        restricted_downstream=not formal_eligible,
         final_quality=pipeline._stage8_final_quality,
+        processing_route=processing_route,
+        formal_eligible=formal_eligible,
         reason_code=final_reason_code,
         reason_text=final_reason_text,
     )
+    halo_guard_report = dict(
+        getattr(pipeline, "_stage8_star_halo_guard_report", {}) or {}
+    )
+    if halo_guard_report:
+        handoff["star_halo_guard"] = {
+            "status": halo_guard_report.get("status"),
+            "reason_code": halo_guard_report.get("reason_code"),
+            "report": star_halo_guard.REPORT_NAME,
+            "artifact": halo_guard_report.get("artifact"),
+            "artifact_sha256": halo_guard_report.get("artifact_sha256"),
+            "verified": bool(
+                getattr(pipeline, "_stage8_star_halo_guard_verified", False)
+            ),
+        }
+    handoff["spatial_background_lineage"] = {
+        "schema": stage3_spatial_lineage.get("schema"),
+        "status": stage3_spatial_lineage.get("status"),
+        "accepted": bool(stage3_spatial_lineage.get("accepted", False)),
+        "support_sha256": stage3_spatial_lineage.get("support_sha256"),
+        "issues": list(stage3_spatial_lineage.get("issues") or []),
+    }
     handoff["outcome_reason_code"] = (
-        "stage8_limited_candidate_rejected"
+        str(
+            final_cumulative_quality.get("reason_code")
+            or "stage8_final_cumulative_qa_rejected"
+        )
+        if str(final_cumulative_quality.get("status") or "") == "rejected"
+        else "stage8_structure_cumulative_rollback_safe_passthrough_accepted"
+        if post_cumulative_safe_passthrough_used
+        else "stage8_limited_safe_passthrough_accepted"
+        if safe_passthrough_formal and stage8_limited_mode
+        else "stage8_limited_candidate_rejected"
         if limited_candidate_rolled_back
         else "stage8_limited_candidate_accepted"
         if stage8_limited_mode and not stage8_passthrough
@@ -2666,6 +5262,17 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
                     stage8_palette_report.get("synthetic_sii", False)
                 ),
                 "physical_parent": "stage8_pre_palette.fit",
+            }
+        )
+    elif bool(getattr(pipeline, "_stage8_vectra_applied", False)):
+        handoff.update(
+            {
+                "color_role": "vectra_exclusive_color_route",
+                "color_rendition": {
+                    "mode": "vectra_exclusive_color_route",
+                    "accepted": True,
+                    "report": "stage8_starless_finish_report.json",
+                },
             }
         )
     elif bool(stage8_subject_chroma_report.get("accepted", False)):
@@ -2696,6 +5303,41 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
         "accepted": bool(stage8_subject_chroma_report.get("accepted", False)),
         "report": "stage8_subject_chroma_report.json",
     }
+    handoff["starless_finish"] = {
+        "status": stage8_starless_finish_report.get("status"),
+        "accepted": bool(stage8_starless_finish_report.get("accepted", False)),
+        "accepted_steps": list(
+            stage8_starless_finish_report.get("accepted_steps") or []
+        ),
+        "report": "stage8_starless_finish_report.json",
+    }
+    handoff["final_cumulative_quality"] = {
+        "status": final_cumulative_quality.get("status"),
+        "accepted": bool(final_cumulative_quality.get("accepted", False)),
+        "fresh_evaluation": bool(
+            final_cumulative_quality.get("fresh_evaluation", False)
+        ),
+        "report": "stage8_final_cumulative_quality.json",
+        "issues": list(final_cumulative_quality.get("issues") or []),
+        "rollback": dict(final_cumulative_quality.get("rollback") or {}),
+    }
+    handoff["structure_cumulative_retry"] = {
+        "attempted": bool(structure_cumulative_rejection),
+        "accepted": bool(post_cumulative_safe_passthrough_used),
+        "source_mode": (
+            "post_cumulative_structure_rollback"
+            if structure_cumulative_rejection
+            else None
+        ),
+        "report": (
+            "stage8_structure_cumulative_quality.json"
+            if structure_cumulative_rejection
+            else None
+        ),
+        "initial_issues": list(
+            structure_cumulative_rejection.get("issues") or []
+        ),
+    }
     pipeline._stage8_handoff = handoff
     saturation_execution = dict(
         getattr(pipeline, "_stage8_saturation_execution", {}) or {}
@@ -2718,11 +5360,83 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
         applied_saturation=applied_saturation,
         palette_report=stage8_palette_report,
         subject_chroma_report=stage8_subject_chroma_report,
+        vectra_report=getattr(pipeline, "_stage8_vectra_report", {}) or {},
     )
+    if (
+        bool(color_quality_report.get("used_for_gate", False))
+        and str(color_quality_report.get("status") or "") == "rejected"
+    ):
+        handoff["restricted_downstream"] = True
+        handoff["formal_eligible"] = False
+        handoff["final_quality"] = "stage8_color_or_halo_gate_rejected"
+        handoff["reason_code"] = "stage8_color_or_halo_gate_rejected"
+        handoff["reason_text"] = "stage8_color_or_halo_gate_rejected"
+        pipeline._stage8_final_quality = "stage8_color_or_halo_gate_rejected"
+        status = "degraded"
+        if hasattr(pipeline, "_require_review"):
+            pipeline._require_review(8, "stage8_color_or_halo_gate_rejected")
     handoff["color_contract"] = color_quality_report.get("contract")
     handoff["color_quality_report"] = "stage8_color_quality_report.json"
+    handoff["color_gate"] = {
+        "report": "stage8_color_quality_report.json",
+        "used_for_gate": bool(color_quality_report.get("used_for_gate", False)),
+        "status": color_quality_report.get("status"),
+        "guard_lineage_verified": bool(
+            (color_quality_report.get("guard_lineage") or {}).get("verified", False)
+        ),
+        "final_pixel_identity": dict(
+            color_quality_report.get("final_pixel_identity") or {}
+        ),
+    }
     handoff["saturation_execution"] = saturation_execution
-    pipeline._stage8_handoff = handoff
+    handoff["safe_passthrough_color_only"] = {
+        "limited_eligibility": limited_safe_passthrough_eligibility,
+        "preflight": safe_passthrough_preflight,
+        "final_validation": safe_passthrough_final,
+    }
+    if str(handoff.get("processing_route") or "") == "safe_passthrough_color_only":
+        final_pixel_identity = dict(
+            color_quality_report.get("final_pixel_identity") or {}
+        )
+        source_artifact = dict(handoff.get("source_artifact") or {})
+        safe_color_gate_verified = bool(
+            color_quality_report.get("used_for_gate", False)
+            and str(color_quality_report.get("status") or "")
+            in {"accepted", "ok", "reported"}
+            and not list(color_quality_report.get("issues") or [])
+            and bool(
+                (color_quality_report.get("guard_lineage") or {}).get(
+                    "verified", False
+                )
+            )
+            and str(final_pixel_identity.get("sha256") or "")
+            == str(source_artifact.get("sha256") or "")
+            and str(final_pixel_identity.get("pixel_sha256") or "")
+            == str(source_artifact.get("pixel_sha256") or "")
+        )
+        handoff["safe_passthrough_color_only"]["color_gate_verified"] = (
+            safe_color_gate_verified
+        )
+        if not safe_color_gate_verified:
+            handoff["restricted_downstream"] = True
+            handoff["formal_eligible"] = False
+            handoff["reason_code"] = "stage8_safe_passthrough_color_gate_unverified"
+            handoff["reason_text"] = "stage8_safe_passthrough_color_gate_unverified"
+            handoff["final_quality"] = (
+                "stage8_safe_passthrough_color_gate_unverified"
+            )
+            pipeline._stage8_final_quality = (
+                "stage8_safe_passthrough_color_gate_unverified"
+            )
+            status = "degraded"
+            if hasattr(pipeline, "_require_review"):
+                pipeline._require_review(
+                    8,
+                    "stage8_safe_passthrough_color_gate_unverified",
+                )
+    if bool(handoff.get("restricted_downstream", True)):
+        handoff["formal_eligible"] = False
+    handoff = _write_stage8_handoff(pipeline, handoff)
     enhancement_report_value = locals().get("enhancement_report")
     if not isinstance(enhancement_report_value, dict) or not enhancement_report_value:
         enhancement_report_value = {
@@ -2770,7 +5484,13 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
         enhancement_report_value["subject_chroma"] = (
             stage8_subject_chroma_report
         )
+        enhancement_report_value["starless_finish"] = (
+            stage8_starless_finish_report
+        )
         enhancement_report_value["color_quality"] = color_quality_report
+        enhancement_report_value["final_cumulative_quality"] = (
+            final_cumulative_quality
+        )
         enhancement_report_value["handoff"] = handoff
         pipeline._write_stage_json(
             "stage8_enhancement_report.json",
@@ -2805,6 +5525,12 @@ def run_stage8_nebula_enhancement(pipeline) -> None:
         ),
         "stage8_subject_chroma_applied": str(
             bool(stage8_subject_chroma_report.get("accepted", False))
+        ).lower(),
+        "stage8_starless_finish_status": str(
+            stage8_starless_finish_report.get("status") or "unknown"
+        ),
+        "stage8_vectra_applied": str(
+            bool(getattr(pipeline, "_stage8_vectra_applied", False))
         ).lower(),
         "channel_semantics": channel_semantics,
     }

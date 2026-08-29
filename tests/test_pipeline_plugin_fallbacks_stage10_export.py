@@ -5,6 +5,109 @@ from managed_output import _read_managed_display_png
 
 
 class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
+    def _final_quality_with_accepted_spatial_lineage(
+        self,
+        probe,
+    ) -> dict[str, Any]:
+        """Keep non-spatial final-quality tests on an explicit accepted lineage."""
+
+        with tempfile.TemporaryDirectory() as td:
+            probe.process_dir = Path(td)
+            original_reader = probe._read_image_by_stem
+            original_background_metrics = probe._background_quality_metrics
+            image = original_reader("stage10_final")
+            image_array = np.asarray(image)
+            if image_array.ndim != 3:
+                image_array = np.full((3, 32, 32), 0.05, dtype=np.float32)
+                probe._read_image_by_stem = lambda _stem: image_array.copy()
+            install_stage10_accepted_spatial_lineage(
+                probe.process_dir,
+                image_array,
+            )
+            shape = tuple(int(value) for value in image_array.shape[-2:])
+            frozen = getattr(probe, "_stage7_frozen_rendition_masks", None)
+            frozen_background = (
+                np.asarray(frozen.get("background_mask"))
+                if isinstance(frozen, dict)
+                and frozen.get("background_mask") is not None
+                else None
+            )
+            if (
+                frozen_background is None
+                or tuple(frozen_background.shape) != shape
+            ):
+                probe._stage7_frozen_rendition_masks = {
+                    "background_mask": np.ones(shape, dtype=np.float32),
+                    "subject_mask": np.zeros(shape, dtype=np.float32),
+                }
+            support = (
+                stage10_export_module._stage10_freeze_authenticated_background_masks(
+                    probe
+                )
+            )
+            self.assertTrue(support["accepted"], support)
+            def background_metrics(image, masks=None):
+                try:
+                    return original_background_metrics(image, masks)
+                except TypeError:
+                    return original_background_metrics(image)
+
+            probe._background_quality_metrics = background_metrics
+            try:
+                return pipeline_module.stage8_pixels.final_quality_report(
+                    probe
+                )
+            finally:
+                probe._read_image_by_stem = original_reader
+                probe._background_quality_metrics = original_background_metrics
+
+    def test_final_quality_missing_spatial_lineage_fails_closed(self):
+        probe = SimpleNamespace(
+            _stage8_final_quality="ok",
+            _stage8_fallback_used=False,
+            _stage9_bypassed_bad_starless=False,
+            _stage9_stars_required=False,
+            _stage9_stars_applied=False,
+            _stage9_remix_formally_accepted=True,
+            _read_image_by_stem=lambda _stem: np.full(
+                (3, 16, 16),
+                0.05,
+                dtype=np.float32,
+            ),
+            _background_quality_metrics=lambda _image, _masks=None: {
+                "chroma_noise_score": 0.0,
+                "background_mottling_score": 0.0,
+                "local_patch_variance": 0.0,
+                "core_clip_score": 0.0,
+                "starless_artifact_score": 0.0,
+                "bg_dirty_score": 0.0,
+                "bg_std": 0.0,
+            },
+            _stage7_halo_residue_score=lambda: 0.0,
+            _active_policy_name=lambda: "test",
+            _active_target_type=lambda: "generic",
+        )
+
+        report = pipeline_module.stage8_pixels.final_quality_report(probe)
+
+        self.assertEqual(report["final_quality"], "poor")
+        self.assertIn(
+            "stage3_spatial_background_lineage_unavailable",
+            report["issues"],
+        )
+        self.assertIn(
+            "authenticated_frozen_background_sampling_unavailable",
+            report["issues"],
+        )
+        sampling = report["metrics"][
+            "final_signal_excluded_background_sampling"
+        ]
+        self.assertEqual(sampling["status"], "rejected")
+        self.assertNotEqual(
+            sampling.get("method"),
+            "darkest_35_percent_fallback",
+        )
+
     def test_stage10_degraded_starmask_catalog_uses_signed_stage5_reference(self):
         processor = self._new_processor()
         self._stage10_final_input(processor)
@@ -57,6 +160,267 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
         )
         self.assertGreater(catalog["stage5_visibility_weak_count"], 0)
         self.assertGreater(catalog["stage5_visibility_bright_count"], 0)
+
+    def test_stage10_stage5_review_catalog_uses_shared_display_contract(self):
+        processor = self._new_processor()
+        self._stage10_final_input(processor)
+        processor._stage9_star_reference_catalog = {
+            "status": "degraded",
+            "source_matched": False,
+            "reference_degraded": True,
+        }
+        (processor.process_dir / "stage5_input_linear.fit").write_bytes(b"mock")
+        coordinates = tuple(
+            (y, x)
+            for y in (10, 28, 46, 64)
+            for x in (12, 40, 68, 96)
+        )
+        processor._stage5_star_reference_report = {
+            "schema": "starun.stage5-star-reference.v1",
+            "status": "available",
+            "fixed_before_deconvolution": True,
+            "source_checkpoint": "stage5_input_linear.fit",
+            "stars": [
+                {
+                    "geometry_valid": True,
+                    "x": x,
+                    "y": y,
+                    "fwhm_geometry": 2.8,
+                    "amplitude": 0.10 + index * 0.01,
+                }
+                for index, (y, x) in enumerate(coordinates)
+            ],
+        }
+        yy, xx = np.mgrid[:80, :112]
+        galaxy = np.exp(
+            -0.5
+            * (
+                ((xx - 56.0) / 20.0) ** 2
+                + ((yy - 40.0) / 13.0) ** 2
+            )
+        )
+        broad = 0.004 + 0.090 * galaxy
+        image = np.stack((broad, broad, broad)).astype(np.float32)
+        for y, x in coordinates:
+            image[:, y, x] += np.float32(0.0015)
+        processor.image_pixels = image
+        processor.siril.get_image_pixeldata = (
+            lambda preview=False: processor.image_pixels.copy()
+        )
+        contract = stage10_export_module.display_rendition.build_linked_review_contract(
+            image,
+            reason="test_review_catalog",
+            source_stem="stage10_final",
+        )
+        displayed = stage10_export_module.display_rendition.apply_review_contract(
+            image,
+            contract,
+        )
+
+        catalog, resolution = (
+            stage10_export_module._stage10_star_visibility_reference(
+                processor,
+                displayed,
+                restore_stem="stage9_remixed",
+                display_contract=contract,
+            )
+        )
+        audit = stage10_export_module.audit_display_visibility(
+            displayed,
+            target_type="large_galaxy",
+            stars_required=True,
+            star_reference=catalog,
+            pixel_coordinate_domain="siril_pixel_buffer_bottom_up",
+            star_visibility_config=processor.cfg,
+        )
+
+        self.assertIsNotNone(catalog)
+        self.assertEqual(resolution["status"], "ready")
+        self.assertEqual(
+            resolution["audit_domain"],
+            "shared_review_display_contract",
+        )
+        self.assertGreaterEqual(
+            catalog["catalog_visibility_reference_count"],
+            16,
+        )
+        self.assertTrue(audit["checks"]["star_visibility"]["passed"], audit)
+
+    def test_stage10_trusted_with_stars_fallback_exports_review_only(self):
+        processor = self._new_processor()
+        self._stage10_final_input(processor)
+        processor.cfg.stage10_final_denoise_enabled = False
+        processor.cfg.stage10_final_saturation_enabled = False
+        processor._stage9_stars_applied = False
+        processor._stage9_remix_formally_accepted = False
+        processor._stage9_output_contains_stars = True
+        processor._stage9_star_reference_catalog = {
+            "status": "degraded",
+            "source_matched": False,
+            "reference_degraded": True,
+        }
+        coordinates = tuple(
+            (y, x)
+            for y in (10, 28, 46, 64)
+            for x in (12, 40, 68, 96)
+        )
+        processor._stage5_star_reference_report = {
+            "schema": "starun.stage5-star-reference.v1",
+            "status": "available",
+            "fixed_before_deconvolution": True,
+            "source_checkpoint": "stage5_input_linear.fit",
+            "stars": [
+                {
+                    "geometry_valid": True,
+                    "x": x,
+                    "y": y,
+                    "fwhm_geometry": 2.8,
+                    "amplitude": 0.10 + index * 0.01,
+                }
+                for index, (y, x) in enumerate(coordinates)
+            ],
+        }
+        (processor.process_dir / "stage5_input_linear.fit").write_bytes(b"mock")
+        yy, xx = np.mgrid[:80, :112]
+        galaxy = np.exp(
+            -0.5
+            * (
+                ((xx - 56.0) / 20.0) ** 2
+                + ((yy - 40.0) / 13.0) ** 2
+            )
+        )
+        broad = 0.004 + 0.090 * galaxy
+        image = np.stack((broad, broad, broad)).astype(np.float32)
+        for y, x in coordinates:
+            image[:, y, x] += np.float32(0.0015)
+        processor.image_pixels = image
+        processor.siril.get_image_pixeldata = (
+            lambda preview=False: processor.image_pixels.copy()
+        )
+        processor._set_current_image_pixeldata = (
+            lambda pixels, **_kwargs: setattr(
+                processor,
+                "image_pixels",
+                np.array(pixels, copy=True),
+            )
+        )
+
+        stage10_export(processor)
+
+        self.assertEqual(processor.results[-1][1], "degraded", processor.results[-1])
+        self.assertTrue(processor._final_output_review_only)
+        self.assertIn(("savetif", "result_review", "-astro"), processor.cmd_calls)
+        self.assertFalse(
+            any(
+                call[0] == "savetif" and call[1] == "result_processed"
+                for call in processor.cmd_calls
+            )
+        )
+        visibility = processor.stage_json_reports[
+            "stage10_pre_export_visibility.json"
+        ]
+        self.assertEqual(visibility["schema"], "starun.stage10-pre-export-visibility.v2")
+        self.assertEqual(visibility["audit_domain"], "shared_review_display_contract")
+        self.assertEqual(visibility["delivery_scope"], "review_only")
+        self.assertTrue(
+            visibility["audit"]["checks"]["star_visibility"]["passed"]
+        )
+
+    def test_stage10_flat_linear_galaxy_uses_catalog_backed_review_mapping(self):
+        processor = self._new_processor()
+        self._stage10_final_input(processor)
+        processor.cfg.stage10_final_denoise_enabled = False
+        processor.cfg.stage10_final_saturation_enabled = False
+        processor._stage9_stars_applied = False
+        processor._stage9_remix_formally_accepted = False
+        processor._stage9_output_contains_stars = True
+        processor._stage9_star_reference_catalog = {
+            "status": "degraded",
+            "source_matched": False,
+            "reference_degraded": True,
+        }
+        processor._active_target_type = lambda: "large_galaxy"
+        coordinates = tuple(
+            (y, x)
+            for y in (10, 28, 46, 64)
+            for x in (12, 40, 68, 96)
+        )
+        processor._stage5_star_reference_report = {
+            "schema": "starun.stage5-star-reference.v1",
+            "status": "available",
+            "fixed_before_deconvolution": True,
+            "source_checkpoint": "stage5_input_linear.fit",
+            "stars": [
+                {
+                    "geometry_valid": True,
+                    "x": x,
+                    "y": y,
+                    "fwhm_geometry": 2.8,
+                    "amplitude": 0.10 + index * 0.01,
+                }
+                for index, (y, x) in enumerate(coordinates)
+            ],
+        }
+        (processor.process_dir / "stage5_input_linear.fit").write_bytes(b"mock")
+        yy, xx = np.mgrid[:80, :112]
+        galaxy = np.exp(
+            -0.5
+            * (
+                ((xx - 56.0) / 20.0) ** 2
+                + ((yy - 40.0) / 13.0) ** 2
+            )
+        )
+        broad = 0.0503 + 0.00055 * galaxy
+        image = np.stack((broad, broad, broad)).astype(np.float32)
+        for y, x in coordinates:
+            image[:, y, x] += np.float32(0.0025)
+        native_audit = stage10_export_module.audit_display_visibility(
+            image,
+            target_type="large_galaxy",
+            stars_required=False,
+        )
+        self.assertEqual(native_audit["exposure_state"], "unmappable")
+        self.assertTrue(native_audit["metrics"]["underexposed"])
+        processor.image_pixels = image
+        processor.siril.get_image_pixeldata = (
+            lambda preview=False: processor.image_pixels.copy()
+        )
+        processor._set_current_image_pixeldata = (
+            lambda pixels, **_kwargs: setattr(
+                processor,
+                "image_pixels",
+                np.array(pixels, copy=True),
+            )
+        )
+
+        stage10_export(processor)
+
+        self.assertEqual(processor.results[-1][1], "degraded", processor.results[-1])
+        self.assertIn(("savetif", "result_review", "-astro"), processor.cmd_calls)
+        contract = processor.stage_json_reports[
+            "display_rendition_contract.json"
+        ]
+        self.assertEqual(contract["mode"], "linked_visibility_v2")
+        evidence = contract["selection_evidence"]
+        self.assertEqual(
+            evidence["mode"],
+            "trusted_catalog_underexposed_linear_review",
+        )
+        self.assertEqual(evidence["catalog_star_count"], 16)
+        self.assertFalse(evidence["compact_peaks_used"])
+        visibility = processor.stage_json_reports[
+            "stage10_pre_export_visibility.json"
+        ]
+        self.assertEqual(
+            visibility["audit_domain"],
+            "shared_review_display_contract",
+        )
+        self.assertTrue(
+            visibility["audit"]["checks"]["galaxy_visibility"]["passed"]
+        )
+        self.assertTrue(
+            visibility["audit"]["checks"]["star_visibility"]["passed"]
+        )
 
     def test_stage10_catalog_failure_withholds_review_even_with_generic_peaks(self):
         processor = self._new_processor()
@@ -117,7 +481,7 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
             audit["checks"]["star_visibility"]["passed"]
         )
 
-    def test_stage10_legacy_accepted_hdr_state_has_no_preserve_exception(self):
+    def test_stage10_legacy_hdr_without_star_identity_is_review_only(self):
         processor = self._new_processor()
         self._stage10_final_input(processor)
         processor._stage9_stars_required = False
@@ -131,7 +495,7 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
             "output_stem": "stage7_with_stars_hdr",
         }
         processor._final_quality_report = lambda _stem: {
-            "schema": "starun.final-quality.v2",
+            "schema": "starun.final-quality.v4",
             "severity": "normal",
             "final_quality": "ok",
             "status": "ok",
@@ -143,8 +507,13 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
 
         self.assertTrue(any(call[0] == "satu" for call in processor.cmd_calls))
         self.assertFalse(processor.script_calls)
-        self.assertIn(("savetif", "result_processed", "-astro"), processor.cmd_calls)
-        self.assertFalse(processor._final_output_review_only)
+        self.assertIn(("savetif", "result_review", "-astro"), processor.cmd_calls)
+        self.assertTrue(processor._final_output_review_only)
+        self.assertFalse(processor._presentation_quality_accepted)
+        self.assertIn(
+            "presentation_quality_requires_review",
+            processor._stage_review_reasons(10),
+        )
         denoise = processor.stage_json_reports["stage10_denoise_plan.json"]
         self.assertNotIn("bright_core_with_stars_hdr_preserve", denoise)
         self.assertNotIn("skipped_by_bright_core_with_stars_hdr", denoise)
@@ -152,6 +521,42 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
             processor._stage10_quality_repair_report["reason"],
             "final_quality_is_not_hard_reject",
         )
+
+    def test_stage10_verified_star_preserve_route_passes_star_gate(self):
+        processor = self._new_processor()
+        self._stage10_final_input(processor)
+        processor.cfg.final_saturation = 0.0
+        processor._stage9_stars_required = False
+        processor._stage9_stars_applied = False
+        processor._stage9_output_contains_stars = True
+        processor._stage9_remix_formally_accepted = True
+        processor._stage9_star_delivery_contract_accepted = True
+        processor._stage9_stars_application_mode = "stars_not_required"
+        processor._stage9_final_source = "stage9_remixed"
+        processor._final_quality_report = lambda _stem: {
+            "schema": "starun.final-quality.v4",
+            "severity": "normal",
+            "final_quality": "ok",
+            "status": "ok",
+            "needs_conservative_rerun": False,
+            "issues": [],
+        }
+
+        stage10_export(processor)
+
+        self.assertTrue(processor._presentation_quality_accepted)
+        presentation = processor.stage_json_reports[
+            "presentation_quality_report.json"
+        ]
+        self.assertEqual(
+            presentation["gates"]["stars"]["reason"],
+            "verified_stars_not_required",
+        )
+        self.assertIn(
+            ("savetif", "result_processed", "-astro"),
+            processor.cmd_calls,
+        )
+        self.assertFalse(processor._final_output_review_only)
 
     def test_stage10_review_primary_png_matches_managed_display(self):
         processor = self._new_processor()
@@ -453,8 +858,22 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
     def test_stage10_low_noise_input_skips_expensive_denoiser(self):
         processor = self._new_processor()
         (processor.process_dir / "stage9_remixed.fit").write_bytes(b"mock")
+        processor._stage9_stars_required = False
+        processor._stage9_stars_applied = False
+        processor._stage9_output_contains_stars = True
+        processor._stage9_remix_formally_accepted = True
+        processor._stage9_star_delivery_contract_accepted = True
+        processor._stage9_final_source = "stage9_remixed"
         processor.available_scripts.add("processing/CosmicClarity_Denoise.py")
         pixels = np.full((3, 32, 32), 0.05, dtype=np.float32)
+        install_stage10_accepted_spatial_lineage(
+            processor.process_dir,
+            pixels,
+        )
+        processor._stage7_frozen_rendition_masks = {
+            "background_mask": np.ones((32, 32), dtype=np.float32),
+            "subject_mask": np.zeros((32, 32), dtype=np.float32),
+        }
         processor.siril.get_image_pixeldata = lambda preview=False: pixels
         processor._background_quality_metrics = lambda _image: {
             "chroma_noise_score": 0.058,
@@ -851,7 +1270,7 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
             _active_target_type=lambda: "emission_nebula_widefield",
         )
 
-        report = pipeline_module.stage8_pixels.final_quality_report(probe)
+        report = self._final_quality_with_accepted_spatial_lineage(probe)
 
         self.assertFalse(report["strict_gate"])
         self.assertTrue(report["metrics"]["stage8_conservative_skipped"])
@@ -943,7 +1362,7 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
             _active_target_type=lambda: "generic_low_snr_safe",
         )
 
-        report = stage8_pixels.final_quality_report(probe)
+        report = self._final_quality_with_accepted_spatial_lineage(probe)
 
         final_metrics = report["metrics"][
             "final_signal_excluded_background_metrics"
@@ -992,7 +1411,7 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
             _active_target_type=lambda: "generic_low_snr_safe",
         )
 
-        report = pipeline_module.stage8_pixels.final_quality_report(probe)
+        report = self._final_quality_with_accepted_spatial_lineage(probe)
 
         self.assertTrue(report["strict_gate"])
         self.assertIn(
@@ -1028,7 +1447,7 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
             _active_target_type=lambda: "large_galaxy",
         )
 
-        report = pipeline_module.stage8_pixels.final_quality_report(probe)
+        report = self._final_quality_with_accepted_spatial_lineage(probe)
 
         self.assertFalse(report["strict_gate"])
         self.assertEqual(report["final_quality"], "ok")
@@ -1060,9 +1479,9 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
             _active_target_type=lambda: "emission_nebula_widefield",
         )
 
-        report = pipeline_module.stage8_pixels.final_quality_report(probe)
+        report = self._final_quality_with_accepted_spatial_lineage(probe)
 
-        self.assertEqual(report["schema"], "starun.final-quality.v2")
+        self.assertEqual(report["schema"], "starun.final-quality.v4")
         self.assertEqual(report["severity"], "soft_warning")
         self.assertEqual(report["final_quality"], "ok")
         self.assertFalse(report["needs_conservative_rerun"])
@@ -1101,7 +1520,7 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
             _active_target_type=lambda: "emission_nebula_widefield",
         )
 
-        report = pipeline_module.stage8_pixels.final_quality_report(probe)
+        report = self._final_quality_with_accepted_spatial_lineage(probe)
 
         self.assertEqual(report["severity"], "soft_warning")
         self.assertEqual(report["final_quality"], "ok")
@@ -1215,10 +1634,27 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
             _active_target_type=lambda: "emission_nebula_widefield",
         )
 
-        report = pipeline_module.stage8_pixels.final_quality_report(
-            probe,
-            "stage10_final",
-        )
+        with tempfile.TemporaryDirectory() as td:
+            probe.process_dir = Path(td)
+            fixture_pixels = np.full((3, 16, 16), 0.05, dtype=np.float32)
+            install_stage10_accepted_spatial_lineage(
+                probe.process_dir,
+                fixture_pixels,
+            )
+            probe._stage7_frozen_rendition_masks = {
+                "background_mask": np.ones((16, 16), dtype=np.float32),
+                "subject_mask": np.zeros((16, 16), dtype=np.float32),
+            }
+            support = (
+                stage10_export_module._stage10_freeze_authenticated_background_masks(
+                    probe
+                )
+            )
+            self.assertTrue(support["accepted"], support)
+            report = pipeline_module.stage8_pixels.final_quality_report(
+                probe,
+                "stage10_final",
+            )
 
         self.assertEqual(report["severity"], "hard_reject")
         self.assertTrue(
@@ -1289,7 +1725,7 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
                 _active_policy_name=lambda: "batch_regression",
                 _active_target_type=lambda: target_type,
             )
-            return pipeline_module.stage8_pixels.final_quality_report(probe)
+            return self._final_quality_with_accepted_spatial_lineage(probe)
 
         ngc2237 = evaluate(
             {
@@ -1481,7 +1917,7 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
             _active_target_type=lambda: "bright_emission_reflection_nebula",
         )
 
-        report = pipeline_module.stage8_pixels.final_quality_report(probe)
+        report = self._final_quality_with_accepted_spatial_lineage(probe)
 
         self.assertFalse(report["strict_gate"])
         self.assertEqual(report["final_quality"], "ok")
@@ -1494,7 +1930,7 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
 
         probe._stage9_remix_formally_accepted = False
         probe._stage9_review_candidate_selected = True
-        review_report = pipeline_module.stage8_pixels.final_quality_report(
+        review_report = self._final_quality_with_accepted_spatial_lineage(
             probe
         )
         self.assertFalse(
@@ -1524,8 +1960,12 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
                 "quality_gates": {
                     "galaxy_disk_halo_residue": {
                         "status": "advisory",
+                        "advisory": True,
                         "hard_failed": False,
                         "reason_code": "single_local_galaxy_halo_evidence",
+                        "value": raw_local_halo,
+                        "accepted_limit": 0.48,
+                        "hard_limit": 0.96,
                     },
                 },
                 "derived": {
@@ -1533,6 +1973,191 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
                     "global_halo_residue_score": 0.0556,
                     "compact_halo_residue_score": 0.1974,
                     "galaxy_disk_halo_corroborated_local_count": 1,
+                    "galaxy_disk_halo_evidence_available": 1.0,
+                    "galaxy_disk_halo_residue_score": raw_local_halo,
+                },
+            },
+            _read_image_by_stem=lambda _stem: object(),
+            _background_quality_metrics=lambda _image: {
+                "chroma_noise_score": 0.01,
+                "background_mottling_score": 0.03,
+                "local_patch_variance": 0.000001,
+                "core_clip_score": 0.0,
+                "starless_artifact_score": 0.06,
+                "bg_dirty_score": 0.04,
+                "bg_std": 0.004,
+            },
+            _stage7_halo_residue_score=lambda: raw_local_halo,
+            _stage7_effective_halo_threshold=lambda: 0.48,
+            _active_policy_name=lambda: "large_galaxy_core_protect",
+            _active_target_type=lambda: "large_galaxy",
+        )
+
+        report = self._final_quality_with_accepted_spatial_lineage(probe)
+
+        self.assertFalse(report["strict_gate"], report)
+        self.assertEqual(report["final_quality"], "ok")
+        self.assertEqual(report["metrics"]["halo_artifact_score"], raw_local_halo)
+        self.assertAlmostEqual(
+            report["metrics"]["stage7_effective_halo_residue_score"],
+            0.1974,
+        )
+        self.assertTrue(
+            report["metrics"][
+                "stage7_single_local_galaxy_halo_override_active"
+            ]
+        )
+
+    def test_final_quality_accepts_reverified_formal_stage8_safe_passthrough(self):
+        artifact_sha256 = "a" * 64
+        pixel_sha256 = "b" * 64
+        raw_local_halo = 0.7126002602028572
+        handoff = {
+            "schema": "starun.stage8-handoff.v3",
+            "processing_route": "safe_passthrough_color_only",
+            "formal_eligible": True,
+            "restricted_downstream": False,
+            "lineage_verified": True,
+            "passthrough": True,
+            "artifact_sha256": artifact_sha256,
+            "pixel_sha256": pixel_sha256,
+            "source_artifact": {
+                "sha256": artifact_sha256,
+                "pixel_sha256": pixel_sha256,
+            },
+            "safe_passthrough_color_only": {
+                "color_gate_verified": True,
+                "preflight": {"accepted": True, "issues": []},
+                "final_validation": {"accepted": True, "issues": []},
+            },
+        }
+        handoff_verification = {
+            "schema": "starun.stage9-stage8-handoff-verification.v1",
+            "status": "verified",
+            "verified": True,
+            "review_only": False,
+            "processing_route": "safe_passthrough_color_only",
+            "formal_eligible": True,
+            "issues": [],
+            "artifact": {
+                "expected_sha256": artifact_sha256,
+                "actual_sha256": artifact_sha256,
+                "expected_pixel_sha256": pixel_sha256,
+                "actual_pixel_sha256": pixel_sha256,
+            },
+        }
+        probe = SimpleNamespace(
+            _stage8_final_quality="safe_passthrough_color_only",
+            _stage8_fallback_used=True,
+            _stage8_handoff=handoff,
+            _stage9_stage8_handoff_verification=handoff_verification,
+            _stage9_bypassed_bad_starless=False,
+            _stage9_stars_required=True,
+            _stage9_stars_applied=True,
+            _stage9_remix_formally_accepted=True,
+            _stage9_review_candidate_selected=False,
+            _stage9_starmask_stretch_failed=False,
+            _stage9_starmask_preparation_failed=False,
+            _stage7_selected_quality={
+                "status": "ok",
+                "quality_gates": {
+                    "galaxy_disk_halo_residue": {
+                        "status": "advisory",
+                        "advisory": True,
+                        "hard_failed": False,
+                        "value": raw_local_halo,
+                        "accepted_limit": 0.48,
+                        "hard_limit": 0.96,
+                    },
+                },
+                "derived": {
+                    "halo_residue_score": raw_local_halo,
+                    "global_halo_residue_score": 0.046,
+                    "compact_halo_residue_score": 0.189,
+                    "galaxy_disk_halo_corroborated_local_count": 1,
+                    "galaxy_disk_halo_evidence_available": 1.0,
+                    "galaxy_disk_halo_residue_score": raw_local_halo,
+                },
+            },
+            _read_image_by_stem=lambda _stem: object(),
+            _background_quality_metrics=lambda _image: {
+                "chroma_noise_score": 0.01,
+                "background_mottling_score": 0.03,
+                "local_patch_variance": 0.000001,
+                "core_clip_score": 0.0,
+                "starless_artifact_score": 0.06,
+                "bg_dirty_score": 0.04,
+                "bg_std": 0.004,
+            },
+            _stage7_halo_residue_score=lambda: raw_local_halo,
+            _stage7_effective_halo_threshold=lambda: 0.48,
+            _active_policy_name=lambda: "large_galaxy_core_protect",
+            _active_target_type=lambda: "large_galaxy",
+        )
+
+        report = self._final_quality_with_accepted_spatial_lineage(probe)
+
+        self.assertFalse(report["strict_gate"], report)
+        self.assertEqual(report["final_quality"], "ok")
+        self.assertTrue(report["metrics"]["stage8_fallback_used"])
+        self.assertTrue(
+            report["metrics"]["stage8_verified_formal_safe_passthrough"]
+        )
+        self.assertFalse(
+            report["metrics"]["stage8_fallback_requires_review"]
+        )
+        self.assertTrue(
+            report["metrics"][
+                "stage7_single_local_galaxy_halo_override_active"
+            ]
+        )
+        self.assertAlmostEqual(
+            report["metrics"]["stage7_effective_halo_residue_score"],
+            0.189,
+        )
+
+        handoff_verification["artifact"]["actual_pixel_sha256"] = "c" * 64
+        tampered_report = self._final_quality_with_accepted_spatial_lineage(
+            probe
+        )
+        self.assertTrue(tampered_report["strict_gate"])
+        self.assertFalse(
+            tampered_report["metrics"][
+                "stage8_verified_formal_safe_passthrough"
+            ]
+        )
+        self.assertTrue(
+            tampered_report["metrics"]["stage8_fallback_requires_review"]
+        )
+
+    def test_final_quality_rejects_incomplete_local_galaxy_halo_advisory(self):
+        raw_local_halo = 0.7126
+        probe = SimpleNamespace(
+            _stage8_final_quality="ok",
+            _stage8_fallback_used=False,
+            _stage9_bypassed_bad_starless=False,
+            _stage9_stars_required=True,
+            _stage9_stars_applied=True,
+            _stage9_remix_formally_accepted=True,
+            _stage7_selected_quality={
+                "status": "ok",
+                "quality_gates": {
+                    "galaxy_disk_halo_residue": {
+                        "status": "advisory",
+                        "advisory": True,
+                        "hard_failed": False,
+                        "value": raw_local_halo,
+                        "accepted_limit": 0.48,
+                        "hard_limit": 0.96,
+                    },
+                },
+                "derived": {
+                    "halo_residue_score": raw_local_halo,
+                    "global_halo_residue_score": 0.046,
+                    # Compact evidence is mandatory for the local-only route.
+                    "galaxy_disk_halo_corroborated_local_count": 1,
+                    "galaxy_disk_halo_evidence_available": 1.0,
+                    "galaxy_disk_halo_residue_score": raw_local_halo,
                 },
             },
             _read_image_by_stem=lambda _stem: object(),
@@ -1553,14 +2178,9 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
 
         report = pipeline_module.stage8_pixels.final_quality_report(probe)
 
-        self.assertFalse(report["strict_gate"], report)
-        self.assertEqual(report["final_quality"], "ok")
-        self.assertEqual(report["metrics"]["halo_artifact_score"], raw_local_halo)
-        self.assertAlmostEqual(
-            report["metrics"]["stage7_effective_halo_residue_score"],
-            0.1974,
-        )
-        self.assertTrue(
+        self.assertTrue(report["strict_gate"])
+        self.assertEqual(report["final_quality"], "poor")
+        self.assertFalse(
             report["metrics"][
                 "stage7_single_local_galaxy_halo_override_active"
             ]
@@ -1609,7 +2229,9 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
             "metrics": {"chromatic_star_addition_ratio": 0.004},
             "limits": {"chromatic_star_addition_ratio": 0.003},
         }
-        advisory_report = pipeline_module.stage8_pixels.final_quality_report(probe)
+        advisory_report = self._final_quality_with_accepted_spatial_lineage(
+            probe
+        )
         self.assertEqual(advisory_report["final_quality"], "ok")
         self.assertEqual(
             advisory_report["metrics"][
@@ -1799,8 +2421,8 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
 
     def test_stage10_nonpreferred_source_recovery_forces_review_only_output(self):
         processor = self._new_processor()
-        processor._stage9_final_source = "preferred_stage9_output"
         self._stage10_final_input(processor)
+        processor._stage9_final_source = "preferred_stage9_output"
         processor.available_scripts.add("processing/CosmicClarity_Denoise.py")
 
         stage10_export(processor)
@@ -1820,6 +2442,7 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
 
     def test_stage10_unavailable_source_lineage_forces_review_only_output(self):
         processor = self._new_processor()
+        (processor.process_dir / "stage8_enhanced.fit").unlink()
 
         stage10_export(processor)
 
@@ -2284,6 +2907,42 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
         self.assertTrue(denoise_plan["skipped_by_review_only"])
         self.assertFalse(denoise_plan["skipped_by_duplicate_guard"])
 
+    def test_stage10_unknown_stage9_contract_skips_denoise_and_exports_review_only(self):
+        processor = self._new_processor()
+        self._stage10_final_input(processor)
+        del processor._stage9_stars_applied
+        processor.available_scripts.add("processing/CosmicClarity_Denoise.py")
+        processor.available_commands.add("siril_scunet_denoise")
+
+        stage10_export(processor)
+
+        self.assertIn(
+            "stage9_formal_contract_unavailable",
+            processor._stage_review_reasons(9),
+        )
+        self.assertFalse(
+            any(
+                step == "最终降噪"
+                for step, _name, _args in processor.script_calls
+            )
+        )
+        self.assertFalse(
+            any(call and call[0] == "siril_scunet_denoise" for call in processor.cmd_calls)
+        )
+        denoise_plan = processor.stage_json_reports["stage10_denoise_plan.json"]
+        self.assertTrue(denoise_plan["skipped_by_review_only"])
+        self.assertIn(("savetif", "result_review", "-astro"), processor.cmd_calls)
+        self.assertIn(("savepng", "result_review"), processor.cmd_calls)
+        self.assertIn(("save", "result_review_final"), processor.cmd_calls)
+        self.assertFalse(
+            any(
+                "result_processed" in str(item) or "result_final" in str(item)
+                for call in processor.cmd_calls
+                for item in call
+            )
+        )
+        self.assertTrue(processor._final_output_review_only)
+
     def test_stage10_missing_required_star_remix_forces_review_only_output(self):
         processor = self._new_processor()
         self._stage10_final_input(processor)
@@ -2362,6 +3021,35 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
         self.assertIn(
             "stage9_review_candidate_selected=true",
             processor.results[-1][3],
+        )
+
+    def test_stage10_upstream_review_requirement_preserves_stage9_pixels(self):
+        processor = self._new_processor()
+        self._stage10_final_input(processor)
+        processor.cfg.final_saturation = 0.15
+        processor._require_review(3, "stage3_background_review_required")
+        before = processor.siril.get_image_pixeldata(preview=False)
+
+        stage10_export(processor)
+
+        after = processor.siril.get_image_pixeldata(preview=False)
+        self.assertTrue(np.array_equal(after, before))
+        self.assertFalse(
+            any(call and call[0] == "satu" for call in processor.cmd_calls)
+        )
+        self.assertFalse(
+            any(
+                step == "最终降噪"
+                for step, _name, _args in processor.script_calls
+            )
+        )
+        self.assertTrue(processor._final_output_review_only)
+        report = processor.stage_json_reports[
+            "stage10_color_rebalance_report.json"
+        ]
+        self.assertEqual(
+            report["decision"]["execution_blocked_reason"],
+            "review_only_output",
         )
 
     def test_stage10_stage8_starmask_fallback_is_review_only(self):

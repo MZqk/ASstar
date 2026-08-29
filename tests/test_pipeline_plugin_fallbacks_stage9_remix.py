@@ -43,89 +43,6 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         self.assertTrue(report["output_withheld"])
         self.assertEqual(processor.results[-1][1], "failed")
 
-    @staticmethod
-    def _psf_quality(
-        attempt,
-        ratios,
-        *,
-        intensity=1.0,
-        bright_growth=0.0,
-    ):
-        lower = 0.93
-        upper = 1.10
-        failed_groups = [
-            group
-            for group, ratio in ratios.items()
-            if not lower <= float(ratio) <= upper
-        ]
-        issues = [
-            f"star_psf_fwhm_ratio_{group} {float(ratios[group]):.6f} "
-            f"outside {lower:.6f}..{upper:.6f}"
-            for group in failed_groups
-        ]
-        accepted = not failed_groups
-        return {
-            "attempt": attempt,
-            "formula": "screen",
-            "status": "ok" if accepted else "rejected",
-            "accepted": accepted,
-            "issues": list(issues),
-            "structural_issues": list(issues),
-            "gate_issues": [],
-            "quality_gates": {},
-            "star_color_validation": {
-                "status": "ok",
-                "accepted": True,
-                "gate_enabled": True,
-                "enforced": True,
-                "issues": [],
-                "quality_gates": {},
-                "metrics": {
-                    "median_chroma_error": 0.05,
-                    "extreme_chroma_outlier_ratio": 0.0,
-                    "sample_count": 16,
-                },
-                "limits": {
-                    "median_chroma_error_max": 0.22,
-                    "extreme_chroma_outlier_ratio_max": 0.20,
-                },
-            },
-            "intensity": intensity,
-            "metrics": {
-                "weak_star_recovery_ratio": 1.0,
-                "star_recovery_ratio": 1.0,
-                "star_positive_delta_window_recovery_ratio": 1.0,
-                "star_wing_recovery_ratio": 0.86,
-                "highlight_clip_growth": 0.0,
-                "bright_pixel_growth": bright_growth,
-            },
-            "limits": {
-                "weak_star_recovery_ratio": 0.70,
-                "star_recovery_ratio": 0.75,
-                "star_positive_delta_window_recovery_ratio": 0.75,
-                "star_wing_recovery_ratio": 0.65,
-            },
-            "psf_closure": {
-                "schema": "starun.stage9-psf-closure.v3",
-                "status": "ok" if accepted else "rejected",
-                "accepted": accepted,
-                "gate_enabled": True,
-                "issues": list(issues),
-                "limits": {
-                    "stage9_psf_fwhm_ratio_min": lower,
-                    "stage9_psf_fwhm_ratio_max": upper,
-                },
-                "groups": {
-                    group: {
-                        "status": "ok",
-                        "accepted": lower <= float(ratio) <= upper,
-                        "fwhm_ratio_median": float(ratio),
-                    }
-                    for group, ratio in ratios.items()
-                },
-            },
-        }
-
     def test_stage9_uses_previous_stage_starless_for_star_remix(self):
         processor = self._new_processor()
         processor.cfg.workflow_plugin_probe_enabled = False
@@ -182,7 +99,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         self.assertTrue(report["stars_applied"])
         self.assertEqual(report["stars_application_mode"], "screen")
 
-    def test_stage9_partial_psf_evidence_keeps_stars_and_marks_review(self):
+    def test_stage9_partial_psf_evidence_without_triplet_fails_closed(self):
         processor = self._new_processor()
         processor.cfg.workflow_plugin_probe_enabled = False
         processor.starmask_file = processor.process_dir / "starmask.fit"
@@ -218,18 +135,24 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
 
         stage9_star_remixing(processor)
 
-        self.assertEqual(processor.results[-1][1], "degraded")
-        self.assertTrue(processor._stage9_stars_applied)
-        self.assertTrue(processor._stage9_psf_review_required)
+        self.assertEqual(processor.results[-1][1], "failed")
+        self.assertFalse(processor._stage9_stars_applied)
+        self.assertTrue(processor._stage9_output_withheld)
         self.assertEqual(
             processor.result_metadata[-1]["reason_code"],
-            "stage9_psf_subgroup_evidence_insufficient",
+            "required_stars_output_withheld",
         )
         report = processor.stage_json_reports["stage9_remix_quality.json"]
-        self.assertTrue(report["psf_review_required"])
+        self.assertIsNone(report["selected"])
         self.assertEqual(
-            report["psf_closure"]["groups"]["bright"]["status"],
-            "not_assessed",
+            report["attempts"][-1]["psf_soft_target_closure"]["status"],
+            "rolled_back_unclosed",
+        )
+        self.assertEqual(
+            report["attempts"][-1]["psf_soft_target_closure"][
+                "final_missing_formal_groups"
+            ],
+            ["all", "weak", "bright"],
         )
 
     def test_stage9_selects_unscreen_only_after_material_non_regressing_gain(self):
@@ -504,11 +427,11 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
 
         self.assertEqual(
             stage9_module._stage9_psf_recovery_target_min(processor, quality),
-            0.94,
+            0.97,
         )
         self.assertEqual(
             stage9_module._stage9_psf_recovery_target_max(processor, quality),
-            1.08,
+            1.05,
         )
 
     def test_stage9_screen_psf_recovery_uses_one_pixel_before_two(self):
@@ -655,11 +578,17 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
             stage9_star_remixing(processor)
 
         report = processor.stage_json_reports["stage9_remix_quality.json"]
-        self.assertEqual(report["selected"]["attempt"], "screen_primary")
-        self.assertEqual(
-            report["selected"]["psf_support_recovery_pixels"],
-            0,
+        self.assertIsNone(report["selected"])
+        primary = next(
+            attempt
+            for attempt in report["attempts"]
+            if attempt.get("attempt") == "screen_primary"
         )
+        self.assertEqual(
+            primary["psf_soft_target_closure"]["status"],
+            "rolled_back_unclosed",
+        )
+        self.assertFalse(primary["psf_soft_target_closure"]["accepted"])
         self.assertFalse(
             any(
                 attempt.get("attempt") == "screen_psf_support_recovery_2px"
@@ -929,6 +858,22 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
             "issues": [],
             "metrics": {},
             "decomposition_method": "matched_mtf_unscreen_source_presence",
+            "psf_closure": {
+                "status": "ok",
+                "accepted": True,
+                "limits": {
+                    "stage9_psf_fwhm_ratio_min": 0.93,
+                    "stage9_psf_fwhm_ratio_max": 1.10,
+                },
+                "groups": {
+                    group: {
+                        "status": "ok",
+                        "accepted": True,
+                        "fwhm_ratio_median": 1.0,
+                    }
+                    for group in ("all", "weak", "bright")
+                },
+            },
         }
         calls = []
 
@@ -1359,39 +1304,50 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
             "strict_recovery",
         )
 
-    def test_stage9_caps_star_remix_when_stage8_used_fallback(self):
+    def test_stage9_restricted_stage8_handoff_routes_to_with_stars_review(self):
         processor = self._new_processor()
         processor.cfg.workflow_plugin_probe_enabled = False
         processor.cfg.star_intensity = 1.05
         processor.cfg.stage9_fallback_intensity_cap = 1.05
         processor._stage8_final_source = "stage8_input_starless"
+        restricted_path = processor.process_dir / "stage8_input_starless.fit"
+        restricted_path.write_bytes(b"restricted-stage8")
         processor._stage8_handoff = {
-            "schema": "starun.stage8-handoff.v1",
+            "schema": "starun.stage8-handoff.v2",
             "source_stem": "stage8_input_starless",
             "passthrough": True,
             "restricted_downstream": True,
             "reason_code": "bright_nebula_halo_advisory",
+            "final_quality": "ok",
+            "lineage_verified": True,
+            "source_artifact": {
+                "artifact": "stage8_input_starless.fit",
+                "sha256": hashlib.sha256(restricted_path.read_bytes()).hexdigest(),
+                "pixel_sha256": None,
+            },
         }
         processor.starmask_file = processor.process_dir / "starmask.fit"
         processor.starmask_file.write_bytes(b"mock")
+        (processor.process_dir / "stage7_review_with_stars.fit").write_bytes(
+            b"trusted-with-stars"
+        )
 
         stage9_star_remixing(processor)
 
         _name, status, _dur, message = processor.results[-1]
-        self.assertEqual(status, "ok")
-        self.assertEqual(
-            processor.previous_stage_remix_calls,
-            [("stage8_input_starless", "starmask_stretched", 0.95)],
-        )
-        self.assertIn("Stage8 restricted source active", message)
+        self.assertEqual(status, "degraded")
+        self.assertFalse(processor.previous_stage_remix_calls)
+        self.assertIn("prohibited formal star remix", message)
         report = processor.stage_json_reports["stage9_remix_quality.json"]
         self.assertTrue(report["upstream_passthrough"])
-        self.assertFalse(report["stage9_fallback_used"])
-        self.assertIsNone(report["stage9_fallback_reason"])
+        self.assertTrue(report["stage9_fallback_used"])
         metadata = processor.result_metadata[-1]
         self.assertTrue(metadata["upstream_passthrough"])
-        self.assertFalse(metadata["fallback_used"])
-        self.assertEqual(metadata["reason_code"], "upstream_safe_passthrough")
+        self.assertTrue(metadata["fallback_used"])
+        self.assertEqual(
+            metadata["reason_code"],
+            "required_stars_preserved_in_review_fallback",
+        )
         self.assertEqual(metadata["details"]["reason_text"], "使用 Stage 8 安全旁路源")
 
     def test_stage9_rebuilds_inadequate_plugin_starmask_with_builtin_asinh(self):
@@ -1411,7 +1367,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         self.assertTrue(asinh_calls)
         self.assertIn(("save", "starmask_stretched"), processor.cmd_calls)
 
-    def test_stage9_refined_starless_uses_independent_base(self):
+    def test_stage9_never_runs_starless_finish_plugins(self):
         processor = self._new_processor()
         processor.cfg.workflow_plugin_probe_enabled = True
         processor.command_labels["细节/结构增强2"] = "VeraLux Revela"
@@ -1425,35 +1381,11 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
 
         stage9_star_remixing(processor)
 
-        self.assertIn("stage9_starless_base", saved_stems)
+        self.assertNotIn("stage9_starless_base", saved_stems)
+        self.assertNotIn("细节/结构增强2", processor.command_chain_calls)
+        self.assertNotIn("最终微调颜色", processor.command_chain_calls)
+        self.assertNotIn("调色2（可选）", processor.command_chain_calls)
         self.assertNotIn(("save", "stage8_enhanced"), processor.cmd_calls)
-        self.assertEqual(
-            processor.previous_stage_remix_calls,
-            [
-                (
-                    "stage9_starless_base",
-                    "starmask_stretched",
-                    processor.cfg.star_intensity,
-                )
-            ],
-        )
-        report = processor.stage_json_reports["stage9_remix_quality.json"]
-        self.assertEqual(report["upstream_source_stem"], "stage8_enhanced")
-        self.assertEqual(report["remix_base_stem"], "stage9_starless_base")
-        self.assertEqual(report["source_stem"], "stage9_starless_base")
-
-    def test_stage9_refined_base_save_failure_restores_stage8_source(self):
-        processor = self._new_processor()
-        processor.cfg.workflow_plugin_probe_enabled = True
-        processor.command_labels["细节/结构增强2"] = "VeraLux Revela"
-        processor.starmask_file = processor.process_dir / "starmask.fit"
-        processor.starmask_file.write_bytes(b"mock")
-        processor._save_stage_output = (
-            lambda stem: stem != "stage9_starless_base"
-        )
-
-        stage9_star_remixing(processor)
-
         self.assertEqual(
             processor.previous_stage_remix_calls,
             [
@@ -1464,13 +1396,423 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
                 )
             ],
         )
-        self.assertGreaterEqual(
-            processor.cmd_calls.count(("load", "stage8_enhanced")),
-            2,
-        )
         report = processor.stage_json_reports["stage9_remix_quality.json"]
         self.assertEqual(report["upstream_source_stem"], "stage8_enhanced")
         self.assertEqual(report["remix_base_stem"], "stage8_enhanced")
+        self.assertEqual(report["source_stem"], "stage8_enhanced")
+
+    def test_stage9_rejects_tampered_stage8_handoff_before_remix(self):
+        processor = self._new_processor()
+        processor.cfg.workflow_plugin_probe_enabled = True
+        processor.command_labels["细节/结构增强2"] = "VeraLux Revela"
+        processor.starmask_file = processor.process_dir / "starmask.fit"
+        processor.starmask_file.write_bytes(b"mock")
+        (processor.process_dir / "stage7_review_with_stars.fit").write_bytes(
+            b"trusted-with-stars"
+        )
+        processor._stage8_handoff["source_artifact"]["sha256"] = "0" * 64
+
+        stage9_star_remixing(processor)
+
+        self.assertFalse(processor.previous_stage_remix_calls)
+        self.assertEqual(
+            processor._stage9_final_source,
+            "stage9_review_with_stars",
+        )
+        verification = processor.stage_json_reports[
+            "stage9_stage8_handoff_verification.json"
+        ]
+        self.assertFalse(verification["verified"])
+        self.assertIn("stage8_handoff_sha256_mismatch", verification["issues"])
+        self.assertEqual(processor.results[-1][1], "degraded")
+        self.assertNotIn("细节/结构增强2", processor.command_chain_calls)
+
+    def test_stage9_legacy_v1_handoff_is_review_only(self):
+        processor = self._new_processor()
+        processor._stage8_handoff = {
+            "schema": "starun.stage8-handoff.v1",
+            "source_stem": "stage8_enhanced",
+            "passthrough": False,
+            "restricted_downstream": False,
+        }
+        (processor.process_dir / "stage7_review_with_stars.fit").write_bytes(
+            b"trusted-with-stars"
+        )
+
+        stage9_star_remixing(processor)
+
+        verification = processor.stage_json_reports[
+            "stage9_stage8_handoff_verification.json"
+        ]
+        self.assertEqual(
+            verification["status"],
+            "legacy_stage8_handoff_review_only",
+        )
+        self.assertIn("legacy_delivery_contract", verification["issues"])
+        self.assertFalse(processor._stage9_remix_formally_accepted)
+        self.assertEqual(processor._stage9_final_source, "stage9_review_with_stars")
+
+    def test_stage9_handoff_v3_rejects_identity_route_and_eligibility_tampering(self):
+        stage9_module = sys.modules["stages.stage9_star_remixing"]
+        for scenario, expected_issue in (
+            ("filename", "stage8_handoff_artifact_filename_mismatch"),
+            ("pixel", "stage8_handoff_pixel_identity_mismatch"),
+            ("route", "stage8_handoff_processing_route_invalid"),
+            ("formal", "stage8_handoff_not_formal_eligible"),
+            (
+                "top_artifact_sha",
+                "stage8_handoff_top_level_artifact_sha256_mismatch",
+            ),
+        ):
+            with self.subTest(scenario=scenario):
+                processor = self._new_processor()
+                if scenario == "filename":
+                    processor._stage8_handoff["source_artifact"][
+                        "artifact"
+                    ] = "wrong.fit"
+                elif scenario == "pixel":
+                    processor._stage8_handoff["source_artifact"][
+                        "pixel_sha256"
+                    ] = "f" * 64
+                elif scenario == "route":
+                    processor._stage8_handoff["processing_route"] = "review_only"
+                elif scenario == "formal":
+                    processor._stage8_handoff["formal_eligible"] = False
+                else:
+                    processor._stage8_handoff["artifact_sha256"] = "e" * 64
+
+                report = stage9_module._stage9_verify_stage8_handoff(
+                    processor,
+                    "stage8_enhanced",
+                    processor._stage8_handoff,
+                )
+
+                self.assertFalse(report["verified"])
+                self.assertIn(expected_issue, report["issues"])
+
+    def test_stage9_handoff_v3_does_not_trust_or_reject_quality_string(self):
+        stage9_module = sys.modules["stages.stage9_star_remixing"]
+        processor = self._new_processor()
+        processor._stage8_handoff["final_quality"] = "arbitrary_status_text"
+
+        report = stage9_module._stage9_verify_stage8_handoff(
+            processor,
+            "stage8_enhanced",
+            processor._stage8_handoff,
+        )
+
+        self.assertTrue(report["verified"], report)
+
+    def test_stage9_handoff_v3_verifies_fits_and_decoded_pixel_domains(self):
+        from processor_runtime import _read_fits_stage_fingerprint
+        from stage8_starless_finish import (
+            DECODED_PIXEL_SHA256_METHOD,
+            FITS_DATA_SHA256_METHOD,
+            persisted_fits_decoded_pixel_sha256,
+        )
+
+        stage9_module = sys.modules["stages.stage9_star_remixing"]
+        processor = self._new_processor()
+        source_path = processor.process_dir / "stage8_enhanced.fit"
+        pixels = np.linspace(
+            0.01,
+            0.91,
+            num=3 * 16 * 12,
+            dtype=np.float32,
+        ).reshape(3, 16, 12)
+        fits.PrimaryHDU(pixels).writeto(source_path, overwrite=True)
+        processor.saved_image_pixels["stage8_enhanced"] = pixels.copy()
+        processor._fits_stage_fingerprint = _read_fits_stage_fingerprint
+        fingerprint = _read_fits_stage_fingerprint(source_path)
+        fits_data_sha = fingerprint["data_sha256"]
+        decoded_pixel_sha = persisted_fits_decoded_pixel_sha256(source_path)
+        self.assertNotEqual(fits_data_sha, decoded_pixel_sha)
+        container_sha = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        artifact = {
+            "artifact": source_path.name,
+            "sha256": container_sha,
+            "pixel_sha256": fits_data_sha,
+            "pixel_sha256_method": FITS_DATA_SHA256_METHOD,
+            "fits_data_sha256": fits_data_sha,
+            "fits_data_sha256_method": FITS_DATA_SHA256_METHOD,
+            "decoded_pixel_sha256": decoded_pixel_sha,
+            "decoded_pixel_sha256_method": DECODED_PIXEL_SHA256_METHOD,
+            "identity_status": "verified",
+        }
+        handoff = processor._make_stage8_handoff("stage8_enhanced")
+        handoff.update(
+            source_artifact=artifact,
+            artifact_sha256=container_sha,
+            pixel_sha256=fits_data_sha,
+            pixel_sha256_method=FITS_DATA_SHA256_METHOD,
+            fits_data_sha256=fits_data_sha,
+            fits_data_sha256_method=FITS_DATA_SHA256_METHOD,
+            decoded_pixel_sha256=decoded_pixel_sha,
+            decoded_pixel_sha256_method=DECODED_PIXEL_SHA256_METHOD,
+        )
+        handoff["lineage"]["output_artifact"] = artifact
+        handoff = seal_stage8_handoff(handoff)
+
+        report = stage9_module._stage9_verify_stage8_handoff(
+            processor,
+            "stage8_enhanced",
+            handoff,
+        )
+
+        self.assertTrue(report["verified"], report)
+        self.assertEqual(
+            report["artifact"]["actual_fits_data_sha256"],
+            fits_data_sha,
+        )
+        self.assertEqual(
+            report["artifact"]["actual_decoded_pixel_sha256"],
+            decoded_pixel_sha,
+        )
+
+        for field, replacement, expected_issue in (
+            (
+                "fits_data_sha256",
+                "1" * 64,
+                "stage8_handoff_fits_data_identity_mismatch",
+            ),
+            (
+                "decoded_pixel_sha256",
+                "2" * 64,
+                "stage8_handoff_decoded_pixel_identity_mismatch",
+            ),
+            (
+                "decoded_pixel_sha256_method",
+                "untrusted_method",
+                "stage8_handoff_decoded_pixel_identity_method_invalid",
+            ),
+        ):
+            with self.subTest(field=field):
+                tampered = copy.deepcopy(handoff)
+                tampered["source_artifact"][field] = replacement
+                tampered["lineage"]["output_artifact"] = dict(
+                    tampered["source_artifact"]
+                )
+                tampered[field] = replacement
+                rejected = stage9_module._stage9_verify_stage8_handoff(
+                    processor,
+                    "stage8_enhanced",
+                    tampered,
+                )
+                self.assertFalse(rejected["verified"], rejected)
+                self.assertIn(expected_issue, rejected["issues"])
+
+    def test_stage9_accepts_complete_limited_safe_passthrough_contract(self):
+        stage9_module = sys.modules["stages.stage9_star_remixing"]
+        processor = self._new_processor()
+        handoff = processor._stage8_handoff
+        artifact = dict(handoff["source_artifact"])
+        eligibility = {
+            "schema": "starun.stage8-limited-safe-passthrough-eligibility.v1",
+            "status": "eligible",
+            "accepted": True,
+            "checks": {
+                "limited_policy": True,
+                "guard_status": True,
+                "guard_hard_reasons_clear": True,
+                "guard_subject_reasons_clear": True,
+                "upstream_quality_ok": True,
+                "upstream_reason_is_safe": True,
+                "upstream_hard_metric_evidence_complete": True,
+                "upstream_hard_metrics_clear": True,
+                "final_candidate_ready": True,
+                "processing_mode_safe": True,
+                "no_external_override": True,
+                "review_requirement_free": True,
+            },
+            "issues": [],
+            "review_requirements": [],
+            "upstream_hard_metrics": {
+                name: {"accepted": True}
+                for name in (
+                    "residual_star_score",
+                    "starless_noise_gain",
+                    "effective_halo_residue_score",
+                )
+            },
+        }
+        preflight = {
+            "schema": "starun.stage8-safe-passthrough-preflight.v1",
+            "status": "accepted",
+            "accepted": True,
+            "source_mode": "limited_safe_passthrough",
+            "eligibility": eligibility,
+            "checks": {
+                name: {"accepted": True}
+                for name in (
+                    "exact_structure_rollback",
+                    "stage7_presentation_reference",
+                    "spatial_background",
+                    "subject_boundary_seam",
+                    "star_halo",
+                    "clipping",
+                )
+            },
+        }
+        final_validation = {
+            "schema": "starun.stage8-safe-passthrough-final.v1",
+            "status": "accepted",
+            "accepted": True,
+            "checks": {
+                "color": {"accepted": True, "mode": "verified_pixel_identity"},
+                "background_seam_clip_presentation": {"status": "ok"},
+                "spatial_background": {"accepted": True},
+                "star_halo": {"accepted": True},
+                "artifact": {"accepted": True},
+            },
+        }
+        handoff.update(
+            processing_route="safe_passthrough_color_only",
+            formal_eligible=True,
+            restricted_downstream=False,
+            passthrough=True,
+            safe_passthrough_color_only={
+                "limited_eligibility": eligibility,
+                "preflight": preflight,
+                "final_validation": final_validation,
+                "color_gate_verified": True,
+            },
+            color_gate={
+                "used_for_gate": True,
+                "status": "reported",
+                "guard_lineage_verified": True,
+                "final_pixel_identity": {
+                    "sha256": artifact["sha256"],
+                    "pixel_sha256": artifact["pixel_sha256"],
+                },
+            },
+            star_halo_guard={"status": "ok", "verified": True},
+        )
+        handoff = seal_stage8_handoff(handoff)
+
+        report = stage9_module._stage9_verify_stage8_handoff(
+            processor,
+            "stage8_enhanced",
+            handoff,
+        )
+
+        self.assertTrue(report["verified"], report)
+        self.assertEqual(report["processing_route"], "safe_passthrough_color_only")
+
+    def test_stage9_safe_passthrough_contract_tampering_fails_closed(self):
+        stage9_module = sys.modules["stages.stage9_star_remixing"]
+
+        def safe_handoff(processor):
+            handoff = processor._stage8_handoff
+            artifact = dict(handoff["source_artifact"])
+            eligibility = {
+                "accepted": True,
+                "issues": [],
+                "review_requirements": [],
+                "checks": {"review_requirement_free": True},
+                "upstream_hard_metrics": {
+                    "halo": {"accepted": True},
+                },
+            }
+            preflight = {
+                "accepted": True,
+                "source_mode": "limited_safe_passthrough",
+                "eligibility": eligibility,
+                "checks": {
+                    name: {"accepted": True}
+                    for name in (
+                        "exact_structure_rollback",
+                        "stage7_presentation_reference",
+                        "spatial_background",
+                        "subject_boundary_seam",
+                        "star_halo",
+                        "clipping",
+                    )
+                },
+            }
+            handoff.update(
+                processing_route="safe_passthrough_color_only",
+                formal_eligible=True,
+                restricted_downstream=False,
+                passthrough=True,
+                safe_passthrough_color_only={
+                    "limited_eligibility": eligibility,
+                    "preflight": preflight,
+                    "final_validation": {
+                        "accepted": True,
+                        "checks": {
+                            "color": {"accepted": True},
+                            "background_seam_clip_presentation": {"status": "ok"},
+                            "spatial_background": {"accepted": True},
+                            "star_halo": {"accepted": True},
+                            "artifact": {"accepted": True},
+                        },
+                    },
+                    "color_gate_verified": True,
+                },
+                color_gate={
+                    "used_for_gate": True,
+                    "status": "reported",
+                    "guard_lineage_verified": True,
+                    "final_pixel_identity": {
+                        "sha256": artifact["sha256"],
+                        "pixel_sha256": artifact["pixel_sha256"],
+                    },
+                },
+                star_halo_guard={"status": "ok", "verified": True},
+            )
+            return seal_stage8_handoff(handoff)
+
+        for scenario, expected_issue in (
+            (
+                "limited_eligibility",
+                "stage8_limited_safe_passthrough_eligibility_unverified",
+            ),
+            (
+                "seam",
+                "stage8_safe_passthrough_preflight_gate_unverified",
+            ),
+            (
+                "final_quality",
+                "stage8_safe_passthrough_final_gate_unverified",
+            ),
+            (
+                "color",
+                "stage8_safe_passthrough_color_gate_unverified",
+            ),
+            (
+                "halo",
+                "stage8_safe_passthrough_halo_guard_unverified",
+            ),
+        ):
+            with self.subTest(scenario=scenario):
+                processor = self._new_processor()
+                handoff = safe_handoff(processor)
+                safe = handoff["safe_passthrough_color_only"]
+                if scenario == "limited_eligibility":
+                    safe["limited_eligibility"]["checks"][
+                        "review_requirement_free"
+                    ] = False
+                elif scenario == "seam":
+                    safe["preflight"]["checks"]["subject_boundary_seam"][
+                        "accepted"
+                    ] = False
+                elif scenario == "final_quality":
+                    safe["final_validation"]["checks"][
+                        "background_seam_clip_presentation"
+                    ]["status"] = "poor"
+                elif scenario == "color":
+                    safe["color_gate_verified"] = False
+                else:
+                    handoff["star_halo_guard"]["verified"] = False
+
+                report = stage9_module._stage9_verify_stage8_handoff(
+                    processor,
+                    "stage8_enhanced",
+                    handoff,
+                )
+
+                self.assertFalse(report["verified"], report)
+                self.assertIn(expected_issue, report["issues"])
 
     def test_stage9_partial_star_plugin_result_feeds_builtin_stretch(self):
         processor = self._new_processor()
@@ -2698,6 +3040,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         processor._stage8_final_source = "stage7_stretched"
         processor._stage8_fallback_used = True
         (processor.process_dir / "stage7_stretched.fit").write_bytes(b"accepted")
+        processor.refresh_stage8_handoff("stage7_stretched")
         processor.starmask_file = processor.process_dir / "starmask.fit"
         processor.starmask_file.write_bytes(b"mock")
         processor._stage9_bad_starless_reason = types.MethodType(
@@ -2804,18 +3147,47 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         processor = self._new_processor()
         processor._star_preserve_target_bypass = True
         processor._stage8_final_source = "stage8_enhanced"
+        for y, x in (
+            (12, 16),
+            (20, 42),
+            (31, 78),
+            (45, 55),
+            (52, 101),
+            (62, 30),
+            (70, 88),
+            (82, 116),
+        ):
+            processor.image_pixels[:, y, x] = 0.95
+        processor.refresh_stage8_handoff(
+            processing_route="star_preserve_secondary_nebulosity",
+        )
+        stage9_module = sys.modules["stages.stage9_star_remixing"]
 
-        stage9_star_remixing(processor)
+        with patch.object(
+            stage9_module.spatial_background_lineage,
+            "assess_final_spatial_background",
+            return_value={
+                "schema": "starun.final-spatial-background.v1",
+                "status": "ok",
+                "accepted": True,
+                "support_sha256": "1" * 64,
+                "issues": [],
+            },
+        ):
+            stage9_star_remixing(processor)
 
         report = processor.stage_json_reports["stage9_remix_quality.json"]
-        self.assertEqual(report["mode"], "star_preserve_target_bypass")
+        self.assertEqual(report["mode"], "stars_not_required", report)
         self.assertNotEqual(report["unscreen_reference"]["status"], "ready")
         self.assertFalse(report["stars_required"])
         self.assertFalse(report["stars_applied"])
         self.assertEqual(
             report["stars_application_mode"],
-            "not_required_star_preserve",
+            "stars_not_required",
         )
+        self.assertTrue(report["formal_accepted"])
+        self.assertEqual(processor._stage9_final_source, "stage9_remixed")
+        self.assertFalse(processor._stage9_output_withheld)
         self.assertEqual(processor.results[-1][1], "skipped")
 
     def test_stage9_review_candidate_boundaries_and_failure_classes(self):
@@ -3013,6 +3385,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         (processor.process_dir / "stage8_enhanced.fit").write_bytes(
             b"stage8-starless"
         )
+        processor.refresh_stage8_handoff()
         (processor.process_dir / "stage5_linear.fit").write_bytes(b"with-stars")
         processor.saved_image_pixels["stage8_enhanced"] = (
             processor.image_pixels.copy()
@@ -3115,7 +3488,8 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
             processor.result_metadata[-1]["reason_code"],
             "best_failed_candidate_review",
         )
-        self.assertNotIn(("load", "stage5_linear"), processor.cmd_calls)
+        self.assertIn(("load", "stage5_linear"), processor.cmd_calls)
+        self.assertNotIn(("autostretch", "-linked"), processor.cmd_calls)
         self.assertIn("stage9_review_with_stars", processor.saved_image_pixels)
         self.assertIn("stage9_remixed", processor.saved_image_pixels)
 
@@ -3227,6 +3601,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         (processor.process_dir / "stage8_enhanced.fit").write_bytes(
             b"stage8-starless"
         )
+        processor.refresh_stage8_handoff()
         (processor.process_dir / "starmask_fallback_stretched.fit").write_bytes(
             b"fallback-stretched"
         )
@@ -3284,7 +3659,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
             "stage8_enhanced",
         )
         self.assertFalse(report["remix_formally_accepted"])
-        self.assertNotIn(("load", "stage5_linear"), processor.cmd_calls)
+        self.assertIn(("load", "stage5_linear"), processor.cmd_calls)
         self.assertNotIn(("autostretch", "-linked"), processor.cmd_calls)
         self.assertIn("base=stage8_enhanced", processor.results[-1][3])
         self.assertEqual(processor.results[-1][1], "degraded")
@@ -3297,6 +3672,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         (processor.process_dir / "stage8_enhanced.fit").write_bytes(
             b"stage8-starless"
         )
+        processor.refresh_stage8_handoff()
         (processor.process_dir / "stage5_linear.fit").write_bytes(b"with-stars")
         processor.saved_image_pixels["stage8_enhanced"] = (
             processor.image_pixels.copy()
@@ -3337,7 +3713,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         self.assertEqual(report["fallback_remix"]["selected_variant"], "raw")
         self.assertTrue(report["stars_applied"])
         self.assertFalse(report["remix_formally_accepted"])
-        self.assertNotIn(("load", "stage5_linear"), processor.cmd_calls)
+        self.assertIn(("load", "stage5_linear"), processor.cmd_calls)
         self.assertTrue(
             any(
                 call[:3]
@@ -3481,6 +3857,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         (processor.process_dir / "stage8_enhanced.fit").write_bytes(
             b"stage8-starless"
         )
+        processor.refresh_stage8_handoff()
         (processor.process_dir / "starmask.fit").write_bytes(b"starmask")
         base = processor.image_pixels.copy()
         starmask = np.zeros_like(base)
@@ -3538,6 +3915,7 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
         (processor.process_dir / "stage8_enhanced.fit").write_bytes(
             b"stage8-starless"
         )
+        processor.refresh_stage8_handoff()
         (processor.process_dir / "stage5_linear.fit").write_bytes(b"with-stars")
         processor.saved_image_pixels["stage8_enhanced"] = (
             processor.image_pixels.copy()
@@ -3577,431 +3955,3 @@ class PipelinePluginFallbackStage9RemixTests(PipelinePluginFallbackTestBase):
             "withheld_no_with_stars_review_source",
         )
         self.assertEqual(processor.results[-1][1], "failed")
-
-    def test_stage9_remix_base_identity_rejects_between_candidate_mutation(self):
-        processor = self._new_processor()
-        base_path = processor.process_dir / "stage8_enhanced.fit"
-        base_path.write_bytes(b"immutable-stage8-base")
-
-        locked = processor._stage9_verify_remix_base_identity("stage8_enhanced")
-        self.assertEqual(locked["status"], "verified")
-        base_path.write_bytes(b"mutated-stage8-base")
-        rejected = processor._stage9_verify_remix_base_identity("stage8_enhanced")
-
-        self.assertEqual(rejected["status"], "rejected")
-        self.assertIn("changed between candidates", rejected["reason"])
-
-    def test_stage9_hard_halo_risk_still_bypasses_after_accepted_stretch(self):
-        processor = self._new_processor()
-        processor.cfg.stage7_residual_star_score_max = 0.28
-        processor.cfg.stage7_halo_residue_score_max = 0.35
-        processor.cfg.stage7_starless_noise_gain_max = 2.2
-        processor.cfg.stage7_starless_dynamic_range_min_ratio = 0.55
-        processor.cfg.stage7_starless_peak_signal_min = 0.006
-        processor.stretched_name = "stage7_stretched"
-        processor._stage7_stretch_accepted = True
-        processor._stage7_stretch_output = "stage7_stretched"
-        processor._stage7_selected_quality = {
-            "status": "poor",
-            "issues": [
-                "starless_dynamic_range_collapse 0.117<0.550, "
-                "peak=0.00551<0.00600"
-            ],
-            "derived": {
-                "residual_star_score": 0.0,
-                "halo_residue_score": 0.71,
-                "starless_noise_gain": 0.78,
-                "starless_dynamic_range_ratio": 0.117,
-                "starless_peak_signal": 0.00551,
-            },
-        }
-        (processor.process_dir / "stage7_stretched.fit").write_bytes(b"accepted")
-        processor._stage9_bad_starless_reason = types.MethodType(
-            pipeline_module.StarunPostProcessor._stage9_bad_starless_reason,
-            processor,
-        )
-        processor._stage7_effective_halo_threshold = lambda: (
-            processor.cfg.stage7_halo_residue_score_max
-        )
-
-        reason = processor._stage9_bad_starless_reason()
-
-        self.assertIn("stage7_halo_residue_score", reason)
-        self.assertNotIn("stage7_starless_dynamic_range", reason)
-
-    def test_stage9_uses_descending_fallback_intensity_ladder(self):
-        processor = self._new_processor()
-        processor.cfg.workflow_plugin_probe_enabled = False
-        processor.cfg.star_intensity = 1.05
-        processor.cfg.stage9_fallback_intensity_cap = 1.0
-        processor.starmask_file = processor.process_dir / "starmask.fit"
-        processor.starmask_file.write_bytes(b"mock")
-
-        def assess(_source_stem, *, attempt, formula):
-            accepted = attempt == "screen_fallback_040"
-            return {
-                "attempt": attempt,
-                "formula": formula,
-                "status": "ok" if accepted else "rejected",
-                "accepted": accepted,
-                "issues": [] if accepted else ["changed_pixel_ratio"],
-                "metrics": {},
-            }
-
-        processor._stage9_assess_current_remix = assess
-
-        stage9_star_remixing(processor)
-
-        self.assertEqual(
-            [call[2] for call in processor.previous_stage_remix_calls],
-            [1.05, 0.75, 0.55, 0.40],
-        )
-        report = processor.stage_json_reports["stage9_remix_quality.json"]
-        self.assertEqual(report["selected"]["attempt"], "screen_fallback_040")
-
-    def test_stage9_retry_limit_and_floor_bound_the_intensity_ladder(self):
-        processor = self._new_processor()
-        stage9_module = sys.modules["stages.stage9_star_remixing"]
-        processor.cfg.stage9_fallback_intensity_cap = 0.95
-        processor.cfg.stage9_fallback_retry_max = 3
-        processor.cfg.stage9_fallback_intensity_floor = 0.55
-
-        candidates = stage9_module._stage9_remix_intensity_candidates(
-            processor,
-            primary_intensity=1.05,
-            remix_scale=1.0,
-        )
-
-        self.assertEqual(
-            candidates,
-            [("primary", 1.05), ("fallback_075", 0.75), ("fallback_055", 0.55)],
-        )
-        processor.cfg.stage9_fallback_retry_max = 1
-        self.assertEqual(
-            stage9_module._stage9_remix_intensity_candidates(
-                processor,
-                primary_intensity=1.05,
-                remix_scale=1.0,
-            ),
-            [("primary", 1.05), ("fallback_075", 0.75)],
-        )
-
-    def test_stage9_preserve_review_stops_after_first_rejected_candidate(self):
-        processor = self._new_processor()
-        processor.cfg.workflow_plugin_probe_enabled = False
-        processor.cfg.stage9_failure_action = "preserve_review"
-        processor.starmask_file = processor.process_dir / "starmask.fit"
-        processor.starmask_file.write_bytes(b"mock")
-        (processor.process_dir / "stage5_linear.fit").write_bytes(b"with-stars")
-        processor._stage9_assess_current_remix = lambda *_args, **kwargs: {
-            **self._psf_quality(
-                kwargs["attempt"],
-                {"all": 1.04, "weak": 1.00, "bright": 1.36},
-            ),
-            "formula": kwargs["formula"],
-        }
-
-        stage9_star_remixing(processor)
-
-        self.assertEqual(len(processor.previous_stage_remix_calls), 1)
-        self.assertTrue(processor._stage_review_reasons(9))
-        self.assertEqual(processor._stage_review_reasons(3), [])
-        self.assertEqual(processor.results[-1][1], "degraded")
-        self.assertFalse(
-            any(
-                stem.startswith("stage9_review_candidate_")
-                for stem in processor.saved_image_pixels
-            )
-        )
-        report = processor.stage_json_reports["stage9_remix_quality.json"]
-        self.assertEqual(
-            report["attempts"][0]["review_eligibility"]["reasons"],
-            ["review_policy_disabled_for_failure_action"],
-        )
-
-    def test_stage9_preserve_mode_requires_and_uses_verified_with_stars_source(self):
-        processor = self._new_processor()
-        processor.cfg.stage9_processing_mode = "preserve_with_stars"
-        (processor.process_dir / "stage5_linear.fit").write_bytes(b"with-stars")
-
-        stage9_star_remixing(processor)
-
-        self.assertEqual(processor.previous_stage_remix_calls, [])
-        self.assertTrue(processor._stage9_output_contains_stars)
-        self.assertFalse(processor._stage9_output_withheld)
-        self.assertEqual(
-            processor._stage_review_reasons(9),
-            ["user_preserve_with_stars"],
-        )
-        self.assertEqual(processor._stage_review_reasons(3), [])
-        self.assertEqual(processor.results[-1][1], "ok")
-        report = processor.stage_json_reports["stage9_remix_quality.json"]
-        self.assertEqual(report["mode"], "user_preserve_with_stars")
-
-    def test_stage9_does_not_lower_screen_intensity_after_recovery_shortfall(self):
-        processor = self._new_processor()
-        processor.cfg.workflow_plugin_probe_enabled = False
-        processor.starmask_file = processor.process_dir / "starmask.fit"
-        processor.starmask_file.write_bytes(b"mock")
-        (processor.process_dir / "stage5_linear.fit").write_bytes(b"with-stars")
-        processor._stage9_assess_current_remix = lambda *_args, **kwargs: {
-            "attempt": kwargs["attempt"],
-            "formula": kwargs["formula"],
-            "status": "rejected",
-            "accepted": False,
-            "issues": ["weak_star_recovery_ratio 0.420000<0.700000"],
-            "metrics": {
-                "weak_star_recovery_ratio": 0.42,
-                "star_recovery_ratio": 0.50,
-            },
-        }
-
-        stage9_star_remixing(processor)
-
-        self.assertEqual(
-            processor.previous_stage_remix_calls,
-            [
-                (
-                    "stage8_enhanced",
-                    "starmask_stretched",
-                    processor.cfg.star_intensity,
-                )
-            ],
-        )
-        report = processor.stage_json_reports["stage9_remix_quality.json"]
-        self.assertEqual(report["mode"], "stage5_review_fallback")
-        self.assertFalse(report["stars_applied"])
-        self.assertTrue(report["output_contains_stars"])
-        self.assertEqual(processor.results[-1][1], "degraded")
-
-    def test_stage9_targeted_psf_recovery_only_targets_small_bright_group(self):
-        processor = self._new_processor()
-        stage9_module = sys.modules["stages.stage9_star_remixing"]
-        quality = self._psf_quality(
-            "screen_unscreen_normal_primary",
-            {"all": 0.866, "weak": 0.968, "bright": 0.804},
-        )
-
-        groups = stage9_module._stage9_psf_recovery_target_groups(
-            processor,
-            quality,
-        )
-
-        self.assertEqual(groups, ("bright",))
-        self.assertNotIn("weak", groups)
-
-    def test_stage9_ngc2237_fixed_metrics_use_independent_unscreen_supports_and_stop(self):
-        processor = self._new_processor()
-        stage9_module = sys.modules["stages.stage9_star_remixing"]
-        processor.cfg.workflow_plugin_probe_enabled = False
-        processor.cfg.stage9_targeted_recovery_enabled = True
-        processor.starmask_file = processor.process_dir / "starmask.fit"
-        processor.starmask_file.write_bytes(b"mock")
-        shape = (4, 4)
-        normal_layer = np.full((3, *shape), 0.20, dtype=np.float32)
-        strict_layer = np.full((3, *shape), 0.16, dtype=np.float32)
-        prepared_unscreens = []
-
-        def preflight(pipeline, *_args, **_kwargs):
-            report = {
-                "schema": "starun.stage9-starmask-support-preflight.v2",
-                "status": "ready",
-                "route": "dual_competition",
-                "reason_code": "stage9_support_preflight_boundary_dual",
-                "planned_candidates": ["normal", "strict_compact"],
-                "skipped_candidates": [],
-                "support_masks_equivalent": False,
-                "candidates": {
-                    "normal": {"status": "ok", "usable": True},
-                    "strict_compact": {"status": "ok", "usable": True},
-                },
-                "_calibrations": {
-                    "normal": {"status": "ok", "support_mode": "normal"},
-                    "strict_compact": {
-                        "status": "ok",
-                        "support_mode": "strict_compact",
-                    },
-                },
-            }
-            pipeline._stage9_starmask_support_preflight = (
-                stage9_module.stage9_quality.public_starmask_support_preflight(
-                    report
-                )
-            )
-            return report
-
-        def prepare_support(pipeline, *_args, **kwargs):
-            support_mode = (
-                "strict_compact" if kwargs.get("strict_support") else "normal"
-            )
-            layer = strict_layer if support_mode == "strict_compact" else normal_layer
-            mask = np.ones(shape, dtype=bool)
-            pipeline._stage9_starmask_calibration = {
-                "status": "ok",
-                "support_mode": support_mode,
-            }
-            pipeline._stage9_last_star_layer = layer.copy()
-            pipeline._stage9_last_star_overlay_mask = mask.copy()
-            pipeline._stage9_last_weak_overlay_mask = mask.copy()
-            pipeline._stage9_last_bright_overlay_mask = np.zeros(shape, dtype=bool)
-            return str(kwargs["output_name"])
-
-        def prepare_unscreen(
-            pipeline,
-            trusted_starmask_name,
-            _messages,
-            *,
-            output_name,
-            support_mode,
-        ):
-            prepared_unscreens.append(
-                (support_mode, trusted_starmask_name, output_name)
-            )
-            layer = (
-                np.full((3, *shape), 0.31, dtype=np.float32)
-                if support_mode == "normal"
-                else np.full((3, *shape), 0.27, dtype=np.float32)
-            )
-            mask = np.ones(shape, dtype=bool)
-            pipeline._stage9_last_star_layer = layer.copy()
-            pipeline._stage9_last_star_overlay_mask = mask.copy()
-            pipeline._stage9_last_weak_overlay_mask = mask.copy()
-            pipeline._stage9_last_bright_overlay_mask = np.zeros(shape, dtype=bool)
-            return {
-                "available": True,
-                "report": {
-                    "schema": "starun.stage9-unscreen-reference.v1",
-                    "status": "ready",
-                    "available": True,
-                    "reason_code": "stage9_unscreen_reference_ready",
-                },
-                "starmask": output_name,
-                "support_mode": support_mode,
-                "support_starmask": trusted_starmask_name,
-                "trusted_stars": (
-                    normal_layer
-                    if support_mode == "normal"
-                    else strict_layer
-                ),
-                "unscreen_stars": layer,
-                "stars": layer,
-                "support_mask": mask,
-                "weak_mask": mask,
-                "bright_mask": np.zeros(shape, dtype=bool),
-            }
-
-        def assess(_source_stem, *, attempt, formula):
-            if attempt == "screen_primary":
-                ratios = {
-                    "all": 0.733799397945404,
-                    "weak": 0.7559289336204529,
-                    "bright": 0.6859943866729736,
-                }
-                chroma = 0.004643959673283182
-            elif attempt in {
-                "screen_compact_primary",
-                "screen_unscreen_strict_compact_primary",
-            }:
-                ratios = {
-                    "all": 1.1180340051651,
-                    "weak": 1.1435438394546509,
-                    "bright": 0.8997353911399841,
-                }
-                chroma = 0.000007721634124603768
-            else:
-                ratios = {
-                    "all": 1.0377490520477295,
-                    "weak": 1.0444660186767578,
-                    "bright": 1.0206207036972046,
-                }
-                chroma = 0.000007721634124603768
-            quality = self._psf_quality(attempt, ratios)
-            quality["formula"] = formula
-            quality["metrics"]["chromatic_star_addition_ratio"] = chroma
-            return quality
-
-        processor._stage9_assess_current_remix = assess
-
-        with (
-            patch.object(
-                stage9_module,
-                "_stage9_starmask_support_preflight",
-                side_effect=preflight,
-            ),
-            patch.object(
-                stage9_module,
-                "_prepare_stage9_starmask_for_pixel_remix",
-                side_effect=prepare_support,
-            ),
-            patch.object(
-                stage9_module,
-                "_prepare_stage9_unscreen_candidate",
-                side_effect=prepare_unscreen,
-            ),
-            patch.object(
-                stage9_module,
-                "_stage9_reference_fidelity",
-                return_value={"status": "ok", "support_rgb_mae": 0.04},
-            ),
-        ):
-            stage9_star_remixing(processor)
-
-        self.assertEqual(
-            prepared_unscreens,
-            [
-                (
-                    "normal",
-                    "starmask_stretched",
-                    "starmask_unscreen_normal",
-                ),
-                (
-                    "strict_compact",
-                    "starmask_stretched_compact_primary",
-                    "starmask_unscreen_strict_compact",
-                ),
-            ],
-        )
-        report = processor.stage_json_reports["stage9_remix_quality.json"]
-        self.assertEqual(len(report["attempts"]), 4)
-        self.assertEqual(
-            report["selected"]["attempt"],
-            "screen_unscreen_normal_primary",
-        )
-        self.assertEqual(report["selected"]["support_mode"], "normal")
-        self.assertEqual(
-            report["selected"]["recovery_kind"],
-            "unscreen_amplitude_recovery",
-        )
-        self.assertEqual(
-            report["selected"]["support_starmask"],
-            "starmask_stretched",
-        )
-        self.assertFalse(report["delivery_fallback_used"])
-        self.assertFalse(report["fallback_used"])
-        self.assertAlmostEqual(
-            report["selected"]["metrics"]["chromatic_star_addition_ratio"],
-            0.000007721634124603768,
-        )
-        self.assertAlmostEqual(
-            report["selected"]["psf_closure"]["groups"]["all"][
-                "fwhm_ratio_median"
-            ],
-            1.0377490520477295,
-        )
-        self.assertTrue(report["candidate_recovery_used"])
-        self.assertFalse(
-            any(
-                "source_presence" in str(attempt.get("attempt") or "")
-                or "selective" in str(attempt.get("attempt") or "")
-                for attempt in report["attempts"]
-            )
-        )
-
-    def test_pipeline_status_stage9_psf_review_is_review_required(self):
-        probe = pipeline_module.ProcessorRuntimeMixin()
-        probe.results = []
-        probe._require_review(9, "stage9_psf_subgroup_evidence_insufficient")
-
-        status = probe._pipeline_result_status()
-
-        self.assertEqual(status, "review_required")

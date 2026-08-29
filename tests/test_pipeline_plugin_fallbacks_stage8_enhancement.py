@@ -1,5 +1,7 @@
 """Pipeline/plugin fallback tests for stage8 enhancement."""
 
+from contextlib import nullcontext
+
 from tests.pipeline_plugin_fallbacks_support import *  # noqa: F401,F403
 
 
@@ -239,6 +241,278 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
             "stage8_pre_subject_chroma",
             processor.saved_image_pixels,
         )
+
+    def test_stage8_starless_finish_projects_plugins_to_linked_subject_luma(self):
+        runtime = sys.modules["stages.stage8_nebula_enhancement"]
+        processor = self._subject_chroma_processor()
+        processor.cfg.workflow_plugin_probe_enabled = True
+        baseline = processor.image_pixels.copy()
+        masks = processor._stage8_generate_starless_masks(baseline)
+        core = np.zeros(baseline.shape[-2:], dtype=np.float32)
+        core[42:48, 60:68] = 1.0
+        masks["core_hard_mask"] = core
+        processor._stage8_generate_starless_masks = lambda _image: {
+            key: np.array(value, copy=True) for key, value in masks.items()
+        }
+
+        def run_plugin(step_key, _candidates):
+            if step_key == "细节/结构增强2":
+                processor.image_pixels = np.clip(
+                    processor.image_pixels
+                    * np.asarray((1.10, 1.03, 0.97), dtype=np.float32)[:, None, None],
+                    0.0,
+                    1.0,
+                )
+                return "VeraLux Revela"
+            if step_key == "最终微调颜色":
+                processor.image_pixels = np.clip(
+                    processor.image_pixels
+                    * np.asarray((1.04, 1.01, 0.98), dtype=np.float32)[:, None, None],
+                    0.0,
+                    1.0,
+                )
+                return "VeraLux Curves"
+            return None
+
+        processor._run_first_available_command = run_plugin
+        report = runtime._stage8_run_starless_finish(
+            processor,
+            [],
+            base_stem="stage8_enhanced",
+            channel_semantics="broadband_rgb_osc",
+            processing_policy="full",
+            user_processing_mode="auto",
+            external_override=False,
+            vectra_route_selected=False,
+            effective_saturation_budget=0.40,
+        )
+
+        self.assertEqual(report["schema"], "starun.stage8-starless-finish.v1")
+        self.assertEqual(report["accepted_steps"], ["revela", "subject_curves"])
+        candidate = processor.saved_image_pixels["stage8_enhanced"]
+        background = masks["background_mask"] >= 0.5
+        np.testing.assert_array_equal(candidate[:, background], baseline[:, background])
+        np.testing.assert_array_equal(candidate[:, core >= 0.5], baseline[:, core >= 0.5])
+        subject = (masks["subject_mask"] > 0.5) & (core < 0.5)
+        baseline_ratio = baseline[0, subject] / np.maximum(baseline[1, subject], 1e-6)
+        candidate_ratio = candidate[0, subject] / np.maximum(candidate[1, subject], 1e-6)
+        np.testing.assert_allclose(candidate_ratio, baseline_ratio, atol=2e-6)
+
+    def test_stage8_vectra_is_exclusive_and_failure_has_no_subject_fallback(self):
+        runtime = sys.modules["stages.stage8_nebula_enhancement"]
+        processor = self._subject_chroma_processor()
+        processor.cfg.workflow_plugin_probe_enabled = True
+
+        def run_plugin(step_key, _candidates):
+            if step_key != "调色2（可选）":
+                return None
+            luma = (
+                0.2126 * processor.image_pixels[0]
+                + 0.7152 * processor.image_pixels[1]
+                + 0.0722 * processor.image_pixels[2]
+            )
+            processor.image_pixels = np.clip(
+                luma[None, ...]
+                + (processor.image_pixels - luma[None, ...]) * 1.12,
+                0.0,
+                1.0,
+            ).astype(np.float32)
+            return "VeraLux Vectra"
+
+        processor._run_first_available_command = run_plugin
+        finish = runtime._stage8_run_starless_finish(
+            processor,
+            [],
+            base_stem="stage8_enhanced",
+            channel_semantics="broadband_rgb_osc",
+            processing_policy="full",
+            user_processing_mode="auto",
+            external_override=False,
+            vectra_route_selected=True,
+            effective_saturation_budget=0.40,
+        )
+        self.assertTrue(processor._stage8_vectra_applied, finish)
+        self.assertEqual(
+            processor._stage8_saturation_execution["method"],
+            "vectra_exclusive_color_route",
+        )
+        subject = runtime._stage8_run_subject_chroma(
+            processor,
+            [],
+            base_stem="stage8_enhanced",
+            channel_semantics="broadband_rgb_osc",
+            processing_policy="full",
+            user_processing_mode="auto",
+            external_override=False,
+            requested_saturation_budget=0.40,
+            effective_saturation_budget=0.40,
+            generic_saturation_suppressed=True,
+            vectra_route_selected=True,
+        )
+        self.assertFalse(subject["accepted"])
+        self.assertIn(
+            "vectra_exclusive_color_route",
+            subject["eligibility"]["issues"],
+        )
+        self.assertNotIn("stage8_subject_chroma_candidate", processor.saved_image_pixels)
+
+    def test_stage8_starless_finish_skips_restricted_policy_without_probe(self):
+        runtime = sys.modules["stages.stage8_nebula_enhancement"]
+        for policy in ("limited", "background_only", "skip", "preserve"):
+            with self.subTest(policy=policy):
+                processor = self._subject_chroma_processor()
+                processor._run_first_available_command = lambda *_args: self.fail(
+                    "restricted Stage8 route must not probe Starless plugins"
+                )
+                report = runtime._stage8_run_starless_finish(
+                    processor,
+                    [],
+                    base_stem="stage8_enhanced",
+                    channel_semantics="broadband_rgb_osc",
+                    processing_policy=policy,
+                    user_processing_mode="auto",
+                    external_override=False,
+                    vectra_route_selected=False,
+                    effective_saturation_budget=0.40,
+                )
+                self.assertEqual(report["status"], "skipped_ineligible")
+                self.assertIn(
+                    "processing_policy_not_full",
+                    report["eligibility"]["issues"],
+                )
+
+    def test_stage8_safe_passthrough_never_reenters_starless_finish_plugins(self):
+        runtime = sys.modules["stages.stage8_nebula_enhancement"]
+        processor = self._subject_chroma_processor()
+        processor.cfg.workflow_plugin_probe_enabled = True
+        processor._stage8_final_quality = "poor"
+        processor._stage8_safe_passthrough_color_only_preflight = {
+            "schema": "starun.stage8-safe-passthrough-preflight.v1",
+            "status": "accepted",
+            "accepted": True,
+        }
+        processor._run_first_available_command = lambda *_args: self.fail(
+            "safe color-only passthrough must not probe Starless plugins"
+        )
+
+        report = runtime._stage8_run_starless_finish(
+            processor,
+            [],
+            base_stem="stage8_input_starless",
+            channel_semantics="broadband_rgb_osc",
+            processing_policy="full",
+            user_processing_mode="auto",
+            external_override=False,
+            vectra_route_selected=False,
+            effective_saturation_budget=0.40,
+        )
+
+        self.assertEqual(
+            report["status"],
+            "skipped_safe_passthrough_color_only",
+        )
+        self.assertFalse(report["accepted"])
+        self.assertEqual(report["steps"], [])
+        self.assertFalse(processor._stage8_vectra_applied)
+
+    def test_stage8_starless_finish_rollback_failure_requires_review(self):
+        runtime = sys.modules["stages.stage8_nebula_enhancement"]
+        processor = self._subject_chroma_processor()
+        processor.cfg.workflow_plugin_probe_enabled = True
+        processor._run_first_available_command = lambda *_args: "VeraLux Revela"
+        with patch.object(
+            runtime,
+            "project_linked_luminance_candidate",
+            side_effect=RuntimeError("forced projection failure"),
+        ), patch.object(
+            runtime,
+            "_stage8_restore_finish_step",
+            return_value=(False, "forced rollback failure"),
+        ):
+            report = runtime._stage8_run_starless_finish(
+                processor,
+                [],
+                base_stem="stage8_enhanced",
+                channel_semantics="broadband_rgb_osc",
+                processing_policy="full",
+                user_processing_mode="auto",
+                external_override=False,
+                vectra_route_selected=False,
+                effective_saturation_budget=0.40,
+            )
+
+        self.assertEqual(report["status"], "failed_rollback_failed")
+        self.assertEqual(report["steps"][0]["status"], "failed_rollback_failed")
+        self.assertIn(
+            "stage8_starless_finish_rollback_failed",
+            processor._stage_review_reasons(8),
+        )
+
+    def test_stage8_starless_finish_step_unavailable_failure_and_rejection(self):
+        runtime = sys.modules["stages.stage8_nebula_enhancement"]
+        for scenario in (
+            "unavailable",
+            "command_failure",
+            "quality_rejection",
+            "candidate_save_failure",
+        ):
+            with self.subTest(scenario=scenario):
+                processor = self._subject_chroma_processor()
+                processor.cfg.workflow_plugin_probe_enabled = True
+
+                def run_plugin(*_args):
+                    if scenario == "unavailable":
+                        return None
+                    if scenario == "command_failure":
+                        raise RuntimeError("forced command failure")
+                    processor.image_pixels = np.clip(
+                        processor.image_pixels * 1.03,
+                        0.0,
+                        1.0,
+                    )
+                    return "VeraLux Revela"
+
+                processor._run_first_available_command = run_plugin
+                original_save = processor._save_stage_output
+                if scenario == "candidate_save_failure":
+                    processor._save_stage_output = lambda stem: (
+                        False
+                        if stem == "stage8_revela_candidate"
+                        else original_save(stem)
+                    )
+                gate_patch = (
+                    patch.object(
+                        runtime,
+                        "assess_finish_candidate",
+                        return_value={
+                            "accepted": False,
+                            "status": "rejected",
+                            "issues": ["forced_rejection"],
+                        },
+                    )
+                    if scenario == "quality_rejection"
+                    else nullcontext()
+                )
+                with gate_patch:
+                    step = runtime._stage8_run_starless_finish_step(
+                        processor,
+                        [],
+                        step_id="revela",
+                        step_key="细节/结构增强2",
+                        command_candidates=[("Revela", ("revela",))],
+                        base_stem="stage8_enhanced",
+                        mode="structure",
+                    )
+
+                expected = {
+                    "unavailable": "skipped_unavailable",
+                    "command_failure": "failed_rolled_back",
+                    "quality_rejection": "rejected_rolled_back",
+                    "candidate_save_failure": "failed_rolled_back",
+                }[scenario]
+                self.assertEqual(step["status"], expected)
+                if scenario != "unavailable":
+                    self.assertTrue(step["transaction"]["rollback_ok"])
 
     def test_stage8_high_risk_generic_saturation_does_not_double_consume(self):
         processor = self._new_processor()
@@ -595,21 +869,23 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
             message,
         )
 
-    def test_stage8_manual_ohs_palette_accepts_degraded_pcc_parent(self):
+    def test_stage8_manual_ohs_palette_still_requires_positive_chroma_gain(self):
         processor = self._dualband_palette_processor(requested_palette="OHS")
 
         stage8_nebula_enhancement(processor)
 
         report = processor.stage_json_reports["stage8_palette_report.json"]
-        self.assertTrue(report["accepted"], report)
+        self.assertFalse(report["accepted"], report)
         self.assertEqual(report["requested_palette"], "OHS")
         self.assertEqual(report["automatic_palette"], "SHO")
-        self.assertEqual(report["palette"], "OHS")
+        self.assertEqual(report["planned_palette"], "OHS")
         self.assertEqual(report["selection_mode"], "explicit_user_palette")
         self.assertTrue(report["manual_override"])
-        self.assertTrue(report["feeds_main_pipeline"])
+        self.assertFalse(report["feeds_main_pipeline"])
         self.assertTrue(report["color_parent"]["degraded_pcc_applied"])
         self.assertTrue(report["color_parent"]["requires_review"])
+        self.assertEqual(report["status"], "rejected_by_palette_quality_gate")
+        self.assertIn("auto_palette_subject_chroma_gain_unmet", report["issues"])
         self.assertFalse(processor.cfg.optional_color_transform_enabled)
         self.assertEqual(
             processor.result_metadata[-1]["details"]["dualband_palette"],
@@ -834,12 +1110,21 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
         stage8_nebula_enhancement(processor)
 
         self.assertEqual(processor._stage8_final_quality, "conservative_skipped")
+        self.assertEqual(processor.results[-1][1], "degraded")
         report = processor.stage_json_reports["stage8_enhancement_report.json"]
         quality = processor.stage_json_reports["stage8_quality.json"]
         self.assertEqual(report["status"], "conservative_skipped")
         self.assertEqual(report["final_quality"], "conservative_skipped")
         self.assertEqual(quality["initial"]["status"], "conservative_skipped")
         self.assertEqual(quality["final"]["final_quality"], "conservative_skipped")
+        handoff = processor.stage_json_reports["stage8_handoff.json"]
+        self.assertFalse(handoff["formal_eligible"])
+        self.assertTrue(handoff["restricted_downstream"])
+        self.assertEqual(handoff["processing_route"], "review_only")
+        self.assertIn(
+            "stage8_input_guard_skip",
+            processor._stage_review_reasons(8),
+        )
 
     def test_stage8_background_only_route_keeps_immutable_baseline(self):
         processor = self._new_processor()
@@ -873,6 +1158,20 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
             processor.stage_json_reports["stage8_color_quality_report.json"]["status"],
             "reported",
         )
+        color_report = processor.stage_json_reports[
+            "stage8_color_quality_report.json"
+        ]
+        self.assertTrue(color_report["used_for_gate"])
+        self.assertIn("guard_lineage", color_report)
+        self.assertIn("component_anomalies", color_report)
+        self.assertIn("weakened_retry", color_report)
+        self.assertIn("final_pixel_identity", color_report)
+        handoff = processor.stage_json_reports["stage8_handoff.json"]
+        self.assertEqual(
+            handoff["color_gate"]["report"],
+            "stage8_color_quality_report.json",
+        )
+        self.assertTrue(handoff["color_gate"]["used_for_gate"])
         palette_report = processor.stage_json_reports[
             "stage8_palette_report.json"
         ]
@@ -960,8 +1259,12 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
                 "quality_gates": {
                     "galaxy_disk_halo_residue": {
                         "status": "advisory",
+                        "advisory": True,
                         "hard_failed": False,
                         "reason_code": "single_local_galaxy_halo_evidence",
+                        "value": raw_local_halo,
+                        "accepted_limit": 0.48,
+                        "hard_limit": 0.96,
                     },
                 },
                 "derived": {
@@ -970,6 +1273,8 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
                     "global_halo_residue_score": 0.0556,
                     "compact_halo_residue_score": 0.1974,
                     "galaxy_disk_halo_corroborated_local_count": 1,
+                    "galaxy_disk_halo_evidence_available": 1.0,
+                    "galaxy_disk_halo_residue_score": raw_local_halo,
                     "starless_noise_gain": 1.0,
                 },
             },
@@ -1523,6 +1828,371 @@ class PipelinePluginFallbackStage8EnhancementTests(PipelinePluginFallbackTestBas
             processor.result_metadata[-1]["execution"],
             "completed",
         )
+
+    def test_stage8_limited_advisory_verified_noop_gets_formal_v3_handoff(self):
+        runtime = sys.modules["stages.stage8_nebula_enhancement"]
+        processor = self._new_processor()
+        processor.cfg.stage8_masked_enhancement_enabled = True
+        processor.cfg.stage8_limited_saturation_max = 0.05
+        processor._stage7_stretch_accepted = True
+        processor._stage7_stretch_output = "stage7_stretched"
+        processor._save_stage_output("stage7_stretched")
+        processor._stage8_handoff = {
+            "processing_policy": "limited",
+            "restricted_downstream": True,
+            "quality_status": "ok",
+            "reason_code": "stage6_quality_advisory",
+            "reason_text": "stage6_quality_advisory: halo_residue 0.713>0.480",
+            "reasons": [
+                {
+                    "code": "stage6_quality_advisory",
+                    "source_stage": 6,
+                }
+            ],
+            "metrics": {
+                "residual_star_score": 0.0,
+                "residual_star_hard_limit": 0.90,
+                "starless_noise_gain": 0.474,
+                "starless_noise_gain_hard_limit": 2.50,
+                "effective_halo_residue_score": 0.713,
+                "halo_residue_hard_limit": 0.96,
+            },
+        }
+        processor.starmask_file = processor.process_dir / "starmask.fit"
+        processor.starmask_file.write_bytes(b"mock")
+        processor._stage8_input_enhancement_guard = lambda: {
+            "status": "ok",
+            "skip_enhancement": False,
+            "processing_policy": "limited",
+            "reason_code": "stage6_quality_advisory",
+            "reason_text": processor._stage8_handoff["reason_text"],
+            "reason_details": processor._stage8_handoff["reasons"],
+            "hard_reasons": [],
+            "subject_reasons": [],
+            "advisories": [processor._stage8_handoff["reason_text"]],
+        }
+        processor._apply_stage8_builtin_enhancement = (
+            lambda _plan, *, label: [f"{label} verified noop"]
+        )
+        processor._stage8_quality_assessment = lambda: {
+            "status": "ok",
+            "issues": [],
+        }
+        processor._stage8_enhancement_quality_report = lambda: {
+            "status": "ok",
+            "issues": [],
+            "advisories": [],
+        }
+        processor._stage8_star_halo_guard_report = {
+            "schema": "starun.stage6-star-halo-guard.v1",
+            "status": "ok",
+            "reason_code": "stage6_star_halo_guard_ready",
+            "artifact": "stage6_star_halo_guard.fit",
+            "artifact_sha256": "a" * 64,
+        }
+        processor._stage8_star_halo_guard_verified = True
+        (processor.process_dir / "stage3_spatial_background_lineage.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+
+        eligibility_capture = {}
+
+        def accepted_preflight(_pipeline, *, source_mode, eligibility):
+            eligibility_capture.update(eligibility)
+            report = {
+                "schema": "starun.stage8-safe-passthrough-preflight.v1",
+                "status": "accepted",
+                "accepted": True,
+                "source_mode": source_mode,
+                "eligibility": eligibility,
+                "checks": {
+                    name: {"accepted": True}
+                    for name in (
+                        "exact_structure_rollback",
+                        "stage7_presentation_reference",
+                        "spatial_background",
+                        "subject_boundary_seam",
+                        "star_halo",
+                        "clipping",
+                    )
+                },
+            }
+            processor._stage8_safe_passthrough_color_only_preflight = report
+            return report
+
+        def accepted_final(_pipeline, **_kwargs):
+            return {
+                "schema": "starun.stage8-safe-passthrough-final.v1",
+                "status": "accepted",
+                "accepted": True,
+                "checks": {
+                    "color": {"accepted": True},
+                    "background_seam_clip_presentation": {"status": "ok"},
+                    "spatial_background": {"accepted": True},
+                    "star_halo": {"accepted": True},
+                    "artifact": {"accepted": True},
+                },
+            }
+
+        def accepted_color_report(_pipeline, *, final_source, **_kwargs):
+            identity = runtime._stage8_source_identity(
+                processor,
+                final_source,
+            )
+            return {
+                "schema": "starun.color-quality-report.v1",
+                "status": "reported",
+                "used_for_gate": True,
+                "issues": [],
+                "guard_lineage": {"verified": True},
+                "final_pixel_identity": identity,
+                "contract": {},
+            }
+
+        def accepted_cumulative(_pipeline, **_kwargs):
+            report = {
+                "schema": "starun.stage8-final-cumulative-quality.v1",
+                "status": "accepted",
+                "accepted": True,
+                "fresh_evaluation": True,
+                "issues": [],
+            }
+            _pipeline._stage8_final_cumulative_quality_report = dict(report)
+            return report
+
+        with patch.object(
+            runtime.spatial_background_lineage,
+            "load_lineage",
+            return_value={
+                "schema": "starun.stage3-spatial-background-lineage.v2",
+                "status": "accepted",
+                "accepted": True,
+                "support_sha256": "b" * 64,
+                "issues": [],
+            },
+        ), patch.object(
+            runtime,
+            "_stage8_safe_passthrough_preflight",
+            side_effect=accepted_preflight,
+        ), patch.object(
+            runtime,
+            "_stage8_safe_passthrough_final_validation",
+            side_effect=accepted_final,
+        ), patch.object(
+            runtime,
+            "_write_stage8_color_quality_report",
+            side_effect=accepted_color_report,
+        ), patch.object(
+            runtime,
+            "_stage8_enforce_final_cumulative_validation",
+            side_effect=accepted_cumulative,
+        ):
+            stage8_nebula_enhancement(processor)
+
+        handoff = processor._stage8_handoff
+        self.assertTrue(eligibility_capture["accepted"], eligibility_capture)
+        self.assertEqual(
+            handoff["processing_route"],
+            "safe_passthrough_color_only",
+        )
+        self.assertTrue(handoff["formal_eligible"], handoff)
+        self.assertFalse(handoff["restricted_downstream"], handoff)
+        self.assertTrue(handoff["passthrough"], handoff)
+        self.assertEqual(
+            handoff["outcome_reason_code"],
+            "stage8_limited_safe_passthrough_accepted",
+        )
+
+    def test_stage8_cumulative_structure_rejection_retries_color_only(self):
+        runtime = sys.modules["stages.stage8_nebula_enhancement"]
+        processor = self._new_processor()
+        processor.cfg.stage8_masked_enhancement_enabled = True
+        processor._stage7_stretch_accepted = True
+        processor._stage7_stretch_output = "stage7_stretched"
+        processor._save_stage_output("stage7_stretched")
+        processor._stage8_handoff = {
+            "processing_policy": "full",
+            "restricted_downstream": False,
+            "quality_status": "ok",
+            "reason_code": "",
+            "reasons": [],
+        }
+        processor._stage8_input_enhancement_guard = lambda: {
+            "status": "ok",
+            "skip_enhancement": False,
+            "processing_policy": "full",
+            "reason_code": "",
+            "reason_text": "",
+            "reason_details": [],
+            "hard_reasons": [],
+            "subject_reasons": [],
+            "advisories": [],
+        }
+        processor._apply_stage8_builtin_enhancement = (
+            lambda _plan, *, label: [f"{label} structure candidate"]
+        )
+        processor._stage8_quality_assessment = lambda **_kwargs: {
+            "status": "ok",
+            "issues": [],
+        }
+        processor._stage8_enhancement_quality_report = lambda: {
+            "status": "ok",
+            "issues": [],
+            "advisories": [],
+        }
+        processor._stage8_star_halo_guard_report = {
+            "schema": "starun.stage6-star-halo-guard.v1",
+            "status": "ok",
+            "reason_code": "stage6_star_halo_guard_ready",
+            "artifact": "stage6_star_halo_guard.fit",
+            "artifact_sha256": "a" * 64,
+        }
+        processor._stage8_star_halo_guard_verified = True
+        (processor.process_dir / "stage3_spatial_background_lineage.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        cumulative_calls = []
+        preflight_modes = []
+
+        def cumulative(_pipeline, **kwargs):
+            cumulative_calls.append(dict(kwargs))
+            if len(cumulative_calls) == 1:
+                self.assertTrue(kwargs["defer_review_on_exact_rollback"])
+                baseline = np.array(
+                    _pipeline.saved_image_pixels["stage8_input_starless"],
+                    copy=True,
+                )
+                _pipeline.image_pixels = baseline
+                _pipeline.saved_image_pixels["stage8_enhanced"] = baseline
+                _pipeline._stage8_final_source = "stage8_input_starless"
+                _pipeline._stage8_final_quality = (
+                    "final_cumulative_qa_rejected"
+                )
+                report = {
+                    "schema": "starun.stage8-final-cumulative-quality.v1",
+                    "status": "rejected",
+                    "accepted": False,
+                    "fresh_evaluation": True,
+                    "issues": ["outside_target_pixel_identity"],
+                    "rollback": {"status": "restored", "accepted": True},
+                    "review_deferred_for_safe_passthrough": True,
+                    "reason_code": "stage8_final_cumulative_qa_rejected",
+                }
+                _pipeline._stage8_final_cumulative_quality_report = dict(
+                    report
+                )
+                return report
+            report = {
+                "schema": "starun.stage8-final-cumulative-quality.v1",
+                "status": "accepted",
+                "accepted": True,
+                "fresh_evaluation": True,
+                "issues": [],
+                "reason_code": "accepted",
+            }
+            _pipeline._stage8_final_cumulative_quality_report = dict(report)
+            return report
+
+        def accepted_preflight(_pipeline, *, source_mode, eligibility=None):
+            _ = eligibility
+            preflight_modes.append(source_mode)
+            report = {
+                "schema": "starun.stage8-safe-passthrough-preflight.v1",
+                "status": "accepted",
+                "accepted": True,
+                "source_mode": source_mode,
+                "checks": {"exact_structure_rollback": {"accepted": True}},
+                "issues": [],
+            }
+            _pipeline._stage8_safe_passthrough_color_only_preflight = report
+            return report
+
+        def accepted_subject(_pipeline, _messages, **kwargs):
+            report = {
+                "schema": "starun.stage8-subject-chroma.v1",
+                "status": "accepted",
+                "accepted": True,
+                "source": f"{kwargs['base_stem']}.fit",
+                "output": "stage8_enhanced.fit",
+                "factor": {"factor": 1.02},
+            }
+            _pipeline._stage8_subject_chroma_report = report
+            return report
+
+        def accepted_color_report(_pipeline, *, final_source, **_kwargs):
+            return {
+                "schema": "starun.color-quality-report.v1",
+                "status": "reported",
+                "used_for_gate": True,
+                "issues": [],
+                "guard_lineage": {"verified": True},
+                "final_pixel_identity": runtime._stage8_source_identity(
+                    _pipeline,
+                    final_source,
+                ),
+                "contract": {},
+            }
+
+        with patch.object(
+            runtime.spatial_background_lineage,
+            "load_lineage",
+            return_value={
+                "schema": "starun.stage3-spatial-background-lineage.v2",
+                "status": "accepted",
+                "accepted": True,
+                "support_sha256": "b" * 64,
+                "issues": [],
+            },
+        ), patch.object(
+            runtime,
+            "_stage8_safe_passthrough_preflight",
+            side_effect=accepted_preflight,
+        ), patch.object(
+            runtime,
+            "_stage8_safe_passthrough_final_validation",
+            return_value={
+                "schema": "starun.stage8-safe-passthrough-final.v1",
+                "status": "accepted",
+                "accepted": True,
+                "checks": {"color": {"accepted": True}},
+                "issues": [],
+            },
+        ), patch.object(
+            runtime,
+            "_stage8_run_subject_chroma",
+            side_effect=accepted_subject,
+        ), patch.object(
+            runtime,
+            "_stage8_enforce_final_cumulative_validation",
+            side_effect=cumulative,
+        ), patch.object(
+            runtime,
+            "_write_stage8_color_quality_report",
+            side_effect=accepted_color_report,
+        ):
+            stage8_nebula_enhancement(processor)
+
+        handoff = processor._stage8_handoff
+        self.assertEqual(len(cumulative_calls), 2)
+        self.assertEqual(
+            preflight_modes,
+            ["post_cumulative_structure_rollback"],
+        )
+        self.assertEqual(
+            handoff["processing_route"],
+            "safe_passthrough_color_only",
+        )
+        self.assertTrue(handoff["formal_eligible"], handoff)
+        self.assertFalse(handoff["restricted_downstream"], handoff)
+        self.assertTrue(handoff["structure_cumulative_retry"]["accepted"])
+        self.assertEqual(
+            handoff["outcome_reason_code"],
+            "stage8_structure_cumulative_rollback_"
+            "safe_passthrough_accepted",
+        )
+        self.assertFalse(processor._stage_review_reasons(8))
 
     def test_stage8_limited_candidate_rejection_preserves_candidate_and_rolls_back(self):
         processor = self._new_processor()

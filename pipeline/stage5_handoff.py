@@ -11,7 +11,7 @@ except ImportError:
     import run_manifest
 
 
-STAGE5_HANDOFF_SCHEMA = "starun.stage5-stage6-handoff.v1"
+STAGE5_HANDOFF_SCHEMA = "starun.stage5-stage6-handoff.v2"
 STAGE5_INPUT_LINEAGE_SCHEMA = "starun.stage5-input-lineage.v1"
 STAGE5_UPSTREAM_STEM = "stage4_color"
 STAGE5_UPSTREAM_ARTIFACT = "stage4_color.fit"
@@ -25,6 +25,7 @@ VERIFIED_RESUME_ORIGIN = "verified_stage5_resume"
 
 REASON_SOURCE_UNAVAILABLE = "stage6_stage5_linear_unavailable"
 REASON_LINEAGE_UNVERIFIED = "stage6_stage5_lineage_unverified"
+REASON_FORMAL_INELIGIBLE = "stage6_stage5_not_formal_eligible"
 REASON_INPUT_CHECKPOINT_FAILED = "stage6_input_checkpoint_failed"
 
 
@@ -229,6 +230,7 @@ def freeze_stage5_handoff(
     stage_status: str,
     deconvolution_integrity_ok: bool,
     denoise_integrity_ok: bool,
+    formal_eligible: bool = False,
     input_lineage: Optional[Mapping[str, Any]] = None,
     provenance: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -247,6 +249,7 @@ def freeze_stage5_handoff(
         "origin": normalized_origin,
         "run_id": _run_id(pipeline) or None,
         "stage_status": normalized_status,
+        "formal_eligible": bool(formal_eligible),
         "input_integrity_ok": False,
         "input_lineage": (
             dict(input_lineage)
@@ -297,6 +300,12 @@ def freeze_stage5_handoff(
         record["integrity_ok"] = bool(
             deconvolution_integrity_ok and denoise_integrity_ok
         )
+        if not formal_eligible:
+            record.update(
+                reason_code=REASON_FORMAL_INELIGIBLE,
+                detail="current-run Stage 5 formal eligibility was revoked",
+            )
+            return _persist_handoff(pipeline, record)
         if normalized_status not in {"ok", "degraded"}:
             record["detail"] = "current-run Stage 5 status is not deliverable"
             return _persist_handoff(pipeline, record)
@@ -365,6 +374,7 @@ def verify_stage5_handoff(pipeline: object) -> Dict[str, Any]:
         or str(record.get("artifact") or "") != STAGE5_SOURCE_ARTIFACT
         or str(record.get("state") or "") != "linear"
         or origin not in {CURRENT_RUN_ORIGIN, VERIFIED_RESUME_ORIGIN}
+        or record.get("formal_eligible") is not True
         or record.get("input_integrity_ok") is not True
         or record.get("deconvolution_integrity_ok") is not True
         or record.get("denoise_integrity_ok") is not True
@@ -464,6 +474,7 @@ def verify_stage5_handoff(pipeline: object) -> Dict[str, Any]:
 __all__ = [
     "CURRENT_RUN_ORIGIN",
     "REASON_INPUT_CHECKPOINT_FAILED",
+    "REASON_FORMAL_INELIGIBLE",
     "REASON_LINEAGE_UNVERIFIED",
     "REASON_SOURCE_UNAVAILABLE",
     "STAGE5_HANDOFF_SCHEMA",

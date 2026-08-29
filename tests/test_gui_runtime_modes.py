@@ -192,7 +192,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
 
         self.assertTrue(proxy.processing_parameters_expanded)
         self.assertTrue(panel.visible)
-        self.assertEqual(button.text, "收起处理参数")
+        self.assertEqual(button.text, "收起高级流水线设置")
         self.assertEqual(button.accessible_name, "收起处理参数设置")
 
     def test_processing_runtime_configuration_maps_safe_ui_settings(self):
@@ -460,7 +460,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
             self.assertEqual(selected, app_model)
             self.assertEqual(source, "graxpert_app")
 
-    def test_result_preview_uses_newest_known_output_across_name_families(self):
+    def test_result_preview_does_not_glob_unverified_output_names(self):
         with tempfile.TemporaryDirectory() as td:
             work_dir = Path(td)
             stale = work_dir / "result_processed.png"
@@ -472,7 +472,7 @@ class GuiRuntimeModesTests(unittest.TestCase):
 
             selected = gui_module.StarunGui._find_result_preview(None, work_dir)
 
-            self.assertEqual(selected, current)
+            self.assertIsNone(selected)
 
     def test_quality_report_path_prefers_process_report(self):
         with tempfile.TemporaryDirectory() as td:

@@ -55,6 +55,7 @@ class Stage5HandoffTests(unittest.TestCase):
                 stage_status="degraded",
                 deconvolution_integrity_ok=True,
                 denoise_integrity_ok=True,
+                formal_eligible=True,
                 input_lineage=input_lineage,
             )
 
@@ -89,11 +90,39 @@ class Stage5HandoffTests(unittest.TestCase):
                 stage_status="degraded",
                 deconvolution_integrity_ok=False,
                 denoise_integrity_ok=True,
+                formal_eligible=True,
                 input_lineage=input_lineage,
             )
 
             self.assertFalse(record["accepted"])
             self.assertFalse(record["deconvolution_integrity_ok"])
+            with self.assertRaises(stage5_handoff.Stage5HandoffError):
+                stage5_handoff.verify_stage5_handoff(pipeline)
+
+    def test_current_run_handoff_rejects_revoked_formal_eligibility(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            pipeline = self._pipeline(Path(temporary_directory))
+            (pipeline.process_dir / stage5_handoff.STAGE5_SOURCE_ARTIFACT).write_bytes(
+                b"review-only-linear"
+            )
+            input_lineage = self._current_input_lineage(pipeline)
+
+            record = stage5_handoff.freeze_stage5_handoff(
+                pipeline,
+                origin=stage5_handoff.CURRENT_RUN_ORIGIN,
+                stage_status="degraded",
+                deconvolution_integrity_ok=True,
+                denoise_integrity_ok=True,
+                formal_eligible=False,
+                input_lineage=input_lineage,
+            )
+
+            self.assertFalse(record["accepted"])
+            self.assertFalse(record["formal_eligible"])
+            self.assertEqual(
+                record["reason_code"],
+                stage5_handoff.REASON_FORMAL_INELIGIBLE,
+            )
             with self.assertRaises(stage5_handoff.Stage5HandoffError):
                 stage5_handoff.verify_stage5_handoff(pipeline)
 
@@ -109,6 +138,7 @@ class Stage5HandoffTests(unittest.TestCase):
                 stage_status="ok",
                 deconvolution_integrity_ok=True,
                 denoise_integrity_ok=True,
+                formal_eligible=True,
                 input_lineage=input_lineage,
             )
             artifact.write_bytes(b"changed")
@@ -132,6 +162,7 @@ class Stage5HandoffTests(unittest.TestCase):
                 stage_status="ok",
                 deconvolution_integrity_ok=True,
                 denoise_integrity_ok=True,
+                formal_eligible=True,
                 input_lineage=input_lineage,
             )
             pipeline._run_id = "run-b"
@@ -160,6 +191,7 @@ class Stage5HandoffTests(unittest.TestCase):
                 stage_status="degraded",
                 deconvolution_integrity_ok=True,
                 denoise_integrity_ok=True,
+                formal_eligible=True,
                 input_lineage=lineage,
             )
 
@@ -184,6 +216,7 @@ class Stage5HandoffTests(unittest.TestCase):
                     stage_status="ok",
                     deconvolution_integrity_ok=True,
                     denoise_integrity_ok=True,
+                    formal_eligible=True,
                     input_lineage=input_lineage,
                 )
                 (pipeline.process_dir / artifact_name).write_bytes(b"tampered")
@@ -216,6 +249,7 @@ class Stage5HandoffTests(unittest.TestCase):
                 stage_status="verified_resume",
                 deconvolution_integrity_ok=True,
                 denoise_integrity_ok=True,
+                formal_eligible=True,
                 provenance=provenance,
             )
 

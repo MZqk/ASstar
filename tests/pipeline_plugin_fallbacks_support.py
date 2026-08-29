@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -32,6 +33,14 @@ if str(PIPELINE_DIR) not in sys.path:
 
 from dualband_palette import resolve_palette_selection  # noqa: E402
 from narrowband_normalization import resolve_dual_narrowband_mapping  # noqa: E402
+from stage8_starless_finish import (  # noqa: E402
+    DECODED_PIXEL_SHA256_METHOD,
+    FITS_DATA_SHA256_METHOD,
+    canonical_decoded_pixel_sha256,
+    pixel_sha256,
+)
+from stage8_handoff import seal_stage8_handoff  # noqa: E402
+import stage7_stretch_metrics  # noqa: E402
 
 
 def _ensure_fake_sirilpy() -> None:
@@ -180,6 +189,124 @@ _stage9_star_remixing_impl = pipeline_module.StarunPostProcessor.stage9_star_rem
 _stage10_export_impl = pipeline_module.StarunPostProcessor.stage10_export
 
 
+def install_stage10_accepted_spatial_lineage(
+    process_dir: Path,
+    image: np.ndarray,
+) -> None:
+    """Write a complete SHA-bound Stage3/7 spatial fixture for Stage10 tests."""
+
+    spatial = pipeline_module.stage8_pixels.spatial_background_lineage
+    pixels = np.asarray(image, dtype=np.float32)
+    height, width = pixels.shape[-2:]
+    support = np.ones((height, width), dtype=np.uint8)
+    points = [
+        (float(x), float(y))
+        for y in np.linspace(3, height - 4, 4)
+        for x in np.linspace(3, width - 4, 4)
+    ]
+    support_path = process_dir / "stage3_spatial_background_support.fit"
+    input_path = process_dir / "stage3_bg_input.fit"
+    stage3_path = process_dir / "stage3_bgremoved.fit"
+    candidate_path = process_dir / "stage7_spatial_fixture.fit"
+    fits.PrimaryHDU(support).writeto(support_path, overwrite=True)
+    fits.PrimaryHDU(pixels).writeto(input_path, overwrite=True)
+    fits.PrimaryHDU(pixels).writeto(stage3_path, overwrite=True)
+    fits.PrimaryHDU(pixels).writeto(candidate_path, overwrite=True)
+
+    support_sha256 = hashlib.sha256(support_path.read_bytes()).hexdigest()
+    input_sha256 = hashlib.sha256(input_path.read_bytes()).hexdigest()
+    stage3_sha256 = hashlib.sha256(stage3_path.read_bytes()).hexdigest()
+    expected_metrics = spatial.measure_spatial_background_planes(
+        pixels,
+        support.astype(bool),
+        points,
+        patch_radius=1,
+    )
+    reference_plane = {
+        name: {
+            "coefficients": list(metrics.get("coefficients") or []),
+            "slope_span": metrics.get("slope_span"),
+            "slope_significance_sigma": metrics.get(
+                "slope_significance_sigma"
+            ),
+        }
+        for name, metrics in expected_metrics.items()
+    }
+    lineage = spatial.seal_lineage({
+        "schema": spatial.LINEAGE_SCHEMA,
+        "status": "accepted",
+        "accepted": True,
+        "review_required": False,
+        "run_id": "stage10-spatial-fixture",
+        "processing_route": "background_correction",
+        "image_shape": [height, width],
+        "channel_layout": "rgb_chw",
+        "support_artifact": support_path.name,
+        "support_kind": "candidate_independent_full_sky_mask",
+        "support_pixel_count": int(np.count_nonzero(support)),
+        "support_coverage": 1.0,
+        "sample_patch_support_pixel_count": int(
+            np.count_nonzero(
+                spatial.build_sample_patch_support(
+                    support.shape,
+                    points,
+                    support.astype(bool),
+                    patch_radius=1,
+                )[0]
+            )
+        ),
+        "sample_patch_min_support_pixel_count": 9,
+        "support_sha256": support_sha256,
+        "stage3_input_sha256": input_sha256,
+        "stage3_input_pixel_sha256": spatial._array_sha256(pixels),
+        "stage3_output_sha256": stage3_sha256,
+        "stage3_output_pixel_sha256": spatial._array_sha256(pixels),
+        "fit_points": points[:8],
+        "validation_points": points[8:],
+        "patch_radius": 1,
+        "reference_metrics": expected_metrics,
+        "reference_plane": {
+            "coordinate_system": "normalized_image_xy",
+            "components": reference_plane,
+            "sha256": spatial._json_sha256(reference_plane),
+        },
+        "projection_schema": None,
+        "projection_reason_code": None,
+        "selected_components": [],
+        "unresolved_components": [],
+    })
+    (process_dir / "stage3_spatial_background_lineage.json").write_text(
+        json.dumps(lineage, sort_keys=True),
+        encoding="utf-8",
+    )
+    transform_identity = {"method": "test_identity"}
+    matched_domain = {"status": "active", "schema": "test.v1"}
+    stage7_reference = {
+        "schema": spatial.STAGE7_REFERENCE_SCHEMA,
+        "status": "accepted",
+        "accepted": True,
+        "support_sha256": support_sha256,
+        "stage7_candidate": {
+            "name": "spatial_fixture",
+            "artifact": candidate_path.name,
+            "pixel_sha256": spatial._array_sha256(pixels),
+        },
+        "expected_metrics": expected_metrics,
+        "transform_identity": transform_identity,
+        "matched_domain_transfer": matched_domain,
+        "transform_digest_sha256": spatial._json_sha256(
+            {
+                "transform_identity": transform_identity,
+                "matched_domain_transfer": matched_domain,
+            }
+        ),
+    }
+    (process_dir / spatial.STAGE7_REFERENCE_NAME).write_text(
+        json.dumps(stage7_reference, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
 def stage9_star_remixing(processor):
     """Run Stage 9 while keeping legacy shallow fakes focused on scheduling.
 
@@ -195,6 +322,91 @@ def stage9_star_remixing(processor):
     real_persisted_validator = (
         stage9_module._validate_stage9_persisted_output
     )
+    configured_assessor = getattr(
+        processor,
+        "_stage9_assess_current_remix",
+        None,
+    )
+
+    def compatibility_assessor(
+        source_stem,
+        *,
+        attempt,
+        formula,
+    ):
+        """Give shallow selection fixtures a complete formal PSF triplet."""
+        if callable(configured_assessor):
+            report = configured_assessor(
+                source_stem,
+                attempt=attempt,
+                formula=formula,
+            )
+        else:
+            report = {
+                "attempt": attempt,
+                "formula": formula,
+                "status": "ok",
+                "accepted": True,
+                "issues": [],
+                "advisories": [],
+                "metrics": {},
+            }
+        if not isinstance(report, dict):
+            return report
+        if not bool(report.get("accepted", False)) or bool(
+            report.get("review_required", False)
+        ):
+            return report
+        closure = report.get("psf_closure")
+        if not isinstance(closure, dict):
+            closure = {}
+            report["psf_closure"] = closure
+        if bool(closure.get("review_required", False)) or str(
+            closure.get("status") or ""
+        ).lower() == "partial":
+            return report
+        groups = closure.get("groups")
+        if not isinstance(groups, dict):
+            groups = {}
+            closure["groups"] = groups
+        assessed = []
+        for group in groups.values():
+            if not isinstance(group, dict) or group.get("status") != "ok":
+                continue
+            try:
+                ratio = float(group["fwhm_ratio_median"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if np.isfinite(ratio) and ratio > 0.0:
+                assessed.append(ratio)
+        try:
+            all_ratio = float(
+                ((groups.get("all") or {}).get("fwhm_ratio_median"))
+            )
+        except (TypeError, ValueError):
+            all_ratio = float(np.median(assessed)) if assessed else 1.0
+        if not np.isfinite(all_ratio) or all_ratio <= 0.0:
+            all_ratio = 1.0
+        for group_name in ("all", "weak", "bright"):
+            groups.setdefault(
+                group_name,
+                {
+                    "status": "ok",
+                    "accepted": True,
+                    "fwhm_ratio_median": all_ratio,
+                    "test_double_compatibility": True,
+                },
+            )
+        closure.setdefault(
+            "limits",
+            {
+                "stage9_psf_fwhm_ratio_min": 0.93,
+                "stage9_psf_fwhm_ratio_max": 1.10,
+            },
+        )
+        closure.setdefault("status", "ok")
+        closure.setdefault("accepted", True)
+        return report
 
     def compatibility_persisted_validator(
         pipeline,
@@ -369,6 +581,12 @@ def stage9_star_remixing(processor):
             stage9_module,
             "_validate_stage9_persisted_output",
             side_effect=compatibility_persisted_validator,
+        ),
+        patch.object(
+            processor,
+            "_stage9_assess_current_remix",
+            side_effect=compatibility_assessor,
+            create=True,
         ),
     ):
         return _stage9_star_remixing_impl(processor)
@@ -614,13 +832,21 @@ class Stage3TransactionFake(ReviewRegistryTestDouble):
         self.results: list[tuple[str, str, float, str]] = []
         self.result_metadata: list[dict[str, Any]] = []
         self.report: dict[str, Any] = {}
+        self._stage3_tempdir = tempfile.TemporaryDirectory()
+        self.work_dir = Path(self._stage3_tempdir.name) / "stage3-test-run"
+        self.process_dir = self.work_dir / "process"
+        self.process_dir.mkdir(parents=True, exist_ok=True)
         self.siril = Stage3TransactionSiril(self)
 
     def cmd_with_check(self, *args: Any, quiet: bool = False) -> bool:
         _ = quiet
         self.cmd_calls.append(args)
         if args[0] == "save":
-            self.saved_sources[str(args[1])] = self.current_image
+            stem = str(args[1])
+            self.saved_sources[stem] = self.current_image
+            fits.PrimaryHDU(
+                np.asarray(self.siril.get_image_pixeldata(preview=False))
+            ).writeto(self.process_dir / f"{stem}.fit", overwrite=True)
             return True
         if args[0] == "load":
             stem = str(args[1])
@@ -655,11 +881,14 @@ class Stage3TransactionFake(ReviewRegistryTestDouble):
         }
 
     def _save_stage_output(self, stem: str) -> bool:
-        self.saved_sources[stem] = self.current_image
-        return True
+        return self.cmd_with_check("save", stem)
 
     def _write_stage_json(self, _name: str, payload: dict[str, Any]) -> None:
         self.report = payload
+        (self.process_dir / _name).write_text(
+            json.dumps(payload, indent=2),
+            encoding="utf-8",
+        )
 
     def _record_stage(
         self,
@@ -678,6 +907,7 @@ class Stage3CompoundSiril:
         self.owner = owner
         self.samples: list[tuple[float, float]] = []
         self.set_calls: list[dict[str, Any]] = []
+        self.image_lock_entries = 0
 
     def get_image_pixeldata(self, preview: bool = False):
         _ = preview
@@ -706,6 +936,19 @@ class Stage3CompoundSiril:
 
     def get_image_bgsamples(self):
         return list(self.samples)
+
+    def image_lock(self):
+        owner = self
+
+        @contextlib.contextmanager
+        def locked():
+            owner.image_lock_entries += 1
+            yield
+
+        return locked()
+
+    def set_image_pixeldata(self, image: Any) -> None:
+        self.owner.images[self.owner.state] = np.asarray(image).copy()
 
 
 class Stage3CompoundFake(ReviewRegistryTestDouble):
@@ -833,6 +1076,10 @@ class Stage3CompoundFake(ReviewRegistryTestDouble):
         self.result_metadata: list[dict[str, Any]] = []
         self.report: dict[str, Any] = {}
         self._background_review_required = False
+        self._stage3_tempdir = tempfile.TemporaryDirectory()
+        self.work_dir = Path(self._stage3_tempdir.name) / "stage3-test-run"
+        self.process_dir = self.work_dir / "process"
+        self.process_dir.mkdir(parents=True, exist_ok=True)
         self.siril = Stage3CompoundSiril(self)
 
     def cmd_with_check(self, *args: Any, quiet: bool = False) -> bool:
@@ -843,6 +1090,10 @@ class Stage3CompoundFake(ReviewRegistryTestDouble):
             stem = str(args[1])
             self.saved_states[stem] = self.state
             self.saved_images[stem] = self.images[self.state].copy()
+            fits.PrimaryHDU(self.saved_images[stem]).writeto(
+                self.process_dir / f"{stem}.fit",
+                overwrite=True,
+            )
             return True
         if command == "load":
             stem = str(args[1])
@@ -905,6 +1156,10 @@ class Stage3CompoundFake(ReviewRegistryTestDouble):
 
     def _write_stage_json(self, _name: str, payload: dict[str, Any]) -> None:
         self.report = payload
+        (self.process_dir / _name).write_text(
+            json.dumps(payload, indent=2),
+            encoding="utf-8",
+        )
 
     def _record_stage(
         self,
@@ -945,8 +1200,8 @@ class FakeProcessor(ReviewRegistryTestDouble):
             denoise_mod=0.35,
             denoise_safety_max=0.55,
             stage5_multiscale_denoise_enabled=False,
-            stage5_multiscale_detail_retention_min=0.82,
-            stage5_multiscale_noise_reduction_min=0.05,
+            stage5_multiscale_detail_retention_min=0.90,
+            stage5_multiscale_noise_reduction_min=0.12,
             stage5_denoise_chroma_noise_growth_max=1.05,
             asinh_stretch=3.0,
             asinh_offset=0.001,
@@ -989,7 +1244,30 @@ class FakeProcessor(ReviewRegistryTestDouble):
             1.0,
         ).astype(np.float32)
         self.saved_image_pixels: dict[str, np.ndarray] = {}
-        self.siril = SimpleNamespace(get_image_shape=lambda: self.image_shape)
+        self._stage7_presentation_reference_pixels = self.image_pixels.copy()
+        subject_mask = np.zeros(self.image_pixels.shape[-2:], dtype=np.float32)
+        subject_mask[20:76, 24:104] = 1.0
+        self._stage7_frozen_rendition_masks = {
+            "subject_mask": subject_mask,
+            "background_mask": 1.0 - subject_mask,
+            "star_mask": np.zeros_like(subject_mask),
+            "star_halo_guard_mask": np.zeros_like(subject_mask),
+        }
+        self._stage9_selected_remix_quality = {
+            "psf_closure": {
+                "groups": {
+                    name: {
+                        "status": "ok",
+                        "fwhm_ratio_median": 1.0,
+                    }
+                    for name in ("all", "weak", "bright")
+                }
+            }
+        }
+        self.siril = SimpleNamespace(
+            get_image_shape=lambda: self.image_shape,
+            get_image_pixeldata=lambda preview=False: self.image_pixels.copy(),
+        )
 
         self.export_linear_ok = True
         self.fail_commands: set[str] = set()
@@ -1028,20 +1306,108 @@ class FakeProcessor(ReviewRegistryTestDouble):
         self.workflow_command_used: dict[str, str] = {}
         self.starmask_file: Path | None = None
         self.starless_file: Path | None = None
-        self._stage8_handoff = {
-            "schema": "starun.stage8-handoff.v1",
-            "source_stem": "stage8_enhanced",
-            "passthrough": False,
-            "restricted_downstream": False,
-            "reason_code": "stage8_enhancement_accepted",
-            "processing_policy": "full",
-        }
+        stage8_path = self.process_dir / "stage8_enhanced.fit"
+        stage8_path.write_bytes(b"mock-stage8-enhanced")
+        self.saved_image_pixels["stage8_enhanced"] = self.image_pixels.copy()
+        self._stage8_handoff = self._make_stage8_handoff("stage8_enhanced")
         self.previous_stage_remix_calls: list[tuple[str, str, float]] = []
         self.fail_previous_stage_remix = False
         self.sasp_stage8_label: str | None = None
         self.sasp_stage8_calls: list[dict[str, Any] | None] = []
         self.stage_json_reports: dict[str, dict[str, Any]] = {}
         self.header_metadata: dict[str, Any] = {}
+
+    def _make_stage8_handoff(
+        self,
+        source_stem: str,
+        *,
+        processing_route: str = "structure_enhanced",
+    ) -> dict[str, Any]:
+        """Bind a test artifact to the formal Stage8 v3 handoff contract."""
+
+        source_path = self.process_dir / f"{source_stem}.fit"
+        pixels = self.saved_image_pixels.get(source_stem)
+        if pixels is None:
+            pixels = self.image_pixels.copy()
+            self.saved_image_pixels[source_stem] = pixels
+        fits_data_sha = pixel_sha256(pixels)
+        decoded_pixel_sha = canonical_decoded_pixel_sha256(pixels)
+        artifact = {
+            "artifact": f"{source_stem}.fit",
+            "sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+            "pixel_sha256": fits_data_sha,
+            "pixel_sha256_method": FITS_DATA_SHA256_METHOD,
+            "fits_data_sha256": fits_data_sha,
+            "fits_data_sha256_method": FITS_DATA_SHA256_METHOD,
+            "decoded_pixel_sha256": decoded_pixel_sha,
+            "decoded_pixel_sha256_method": DECODED_PIXEL_SHA256_METHOD,
+            "identity_status": "verified",
+        }
+        handoff = {
+            "schema": "starun.stage8-handoff.v3",
+            "source_stem": source_stem,
+            "passthrough": processing_route == "safe_passthrough_color_only",
+            "restricted_downstream": False,
+            "processing_route": processing_route,
+            "formal_eligible": True,
+            "reason_code": "stage8_enhancement_accepted",
+            "processing_policy": "full",
+            "final_quality": "ok",
+            "lineage_verified": True,
+            "source_artifact": artifact,
+            "artifact_sha256": artifact["sha256"],
+            "pixel_sha256": artifact["pixel_sha256"],
+            "pixel_sha256_method": artifact["pixel_sha256_method"],
+            "fits_data_sha256": artifact["fits_data_sha256"],
+            "fits_data_sha256_method": artifact["fits_data_sha256_method"],
+            "decoded_pixel_sha256": artifact["decoded_pixel_sha256"],
+            "decoded_pixel_sha256_method": artifact[
+                "decoded_pixel_sha256_method"
+            ],
+            "lineage": {
+                "input_stem": None,
+                "input_artifact": None,
+                "output_stem": source_stem,
+                "output_artifact": artifact,
+            },
+            "spatial_background_lineage": {
+                "accepted": True,
+                "support_sha256": "1" * 64,
+            },
+            "final_cumulative_quality_verified": True,
+            "final_cumulative_quality": {
+                "status": "accepted",
+                "accepted": True,
+                "fresh_evaluation": True,
+                "issues": [],
+            },
+        }
+        if processing_route == "star_preserve_secondary_nebulosity":
+            handoff["star_preserve_secondary_nebulosity"] = {
+                "status": "accepted",
+                "accepted": True,
+                "eligible": True,
+                "route": "star_preserve_secondary_nebulosity",
+                "primary_policy_unchanged": True,
+                "stars_excluded_from_adjustment": True,
+                "issues": [],
+            }
+        return seal_stage8_handoff(handoff)
+
+    def refresh_stage8_handoff(
+        self,
+        source_stem: str = "stage8_enhanced",
+        *,
+        processing_route: str = "structure_enhanced",
+    ) -> None:
+        """Refresh a test-mutated artifact under the Stage8 v3 contract."""
+
+        self._stage8_final_source = source_stem
+        self.saved_image_pixels[source_stem] = self.image_pixels.copy()
+        self._stage8_handoff = self._make_stage8_handoff(
+            source_stem,
+            processing_route=processing_route,
+        )
 
     def cmd_with_check(self, *args: Any, quiet: bool = False) -> bool:
         _ = quiet
@@ -1348,6 +1714,16 @@ class FakeProcessor(ReviewRegistryTestDouble):
         (self.process_dir / f"{_stem}.fit").write_bytes(b"mock-fit")
         return True
 
+    def _read_image_by_stem(self, stem: str):
+        if stem == "stage7_presentation_reference":
+            return np.array(
+                self._stage7_presentation_reference_pixels,
+                copy=True,
+            )
+        self.cmd_with_check("load", stem)
+        pixels = self.siril.get_image_pixeldata(preview=False)
+        return None if pixels is None else np.array(pixels, copy=True)
+
     def _read_fits_header_metadata(self, *_candidates: str):
         metadata = {
             "CRVAL1": 303.051891667,
@@ -1471,6 +1847,18 @@ class FakeProcessor(ReviewRegistryTestDouble):
 
     def _write_stage_json(self, name: str, payload: dict[str, Any]) -> None:
         self.stage_json_reports[name] = payload
+        if name == "stage9_stage8_handoff_verification.json":
+            # Most legacy Stage9 unit fixtures intentionally omit persisted
+            # Stage8 fallback pixels while mocking Siril loads in memory.  Keep
+            # the small default file long enough to exercise the new v2 entry
+            # verification, then remove only that untouched fixture so those
+            # fallback-unavailable scenarios retain their original meaning.
+            default_stage8 = self.process_dir / "stage8_enhanced.fit"
+            try:
+                if default_stage8.read_bytes() == b"mock-stage8-enhanced":
+                    default_stage8.unlink()
+            except OSError:
+                pass
 
     def _stage9_capture_remix_base_identity(self, source_stem: str):
         return pipeline_module.StarunPostProcessor._stage9_capture_remix_base_identity(
@@ -1590,6 +1978,22 @@ def stage5_linear_denoise(processor: FakeProcessor) -> None:
         np.array(image, copy=True),
     )
     empty_mask = np.zeros(processor.image_pixels.shape[-2:], dtype=np.float32)
+    accepted_sky = np.ones(
+        processor.image_pixels.shape[-2:],
+        dtype=bool,
+    )
+    frozen_lineage = getattr(
+        processor,
+        "_stage5_test_spatial_lineage",
+        {
+            "schema": "starun.stage3-spatial-background-lineage.v2",
+            "status": "accepted",
+            "accepted": True,
+            "support_mask": accepted_sky,
+            "support_sha256": "1" * 64,
+            "issues": [],
+        },
+    )
     with patch.object(
         stage5_linear_denoise_module.stage8_pixels,
         "build_signal_excluded_background_masks",
@@ -1602,6 +2006,10 @@ def stage5_linear_denoise(processor: FakeProcessor) -> None:
             },
             {"status": "test_fixture", "reason": "isolated star field"},
         ),
+    ), patch.object(
+        stage5_linear_denoise_module.spatial_background_lineage,
+        "load_lineage",
+        return_value=frozen_lineage,
     ):
         _stage5_linear_denoise_impl(processor)
 
@@ -1611,6 +2019,89 @@ class PipelinePluginFallbackTestBase(unittest.TestCase):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         return FakeProcessor(pipeline_module, Path(td.name))
+
+    @staticmethod
+    def _psf_quality(
+        attempt,
+        ratios,
+        *,
+        intensity=1.0,
+        bright_growth=0.0,
+    ):
+        lower = 0.93
+        upper = 1.10
+        failed_groups = [
+            group
+            for group, ratio in ratios.items()
+            if not lower <= float(ratio) <= upper
+        ]
+        issues = [
+            f"star_psf_fwhm_ratio_{group} {float(ratios[group]):.6f} "
+            f"outside {lower:.6f}..{upper:.6f}"
+            for group in failed_groups
+        ]
+        accepted = not failed_groups
+        return {
+            "attempt": attempt,
+            "formula": "screen",
+            "status": "ok" if accepted else "rejected",
+            "accepted": accepted,
+            "issues": list(issues),
+            "structural_issues": list(issues),
+            "gate_issues": [],
+            "quality_gates": {},
+            "star_color_validation": {
+                "status": "ok",
+                "accepted": True,
+                "gate_enabled": True,
+                "enforced": True,
+                "issues": [],
+                "quality_gates": {},
+                "metrics": {
+                    "median_chroma_error": 0.05,
+                    "extreme_chroma_outlier_ratio": 0.0,
+                    "sample_count": 16,
+                },
+                "limits": {
+                    "median_chroma_error_max": 0.22,
+                    "extreme_chroma_outlier_ratio_max": 0.20,
+                },
+            },
+            "intensity": intensity,
+            "metrics": {
+                "weak_star_recovery_ratio": 1.0,
+                "star_recovery_ratio": 1.0,
+                "star_positive_delta_window_recovery_ratio": 1.0,
+                "star_wing_recovery_ratio": 0.86,
+                "highlight_clip_growth": 0.0,
+                "bright_pixel_growth": bright_growth,
+            },
+            "limits": {
+                "weak_star_recovery_ratio": 0.70,
+                "star_recovery_ratio": 0.75,
+                "star_positive_delta_window_recovery_ratio": 0.75,
+                "star_wing_recovery_ratio": 0.65,
+            },
+            "psf_closure": {
+                "schema": "starun.stage9-psf-closure.v3",
+                "status": "ok" if accepted else "rejected",
+                "accepted": accepted,
+                "gate_enabled": True,
+                "issues": list(issues),
+                "limits": {
+                    "stage9_psf_fwhm_ratio_min": lower,
+                    "stage9_psf_fwhm_ratio_max": upper,
+                },
+                "groups": {
+                    group: {
+                        "status": "ok",
+                        "accepted": lower <= float(ratio) <= upper,
+                        "fwhm_ratio_median": float(ratio),
+                    }
+                    for group, ratio in ratios.items()
+                },
+            },
+        }
 
     def _dualband_palette_processor(
         self,
@@ -1722,6 +2213,75 @@ class PipelinePluginFallbackTestBase(unittest.TestCase):
             )
             pixels[:, y, x] = peak
         state = {"pixels": pixels}
+        install_stage10_accepted_spatial_lineage(
+            processor.process_dir,
+            pixels,
+        )
+        processor._stage7_presentation_reference_pixels = pixels.copy()
+        reference_path = (
+            processor.process_dir / "stage7_presentation_reference.fit"
+        )
+        reference_path.write_bytes(b"mock-stage7-presentation-reference")
+        reference_pixel_sha = stage7_stretch_metrics.stage7_pixel_sha256(
+            pixels
+        )
+        selected_candidate = {
+            "id": "cand_b",
+            "stem": "stage7_cand_b",
+            "pixel_sha256": reference_pixel_sha,
+        }
+        formal_source = {
+            "stem": "stage7_stretched",
+            "file": "stage7_stretched.fit",
+            "pixel_sha256": reference_pixel_sha,
+        }
+        matched_domain = {
+            "schema": "starun.stage7-matched-domain-transfer.v4",
+            "status": "active",
+            "chain_sha256": "1" * 64,
+            "winner_sha256": "2" * 64,
+        }
+        reference_report = {
+            "schema": "starun.stage7-presentation-reference.v1",
+            "status": "ready",
+            "accepted": True,
+            "linear_source": {"stem": "stage6_starless"},
+            "selected_candidate": selected_candidate,
+            "matched_domain": matched_domain,
+            "source_artifact": formal_source,
+            "artifact": {
+                "stem": "stage7_presentation_reference",
+                "file": reference_path.name,
+                "container_sha256": hashlib.sha256(
+                    b"mock-stage7-presentation-reference"
+                ).hexdigest(),
+                "pixel_sha256": reference_pixel_sha,
+                "shape": list(pixels.shape),
+                "dtype": str(pixels.dtype),
+            },
+        }
+        reference_report["source_binding_sha256"] = (
+            stage7_stretch_metrics.canonical_json_sha256(
+                {
+                    "linear_source": reference_report["linear_source"],
+                    "selected_candidate": selected_candidate,
+                    "matched_domain": matched_domain,
+                    "formal_source_artifact": formal_source,
+                }
+            )
+        )
+        reference_report["report_sha256"] = (
+            stage7_stretch_metrics.canonical_json_sha256(reference_report)
+        )
+        processor._stage7_presentation_reference_report = reference_report
+        subject_mask = np.zeros((32, 32), dtype=np.float32)
+        subject_mask[4:28, 4:28] = 1.0
+        processor._stage7_frozen_rendition_masks = {
+            "subject_mask": subject_mask,
+            "background_mask": 1.0 - subject_mask,
+            "star_mask": np.zeros_like(subject_mask),
+            "star_halo_guard_mask": np.zeros_like(subject_mask),
+        }
         processor.siril.get_image_pixeldata = (
             lambda preview=False: state["pixels"].copy()
         )
@@ -1745,6 +2305,10 @@ class PipelinePluginFallbackTestBase(unittest.TestCase):
         processor._stage9_stars_required = True
         processor._stage9_stars_applied = True
         processor._stage9_output_contains_stars = True
+        processor._stage9_remix_formally_accepted = True
+        processor._stage9_star_delivery_contract_accepted = True
+        processor._stage9_final_source = "stage9_remixed"
+        processor._stage9_stars_application_mode = "screen"
         processor._stage9_star_reference_catalog = {
             "status": "ok",
             "source_matched": True,
@@ -1784,7 +2348,7 @@ class PipelinePluginFallbackTestBase(unittest.TestCase):
             else []
         )
         return {
-            "schema": "starun.final-quality.v2",
+            "schema": "starun.final-quality.v4",
             "severity": "hard_reject" if hard else "soft_warning",
             "status": "needs_conservative_rerun" if hard else "ok",
             "final_quality": "poor" if hard else "ok",

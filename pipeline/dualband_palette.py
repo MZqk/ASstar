@@ -343,6 +343,35 @@ def _luminance_preserving_gamut_map(
     return np.clip(result, 0.0, 1.0).astype(np.float32)
 
 
+def _luminance_preserving_chroma_scale(
+    rgb: np.ndarray,
+    scale: float,
+) -> np.ndarray:
+    """Scale palette chroma without changing luminance or leaving gamut."""
+    image = np.asarray(rgb, dtype=np.float32)
+    target_luma = _luminance(image)
+    chroma = image - target_luma[None, :, :]
+    requested = _finite_clamp(scale, 1.0, 1.40, 1.0)
+    gamut_scale = np.full_like(target_luma, requested, dtype=np.float32)
+    for channel in range(3):
+        component = chroma[channel]
+        positive = component > 1e-7
+        negative = component < -1e-7
+        channel_scale = np.full_like(target_luma, requested, dtype=np.float32)
+        channel_scale[positive] = np.minimum(
+            requested,
+            (1.0 - target_luma[positive]) / component[positive],
+        )
+        channel_scale[negative] = np.minimum(
+            requested,
+            target_luma[negative] / -component[negative],
+        )
+        gamut_scale = np.minimum(gamut_scale, channel_scale)
+    gamut_scale = np.clip(gamut_scale * 0.995, 0.0, requested)
+    result = target_luma[None, :, :] + chroma * gamut_scale[None, :, :]
+    return np.clip(result, 0.0, 1.0).astype(np.float32)
+
+
 def evaluate_palette_quality_metrics(
     metrics: Mapping[str, Any],
     *,
@@ -423,10 +452,15 @@ def build_dualband_palette_candidate(
     nebula_mask: np.ndarray,
     faint_nebula_mask: np.ndarray,
     background_mask: np.ndarray,
+    star_mask: Optional[np.ndarray] = None,
+    star_halo_guard_mask: Optional[np.ndarray] = None,
     strength: float = 0.85,
     luma_drift_p95_max: float = 0.005,
     clip_growth_max: float = 0.002,
     quality_warning_tolerance: float = 0.50,
+    subject_chroma_separation_gain_min: float = 1.0e-4,
+    subject_saturation_input_ratio_min: float = 0.50,
+    subject_saturation_absolute_min: float = 0.08,
 ) -> tuple[np.ndarray, Dict[str, Any]]:
     """Build one masked, luminance-preserving palette candidate."""
     source, base, layout = _as_rgb_float(image)
@@ -444,8 +478,23 @@ def build_dualband_palette_candidate(
     nebula = checked_mask("nebula_mask", nebula_mask)
     faint = checked_mask("faint_nebula_mask", faint_nebula_mask)
     background = checked_mask("background_mask", background_mask)
-    subject = np.maximum.reduce((core, nebula, faint))
-    subject = np.clip(subject * (1.0 - background), 0.0, 1.0)
+    stars = (
+        checked_mask("star_mask", star_mask)
+        if star_mask is not None
+        else np.zeros((height, width), dtype=np.float32)
+    )
+    halo = (
+        checked_mask("star_halo_guard_mask", star_halo_guard_mask)
+        if star_halo_guard_mask is not None
+        else np.zeros((height, width), dtype=np.float32)
+    )
+    protected = np.maximum.reduce((core, stars, halo))
+    subject = np.maximum(nebula, faint)
+    subject = np.clip(
+        subject * (1.0 - background) * (1.0 - protected),
+        0.0,
+        1.0,
+    )
     subject[background >= 0.80] = 0.0
     safe_strength = _finite_clamp(strength, 0.10, 1.0, 0.85)
     weight = subject * safe_strength
@@ -455,13 +504,100 @@ def build_dualband_palette_candidate(
     if int(np.count_nonzero(subject_support)) < 64:
         raise ValueError("dual-band palette subject mask has insufficient support")
 
+    # These are delivery minima, not tuning knobs.  Configuration may make a
+    # palette stricter, but it cannot relax the physical chroma contract.
+    effective_separation_gain_min = max(
+        float(subject_chroma_separation_gain_min),
+        1.0e-4,
+    )
+    effective_saturation_ratio_min = max(
+        _finite_clamp(
+            subject_saturation_input_ratio_min,
+            0.0,
+            1.0,
+            0.50,
+        ),
+        0.50,
+    )
+    effective_saturation_absolute_min = max(
+        _finite_clamp(
+            subject_saturation_absolute_min,
+            0.0,
+            1.0,
+            0.08,
+        ),
+        0.08,
+    )
+
     channels = derive_classic_dualband_channels(base)
     raw_palette = compose_palette(channels, palette)
     safe_palette = _luminance_preserving_gamut_map(raw_palette, base)
-    candidate = base + (safe_palette - base) * weight[None, :, :]
-    candidate = np.clip(candidate, 0.0, 1.0).astype(np.float32)
-
     base_luma = _luminance(base)
+    base_saturation = _saturation_proxy(base)
+    subject_saturation_before = base_saturation[subject_support]
+    if np.count_nonzero(background_support) >= 64:
+        background_saturation_before = base_saturation[background_support]
+        background_p50_before = float(
+            np.quantile(background_saturation_before, 0.50)
+        )
+    else:
+        background_p50_before = 0.0
+    subject_p50_before = float(
+        np.quantile(subject_saturation_before, 0.50)
+    )
+    saturation_floor = min(
+        effective_saturation_ratio_min * subject_p50_before,
+        effective_saturation_absolute_min,
+    )
+
+    # A Classic channel permutation can reduce median chroma after its
+    # luminance-preserving gamut map.  Close that loop only inside the frozen
+    # subject support: evaluate a bounded ladder and keep the weakest palette
+    # chroma scale that clears the unchanged delivery gates.  This is not a
+    # global saturation operation; ``weight`` still makes every protected or
+    # out-of-mask pixel exactly equal to the physical Stage 7 parent.
+    chroma_closure_attempts: list[Dict[str, Any]] = []
+    selected_chroma_scale = 1.40
+    candidate = base.copy()
+    for chroma_scale in (1.0, 1.12, 1.25, 1.40):
+        scaled_palette = _luminance_preserving_chroma_scale(
+            safe_palette,
+            chroma_scale,
+        )
+        trial = base + (scaled_palette - base) * weight[None, :, :]
+        trial = np.clip(trial, 0.0, 1.0).astype(np.float32)
+        trial_saturation = _saturation_proxy(trial)
+        trial_subject_p50 = float(
+            np.quantile(trial_saturation[subject_support], 0.50)
+        )
+        trial_background_p50 = (
+            float(np.quantile(trial_saturation[background_support], 0.50))
+            if np.count_nonzero(background_support) >= 64
+            else 0.0
+        )
+        trial_separation_gain = (
+            (trial_subject_p50 - trial_background_p50)
+            - (subject_p50_before - background_p50_before)
+        )
+        clears_chroma_contract = bool(
+            trial_separation_gain > effective_separation_gain_min
+            and trial_subject_p50 + 1e-12 >= saturation_floor
+        )
+        chroma_closure_attempts.append(
+            {
+                "scale": float(chroma_scale),
+                "subject_saturation_p50_after": trial_subject_p50,
+                "subject_background_chroma_separation_gain": (
+                    trial_separation_gain
+                ),
+                "clears_chroma_contract": clears_chroma_contract,
+            }
+        )
+        candidate = trial
+        selected_chroma_scale = float(chroma_scale)
+        if clears_chroma_contract:
+            break
+
     candidate_luma = _luminance(candidate)
     luma_drift_p95 = float(np.quantile(np.abs(candidate_luma - base_luma), 0.95))
     before_clip = float(np.mean((base <= 0.0) | (base >= 1.0)))
@@ -477,30 +613,21 @@ def build_dualband_palette_candidate(
         else 0.0
     )
     subject_delta_p95 = float(np.quantile(delta[subject_support], 0.95))
-    base_saturation = _saturation_proxy(base)
     candidate_saturation_map = _saturation_proxy(candidate)
-    subject_saturation_before = base_saturation[subject_support]
     subject_saturation = candidate_saturation_map[subject_support]
     if np.count_nonzero(background_support) >= 64:
-        background_saturation_before = base_saturation[background_support]
         background_saturation_after = candidate_saturation_map[
             background_support
         ]
-        background_p50_before = float(
-            np.quantile(background_saturation_before, 0.50)
-        )
         background_p50_after = float(
             np.quantile(background_saturation_after, 0.50)
         )
     else:
-        background_p50_before = 0.0
         background_p50_after = 0.0
-    subject_p50_before = float(
-        np.quantile(subject_saturation_before, 0.50)
-    )
     subject_p50_after = float(np.quantile(subject_saturation, 0.50))
     separation_before = subject_p50_before - background_p50_before
     separation_after = subject_p50_after - background_p50_after
+    separation_gain = separation_after - separation_before
     metrics = {
         "subject_mask_coverage": float(np.mean(subject_support)),
         "background_mask_coverage": float(np.mean(background_support)),
@@ -520,7 +647,11 @@ def build_dualband_palette_candidate(
         "subject_background_chroma_separation_before": separation_before,
         "subject_background_chroma_separation_after": separation_after,
         "subject_background_chroma_separation_gain": (
-            separation_after - separation_before
+            separation_gain
+        ),
+        "subject_saturation_p50_floor": saturation_floor,
+        "subject_saturation_p50_floor_passed": bool(
+            subject_p50_after + 1e-12 >= saturation_floor
         ),
     }
     quality = evaluate_palette_quality_metrics(
@@ -532,6 +663,10 @@ def build_dualband_palette_candidate(
     limits = dict(quality["limits"])
     issues = list(quality["issues"])
     warnings = list(quality["warnings"])
+    if separation_gain <= effective_separation_gain_min:
+        issues.append("subject_background_chroma_separation_gain_unmet")
+    if subject_p50_after + 1e-12 < saturation_floor:
+        issues.append("subject_saturation_floor_unmet")
     if not np.all(np.isfinite(candidate)):
         issues.append("nonfinite_candidate")
 
@@ -559,6 +694,19 @@ def build_dualband_palette_candidate(
             "O": "(G+B)*0.5",
             "S_proxy": "(H+O)*0.5",
         },
+        "subject_chroma_closure": {
+            "schema": "starun.stage8-palette-subject-chroma-closure.v1",
+            "scope": "frozen_subject_mask_only",
+            "selection": "weakest_passing_scale",
+            "scale_max": 1.40,
+            "selected_scale": selected_chroma_scale,
+            "attempts": chroma_closure_attempts,
+        },
+        "mask_contract": {
+            "subject_formula": "max(nebula,faint)*(1-background)*(1-max(core,star,halo))",
+            "guard_sources": ["core_mask", "star_mask", "star_halo_guard_mask"],
+            "protected_coverage": float(np.mean(protected > 0.0)),
+        },
         "mapping": {
             "R": PALETTE_CHANNELS[palette_id][0],
             "G": PALETTE_CHANNELS[palette_id][1],
@@ -570,6 +718,19 @@ def build_dualband_palette_candidate(
         "issues": issues,
         "warnings": warnings,
     }
+    report["limits"].update(
+        {
+            "subject_background_chroma_separation_gain_min_exclusive": float(
+                effective_separation_gain_min
+            ),
+            "subject_saturation_input_ratio_min": float(
+                effective_saturation_ratio_min
+            ),
+            "subject_saturation_absolute_min": float(
+                effective_saturation_absolute_min
+            ),
+        }
+    )
     return _restore(source, candidate, layout), report
 
 

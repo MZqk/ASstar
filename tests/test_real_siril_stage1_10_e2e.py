@@ -67,6 +67,31 @@ class RealSirilStage110E2EContractTests(unittest.TestCase):
                 "review_candidate_selected": False,
                 "final_source": "stage9_remixed",
             },
+            "delivery_gates": {
+                "schema": "starun.final-delivery-gates.v1",
+                "legacy_delivery_contract": False,
+                "scientific": {
+                    "accepted": True,
+                    "report": "final_quality_report.json",
+                },
+                "presentation": {
+                    "accepted": True,
+                    "report": "presentation_quality_report.json",
+                    "status": "ok",
+                },
+                "artifacts": {
+                    "accepted": True,
+                    "formal_count": 1,
+                    "formal_outputs": [output.name],
+                    "identity": "pipeline_result_output_sha256",
+                },
+                "review": {
+                    "accepted": True,
+                    "requirement_count": 0,
+                },
+                "formal_delivery_accepted": True,
+            },
+            "delivery_eligible": True,
             "actual_steps": actual_steps,
             "outputs": {
                 output.name: run_manifest.file_record(output, base_dir=root)
@@ -137,6 +162,17 @@ class RealSirilStage110E2EContractTests(unittest.TestCase):
                     }
                 ],
                 "selected_pointer": selected_pointer,
+            },
+        )
+        run_manifest.atomic_write_json(
+            process_dir / "stage6_subject_chroma_lineage.json",
+            {
+                "schema": real_e2e.STAGE6_SUBJECT_CHROMA_SCHEMA,
+                "selected": {
+                    "status": "ok",
+                    "accepted": True,
+                    "hard_failed": False,
+                },
             },
         )
         return result
@@ -309,7 +345,7 @@ class RealSirilStage110E2EContractTests(unittest.TestCase):
 
     def test_verifier_rejects_nonaccepted_final_quality(self) -> None:
         cases = (
-            ({"status": "accepted"}, "final-quality.v2"),
+            ({"status": "accepted"}, "final-quality.v4"),
             (
                 {
                     "schema": real_e2e.FINAL_QUALITY_SCHEMA,

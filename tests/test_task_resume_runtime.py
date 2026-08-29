@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+from astropy.io import fits
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -578,10 +579,124 @@ class TaskResumeRuntimeTests(unittest.TestCase):
         self.assertTrue(
             payload["star_separation"]["review_candidate_selected"]
         )
+        self.assertFalse(
+            payload["delivery_gates"]["formal_delivery_accepted"]
+        )
+        self.assertFalse(payload["delivery_gates"]["review"]["accepted"])
         self.assertIn(
             {"stage": 9, "code": "stage9_review_candidate_selected", "details": {}},
             payload["review_requirements"],
         )
+
+    def test_pipeline_result_requires_science_presentation_and_artifact_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            runtime = processor_runtime.ProcessorRuntimeMixin()
+            runtime.work_dir = Path(td)
+            runtime.process_dir = runtime.work_dir / "process"
+            runtime.process_dir.mkdir()
+            runtime.log = _Log()
+            runtime.results = []
+            runtime.input_profile = {"state": "linear"}
+            runtime._channel_semantics = "broadband_rgb_osc"
+            runtime.target_profile = {}
+            runtime.color_calibration_report = {}
+            runtime.narrowband_channel_mapping = {}
+            runtime._scientific_quality_accepted = True
+            runtime._presentation_quality_accepted = True
+            runtime._presentation_quality_report = {"status": "ok"}
+            runtime._final_output_review_only = False
+            runtime._final_output_basenames = ("result_processed",)
+            formal = runtime.work_dir / "result_processed.fit"
+            formal_pixels = np.linspace(
+                0.01,
+                0.25,
+                num=3 * 8 * 8,
+                dtype=np.float32,
+            ).reshape(3, 8, 8)
+            fits.PrimaryHDU(formal_pixels).writeto(formal)
+            fits.PrimaryHDU(formal_pixels).writeto(
+                runtime.process_dir / "stage10_final.fit"
+            )
+            plan = task_plan.build_processing_plan(
+                run_id="delivery-gates-run",
+                generated_at="2026-08-14T00:00:00Z",
+                input_record={"kind": "master_file"},
+                input_state="linear",
+                input_trust="recognized",
+            )
+            run_manifest.atomic_write_json(
+                runtime.work_dir / "processing-plan.json",
+                plan,
+            )
+            runtime._run_id = plan["run_id"]
+            runtime._processing_plan_hash = plan["plan_hash"]
+
+            written = runtime._write_pipeline_result_manifest()
+            payload = json.loads(
+                (runtime.work_dir / "pipeline-result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertTrue(written)
+        gates = payload["delivery_gates"]
+        self.assertEqual(gates["schema"], "starun.final-delivery-gates.v1")
+        self.assertTrue(gates["scientific"]["accepted"])
+        self.assertTrue(gates["presentation"]["accepted"])
+        self.assertTrue(gates["artifacts"]["accepted"])
+        self.assertTrue(gates["review"]["accepted"])
+        self.assertTrue(gates["formal_delivery_accepted"])
+        self.assertTrue(payload["delivery_eligible"])
+        self.assertEqual(gates["artifacts"]["formal_count"], 1)
+
+    def test_failed_run_cannot_become_delivery_eligible_from_four_green_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = processor_runtime.ProcessorRuntimeMixin()
+            runtime.work_dir = Path(temporary)
+            runtime.process_dir = None
+            runtime.log = _Log()
+            runtime.results = []
+            runtime.input_profile = {"state": "linear"}
+            runtime._channel_semantics = "broadband_rgb_osc"
+            runtime.target_profile = {}
+            runtime.color_calibration_report = {}
+            runtime.narrowband_channel_mapping = {}
+            runtime._scientific_quality_accepted = True
+            runtime._presentation_quality_accepted = True
+            runtime._presentation_quality_report = {"status": "ok"}
+            runtime._final_output_review_only = False
+            runtime._final_output_basenames = ("result_final",)
+            (runtime.work_dir / "result_final.fit").write_bytes(b"formal")
+            plan = task_plan.build_processing_plan(
+                run_id="run-failed-delivery",
+                generated_at="2026-08-14T00:00:00Z",
+                input_record={"kind": "master_file"},
+                input_state="linear",
+                input_trust="recognized",
+            )
+            run_manifest.atomic_write_json(
+                runtime.work_dir / "processing-plan.json",
+                plan,
+            )
+            runtime._run_id = plan["run_id"]
+            runtime._processing_plan_hash = plan["plan_hash"]
+
+            self.assertTrue(
+                runtime._write_pipeline_result_manifest(
+                    failure_reason="fatal"
+                )
+            )
+            payload = json.loads(
+                (runtime.work_dir / "pipeline-result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(payload["status"], "failed")
+        self.assertFalse(
+            payload["delivery_gates"]["formal_delivery_accepted"]
+        )
+        self.assertFalse(payload["delivery_eligible"])
 
 
 if __name__ == "__main__":

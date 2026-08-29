@@ -20,10 +20,18 @@ from PySide6.QtCore import QSettings, Qt  # noqa: E402
 from PySide6.QtGui import QAction, QKeySequence  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
+import gui.main_window as gui_module  # noqa: E402
 from gui.main_window import (  # noqa: E402
     StarunGui,
     WORKSPACE_EMPTY,
     WORKSPACE_RUN,
+    WORKSPACE_TASK,
+)
+from gui.run_presentation import (  # noqa: E402
+    RunOutcome,
+    RunPresentation,
+    VerifiedOutput,
+    VerifiedRunBundle,
 )
 from gui.ui_platform import MACOS_PROFILE, standard_shortcuts  # noqa: E402
 
@@ -163,13 +171,278 @@ def test_view_and_edit_commands_follow_current_ui_state(app) -> None:
             window._leave_history()
             window.toggle_log_action.setChecked(True)
             window.log_view.setPlainText("read-only log")
-            window.log_view.selectAll()
-            window.log_view.setFocus()
+            assert window._current_inspector_section() == "logs"
+            window.inspector_log_view.selectAll()
+            window.inspector_log_view.setFocus()
             app.processEvents()
             window._update_edit_actions()
             assert window.copy_action.isEnabled() is True
             assert window.cut_action.isEnabled() is False
             assert window.paste_action.isEnabled() is False
+        finally:
+            window.close()
+
+
+def test_detailed_log_command_routes_to_drawer_or_run_inspector(app) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        window = _window(Path(td))
+        window.show()
+        app.processEvents()
+        try:
+            assert window._workspace_state == WORKSPACE_EMPTY
+            window.toggle_log_action.setChecked(True)
+            app.processEvents()
+            assert window.log_container.isVisible() is True
+            assert window.log_toggle_btn.isChecked() is True
+
+            window._show_workspace(WORKSPACE_TASK)
+            app.processEvents()
+            assert window.log_container.isVisible() is True
+            assert window.log_toggle_btn.isChecked() is True
+
+            window._show_workspace(WORKSPACE_RUN)
+            app.processEvents()
+            assert window.log_container.isVisible() is False
+            assert window.toggle_log_action.isChecked() is False
+
+            window.toggle_inspector_action.setChecked(False)
+            window.toggle_log_action.setChecked(True)
+            app.processEvents()
+            assert window.toggle_inspector_action.isChecked() is True
+            assert window.run_inspector.isVisible() is True
+            assert window._current_inspector_section() == "logs"
+            assert window.log_container.isVisible() is False
+            assert window.toggle_log_action.isChecked() is False
+            assert (
+                window.inspector_log_view.document()
+                is window.log_view.document()
+            )
+
+            window._set_inspector_section("overview")
+            window.toggle_inspector_action.setChecked(False)
+            window.log_toggle_btn.setChecked(True)
+            app.processEvents()
+            assert window.toggle_inspector_action.isChecked() is True
+            assert window._current_inspector_section() == "logs"
+            assert window.log_toggle_btn.isChecked() is False
+
+            window._show_workspace(WORKSPACE_TASK)
+            app.processEvents()
+            assert window.log_container.isVisible() is True
+            assert window.log_toggle_btn.isChecked() is True
+        finally:
+            window.close()
+
+
+def test_review_only_success_uses_warning_visual_state(app) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        window = _window(Path(td))
+        window.show()
+        app.processEvents()
+        try:
+            window._show_workspace(WORKSPACE_RUN)
+            presentation = RunPresentation(
+                status=RunOutcome.SUCCESS,
+                tone="warning",
+                title="处理完成，仅供复核",
+                summary="结果完整性已验证，但不能作为正式结果。",
+                delivery_eligible=False,
+                output_kind="review",
+                verified_outputs=(),
+                preview_path=None,
+                review_requirements=({"code": "manual_review"},),
+                issues=(),
+                integrity_error=None,
+            )
+
+            window._apply_run_presentation(presentation)
+
+            assert (
+                window.overview_outcome_label.property("outcomeState")
+                == RunOutcome.REVIEW_REQUIRED.value
+            )
+            assert (
+                window.delivery_status_label.property("outcomeState")
+                == RunOutcome.REVIEW_REQUIRED.value
+            )
+            assert "仅供复核" in window.delivery_status_label.text()
+        finally:
+            window.close()
+
+
+def test_formal_result_actions_exclude_sha_only_auxiliary_image() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        formal = root / "verified-formal.tif"
+        formal.write_bytes(b"formal")
+        sha_only = root / "sha-only.png"
+        sha_only.write_bytes(b"sha-only")
+        formal_output = VerifiedOutput(
+            name=formal.name,
+            path=formal,
+            sha256="a" * 64,
+            size=formal.stat().st_size,
+            kind="formal",
+        )
+        unlisted_output = VerifiedOutput(
+            name=sha_only.name,
+            path=sha_only,
+            sha256="b" * 64,
+            size=sha_only.stat().st_size,
+            kind="formal",
+        )
+        presentation = RunPresentation(
+            status=RunOutcome.SUCCESS,
+            tone="success",
+            title="正式结果可用",
+            summary="正式产物身份已验证。",
+            delivery_eligible=True,
+            output_kind="formal",
+            verified_outputs=(formal_output, unlisted_output),
+            preview_path=None,
+            review_requirements=(),
+            issues=(),
+            integrity_error=None,
+            formal_output_names=(formal.name,),
+        )
+
+        selected = StarunGui._run_presentation_result_outputs(presentation)
+
+    assert selected == (formal_output,)
+
+
+def test_stage_accessibility_description_includes_review_state(app) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        window = _window(Path(td))
+        try:
+            window._stage_progress_states[8] = "degraded"
+            window._stage_elapsed_seconds[8] = 11.0
+            window._stage_progress_details[8] = {
+                "review_required": True,
+                "review_reasons": ["人工确认增强边界"],
+            }
+            window._update_stage_chip(8)
+
+            description = window._stage_items[8].accessibleDescription()
+            assert "状态：已降级" in description
+            assert "耗时：00:11" in description
+            assert "复核：需要人工复核" in description
+        finally:
+            window.close()
+
+
+def test_run_issue_list_does_not_repeat_integrity_summary(app) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        window = _window(Path(td))
+        try:
+            presentation = RunPresentation(
+                status=RunOutcome.VERIFICATION_FAILED,
+                tone="error",
+                title="结果无法验证",
+                summary="结果链失败。",
+                delivery_eligible=False,
+                output_kind="none",
+                verified_outputs=(),
+                preview_path=None,
+                review_requirements=(),
+                issues=(
+                    {"severity": "fatal", "message": "处理计划哈希无效"},
+                    {"severity": "fatal", "message": "输出 SHA-256 不匹配"},
+                ),
+                integrity_error="处理计划哈希无效；输出 SHA-256 不匹配",
+            )
+
+            lines = window._run_presentation_issues(presentation)
+
+            assert lines == [
+                "✕ 处理计划哈希无效",
+                "✕ 输出 SHA-256 不匹配",
+            ]
+        finally:
+            window.close()
+
+
+def test_task_result_action_does_not_reuse_previous_run_bundle(
+    app,
+    monkeypatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        window = _window(root)
+        task_a_run = root / "task-a" / "runs" / "run-a"
+        task_a_run.mkdir(parents=True)
+        result_a = task_a_run / "result_processed.tif"
+        result_a.write_bytes(b"task-a")
+        task_b = root / "task-b"
+        task_b_run = task_b / "runs" / "run-b"
+        task_b_run.mkdir(parents=True)
+        (task_b / "task-manifest.json").write_text("{}", encoding="utf-8")
+        result_b = task_b_run / "result_processed.tif"
+        result_b.write_bytes(b"task-b")
+        stale_output = VerifiedOutput(
+            name=result_a.name,
+            path=result_a,
+            sha256="a" * 64,
+            size=result_a.stat().st_size,
+            kind="formal",
+        )
+        window._run_presentation = RunPresentation(
+            status=RunOutcome.SUCCESS,
+            tone="success",
+            title="正式结果可用",
+            summary="旧任务 A",
+            delivery_eligible=True,
+            output_kind="formal",
+            verified_outputs=(stale_output,),
+            preview_path=None,
+            review_requirements=(),
+            issues=(),
+            integrity_error=None,
+        )
+        window._verified_run_bundle = VerifiedRunBundle(
+            run_root=task_a_run,
+            run_manifest={},
+            plan={},
+            result={},
+            verified_outputs=(stale_output,),
+            verified_png=None,
+        )
+        window._last_task_root = task_a_run.parent.parent
+        window._show_workspace(WORKSPACE_TASK)
+
+        monkeypatch.setattr(
+            gui_module,
+            "latest_result_files",
+            lambda task_root, suffixes=None: (
+                (result_b,)
+                if Path(task_root).resolve() == task_b.resolve()
+                else ()
+            ),
+        )
+        monkeypatch.setattr(
+            gui_module,
+            "latest_result_directory",
+            lambda task_root: (
+                task_b_run
+                if Path(task_root).resolve() == task_b.resolve()
+                else None
+            ),
+        )
+        opened: list[Path] = []
+        monkeypatch.setattr(
+            gui_module.QDesktopServices,
+            "openUrl",
+            lambda url: opened.append(Path(url.toLocalFile())),
+        )
+        try:
+            window._update_result_actions(task_b)
+            assert window._result_action_task_root == task_b.resolve()
+
+            window._open_result_dir()
+
+            assert opened == [task_b_run]
+            window._update_result_actions(None)
+            assert window._result_action_task_root is None
         finally:
             window.close()
 

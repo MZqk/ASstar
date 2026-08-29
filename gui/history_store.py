@@ -10,10 +10,23 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Collection, Mapping
+from typing import Any, Collection, Mapping, Sequence
 
 try:
-    from pipeline import outcome, run_manifest
+    from .run_presentation import (
+        VerifiedOutput,
+        VerifiedRunBundle,
+        formal_output_allowlist,
+    )
+except ImportError:  # Support direct execution from the gui directory.
+    from run_presentation import (  # type: ignore
+        VerifiedOutput,
+        VerifiedRunBundle,
+        formal_output_allowlist,
+    )
+
+try:
+    from pipeline import outcome, run_manifest, task_plan
     from pipeline.task_workspace import (
         RUN_MANIFEST_NAME,
         RUN_MANIFEST_SCHEMA,
@@ -28,7 +41,7 @@ except ImportError:  # Support direct execution from the gui directory.
     repo_root = Path(__file__).resolve().parent.parent
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
-    from pipeline import outcome, run_manifest  # type: ignore[no-redef]
+    from pipeline import outcome, run_manifest, task_plan  # type: ignore[no-redef]
     from pipeline.task_workspace import (  # type: ignore[no-redef]
         RUN_MANIFEST_NAME,
         RUN_MANIFEST_SCHEMA,
@@ -74,6 +87,20 @@ STATUS_LABELS = {
     STATUS_STOPPED: "已中止",
     STATUS_INTERRUPTED: "异常中断",
 }
+
+DELIVERABLE_IMAGE_SUFFIXES = frozenset(
+    {
+        ".fit",
+        ".fits",
+        ".fts",
+        ".xisf",
+        ".tif",
+        ".tiff",
+        ".png",
+        ".jpg",
+        ".jpeg",
+    }
+)
 
 
 class HistoryStoreError(RuntimeError):
@@ -289,6 +316,265 @@ def verified_result_files(
         if expected_sha256 and run_manifest.sha256_file(candidate) == expected_sha256:
             verified.append(candidate)
     return tuple(sorted(verified, key=lambda path: path.name.casefold()))
+
+
+def _output_kind(
+    name: str,
+    path: Path,
+    *,
+    result_status: str,
+    formal_output_names: Collection[str],
+) -> str:
+    tokens = f"{name} {path.name}".casefold()
+    basename = path.name.casefold()
+    if basename == "processing-plan.json" or basename == "result_linear.fit" or (
+        basename.startswith("starun_diagnostics")
+    ):
+        return "auxiliary"
+    if path.suffix.casefold() not in DELIVERABLE_IMAGE_SUFFIXES:
+        return "auxiliary"
+    if "result_review" in tokens or result_status == STATUS_REVIEW_REQUIRED:
+        return "review"
+    if (
+        result_status in {STATUS_SUCCESS, STATUS_PARTIAL_SUCCESS}
+        and name in formal_output_names
+    ):
+        return "formal"
+    return "auxiliary"
+
+
+def select_verified_png(
+    outputs: Sequence[VerifiedOutput],
+    *,
+    status: str = "",
+) -> Path | None:
+    """Choose a deterministic preview only from SHA-verified result records."""
+
+    normalized_status = str(status or "").strip().lower()
+    selected_kind = (
+        "review"
+        if normalized_status == STATUS_REVIEW_REQUIRED
+        else "formal"
+        if normalized_status in {STATUS_SUCCESS, STATUS_PARTIAL_SUCCESS}
+        else ""
+    )
+    pngs = tuple(
+        output
+        for output in outputs
+        if output.path.suffix.casefold() == ".png"
+        and output.kind == selected_kind
+    )
+    if not pngs:
+        return None
+
+    def rank(output: VerifiedOutput) -> tuple[int, int, str, str]:
+        basename = output.path.name.casefold()
+        display_rank = 0 if "display_srgb" in basename else 1
+        canonical_rank = 0 if basename in {
+            "result_processed.png",
+            "result_review.png",
+        } else 1
+        return (
+            display_rank,
+            canonical_rank,
+            basename,
+            output.name.casefold(),
+        )
+
+    return min(pngs, key=rank).path
+
+
+def _verified_output_records(
+    run_root: Path,
+    result: Mapping[str, Any],
+) -> tuple[tuple[VerifiedOutput, ...], tuple[str, ...]]:
+    root = run_root.expanduser().resolve()
+    raw_outputs = result.get("outputs")
+    result_status = str(result.get("status") or "").strip().lower()
+    formal_output_names = formal_output_allowlist(result) or frozenset()
+    if not isinstance(raw_outputs, Mapping):
+        return (), ("pipeline-result.json 没有有效的 outputs 映射",)
+
+    verified: list[VerifiedOutput] = []
+    errors: list[str] = []
+    seen_paths: set[Path] = set()
+    for raw_name, raw_record in sorted(
+        raw_outputs.items(),
+        key=lambda item: str(item[0]).casefold(),
+    ):
+        name = str(raw_name)
+        if not isinstance(raw_record, Mapping):
+            errors.append(f"输出记录 {name} 不是对象")
+            continue
+        relative_text = str(raw_record.get("path") or "").strip()
+        relative = Path(relative_text)
+        if not relative_text or relative.is_absolute():
+            errors.append(f"输出记录 {name} 的路径无效")
+            continue
+        candidate = (root / relative).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            errors.append(f"输出记录 {name} 越出运行目录")
+            continue
+        expected_sha256 = str(raw_record.get("sha256") or "").strip().casefold()
+        if not expected_sha256:
+            errors.append(f"输出记录 {name} 缺少 SHA-256")
+            continue
+        actual_sha256 = run_manifest.sha256_file(candidate)
+        if not actual_sha256 or actual_sha256.casefold() != expected_sha256:
+            errors.append(f"输出记录 {name} 的 SHA-256 不匹配")
+            continue
+        if candidate in seen_paths:
+            continue
+        seen_paths.add(candidate)
+        try:
+            size = int(candidate.stat().st_size)
+        except OSError:
+            errors.append(f"输出记录 {name} 无法读取")
+            continue
+        verified.append(
+            VerifiedOutput(
+                name=name,
+                path=candidate,
+                sha256=actual_sha256,
+                size=size,
+                kind=_output_kind(
+                    name,
+                    candidate,
+                    result_status=result_status,
+                    formal_output_names=formal_output_names,
+                ),
+            )
+        )
+    return tuple(verified), tuple(dict.fromkeys(errors))
+
+
+def load_verified_run_bundle(
+    task_directory: Path,
+    run_id: str,
+) -> VerifiedRunBundle:
+    """Read one run's signed evidence without mutating or guessing artifacts.
+
+    The signed run manifest and task identity are a hard entry requirement.
+    Invalid or incomplete plan/result/output evidence is returned as a
+    fail-closed bundle so the result page can explain the problem without
+    treating history status as delivery truth.
+    """
+
+    _workspace, run_payload, run_root = verify_history_run(task_directory, run_id)
+    expected_run_id = str(run_payload.get("run_id") or "")
+    expected_source_fingerprint = str(run_payload.get("source_fingerprint") or "")
+    expected_run_manifest_hash = str(run_payload.get("manifest_hash") or "")
+    integrity_errors: list[str] = []
+    verification_issues: list[str] = []
+
+    plan: dict[str, Any] | None = None
+    plan_verified = False
+    plan_path = run_root / "processing-plan.json"
+    raw_plan = run_manifest.load_json(plan_path)
+    if raw_plan is None:
+        if plan_path.exists():
+            integrity_errors.append("processing-plan.json 无法解析")
+        else:
+            verification_issues.append("processing-plan.json 缺失")
+    else:
+        plan_check = task_plan.verify_processing_plan(raw_plan)
+        if not plan_check.get("verified"):
+            integrity_errors.append(
+                "processing-plan.json 校验失败："
+                + str(plan_check.get("detail") or "unknown error")
+            )
+        elif str(raw_plan.get("run_id") or "") != expected_run_id:
+            integrity_errors.append("processing-plan.json 的 run_id 与运行清单不一致")
+        else:
+            input_record = raw_plan.get("input")
+            input_fingerprint = (
+                str(input_record.get("fingerprint") or "")
+                if isinstance(input_record, Mapping)
+                else ""
+            )
+            if input_fingerprint and input_fingerprint != expected_source_fingerprint:
+                integrity_errors.append("processing-plan.json 的输入指纹与运行清单不一致")
+            else:
+                metadata = raw_plan.get("metadata")
+                recorded_manifest_hash = (
+                    str(metadata.get("task_run_manifest_hash") or "")
+                    if isinstance(metadata, Mapping)
+                    else ""
+                )
+                if (
+                    recorded_manifest_hash
+                    and recorded_manifest_hash != expected_run_manifest_hash
+                ):
+                    integrity_errors.append(
+                        "processing-plan.json 引用的运行清单哈希不一致"
+                    )
+                else:
+                    plan = dict(raw_plan)
+                    plan_verified = True
+
+    result: dict[str, Any] | None = None
+    result_verified = False
+    result_path = run_root / "pipeline-result.json"
+    if not result_path.is_file():
+        if result_path.exists():
+            integrity_errors.append("pipeline-result.json 不是普通文件")
+        else:
+            verification_issues.append("pipeline-result.json 缺失")
+    else:
+        try:
+            normalized_result = load_verified_pipeline_result(run_root)
+        except HistoryStoreError as error:
+            integrity_errors.append(str(error))
+        else:
+            if normalized_result is None:
+                verification_issues.append("pipeline-result.json 缺失")
+            elif str(normalized_result.get("run_id") or "") != expected_run_id:
+                integrity_errors.append("pipeline-result.json 的 run_id 与运行清单不一致")
+            else:
+                result = dict(normalized_result)
+                result_verified = True
+
+    lineage_verified = False
+    if plan_verified and result_verified and plan is not None and result is not None:
+        plan_hash = str(plan.get("plan_hash") or "")
+        result_plan_hash = str(result.get("plan_hash") or "")
+        if not result_plan_hash or result_plan_hash != plan_hash:
+            integrity_errors.append(
+                "pipeline-result.json 引用的处理计划哈希不匹配"
+            )
+        else:
+            lineage_verified = True
+
+    verified_outputs: tuple[VerifiedOutput, ...] = ()
+    if result_verified and result is not None:
+        verified_outputs, output_errors = _verified_output_records(run_root, result)
+        integrity_errors.extend(output_errors)
+        result_status = str(result.get("status") or "")
+        if result_status in {
+            STATUS_SUCCESS,
+            STATUS_PARTIAL_SUCCESS,
+            STATUS_REVIEW_REQUIRED,
+        } and not verified_outputs:
+            verification_issues.append("流水线结果没有通过 SHA-256 校验的输出文件")
+    else:
+        result_status = ""
+
+    verified_png = select_verified_png(verified_outputs, status=result_status)
+    return VerifiedRunBundle(
+        run_root=run_root,
+        run_manifest=dict(run_payload),
+        plan=plan,
+        result=result,
+        verified_outputs=verified_outputs,
+        verified_png=verified_png,
+        plan_verified=plan_verified,
+        result_verified=result_verified,
+        lineage_verified=lineage_verified,
+        integrity_errors=tuple(dict.fromkeys(integrity_errors)),
+        verification_issues=tuple(dict.fromkeys(verification_issues)),
+    )
 
 
 def validate_deletable_task_root(candidate: Path) -> TaskWorkspace:
@@ -640,7 +926,9 @@ __all__ = [
     "display_name_from_source",
     "history_task_key",
     "load_normalized_run_state",
+    "load_verified_run_bundle",
     "load_verified_pipeline_result",
+    "select_verified_png",
     "utc_timestamp",
     "validate_deletable_task_root",
     "verified_result_files",

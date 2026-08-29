@@ -1400,7 +1400,8 @@ class PipelinePluginFallbackStage6SeparationTests(PipelinePluginFallbackTestBase
         self.assertTrue((processor.process_dir / "starless.fit").exists())
         self.assertTrue((processor.process_dir / "starmask_raw.fit").exists())
         exchange = processor.stage_json_reports["stage6_syqon_exchange.json"]
-        self.assertEqual(exchange["schema"], "starun.syqon-pixel-exchange.v2")
+        self.assertEqual(exchange["schema"], "starun.syqon-pixel-exchange.v3")
+        self.assertFalse(exchange["channel_diagnostics"]["used_for_gate"])
         self.assertEqual(exchange["worker"]["requested"]["target_median"], 0.15)
         self.assertTrue(exchange["pair_id"])
         self.assertEqual(
@@ -1644,6 +1645,20 @@ class PipelinePluginFallbackStage6SeparationTests(PipelinePluginFallbackTestBase
         self.assertFalse(profile.use_amp)
         self.assertIn("--no_gpu", args)
         self.assertIn("zenith_tile_artifact_cpu_recovery", note)
+
+    def test_stage6_chroma_recovery_is_linked_mtf_fp32_profile(self):
+        profile = pipeline_module.syqon_starless.SYQON_CHROMA_RECOVERY_PROFILE
+        processor = self._new_processor()
+
+        args, _timeout, note = processor._syqon_starless_cli_options(profile=profile)
+
+        self.assertEqual(profile.profile_id, "zenith_chroma_linked_mtf_recovery")
+        self.assertEqual(profile.stretch_method, "mtf")
+        self.assertTrue(profile.linked_stretch)
+        self.assertFalse(profile.use_amp)
+        self.assertIn("--linked-stretch", args)
+        self.assertIn("--no-amp", args)
+        self.assertIn("stretch=mtf", note)
 
     def test_stage6_syqon_exchange_preserves_artifact_retry_history(self):
         processor = self._new_processor()

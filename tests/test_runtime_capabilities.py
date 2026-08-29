@@ -146,7 +146,16 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
             )
 
     def test_new_pipeline_modules_are_required_by_build_and_preflight(self) -> None:
-        required_modules = ("stage5_handoff.py", "stage8_color_rendition.py")
+        required_modules = (
+            "final_artifact_identity.py",
+            "presentation_quality.py",
+            "spatial_background_lineage.py",
+            "stage5_handoff.py",
+            "stage8_handoff.py",
+            "stage8_color_rendition.py",
+            "stage8_starless_finish.py",
+            "star_halo_guard.py",
+        )
         build_script = (
             Path(__file__).resolve().parents[1] / "build" / "build_macos_app.sh"
         ).read_text(encoding="utf-8")
@@ -346,6 +355,50 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
                 "operational_timeout_cached",
             )
             self.assertIn("operational_timeout_cached", decision["reason_codes"])
+
+    def test_transient_exhaustion_uses_v2_operational_cache_status(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            layout = self._make_bundle_layout(Path(td))
+            manifest = self._manifest(
+                layout,
+                network_enabled=True,
+                endpoints={
+                    "gaia_astro": ("https://astro.example.test/availability",),
+                    "gaia_xp": ("https://xp.example.test/chunk.dat",),
+                },
+            )
+            capabilities.update_siril_launch_probe(
+                manifest,
+                launchable=True,
+                version="siril 1.4.4",
+            )
+            capabilities.probe_network_capabilities(
+                manifest,
+                opener=lambda *_args, **_kwargs: _Response(),
+            )
+            cache_key = capabilities.stage4_spcc_operational_cache_key(manifest)
+            assert cache_key is not None
+
+            capabilities.apply_stage4_spcc_operational_timeout_cache(
+                manifest,
+                cache_key=cache_key,
+                evidence={
+                    "status": "online_transient_exhausted",
+                    "failure_class": "transient_network",
+                },
+            )
+
+            cache = manifest["decisions"]["stage4_color_calibration"][
+                "spcc_operational_cache"
+            ]
+            self.assertEqual(
+                cache["schema"],
+                capabilities.SPCC_OPERATIONAL_CACHE_SCHEMA,
+            )
+            self.assertEqual(
+                cache["status"],
+                "operational_transient_failure_cached",
+            )
 
     def test_online_transport_failure_remains_operationally_unverified(self) -> None:
         with tempfile.TemporaryDirectory() as td:

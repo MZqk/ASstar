@@ -10,13 +10,17 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from models import PipelineStage
+import spatial_background_lineage
 import stage5_deconvolution_quality
 import stage5_handoff
 import stage8_pixels
 from noise_model import (
+    NOISE_MODEL_SCHEMA,
     assess_denoise_candidate,
     build_noise_model_report,
     multiscale_denoise_candidate,
+    noise_model_mask_sha256,
+    validate_noise_model_report,
 )
 from sirilpy.exceptions import CommandError, SirilError
 
@@ -27,6 +31,23 @@ _ENV_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _ENV_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 _GRAXPERT_MODEL_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 STAGE5_DECONV_BG_STD_GROWTH_MAX = 1.38
+STAGE5_MULTISCALE_STRENGTH_LADDER = (0.60, 0.72, 0.84)
+
+
+def _stage5_locked_lower_gate(
+    pipeline,
+    field: str,
+    locked_minimum: float,
+) -> float:
+    """Allow stricter task gates without weakening this run's fixed contract."""
+
+    try:
+        value = float(getattr(pipeline.cfg, field, locked_minimum))
+    except (AttributeError, TypeError, ValueError):
+        value = locked_minimum
+    if not np.isfinite(value):
+        value = locked_minimum
+    return float(np.clip(max(value, locked_minimum), locked_minimum, 1.0))
 
 
 def _stage5_background_risk(adaptive: dict, stage5_policy: dict) -> bool:
@@ -169,56 +190,101 @@ def _run_multiscale_linear_denoise(
         "accepted": False,
     }
     try:
-        candidate, report = multiscale_denoise_candidate(
-            baseline_pixels,
-            strength=max(
-                0.10,
-                min(
-                    1.0,
-                    float(
-                        getattr(
-                            pipeline.cfg,
-                            "stage5_multiscale_denoise_strength",
-                            0.72,
-                        )
-                    ),
-                ),
-            ),
-            detail_retention_min=float(
-                getattr(
-                    pipeline.cfg,
-                    "stage5_multiscale_detail_retention_min",
-                    0.82,
-                )
-            ),
-            noise_reduction_min=float(
-                getattr(
-                    pipeline.cfg,
-                    "stage5_multiscale_noise_reduction_min",
-                    0.05,
-                )
-            ),
-            chroma_noise_growth_max=float(
-                getattr(
-                    pipeline.cfg,
-                    "stage5_denoise_chroma_noise_growth_max",
-                    1.05,
-                )
-            ),
+        background_mask = getattr(
+            pipeline,
+            "_stage5_frozen_background_mask",
+            None,
         )
-        report["transaction"]["baseline_saved"] = True
-        report["transaction"]["pixels_mutated"] = False
-        if not bool(report.get("accepted")):
+        signal_mask = getattr(
+            pipeline,
+            "_stage5_frozen_signal_mask",
+            None,
+        )
+        noise_model_report = dict(
+            getattr(pipeline, "_stage5_noise_model_report", {}) or {}
+        )
+        candidate_reports: List[Dict[str, Any]] = []
+        selected_candidate: Optional[np.ndarray] = None
+        selected_report: Optional[Dict[str, Any]] = None
+        strengths = _stage5_multiscale_strength_ladder(pipeline)
+        for strength in strengths:
+            candidate, candidate_report = multiscale_denoise_candidate(
+                baseline_pixels,
+                strength=strength,
+                detail_retention_min=_stage5_locked_lower_gate(
+                    pipeline,
+                    "stage5_multiscale_detail_retention_min",
+                    0.90,
+                ),
+                noise_reduction_min=_stage5_locked_lower_gate(
+                    pipeline,
+                    "stage5_multiscale_noise_reduction_min",
+                    0.12,
+                ),
+                chroma_noise_growth_max=float(
+                    getattr(
+                        pipeline.cfg,
+                        "stage5_denoise_chroma_noise_growth_max",
+                        1.05,
+                    )
+                ),
+                background_mask=background_mask,
+                signal_mask=signal_mask,
+                noise_model_report=noise_model_report,
+            )
+            candidate_report["transaction"]["baseline_saved"] = True
+            candidate_report["transaction"]["pixels_mutated"] = False
+            candidate_reports.append(candidate_report)
+            if (
+                selected_report is None
+                and bool(candidate_report.get("accepted"))
+            ):
+                selected_candidate = candidate
+                selected_report = candidate_report
+
+        if selected_report is None or selected_candidate is None:
+            issues = list(
+                dict.fromkeys(
+                    str(issue)
+                    for candidate_report in candidate_reports
+                    for issue in candidate_report.get("issues", [])
+                )
+            )
+            report.update(
+                status="rejected",
+                accepted=False,
+                strength_ladder=strengths,
+                selected_strength=None,
+                candidates=candidate_reports,
+                issues=issues,
+                transaction={
+                    "baseline": "stage5_pre_denoise.fit",
+                    "pixels_mutated": False,
+                    "rollback_required": False,
+                },
+            )
             messages.append(
-                "Stage5 multiscale candidate not applied: "
-                f"status={report.get('status')}, "
-                f"issues={','.join(report.get('issues') or []) or 'none'}"
+                "Stage5 multiscale strength ladder rejected all candidates: "
+                f"strengths={strengths}, issues={','.join(issues) or 'none'}"
             )
             return False, report
 
+        report = {
+            **selected_report,
+            "strength_ladder": strengths,
+            "selected_strength": float(selected_report["strength"]),
+            "selection_policy": "weakest_fully_qualified_v1",
+            "candidates": candidate_reports,
+        }
+        report["transaction"]["baseline_saved"] = True
+        report["transaction"]["pixels_mutated"] = False
+
         safe_writer = getattr(pipeline, "_set_current_image_pixeldata", None)
         if callable(safe_writer):
-            safe_writer(candidate, label="Stage5 multiscale linear denoise")
+            safe_writer(
+                selected_candidate,
+                label="Stage5 multiscale linear denoise",
+            )
         else:
             set_pixels = getattr(pipeline.siril, "set_image_pixeldata", None)
             if not callable(set_pixels):
@@ -226,12 +292,12 @@ def _run_multiscale_linear_denoise(
             lock_factory = getattr(pipeline.siril, "image_lock", None)
             if callable(lock_factory):
                 with lock_factory():
-                    set_pixels(candidate)
+                    set_pixels(selected_candidate)
             else:
                 pipeline.log.warn(
                     "Stage5 multiscale denoise: image_lock unavailable"
                 )
-                set_pixels(candidate)
+                set_pixels(selected_candidate)
         report["transaction"]["pixels_mutated"] = True
 
         if not pipeline._save_stage_output("stage5_multiscale_candidate"):
@@ -243,7 +309,8 @@ def _run_multiscale_linear_denoise(
         metrics = report.get("metrics") or {}
         messages.append(
             "Stage5 deterministic multiscale denoise accepted "
-            f"(noise_reduction={float(metrics.get('background_noise_reduction', 0.0)):.3f}, "
+            f"(strength={float(report['selected_strength']):.2f}, "
+            f"noise_reduction={float(metrics.get('background_noise_reduction', 0.0)):.3f}, "
             f"detail_retention={float(metrics.get('signal_detail_retention', 0.0)):.3f})"
         )
         return True, report
@@ -359,6 +426,178 @@ def _stage5_current_pixels(pipeline) -> np.ndarray:
     return np.array(array, copy=True)
 
 
+def _stage5_multiscale_strength_ladder(pipeline) -> List[float]:
+    """Return the contract-locked weakest-first three-rung ladder."""
+    del pipeline
+    return list(STAGE5_MULTISCALE_STRENGTH_LADDER)
+
+
+def _stage5_frozen_denoise_context(
+    pipeline,
+    baseline_pixels: np.ndarray,
+    noise_model_report: Dict[str, Any],
+    *,
+    expected_source_checkpoint: str,
+    require_noise_model: bool = True,
+) -> tuple[Optional[np.ndarray], Optional[np.ndarray], Dict[str, Any]]:
+    """Resolve immutable Stage 3 sky and Stage 5 target support for all candidates."""
+    spatial_shape = tuple(int(value) for value in baseline_pixels.shape[-2:])
+    lineage = spatial_background_lineage.load_lineage(
+        getattr(pipeline, "process_dir", None)
+    )
+    background_mask: Optional[np.ndarray] = None
+    issues: List[str] = []
+    if bool(lineage.get("accepted", False)):
+        candidate = np.asarray(lineage.get("support_mask"), dtype=bool)
+        if candidate.shape == spatial_shape and int(np.count_nonzero(candidate)) >= 64:
+            background_mask = candidate.copy()
+        else:
+            issues.append("stage3_frozen_sky_mask_shape_or_support_invalid")
+    else:
+        issues.extend(
+            str(issue)
+            for issue in lineage.get("issues", [])
+            if str(issue)
+        )
+        if not issues:
+            issues.append("stage3_spatial_background_lineage_unavailable")
+
+    signal_mask: Optional[np.ndarray] = None
+    signal_source = "candidate_luminance_fallback"
+    candidate_signal = getattr(pipeline, "_stage5_target_structure_mask", None)
+    if candidate_signal is not None:
+        parsed_signal = np.asarray(candidate_signal, dtype=bool)
+        if parsed_signal.shape == spatial_shape:
+            if int(np.count_nonzero(parsed_signal)) >= 64:
+                signal_mask = parsed_signal.copy()
+                signal_source = "stage5_frozen_target_structure"
+        else:
+            issues.append("stage5_frozen_target_structure_shape_invalid")
+    if signal_mask is None:
+        try:
+            source = np.asarray(baseline_pixels, dtype=np.float32)
+            if source.ndim == 2:
+                luma = source
+            elif source.ndim == 3 and source.shape[0] >= 3:
+                luma = (
+                    0.2126 * source[0]
+                    + 0.7152 * source[1]
+                    + 0.0722 * source[2]
+                )
+            elif source.ndim == 3 and source.shape[-1] >= 3:
+                luma = (
+                    0.2126 * source[..., 0]
+                    + 0.7152 * source[..., 1]
+                    + 0.0722 * source[..., 2]
+                )
+            else:
+                raise ValueError("unsupported Stage5 subject-mask layout")
+            finite = np.isfinite(luma)
+            values = luma[finite]
+            if values.size < 128:
+                raise ValueError("insufficient Stage5 subject-mask pixels")
+            lower, upper = np.quantile(values, (0.70, 0.99))
+            inferred = finite & (luma >= lower) & (luma <= upper)
+            if int(np.count_nonzero(inferred)) < 64:
+                raise ValueError("inferred Stage5 subject mask is too small")
+            signal_mask = inferred
+            signal_source = "stage5_frozen_luminance_subject"
+        except (TypeError, ValueError) as error:
+            issues.append(f"stage5_frozen_target_structure_unavailable:{error}")
+
+    masks_verified = bool(
+        background_mask is not None and signal_mask is not None
+    )
+    noise_model_validation: Dict[str, Any] = {
+        "status": "not_required",
+        "accepted": False,
+        "issues": [],
+    }
+    if require_noise_model and background_mask is not None:
+        noise_model_validation = validate_noise_model_report(
+            noise_model_report,
+            image=baseline_pixels,
+            background_mask=background_mask,
+            source_checkpoint=expected_source_checkpoint,
+        )
+        issues.extend(
+            str(issue)
+            for issue in noise_model_validation.get("issues", [])
+            if str(issue)
+        )
+    noise_model_verified = bool(
+        require_noise_model
+        and noise_model_validation.get("accepted") is True
+    )
+    if require_noise_model and not noise_model_verified:
+        issues.append("stage5_noise_model_unverified")
+    formal = bool(
+        masks_verified
+        and (noise_model_verified if require_noise_model else True)
+    )
+    public_lineage = {
+        key: value
+        for key, value in lineage.items()
+        if key != "support_mask"
+    }
+    return background_mask, signal_mask, {
+        "schema": "starun.stage5-frozen-denoise-context.v1",
+        "status": "accepted" if formal else "legacy_fallback",
+        "accepted": formal,
+        "masks_verified": masks_verified,
+        "issues": list(dict.fromkeys(issues)),
+        "background_mask": {
+            "source": (
+                "stage3_spatial_background_lineage"
+                if background_mask is not None
+                else "candidate_quantile_fallback"
+            ),
+            "sample_count": int(
+                np.count_nonzero(background_mask)
+                if background_mask is not None
+                else 0
+            ),
+            "support_sha256": lineage.get("support_sha256"),
+            "mask_sha256": (
+                noise_model_mask_sha256(background_mask)
+                if background_mask is not None
+                else None
+            ),
+        },
+        "signal_mask": {
+            "source": signal_source,
+            "sample_count": int(
+                np.count_nonzero(signal_mask)
+                if signal_mask is not None
+                else 0
+            ),
+            "mask_sha256": (
+                noise_model_mask_sha256(signal_mask)
+                if signal_mask is not None
+                else None
+            ),
+        },
+        "noise_model": {
+            "schema": noise_model_report.get("schema"),
+            "source_checkpoint": noise_model_report.get("source_checkpoint"),
+            "scale_count": len(noise_model_report.get("scales") or []),
+            "required": require_noise_model,
+            "verified": noise_model_verified,
+            "input_pixel_sha256": (
+                noise_model_report.get("input") or {}
+            ).get("pixel_sha256"),
+            "background_mask_sha256": (
+                noise_model_report.get("background") or {}
+            ).get("mask_sha256"),
+            "model_digest_sha256": noise_model_report.get(
+                "model_digest_sha256"
+            ),
+            "validation": noise_model_validation,
+        },
+        "stage3_lineage": public_lineage,
+    }
+
+
 def _stage5_restore_denoise_baseline(
     pipeline,
     *,
@@ -372,11 +611,9 @@ def _stage5_restore_denoise_baseline(
         if baseline_pixels is None:
             return
         restored = _stage5_current_pixels(pipeline)
-        if restored.shape != baseline_pixels.shape or not np.allclose(
+        if restored.shape != baseline_pixels.shape or not np.array_equal(
             restored,
             baseline_pixels,
-            rtol=1e-5,
-            atol=1e-6,
             equal_nan=True,
         ):
             raise RuntimeError(
@@ -455,19 +692,15 @@ def _stage5_quality_gate(
     return assess_denoise_candidate(
         baseline_pixels,
         candidate_pixels,
-        detail_retention_min=float(
-            getattr(
-                pipeline.cfg,
-                "stage5_multiscale_detail_retention_min",
-                0.82,
-            )
+        detail_retention_min=_stage5_locked_lower_gate(
+            pipeline,
+            "stage5_multiscale_detail_retention_min",
+            0.90,
         ),
-        noise_reduction_min=float(
-            getattr(
-                pipeline.cfg,
-                "stage5_multiscale_noise_reduction_min",
-                0.05,
-            )
+        noise_reduction_min=_stage5_locked_lower_gate(
+            pipeline,
+            "stage5_multiscale_noise_reduction_min",
+            0.12,
         ),
         chroma_noise_growth_max=float(
             getattr(
@@ -475,6 +708,16 @@ def _stage5_quality_gate(
                 "stage5_denoise_chroma_noise_growth_max",
                 1.05,
             )
+        ),
+        background_mask=getattr(
+            pipeline,
+            "_stage5_frozen_background_mask",
+            None,
+        ),
+        signal_mask=getattr(
+            pipeline,
+            "_stage5_frozen_signal_mask",
+            None,
         ),
     )
 
@@ -1153,6 +1396,12 @@ def run_stage5_linear_denoise(pipeline) -> None:
         "status": "unavailable",
         "reason": "stage5 input pixels unavailable",
     }
+    denoise_context_report: Dict[str, Any] = {
+        "schema": "starun.stage5-frozen-denoise-context.v1",
+        "status": "unavailable",
+        "accepted": False,
+        "issues": ["stage5 input pixels unavailable"],
+    }
     star_reference_report: Dict[str, Any] = {
         "schema": stage5_deconvolution_quality.STAR_REFERENCE_SCHEMA,
         "status": "unavailable",
@@ -1176,6 +1425,8 @@ def run_stage5_linear_denoise(pipeline) -> None:
         "checkpoint": "stage5_pre_denoise.fit",
     }
     denoise_integrity_ok = True
+    denoise_formal_eligible = True
+    formal_denoise_prohibited = False
     denoise_input = "stage5_input_linear"
     final_stem = "stage5_linear"
     upstream_loaded = False
@@ -1252,23 +1503,13 @@ def run_stage5_linear_denoise(pipeline) -> None:
             raise RuntimeError("verified stage5_input_linear baseline unavailable")
         stage5_input_linear_pixels = _stage5_current_pixels(pipeline)
         pipeline._stage5_input_linear_pixels = stage5_input_linear_pixels
-        noise_model_report = build_noise_model_report(
-            stage5_input_linear_pixels,
-            source_checkpoint="stage5_input_linear.fit",
-            channel_semantics=str(
-                getattr(pipeline, "_channel_semantics", "unknown") or "unknown"
-            ),
-        )
-        pipeline._stage5_noise_model_report = noise_model_report
-        pipeline._write_stage_json(
-            "stage5_noise_model.json",
-            noise_model_report,
-        )
-        messages.append(
-            "stage5_noise_model=report_only "
-            f"scales={len(noise_model_report['scales'])} "
-            f"background_samples={int(noise_model_report['background']['sample_count'])}"
-        )
+        noise_model_report = {
+            "schema": NOISE_MODEL_SCHEMA,
+            "mode": "pending_frozen_sky",
+            "applied_to_pixels": False,
+            "consumed_by_denoiser": False,
+            "status": "pending",
+        }
     except (
         AttributeError,
         CommandError,
@@ -1279,7 +1520,7 @@ def run_stage5_linear_denoise(pipeline) -> None:
         ValueError,
     ) as error:
         noise_model_report = {
-            "schema": "starun.multiscale-noise-model.v1",
+            "schema": NOISE_MODEL_SCHEMA,
             "mode": "report_only",
             "applied_to_pixels": False,
             "status": "unavailable",
@@ -1287,7 +1528,7 @@ def run_stage5_linear_denoise(pipeline) -> None:
         }
         pipeline._stage5_noise_model_report = noise_model_report
         pipeline.log.warn(f"Stage5 noise model report unavailable: {error}")
-        messages.append("stage5 noise model unavailable; existing denoise policy unchanged")
+        messages.append("stage5 input pixels unavailable for frozen noise context")
     background_risk = _stage5_background_risk(before_adaptive, stage5_policy)
 
     if stage5_input_linear_pixels is not None:
@@ -1330,6 +1571,94 @@ def run_stage5_linear_denoise(pipeline) -> None:
             }
     else:
         pipeline._stage5_target_structure_mask = None
+
+    if stage5_input_linear_pixels is not None:
+        (
+            frozen_background_mask,
+            frozen_signal_mask,
+            denoise_context_report,
+        ) = _stage5_frozen_denoise_context(
+            pipeline,
+            stage5_input_linear_pixels,
+            noise_model_report,
+            expected_source_checkpoint="stage5_input_linear.fit",
+            require_noise_model=False,
+        )
+        pipeline._stage5_frozen_background_mask = frozen_background_mask
+        pipeline._stage5_frozen_signal_mask = frozen_signal_mask
+        if denoise_context_report.get("masks_verified") is True:
+            try:
+                noise_model_report = build_noise_model_report(
+                    stage5_input_linear_pixels,
+                    source_checkpoint="stage5_input_linear.fit",
+                    channel_semantics=str(
+                        getattr(
+                            pipeline,
+                            "_channel_semantics",
+                            "unknown",
+                        )
+                        or "unknown"
+                    ),
+                    background_mask=frozen_background_mask,
+                )
+                (
+                    frozen_background_mask,
+                    frozen_signal_mask,
+                    denoise_context_report,
+                ) = _stage5_frozen_denoise_context(
+                    pipeline,
+                    stage5_input_linear_pixels,
+                    noise_model_report,
+                    expected_source_checkpoint="stage5_input_linear.fit",
+                )
+            except (TypeError, ValueError) as error:
+                noise_model_report = {
+                    "schema": NOISE_MODEL_SCHEMA,
+                    "mode": "frozen_denoise_context",
+                    "applied_to_pixels": False,
+                    "consumed_by_denoiser": False,
+                    "status": "unavailable",
+                    "error": str(error),
+                }
+                denoise_context_report = {
+                    **denoise_context_report,
+                    "status": "rejected",
+                    "accepted": False,
+                    "issues": list(
+                        dict.fromkeys(
+                            [
+                                *denoise_context_report.get("issues", []),
+                                "stage5_noise_model_unverified",
+                            ]
+                        )
+                    ),
+                }
+        noise_model_report = {
+            **noise_model_report,
+            "mode": "frozen_denoise_context",
+            "consumed_by_denoiser": False,
+            "frozen_context": {
+                "status": denoise_context_report.get("status"),
+                "background_mask_source": (
+                    denoise_context_report.get("background_mask") or {}
+                ).get("source"),
+                "signal_mask_source": (
+                    denoise_context_report.get("signal_mask") or {}
+                ).get("source"),
+            },
+        }
+        pipeline._stage5_noise_model_report = noise_model_report
+        pipeline._write_stage_json(
+            "stage5_noise_model.json",
+            noise_model_report,
+        )
+        messages.append(
+            "stage5 frozen denoise context="
+            f"{denoise_context_report.get('status')}"
+        )
+    else:
+        pipeline._stage5_frozen_background_mask = None
+        pipeline._stage5_frozen_signal_mask = None
 
     star_reference_report, star_reference_catalog = (
         _stage5_capture_star_reference(
@@ -1374,6 +1703,7 @@ def run_stage5_linear_denoise(pipeline) -> None:
             stage_status=status,
             deconvolution_integrity_ok=bool(linear_saved and preserve_reload_ok),
             denoise_integrity_ok=bool(linear_saved and preserve_reload_ok),
+            formal_eligible=bool(linear_saved and preserve_reload_ok),
             input_lineage=stage5_input_lineage,
         )
         if downstream_handoff.get("accepted") is not True:
@@ -1430,6 +1760,7 @@ def run_stage5_linear_denoise(pipeline) -> None:
             ),
             "noise_model_report": noise_model_report,
             "target_structure_mask": target_structure_report,
+            "frozen_denoise_context": denoise_context_report,
             "star_reference": star_reference_report,
             "deconvolution": {
                 **preserve_deconvolution_component,
@@ -1811,6 +2142,16 @@ def run_stage5_linear_denoise(pipeline) -> None:
             "config_disabled": "linear denoise skipped by configuration",
         }[denoise_reason_code]
         messages.append(denoise_reason_text)
+    elif denoise_context_report.get("masks_verified") is not True:
+        denoise_reason_code = "frozen_denoise_context_unverified"
+        status = "degraded"
+        denoise_formal_eligible = False
+        formal_denoise_prohibited = True
+        pipeline._require_review(5, denoise_reason_code)
+        messages.append(
+            "Stage5 formal denoise prohibited: frozen sky, subject support, "
+            "and multiscale noise context were not all verified"
+        )
     else:
         baseline_stem = "stage5_pre_denoise"
         baseline_saved = pipeline._save_stage_output(baseline_stem)
@@ -1841,6 +2182,9 @@ def run_stage5_linear_denoise(pipeline) -> None:
             )
             denoise_reason_code = "immutable_baseline_unavailable"
             status = "degraded"
+            denoise_formal_eligible = False
+            formal_denoise_prohibited = True
+            pipeline._require_review(5, denoise_reason_code)
             messages.append(
                 "Stage5 denoise prohibited: immutable checkpoint and frozen "
                 "pixel baseline are both required"
@@ -1878,46 +2222,182 @@ def run_stage5_linear_denoise(pipeline) -> None:
 
             if low_noise_input:
                 denoise_reason_code = "auto_low_noise"
+                denoise_context_report = {
+                    **denoise_context_report,
+                    "status": "verified_low_noise_skip",
+                    "accepted": True,
+                    "noise_model": {
+                        **(denoise_context_report.get("noise_model") or {}),
+                        "required": False,
+                        "verified": False,
+                        "consumed": False,
+                    },
+                }
+                noise_model_report = {
+                    **noise_model_report,
+                    "mode": "verified_low_noise_skip",
+                    "consumed_by_denoiser": False,
+                }
+                pipeline._stage5_noise_model_report = noise_model_report
+                pipeline._write_stage_json(
+                    "stage5_noise_model.json",
+                    noise_model_report,
+                )
                 messages.append(
                     "Stage5 low-noise guard skipped all denoise candidates"
                 )
             elif multiscale_enabled:
-                multiscale_applied, multiscale_report = (
-                    _run_multiscale_linear_denoise(
+                try:
+                    noise_model_report = build_noise_model_report(
+                        baseline_pixels,
+                        source_checkpoint="stage5_pre_denoise.fit",
+                        channel_semantics=str(
+                            getattr(
+                                pipeline,
+                                "_channel_semantics",
+                                "unknown",
+                            )
+                            or "unknown"
+                        ),
+                        background_mask=getattr(
+                            pipeline,
+                            "_stage5_frozen_background_mask",
+                            None,
+                        ),
+                    )
+                    (
+                        frozen_background_mask,
+                        frozen_signal_mask,
+                        denoise_context_report,
+                    ) = _stage5_frozen_denoise_context(
                         pipeline,
-                        messages,
-                        baseline_pixels=baseline_pixels,
+                        baseline_pixels,
+                        noise_model_report,
+                        expected_source_checkpoint="stage5_pre_denoise.fit",
                     )
-                )
-                denoise_attempts.append(multiscale_report)
-                pipeline._write_stage_json(
-                    "stage5_multiscale_denoise.json",
-                    multiscale_report,
-                )
-                if multiscale_applied:
-                    denoise_used = "deterministic_multiscale"
-                    denoise_reason_code = "accepted"
-                elif bool(
-                    (multiscale_report.get("transaction") or {}).get(
-                        "pixels_mutated"
+                    pipeline._stage5_frozen_background_mask = (
+                        frozen_background_mask
                     )
-                ):
-                    rollback = _stage5_restore_denoise_baseline(
-                        pipeline,
-                        baseline_stem=baseline_stem,
-                        baseline_pixels=baseline_pixels,
+                    pipeline._stage5_frozen_signal_mask = frozen_signal_mask
+                except (TypeError, ValueError) as error:
+                    denoise_context_report = {
+                        **denoise_context_report,
+                        "status": "rejected",
+                        "accepted": False,
+                        "issues": list(
+                            dict.fromkeys(
+                                [
+                                    *denoise_context_report.get("issues", []),
+                                    f"stage5_noise_model_unavailable:{error}",
+                                ]
+                            )
+                        ),
+                    }
+                if denoise_context_report.get("accepted") is not True:
+                    denoise_reason_code = "frozen_noise_model_unverified"
+                    status = "degraded"
+                    denoise_formal_eligible = False
+                    formal_denoise_prohibited = True
+                    pipeline._require_review(5, denoise_reason_code)
+                    messages.append(
+                        "Stage5 multiscale denoise prohibited: frozen noise "
+                        "model bindings or positive finite scales failed"
                     )
-                    multiscale_report.setdefault("transaction", {}).update(
-                        rollback_required=True,
-                        rollback_completed=bool(rollback.get("completed")),
-                        rollback=rollback,
+                else:
+                    noise_model_report = {
+                        **noise_model_report,
+                        "mode": "frozen_denoise_context",
+                        "consumed_by_denoiser": True,
+                        "frozen_context": {
+                            "status": denoise_context_report.get("status"),
+                            "background_mask_source": (
+                                denoise_context_report.get("background_mask")
+                                or {}
+                            ).get("source"),
+                            "signal_mask_source": (
+                                denoise_context_report.get("signal_mask") or {}
+                            ).get("source"),
+                        },
+                    }
+                    pipeline._stage5_noise_model_report = noise_model_report
+                    pipeline._write_stage_json(
+                        "stage5_noise_model.json",
+                        noise_model_report,
                     )
-                    denoise_integrity_ok = bool(rollback.get("completed"))
+                    multiscale_applied, multiscale_report = (
+                        _run_multiscale_linear_denoise(
+                            pipeline,
+                            messages,
+                            baseline_pixels=baseline_pixels,
+                        )
+                    )
+                    denoise_attempts.append(multiscale_report)
+                    pipeline._write_stage_json(
+                        "stage5_multiscale_denoise.json",
+                        multiscale_report,
+                    )
+                    if multiscale_applied:
+                        denoise_used = "deterministic_multiscale"
+                        denoise_reason_code = "accepted"
+                    else:
+                        if multiscale_report.get("status") == "rejected":
+                            denoise_formal_eligible = False
+                            formal_denoise_prohibited = True
+                            denoise_reason_code = (
+                                "all_candidates_rejected_safe_passthrough"
+                            )
+                            status = "degraded"
+                            pipeline._require_review(
+                                5,
+                                "multiscale_strength_ladder_rejected",
+                            )
+                            rollback = _stage5_restore_denoise_baseline(
+                                pipeline,
+                                baseline_stem=baseline_stem,
+                                baseline_pixels=baseline_pixels,
+                            )
+                            multiscale_report.setdefault(
+                                "transaction",
+                                {},
+                            ).update(
+                                rollback_required=True,
+                                rollback_completed=bool(
+                                    rollback.get("completed")
+                                ),
+                                rollback=rollback,
+                            )
+                            denoise_integrity_ok = bool(
+                                rollback.get("completed")
+                            )
+                        elif bool(
+                            (multiscale_report.get("transaction") or {}).get(
+                                "pixels_mutated"
+                            )
+                        ):
+                            rollback = _stage5_restore_denoise_baseline(
+                                pipeline,
+                                baseline_stem=baseline_stem,
+                                baseline_pixels=baseline_pixels,
+                            )
+                            multiscale_report.setdefault(
+                                "transaction",
+                                {},
+                            ).update(
+                                rollback_required=True,
+                                rollback_completed=bool(
+                                    rollback.get("completed")
+                                ),
+                                rollback=rollback,
+                            )
+                            denoise_integrity_ok = bool(
+                                rollback.get("completed")
+                            )
 
             if (
                 denoise_used == "none"
                 and denoise_integrity_ok
                 and not low_noise_input
+                and not formal_denoise_prohibited
                 and denoise_backend_policy in {"auto_chain", "siril_only"}
             ):
                 builtin_used, builtin_report, denoise_integrity_ok = (
@@ -1948,6 +2428,7 @@ def run_stage5_linear_denoise(pipeline) -> None:
                 denoise_used == "none"
                 and denoise_integrity_ok
                 and not low_noise_input
+                and not formal_denoise_prohibited
                 and denoise_backend_policy
                 in {"auto_chain", "cosmic_clarity_only"}
             ):
@@ -1980,7 +2461,11 @@ def run_stage5_linear_denoise(pipeline) -> None:
                     "Stage5 denoise integrity failure: rollback failed; "
                     "no further denoise candidates were executed"
                 )
-            elif denoise_used == "none" and not low_noise_input:
+            elif (
+                denoise_used == "none"
+                and not low_noise_input
+                and not formal_denoise_prohibited
+            ):
                 status = "degraded"
                 rejected = any(
                     attempt.get("status") == "rejected"
@@ -2110,7 +2595,11 @@ def run_stage5_linear_denoise(pipeline) -> None:
         "config_disabled",
     }:
         denoise_component_status = "skipped"
-    elif denoise_reason_code == "immutable_baseline_unavailable":
+    elif denoise_reason_code in {
+        "immutable_baseline_unavailable",
+        "frozen_denoise_context_unverified",
+        "frozen_noise_model_unverified",
+    }:
         denoise_component_status = "prohibited"
     elif denoise_reason_code in {
         "all_candidates_rejected_safe_passthrough",
@@ -2163,6 +2652,8 @@ def run_stage5_linear_denoise(pipeline) -> None:
         )
     elif denoise_reason_code in {
         "immutable_baseline_unavailable",
+        "frozen_denoise_context_unverified",
+        "frozen_noise_model_unverified",
         "denoise_rollback_failed",
         "all_candidates_rejected_safe_passthrough",
         "all_denoisers_failed_safe_passthrough",
@@ -2198,6 +2689,9 @@ def run_stage5_linear_denoise(pipeline) -> None:
         ),
         denoise_integrity_ok=bool(
             linear_saved and denoise_integrity_ok
+        ),
+        formal_eligible=bool(
+            linear_saved and denoise_formal_eligible
         ),
         input_lineage=stage5_input_lineage,
     )
@@ -2278,24 +2772,21 @@ def run_stage5_linear_denoise(pipeline) -> None:
                 "input": denoise_input,
                 "output": "stage5_linear",
                 "noise_model_report": noise_model_report,
+                "frozen_context": denoise_context_report,
                 "multiscale_candidate": multiscale_report,
                 "baseline_transaction": denoise_baseline_transaction,
                 "candidate_attempts": denoise_attempts,
                 "integrity_ok": denoise_integrity_ok,
                 "quality_gate": {
-                    "detail_retention_min": float(
-                        getattr(
-                            pipeline.cfg,
-                            "stage5_multiscale_detail_retention_min",
-                            0.82,
-                        )
+                    "detail_retention_min": _stage5_locked_lower_gate(
+                        pipeline,
+                        "stage5_multiscale_detail_retention_min",
+                        0.90,
                     ),
-                    "noise_reduction_min": float(
-                        getattr(
-                            pipeline.cfg,
-                            "stage5_multiscale_noise_reduction_min",
-                            0.05,
-                        )
+                    "noise_reduction_min": _stage5_locked_lower_gate(
+                        pipeline,
+                        "stage5_multiscale_noise_reduction_min",
+                        0.12,
                     ),
                     "chroma_noise_growth_max": float(
                         getattr(

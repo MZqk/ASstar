@@ -328,6 +328,26 @@ class GuiTaskIntakeTests(unittest.TestCase):
                         self.assertEqual(evidence["status"], "timeout")
                         self.assertEqual(evidence["label"], "catalog:gaia")
 
+            run_manifest.atomic_write_json(
+                report,
+                {
+                    "spcc": {
+                        "attempts": [
+                            {
+                                "status": "failed",
+                                "label": "catalog:gaia",
+                                "spcc_readiness": "online_unverified",
+                                "reason_code": "online_transient_exhausted",
+                                "failure_class": "transient_network",
+                            }
+                        ]
+                    }
+                },
+            )
+            evidence = stage4_online_spcc_timeout_evidence(run_root)
+            self.assertIsNotNone(evidence)
+            self.assertEqual(evidence["status"], "online_transient_exhausted")
+
     def test_product_task_selects_latest_checkpoint_compatible_with_settings(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

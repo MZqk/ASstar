@@ -68,6 +68,17 @@ BRIGHT_CORE_INTEGRITY_LIMITS = {
     "parity_phase_span_max": {"accepted": 0.01, "hard": 0.02},
 }
 
+STAGE6_SUBJECT_CHROMA_SCHEMA = "starun.stage6-subject-chroma-lineage.v1"
+STAGE6_SUBJECT_CHROMA_SATURATION_P50_RETENTION_MIN = 0.35
+STAGE6_SUBJECT_CHROMA_SATURATION_P95_RETENTION_MIN = 0.50
+STAGE6_SUBJECT_CHROMA_OPPONENT_RETENTION_MIN = 0.40
+STAGE6_SUBJECT_CHROMA_DIRECTION_CORRELATION_MIN = 0.70
+STAGE6_SUBJECT_CHROMA_SOURCE_SATURATION_MIN = 0.02
+STAGE6_SUBJECT_CHROMA_SOURCE_OPPONENT_RMS_MIN = 0.0001
+STAGE6_SUBJECT_CHROMA_SUPPORT_MIN = 2048
+STAGE6_SUBJECT_CHROMA_GRID_MIN = 4
+STAGE6_SUBJECT_CHROMA_QUADRANT_MIN = 3
+
 
 def strict_bright_core_target_evidence(
     target_type: str,
@@ -2048,6 +2059,466 @@ def _apply_shared_valid_region(
     return output
 
 
+def _stage6_chroma_channels_first(
+    image_data: Any,
+) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+    """Return strict 0..1 CHW pixels without silently promoting mono to RGB."""
+    source = np.asarray(image_data)
+    layout: Dict[str, Any] = {
+        "source_shape": [int(value) for value in source.shape],
+        "channel_layout": "unknown",
+        "channel_count": 0,
+    }
+    if source.ndim == 2:
+        layout.update(channel_layout="mono_2d", channel_count=1)
+        return None, layout
+    if source.ndim != 3:
+        layout["reason"] = "unsupported_image_rank"
+        return None, layout
+    try:
+        canonical, domain = canonicalize_stage7_pixels_01(source)
+    except (TypeError, ValueError) as error:
+        layout["reason"] = f"canonical_domain_error:{error}"
+        return None, layout
+    layout["pixel_domain"] = domain
+    if canonical.shape[0] == 1 and canonical.shape[-1] not in (1, 3):
+        layout.update(channel_layout="mono_chw", channel_count=1)
+        return None, layout
+    if canonical.shape[-1] == 1:
+        layout.update(channel_layout="mono_hwc", channel_count=1)
+        return None, layout
+    if canonical.shape[0] == 3 and canonical.shape[-1] != 3:
+        rgb = canonical
+        layout.update(channel_layout="chw", channel_count=3)
+    elif canonical.shape[-1] == 3:
+        rgb = np.moveaxis(canonical, -1, 0)
+        layout.update(channel_layout="hwc", channel_count=3)
+    elif canonical.shape[0] == 3:
+        rgb = canonical
+        layout.update(channel_layout="chw", channel_count=3)
+    else:
+        layout["reason"] = "unsupported_channel_layout"
+        return None, layout
+    return np.asarray(rgb, dtype=np.float32), layout
+
+
+def _stage6_source_point_mask(
+    luminance: np.ndarray,
+    valid: np.ndarray,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Build a deterministic source-only point mask when the frozen catalog is absent."""
+    broad = np.asarray(luminance, dtype=np.float32)
+    for _ in range(2):
+        broad = _box_blur_gray(broad)
+    detail = np.asarray(luminance, dtype=np.float32) - broad
+    support = detail[valid]
+    if support.size < 64:
+        return np.zeros_like(valid, dtype=bool), {
+            "status": "unavailable",
+            "method": "source_highpass_5sigma_q997_dilate4",
+            "reason": "insufficient_valid_support",
+        }
+    median = float(np.median(support))
+    sigma = float(1.4826 * np.median(np.abs(support - median)))
+    positive = support[support > median]
+    quantile = float(np.quantile(positive, 0.997)) if positive.size else median
+    luma_floor = float(np.quantile(np.asarray(luminance)[valid], 0.70))
+    threshold = max(median + 5.0 * max(sigma, 1e-7), quantile)
+    seed = valid & (detail >= threshold) & (luminance >= luma_floor)
+    excluded = _dilate_binary_mask(seed, 4)
+    return excluded, {
+        "status": "available",
+        "method": "source_highpass_5sigma_q997_dilate4",
+        "threshold": threshold,
+        "noise_sigma": sigma,
+        "seed_count": int(np.count_nonzero(seed)),
+        "excluded_count": int(np.count_nonzero(excluded)),
+        "excluded_fraction": float(np.mean(excluded)),
+    }
+
+
+def assess_stage6_subject_chroma_lineage(
+    source_data: Any,
+    starless_data: Any,
+    shared_scene_support: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Verify that a Stage 6 Starless proposal retains source subject chroma."""
+    limits = {
+        "source_saturation_min": STAGE6_SUBJECT_CHROMA_SOURCE_SATURATION_MIN,
+        "source_opponent_rms_min": STAGE6_SUBJECT_CHROMA_SOURCE_OPPONENT_RMS_MIN,
+        "saturation_p50_retention_min": (
+            STAGE6_SUBJECT_CHROMA_SATURATION_P50_RETENTION_MIN
+        ),
+        "saturation_p95_retention_min": (
+            STAGE6_SUBJECT_CHROMA_SATURATION_P95_RETENTION_MIN
+        ),
+        "opponent_energy_retention_min": (
+            STAGE6_SUBJECT_CHROMA_OPPONENT_RETENTION_MIN
+        ),
+        "opponent_direction_correlation_min": (
+            STAGE6_SUBJECT_CHROMA_DIRECTION_CORRELATION_MIN
+        ),
+        "support_min_floor": STAGE6_SUBJECT_CHROMA_SUPPORT_MIN,
+        "grid_cells_min": STAGE6_SUBJECT_CHROMA_GRID_MIN,
+        "quadrants_min": STAGE6_SUBJECT_CHROMA_QUADRANT_MIN,
+    }
+    report: Dict[str, Any] = {
+        "schema": STAGE6_SUBJECT_CHROMA_SCHEMA,
+        "status": "unverified",
+        "applicable": False,
+        "accepted": False,
+        "hard_failed": True,
+        "reason_code": "stage6_subject_chroma_lineage_unverified",
+        "candidate_independent_support": True,
+        "used_for_gate": True,
+        "limits": limits,
+    }
+    if source_data is None or starless_data is None:
+        report["reason"] = (
+            "source_missing" if source_data is None else "starless_missing"
+        )
+        return report
+    source_rgb, source_layout = _stage6_chroma_channels_first(source_data)
+    output_rgb, output_layout = _stage6_chroma_channels_first(starless_data)
+    report["source_layout"] = source_layout
+    report["output_layout"] = output_layout
+    if int(source_layout.get("channel_count", 0)) == 1:
+        report.update(
+            status="not_applicable",
+            applicable=False,
+            accepted=True,
+            hard_failed=False,
+            reason_code=None,
+            reason="mono_source",
+        )
+        return report
+    if source_rgb is None or output_rgb is None:
+        report["reason"] = (
+            source_layout.get("reason")
+            or output_layout.get("reason")
+            or "rgb_layout_unavailable"
+        )
+        return report
+    if source_rgb.shape != output_rgb.shape:
+        report.update(
+            reason="source_starless_shape_mismatch",
+            source_shape=[int(value) for value in source_rgb.shape],
+            output_shape=[int(value) for value in output_rgb.shape],
+        )
+        return report
+
+    source_global_peak = np.max(source_rgb, axis=0)
+    source_global_saturation = (
+        (source_global_peak - np.min(source_rgb, axis=0))
+        / np.maximum(source_global_peak, 1e-6)
+    )
+    source_global_rg = source_rgb[0] - source_rgb[1]
+    source_global_bg = source_rgb[2] - source_rgb[1]
+    source_global_saturation_p50 = float(np.median(source_global_saturation))
+    source_global_opponent_rms = float(
+        np.sqrt(np.mean(source_global_rg**2 + source_global_bg**2))
+    )
+    report["source_global_chroma_precheck"] = {
+        "method": "full_frame_no_mask_not_applicable_only",
+        "saturation_p50": source_global_saturation_p50,
+        "opponent_rms": source_global_opponent_rms,
+        "used_for_acceptance": False,
+    }
+    if (
+        source_global_saturation_p50
+        < STAGE6_SUBJECT_CHROMA_SOURCE_SATURATION_MIN
+        and source_global_opponent_rms
+        < STAGE6_SUBJECT_CHROMA_SOURCE_OPPONENT_RMS_MIN
+    ):
+        report.update(
+            status="not_applicable",
+            applicable=False,
+            accepted=True,
+            hard_failed=False,
+            reason_code=None,
+            reason="source_global_chroma_below_measurement_floor",
+        )
+        return report
+
+    support = shared_scene_support if isinstance(shared_scene_support, dict) else {}
+    manifest = support.get("manifest") if isinstance(support.get("manifest"), dict) else {}
+    components = manifest.get("components") if isinstance(manifest.get("components"), dict) else {}
+    valid_mask = support.get("valid_mask")
+    saturation_map = support.get("saturation_map")
+    height, width = source_rgb.shape[1:]
+    if (
+        valid_mask is None
+        or saturation_map is None
+        or str((components.get("valid_mask") or {}).get("status")) != "available"
+        or str((components.get("saturation_map") or {}).get("status")) != "available"
+    ):
+        report["reason"] = "shared_valid_or_saturation_evidence_unavailable"
+        report["shared_scene_support"] = scene_support.scene_support_summary(support)
+        return report
+    valid = np.asarray(valid_mask, dtype=bool)
+    saturated = np.asarray(saturation_map, dtype=np.uint8) > 0
+    if valid.shape != (height, width) or saturated.shape != (height, width):
+        report["reason"] = "shared_scene_support_shape_mismatch"
+        return report
+    valid &= ~saturated
+    if int(np.count_nonzero(valid)) < STAGE6_SUBJECT_CHROMA_SUPPORT_MIN:
+        report["reason"] = "valid_unsaturated_support_insufficient"
+        return report
+
+    source_luminance = (
+        0.2126 * source_rgb[0]
+        + 0.7152 * source_rgb[1]
+        + 0.0722 * source_rgb[2]
+    ).astype(np.float32)
+    catalog_mask = scene_support.catalog_aperture_mask(
+        support,
+        (height, width),
+        radius_scale=3.5,
+    )
+    if catalog_mask is not None:
+        star_exclusion = np.asarray(catalog_mask, dtype=np.float32) > 0.0
+        star_evidence = {
+            "status": "available",
+            "method": "stage3_frozen_catalog_aperture_3_5xfwhm",
+            "excluded_count": int(np.count_nonzero(star_exclusion)),
+            "excluded_fraction": float(np.mean(star_exclusion)),
+        }
+    else:
+        star_exclusion, star_evidence = _stage6_source_point_mask(
+            source_luminance,
+            valid,
+        )
+    if star_evidence.get("status") != "available":
+        report["reason"] = "star_exclusion_evidence_unavailable"
+        report["star_exclusion"] = star_evidence
+        return report
+    valid &= ~star_exclusion
+    valid_count = int(np.count_nonzero(valid))
+    if valid_count < STAGE6_SUBJECT_CHROMA_SUPPORT_MIN:
+        report["reason"] = "post_star_exclusion_support_insufficient"
+        report["star_exclusion"] = star_evidence
+        return report
+
+    broad_luminance = source_luminance
+    for _ in range(3):
+        broad_luminance = _box_blur_gray(broad_luminance)
+    valid_luminance = broad_luminance[valid]
+    background_limit = float(np.quantile(valid_luminance, 0.40))
+    signal_low = float(np.quantile(valid_luminance, 0.60))
+    signal_high = float(np.quantile(valid_luminance, 0.98))
+    background = valid & (broad_luminance <= background_limit)
+    signal_band = valid & (broad_luminance >= signal_low) & (broad_luminance <= signal_high)
+    if int(np.count_nonzero(background)) < 256:
+        report["reason"] = "background_support_insufficient"
+        return report
+
+    source_background = np.asarray(
+        [np.median(source_rgb[channel][background]) for channel in range(3)],
+        dtype=np.float32,
+    )
+    output_background = np.asarray(
+        [np.median(output_rgb[channel][background]) for channel in range(3)],
+        dtype=np.float32,
+    )
+
+    def low_frequency_rgb(rgb: np.ndarray) -> np.ndarray:
+        smoothed = np.empty_like(rgb, dtype=np.float32)
+        for channel in range(3):
+            plane = rgb[channel]
+            for _ in range(2):
+                plane = _box_blur_gray(plane)
+            smoothed[channel] = plane
+        return smoothed
+
+    source_low_frequency = low_frequency_rgb(source_rgb)
+    output_low_frequency = low_frequency_rgb(output_rgb)
+    source_signal = np.clip(
+        source_low_frequency - source_background[:, None, None],
+        0.0,
+        None,
+    )
+    output_signal = np.clip(
+        output_low_frequency - output_background[:, None, None],
+        0.0,
+        None,
+    )
+
+    def saturation(values: np.ndarray) -> np.ndarray:
+        peak = np.max(values, axis=0)
+        return (peak - np.min(values, axis=0)) / np.maximum(peak, 1e-6)
+
+    # Saturation is an absolute RGB chroma-to-level property. Computing it
+    # after per-channel background subtraction makes near-zero residuals look
+    # highly saturated and lets a flattened Starless proposal pass. The
+    # background-subtracted planes remain the basis for subject discovery and
+    # opponent-energy lineage, while the formal saturation retention is
+    # measured on the matched low-frequency RGB values themselves.
+    source_saturation = saturation(source_low_frequency)
+    output_saturation = saturation(output_low_frequency)
+    source_rg = source_signal[0] - source_signal[1]
+    source_bg = source_signal[2] - source_signal[1]
+    output_rg = output_signal[0] - output_signal[1]
+    output_bg = output_signal[2] - output_signal[1]
+    report["measurement_domains"] = {
+        "subject_roi": "source_low_frequency_luminance_signal_band",
+        "saturation": "matched_low_frequency_absolute_rgb",
+        "opponent_energy": "per_channel_background_subtracted_low_frequency_rgb",
+        "candidate_used_for_support": False,
+    }
+    preliminary = signal_band
+    preliminary_count = int(np.count_nonzero(preliminary))
+    if preliminary_count < 64:
+        report["reason"] = "preliminary_subject_support_insufficient"
+        return report
+    preliminary_source_sat = float(np.median(source_saturation[preliminary]))
+    preliminary_source_energy = float(
+        np.sqrt(np.mean(source_rg[preliminary] ** 2 + source_bg[preliminary] ** 2))
+    )
+    report["source_chroma_presence"] = {
+        "saturation_p50": preliminary_source_sat,
+        "opponent_rms": preliminary_source_energy,
+        "support": preliminary_count,
+    }
+    if (
+        preliminary_source_sat < STAGE6_SUBJECT_CHROMA_SOURCE_SATURATION_MIN
+        and preliminary_source_energy < STAGE6_SUBJECT_CHROMA_SOURCE_OPPONENT_RMS_MIN
+    ):
+        report.update(
+            status="not_applicable",
+            applicable=False,
+            accepted=True,
+            hard_failed=False,
+            reason_code=None,
+            reason="source_subject_chroma_below_measurement_floor",
+            star_exclusion=star_evidence,
+        )
+        return report
+
+    # Freeze the subject ROI from source luminance alone. Conditioning the ROI
+    # on high source saturation cherry-picks a few color outliers and can hide
+    # broad, low-amplitude chroma collapse in a faint nebula.
+    subject = signal_band
+    subject_count = int(np.count_nonzero(subject))
+    subject_min = max(
+        STAGE6_SUBJECT_CHROMA_SUPPORT_MIN,
+        int(math.ceil(valid_count * 0.001)),
+    )
+    grid_cells = 0
+    quadrants = 0
+    for y_index in range(4):
+        y0, y1 = height * y_index // 4, height * (y_index + 1) // 4
+        for x_index in range(4):
+            x0, x1 = width * x_index // 4, width * (x_index + 1) // 4
+            if int(np.count_nonzero(subject[y0:y1, x0:x1])) >= 32:
+                grid_cells += 1
+    for y_index in range(2):
+        y0, y1 = height * y_index // 2, height * (y_index + 1) // 2
+        for x_index in range(2):
+            x0, x1 = width * x_index // 2, width * (x_index + 1) // 2
+            if int(np.count_nonzero(subject[y0:y1, x0:x1])) >= 64:
+                quadrants += 1
+    coverage = {
+        "valid_unsaturated_nonstar": valid_count,
+        "subject_support": subject_count,
+        "subject_support_min": subject_min,
+        "subject_fraction": float(subject_count / max(valid_count, 1)),
+        "grid_cells": grid_cells,
+        "quadrants": quadrants,
+    }
+    report["coverage"] = coverage
+    report["star_exclusion"] = star_evidence
+    report["shared_scene_support"] = scene_support.scene_support_summary(support)
+    if (
+        subject_count < subject_min
+        or grid_cells < STAGE6_SUBJECT_CHROMA_GRID_MIN
+        or quadrants < STAGE6_SUBJECT_CHROMA_QUADRANT_MIN
+    ):
+        report["reason"] = "subject_chroma_spatial_support_insufficient"
+        return report
+
+    source_sat_values = source_saturation[subject]
+    output_sat_values = output_saturation[subject]
+    source_sat_p50 = float(np.median(source_sat_values))
+    source_sat_p95 = float(np.quantile(source_sat_values, 0.95))
+    output_sat_p50 = float(np.median(output_sat_values))
+    output_sat_p95 = float(np.quantile(output_sat_values, 0.95))
+    source_energy = float(
+        np.sqrt(np.mean(source_rg[subject] ** 2 + source_bg[subject] ** 2))
+    )
+    output_energy = float(
+        np.sqrt(np.mean(output_rg[subject] ** 2 + output_bg[subject] ** 2))
+    )
+    source_vectors = np.stack((source_rg[subject], source_bg[subject]), axis=0)
+    output_vectors = np.stack((output_rg[subject], output_bg[subject]), axis=0)
+    denominator = float(
+        np.sqrt(np.sum(source_vectors * source_vectors))
+        * np.sqrt(np.sum(output_vectors * output_vectors))
+    )
+    direction_correlation = (
+        float(np.sum(source_vectors * output_vectors) / denominator)
+        if denominator > 1e-12
+        else 0.0
+    )
+    direction_correlation = float(np.clip(direction_correlation, -1.0, 1.0))
+    metrics = {
+        "source_saturation_p50": source_sat_p50,
+        "source_saturation_p95": source_sat_p95,
+        "output_saturation_p50": output_sat_p50,
+        "output_saturation_p95": output_sat_p95,
+        "saturation_p50_retention": output_sat_p50 / max(source_sat_p50, 1e-12),
+        "saturation_p95_retention": output_sat_p95 / max(source_sat_p95, 1e-12),
+        "source_opponent_rms": source_energy,
+        "output_opponent_rms": output_energy,
+        "opponent_energy_retention": output_energy / max(source_energy, 1e-12),
+        "opponent_direction_correlation": direction_correlation,
+        "source_background_rgb": [float(value) for value in source_background],
+        "output_background_rgb": [float(value) for value in output_background],
+    }
+    failed_metrics = [
+        name
+        for name, value, limit in (
+            (
+                "saturation_p50_retention",
+                metrics["saturation_p50_retention"],
+                STAGE6_SUBJECT_CHROMA_SATURATION_P50_RETENTION_MIN,
+            ),
+            (
+                "saturation_p95_retention",
+                metrics["saturation_p95_retention"],
+                STAGE6_SUBJECT_CHROMA_SATURATION_P95_RETENTION_MIN,
+            ),
+            (
+                "opponent_energy_retention",
+                metrics["opponent_energy_retention"],
+                STAGE6_SUBJECT_CHROMA_OPPONENT_RETENTION_MIN,
+            ),
+            (
+                "opponent_direction_correlation",
+                metrics["opponent_direction_correlation"],
+                STAGE6_SUBJECT_CHROMA_DIRECTION_CORRELATION_MIN,
+            ),
+        )
+        if float(value) < float(limit)
+    ]
+    report.update(
+        applicable=True,
+        metrics=metrics,
+        failed_metrics=failed_metrics,
+        status="hard_failed" if failed_metrics else "ok",
+        accepted=not failed_metrics,
+        hard_failed=bool(failed_metrics),
+        reason_code=(
+            "stage6_subject_chroma_collapse" if failed_metrics else None
+        ),
+        reason=(
+            "subject_chroma_retention_below_fixed_limits"
+            if failed_metrics
+            else "subject_chroma_lineage_verified"
+        ),
+    )
+    return report
+
+
 def _stage6_catalog_starmask_coverage(
     pipeline,
     source_data: Optional[np.ndarray],
@@ -2310,6 +2781,11 @@ def stage7_quality_assessment(
         zero_fill=True,
     )
     shared_support_summary = scene_support.scene_support_summary(shared_support)
+    subject_chroma_lineage = assess_stage6_subject_chroma_lineage(
+        source_data,
+        starless_data,
+        shared_support,
+    )
 
     source_metrics = measure_quality_metrics(source_data) if source_data is not None else QualityMetrics()
     starless_metrics = measure_quality_metrics(starless_data) if starless_data is not None else QualityMetrics()
@@ -2517,6 +2993,31 @@ def stage7_quality_assessment(
             issues.append(message)
         elif bool(gate.get("advisory", False)):
             advisories.append(message)
+
+    chroma_status = str(subject_chroma_lineage.get("status") or "unverified")
+    chroma_gate = {
+        "status": chroma_status,
+        "advisory": False,
+        "hard_failed": bool(subject_chroma_lineage.get("hard_failed", True)),
+        "fixed_limit": True,
+        "reason_code": subject_chroma_lineage.get("reason_code"),
+        "failed_metrics": list(subject_chroma_lineage.get("failed_metrics") or []),
+        "used_for_gate": True,
+    }
+    if chroma_gate["hard_failed"]:
+        reason_code = str(
+            chroma_gate.get("reason_code")
+            or "stage6_subject_chroma_lineage_unverified"
+        )
+        record_gate(
+            "subject_chroma_lineage",
+            chroma_gate,
+            reason_code
+            + ":"
+            + str(subject_chroma_lineage.get("reason") or "unverified"),
+        )
+    else:
+        quality_gates["subject_chroma_lineage"] = chroma_gate
 
     if bool(bright_core_integrity.get("applicable", False)):
         bright_core_status = str(
@@ -2898,6 +3399,7 @@ def stage7_quality_assessment(
         "local_advisories": advisories,
         "quality_gates": quality_gates,
         "bright_core_integrity": bright_core_integrity,
+        "subject_chroma_lineage": subject_chroma_lineage,
     }
     all_issues = issues
     return {
@@ -2911,6 +3413,7 @@ def stage7_quality_assessment(
         "local_advisories": advisories,
         "quality_gates": quality_gates,
         "bright_core_integrity": bright_core_integrity,
+        "subject_chroma_lineage": subject_chroma_lineage,
         "source_metrics": asdict(source_metrics),
         "starless_metrics": asdict(starless_metrics),
         "starmask_metrics": asdict(starmask_metrics) if starmask_data is not None else None,
@@ -3005,6 +3508,12 @@ def stage7_quality_score(pipeline, quality: Optional[Dict[str, Any]]) -> float:
         collapse = dynamic_range_ratio < dynamic_threshold and peak_signal < peak_threshold
     if bool(collapse):
         dynamic_penalty = (dynamic_threshold - dynamic_range_ratio) * 2.0
+    chroma_gate = (quality.get("quality_gates") or {}).get(
+        "subject_chroma_lineage"
+    )
+    chroma_penalty = 10.0 if bool(
+        isinstance(chroma_gate, dict) and chroma_gate.get("hard_failed", False)
+    ) else 0.0
     return (
         residual
         + coverage_penalty * 2.0
@@ -3016,6 +3525,7 @@ def stage7_quality_score(pipeline, quality: Optional[Dict[str, Any]]) -> float:
         + noise_penalty
         + dynamic_penalty
         + galaxy_core_penalty
+        + chroma_penalty
     )
 
 def stage7_repair_triggers(pipeline, quality: Optional[Dict[str, Any]]) -> List[str]:
@@ -3025,6 +3535,17 @@ def stage7_repair_triggers(pipeline, quality: Optional[Dict[str, Any]]) -> List[
     if not isinstance(derived, dict):
         return []
     triggers: List[str] = []
+    chroma_lineage = quality.get("subject_chroma_lineage")
+    if isinstance(chroma_lineage, dict) and bool(
+        chroma_lineage.get("hard_failed", False)
+    ):
+        if (
+            str(chroma_lineage.get("reason_code") or "")
+            == "stage6_subject_chroma_collapse"
+        ):
+            triggers.append("subject_chroma_collapse")
+        else:
+            triggers.append("subject_chroma_lineage_unverified")
     bright_core_integrity = quality.get("bright_core_integrity")
     if (
         isinstance(bright_core_integrity, dict)
@@ -3149,11 +3670,15 @@ def stage7_single_local_galaxy_halo_override_active(
     gates = quality.get("quality_gates")
     gates = gates if isinstance(gates, dict) else {}
     galaxy_gate = gates.get("galaxy_disk_halo_residue")
-    if (
-        not isinstance(galaxy_gate, dict)
-        or galaxy_gate.get("reason_code")
-        != "single_local_galaxy_halo_evidence"
-        or galaxy_gate.get("hard_failed") is not False
+    if not isinstance(galaxy_gate, dict):
+        return False
+    reason_code = str(galaxy_gate.get("reason_code") or "").strip()
+    if reason_code not in {"", "single_local_galaxy_halo_evidence"}:
+        return False
+    if not (
+        str(galaxy_gate.get("status") or "") == "advisory"
+        and galaxy_gate.get("advisory") is True
+        and galaxy_gate.get("hard_failed") is False
     ):
         return False
     target_type = str(pipeline._active_target_type() or "").strip().lower()
@@ -3162,24 +3687,70 @@ def stage7_single_local_galaxy_halo_override_active(
     derived = quality.get("derived")
     derived = derived if isinstance(derived, dict) else {}
     try:
+        gate_value = float(galaxy_gate["value"])
+        gate_accepted_limit = float(galaxy_gate["accepted_limit"])
+        gate_hard_limit = float(galaxy_gate["hard_limit"])
         corroborated_count = int(
-            derived.get("galaxy_disk_halo_corroborated_local_count", 0) or 0
+            derived["galaxy_disk_halo_corroborated_local_count"]
         )
-        global_halo = max(
-            float(derived.get("global_halo_residue_score", 0.0) or 0.0),
-            0.0,
+        evidence_available = float(
+            derived["galaxy_disk_halo_evidence_available"]
         )
-        compact_halo = max(
-            float(derived.get("compact_halo_residue_score", 0.0) or 0.0),
-            0.0,
+        local_halo = float(derived["galaxy_disk_halo_residue_score"])
+        combined_halo = float(derived["halo_residue_score"])
+        global_halo = float(derived["global_halo_residue_score"])
+        compact_halo = float(derived["compact_halo_residue_score"])
+        accepted_limit = float(
+            pipeline._stage7_effective_halo_threshold()
         )
-        accepted_limit = float(pipeline._stage7_effective_halo_threshold())
-    except (TypeError, ValueError):
+    except (KeyError, TypeError, ValueError):
         return False
+    numeric_evidence = (
+        gate_value,
+        gate_accepted_limit,
+        gate_hard_limit,
+        evidence_available,
+        local_halo,
+        combined_halo,
+        global_halo,
+        compact_halo,
+        accepted_limit,
+    )
+    if not all(math.isfinite(value) for value in numeric_evidence):
+        return False
+    if min(
+        gate_value,
+        gate_accepted_limit,
+        gate_hard_limit,
+        evidence_available,
+        local_halo,
+        combined_halo,
+        global_halo,
+        compact_halo,
+        accepted_limit,
+    ) < 0.0:
+        return False
+    tolerance = max(1e-9, abs(gate_value) * 1e-6)
+    ordinary_advisory_valid = bool(
+        reason_code == ""
+        and gate_accepted_limit < gate_value <= gate_hard_limit
+    )
+    explicit_single_point_override = bool(
+        reason_code == "single_local_galaxy_halo_evidence"
+        and gate_value > gate_accepted_limit
+    )
     return bool(
-        corroborated_count == 1
+        str(quality.get("status") or "") == "ok"
+        and corroborated_count == 1
+        and evidence_available >= 1.0
+        and abs(local_halo - gate_value) <= tolerance
+        and combined_halo + tolerance >= local_halo
+        and abs(gate_accepted_limit - accepted_limit)
+        <= max(1e-9, abs(accepted_limit) * 1e-6)
+        and gate_hard_limit >= gate_accepted_limit
         and global_halo <= accepted_limit
         and compact_halo <= accepted_limit
+        and (ordinary_advisory_valid or explicit_single_point_override)
     )
 
 def stage7_update_star_remix_from_quality(

@@ -370,10 +370,16 @@ try:
         HistoryStoreError,
         UnsafeTaskDeletionError,
         history_task_key,
+        load_verified_run_bundle,
         load_verified_pipeline_result,
         validate_deletable_task_root,
-        verified_result_files,
-        verify_history_run,
+    )
+    from .run_presentation import (
+        RunOutcome,
+        RunPresentation,
+        VerifiedOutput,
+        VerifiedRunBundle,
+        build_run_presentation,
     )
 except ImportError:  # Support direct execution from the gui directory.
     import sys
@@ -420,10 +426,16 @@ except ImportError:  # Support direct execution from the gui directory.
         HistoryStoreError,
         UnsafeTaskDeletionError,
         history_task_key,
+        load_verified_run_bundle,
         load_verified_pipeline_result,
         validate_deletable_task_root,
-        verified_result_files,
-        verify_history_run,
+    )
+    from run_presentation import (  # type: ignore[no-redef]
+        RunOutcome,
+        RunPresentation,
+        VerifiedOutput,
+        VerifiedRunBundle,
+        build_run_presentation,
     )
 
 
@@ -507,6 +519,28 @@ VALID_DENOISE_MODES = frozenset({"auto", "on", "off"})
 VALID_DECONVOLUTION_MODES = frozenset({"auto", "rl", "off"})
 VALID_COMPUTE_MODES = frozenset({"auto", "cpu"})
 
+RUN_INSPECTOR_SECTIONS = (
+    "overview",
+    "stages",
+    "details",
+    "task",
+    "logs",
+)
+
+
+class InspectorStageButton(QPushButton):
+    """Native, keyboard-focusable stage row used by the run inspector."""
+
+    activated = Signal(int)
+
+    def __init__(self, stage: int, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.stage = int(stage)
+        self.setFlat(True)
+        self.setCheckable(False)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.clicked.connect(lambda: self.activated.emit(self.stage))
+
 
 class StarunGui(QMainWindow):
     thread_log = Signal(str)
@@ -552,14 +586,19 @@ class StarunGui(QMainWindow):
         self._recent_directories: list[str] = []
         self._recommended_input_mode = INPUT_MODE_AUTO
         self._result_preview_path: Path | None = None
+        self._result_action_task_root: Path | None = None
         self.preview_worker: InitialPreviewWorker | None = None
         self._preview_request_id = 0
         self._latest_preview_stage = -1
         self._latest_preview_title = ""
         self._latest_preview_path: Path | None = None
         self._workspace_state = WORKSPACE_EMPTY
+        self._non_run_log_expanded = False
         self._ui_running = False
         self._run_terminal_status: str | None = None
+        self._run_presentation = None
+        self._verified_run_bundle = None
+        self._selected_inspector_stage: int | None = None
         self._last_run_snapshot: dict[str, object] | None = None
         self._run_input_mode: str | None = None
         self._input_discovery: InputDiscovery | None = None
@@ -626,7 +665,7 @@ class StarunGui(QMainWindow):
         self._stage_progress_states: dict[int, str] = {}
         self._stage_progress_titles: dict[int, str] = {}
         self._stage_progress_details: dict[int, dict[str, object]] = {}
-        self._stage_items: dict[int, QLabel] = {}
+        self._stage_items: dict[int, InspectorStageButton] = {}
         self._progress_stage_count = 10
         self.input_mode = INPUT_MODE_AUTO
         self.debug_mode_enabled = False
@@ -1318,9 +1357,16 @@ class StarunGui(QMainWindow):
                 button.setChecked(action.isChecked())
                 button.blockSignals(False)
 
-        button.clicked.connect(
-            lambda _checked=False, shared_action=action: shared_action.trigger()
-        )
+        if action.isCheckable():
+            button.toggled.connect(
+                lambda checked, shared_action=action: shared_action.setChecked(
+                    checked
+                )
+            )
+        else:
+            button.clicked.connect(
+                lambda _checked=False, shared_action=action: shared_action.trigger()
+            )
         action.changed.connect(sync_button)
         sync_button()
 
@@ -1693,23 +1739,6 @@ class StarunGui(QMainWindow):
         self.task_splitter.splitterMoved.connect(
             self._on_task_splitter_moved
         )
-        phase_card = QFrame()
-        phase_card.setObjectName("phaseBar")
-        self.task_phase_bar = phase_card
-        phase_layout = QVBoxLayout(phase_card)
-        phase_layout.setContentsMargins(14, 11, 14, 11)
-        phase_row = QHBoxLayout()
-        self.linear_phase_label = QLabel("○ 线性处理 · Stage 1–6")
-        self.nonlinear_phase_label = QLabel("○ 非线性处理 · Stage 7–10")
-        for label in (
-            self.linear_phase_label,
-            self.nonlinear_phase_label,
-        ):
-            label.setProperty("role", "phase")
-            label.setProperty("active", False)
-            phase_row.addWidget(label, 1)
-        phase_layout.addLayout(phase_row)
-
         self.processing_params_panel = self._build_processing_parameters_panel()
         self.processing_params_scroll = QScrollArea()
         self.processing_params_scroll.setObjectName("processingParametersScroll")
@@ -1723,7 +1752,6 @@ class StarunGui(QMainWindow):
         task_top_layout.setContentsMargins(0, 0, 0, 0)
         task_top_layout.setSpacing(12)
         task_top_layout.addWidget(self.task_splitter, 1)
-        task_top_layout.addWidget(phase_card)
         self.task_top_region.setMinimumHeight(180)
 
         self.task_section_splitter = QSplitter(Qt.Orientation.Vertical)
@@ -1753,7 +1781,7 @@ class StarunGui(QMainWindow):
         source_layout = QVBoxLayout(source_card)
         source_layout.setContentsMargins(16, 14, 16, 14)
         source_layout.setSpacing(10)
-        section_title = self._section_title("输入与处理计划")
+        section_title = self._section_title("输入与推荐计划")
         source_layout.addWidget(section_title)
 
         directory_row = QHBoxLayout()
@@ -1792,19 +1820,15 @@ class StarunGui(QMainWindow):
         self.recent_combo.hide()
         source_layout.addLayout(recent_row)
 
-        self.directory_summary_label = QLabel("尚未选择输入")
-        self.directory_summary_label.setAccessibleName("自动处理计划")
-        self.directory_summary_label.setWordWrap(True)
-        source_layout.addWidget(self.directory_summary_label)
-
-        self.source_header_group = QGroupBox("源文件 Header 信息")
+        self.source_header_group = QGroupBox("Header 元数据")
         self.source_header_group.setAccessibleName("源文件 Header 信息")
         self.source_header_group.setAccessibleDescription(
             "从当前选择的 FITS 主 Header 读取设备、滤镜、曝光和拍摄信息"
         )
-        source_header_form = QFormLayout(self.source_header_group)
-        source_header_form.setContentsMargins(12, 10, 12, 10)
-        source_header_form.setSpacing(7)
+        source_header_form = QGridLayout(self.source_header_group)
+        source_header_form.setContentsMargins(12, 9, 12, 9)
+        source_header_form.setHorizontalSpacing(12)
+        source_header_form.setVerticalSpacing(4)
 
         self.source_header_device_label = QLabel("未记录")
         self.source_header_filter_label = QLabel("未记录")
@@ -1819,19 +1843,77 @@ class StarunGui(QMainWindow):
             label.setAccessibleName(accessible_name)
             label.setTextFormat(Qt.TextFormat.PlainText)
             label.setWordWrap(True)
-        source_header_form.addRow("设备名称", self.source_header_device_label)
-        source_header_form.addRow("滤镜名称", self.source_header_filter_label)
-        source_header_form.addRow("曝光时间", self.source_header_exposure_label)
-        source_header_form.addRow("其他重要信息", self.source_header_details_label)
+        for column, (heading, value_label) in enumerate(
+            (
+                ("设备", self.source_header_device_label),
+                ("滤镜", self.source_header_filter_label),
+                ("曝光", self.source_header_exposure_label),
+            )
+        ):
+            heading_label = QLabel(heading)
+            heading_label.setProperty("tone", "muted")
+            source_header_form.addWidget(heading_label, 0, column)
+            source_header_form.addWidget(value_label, 1, column)
+            source_header_form.setColumnStretch(column, 1)
+        source_header_form.addWidget(
+            self.source_header_details_label,
+            2,
+            0,
+            1,
+            3,
+        )
 
         self.source_header_status_label = QLabel("")
         self.source_header_status_label.setAccessibleName("Header 扫描状态")
         self.source_header_status_label.setProperty("tone", "muted")
         self.source_header_status_label.setTextFormat(Qt.TextFormat.PlainText)
         self.source_header_status_label.setWordWrap(True)
-        source_header_form.addRow(self.source_header_status_label)
+        source_header_form.addWidget(
+            self.source_header_status_label,
+            3,
+            0,
+            1,
+            3,
+        )
         self.source_header_group.hide()
         source_layout.addWidget(self.source_header_group)
+
+        self.task_input_banner = QFrame()
+        self.task_input_banner.setObjectName("taskBanner")
+        self.task_input_banner.setProperty("tone", "info")
+        self.task_input_banner.setAccessibleName("输入识别状态")
+        task_banner_layout = QHBoxLayout(self.task_input_banner)
+        task_banner_layout.setContentsMargins(11, 8, 11, 8)
+        self.task_input_status_label = QLabel("○ 尚未选择输入")
+        self.task_input_status_label.setWordWrap(True)
+        self.task_input_status_label.setAccessibleName("输入识别结论")
+        task_banner_layout.addWidget(self.task_input_status_label)
+        source_layout.addWidget(self.task_input_banner)
+
+        source_layout.addWidget(self._section_title("推荐处理计划"))
+        self.directory_summary_label = QLabel("等待识别输入后生成 Stage 1–10 计划。")
+        self.directory_summary_label.setAccessibleName("自动处理计划")
+        self.directory_summary_label.setWordWrap(True)
+        source_layout.addWidget(self.directory_summary_label)
+
+        phase_card = QFrame()
+        phase_card.setObjectName("phaseBar")
+        self.task_phase_bar = phase_card
+        phase_layout = QVBoxLayout(phase_card)
+        phase_layout.setContentsMargins(12, 9, 12, 9)
+        phase_row = QHBoxLayout()
+        self.linear_phase_label = QLabel("○ 线性处理 · Stage 1–6")
+        self.nonlinear_phase_label = QLabel("○ 非线性处理 · Stage 7–10")
+        for label in (
+            self.linear_phase_label,
+            self.nonlinear_phase_label,
+        ):
+            label.setProperty("role", "phase")
+            label.setProperty("active", False)
+            label.setWordWrap(True)
+            phase_row.addWidget(label, 1)
+        phase_layout.addLayout(phase_row)
+        source_layout.addWidget(phase_card)
 
         mode_row = QHBoxLayout()
         mode_label = QLabel("处理方式")
@@ -1863,7 +1945,7 @@ class StarunGui(QMainWindow):
         self.advanced_panel.setAccessibleName("高级设置")
         advanced_layout = QHBoxLayout(self.advanced_panel)
         advanced_layout.setContentsMargins(8, 2, 8, 2)
-        self.processing_params_btn = QPushButton("处理参数…")
+        self.processing_params_btn = QPushButton("高级流水线设置…")
         self.processing_params_btn.setAccessibleName("配置本次图像处理参数")
         self.processing_params_btn.setAccessibleDescription(
             "在当前任务设置下方展开或收起通用配置与 Stage 1–10 分阶段参数"
@@ -1931,7 +2013,8 @@ class StarunGui(QMainWindow):
 
         self.warning_card = QFrame()
         self.warning_card.setObjectName("stateBanner")
-        self.warning_card.setProperty("tone", "warning")
+        self.warning_card.setProperty("tone", "info")
+        self.warning_card.setAccessibleName("运行结果状态")
         self.warning_card.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Maximum,
@@ -1939,10 +2022,12 @@ class StarunGui(QMainWindow):
         warning_layout = QHBoxLayout(self.warning_card)
         warning_layout.setContentsMargins(10, 8, 10, 8)
         self.warning_label = QLabel(
-            "⚠ 处理已完成，但存在降级或失败阶段，请复核最终质量。"
+            "● 正在准备或处理，尚无结果"
         )
         self.warning_label.setWordWrap(True)
-        self.warning_label.setAccessibleName("处理完成警告")
+        self.warning_label.setAccessibleName("运行结果状态说明")
+        self.outcome_card = self.warning_card
+        self.outcome_label = self.warning_label
         self.quality_report_btn = QPushButton("查看质量报告")
         self.quality_report_btn.setAccessibleName("查看最终质量报告")
         self.quality_report_btn.clicked.connect(self._open_quality_report)
@@ -2013,6 +2098,20 @@ class StarunGui(QMainWindow):
         layout.addStretch(1)
 
         layout.addWidget(self._section_title("结果"))
+        self.delivery_status_label = QLabel("● 尚无可交付结果")
+        self.delivery_status_label.setObjectName("deliveryStatus")
+        self.delivery_status_label.setProperty("outcomeState", "preparing")
+        self.delivery_status_label.setAccessibleName("交付状态")
+        self.delivery_status_label.setWordWrap(True)
+        self.verified_outputs_label = QLabel("已验证输出\n—")
+        self.verified_outputs_label.setAccessibleName("已验证输出摘要")
+        self.verified_outputs_label.setProperty("role", "summary")
+        self.verified_outputs_label.setWordWrap(True)
+        self.verified_outputs_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(self.delivery_status_label)
+        layout.addWidget(self.verified_outputs_label)
         self.result_preview_btn = QPushButton("结果预览")
         self.result_preview_btn.setAccessibleName("预览处理结果")
         self.result_preview_btn.clicked.connect(self._open_result_preview)
@@ -2112,6 +2211,38 @@ class StarunGui(QMainWindow):
         self.inspector_tabs.setDocumentMode(True)
         layout.addWidget(self.inspector_tabs)
 
+        overview_tab = QWidget()
+        overview_layout = QVBoxLayout(overview_tab)
+        overview_layout.setContentsMargins(12, 11, 12, 11)
+        overview_layout.setSpacing(8)
+        overview_layout.addWidget(self._section_title("当前结果"))
+        self.overview_outcome_label = QLabel("● 正在准备，尚无结果")
+        self.overview_outcome_label.setObjectName("outcomeStateLabel")
+        self.overview_outcome_label.setProperty("outcomeState", "preparing")
+        self.overview_outcome_label.setAccessibleName("当前运行终态")
+        self.overview_outcome_label.setWordWrap(True)
+        overview_layout.addWidget(self.overview_outcome_label)
+        self.overview_summary_label = QLabel("任务尚未产生可交付结果。")
+        self.overview_summary_label.setWordWrap(True)
+        self.overview_summary_label.setProperty("tone", "muted")
+        overview_layout.addWidget(self.overview_summary_label)
+        overview_layout.addWidget(self._section_title("复核原因与 Issues"))
+        self.overview_issues_label = QLabel("暂无")
+        self.overview_issues_label.setAccessibleName("复核原因和问题列表")
+        self.overview_issues_label.setWordWrap(True)
+        self.overview_issues_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        overview_layout.addWidget(self.overview_issues_label)
+        self.overview_quality_report_btn = QPushButton("查看质量报告")
+        self.overview_quality_report_btn.setAccessibleName("查看最终质量报告")
+        self.overview_quality_report_btn.clicked.connect(
+            self._open_quality_report
+        )
+        self.overview_quality_report_btn.hide()
+        overview_layout.addWidget(self.overview_quality_report_btn)
+        overview_layout.addStretch(1)
+
         stage_tab = QWidget()
         stage_layout = QVBoxLayout(stage_tab)
         stage_layout.setContentsMargins(12, 11, 12, 11)
@@ -2136,8 +2267,42 @@ class StarunGui(QMainWindow):
         self.stage_scroll.setAccessibleName("完整处理阶段列表")
         self.stage_scroll.setWidgetResizable(True)
         self.stage_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.stage_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self.stage_scroll.setWidget(self.stage_stepper)
         stage_layout.addWidget(self.stage_scroll, 1)
+
+        detail_tab = QWidget()
+        detail_layout = QVBoxLayout(detail_tab)
+        detail_layout.setContentsMargins(12, 11, 12, 11)
+        detail_layout.setSpacing(8)
+        self.stage_detail_title_label = self._section_title("阶段详情")
+        detail_layout.addWidget(self.stage_detail_title_label)
+        self.stage_detail_status_label = QLabel("选择一个 Stage 查看执行详情")
+        self.stage_detail_status_label.setProperty("tone", "muted")
+        self.stage_detail_status_label.setWordWrap(True)
+        detail_layout.addWidget(self.stage_detail_status_label)
+        self.stage_detail_text_label = QLabel("—")
+        self.stage_detail_text_label.setAccessibleName("所选阶段执行详情")
+        self.stage_detail_text_label.setWordWrap(True)
+        self.stage_detail_text_label.setAlignment(
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
+        )
+        self.stage_detail_text_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        detail_scroll = QScrollArea()
+        detail_scroll.setAccessibleName("阶段详情内容")
+        detail_scroll.setWidgetResizable(True)
+        detail_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        detail_content = QWidget()
+        detail_content_layout = QVBoxLayout(detail_content)
+        detail_content_layout.setContentsMargins(0, 0, 0, 0)
+        detail_content_layout.addWidget(self.stage_detail_text_label)
+        detail_content_layout.addStretch(1)
+        detail_scroll.setWidget(detail_content)
+        detail_layout.addWidget(detail_scroll, 1)
 
         task_tab = QWidget()
         task_layout = QVBoxLayout(task_tab)
@@ -2168,10 +2333,45 @@ class StarunGui(QMainWindow):
         self.run_configuration_scroll.setWidget(configuration_content)
         task_layout.addWidget(self.run_configuration_scroll)
 
-        self.inspector_tabs.addTab(stage_tab, "阶段")
-        self.inspector_tabs.addTab(task_tab, "任务")
-        self.inspector_tabs.setTabToolTip(0, "查看 Stage 1–10 状态与质量")
-        self.inspector_tabs.setTabToolTip(1, "查看本次运行冻结的配置")
+        log_tab = QWidget()
+        log_layout = QVBoxLayout(log_tab)
+        log_layout.setContentsMargins(12, 11, 12, 11)
+        log_layout.setSpacing(7)
+        log_actions = QHBoxLayout()
+        log_actions.addWidget(self._section_title("运行日志"))
+        log_actions.addStretch(1)
+        self.inspector_open_log_btn = QPushButton("打开日志文件")
+        self.inspector_open_log_btn.setAccessibleName("打开完整日志文件")
+        self._bind_button_to_action(
+            self.inspector_open_log_btn,
+            self.open_log_action,
+        )
+        log_actions.addWidget(self.inspector_open_log_btn)
+        log_layout.addLayout(log_actions)
+        self.inspector_log_view = QPlainTextEdit()
+        self.inspector_log_view.setObjectName("runInspectorLogView")
+        self.inspector_log_view.setAccessibleName("运行检查器详细日志")
+        self.inspector_log_view.setAccessibleDescription(
+            "与主界面日志抽屉共享同一只读日志文档"
+        )
+        self.inspector_log_view.setReadOnly(True)
+        self.inspector_log_view.setLineWrapMode(
+            QPlainTextEdit.LineWrapMode.NoWrap
+        )
+        log_layout.addWidget(self.inspector_log_view, 1)
+
+        tabs = (
+            ("overview", overview_tab, "概览", "查看终态、复核原因和质量报告"),
+            ("stages", stage_tab, "阶段", "查看 Stage 1–10 状态与质量"),
+            ("details", detail_tab, "详情", "查看所选 Stage 的执行与诊断"),
+            ("task", task_tab, "任务", "查看本次运行冻结的配置"),
+            ("logs", log_tab, "日志", "查看本次运行的详细日志"),
+        )
+        self._inspector_section_indexes: dict[str, int] = {}
+        for section, widget, title, tooltip in tabs:
+            index = self.inspector_tabs.addTab(widget, title)
+            self._inspector_section_indexes[section] = index
+            self.inspector_tabs.setTabToolTip(index, tooltip)
         self.inspector_tabs.currentChanged.connect(
             self._on_inspector_tab_changed
         )
@@ -2214,6 +2414,7 @@ class StarunGui(QMainWindow):
         self.log_view.setMinimumHeight(180)
         self.log_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.inspector_log_view.setDocument(self.log_view.document())
         log_layout.addWidget(self.log_view)
         self.log_container.hide()
         outer.addWidget(self.log_container)
@@ -2469,6 +2670,7 @@ class StarunGui(QMainWindow):
             WORKSPACE_TASK,
             WORKSPACE_RUN,
         } else WORKSPACE_EMPTY
+        previous_state = getattr(self, "_workspace_state", WORKSPACE_EMPTY)
         if (
             getattr(self, "_workspace_state", None) == WORKSPACE_TASK
             and hasattr(self, "task_splitter")
@@ -2497,8 +2699,50 @@ class StarunGui(QMainWindow):
         if normalized == WORKSPACE_TASK:
             self.task_splitter.setSizes(self._task_splitter_sizes)
             self._restore_task_section_splitter_sizes()
+        if normalized == WORKSPACE_RUN:
+            if previous_state != WORKSPACE_RUN:
+                self._non_run_log_expanded = self.toggle_log_action.isChecked()
+            self.toggle_log_action.blockSignals(True)
+            self.toggle_log_action.setChecked(False)
+            self.toggle_log_action.blockSignals(False)
+            self.log_toggle_btn.blockSignals(True)
+            self.log_toggle_btn.setChecked(False)
+            self.log_toggle_btn.blockSignals(False)
+            self.log_toggle_btn.setText("详细日志")
+            self.log_toggle_btn.setAccessibleName("在运行检查器中显示详细日志")
+            self.log_container.hide()
+        elif previous_state == WORKSPACE_RUN:
+            expanded = bool(self._non_run_log_expanded)
+            self.toggle_log_action.blockSignals(True)
+            self.toggle_log_action.setChecked(expanded)
+            self.toggle_log_action.blockSignals(False)
+            self.log_toggle_btn.blockSignals(True)
+            self.log_toggle_btn.setChecked(expanded)
+            self.log_toggle_btn.blockSignals(False)
+            self.log_container.setVisible(expanded)
+            self.log_toggle_btn.setText(
+                "详细日志 ▾" if expanded else "详细日志 ▸"
+            )
+            self.log_toggle_btn.setAccessibleName(
+                "折叠详细日志" if expanded else "展开详细日志"
+            )
+        self._update_window_title()
         self._update_toolbar_state()
         self._update_responsive_layout()
+
+    def _update_window_title(self) -> None:
+        if self._workspace_state == WORKSPACE_TASK:
+            title = "Starun — 任务设置"
+        elif self._workspace_state == WORKSPACE_RUN:
+            title = (
+                "Starun — 运行结果"
+                if self._run_terminal_status or self._history_detail_mode
+                else "Starun — 正在处理"
+            )
+        else:
+            title = "Starun"
+        if self.windowTitle() != title:
+            self.setWindowTitle(title)
 
     @staticmethod
     def _format_history_time(value: object) -> str:
@@ -3186,33 +3430,47 @@ class StarunGui(QMainWindow):
             QMessageBox.warning(parent, "历史记录不可用", "所选运行记录不存在。")
             return
         try:
-            workspace, _run_manifest, run_root = verify_history_run(
-                task_root,
-                run_id,
-            )
-        except (HistoryStoreError, OSError, TypeError, ValueError) as error:
+            workspace = validate_deletable_task_root(task_root)
+            run_root = (workspace.runs_dir / str(run_id)).resolve()
+            relative_run = run_root.relative_to(workspace.runs_dir.resolve())
+            if (
+                len(relative_run.parts) != 1
+                or not run_root.is_dir()
+                or run_root.is_symlink()
+            ):
+                raise HistoryStoreError("运行目录不存在或不是任务 runs 的直接子目录")
+        except (
+            HistoryStoreError,
+            UnsafeTaskDeletionError,
+            OSError,
+            TypeError,
+            ValueError,
+        ) as error:
             QMessageBox.warning(
                 parent,
-                "历史运行无法验证",
+                "历史运行位置不可用",
                 str(error),
             )
             return
 
-        result_error = ""
-        try:
-            result = load_verified_pipeline_result(run_root)
-        except HistoryStoreError as error:
-            result = None
-            result_error = str(error)
+        indexed_status = str(run_record.get("status") or STATUS_INTERRUPTED)
+        bundle, presentation, load_error = self._verified_run_presentation(
+            workspace.root,
+            str(run_id),
+            fallback_status=indexed_status,
+        )
+        result = bundle.result if bundle is not None else None
+        verified_manifest = bundle.run_manifest if bundle is not None else {}
         self._save_history_window_geometry()
         self.history_window.hide()
-        status = str(run_record.get("status") or STATUS_INTERRUPTED)
         self._history_detail_mode = True
         self._active_history_task_key = task_key
         self._active_history_run_id = run_id
         self._historical_run_root = run_root
+        self._historical_result_files = ()
         self._last_task_root = workspace.root
-        self._run_terminal_status = self._history_ui_terminal_status(status)
+        self._current_work_dir = run_root
+        self._run_terminal_status = self._run_outcome_value(presentation.status)
         self._last_run_snapshot = None
 
         self._progress_timer.stop()
@@ -3225,10 +3483,17 @@ class StarunGui(QMainWindow):
         )
         stage_count = 10
         self._reset_stage_progress(stage_count)
-        for stage, raw_step in enumerate(actual_steps[:stage_count], start=1):
+        loaded_stages: list[int] = []
+        for index, raw_step in enumerate(actual_steps, start=1):
             if not isinstance(raw_step, dict):
                 continue
             payload = dict(raw_step)
+            try:
+                stage = int(payload.get("stage") or index)
+            except (TypeError, ValueError):
+                continue
+            if stage < 1 or stage > stage_count:
+                continue
             payload["title"] = str(
                 payload.get("title") or payload.get("name") or ""
             )
@@ -3239,14 +3504,17 @@ class StarunGui(QMainWindow):
                 duration = 0.0
             self._stage_elapsed_seconds[stage] = duration
             self._update_stage_chip(stage)
+            loaded_stages.append(stage)
+        if loaded_stages:
+            self._select_inspector_stage(max(loaded_stages), show_details=False)
 
-        status_text = self._history_status_text(status)
+        status_text = presentation.title
         self.progress_summary_label.setText(f"历史运行：{status_text}")
         self.progress_summary_label.setAccessibleDescription(
             f"历史运行状态：{status_text}"
         )
         self.stage_timing_label.setText("历史运行 · 阶段耗时见右侧")
-        self.run_phase_label.setText(f"历史记录 · {STATUS_LABELS.get(status, status)}")
+        self.run_phase_label.setText(f"历史记录 · {status_text}")
         self.run_task_name_label.setText(
             str(task.get("display_name") or task_root.name)
         )
@@ -3263,44 +3531,26 @@ class StarunGui(QMainWindow):
         plan_path = run_root / "processing-plan.json"
         option_lines = ["只读历史记录"]
         frozen_parameter_lines = self._processing_payload_summary_lines(
-            _run_manifest.get("processing_parameters"),
+            verified_manifest.get("processing_parameters"),
             history_input_mode,
         )
         if frozen_parameter_lines:
             option_lines.extend(frozen_parameter_lines)
-        elif plan_path.is_file():
-            option_lines.append("参数快照：processing-plan.json")
+        elif bundle is None:
+            option_lines.append("冻结配置：运行清单无法验证")
+        elif bundle.plan_verified and plan_path.is_file():
+            option_lines.append("参数快照：processing-plan.json 已验证")
         if run_record.get("failure_reason"):
             option_lines.append("说明：" + str(run_record["failure_reason"]))
-        if result_error:
-            option_lines.append("结果清单：验证失败")
+        if presentation.integrity_error or load_error:
+            option_lines.append("结果链：验证失败")
         self.run_options_label.setText("\n".join(option_lines))
 
         self.preview_canvas.clear_image()
-        result_files = (
-            verified_result_files(run_root, result)
-            if isinstance(result, dict)
-            else ()
-        )
-        self._historical_result_files = result_files
-        png_files = [path for path in result_files if path.suffix.lower() == ".png"]
-        preview_path = max(png_files, key=safe_mtime) if png_files else None
-        if preview_path is None:
-            persisted_preview = run_root / "process" / "ui_preview" / "latest.png"
-            if persisted_preview.is_file():
-                preview_path = persisted_preview
-        self._result_preview_path = preview_path
-        if preview_path is not None and self._display_latest_preview(
-            preview_path,
-            stage=min(10, len(actual_steps) or 10),
-            title="历史运行",
-        ):
-            self.preview_activity_label.setText("历史运行预览")
-            self.preview_notice_label.setText("历史预览 · 只读显示")
-        else:
-            self.preview_activity_label.setText("历史预览不可用")
-            self.preview_stage_label.setText("预览：不可用")
-            self.preview_status_label.setText("预览：历史结果不可用")
+        self._latest_preview_stage = -1
+        self._latest_preview_title = ""
+        self._latest_preview_path = None
+        self._result_preview_path = None
 
         self.run_log_path = self._history_run_log_path(run_root, run_record)
         self.log_view.clear()
@@ -3311,35 +3561,14 @@ class StarunGui(QMainWindow):
             detail = str(run_record.get("failure_reason") or "没有保存运行日志。")
             self.log_view.setPlainText(detail)
 
-        has_results = bool(result_files)
-        self.open_result_action.setEnabled(has_results)
-        self.result_preview_btn.setEnabled(
-            self._result_preview_path is not None
-            and self._result_preview_path.is_file()
-        )
-        if status in {STATUS_PARTIAL_SUCCESS, STATUS_REVIEW_REQUIRED}:
-            self._show_run_banner(
-                "warning",
-                "这是只读历史运行；处理结果需要复核。",
-                show_log=True,
-            )
-        elif status == STATUS_SUCCESS:
-            self._show_run_banner("success", "这是只读历史运行。")
-        elif status == STATUS_STOPPED:
-            self._show_run_banner(
-                "info",
-                "这是已中止的只读历史运行。",
-                show_log=True,
-            )
-        else:
-            self._show_run_banner(
-                "error",
-                "这是失败或异常中断的只读历史运行。",
-                show_log=True,
-            )
         self._show_workspace(WORKSPACE_RUN)
+        self._apply_run_presentation(
+            presentation,
+            bundle,
+            load_error=load_error,
+        )
         self._set_status_message(
-            f"历史记录 · {STATUS_LABELS.get(status, status or '未知')}"
+            f"历史记录 · {presentation.title}"
         )
         self.show()
         self.raise_()
@@ -3437,6 +3666,11 @@ class StarunGui(QMainWindow):
         )
         task_state = self._workspace_state == WORKSPACE_TASK
         run_state = self._workspace_state == WORKSPACE_RUN
+        discovery = getattr(self, "_input_discovery", None)
+        input_accepted = bool(
+            discovery is not None and getattr(discovery, "accepted", False)
+        )
+        can_start = bool(task_state and not running and input_accepted)
         terminal = bool(run_state and self._run_terminal_status)
         historical_terminal = bool(terminal and self._history_detail_mode)
         can_rerun = bool(
@@ -3471,7 +3705,7 @@ class StarunGui(QMainWindow):
             self._update_history_selection_actions()
 
         self.task_options_action.setEnabled(task_state and not running)
-        self.start_action.setEnabled(task_state and not running)
+        self.start_action.setEnabled(can_start)
         self.stop_action.setEnabled(
             (run_state and running) or (task_state and intake_running)
         )
@@ -3491,6 +3725,7 @@ class StarunGui(QMainWindow):
             self.zoom_out_action,
         ):
             action.setEnabled(run_state)
+        self.clear_view_action.setEnabled(not self._history_detail_mode)
         self.preferences_action.setEnabled(True)
 
     def _preferences_snapshot(self) -> dict[str, object]:
@@ -3861,6 +4096,19 @@ class StarunGui(QMainWindow):
         if not self._restoring_settings:
             self._save_settings()
 
+    def _current_inspector_section(self) -> str:
+        current = self.inspector_tabs.currentIndex()
+        for section, index in self._inspector_section_indexes.items():
+            if index == current:
+                return section
+        return "overview"
+
+    def _set_inspector_section(self, section: str) -> None:
+        normalized = section if section in RUN_INSPECTOR_SECTIONS else "overview"
+        index = self._inspector_section_indexes.get(normalized, 0)
+        if self.inspector_tabs.currentIndex() != index:
+            self.inspector_tabs.setCurrentIndex(index)
+
     def _on_inspector_tab_changed(self, _index: int) -> None:
         if not self._restoring_settings:
             self._save_settings()
@@ -4115,9 +4363,13 @@ class StarunGui(QMainWindow):
                 self.start_btn,
                 self.stop_btn,
                 self.quality_report_btn,
+                self.overview_quality_report_btn,
+                self.inspector_tabs,
                 self.result_preview_btn,
                 self.open_result_btn,
                 self.log_toggle_btn,
+                self.inspector_open_log_btn,
+                self.inspector_log_view,
                 self.open_log_btn,
                 self.clear_view_btn,
                 self.log_view,
@@ -4160,9 +4412,13 @@ class StarunGui(QMainWindow):
             self.start_btn,
             self.stop_btn,
             self.quality_report_btn,
+            self.overview_quality_report_btn,
+            self.inspector_tabs,
             self.result_preview_btn,
             self.open_result_btn,
             self.log_toggle_btn,
+            self.inspector_open_log_btn,
+            self.inspector_log_view,
             self.open_log_btn,
             self.clear_view_btn,
             self.log_view,
@@ -4189,6 +4445,7 @@ class StarunGui(QMainWindow):
         self._stage_progress_titles.clear()
         self._stage_progress_details.clear()
         self._stage_items.clear()
+        self._selected_inspector_stage = None
         while self.stage_stepper_layout.count():
             layout_item = self.stage_stepper_layout.takeAt(0)
             widget = layout_item.widget()
@@ -4207,10 +4464,14 @@ class StarunGui(QMainWindow):
                 phase_label.setContentsMargins(2, 6, 2, 2)
                 self.stage_stepper_layout.addWidget(phase_label)
             title = PIPELINE_STAGE_TITLES.get(stage, f"阶段 {stage}")
-            chip = QLabel()
-            chip.setWordWrap(True)
+            chip = InspectorStageButton(stage)
+            chip.setText(" ")
+            chip.setAccessibleDescription(
+                f"Stage {stage}，按下可查看阶段详情"
+            )
+            chip.activated.connect(self._select_inspector_stage)
             chip.setSizePolicy(
-                QSizePolicy.Policy.Preferred,
+                QSizePolicy.Policy.Ignored,
                 QSizePolicy.Policy.Minimum,
             )
             self.stage_stepper_layout.addWidget(chip)
@@ -4225,6 +4486,12 @@ class StarunGui(QMainWindow):
         )
         if hasattr(self, "stage_timing_label"):
             self.stage_timing_label.setText("本阶段 — · 总耗时 —")
+        if hasattr(self, "stage_detail_status_label"):
+            self.stage_detail_title_label.setText("阶段详情")
+            self.stage_detail_status_label.setText(
+                "选择一个 Stage 查看执行详情"
+            )
+            self.stage_detail_text_label.setText("—")
 
     @staticmethod
     def _format_stage_component_summary(payload: dict[str, object]) -> str:
@@ -4313,7 +4580,13 @@ class StarunGui(QMainWindow):
             }
             fallback_text = fallback_labels.get(fallback_reason, fallback_reason)
             if fallback_text:
-                prefix = "Stage 9 已使用回退：" + fallback_text
+                try:
+                    fallback_stage = int(payload.get("stage") or 9)
+                except (TypeError, ValueError):
+                    fallback_stage = 9
+                prefix = (
+                    f"Stage {fallback_stage} 已使用回退：" + fallback_text
+                )
                 if upstream_passthrough:
                     prefix += "；上游为 Stage 8 安全旁路源"
                 return prefix
@@ -4326,6 +4599,114 @@ class StarunGui(QMainWindow):
             "star_preserve_target_bypass": "目标要求保留星点，使用安全旁路",
         }
         return reason_labels.get(reason_code, "")
+
+    @staticmethod
+    def _stage_requires_review(payload: Mapping[str, object]) -> bool:
+        reasons = payload.get("review_reasons")
+        return bool(
+            payload.get("review_required", False)
+            or (isinstance(reasons, (list, tuple)) and reasons)
+        )
+
+    def _select_inspector_stage(
+        self,
+        stage: int,
+        *,
+        show_details: bool = True,
+    ) -> None:
+        normalized = int(stage)
+        if normalized < 1 or normalized > 10:
+            return
+        previous = self._selected_inspector_stage
+        self._selected_inspector_stage = normalized
+        if previous is not None and previous in self._stage_items:
+            self._update_stage_chip(previous)
+        self._update_stage_chip(normalized)
+        self._update_selected_stage_detail()
+        if show_details:
+            self._set_inspector_section("details")
+            self.toggle_inspector_action.setChecked(True)
+
+    def _update_selected_stage_detail(self) -> None:
+        if not hasattr(self, "stage_detail_text_label"):
+            return
+        stage = self._selected_inspector_stage
+        if stage is None:
+            self.stage_detail_title_label.setText("阶段详情")
+            self.stage_detail_status_label.setText(
+                "选择一个 Stage 查看执行详情"
+            )
+            self.stage_detail_text_label.setText("—")
+            return
+        payload = self._stage_progress_details.get(stage, {})
+        title = self._stage_progress_titles.get(
+            stage,
+            PIPELINE_STAGE_TITLES.get(stage, f"阶段 {stage}"),
+        )
+        state = self._stage_progress_states.get(stage, "waiting")
+        state_text = PIPELINE_PROGRESS_STATE_LABELS.get(state, state)
+        review_required = self._stage_requires_review(payload)
+        self.stage_detail_title_label.setText(f"Stage {stage} · {title}")
+        status_text = f"执行状态：{state_text}"
+        if review_required:
+            status_text += " · ⚠ 需要复核"
+        self.stage_detail_status_label.setText(status_text)
+        set_style_property(
+            self.stage_detail_status_label,
+            "stageState",
+            "review" if review_required else state,
+        )
+
+        execution = str(payload.get("execution") or "waiting")
+        duration = payload.get("duration_seconds")
+        if duration is None:
+            duration = self._stage_elapsed_seconds.get(stage)
+        try:
+            duration_text = self._format_elapsed(float(duration))
+        except (TypeError, ValueError):
+            duration_text = "—"
+        lines = [
+            f"执行：{execution}",
+            f"耗时：{duration_text}",
+        ]
+        components = self._format_stage_component_summary(dict(payload))
+        if components:
+            lines.append("Components：" + components)
+        fallback_used = bool(payload.get("fallback_used", False))
+        fallback_note = self._format_stage_detail_note(dict(payload))
+        lines.append("Fallback：" + ("已使用" if fallback_used else "未使用"))
+        if fallback_note:
+            lines.append("说明：" + fallback_note)
+        review_reasons = payload.get("review_reasons")
+        if isinstance(review_reasons, (list, tuple)) and review_reasons:
+            lines.append("复核原因：")
+            lines.extend(f"• {reason}" for reason in review_reasons)
+        raw_issues = payload.get("issues")
+        diagnostic_codes: list[str] = []
+        if isinstance(raw_issues, (list, tuple)) and raw_issues:
+            lines.append("Issues：")
+            for issue in raw_issues:
+                if isinstance(issue, Mapping):
+                    code = str(issue.get("code") or "").strip()
+                    message = str(
+                        issue.get("message") or issue.get("detail") or code
+                    ).strip()
+                    severity = str(issue.get("severity") or "info").strip()
+                    lines.append(f"• [{severity}] {message}")
+                    if code:
+                        diagnostic_codes.append(code)
+                else:
+                    lines.append(f"• {issue}")
+        reason_code = str(payload.get("reason_code") or "").strip()
+        if reason_code:
+            diagnostic_codes.append(reason_code)
+        raw_codes = payload.get("diagnostic_codes")
+        if isinstance(raw_codes, (list, tuple, set)):
+            diagnostic_codes.extend(str(code) for code in raw_codes if code)
+        if diagnostic_codes:
+            unique_codes = tuple(dict.fromkeys(diagnostic_codes))
+            lines.append("诊断代码：" + "、".join(unique_codes))
+        self.stage_detail_text_label.setText("\n".join(lines))
 
     def _update_stage_chip(self, stage: int) -> None:
         chip = self._stage_items.get(stage)
@@ -4356,13 +4737,26 @@ class StarunGui(QMainWindow):
         stage_detail = self._stage_progress_details.get(stage, {})
         component_summary = self._format_stage_component_summary(stage_detail)
         detail_note = self._format_stage_detail_note(stage_detail)
+        review_required = self._stage_requires_review(stage_detail)
         extra_text = component_summary or detail_note
         chip_text = f"{symbol}  Stage {stage} · {short_title}    {state_text}"
+        if review_required:
+            chip_text += " · ⚠ 需复核"
         if extra_text:
             chip_text += f"\n   {extra_text}"
         chip.setText(chip_text)
         chip.setAccessibleName(f"阶段 {stage}：{short_title}")
-        set_style_property(chip, "stageState", state)
+        visual_state = (
+            "selected"
+            if self._selected_inspector_stage == stage
+            else "review"
+            if review_required
+            else state
+        )
+        set_style_property(chip, "stageState", visual_state)
+        set_style_property(chip, "executionState", state)
+        set_style_property(chip, "reviewState", "review" if review_required else "none")
+        set_style_property(chip, "selected", self._selected_inspector_stage == stage)
         elapsed = self._stage_elapsed_seconds.get(stage)
         elapsed_text = self._format_elapsed(elapsed) if elapsed is not None else "—"
         tooltip = (
@@ -4370,12 +4764,16 @@ class StarunGui(QMainWindow):
             f"状态：{state_text}\n"
             f"耗时：{elapsed_text}"
         )
+        if review_required:
+            tooltip += "\n复核：需要人工复核"
         if component_summary:
             tooltip += f"\n子状态：{component_summary}"
         if detail_note:
             tooltip += f"\n说明：{detail_note}"
         chip.setToolTip(tooltip)
         chip.setAccessibleDescription(chip.toolTip())
+        if self._selected_inspector_stage == stage:
+            self._update_selected_stage_detail()
         if state == "running" and hasattr(self, "stage_scroll"):
             self.stage_scroll.ensureWidgetVisible(chip, 0, 8)
 
@@ -4865,7 +5263,7 @@ class StarunGui(QMainWindow):
         layout.setSpacing(10)
 
         header = QHBoxLayout()
-        title = QLabel("处理参数")
+        title = QLabel("高级流水线设置")
         title.setObjectName("sectionTitle")
         self.processing_sheet_note = QLabel("阶段参数仅用于当前任务；通用配置会保留。")
         self.processing_sheet_note.setWordWrap(True)
@@ -6047,7 +6445,7 @@ class StarunGui(QMainWindow):
                 restore_sizes()
                 QTimer.singleShot(0, restore_sizes)
         self.processing_params_btn.setText(
-            "收起处理参数" if expanded else "处理参数…"
+            "收起高级流水线设置" if expanded else "高级流水线设置…"
         )
         self.processing_params_btn.setAccessibleName(
             "收起处理参数设置" if expanded else "展开处理参数设置"
@@ -6142,7 +6540,7 @@ class StarunGui(QMainWindow):
                 restore_sizes()
                 QTimer.singleShot(0, restore_sizes)
         self.advanced_toggle_btn.setText(
-            "高级设置 ▾" if expanded else "高级设置 ▸"
+            "任务选项 ▾" if expanded else "任务选项 ▸"
         )
         self.advanced_toggle_btn.setAccessibleName(
             "折叠高级设置" if expanded else "展开高级设置"
@@ -6151,6 +6549,24 @@ class StarunGui(QMainWindow):
             self._save_settings()
 
     def _on_log_toggled(self, expanded: bool) -> None:
+        if self._workspace_state == WORKSPACE_RUN:
+            self.log_container.hide()
+            if expanded:
+                self.toggle_inspector_action.setChecked(True)
+                self._set_inspector_section("logs")
+                self.inspector_log_view.setFocus()
+            self.toggle_log_action.blockSignals(True)
+            self.toggle_log_action.setChecked(False)
+            self.toggle_log_action.blockSignals(False)
+            self.log_toggle_btn.blockSignals(True)
+            self.log_toggle_btn.setChecked(False)
+            self.log_toggle_btn.blockSignals(False)
+            self.log_toggle_btn.setText("详细日志")
+            self.log_toggle_btn.setAccessibleName(
+                "在运行检查器中显示详细日志"
+            )
+            return
+        self._non_run_log_expanded = bool(expanded)
         if self.log_toggle_btn.isChecked() != expanded:
             self.log_toggle_btn.blockSignals(True)
             self.log_toggle_btn.setChecked(expanded)
@@ -6237,15 +6653,25 @@ class StarunGui(QMainWindow):
             self.toggle_inspector_action.setChecked(
                 self.settings.value("ui/runInspectorVisible", True, type=bool)
             )
-            try:
-                inspector_tab = int(
-                    self.settings.value("ui/runInspectorTab", 0)
+            inspector_section = str(
+                self.settings.value("ui/runInspectorSection", "") or ""
+            ).strip()
+            if inspector_section not in RUN_INSPECTOR_SECTIONS:
+                try:
+                    legacy_tab = int(
+                        self.settings.value("ui/runInspectorTab", -1)
+                    )
+                except (TypeError, ValueError):
+                    legacy_tab = -1
+                inspector_section = {
+                    0: "stages",
+                    1: "task",
+                }.get(legacy_tab, "overview")
+                self.settings.setValue(
+                    "ui/runInspectorSection",
+                    inspector_section,
                 )
-            except (TypeError, ValueError):
-                inspector_tab = 0
-            self.inspector_tabs.setCurrentIndex(
-                min(max(0, inspector_tab), self.inspector_tabs.count() - 1)
-            )
+            self._set_inspector_section(inspector_section)
 
             self.debug_mode_enabled = self.settings.value(
                 "advanced/keepIntermediateFiles", False, type=bool
@@ -6461,10 +6887,15 @@ class StarunGui(QMainWindow):
             self.toggle_inspector_action.isChecked(),
         )
         self.settings.setValue(
-            "ui/runInspectorTab",
-            self.inspector_tabs.currentIndex(),
+            "ui/runInspectorSection",
+            self._current_inspector_section(),
         )
-        self.settings.setValue("ui/logExpanded", self.log_toggle_btn.isChecked())
+        log_expanded = (
+            self._non_run_log_expanded
+            if self._workspace_state == WORKSPACE_RUN
+            else self.log_toggle_btn.isChecked()
+        )
+        self.settings.setValue("ui/logExpanded", log_expanded)
         self._store_window_geometry_settings()
         self.settings.setValue("modeSelection", UI_MODE_RECOMMENDED)
         self.settings.setValue("recentDirectories", self._recent_directories)
@@ -6955,6 +7386,51 @@ class StarunGui(QMainWindow):
         self.source_header_status_label.setAccessibleDescription(summary.message)
         self.source_header_group.show()
 
+    def _set_task_input_presentation(
+        self,
+        discovery: InputDiscovery | None,
+    ) -> None:
+        if discovery is None:
+            set_style_property(self.task_input_banner, "tone", "info")
+            self.task_input_status_label.setText("○ 尚未选择有效输入")
+            self.task_input_status_label.setAccessibleDescription(
+                "尚未选择有效输入，开始处理不可用"
+            )
+            self.directory_summary_label.setText(
+                "等待识别输入后生成 Stage 1–10 计划。"
+            )
+            return
+
+        trust = str(getattr(discovery.trust, "value", discovery.trust))
+        if not discovery.accepted:
+            tone = "error"
+            symbol = "✕"
+            heading = "输入无效"
+        elif discovery.warnings or trust == "review_required":
+            tone = "warning"
+            symbol = "⚠"
+            heading = "输入需要复核"
+        elif discovery.kind == InputKind.PRODUCT_TASK and trust == "verified":
+            tone = "success"
+            symbol = "✓"
+            heading = "产品任务已验证"
+        else:
+            tone = "success"
+            symbol = "✓"
+            heading = "输入已识别"
+        messages = [
+            discovery.summary,
+            *discovery.warnings,
+            *discovery.errors,
+        ]
+        detail = "\n".join(message for message in messages if message)
+        label_text = f"{symbol} {heading}"
+        if detail:
+            label_text += f" · {detail}"
+        set_style_property(self.task_input_banner, "tone", tone)
+        self.task_input_status_label.setText(label_text)
+        self.task_input_status_label.setAccessibleDescription(label_text)
+
     def _analyze_selected_directory(self) -> None:
         text = self.dir_edit.text().strip()
         selected_path = Path(text).expanduser() if text else None
@@ -6965,9 +7441,7 @@ class StarunGui(QMainWindow):
             if self.mode_combo.currentData() == UI_MODE_RECOMMENDED:
                 self.input_mode = INPUT_MODE_AUTO
             self.mode_combo.setItemText(0, "自动推荐（完整处理）")
-            self.directory_summary_label.setText(
-                "尚未选择有效输入，可拖入 FITS/XISF 文件、Light 目录或产品任务。"
-            )
+            self._set_task_input_presentation(None)
             self.linear_phase_label.setText("— 线性处理未计划")
             self.nonlinear_phase_label.setText("— 非线性处理未计划")
             self._update_result_actions(None)
@@ -7004,13 +7478,8 @@ class StarunGui(QMainWindow):
                 self.mode_combo.blockSignals(False)
         self.input_mode = recommended_mode
         presentation = describe_input_plan(discovery)
-        details = [
-            discovery.summary,
-            presentation.summary,
-            *discovery.warnings,
-            *discovery.errors,
-        ]
-        self.directory_summary_label.setText("\n".join(details))
+        self._set_task_input_presentation(discovery)
+        self.directory_summary_label.setText(presentation.summary)
         self.linear_phase_label.setText(presentation.linear_phase)
         self.nonlinear_phase_label.setText(presentation.nonlinear_phase)
         result_root = (
@@ -7021,37 +7490,39 @@ class StarunGui(QMainWindow):
         self._update_result_actions(result_root)
         if self._workspace_state != WORKSPACE_RUN:
             self._show_workspace(WORKSPACE_TASK)
+        else:
+            self._update_toolbar_state()
         if not self._restoring_settings:
             self._schedule_initial_preview(selected_path)
 
     def _find_result_preview(self, work_dir: Path) -> Path | None:
-        preferred_candidates: set[Path] = set()
-        if (work_dir / "task-manifest.json").is_file():
-            preferred_candidates.update(
-                path
-                for path in latest_result_files(
-                    work_dir,
-                    suffixes={".png"},
-                )
-                if path.suffix.lower() == ".png"
+        if not (work_dir / "task-manifest.json").is_file():
+            return None
+        verified_pngs = tuple(
+            path
+            for path in latest_result_files(
+                work_dir,
+                suffixes={".png"},
             )
-        for pattern in (
-            "*_ai.png",
-            "result_review*.png",
-            "result_processed*.png",
-            "*_processed*.png",
-        ):
-            preferred_candidates.update(
-                path for path in work_dir.glob(pattern) if path.is_file()
-            )
-        if preferred_candidates:
-            return max(preferred_candidates, key=safe_mtime)
-        candidates = [path for path in work_dir.glob("*.png") if path.is_file()]
-        return max(candidates, key=safe_mtime) if candidates else None
+            if path.is_file() and path.suffix.lower() == ".png"
+        )
+        return max(verified_pngs, key=safe_mtime) if verified_pngs else None
 
     def _update_result_actions(self, work_dir: Path | None) -> None:
-        valid_directory = bool(work_dir and work_dir.is_dir())
-        self.open_result_action.setEnabled(valid_directory)
+        verified_files = (
+            latest_result_files(work_dir)
+            if work_dir is not None
+            and work_dir.is_dir()
+            and (work_dir / "task-manifest.json").is_file()
+            else ()
+        )
+        self._result_action_task_root = (
+            work_dir.expanduser().resolve()
+            if work_dir is not None and verified_files
+            else None
+        )
+        self.open_result_action.setText("打开结果文件夹")
+        self.open_result_action.setEnabled(bool(verified_files))
         self._result_preview_path = (
             self._find_result_preview(work_dir) if work_dir is not None else None
         )
@@ -7408,10 +7879,27 @@ class StarunGui(QMainWindow):
         return lines
 
     def _open_result_dir(self) -> None:
+        presentation = getattr(self, "_run_presentation", None)
+        bundle = getattr(self, "_verified_run_bundle", None)
+        result_outputs = (
+            self._run_presentation_result_outputs(presentation)
+            if isinstance(presentation, RunPresentation)
+            else ()
+        )
+        may_show_current_result = bool(
+            isinstance(presentation, RunPresentation)
+            and (
+                presentation.delivery_eligible
+                or self._run_presentation_is_review_only(presentation)
+            )
+        )
         if self._history_detail_mode:
             run_root = self._historical_run_root
-            if run_root is not None and run_root.is_dir() and any(
-                path.is_file() for path in self._historical_result_files
+            if (
+                may_show_current_result
+                and run_root is not None
+                and run_root.is_dir()
+                and any(path.is_file() for path in self._historical_result_files)
             ):
                 QDesktopServices.openUrl(QUrl.fromLocalFile(str(run_root)))
                 return
@@ -7421,21 +7909,36 @@ class StarunGui(QMainWindow):
                 "该次运行的交付文件已清理、缺失或未通过校验。",
             )
             return
-        task_root = self._last_task_root
-        if self._active_prepared_task is not None:
-            task_root = self._active_prepared_task.workspace.root
-        if task_root is not None and task_root.is_dir():
-            result_directory = latest_result_directory(task_root)
-            QDesktopServices.openUrl(
-                QUrl.fromLocalFile(
-                    str(result_directory or (task_root / "results"))
-                )
+        if (
+            self._workspace_state == WORKSPACE_RUN
+            and may_show_current_result
+            and isinstance(presentation, RunPresentation)
+            and isinstance(bundle, VerifiedRunBundle)
+            and presentation.output_kind in {"formal", "review"}
+            and any(output.path.is_file() for output in result_outputs)
+        ):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(bundle.run_root)))
+            return
+        if self._workspace_state == WORKSPACE_RUN:
+            QMessageBox.information(
+                self,
+                "当前运行没有可显示的结果",
+                "本轮没有通过验证的正式结果或复核候选，未打开其他运行的旧结果。",
             )
             return
-        path = self.dir_edit.text().strip()
-        expanded = Path(path).expanduser() if path else None
-        if expanded is not None and expanded.is_dir():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(expanded)))
+        task_root = self._result_action_task_root
+        if task_root is not None and task_root.is_dir():
+            result_directory = latest_result_directory(task_root)
+            if result_directory is not None:
+                QDesktopServices.openUrl(
+                    QUrl.fromLocalFile(str(result_directory))
+                )
+                return
+        QMessageBox.information(
+            self,
+            "当前任务没有可显示的结果",
+            "当前任务没有仍可验证的最新结果，未打开其他任务的旧结果。",
+        )
 
     def _open_log_file(self) -> None:
         if self.run_log_path and self.run_log_path.exists():
@@ -7480,6 +7983,374 @@ class StarunGui(QMainWindow):
             quality_report=True,
         )
 
+    @staticmethod
+    def _run_outcome_value(outcome: object) -> str:
+        return str(getattr(outcome, "value", outcome) or "").strip().lower()
+
+    @classmethod
+    def _run_presentation_is_review_only(
+        cls,
+        presentation: RunPresentation,
+    ) -> bool:
+        outcome = cls._run_outcome_value(presentation.status)
+        return bool(
+            not presentation.delivery_eligible
+            and (
+                outcome == RunOutcome.REVIEW_REQUIRED.value
+                or (
+                    outcome
+                    in {
+                        RunOutcome.SUCCESS.value,
+                        RunOutcome.PARTIAL_SUCCESS.value,
+                    }
+                    and presentation.output_kind == "review"
+                )
+            )
+        )
+
+    @classmethod
+    def _run_presentation_result_outputs(
+        cls,
+        presentation: RunPresentation,
+    ) -> tuple[VerifiedOutput, ...]:
+        """Return only artifacts that the current action may present as results."""
+
+        formal_names = set(presentation.formal_output_names)
+        if presentation.delivery_eligible:
+            return tuple(
+                output
+                for output in presentation.verified_outputs
+                if output.kind == "formal"
+                and output.name in formal_names
+                and output.path.is_file()
+            )
+        if cls._run_presentation_is_review_only(presentation):
+            return tuple(
+                output
+                for output in presentation.verified_outputs
+                if (
+                    output.kind == "review"
+                    or (
+                        output.kind == "formal"
+                        and output.name in formal_names
+                    )
+                )
+                and output.path.is_file()
+            )
+        return ()
+
+    @staticmethod
+    def _last_result_stage(result: Mapping[str, object] | None) -> int:
+        if not isinstance(result, Mapping):
+            return 0
+        steps = result.get("actual_steps")
+        if not isinstance(steps, list):
+            return 0
+        stages: list[int] = []
+        for index, step in enumerate(steps, start=1):
+            if not isinstance(step, Mapping):
+                continue
+            try:
+                stage = int(step.get("stage") or index)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= stage <= 10:
+                stages.append(stage)
+        return max(stages, default=0)
+
+    def _run_presentation_issues(
+        self,
+        presentation: RunPresentation,
+        *,
+        load_error: str = "",
+    ) -> list[str]:
+        lines: list[str] = []
+        for requirement in presentation.review_requirements:
+            code = str(requirement.get("code") or "").strip()
+            message = str(
+                requirement.get("message")
+                or requirement.get("reason")
+                or code
+            ).strip()
+            if message:
+                lines.append("⚠ " + message)
+        for issue in presentation.issues:
+            code = str(issue.get("code") or "").strip()
+            message = str(issue.get("message") or code).strip()
+            severity = str(issue.get("severity") or "info").strip().lower()
+            symbol = "✕" if severity in {"error", "fatal"} else "⚠"
+            if message:
+                lines.append(f"{symbol} {message}")
+        if load_error:
+            lines.append("✕ " + load_error)
+        return list(dict.fromkeys(lines))
+
+    def _apply_run_presentation(
+        self,
+        presentation: RunPresentation,
+        bundle: VerifiedRunBundle | None = None,
+        *,
+        load_error: str = "",
+    ) -> None:
+        self._run_presentation = presentation
+        self._verified_run_bundle = bundle
+        outcome = self._run_outcome_value(presentation.status)
+        tone = presentation.tone
+        terminal = outcome not in {
+            RunOutcome.PREPARING.value,
+            RunOutcome.RUNNING.value,
+        }
+        review_only = self._run_presentation_is_review_only(presentation)
+        report_root = bundle.run_root if bundle is not None else self._current_work_dir
+        self._last_quality_report_path = self._quality_report_path(report_root)
+        quality_available = bool(
+            self._last_quality_report_path
+            and self._last_quality_report_path.is_file()
+        )
+        self._show_run_banner(
+            tone,
+            f"{presentation.title} · {presentation.summary}",
+            quality_report=bool(
+                quality_available
+                and outcome
+                in {
+                    RunOutcome.PARTIAL_SUCCESS.value,
+                    RunOutcome.REVIEW_REQUIRED.value,
+                }
+            ),
+            show_log=outcome
+            in {
+                RunOutcome.STOPPED.value,
+                RunOutcome.INTERRUPTED.value,
+                RunOutcome.FAILED.value,
+                RunOutcome.VERIFICATION_FAILED.value,
+            },
+        )
+        symbols = {
+            RunOutcome.SUCCESS.value: "✓",
+            RunOutcome.PARTIAL_SUCCESS.value: "✓",
+            RunOutcome.REVIEW_REQUIRED.value: "⚠",
+            RunOutcome.STOPPED.value: "■",
+            RunOutcome.INTERRUPTED.value: "⚠",
+            RunOutcome.FAILED.value: "✕",
+            RunOutcome.VERIFICATION_FAILED.value: "✕",
+        }
+        symbol = symbols.get(outcome, "●")
+        if review_only:
+            symbol = "⚠"
+        visual_outcome = (
+            RunOutcome.REVIEW_REQUIRED.value if review_only else outcome
+        )
+        overview_title = f"{symbol} {presentation.title}"
+        self.overview_outcome_label.setText(overview_title)
+        self.overview_outcome_label.setAccessibleDescription(
+            presentation.summary
+        )
+        set_style_property(
+            self.overview_outcome_label,
+            "outcomeState",
+            visual_outcome,
+        )
+        self.overview_summary_label.setText(presentation.summary)
+        issue_lines = self._run_presentation_issues(
+            presentation,
+            load_error=load_error,
+        )
+        self.overview_issues_label.setText(
+            "\n".join(issue_lines) if issue_lines else "暂无"
+        )
+        self.overview_quality_report_btn.setVisible(quality_available)
+
+        if presentation.delivery_eligible:
+            delivery_text = (
+                "✓ 正式结果可用 · 已披露降级"
+                if outcome == RunOutcome.PARTIAL_SUCCESS.value
+                else "✓ 正式结果可用"
+            )
+        elif review_only:
+            delivery_text = "⚠ 仅供复核 · 不能作为正式结果"
+        elif outcome in {
+            RunOutcome.PREPARING.value,
+            RunOutcome.RUNNING.value,
+        }:
+            delivery_text = "● 尚无结果"
+        elif outcome == RunOutcome.VERIFICATION_FAILED.value:
+            delivery_text = "✕ 结果不可验证 · 禁止交付"
+        else:
+            delivery_text = "■ 未完成 · 无正式结果"
+        self.delivery_status_label.setText(delivery_text)
+        self.delivery_status_label.setAccessibleDescription(delivery_text)
+        set_style_property(
+            self.delivery_status_label,
+            "outcomeState",
+            visual_outcome,
+        )
+
+        verified_outputs = tuple(
+            sorted(
+                presentation.verified_outputs,
+                key=lambda output: (
+                    {"formal": 0, "review": 0, "auxiliary": 1}.get(
+                        output.kind,
+                        2,
+                    ),
+                    output.path.name.casefold(),
+                ),
+            )
+        )
+        output_lines = []
+        for output in verified_outputs[:6]:
+            if output.kind == "formal":
+                kind_label = "正式" if presentation.delivery_eligible else "候选"
+            else:
+                kind_label = {
+                    "review": "复核",
+                    "auxiliary": "辅助",
+                }.get(output.kind, output.kind)
+            output_lines.append(
+                f"✓ {output.path.name} · {kind_label} · {format_bytes(output.size)}"
+            )
+        if len(verified_outputs) > 6:
+            output_lines.append(f"另有 {len(verified_outputs) - 6} 个已验证输出")
+        self.verified_outputs_label.setText(
+            "已验证输出\n" + ("\n".join(output_lines) if output_lines else "—")
+        )
+        result_paths = tuple(
+            output.path
+            for output in self._run_presentation_result_outputs(presentation)
+        )
+        if self._history_detail_mode:
+            self._historical_result_files = result_paths
+        review_candidate = bool(review_only and result_paths)
+        if presentation.delivery_eligible and result_paths:
+            self.open_result_action.setText("在访达中显示正式结果")
+            self.result_preview_btn.setText("预览正式结果")
+            self.open_result_btn.setAccessibleName(
+                "在访达中显示已验证正式结果"
+            )
+            self.result_preview_btn.setAccessibleName("预览已验证正式结果")
+            self.open_result_action.setEnabled(True)
+        elif review_candidate:
+            self.open_result_action.setText("显示复核候选")
+            self.result_preview_btn.setText("预览复核候选")
+            self.open_result_btn.setAccessibleName(
+                "在访达中显示已验证复核候选"
+            )
+            self.result_preview_btn.setAccessibleName("预览已验证复核候选")
+            self.open_result_action.setEnabled(True)
+        else:
+            self.open_result_action.setText("打开结果文件夹")
+            self.result_preview_btn.setText("结果预览")
+            self.open_result_btn.setAccessibleName("打开处理结果目录")
+            self.result_preview_btn.setAccessibleName("预览处理结果")
+            self.open_result_action.setEnabled(False)
+
+        preview_path = presentation.preview_path
+        preview_available = bool(
+            preview_path is not None and preview_path.is_file()
+        )
+        self._result_preview_path = preview_path if preview_available else None
+        self.result_preview_btn.setEnabled(preview_available)
+        if preview_available and preview_path is not None:
+            result = bundle.result if bundle is not None else None
+            preview_stage = self._last_result_stage(result) or 10
+            if presentation.delivery_eligible:
+                title = "已验证结果"
+            elif review_only:
+                title = "复核结果"
+            elif outcome == RunOutcome.VERIFICATION_FAILED.value:
+                title = "结果链异常候选"
+            else:
+                title = "最后可靠阶段预览"
+            self._display_latest_preview(
+                preview_path,
+                stage=preview_stage,
+                title=title,
+            )
+            if presentation.delivery_eligible:
+                self.preview_activity_label.setText("正式结果预览 · 验证链已通过")
+                self.preview_notice_label.setText(
+                    "当前 run 的已验证正式输出 · SHA-256 已通过"
+                )
+            elif review_only:
+                self.preview_activity_label.setText("复核结果预览 · 不是正式交付")
+                self.preview_notice_label.setText(
+                    "当前 run 的已验证复核输出 · 不能作为正式结果"
+                )
+            elif outcome == RunOutcome.VERIFICATION_FAILED.value:
+                self.preview_activity_label.setText(
+                    "候选文件预览 · 结果身份链未通过验证"
+                )
+                self.preview_notice_label.setText(
+                    "仅文件 SHA-256 已匹配 · 结果不可验证且禁止交付"
+                )
+            else:
+                self.preview_activity_label.setText(
+                    "最后可靠预览 · 本次运行未完成"
+                )
+                self.preview_notice_label.setText(
+                    "当前 run 的已验证文件 · 不是正式结果"
+                )
+        elif terminal:
+            cache_path = (
+                bundle.run_root / "process" / "ui_preview" / "latest.png"
+                if bundle is not None
+                else None
+            )
+            if (
+                self._latest_preview_path is None
+                and cache_path is not None
+                and cache_path.is_file()
+            ):
+                preview_stage = self._last_result_stage(bundle.result) or max(
+                    0,
+                    self._display_pipeline_stage or 0,
+                )
+                self._display_latest_preview(
+                    cache_path,
+                    stage=preview_stage,
+                    title="最后可靠阶段预览",
+                )
+            if self._latest_preview_path is not None:
+                self.preview_stage_label.setText("预览：最后可靠阶段预览")
+                self.preview_activity_label.setText(
+                    "仅保留最后可靠阶段预览 · 无正式结果"
+                )
+                self.preview_notice_label.setText(
+                    "阶段缓存预览 · 未作为正式结果验证"
+                )
+            else:
+                self.preview_stage_label.setText("预览：不可用")
+                self.preview_activity_label.setText("没有可验证的结果预览")
+                self.preview_notice_label.setText("无正式结果")
+        if terminal:
+            self.run_phase_label.setText(presentation.title)
+            self._run_terminal_status = outcome
+        self._update_window_title()
+
+    def _set_live_run_presentation(self, status: RunOutcome) -> None:
+        self._apply_run_presentation(
+            build_run_presentation(None, fallback_status=status),
+        )
+
+    def _verified_run_presentation(
+        self,
+        task_root: Path,
+        run_id: str,
+        *,
+        fallback_status: str | RunOutcome | None,
+    ) -> tuple[VerifiedRunBundle | None, RunPresentation, str]:
+        try:
+            bundle = load_verified_run_bundle(task_root, run_id)
+        except (HistoryStoreError, OSError, TypeError, ValueError) as error:
+            detail = str(error)
+            return None, build_run_presentation(None), detail
+        return (
+            bundle,
+            build_run_presentation(bundle, fallback_status=fallback_status),
+            "",
+        )
+
     def _show_run_banner(
         self,
         tone: str,
@@ -7494,6 +8365,7 @@ class StarunGui(QMainWindow):
             "warning": "⚠",
             "error": "✕",
             "info": "●",
+            "neutral": "■",
         }
         self.warning_label.setText(f"{symbols.get(tone, '•')}  {message}")
         self.warning_label.setAccessibleDescription(message)
@@ -9394,6 +10266,7 @@ class StarunGui(QMainWindow):
         self._update_run_summary(work_dir, input_mode)
         self._set_running(True)
         self._show_workspace(WORKSPACE_RUN)
+        self._set_live_run_presentation(RunOutcome.PREPARING)
         self._set_status_text("Preparing")
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setFormat("正在准备运行环境…")
@@ -9488,7 +10361,7 @@ class StarunGui(QMainWindow):
                 )
                 self._write_runtime_capability_manifest()
             self._append_event(
-                "命中本应用会话的在线 Gaia SPCC 超时能力缓存；"
+                "命中本应用会话的在线 Gaia SPCC 失败能力缓存；"
                 "本任务直接进入 PCC/local fallback，不再重复等待 SPCC。"
             )
         elif self._spcc_online_circuit_open:
@@ -9527,7 +10400,27 @@ class StarunGui(QMainWindow):
             STATUS_FAILED,
             failure_reason=f"{title}：{detail}",
         )
-        self._update_result_actions(self._current_work_dir)
+        active_task = self._active_prepared_task
+        if active_task is not None:
+            bundle, presentation, verification_error = (
+                self._verified_run_presentation(
+                    active_task.workspace.root,
+                    active_task.run.run_id,
+                    fallback_status=RunOutcome.FAILED,
+                )
+            )
+        else:
+            bundle = None
+            presentation = build_run_presentation(
+                None,
+                fallback_status=RunOutcome.FAILED,
+            )
+            verification_error = detail
+        self._apply_run_presentation(
+            presentation,
+            bundle,
+            load_error=verification_error,
+        )
         self._close_run_log()
         QMessageBox.critical(self, title, detail)
         self._current_work_dir = None
@@ -9566,7 +10459,27 @@ class StarunGui(QMainWindow):
             STATUS_STOPPED,
             failure_reason="用户在运行环境准备阶段停止任务",
         )
-        self._update_result_actions(self._current_work_dir)
+        active_task = self._active_prepared_task
+        if active_task is not None:
+            bundle, presentation, verification_error = (
+                self._verified_run_presentation(
+                    active_task.workspace.root,
+                    active_task.run.run_id,
+                    fallback_status=RunOutcome.STOPPED,
+                )
+            )
+        else:
+            bundle = None
+            presentation = build_run_presentation(
+                None,
+                fallback_status=RunOutcome.STOPPED,
+            )
+            verification_error = ""
+        self._apply_run_presentation(
+            presentation,
+            bundle,
+            load_error=verification_error,
+        )
         self._close_run_log()
         self._current_work_dir = None
         self._active_prepared_task = None
@@ -9665,6 +10578,7 @@ class StarunGui(QMainWindow):
         self._begin_stage_progress(10)
         self.progress_bar.hide()
         self.preview_activity_label.setText("等待 Stage 1 开始")
+        self._set_live_run_presentation(RunOutcome.RUNNING)
         self._set_status_text("Running")
         self.worker.start()
 
@@ -9713,10 +10627,10 @@ class StarunGui(QMainWindow):
         now = time.monotonic()
 
         if stage not in self._stage_items:
-            chip = QLabel()
-            chip.setWordWrap(True)
+            chip = InspectorStageButton(stage)
+            chip.activated.connect(self._select_inspector_stage)
             chip.setSizePolicy(
-                QSizePolicy.Policy.Preferred,
+                QSizePolicy.Policy.Ignored,
                 QSizePolicy.Policy.Minimum,
             )
             self.stage_stepper_layout.addWidget(chip, 1)
@@ -9989,12 +10903,12 @@ class StarunGui(QMainWindow):
             self._spcc_online_circuit_open = True
             if active_spcc_cache_key is not None:
                 self._append_event(
-                    "检测到 online_unverified Gaia SPCC 超时；"
+                    "检测到 online_unverified Gaia SPCC 终止故障；"
                     "已写入本应用会话能力缓存并为本批次开启在线 SPCC 熔断。"
                 )
             else:
                 self._append_event(
-                    "检测到 online_unverified Gaia SPCC 超时；"
+                    "检测到 online_unverified Gaia SPCC 终止故障；"
                     "能力缓存键不可用，仅为本批次开启在线 SPCC 熔断。"
                 )
         has_next_task = bool(
@@ -10087,7 +11001,28 @@ class StarunGui(QMainWindow):
             ],
         )
 
-        self._update_result_actions(work_dir)
+        active_task = self._active_prepared_task
+        if active_task is not None:
+            verified_bundle, run_presentation, verification_error = (
+                self._verified_run_presentation(
+                    active_task.workspace.root,
+                    active_task.run.run_id,
+                    fallback_status=history_status,
+                )
+            )
+        else:
+            verified_bundle = None
+            run_presentation = build_run_presentation(
+                None,
+                fallback_status=history_status,
+            )
+            verification_error = "当前运行身份不可用"
+        self._apply_run_presentation(
+            run_presentation,
+            verified_bundle,
+            load_error=verification_error,
+        )
+        self._set_status_message(run_presentation.title)
         if has_next_task:
             self._cleanup_after_run(keep_queue=True)
             self._prepared_task_index += 1

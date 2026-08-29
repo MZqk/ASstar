@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -eu
 
-openai_key_pattern='s''k-[A-Za-z0-9_-]{16,}'
+# Require a token boundary so schema names such as ``starmask-support-*`` do
+# not get misclassified while standalone OpenAI-style credentials still fail.
+openai_key_pattern='(^|[^A-Za-z0-9_])s''k-[A-Za-z0-9_-]{16,}'
 bearer_token_pattern='B''earer[[:space:]]+[A-Za-z0-9._~+/=-]{16,}'
 found_secret=0
 

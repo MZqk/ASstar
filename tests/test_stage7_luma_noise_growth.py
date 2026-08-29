@@ -105,32 +105,111 @@ class Stage7LumaNoiseGrowthTests(unittest.TestCase):
         self.assertEqual((spec.minimum, spec.maximum, spec.step), (1.0, 3.0, 0.05))
         self.assertEqual(spec.suffix, "×")
 
-    def test_schema_and_uniform_scaling_keep_visible_noise_stable(self):
+    def test_schema_and_uniform_scaling_keeps_relative_noise_stable(self):
         source = self._image(0.002)
         report = self._assess(source, source * 2.0)
 
         self.assertEqual(report["schema"], LUMA_NOISE_GROWTH_SCHEMA)
         self.assertTrue(report["accepted"])
-        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["status"], "advisory")
         self.assertAlmostEqual(
             report["metrics"]["visible_noise_growth"],
             1.0,
             places=5,
         )
+        self.assertEqual(
+            report["quality_gate"]["relative_growth"]["status"],
+            "ok",
+        )
+        self.assertEqual(
+            report["quality_gate"]["absolute_visible_noise"]["status"],
+            "advisory",
+        )
+
+    def test_authenticated_tone_map_gates_excess_not_raw_growth(self):
+        source = self._image(0.002, base=0.03)
+        expected = self._image(0.012, base=0.12)
+        cfg = PipelineConfig(stage7_stretch_luma_noise_growth_max=1.25)
+
+        report = assess_frozen_background_luma_noise_growth(
+            source,
+            expected,
+            self._all_background(),
+            cfg,
+            expected_candidate=expected,
+            transform_identity={"status": "authenticated", "digest": "abc"},
+        )
+
+        self.assertEqual(
+            report["gate_semantics"],
+            "authenticated_transform_excess_growth",
+        )
+        self.assertGreater(report["metrics"]["raw_growth"], 1.0)
+        self.assertAlmostEqual(report["metrics"]["excess_growth"], 1.0, places=5)
+        self.assertEqual(
+            report["quality_gate"]["relative_growth"]["status"],
+            "ok",
+        )
+        self.assertFalse(report["accepted"])
+        self.assertEqual(
+            report["quality_gate"]["absolute_visible_noise"]["status"],
+            "rejected",
+        )
+
+    def test_authenticated_tone_map_rejects_added_high_frequency_noise(self):
+        source = self._image(0.002, base=0.03)
+        expected = self._image(0.012, base=0.12)
+        actual = expected + 0.015 * self._checkerboard()[None, ...]
+        cfg = PipelineConfig(stage7_stretch_luma_noise_growth_max=1.25)
+
+        report = assess_frozen_background_luma_noise_growth(
+            source,
+            actual,
+            self._all_background(),
+            cfg,
+            expected_candidate=expected,
+            transform_identity={"status": "authenticated", "digest": "abc"},
+        )
+
+        self.assertGreater(report["metrics"]["excess_growth"], 1.25)
+        self.assertFalse(report["accepted"])
 
     def test_nominal_advisory_and_hard_boundaries(self):
         source = self._image(0.002)
-        for factor, expected in (
-            (1.25, "ok"),
-            (1.50, "advisory"),
-            (1.875, "advisory"),
-            (1.90, "poor"),
+        for factor, expected, relative_status in (
+            (1.25, "advisory", "ok"),
+            (1.50, "poor", "advisory"),
+            (1.875, "poor", "advisory"),
+            (1.90, "poor", "hard_failed"),
         ):
             with self.subTest(factor=factor):
                 candidate = self._image(0.002 * factor)
                 report = self._assess(source, candidate)
                 self.assertEqual(report["status"], expected)
                 self.assertEqual(report["accepted"], expected != "poor")
+                self.assertEqual(
+                    report["quality_gate"]["relative_growth"]["status"],
+                    relative_status,
+                )
+
+    def test_task_config_cannot_relax_relative_noise_bands(self):
+        source = self._image(0.002)
+        candidate = self._image(0.002 * 1.90)
+        cfg = PipelineConfig(stage7_stretch_luma_noise_growth_max=3.0)
+        cfg.stage7_9_quality_advisory_multiplier = 2.0
+
+        report = assess_frozen_background_luma_noise_growth(
+            source,
+            candidate,
+            self._all_background(),
+            cfg,
+        )
+
+        relative = report["quality_gate"]["relative_growth"]
+        self.assertEqual(relative["accepted_limit"], 1.25)
+        self.assertEqual(relative["hard_limit"], 1.875)
+        self.assertEqual(relative["advisory_multiplier"], 1.50)
+        self.assertTrue(relative["hard_failed"], relative)
 
     def test_low_absolute_noise_exempts_unstable_ratio(self):
         source = self._image(0.00001)

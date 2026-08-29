@@ -47,8 +47,16 @@ TRANSFORM_LOSS_SCHEMA = "starun.stage7-transform-loss.v1"
 MULTISCALE_CONTRAST_SCHEMA = "starun.stage7-multiscale-contrast.v1"
 RENDITION_METRICS_SCHEMA = "starun.stage7-rendition-metrics.v2"
 RENDITION_CHROMA_SCHEMA = "starun.stage7-subject-chroma.v1"
-LUMA_NOISE_GROWTH_SCHEMA = "starun.stage7-luma-noise-growth.v1"
+SUBJECT_CHROMA_RETENTION_SCHEMA = (
+    "starun.stage7-subject-chroma-retention.v1"
+)
+LUMA_NOISE_GROWTH_SCHEMA = "starun.stage7-luma-noise-growth.v2"
+LEGACY_LUMA_NOISE_GROWTH_SCHEMA = "starun.stage7-luma-noise-growth.v1"
 LUMA_VISIBLE_NOISE_REFERENCE_FLOOR = 0.020
+LUMA_VISIBLE_NOISE_NOMINAL_MAX = 0.025
+LUMA_VISIBLE_NOISE_HARD_MAX = 0.0375
+LUMA_NOISE_GROWTH_NOMINAL_MAX = 1.25
+LUMA_NOISE_GROWTH_ADVISORY_MULTIPLIER = 1.50
 MULTISCALE_CONTRAST_RADII = (1, 2, 4, 8, 16)
 SIRIL_MINIMUM_VERSION_CONTRACT = "1.4.0"
 SIRIL_BUNDLED_REFERENCE_VERSION = "1.4.4"
@@ -82,10 +90,43 @@ STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V2 = (
 STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V3 = (
     "starun.stage7-matched-domain-transfer.v3"
 )
+STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V4 = (
+    "starun.stage7-matched-domain-transfer.v4"
+)
 STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA = (
-    STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V3
+    STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V4
 )
 STAGE7_MATCHED_DOMAIN_CHAIN_SCHEMA = "starun.stage7-matched-domain-chain.v1"
+STAGE7_BACKGROUND_CHROMA_RESCUE_METHOD = (
+    "closed_form_linked_mtf_background_chroma_rescue"
+)
+STAGE7_CHROMA_RESCUE_MASK_SCHEMA = "starun.stage7-chroma-rescue-mask.v1"
+ADAPTIVE_QUANTILE_CALIBRATION_SCHEMA_V1 = (
+    "starun.stage7-adaptive-quantile-calibration.v1"
+)
+ADAPTIVE_QUANTILE_CALIBRATION_SCHEMA_V2 = (
+    "starun.stage7-adaptive-quantile-calibration.v2"
+)
+ADAPTIVE_QUANTILE_CALIBRATION_SCHEMA = (
+    ADAPTIVE_QUANTILE_CALIBRATION_SCHEMA_V2
+)
+ADAPTIVE_QUANTILE_CURVE_SCHEMA_V1 = (
+    "starun.stage7-adaptive-quantile-curve.v1"
+)
+ADAPTIVE_QUANTILE_CURVE_SCHEMA_V2 = (
+    "starun.stage7-adaptive-quantile-curve.v2"
+)
+ADAPTIVE_QUANTILE_CURVE_SCHEMA = ADAPTIVE_QUANTILE_CURVE_SCHEMA_V2
+ADAPTIVE_QUANTILE_STRATEGY_SCHEMA = (
+    "starun.stage7-adaptive-quantile-strategy.v2"
+)
+ADAPTIVE_QUANTILE_MAX_DERIVATIVE = 1000.0
+ADAPTIVE_QUANTILE_SOURCE_SCHEMA = (
+    "starun.stage7-adaptive-quantile-source.v1"
+)
+ADAPTIVE_QUANTILE_WINNER_SCHEMA = (
+    "starun.stage7-adaptive-quantile-winner.v1"
+)
 DISPLAY90_LEGACY_METHOD = "display90_linked_lut"
 DISPLAY_LUMINANCE_VECTOR_METHOD = "display_luminance_vector_lut"
 COMPOSITE_TONE_CALIBRATION_SCHEMA = (
@@ -137,6 +178,45 @@ DISPLAY90_LARGE_GALAXY_OUTPUTS = (
     0.900,
     0.960,
 )
+
+
+def canonical_json_sha256(payload: Any) -> str:
+    """Hash one finite JSON contract with stable key and float encoding."""
+
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def stage7_pixel_sha256(image: np.ndarray) -> str:
+    """Return a stable identity for canonical Stage 7 float pixels."""
+
+    rgb = np.ascontiguousarray(
+        _stage7_rgb_float_fullres(np.asarray(image)),
+        dtype="<f4",
+    )
+    digest = hashlib.sha256()
+    digest.update(str(tuple(int(value) for value in rgb.shape)).encode("ascii"))
+    digest.update(str(rgb.dtype).encode("ascii"))
+    digest.update(rgb.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def stage7_float_array_sha256(values: np.ndarray) -> str:
+    """Hash one finite float32 array without changing its dimensionality."""
+
+    array = np.ascontiguousarray(np.asarray(values), dtype="<f4")
+    if not np.all(np.isfinite(array)):
+        raise ValueError("Stage7 float array contains non-finite values")
+    digest = hashlib.sha256()
+    digest.update(str(tuple(int(value) for value in array.shape)).encode("ascii"))
+    digest.update(str(array.dtype).encode("ascii"))
+    digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
 
 
 def _stage7_mask(
@@ -230,6 +310,11 @@ def measure_frozen_rendition_metrics(
             out=np.zeros_like(peak, dtype=np.float32),
             where=peak > 1e-6,
         )
+        opponent_squared = (
+            np.square(rgb[0] - rgb[1])
+            + np.square(rgb[1] - rgb[2])
+            + np.square(rgb[2] - rgb[0])
+        ) / 3.0
         local_detail = np.abs(luminance - _box_blur_gray(luminance))
 
         def sampled(values: np.ndarray, region: np.ndarray) -> np.ndarray:
@@ -241,8 +326,13 @@ def measure_frozen_rendition_metrics(
 
         subject_luma = sampled(luminance, subject)
         subject_saturation = sampled(saturation, subject)
+        subject_opponent_squared = sampled(opponent_squared, subject)
         non_background_saturation = sampled(
             saturation,
+            non_background_signal,
+        )
+        non_background_opponent_squared = sampled(
+            opponent_squared,
             non_background_signal,
         )
         subject_detail = sampled(local_detail, subject)
@@ -277,11 +367,17 @@ def measure_frozen_rendition_metrics(
                 "subject_span": float(max(0.0, subject_p99 - subject_p50)),
                 "saturation_median": float(np.median(subject_saturation)),
                 "saturation_p95": float(np.percentile(subject_saturation, 95.0)),
+                "opponent_rms": float(
+                    np.sqrt(np.mean(subject_opponent_squared))
+                ),
                 "non_background_saturation_median": float(
                     np.median(non_background_saturation)
                 ),
                 "non_background_saturation_p95": float(
                     np.percentile(non_background_saturation, 95.0)
+                ),
+                "non_background_opponent_rms": float(
+                    np.sqrt(np.mean(non_background_opponent_squared))
                 ),
                 "microcontrast": float(np.percentile(subject_detail, 75.0)),
                 "subject_p50": float(subject_p50),
@@ -347,6 +443,374 @@ def rendition_metric_retention(
         ),
         "metrics": ratios,
     }
+
+
+def assess_subject_chroma_retention(
+    candidate: Dict[str, Any],
+    linked_preview: Dict[str, Any],
+    cfg: Any,
+    *,
+    profile_name: str,
+    channel_semantics: str,
+    preview_method: str = "autostretch -linked",
+) -> Dict[str, Any]:
+    """Gate candidate chroma against one linked preview on frozen Stage 6 ROIs."""
+
+    normalized_profile = str(profile_name or "generic_balanced").strip().lower()
+    normalized_semantics = str(channel_semantics or "unknown").strip().lower()
+    star_preserve = normalized_profile == "star_colour_preserve"
+
+    subject_nominal_floor = 0.35 if star_preserve else 0.70
+    subject_hard_floor = 0.23 if star_preserve else 0.55
+
+    def finite_config(name: str, default: float) -> float:
+        try:
+            value = float(getattr(cfg, name, default))
+        except (TypeError, ValueError):
+            return default
+        return value if np.isfinite(value) else default
+
+    subject_nominal = float(
+        np.clip(
+            max(
+                finite_config(
+                    (
+                        "stage7_star_preserve_chroma_retention_nominal"
+                        if star_preserve
+                        else "stage7_subject_chroma_retention_nominal"
+                    ),
+                    subject_nominal_floor,
+                ),
+                subject_nominal_floor,
+            ),
+            subject_nominal_floor,
+            1.50,
+        )
+    )
+    subject_hard = float(
+        np.clip(
+            max(
+                finite_config(
+                    (
+                        "stage7_star_preserve_chroma_retention_hard_min"
+                        if star_preserve
+                        else "stage7_subject_chroma_retention_hard_min"
+                    ),
+                    subject_hard_floor,
+                ),
+                subject_hard_floor,
+            ),
+            subject_hard_floor,
+            1.50,
+        )
+    )
+    subject_nominal = max(subject_nominal, subject_hard)
+    non_background_nominal = float(
+        np.clip(
+            max(
+                finite_config(
+                    "stage7_non_background_chroma_retention_nominal",
+                    0.45,
+                ),
+                0.45,
+            ),
+            0.45,
+            1.50,
+        )
+    )
+    non_background_hard = float(
+        np.clip(
+            max(
+                finite_config(
+                    "stage7_non_background_chroma_retention_hard_min",
+                    0.30,
+                ),
+                0.30,
+            ),
+            0.30,
+            1.50,
+        )
+    )
+    non_background_nominal = max(
+        non_background_nominal,
+        non_background_hard,
+    )
+    low_saturation_max = float(
+        np.clip(
+            finite_config(
+                "stage7_low_chroma_source_saturation_max",
+                0.02,
+            ),
+            0.0,
+            0.02,
+        )
+    )
+    low_opponent_rms_max = float(
+        np.clip(
+            finite_config(
+                "stage7_low_chroma_source_opponent_rms_max",
+                0.0001,
+            ),
+            0.0,
+            0.0001,
+        )
+    )
+
+    limits = {
+        "subject_nominal_min": subject_nominal,
+        "subject_hard_min": subject_hard,
+        "non_background_nominal_min": (
+            None if star_preserve else non_background_nominal
+        ),
+        "non_background_hard_min": (
+            None if star_preserve else non_background_hard
+        ),
+        "low_chroma_source_saturation_max": low_saturation_max,
+        "low_chroma_source_opponent_rms_max": low_opponent_rms_max,
+    }
+    report: Dict[str, Any] = {
+        "schema": SUBJECT_CHROMA_RETENTION_SCHEMA,
+        "status": "unavailable",
+        "accepted": False,
+        "hard_failed": True,
+        "advisory": False,
+        "reason_code": "subject_chroma_evidence_unavailable",
+        "profile": normalized_profile,
+        "contract_profile": (
+            "star_preserve" if star_preserve else "diffuse_or_galaxy"
+        ),
+        "channel_semantics": normalized_semantics,
+        "mask_source": "stage6_frozen_roi",
+        "reference": "stage7_preview_ref",
+        "preview_method": preview_method,
+        "limits": limits,
+        "quality_gates": {},
+        "metrics": {},
+        "issues": [],
+        "advisories": [],
+    }
+
+    recognized_semantics = {
+        "broadband_rgb",
+        "broadband_rgb_osc",
+        "narrowband_composite",
+        "mono",
+    }
+    if normalized_semantics not in recognized_semantics:
+        report.update(
+            reason_code="rgb_auto_route_evidence_missing",
+            issues=["stage7_subject_chroma_rgb_route_evidence_missing"],
+        )
+        return report
+    if preview_method != "autostretch -linked":
+        report.update(
+            reason_code="linked_preview_identity_mismatch",
+            issues=["stage7_subject_chroma_linked_preview_unverified"],
+        )
+        return report
+    if (
+        candidate.get("status") != "available"
+        or linked_preview.get("status") != "available"
+        or candidate.get("mask_source") != "stage6_frozen_roi"
+        or linked_preview.get("mask_source") != "stage6_frozen_roi"
+    ):
+        report.update(
+            reason_code="frozen_roi_measurement_unavailable",
+            issues=["stage7_subject_chroma_frozen_roi_unverified"],
+        )
+        return report
+
+    candidate_metrics = dict(candidate.get("metrics") or {})
+    source_metrics = dict(linked_preview.get("metrics") or {})
+    try:
+        source_subject = float(source_metrics["saturation_median"])
+        source_subject_p95 = float(source_metrics["saturation_p95"])
+        source_non_background = float(
+            source_metrics["non_background_saturation_median"]
+        )
+        source_non_background_p95 = float(
+            source_metrics["non_background_saturation_p95"]
+        )
+        source_opponent_rms = float(source_metrics["opponent_rms"])
+        candidate_subject = float(candidate_metrics["saturation_median"])
+        candidate_subject_p95 = float(candidate_metrics["saturation_p95"])
+        candidate_non_background = float(
+            candidate_metrics["non_background_saturation_median"]
+        )
+        candidate_non_background_p95 = float(
+            candidate_metrics["non_background_saturation_p95"]
+        )
+    except (KeyError, TypeError, ValueError):
+        report.update(
+            reason_code="subject_chroma_metrics_missing",
+            issues=["stage7_subject_chroma_metrics_missing"],
+        )
+        return report
+    values = (
+        source_subject,
+        source_subject_p95,
+        source_non_background,
+        source_non_background_p95,
+        source_opponent_rms,
+        candidate_subject,
+        candidate_subject_p95,
+        candidate_non_background,
+        candidate_non_background_p95,
+    )
+    if not all(np.isfinite(value) and value >= 0.0 for value in values):
+        report.update(
+            reason_code="subject_chroma_metrics_nonfinite",
+            issues=["stage7_subject_chroma_metrics_nonfinite"],
+        )
+        return report
+
+    report["metrics"] = {
+        "source_subject_saturation_median": source_subject,
+        "source_subject_saturation_p95": source_subject_p95,
+        "source_non_background_saturation_median": source_non_background,
+        "source_non_background_saturation_p95": source_non_background_p95,
+        "source_subject_opponent_rms": source_opponent_rms,
+        "candidate_subject_saturation_median": candidate_subject,
+        "candidate_subject_saturation_p95": candidate_subject_p95,
+        "candidate_non_background_saturation_median": candidate_non_background,
+        "candidate_non_background_saturation_p95": candidate_non_background_p95,
+    }
+    low_chroma_not_applicable = bool(
+        source_subject < low_saturation_max
+        and source_opponent_rms < low_opponent_rms_max
+    )
+    report["low_chroma_not_applicable"] = low_chroma_not_applicable
+    if low_chroma_not_applicable:
+        report.update(
+            status="not_applicable",
+            accepted=True,
+            hard_failed=False,
+            reason_code="source_chroma_below_joint_measurement_floor",
+            quality_gates={
+                "subject": {
+                    "status": "not_applicable",
+                    "hard_failed": False,
+                    "advisory": False,
+                },
+                "non_background": {
+                    "status": "not_applicable",
+                    "hard_failed": False,
+                    "advisory": False,
+                },
+            },
+        )
+        return report
+
+    def retention_gate(
+        candidate_value: float,
+        source_value: float,
+        nominal: float,
+        hard: float,
+        name: str,
+    ) -> Dict[str, Any]:
+        if source_value <= 1e-9:
+            return {
+                "status": "unavailable",
+                "hard_failed": True,
+                "advisory": False,
+                "value": None,
+                "accepted_limit": nominal,
+                "hard_limit": hard,
+                "reason_code": f"{name}_reference_zero",
+            }
+        ratio = candidate_value / source_value
+        hard_failed = bool(ratio < hard)
+        advisory = bool(not hard_failed and ratio < nominal)
+        return {
+            "status": (
+                "rejected" if hard_failed else "advisory" if advisory else "ok"
+            ),
+            "hard_failed": hard_failed,
+            "advisory": advisory,
+            "value": float(ratio),
+            "accepted_limit": nominal,
+            "hard_limit": hard,
+            "candidate": candidate_value,
+            "reference": source_value,
+        }
+
+    subject_gate = retention_gate(
+        candidate_subject,
+        source_subject,
+        subject_nominal,
+        subject_hard,
+        "subject_chroma",
+    )
+    if star_preserve:
+        non_background_gate = {
+            "status": "not_applicable",
+            "hard_failed": False,
+            "advisory": False,
+            "value": None,
+            "accepted_limit": None,
+            "hard_limit": None,
+            "reason_code": "star_preserve_subject_only_contract",
+        }
+    else:
+        non_background_gate = retention_gate(
+            candidate_non_background,
+            source_non_background,
+            non_background_nominal,
+            non_background_hard,
+            "non_background_chroma",
+        )
+    gates = {
+        "subject": subject_gate,
+        "non_background": non_background_gate,
+    }
+    issues = []
+    advisories = []
+    for name, gate in gates.items():
+        if gate.get("hard_failed"):
+            issues.append(
+                f"stage7_{name}_retention "
+                f"{float(gate.get('value') or 0.0):.3f}<"
+                f"{float(gate.get('hard_limit') or 0.0):.3f}"
+            )
+        elif gate.get("advisory"):
+            advisories.append(
+                f"stage7_{name}_retention "
+                f"{float(gate.get('value') or 0.0):.3f}<"
+                f"{float(gate.get('accepted_limit') or 0.0):.3f} advisory"
+            )
+    report["metrics"].update(
+        subject_retention=subject_gate.get("value"),
+        subject_p95_retention=(
+            candidate_subject_p95 / source_subject_p95
+            if source_subject_p95 > 1e-9
+            else None
+        ),
+        non_background_retention=non_background_gate.get("value"),
+        non_background_p95_retention=(
+            candidate_non_background_p95 / source_non_background_p95
+            if source_non_background_p95 > 1e-9
+            else None
+        ),
+    )
+    report.update(
+        status=(
+            "rejected" if issues else "advisory" if advisories else "ok"
+        ),
+        accepted=not issues,
+        hard_failed=bool(issues),
+        advisory=bool(advisories),
+        reason_code=(
+            "subject_chroma_retention_below_hard_floor"
+            if issues
+            else "subject_chroma_retention_advisory"
+            if advisories
+            else "subject_chroma_retention_verified"
+        ),
+        quality_gates=gates,
+        issues=issues,
+        advisories=advisories,
+    )
+    return report
 
 
 def subject_brightness_selection(
@@ -649,6 +1113,75 @@ def validate_matched_domain_chain_contract(
     return expected
 
 
+def validate_adaptive_quantile_matched_domain_transfer(
+    contract: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Validate the complete v4 source, curve, winner, and chain binding."""
+
+    if not isinstance(contract, dict):
+        raise ValueError("adaptive matched-domain transfer is unavailable")
+    if (
+        contract.get("schema") != STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V4
+        or contract.get("status") != "active"
+        or contract.get("method")
+        != "linked_piecewise_linear_quantile_curve"
+        or contract.get("fallback_to_linked_mtf_allowed") is not False
+    ):
+        raise ValueError("adaptive matched-domain v4 envelope is invalid")
+    selected_id = str(contract.get("selected_candidate_id") or "")
+    tone_id = str(contract.get("tone_candidate_id") or "")
+    if not selected_id or selected_id != tone_id:
+        raise ValueError("adaptive matched-domain winner identity mismatch")
+    validated = validate_adaptive_quantile_calibration(
+        dict(contract.get("calibration") or {})
+    )
+    curve = dict(validated.get("curve_contract") or {})
+    source = dict(validated.get("source_binding") or {})
+    if dict(contract.get("curve_contract") or {}) != curve:
+        raise ValueError("adaptive matched-domain curve binding mismatch")
+    if dict(contract.get("source_binding") or {}) != source:
+        raise ValueError("adaptive matched-domain source binding mismatch")
+    winner_payload = {
+        "schema": ADAPTIVE_QUANTILE_WINNER_SCHEMA,
+        "selected_candidate_id": selected_id,
+        "tone_candidate_id": tone_id,
+        "candidate_method": "adaptive_quantile",
+        "transfer_method": "linked_piecewise_linear_quantile_curve",
+        "calibration_sha256": validated.get("calibration_sha256"),
+        "curve_sha256": curve.get("sha256"),
+        "source_binding_sha256": source.get("sha256"),
+    }
+    winner = {
+        **winner_payload,
+        "sha256": canonical_json_sha256(winner_payload),
+    }
+    if dict(contract.get("winner_binding") or {}) != winner:
+        raise ValueError("adaptive matched-domain winner digest mismatch")
+    expected_steps = [
+        {
+            "index": 0,
+            "method": "linked_piecewise_linear_quantile_curve",
+            "calibration_schema": ADAPTIVE_QUANTILE_CALIBRATION_SCHEMA,
+            "calibration_sha256": validated.get("calibration_sha256"),
+            "curve_sha256": curve.get("sha256"),
+            "source_binding_sha256": source.get("sha256"),
+            "winner_sha256": winner.get("sha256"),
+        }
+    ]
+    chain = validate_matched_domain_chain_contract(
+        dict(contract.get("chain_contract") or {}),
+        expected_steps=expected_steps,
+    )
+    return {
+        "contract": dict(contract),
+        "calibration": validated,
+        "curve_contract": curve,
+        "source_binding": source,
+        "winner_binding": winner,
+        "chain_contract": chain,
+    }
+
+
 def build_composite_tone_calibration(
     parent_calibration: Dict[str, Any],
     *,
@@ -792,16 +1325,120 @@ def _stage7_rgb_float_fullres(image: np.ndarray) -> np.ndarray:
     return _to_rgb_float_fullres(pixels)
 
 
+def stage7_visible_noise_quality_gate(
+    value: float,
+    cfg: Any,
+) -> Dict[str, Any]:
+    """Apply the fixed display-domain nominal/advisory/hard noise bands."""
+
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        score = float("nan")
+    try:
+        configured_nominal = float(
+            getattr(
+                cfg,
+                "stage7_visible_noise_score_max",
+                LUMA_VISIBLE_NOISE_NOMINAL_MAX,
+            )
+        )
+    except (TypeError, ValueError):
+        configured_nominal = LUMA_VISIBLE_NOISE_NOMINAL_MAX
+    try:
+        configured_hard = float(
+            getattr(
+                cfg,
+                "stage7_visible_noise_score_hard_max",
+                LUMA_VISIBLE_NOISE_HARD_MAX,
+            )
+        )
+    except (TypeError, ValueError):
+        configured_hard = LUMA_VISIBLE_NOISE_HARD_MAX
+    if not np.isfinite(configured_nominal):
+        configured_nominal = LUMA_VISIBLE_NOISE_NOMINAL_MAX
+    if not np.isfinite(configured_hard):
+        configured_hard = LUMA_VISIBLE_NOISE_HARD_MAX
+    nominal = float(
+        np.clip(
+            configured_nominal,
+            0.0,
+            LUMA_VISIBLE_NOISE_NOMINAL_MAX,
+        )
+    )
+    hard = float(
+        np.clip(
+            configured_hard,
+            0.0,
+            LUMA_VISIBLE_NOISE_HARD_MAX,
+        )
+    )
+    # Preserve a stricter configured hard limit by collapsing the nominal
+    # band instead of widening that hard limit back to the nominal value.
+    nominal = min(nominal, hard)
+    if not np.isfinite(score) or score < 0.0:
+        return {
+            "status": "unavailable",
+            "advisory": False,
+            "hard_failed": True,
+            "value": None,
+            "accepted_limit": nominal,
+            "hard_limit": hard,
+            "reason_code": "stage7_visible_noise_score_invalid",
+        }
+    hard_failed = bool(score > hard)
+    advisory = bool(not hard_failed and score > nominal)
+    return {
+        "status": (
+            "rejected" if hard_failed else "advisory" if advisory else "ok"
+        ),
+        "advisory": advisory,
+        "hard_failed": hard_failed,
+        "value": score,
+        "accepted_limit": nominal,
+        "hard_limit": hard,
+        "reason_code": (
+            "stage7_visible_noise_score_hard_failed"
+            if hard_failed
+            else "stage7_visible_noise_score_advisory"
+            if advisory
+            else "stage7_visible_noise_score_ok"
+        ),
+    }
+
+
 def assess_frozen_background_luma_noise_growth(
     source: np.ndarray,
     candidate: np.ndarray,
     masks: Optional[Dict[str, Any]],
     cfg,
+    *,
+    expected_candidate: Optional[np.ndarray] = None,
+    transform_identity: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Gate high-frequency luminance-noise growth on a frozen background ROI."""
+    """Gate noise added beyond an authenticated tone-map on frozen sky."""
 
+    try:
+        configured_growth_limit = float(
+            getattr(
+                cfg,
+                "stage7_stretch_luma_noise_growth_max",
+                LUMA_NOISE_GROWTH_NOMINAL_MAX,
+            )
+        )
+    except (AttributeError, TypeError, ValueError):
+        configured_growth_limit = LUMA_NOISE_GROWTH_NOMINAL_MAX
+    if not np.isfinite(configured_growth_limit):
+        configured_growth_limit = LUMA_NOISE_GROWTH_NOMINAL_MAX
     accepted_limit = float(
-        getattr(cfg, "stage7_stretch_luma_noise_growth_max", 1.25)
+        np.clip(
+            configured_growth_limit,
+            0.0,
+            LUMA_NOISE_GROWTH_NOMINAL_MAX,
+        )
+    )
+    relative_hard_limit = float(
+        accepted_limit * LUMA_NOISE_GROWTH_ADVISORY_MULTIPLIER
     )
     unavailable_gate = {
         "status": "unavailable",
@@ -809,12 +1446,9 @@ def assess_frozen_background_luma_noise_growth(
         "hard_failed": True,
         "value": None,
         "accepted_limit": accepted_limit,
-        "hard_limit": accepted_limit
-        * stage7_quality.stage7_9_quality_advisory_multiplier(cfg),
+        "hard_limit": relative_hard_limit,
         "severity_ratio": None,
-        "advisory_multiplier": (
-            stage7_quality.stage7_9_quality_advisory_multiplier(cfg)
-        ),
+        "advisory_multiplier": LUMA_NOISE_GROWTH_ADVISORY_MULTIPLIER,
     }
     report: Dict[str, Any] = {
         "schema": LUMA_NOISE_GROWTH_SCHEMA,
@@ -823,6 +1457,7 @@ def assess_frozen_background_luma_noise_growth(
         "issues": ["background_luma_noise_growth_measurement_unavailable"],
         "advisories": [],
         "measurement_domain": "canonical_float_0_1_rec709_luminance",
+        "gate_semantics": "unavailable",
         "mask_source": None,
         "support_count": 0,
         "low_absolute_exempted": False,
@@ -853,6 +1488,23 @@ def assess_frozen_background_luma_noise_growth(
             + 0.7152 * candidate_rgb[1]
             + 0.0722 * candidate_rgb[2]
         ).astype(np.float32)
+        expected_luma: Optional[np.ndarray] = None
+        if expected_candidate is not None:
+            expected_rgb = _stage7_rgb_float_fullres(
+                np.asarray(expected_candidate)
+            )
+            if expected_rgb.shape != source_rgb.shape:
+                raise ValueError(
+                    "expected tone-map/source shape mismatch: "
+                    f"{expected_rgb.shape}!={source_rgb.shape}"
+                )
+            if not np.all(np.isfinite(expected_rgb)):
+                raise ValueError("expected tone-map contains non-finite pixels")
+            expected_luma = (
+                0.2126 * expected_rgb[0]
+                + 0.7152 * expected_rgb[1]
+                + 0.0722 * expected_rgb[2]
+            ).astype(np.float32)
 
         background_weight = _stage7_mask(masks, "background_mask", shape)
         fallback_weight = _stage7_mask(
@@ -912,6 +1564,9 @@ def assess_frozen_background_luma_noise_growth(
 
         source_metrics = measure(source_luma)
         candidate_metrics = measure(candidate_luma)
+        expected_metrics = (
+            measure(expected_luma) if expected_luma is not None else None
+        )
         source_score = float(source_metrics["visible_noise_score"])
         candidate_score = float(candidate_metrics["visible_noise_score"])
         # A linear, dark and integer-quantized source can have an almost-zero
@@ -926,7 +1581,28 @@ def assess_frozen_background_luma_noise_growth(
             source_score,
             LUMA_VISIBLE_NOISE_REFERENCE_FLOOR,
         )
-        growth = candidate_score / reference_score
+        raw_growth = candidate_score / reference_score
+        expected_score = (
+            float(expected_metrics["visible_noise_score"])
+            if expected_metrics is not None
+            else None
+        )
+        expected_growth = (
+            expected_score / reference_score
+            if expected_score is not None
+            else None
+        )
+        excess_growth = (
+            candidate_score
+            / max(expected_score, LUMA_VISIBLE_NOISE_REFERENCE_FLOOR)
+            if expected_score is not None
+            else raw_growth
+        )
+        gate_semantics = (
+            "authenticated_transform_excess_growth"
+            if expected_metrics is not None
+            else "legacy_raw_growth"
+        )
         sigma_delta = float(
             candidate_metrics["sigma"] - source_metrics["sigma"]
         )
@@ -934,16 +1610,30 @@ def assess_frozen_background_luma_noise_growth(
             candidate_metrics["sigma"] <= 0.00075
             and sigma_delta <= 0.00050
         )
-        nominal_gate = stage7_quality.stage7_9_upper_quality_gate(
-            cfg,
-            value=growth,
-            accepted_limit=accepted_limit,
+        relative_status = (
+            "ok"
+            if excess_growth <= accepted_limit
+            else "advisory"
+            if excess_growth <= relative_hard_limit
+            else "hard_failed"
         )
-        gate = dict(nominal_gate)
+        nominal_gate = {
+            "status": relative_status,
+            "advisory": relative_status == "advisory",
+            "hard_failed": relative_status == "hard_failed",
+            "value": float(excess_growth),
+            "accepted_limit": accepted_limit,
+            "hard_limit": relative_hard_limit,
+            "severity_ratio": float(
+                excess_growth / max(accepted_limit, 1e-12)
+            ),
+            "advisory_multiplier": LUMA_NOISE_GROWTH_ADVISORY_MULTIPLIER,
+        }
+        relative_gate = dict(nominal_gate)
         if low_absolute_exempted and (
             nominal_gate.get("advisory") or nominal_gate.get("hard_failed")
         ):
-            gate.update(
+            relative_gate.update(
                 status="low_absolute_exempted",
                 advisory=False,
                 hard_failed=False,
@@ -951,14 +1641,60 @@ def assess_frozen_background_luma_noise_growth(
                 nominal_gate=nominal_gate,
             )
 
+        absolute_gate = stage7_visible_noise_quality_gate(
+            candidate_score,
+            cfg,
+        )
+        visible_nominal_max = float(absolute_gate["accepted_limit"])
+        visible_hard_max = float(absolute_gate["hard_limit"])
+        absolute_hard_failed = bool(absolute_gate.get("hard_failed"))
+        absolute_advisory = bool(absolute_gate.get("advisory"))
+        gate = {
+            "status": (
+                "rejected"
+                if absolute_hard_failed or relative_gate.get("hard_failed")
+                else "advisory"
+                if absolute_advisory or relative_gate.get("advisory")
+                else "ok"
+            ),
+            "advisory": bool(
+                absolute_advisory or relative_gate.get("advisory")
+            ),
+            "hard_failed": bool(
+                absolute_hard_failed or relative_gate.get("hard_failed")
+            ),
+            "value": candidate_score,
+            "accepted_limit": visible_nominal_max,
+            "hard_limit": visible_hard_max,
+            "reason_code": (
+                absolute_gate.get("reason_code")
+                if absolute_hard_failed or absolute_advisory
+                else relative_gate.get("reason_code")
+            ),
+            "relative_growth": relative_gate,
+            "absolute_visible_noise": absolute_gate,
+        }
+
         message = (
             "background_luma_noise_growth "
-            f"{growth:.3f}>{accepted_limit:.3f}"
+            f"{excess_growth:.3f}>{accepted_limit:.3f}"
         )
-        issues = [message] if bool(gate.get("hard_failed")) else []
-        advisories = (
-            [message + " advisory"] if bool(gate.get("advisory")) else []
+        issues = []
+        advisories = []
+        if bool(relative_gate.get("hard_failed")):
+            issues.append(message)
+        elif bool(relative_gate.get("advisory")):
+            advisories.append(message + " advisory")
+        absolute_message = (
+            "background_visible_noise_score "
+            f"{candidate_score:.4f}>{visible_nominal_max:.4f}"
         )
+        if absolute_hard_failed:
+            issues.append(
+                absolute_message + f" hard_max={visible_hard_max:.4f}"
+            )
+        elif absolute_advisory:
+            advisories.append(absolute_message + " advisory")
         report.update(
             status=(
                 "poor" if issues else "advisory" if advisories else "ok"
@@ -969,12 +1705,22 @@ def assess_frozen_background_luma_noise_growth(
             mask_source=mask_source,
             support_count=support_count,
             support_coverage=float(support_count / max(source_luma.size, 1)),
+            gate_semantics=gate_semantics,
+            transform_identity=dict(transform_identity or {}),
             low_absolute_exempted=low_absolute_exempted,
             quality_gate=gate,
             metrics={
                 "source": source_metrics,
                 "candidate": candidate_metrics,
-                "visible_noise_growth": float(growth),
+                "expected_tone_map": expected_metrics,
+                "raw_growth": float(raw_growth),
+                "expected_growth": (
+                    float(expected_growth)
+                    if expected_growth is not None
+                    else None
+                ),
+                "excess_growth": float(excess_growth),
+                "visible_noise_growth": float(excess_growth),
                 "visible_noise_reference_score": float(reference_score),
                 "visible_noise_reference_floor": (
                     LUMA_VISIBLE_NOISE_REFERENCE_FLOOR
@@ -985,6 +1731,8 @@ def assess_frozen_background_luma_noise_growth(
                 "sigma_absolute_growth": sigma_delta,
                 "low_absolute_sigma_max": 0.00075,
                 "low_absolute_sigma_growth_max": 0.00050,
+                "visible_noise_score_nominal_max": visible_nominal_max,
+                "visible_noise_score_hard_max": visible_hard_max,
             },
         )
         return report
@@ -1670,6 +2418,42 @@ def apply_linked_mtf(
     mapped = np.where(source <= shadows, 0.0, mapped)
     mapped = np.where(source >= highlights, 1.0, mapped)
     return np.clip(mapped, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def apply_frozen_background_chroma_rescue(
+    values: np.ndarray,
+    chroma_keep: np.ndarray,
+) -> np.ndarray:
+    """Replay the accepted Stage7 luminance-preserving spatial chroma repair."""
+
+    source = np.asarray(values)
+    rgb = _stage7_rgb_float_fullres(source).astype(np.float32, copy=False)
+    keep = np.asarray(chroma_keep, dtype=np.float32)
+    if keep.ndim != 2 or tuple(keep.shape) != tuple(rgb.shape[1:]):
+        raise ValueError("Stage7 chroma-rescue mask shape mismatch")
+    if not np.all(np.isfinite(keep)) or np.any(keep < 0.0) or np.any(keep > 1.0):
+        raise ValueError("Stage7 chroma-rescue mask values are invalid")
+    gray = (
+        0.2126 * rgb[0]
+        + 0.7152 * rgb[1]
+        + 0.0722 * rgb[2]
+    ).astype(np.float32)
+    rescued_rgb = gray[None, :, :] + (rgb - gray[None, :, :]) * keep[None, :, :]
+    rescued_rgb = np.clip(rescued_rgb, 0.0, 1.0).astype(np.float32, copy=False)
+    if source.ndim == 2:
+        return gray.astype(np.float32, copy=False)
+    if source.ndim == 3 and source.shape[0] == 1:
+        return gray[None, :, :].astype(np.float32, copy=False)
+    if source.ndim == 3 and source.shape[0] == 3:
+        return rescued_rgb
+    if source.ndim == 3 and source.shape[-1] == 1:
+        return gray[:, :, None].astype(np.float32, copy=False)
+    if source.ndim == 3 and source.shape[-1] == 3:
+        return np.transpose(rescued_rgb, (1, 2, 0)).astype(
+            np.float32,
+            copy=False,
+        )
+    raise ValueError(f"unsupported Stage7 chroma-rescue source shape: {source.shape}")
 
 
 def _statistical_scale_estimator_report(
@@ -4381,12 +5165,129 @@ def apply_conditional_linked_rgb_stretch(
     )
 
 
+def _adaptive_quantile_curve_contract(
+    input_percentiles: Any,
+    input_anchors: Any,
+    output_anchors: Any,
+) -> Dict[str, Any]:
+    """Serialize and authenticate the exact NumPy interpolation curve."""
+
+    percentiles = np.asarray(input_percentiles, dtype="<f8")
+    inputs = np.asarray(input_anchors, dtype="<f8")
+    outputs = np.asarray(output_anchors, dtype="<f8")
+    if (
+        percentiles.ndim != 1
+        or inputs.ndim != 1
+        or outputs.ndim != 1
+        or inputs.size < 4
+        or inputs.size != outputs.size
+        or inputs.size != percentiles.size
+        or not np.all(np.isfinite(percentiles))
+        or not np.all(np.isfinite(inputs))
+        or not np.all(np.isfinite(outputs))
+        or np.any(np.diff(inputs) <= 0.0)
+        or np.any(np.diff(outputs) < 0.0)
+    ):
+        raise ValueError("adaptive quantile anchors are invalid")
+    derivatives = np.diff(outputs) / np.diff(inputs)
+    maximum_derivative = float(np.max(derivatives))
+    if (
+        not np.isfinite(maximum_derivative)
+        or maximum_derivative > ADAPTIVE_QUANTILE_MAX_DERIVATIVE
+    ):
+        raise ValueError(
+            "adaptive quantile curve derivative exceeds the fixed safety cap: "
+            f"{maximum_derivative:.6f}>{ADAPTIVE_QUANTILE_MAX_DERIVATIVE:.6f}"
+        )
+    anchor_digest = hashlib.sha256()
+    for values in (percentiles, inputs, outputs):
+        anchor_digest.update(int(values.size).to_bytes(8, "big"))
+        anchor_digest.update(values.tobytes(order="C"))
+    payload = {
+        "schema": ADAPTIVE_QUANTILE_CURVE_SCHEMA,
+        "method": "linked_piecewise_linear_quantile_curve",
+        "interpolation": "numpy.interp",
+        "anchor_dtype": "float64-little-endian",
+        "input_percentiles": [float(value) for value in percentiles],
+        "input_anchors": [float(value) for value in inputs],
+        "output_anchors": [float(value) for value in outputs],
+        "left": float(outputs[0]),
+        "right": float(outputs[-1]),
+        "output_clip": [0.0, 0.995],
+        "maximum_derivative": maximum_derivative,
+        "maximum_derivative_limit": ADAPTIVE_QUANTILE_MAX_DERIVATIVE,
+        "anchors_sha256": anchor_digest.hexdigest(),
+    }
+    return {**payload, "sha256": canonical_json_sha256(payload)}
+
+
+def validate_adaptive_quantile_calibration(
+    calibration: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Reject any adaptive curve, source binding, or calibration tamper."""
+
+    if not isinstance(calibration, dict):
+        raise ValueError("adaptive quantile calibration is unavailable")
+    if (
+        calibration.get("schema") != ADAPTIVE_QUANTILE_CALIBRATION_SCHEMA
+        or calibration.get("status") != "ok"
+        or calibration.get("method")
+        != "linked_piecewise_linear_quantile_curve"
+    ):
+        raise ValueError("adaptive quantile calibration schema is invalid")
+    rebuilt_curve = _adaptive_quantile_curve_contract(
+        calibration.get("input_percentiles"),
+        calibration.get("input_anchors"),
+        calibration.get("output_anchors"),
+    )
+    if dict(calibration.get("curve_contract") or {}) != rebuilt_curve:
+        raise ValueError("adaptive quantile curve digest mismatch")
+    strategy = dict(calibration.get("strategy_contract") or {})
+    if (
+        strategy.get("schema") != ADAPTIVE_QUANTILE_STRATEGY_SCHEMA
+        or strategy.get("status") != "accepted"
+        or strategy.get("mode")
+        not in {
+            "frozen_roi_bounded_mtf_search",
+            "preview_target_curve_derivative_bounded",
+        }
+    ):
+        raise ValueError("adaptive quantile strategy contract is invalid")
+    source_binding = dict(calibration.get("source_binding") or {})
+    source_digest = str(source_binding.pop("sha256", "") or "")
+    if (
+        source_binding.get("schema") != ADAPTIVE_QUANTILE_SOURCE_SCHEMA
+        or not source_digest
+        or canonical_json_sha256(source_binding) != source_digest
+    ):
+        raise ValueError("adaptive quantile source binding mismatch")
+    unsigned = dict(calibration)
+    calibration_digest = str(unsigned.pop("calibration_sha256", "") or "")
+    if (
+        not calibration_digest
+        or canonical_json_sha256(unsigned) != calibration_digest
+    ):
+        raise ValueError("adaptive quantile calibration digest mismatch")
+    return {
+        "calibration": dict(calibration),
+        "curve_contract": rebuilt_curve,
+        "source_binding": dict(calibration.get("source_binding") or {}),
+        "calibration_sha256": calibration_digest,
+    }
+
+
 def calibrate_adaptive_quantile_stretch(
     image: np.ndarray,
     adaptation: Dict[str, Any],
     cfg: Any,
+    *,
+    source_stem: Optional[str] = None,
+    frozen_masks: Optional[Dict[str, Any]] = None,
+    linked_preview: Optional[Dict[str, Any]] = None,
+    profile_name: str = "",
+    channel_semantics: str = "unknown",
 ) -> Dict[str, Any]:
-    """Build a bounded linked curve from source quantiles to preview targets."""
+    """Build a derivative-bounded curve, using frozen ROIs when available."""
     if not bool(getattr(cfg, "stage7_quantile_fallback_enabled", True)):
         return {
             "status": "disabled",
@@ -4427,73 +5328,531 @@ def calibrate_adaptive_quantile_stretch(
         if finite.size > 2_000_000:
             sample_step = int(np.ceil(finite.size / 2_000_000.0))
             finite = finite[::sample_step]
-        input_percentiles = np.asarray(
-            [0.1, 1.0, 50.0, 90.0, 99.0, 99.9, 100.0],
-            dtype=np.float32,
+        source_binding_payload = {
+            "schema": ADAPTIVE_QUANTILE_SOURCE_SCHEMA,
+            "source_stem": str(source_stem or "stage6_source"),
+            "pixel_sha256": stage7_pixel_sha256(rgb),
+            "shape": [int(value) for value in rgb.shape],
+            "dtype": "float32-little-endian-canonical-0-1",
+            "roi_source": "stage6_frozen_roi",
+            "preview_reference": "stage7_preview_ref",
+            "preview_method": "autostretch -linked",
+        }
+        source_binding = {
+            **source_binding_payload,
+            "sha256": canonical_json_sha256(source_binding_payload),
+        }
+
+        def apply_curve(curve: Dict[str, Any]) -> np.ndarray:
+            inputs = np.asarray(curve["input_anchors"], dtype=np.float64)
+            outputs = np.asarray(curve["output_anchors"], dtype=np.float64)
+            mapped = np.interp(
+                rgb.reshape(-1),
+                inputs,
+                outputs,
+                left=float(outputs[0]),
+                right=float(outputs[-1]),
+            ).reshape(rgb.shape)
+            return np.clip(mapped, 0.0, 0.995).astype(
+                np.float32,
+                copy=False,
+            )
+
+        def build_mtf_curve(
+            shadows: float,
+            midtones: float,
+        ) -> Dict[str, Any]:
+            dense_percentiles = np.asarray(
+                [
+                    0.1,
+                    0.5,
+                    1.0,
+                    2.0,
+                    5.0,
+                    10.0,
+                    25.0,
+                    50.0,
+                    75.0,
+                    90.0,
+                    95.0,
+                    99.0,
+                    99.5,
+                    99.9,
+                    100.0,
+                ],
+                dtype=np.float64,
+            )
+            dense_values = np.percentile(
+                finite,
+                dense_percentiles,
+            ).astype(np.float64)
+            inputs = [0.0]
+            percentiles = [0.0]
+            if shadows > 1e-9:
+                inputs.append(float(shadows))
+                percentiles.append(0.0)
+            for percentile, source_value in zip(
+                dense_percentiles,
+                dense_values,
+            ):
+                value = float(source_value)
+                if value > inputs[-1] + 1e-8:
+                    inputs.append(value)
+                    percentiles.append(float(percentile))
+            if inputs[-1] < 1.0 - 1e-8:
+                inputs.append(1.0)
+                percentiles.append(100.0)
+            outputs = [
+                linked_mtf_sample(value, shadows, midtones, 1.0)
+                for value in inputs
+            ]
+            return _adaptive_quantile_curve_contract(
+                percentiles,
+                inputs,
+                outputs,
+            )
+
+        context_ready = bool(
+            isinstance(frozen_masks, dict)
+            and frozen_masks.get("background_mask") is not None
+            and isinstance(linked_preview, dict)
+            and linked_preview.get("status") == "available"
+            and str(channel_semantics or "").strip().lower()
+            in {
+                "broadband_rgb",
+                "broadband_rgb_osc",
+                "narrowband_composite",
+                "mono",
+            }
         )
-        input_values = np.percentile(finite, input_percentiles).astype(np.float64)
+        selected_curve: Optional[Dict[str, Any]] = None
+        strategy_contract: Dict[str, Any]
 
-        shadow_low = min(max(target_p50 * 0.08, 0.0005), 0.008)
-        shadow_high = min(max(target_p50 * 0.22, shadow_low + 0.001), 0.018)
-        target_p90 = target_p50 + 0.55 * (target_p99 - target_p50)
-        peak_target = min(0.970, max(target_p99 + 0.040, target_p99 * 1.06))
-        maximum_target = min(0.985, max(peak_target + 0.010, target_p99 + 0.080))
-        output_values = np.asarray(
-            [
-                shadow_low,
-                shadow_high,
-                target_p50,
-                target_p90,
-                target_p99,
-                peak_target,
-                maximum_target,
-            ],
-            dtype=np.float64,
-        )
-        output_values = np.maximum.accumulate(output_values)
+        candidate_b = preview_calibration.get("candidate_b") or {}
+        mtf = candidate_b.get("mtf") or []
+        source_profile = adaptation.get("conditional_source_profile") or {}
+        if context_ready and len(mtf) >= 2:
+            base_shadows = float(mtf[0])
+            base_midtones = float(mtf[1])
+            background_median = float(
+                source_profile.get(
+                    "background_median",
+                    np.percentile(finite, 50.0),
+                )
+            )
+            if not (
+                0.0 <= base_shadows < background_median < 1.0
+                and 0.0 < base_midtones < 1.0
+            ):
+                raise ValueError("bounded MTF search anchor is invalid")
 
-        # Flat shadows can produce duplicate input quantiles. Keep the later
-        # (brighter) target at an identical source value so the P50 contract is
-        # not silently lost.
-        unique_inputs = []
-        unique_outputs = []
-        unique_percentiles = []
-        for percentile, source_value, target_value in zip(
-            input_percentiles,
-            input_values,
-            output_values,
-        ):
-            source_value = float(source_value)
-            target_value = float(target_value)
-            if not np.isfinite(source_value) or not np.isfinite(target_value):
-                continue
-            if unique_inputs and source_value <= unique_inputs[-1] + 1e-8:
-                unique_inputs[-1] = max(unique_inputs[-1], source_value)
-                unique_outputs[-1] = max(unique_outputs[-1], target_value)
-                unique_percentiles[-1] = float(percentile)
-                continue
-            unique_inputs.append(source_value)
-            unique_outputs.append(target_value)
-            unique_percentiles.append(float(percentile))
-        if len(unique_inputs) < 4 or unique_inputs[-1] <= unique_inputs[0] + 1e-6:
-            raise ValueError("source quantiles do not define a usable curve")
-        if any(
-            later <= earlier
-            for earlier, later in zip(unique_inputs, unique_inputs[1:])
-        ):
-            raise ValueError("source quantile anchors are not strictly increasing")
+            background_weight = _stage7_mask(
+                frozen_masks,
+                "background_mask",
+                tuple(int(value) for value in rgb.shape[1:]),
+            )
+            if background_weight is None:
+                raise ValueError("frozen background mask is unavailable")
+            background_support = background_weight > 0.50
+            for mask_name in (
+                "subject_mask",
+                "core_mask",
+                "nebula_mask",
+                "faint_nebula_mask",
+                "galaxy_signal_mask",
+                "star_mask",
+            ):
+                signal_weight = _stage7_mask(
+                    frozen_masks,
+                    mask_name,
+                    tuple(int(value) for value in rgb.shape[1:]),
+                )
+                if signal_weight is not None:
+                    background_support &= signal_weight <= 0.25
+            valid_weight = _stage7_mask(
+                frozen_masks,
+                "shared_valid_mask",
+                tuple(int(value) for value in rgb.shape[1:]),
+            )
+            if valid_weight is not None:
+                background_support &= valid_weight > 0.50
+            if int(np.count_nonzero(background_support)) < 64:
+                raise ValueError("frozen background support is insufficient")
+            try:
+                preview_background_median = float(
+                    (linked_preview.get("metrics") or {})[
+                        "background_median"
+                    ]
+                )
+            except (KeyError, TypeError, ValueError):
+                preview_background_median = float("nan")
+            if (
+                not np.isfinite(preview_background_median)
+                or preview_background_median <= 0.0
+            ):
+                raise ValueError(
+                    "linked preview background median is unavailable"
+                )
 
-        return {
+            try:
+                configured_color_vector_hard = float(
+                    getattr(
+                        cfg,
+                        "stage7_color_vector_p95_hard_max",
+                        0.08,
+                    )
+                )
+            except (TypeError, ValueError):
+                configured_color_vector_hard = 0.08
+            if not np.isfinite(configured_color_vector_hard):
+                configured_color_vector_hard = 0.08
+            color_vector_hard = float(
+                np.clip(configured_color_vector_hard, 0.0, 0.08)
+            )
+            search_specs = sorted(
+                (
+                    {
+                        "shadow_progress": progress,
+                        "midtone_scale": scale,
+                        "strength": progress + 0.35 * (1.0 - scale),
+                    }
+                    for progress in (
+                        0.20,
+                        0.30,
+                        0.35,
+                        0.375,
+                        0.40,
+                        0.425,
+                        0.45,
+                    )
+                    for scale in (0.65, 0.50, 0.40)
+                ),
+                key=lambda item: (
+                    item["strength"],
+                    item["shadow_progress"],
+                    -item["midtone_scale"],
+                ),
+            )
+            attempts = []
+            accepted = []
+            for spec in search_specs:
+                shadows = base_shadows + float(spec["shadow_progress"]) * (
+                    background_median - base_shadows
+                )
+                midtones = max(
+                    1e-6,
+                    base_midtones * float(spec["midtone_scale"]),
+                )
+                curve = build_mtf_curve(shadows, midtones)
+                candidate_pixels = apply_curve(curve)
+                rendition = measure_frozen_rendition_metrics(
+                    candidate_pixels,
+                    frozen_masks,
+                )
+                chroma = assess_subject_chroma_retention(
+                    rendition,
+                    dict(linked_preview or {}),
+                    cfg,
+                    profile_name=profile_name,
+                    channel_semantics=channel_semantics,
+                )
+                brightness = subject_brightness_selection(
+                    rendition,
+                    dict(linked_preview or {}),
+                    profile_name=profile_name,
+                )
+                noise = assess_frozen_background_luma_noise_growth(
+                    rgb,
+                    candidate_pixels,
+                    frozen_masks,
+                    cfg,
+                    expected_candidate=candidate_pixels,
+                    transform_identity={
+                        "status": "authenticated",
+                        "method": "adaptive_quantile_bounded_mtf_search",
+                        "curve_sha256": curve.get("sha256"),
+                    },
+                )
+                vector = assess_rec709_vector_color_reference(
+                    rgb,
+                    candidate_pixels,
+                )
+                try:
+                    vector_p95 = float(
+                        (vector.get("metrics") or {})[
+                            "chromaticity_l1_half_p95"
+                        ]
+                    )
+                except (KeyError, TypeError, ValueError):
+                    vector_p95 = float("inf")
+                candidate_luma = (
+                    0.2126 * candidate_pixels[0]
+                    + 0.7152 * candidate_pixels[1]
+                    + 0.0722 * candidate_pixels[2]
+                ).astype(np.float32)
+                chroma_bias = np.std(candidate_pixels, axis=0)
+                background_chroma_load = float(
+                    np.mean(chroma_bias[background_support])
+                    / max(
+                        float(np.mean(candidate_luma[background_support])),
+                        1e-4,
+                    )
+                )
+                brightness_retention = dict(
+                    brightness.get("retention") or {}
+                )
+                brightness_floors = dict(brightness.get("floors") or {})
+                p50_retention = brightness_retention.get("subject_p50")
+                lift_retention = brightness_retention.get("subject_lift")
+                lift_floor = brightness_floors.get("subject_lift_retention")
+                margin_values = []
+                if p50_retention is not None:
+                    margin_values.append(
+                        float(p50_retention)
+                        / max(
+                            float(
+                                brightness_floors.get(
+                                    "subject_p50_retention",
+                                    1.0,
+                                )
+                            ),
+                            1e-9,
+                        )
+                    )
+                if lift_retention is not None and lift_floor is not None:
+                    margin_values.append(
+                        float(lift_retention) / max(float(lift_floor), 1e-9)
+                    )
+                brightness_margin = (
+                    min(margin_values) if margin_values else 0.0
+                )
+                try:
+                    candidate_background_median = float(
+                        (rendition.get("metrics") or {})[
+                            "background_median"
+                        ]
+                    )
+                except (KeyError, TypeError, ValueError):
+                    candidate_background_median = float("nan")
+                if (
+                    np.isfinite(candidate_background_median)
+                    and candidate_background_median > 0.0
+                ):
+                    background_median_ratio = float(
+                        candidate_background_median
+                        / preview_background_median
+                    )
+                    background_above_preview = bool(
+                        candidate_background_median
+                        > preview_background_median
+                    )
+                    background_presentation_distance = float(
+                        abs(np.log(background_median_ratio))
+                    )
+                else:
+                    background_median_ratio = None
+                    background_above_preview = None
+                    background_presentation_distance = float("inf")
+                candidate_accepted = bool(
+                    chroma.get("accepted", False)
+                    and brightness.get("formal_floor_passed", False)
+                    and noise.get("accepted", False)
+                    and np.isfinite(vector_p95)
+                    and vector_p95 <= color_vector_hard
+                    and background_chroma_load <= 0.06
+                    and np.isfinite(background_presentation_distance)
+                )
+                noise_gate = dict(
+                    (noise.get("quality_gate") or {}).get(
+                        "absolute_visible_noise"
+                    )
+                    or {}
+                )
+                compact = {
+                    **spec,
+                    "shadows": shadows,
+                    "midtones": midtones,
+                    "curve_sha256": curve.get("sha256"),
+                    "maximum_derivative": curve.get("maximum_derivative"),
+                    "accepted": candidate_accepted,
+                    "subject_p50_retention": p50_retention,
+                    "subject_lift_retention": lift_retention,
+                    "brightness_margin": brightness_margin,
+                    "subject_chroma_status": chroma.get("status"),
+                    "visible_noise_score": noise_gate.get("value"),
+                    "visible_noise_status": noise_gate.get("status"),
+                    "background_median": (
+                        candidate_background_median
+                        if np.isfinite(candidate_background_median)
+                        else None
+                    ),
+                    "preview_background_median": preview_background_median,
+                    "background_median_ratio": background_median_ratio,
+                    "background_above_preview": background_above_preview,
+                    "background_presentation_distance": (
+                        background_presentation_distance
+                        if np.isfinite(background_presentation_distance)
+                        else None
+                    ),
+                    "background_chroma_load": background_chroma_load,
+                    "color_vector_p95": (
+                        vector_p95 if np.isfinite(vector_p95) else None
+                    ),
+                }
+                attempts.append(compact)
+                if candidate_accepted:
+                    accepted.append((compact, curve))
+
+            if not accepted:
+                return {
+                    "status": "unavailable",
+                    "reason": (
+                        "bounded adaptive quantile search found no candidate "
+                        "that passed the unchanged frozen-ROI gates"
+                    ),
+                    "strategy_contract": {
+                        "schema": ADAPTIVE_QUANTILE_STRATEGY_SCHEMA,
+                        "status": "rejected",
+                        "mode": "frozen_roi_bounded_mtf_search",
+                        "reference": (
+                            "stage6_frozen_roi+stage7_preview_ref"
+                        ),
+                        "attempts": attempts,
+                    },
+                }
+            selected_attempt, selected_curve = min(
+                accepted,
+                key=lambda item: (
+                    item[0].get("visible_noise_status") != "ok",
+                    item[0].get("background_above_preview") is not False,
+                    float(
+                        item[0].get("background_presentation_distance")
+                        or 0.0
+                    ),
+                    abs(float(item[0].get("brightness_margin") or 0.0) - 1.03),
+                    float(item[0].get("color_vector_p95") or 0.0),
+                    float(item[0].get("maximum_derivative") or 0.0),
+                    float(item[0].get("strength") or 0.0),
+                ),
+            )
+            strategy_contract = {
+                "schema": ADAPTIVE_QUANTILE_STRATEGY_SCHEMA,
+                "status": "accepted",
+                "mode": "frozen_roi_bounded_mtf_search",
+                "selection_policy": (
+                    "all unchanged hard gates, nominal visible-noise first, "
+                    "then no brighter than the linked-preview frozen "
+                    "background and nearest to its median, "
+                    "then nearest 1.03x brightness-floor margin"
+                ),
+                "reference": "stage6_frozen_roi+stage7_preview_ref",
+                "base_mtf": {
+                    "shadows": base_shadows,
+                    "midtones": base_midtones,
+                    "highlights": 1.0,
+                },
+                "background_median": background_median,
+                "preview_background_median": preview_background_median,
+                "color_vector_hard_max": color_vector_hard,
+                "background_chroma_load_max": 0.06,
+                "selected": selected_attempt,
+                "attempts": attempts,
+            }
+        else:
+            input_percentiles = np.asarray(
+                [0.1, 1.0, 50.0, 90.0, 99.0, 99.9, 100.0],
+                dtype=np.float64,
+            )
+            input_values = np.percentile(
+                finite,
+                input_percentiles,
+            ).astype(np.float64)
+            shadow_low = min(max(target_p50 * 0.08, 0.0005), 0.008)
+            shadow_high = min(
+                max(target_p50 * 0.22, shadow_low + 0.001),
+                0.018,
+            )
+            target_p90 = target_p50 + 0.55 * (target_p99 - target_p50)
+            peak_target = min(
+                0.970,
+                max(target_p99 + 0.040, target_p99 * 1.06),
+            )
+            maximum_target = min(
+                0.985,
+                max(peak_target + 0.010, target_p99 + 0.080),
+            )
+            output_values = np.maximum.accumulate(
+                np.asarray(
+                    [
+                        shadow_low,
+                        shadow_high,
+                        target_p50,
+                        target_p90,
+                        target_p99,
+                        peak_target,
+                        maximum_target,
+                    ],
+                    dtype=np.float64,
+                )
+            )
+            unique_inputs = []
+            unique_outputs = []
+            unique_percentiles = []
+            for percentile, source_value, target_value in zip(
+                input_percentiles,
+                input_values,
+                output_values,
+            ):
+                source_value = float(source_value)
+                target_value = float(target_value)
+                if unique_inputs and source_value <= unique_inputs[-1] + 1e-8:
+                    unique_inputs[-1] = max(unique_inputs[-1], source_value)
+                    unique_outputs[-1] = max(
+                        unique_outputs[-1],
+                        target_value,
+                    )
+                    unique_percentiles[-1] = float(percentile)
+                    continue
+                unique_inputs.append(source_value)
+                unique_outputs.append(target_value)
+                unique_percentiles.append(float(percentile))
+            selected_curve = _adaptive_quantile_curve_contract(
+                unique_percentiles,
+                unique_inputs,
+                unique_outputs,
+            )
+            strategy_contract = {
+                "schema": ADAPTIVE_QUANTILE_STRATEGY_SCHEMA,
+                "status": "accepted",
+                "mode": "preview_target_curve_derivative_bounded",
+                "reference": "stage7_preview_ref candidate_a P50/P99",
+                "reason": (
+                    "frozen ROI search context unavailable; the fixed curve "
+                    "derivative cap remains mandatory"
+                ),
+            }
+
+        if selected_curve is None:
+            raise ValueError("adaptive quantile curve selection failed")
+        calibration = {
+            "schema": ADAPTIVE_QUANTILE_CALIBRATION_SCHEMA,
             "status": "ok",
             "method": "linked_piecewise_linear_quantile_curve",
-            "input_percentiles": unique_percentiles,
-            "input_anchors": unique_inputs,
-            "output_anchors": unique_outputs,
+            "input_percentiles": selected_curve["input_percentiles"],
+            "input_anchors": selected_curve["input_anchors"],
+            "output_anchors": selected_curve["output_anchors"],
             "target_p50": target_p50,
             "target_p99": target_p99,
             "brightness_ordering_preserved": True,
             "channel_curve_linked": True,
-            "source": "stage7_preview_ref candidate_a P50/P99",
+            "source": strategy_contract.get("reference"),
+            "strategy_contract": strategy_contract,
+            "curve_contract": selected_curve,
+            "source_binding": source_binding,
+        }
+        return {
+            **calibration,
+            "calibration_sha256": canonical_json_sha256(calibration),
         }
     except (IndexError, TypeError, ValueError, FloatingPointError) as error:
         return {
@@ -4509,20 +5868,10 @@ def apply_adaptive_quantile_stretch(
     """Apply one shared monotonic curve to all RGB samples."""
     source = np.asarray(image)
     rgb = _stage7_rgb_float_fullres(source)
-    inputs = np.asarray(calibration.get("input_anchors"), dtype=np.float64)
-    outputs = np.asarray(calibration.get("output_anchors"), dtype=np.float64)
-    if (
-        str(calibration.get("status") or "") != "ok"
-        or inputs.ndim != 1
-        or outputs.ndim != 1
-        or inputs.size < 4
-        or inputs.size != outputs.size
-        or not np.all(np.isfinite(inputs))
-        or not np.all(np.isfinite(outputs))
-        or np.any(np.diff(inputs) <= 0.0)
-        or np.any(np.diff(outputs) < 0.0)
-    ):
-        raise ValueError("adaptive quantile calibration is invalid")
+    validated = validate_adaptive_quantile_calibration(calibration)
+    curve = dict(validated.get("curve_contract") or {})
+    inputs = np.asarray(curve.get("input_anchors"), dtype=np.float64)
+    outputs = np.asarray(curve.get("output_anchors"), dtype=np.float64)
     mapped = np.interp(
         rgb.reshape(-1),
         inputs,

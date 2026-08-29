@@ -287,6 +287,49 @@ class Stage9SepCrossmatchTests(unittest.TestCase):
         )
         self.assertIn("source_recovery_ratio", report["failed_gates"])
 
+    def test_config_cannot_relax_fixed_sep_catalog_or_crossmatch_gates(self):
+        self.cfg.stage9_sep_axis_ratio_min = 0.10
+        self.cfg.stage9_sep_fwhm_ratio_min = 0.10
+        self.cfg.stage9_sep_fwhm_ratio_max = 9.00
+        self.cfg.stage9_sep_match_radius_min_px = 16.0
+        self.cfg.stage9_sep_match_radius_max_px = 32.0
+        self.cfg.stage9_sep_match_radius_fwhm = 4.0
+        self.cfg.stage9_sep_high_confidence_fraction = 0.0
+        self.cfg.stage9_sep_source_match_ratio_min = 0.0
+        self.cfg.stage9_sep_unmatched_ratio_max = 1.0
+        self.cfg.stage9_sep_source_recovery_ratio_min = 0.0
+        self.cfg.stage9_sep_separation_p50_max_px = 32.0
+        self.cfg.stage9_sep_separation_p95_max_px = 32.0
+
+        resolved = stage9_quality._stage9_sep_config(self.cfg)
+        self.assertEqual(resolved["axis_ratio_min"], 0.50)
+        self.assertEqual(resolved["fwhm_ratio_min"], 0.50)
+        self.assertEqual(resolved["fwhm_ratio_max"], 2.20)
+
+        original_coordinates = [
+            (float((index % 20) * 10), float((index // 20) * 10))
+            for index in range(160)
+        ]
+        candidate_coordinates = original_coordinates[:32]
+        report = self._assess_with_catalogs(
+            {
+                "O": _catalog("O", original_coordinates),
+                "B": _catalog("B", candidate_coordinates),
+                "C": _catalog("C", candidate_coordinates),
+            }
+        )
+
+        self.assertEqual(report["status"], "rejected", report)
+        self.assertEqual(report["match_radius_px"], 3.0)
+        self.assertEqual(report["formal_set"]["selected_count"], 16)
+        self.assertEqual(report["failed_gates"], ["source_recovery_ratio"])
+        gates = report["gates"]
+        self.assertEqual(gates["source_match_ratio"]["minimum"], 0.75)
+        self.assertEqual(gates["unmatched_ratio"]["maximum"], 0.25)
+        self.assertEqual(gates["source_recovery_ratio"]["minimum"], 0.30)
+        self.assertEqual(gates["distance_p50_px"]["maximum"], 0.75)
+        self.assertEqual(gates["distance_p95_px"]["maximum"], 1.50)
+
     def test_independent_source_presence_restores_only_positive_o_minus_b_pixels(self):
         original = np.full((3, 32, 32), 0.10, dtype=np.float32)
         starless = original.copy()

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import sys
 import tempfile
@@ -1490,6 +1491,144 @@ class Display90Stage9ContractTests(unittest.TestCase):
             rejected["reason_code"],
             "stage9_matched_domain_transfer_invalid",
         )
+
+    def test_background_chroma_rescue_replays_authenticated_mask_chain(self) -> None:
+        image = _linear_rgb(48, 64)
+        params = {
+            "mtf_shadows": 0.01,
+            "mtf_midtones": 0.22,
+            "mtf_highlights": 0.98,
+        }
+        reference = {
+            "schema": "starun.stage7-mtf-reference.v1",
+            "status": "active",
+            "active_anchor": {
+                "candidate": "cand_b",
+                "method": "closed_form_linked_mtf",
+                "params": params,
+            },
+        }
+        keep = np.linspace(0.40, 1.0, 48 * 64, dtype=np.float32).reshape(
+            48,
+            64,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "stage7_chroma_rescue_1_chroma_keep.npz"
+            np.savez_compressed(path, chroma_keep=keep)
+            container_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+            mask_contract = {
+                "schema": stretch_metrics.STAGE7_CHROMA_RESCUE_MASK_SCHEMA,
+                "file": path.name,
+                "array_key": "chroma_keep",
+                "container_sha256": container_sha,
+                "array_sha256": stretch_metrics.stage7_float_array_sha256(
+                    keep
+                ),
+                "shape": [48, 64],
+                "dtype": "float32",
+            }
+            selected = {
+                "name": "chroma_rescue_1",
+                "method": "background_chroma_rescue",
+                "calibration_candidate": "cand_b",
+                "params": {
+                    "strength": 0.60,
+                    "parent_candidate": {
+                        "name": "cand_b",
+                        "method": "linked_mtf",
+                        "params": params,
+                    },
+                    "mask_contract": mask_contract,
+                },
+            }
+            transfer = _stage7_matched_domain_transfer_contract(
+                selected,
+                reference,
+            )
+            self.assertEqual(transfer["status"], "active", transfer)
+            self.assertEqual(
+                [step["method"] for step in transfer["chain_contract"]["steps"]],
+                [
+                    "closed_form_linked_mtf",
+                    "frozen_background_chroma_rescue",
+                ],
+            )
+            resolved = stage9_star_remixing._stage9_resolve_matched_domain_transfer(
+                types.SimpleNamespace(
+                    _stage7_matched_domain_transfer=transfer,
+                    _stage7_closed_form_mtf_reference=reference,
+                    process_dir=root,
+                )
+            )
+            self.assertEqual(resolved["status"], "ready", resolved)
+            expected = stretch_metrics.apply_frozen_background_chroma_rescue(
+                stretch_metrics.apply_linked_mtf(
+                    image,
+                    params["mtf_shadows"],
+                    params["mtf_midtones"],
+                    params["mtf_highlights"],
+                ),
+                keep,
+            )
+            np.testing.assert_array_equal(
+                stage9_star_remixing._stage9_apply_matched_domain_transfer(
+                    image,
+                    resolved,
+                ),
+                expected,
+            )
+
+            path.write_bytes(path.read_bytes() + b"tamper")
+            rejected = stage9_star_remixing._stage9_resolve_matched_domain_transfer(
+                types.SimpleNamespace(
+                    _stage7_matched_domain_transfer=transfer,
+                    _stage7_closed_form_mtf_reference=reference,
+                    process_dir=root,
+                )
+            )
+            self.assertEqual(rejected["status"], "unavailable")
+            self.assertEqual(
+                rejected["reason_code"],
+                "stage9_matched_domain_transfer_invalid",
+            )
+
+    def test_unknown_positive_chroma_wrapper_has_no_transfer_contract(self) -> None:
+        params = {
+            "mtf_shadows": 0.01,
+            "mtf_midtones": 0.22,
+            "mtf_highlights": 0.98,
+        }
+        reference = {
+            "schema": "starun.stage7-mtf-reference.v1",
+            "status": "active",
+            "active_anchor": {
+                "candidate": "cand_b",
+                "method": "closed_form_linked_mtf",
+                "params": params,
+            },
+        }
+        selected = {
+            "name": "cand_retired_positive_chroma",
+            "method": "retired_positive_chroma",
+            "tone_parent": "cand_b",
+            "params": {
+                "factor": 4.0,
+                "parent_name": "cand_b",
+                "parent_candidate": {
+                    "name": "cand_b",
+                    "method": "linked_mtf",
+                    "params": params,
+                },
+            },
+        }
+        transfer = _stage7_matched_domain_transfer_contract(selected, reference)
+        self.assertEqual(
+            transfer["selected_candidate_id"],
+            "cand_retired_positive_chroma",
+        )
+        self.assertEqual(transfer["status"], "unavailable")
+        self.assertNotIn("tone_candidate_id", transfer)
 
     def test_non_cand_b_winner_cannot_borrow_closed_form_mtf_reference(self) -> None:
         params = {

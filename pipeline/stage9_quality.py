@@ -1,11 +1,12 @@
 """Pixel-space remix formula and deterministic Stage 9 quality gate."""
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Mapping, Tuple
 
 import hashlib
 import json
 import math
+import time
 
 import numpy as np
 
@@ -113,7 +114,7 @@ def _stage9_sep_config(cfg: Any) -> Dict[str, Any]:
     fwhm_ratio_min = _bounded(
         getattr(cfg, "stage9_sep_fwhm_ratio_min", 0.50),
         0.50,
-        0.10,
+        0.50,
         2.00,
     )
     return {
@@ -129,7 +130,7 @@ def _stage9_sep_config(cfg: Any) -> Dict[str, Any]:
         "axis_ratio_min": _bounded(
             getattr(cfg, "stage9_sep_axis_ratio_min", 0.50),
             0.50,
-            0.10,
+            0.50,
             1.00,
         ),
         "fwhm_ratio_min": fwhm_ratio_min,
@@ -137,7 +138,7 @@ def _stage9_sep_config(cfg: Any) -> Dict[str, Any]:
             getattr(cfg, "stage9_sep_fwhm_ratio_max", 2.20),
             2.20,
             fwhm_ratio_min,
-            5.00,
+            2.20,
         ),
         "allowed_flags": ["MERGED"],
         "rejected_flags": ["TRUNC", "DOVERFLOW", "SINGU"],
@@ -504,13 +505,13 @@ def assess_independent_sep_crossmatch(
             getattr(cfg, "stage9_sep_match_radius_min_px", 2.0),
             2.0,
             0.5,
-            16.0,
+            2.0,
         )
         radius_max_px = _bounded(
             getattr(cfg, "stage9_sep_match_radius_max_px", 4.0),
             4.0,
             radius_min_px,
-            32.0,
+            4.0,
         )
         radius_px = max(
             radius_min_px,
@@ -520,7 +521,7 @@ def assess_independent_sep_crossmatch(
                     getattr(cfg, "stage9_sep_match_radius_fwhm", 0.75),
                     0.75,
                     0.10,
-                    4.00,
+                    0.75,
                 )
                 * anchor_fwhm,
             ),
@@ -543,7 +544,7 @@ def assess_independent_sep_crossmatch(
                 _bounded(
                     getattr(cfg, "stage9_sep_high_confidence_fraction", 0.20),
                     0.20,
-                    0.01,
+                    0.20,
                     1.00,
                 )
                 * len(c_records)
@@ -582,7 +583,7 @@ def assess_independent_sep_crossmatch(
                 "minimum": _bounded(
                     getattr(cfg, "stage9_sep_source_match_ratio_min", 0.75),
                     0.75,
-                    0.0,
+                    0.75,
                     1.0,
                 ),
             },
@@ -592,7 +593,7 @@ def assess_independent_sep_crossmatch(
                     getattr(cfg, "stage9_sep_unmatched_ratio_max", 0.25),
                     0.25,
                     0.0,
-                    1.0,
+                    0.25,
                 ),
             },
             "source_recovery_ratio": {
@@ -600,7 +601,7 @@ def assess_independent_sep_crossmatch(
                 "minimum": _bounded(
                     getattr(cfg, "stage9_sep_source_recovery_ratio_min", 0.30),
                     0.30,
-                    0.0,
+                    0.30,
                     1.0,
                 ),
             },
@@ -610,7 +611,7 @@ def assess_independent_sep_crossmatch(
                     getattr(cfg, "stage9_sep_separation_p50_max_px", 0.75),
                     0.75,
                     0.0,
-                    radius_max_px,
+                    min(0.75, radius_max_px),
                 ),
             },
             "distance_p95_px": {
@@ -619,7 +620,7 @@ def assess_independent_sep_crossmatch(
                     getattr(cfg, "stage9_sep_separation_p95_max_px", 1.50),
                     1.50,
                     0.0,
-                    radius_max_px,
+                    min(1.50, radius_max_px),
                 ),
             },
         }
@@ -2070,6 +2071,8 @@ def build_chroma_stable_unscreen_layer(
     trusted_stars: np.ndarray,
     support_mask: np.ndarray,
     cfg: Any,
+    *,
+    amplitude_blend: float = 1.0,
 ) -> tuple[np.ndarray | None, Dict[str, Any]]:
     """Build a reliable Unscreen amplitude layer with trusted RGB proportions."""
     report: Dict[str, Any] = {
@@ -2134,6 +2137,12 @@ def build_chroma_stable_unscreen_layer(
             0.75,
             0.98,
         )
+        effective_amplitude_blend = _bounded(
+            amplitude_blend,
+            1.0,
+            0.0,
+            1.0,
+        )
         residual = original - starless
         denominator = 1.0 - starless
         outside = ~support
@@ -2174,7 +2183,14 @@ def build_chroma_stable_unscreen_layer(
             trusted_peak,
             np.minimum(raw_peak, peak_max),
         )
-        output_peak = np.where(reliable, recovered_peak, trusted_peak)
+        recovered_or_trusted_peak = np.where(
+            reliable,
+            recovered_peak,
+            trusted_peak,
+        )
+        output_peak = trusted_peak + effective_amplitude_blend * (
+            recovered_or_trusted_peak - trusted_peak
+        )
         trusted_ratio = np.divide(
             trusted,
             np.maximum(
@@ -2229,6 +2245,10 @@ def build_chroma_stable_unscreen_layer(
                 "outside_residual_mad": residual_mad,
                 "negative_residual_tolerance": negative_tolerance,
                 "peak_max": peak_max,
+                "amplitude_blend": effective_amplitude_blend,
+                "amplitude_blend_semantics": (
+                    "trusted_screen_to_authenticated_unscreen_peak_interpolation"
+                ),
                 "peak_capped_ratio": float(
                     np.count_nonzero(reliable & (raw_peak > peak_max))
                     / support_count
@@ -3632,14 +3652,14 @@ def compare_unscreen_candidate(
         fwhm_min = _bounded(
             getattr(cfg, "stage9_psf_fwhm_ratio_min", 0.93),
             0.93,
-            0.50,
+            0.93,
             1.00,
         )
         fwhm_max = _bounded(
             getattr(cfg, "stage9_psf_fwhm_ratio_max", 1.10),
             1.10,
             1.00,
-            1.50,
+            1.10,
         )
         result.update(
             baseline_fwhm_ratio=baseline_fwhm_ratio,
@@ -3732,7 +3752,7 @@ def _stage9_starmask_output_targets(cfg: Any) -> Dict[str, float]:
     faint = _bounded(
         getattr(cfg, "stage9_starmask_faint_target", 0.26),
         0.26,
-        0.08,
+        0.06,
         0.40,
     )
     peak = _bounded(
@@ -3748,7 +3768,7 @@ def _stage9_starmask_output_targets(cfg: Any) -> Dict[str, float]:
             _bounded(
                 getattr(cfg, "stage9_starmask_mid_target", 0.50),
                 0.50,
-                0.30,
+                0.26,
                 0.70,
             ),
         ),
@@ -6887,16 +6907,27 @@ def contract_star_layer_components(
     gamma: float,
     centroid_drift_max_px: float = 0.05,
 ) -> Tuple[np.ndarray | None, Dict[str, Any]]:
-    """Tighten only selected catalog components with one RGB-shared gain map."""
+    """Tighten selected half-max shoulders with one RGB-shared gain map."""
+    preserved_wing_ceiling_fraction = 0.45
     report: Dict[str, Any] = {
-        "schema": "starun.stage9-psf-component-contraction.v1",
+        "schema": "starun.stage9-psf-component-contraction.v2",
         "status": "unavailable",
         "changed": False,
         "gamma": float(gamma),
         "target_groups": list(target_groups),
-        "operator": "component_local_rgb_shared_u_power_centroid_backoff",
-        "operator_formula": "gain=u^(gamma-1) with per-component gamma backoff",
+        "operator": (
+            "component_local_rgb_shared_halfmax_shoulder_power_"
+            "centroid_backoff"
+        ),
+        "operator_formula": (
+            "u<=0.45 unchanged; u>0.45 maps to "
+            "0.45+0.55*((u-0.45)/0.55)^gamma with per-component "
+            "gamma backoff"
+        ),
         "gamma_bounds": [1.0, 4.0],
+        "preserved_wing_ceiling_fraction": preserved_wing_ceiling_fraction,
+        "wing_pixels_immutable_by_construction": True,
+        "halfmax_shoulder_only": True,
         "peak_preserved": False,
         "channel_ratio_preserved_by_construction": True,
     }
@@ -7005,6 +7036,38 @@ def contract_star_layer_components(
         0.0,
         1.0,
     )
+    peak_y = np.asarray(catalog.get("_peak_y", ()), dtype=np.int32)
+    peak_x = np.asarray(catalog.get("_peak_x", ()), dtype=np.int32)
+    if (
+        peak_y.size != component_ids.size
+        or peak_x.size != component_ids.size
+        or np.any(peak_y < 0)
+        or np.any(peak_x < 0)
+        or np.any(peak_y >= peak_map.shape[0])
+        or np.any(peak_x >= peak_map.shape[1])
+    ):
+        report["reason"] = "frozen catalog peak coordinates are unavailable"
+        return None, report
+    local_peak_positions = scipy_ndimage.maximum_position(
+        peak_map,
+        labels=labels,
+        index=target_ids,
+    )
+    local_peak_y = np.asarray(
+        [position[0] for position in local_peak_positions],
+        dtype=np.int32,
+    )
+    local_peak_x = np.asarray(
+        [position[1] for position in local_peak_positions],
+        dtype=np.int32,
+    )
+    immutable_peak_scope = np.zeros_like(target_scope, dtype=bool)
+    immutable_peak_scope[local_peak_y, local_peak_x] = True
+    selected_catalog_peaks = np.isin(component_ids, target_ids)
+    immutable_peak_scope[
+        peak_y[selected_catalog_peaks],
+        peak_x[selected_catalog_peaks],
+    ] = True
     # The frozen component peak is unchanged by definition.  A pure power
     # contraction can pull the intensity centroid of an asymmetric star toward
     # its peak.  Reduce gamma uniformly for that whole component instead of
@@ -7028,6 +7091,36 @@ def contract_star_layer_components(
         np.float64,
         copy=False,
     )
+    immutable_peak_scoped = immutable_peak_scope[ys, xs]
+
+    def shoulder_gain(component_gammas: np.ndarray) -> np.ndarray:
+        """Preserve true wings and contract only the 45%-to-peak shoulder."""
+        gamma_lookup = np.ones(max_label + 1, dtype=np.float64)
+        gamma_lookup[target_ids] = component_gammas
+        local_gamma = gamma_lookup[scoped_labels]
+        gain = np.ones_like(relative_scoped, dtype=np.float64)
+        shoulder = relative_scoped > preserved_wing_ceiling_fraction
+        if np.any(shoulder):
+            normalized_shoulder = np.clip(
+                (
+                    relative_scoped[shoulder]
+                    - preserved_wing_ceiling_fraction
+                )
+                / (1.0 - preserved_wing_ceiling_fraction),
+                0.0,
+                1.0,
+            )
+            mapped = preserved_wing_ceiling_fraction + (
+                1.0 - preserved_wing_ceiling_fraction
+            ) * np.power(normalized_shoulder, local_gamma[shoulder])
+            gain[shoulder] = np.divide(
+                mapped,
+                relative_scoped[shoulder],
+                out=np.ones_like(mapped),
+                where=relative_scoped[shoulder] > 0.0,
+            )
+        gain[immutable_peak_scoped] = 1.0
+        return np.clip(gain, 0.0, 1.0)
 
     def centroid_drift_for_scoped_gain(
         scoped_gain: np.ndarray,
@@ -7069,13 +7162,8 @@ def contract_star_layer_components(
     def centroid_drift_for_gammas(
         component_gammas: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        gamma_lookup = np.ones(max_label + 1, dtype=np.float64)
-        gamma_lookup[target_ids] = component_gammas
         return centroid_drift_for_scoped_gain(
-            np.power(
-                relative_scoped,
-                gamma_lookup[scoped_labels] - 1.0,
-            )
+            shoulder_gain(component_gammas)
         )
 
     requested_gammas = np.full(
@@ -7100,12 +7188,7 @@ def contract_star_layer_components(
             high = np.where(adjusted & ~middle_safe, middle, high)
         selected_gammas[adjusted] = low[adjusted]
 
-    gamma_lookup = np.ones(max_label + 1, dtype=np.float64)
-    gamma_lookup[target_ids] = selected_gammas
-    scoped_gain = np.power(
-        relative_scoped,
-        gamma_lookup[scoped_labels] - 1.0,
-    )
+    scoped_gain = shoulder_gain(selected_gammas)
 
     centroid_drift, valid_centroid = centroid_drift_for_scoped_gain(
         scoped_gain
@@ -7125,38 +7208,6 @@ def contract_star_layer_components(
     changed_scope = target_scope & (gain < 1.0 - 1.0e-7)
     expanded_gain = _expanded_spatial_mask(normalized, gain)
     contracted = normalized * expanded_gain
-    local_peak_positions = scipy_ndimage.maximum_position(
-        peak_map,
-        labels=labels,
-        index=target_ids,
-    )
-    peak_drift = 0.0
-    if local_peak_positions:
-        local_peak_y = np.asarray(
-            [position[0] for position in local_peak_positions],
-            dtype=np.int32,
-        )
-        local_peak_x = np.asarray(
-            [position[1] for position in local_peak_positions],
-            dtype=np.int32,
-        )
-        before_peak = peak_map[local_peak_y, local_peak_x]
-        after_peak = _pixel_peak(contracted)[local_peak_y, local_peak_x]
-        peak_drift = float(np.max(np.abs(after_peak - before_peak)))
-
-    catalog_position_change = 0.0
-    peak_y = np.asarray(catalog.get("_peak_y", ()), dtype=np.int32)
-    peak_x = np.asarray(catalog.get("_peak_x", ()), dtype=np.int32)
-    if peak_y.size == component_ids.size and peak_x.size == component_ids.size:
-        selected = np.isin(component_ids, target_ids)
-        if np.any(selected):
-            before_catalog = peak_map[peak_y[selected], peak_x[selected]]
-            after_catalog = _pixel_peak(contracted)[
-                peak_y[selected], peak_x[selected]
-            ]
-            catalog_position_change = float(
-                np.max(np.abs(after_catalog - before_catalog))
-            )
 
     restored = contracted * scale
     if np.issubdtype(source.dtype, np.integer):
@@ -7166,18 +7217,83 @@ def contract_star_layer_components(
         )
     else:
         restored = restored.astype(source.dtype, copy=False)
-    outside = ~target_scope
-    spatial_abs_change = _pixel_peak(
-        np.abs(
-            np.asarray(restored, dtype=np.float64)
-            - np.asarray(source, dtype=np.float64)
-        )
+    # Normalization intentionally uses float32 for the Stage9 display-domain
+    # math.  Restore every pixel not selected by the shoulder operator from the
+    # original typed buffer so scale/precision round-trips cannot alter the
+    # background, true wings, or component peaks by even one bit.
+    expanded_changed_scope = _expanded_spatial_mask(source, changed_scope)
+    restored = np.array(restored, copy=True)
+    np.copyto(
+        restored,
+        source,
+        where=np.broadcast_to(expanded_changed_scope, source.shape) == 0,
     )
+    raw_delta = np.abs(
+        np.asarray(restored, dtype=np.float64)
+        - np.asarray(source, dtype=np.float64)
+    )
+    if raw_delta.ndim == 2:
+        spatial_abs_change = raw_delta
+    elif raw_delta.ndim == 3 and raw_delta.shape[0] <= 4:
+        spatial_abs_change = np.max(raw_delta, axis=0)
+    elif raw_delta.ndim == 3 and raw_delta.shape[-1] <= 4:
+        spatial_abs_change = np.max(raw_delta, axis=-1)
+    else:
+        spatial_abs_change = np.max(raw_delta, axis=0)
+    outside = ~target_scope
     outside_change = (
         float(np.max(spatial_abs_change[outside]))
         if np.any(outside)
         else 0.0
     )
+    protected_wing = target_scope & (
+        relative_peak <= preserved_wing_ceiling_fraction
+    )
+    protected_wing_change = (
+        float(np.max(spatial_abs_change[protected_wing]))
+        if np.any(protected_wing)
+        else 0.0
+    )
+    unchanged_scope_change = (
+        float(np.max(spatial_abs_change[~changed_scope]))
+        if np.any(~changed_scope)
+        else 0.0
+    )
+    peak_change = 0.0
+    if local_peak_positions:
+        peak_change = float(
+            np.max(spatial_abs_change[local_peak_y, local_peak_x])
+        )
+    catalog_position_change = 0.0
+    if (
+        peak_y.size == component_ids.size
+        and peak_x.size == component_ids.size
+    ):
+        selected = np.isin(component_ids, target_ids)
+        if np.any(selected):
+            catalog_position_change = float(
+                np.max(spatial_abs_change[peak_y[selected], peak_x[selected]])
+            )
+    exact_preservation_verified = bool(
+        outside_change == 0.0
+        and protected_wing_change == 0.0
+        and unchanged_scope_change == 0.0
+        and peak_change == 0.0
+        and catalog_position_change == 0.0
+    )
+    if not exact_preservation_verified:
+        report.update(
+            status="rejected",
+            changed=False,
+            reason="PSF contraction altered an immutable source pixel",
+            outside_target_max_abs_change=outside_change,
+            protected_wing_max_abs_change=protected_wing_change,
+            unchanged_scope_max_abs_change=unchanged_scope_change,
+            peak_max_abs_drift=peak_change,
+            peak_preserved=False,
+            exact_source_pixel_preservation_verified=False,
+        )
+        return None, report
     applied_drift = centroid_drift[
         np.isfinite(centroid_drift) & ~np.isin(target_ids, unsafe_ids)
     ]
@@ -7202,8 +7318,8 @@ def contract_star_layer_components(
             float(np.max(applied_drift)) if applied_drift.size else None
         ),
         centroid_drift_limit_px=float(centroid_drift_max_px),
-        peak_max_abs_drift=peak_drift,
-        peak_preserved=bool(peak_drift <= 1.0e-7),
+        peak_max_abs_drift=peak_change,
+        peak_preserved=bool(peak_change == 0.0),
         catalog_position_max_abs_change=catalog_position_change,
         effective_gamma={
             "min": float(np.min(effective_component_gammas)),
@@ -7212,10 +7328,1219 @@ def contract_star_layer_components(
             "max": float(np.max(effective_component_gammas)),
         },
         outside_target_max_abs_change=outside_change,
+        protected_wing_max_abs_change=protected_wing_change,
+        unchanged_scope_max_abs_change=unchanged_scope_change,
+        exact_source_pixel_preservation_verified=(
+            exact_preservation_verified
+        ),
         target_pixel_count=int(np.count_nonzero(target_scope)),
         changed_pixel_count=int(np.count_nonzero(changed_scope)),
     )
     return restored, report
+
+
+def _freeze_stage9_assigned_halfmax_wings(
+    immutable_peak: np.ndarray,
+    sorted_flat: np.ndarray,
+    component_slices: Mapping[int, tuple[int, int]],
+    component_peaks: Mapping[int, float],
+    *,
+    wing_ceiling: float,
+) -> np.ndarray:
+    """Freeze parent-domain ``u<=wing_ceiling`` pixels by component."""
+
+    peak = np.asarray(immutable_peak)
+    frozen = np.zeros(peak.shape, dtype=bool)
+    peak_flat = peak.ravel()
+    frozen_flat = frozen.ravel()
+    for component_id, local_peak in component_peaks.items():
+        bounds = component_slices.get(int(component_id))
+        if bounds is None or not math.isfinite(float(local_peak)):
+            continue
+        if float(local_peak) <= 1.0e-12:
+            continue
+        start, size = bounds
+        flat_positions = np.asarray(
+            sorted_flat[start : start + size], dtype=np.int64
+        )
+        component_values = peak_flat[flat_positions]
+        frozen_flat[
+            flat_positions[
+                component_values <= float(wing_ceiling) * float(local_peak)
+            ]
+        ] = True
+    return frozen
+
+
+def prune_star_layer_halfmax_boundaries(
+    stars: np.ndarray,
+    remix_base: np.ndarray,
+    original_display: np.ndarray,
+    catalog: Dict[str, Any],
+    cfg: Any,
+    *,
+    support_mask: np.ndarray,
+    weak_mask: np.ndarray,
+    bright_mask: np.ndarray,
+    target_groups: tuple[str, ...],
+    intensity: float,
+    weak_intensity: float | None = None,
+    alpha_mask: np.ndarray | None = None,
+    target_min: float = 0.97,
+    target_max: float = 1.05,
+) -> Tuple[np.ndarray | None, Dict[str, Any]]:
+    """Prune only reference-overshooting connected half-max boundaries.
+
+    Membership, coordinates, source half-max areas, and measurement geometry
+    all come from the already frozen source-matched catalog.  The first pass
+    accepts only pixels whose RGB L1 error to the authenticated display-domain
+    source ``O`` decreases.  If the bright subgroup remains oversized, each
+    existing bright component gets one independent minimum-cost closure
+    proposal; only the smallest positive-fidelity-cost prefix needed to close
+    the subgroup median is committed.
+    """
+
+    started = time.perf_counter()
+    wing_ceiling = 0.45
+    report: Dict[str, Any] = {
+        "schema": "starun.stage9-reference-guided-halfmax-pruning.v1",
+        "status": "unavailable",
+        "accepted": False,
+        "changed": False,
+        "operator": "matched_domain_connected_halfmax_boundary_pruning",
+        "target_groups": list(target_groups),
+        "soft_target": {"min": float(target_min), "max": float(target_max)},
+        "preserved_wing_ceiling_fraction": wing_ceiling,
+        "generated_coordinates": False,
+        "reference_pixels_used_for_output": False,
+    }
+    if scipy_ndimage is None:
+        report["reason"] = "scipy.ndimage unavailable"
+        return None, report
+    if (
+        not math.isfinite(float(target_min))
+        or not math.isfinite(float(target_max))
+        or float(target_min) < 0.97
+        or float(target_max) > 1.05
+        or float(target_min) > float(target_max)
+    ):
+        report["reason"] = (
+            "reference-guided pruning soft target must remain within "
+            "0.97..1.05"
+        )
+        return None, report
+    normalized_groups = tuple(
+        dict.fromkeys(str(group).strip().lower() for group in target_groups)
+    )
+    if not normalized_groups or any(
+        group not in {"all", "weak", "bright"}
+        for group in normalized_groups
+    ):
+        report["reason"] = "target groups are empty or unsupported"
+        return None, report
+    if (
+        not isinstance(catalog, dict)
+        or catalog.get("status") != "ok"
+        or not bool(catalog.get("source_matched", False))
+    ):
+        report["reason"] = "authenticated source-matched catalog unavailable"
+        return None, report
+
+    try:
+        source = np.asarray(stars)
+        source_scale = _image_scale(source)
+        working_stars = _normalized(source, scale=source_scale).copy()
+        base = _normalized(np.asarray(remix_base))
+        original = _normalized(np.asarray(original_display))
+        if not (
+            source.shape
+            == np.asarray(remix_base).shape
+            == np.asarray(original_display).shape
+        ):
+            raise ValueError("reference-guided pruning image shapes do not match")
+        strict_rgb_layout = bool(
+            source.ndim == 3
+            and (
+                source.shape[0] == 3
+                if source.shape[0] <= 4
+                else source.shape[-1] == 3
+            )
+        )
+        if not strict_rgb_layout:
+            raise ValueError("reference-guided pruning requires an RGB star layer")
+        spatial_shape = _pixel_peak(working_stars).shape
+        support = np.asarray(support_mask, dtype=bool)
+        weak_support = np.asarray(weak_mask, dtype=bool)
+        bright_support = np.asarray(bright_mask, dtype=bool)
+        alpha = np.asarray(
+            support if alpha_mask is None else alpha_mask,
+            dtype=np.float32,
+        )
+        if any(
+            mask.shape != spatial_shape
+            for mask in (support, weak_support, bright_support, alpha)
+        ):
+            raise ValueError("reference-guided pruning support geometry mismatch")
+        alpha = np.clip(alpha, 0.0, 1.0)
+        if not np.any(support):
+            raise ValueError("reference-guided pruning support is empty")
+
+        component_ids = np.asarray(
+            catalog.get("_component_ids", ()), dtype=np.int32
+        )
+        peak_y = np.asarray(catalog.get("_peak_y", ()), dtype=np.int32)
+        peak_x = np.asarray(catalog.get("_peak_x", ()), dtype=np.int32)
+        source_peak_y = np.asarray(
+            catalog.get(
+                "_display_source_peak_y",
+                catalog.get("_source_peak_y", ()),
+            ),
+            dtype=np.int32,
+        )
+        source_peak_x = np.asarray(
+            catalog.get(
+                "_display_source_peak_x",
+                catalog.get("_source_peak_x", ()),
+            ),
+            dtype=np.int32,
+        )
+        catalog_source_peak_y = np.asarray(
+            catalog.get("_source_peak_y", ()), dtype=np.int32
+        )
+        catalog_source_peak_x = np.asarray(
+            catalog.get("_source_peak_x", ()), dtype=np.int32
+        )
+        display_source_peak_y = np.asarray(
+            catalog.get("_display_source_peak_y", ()), dtype=np.int32
+        )
+        display_source_peak_x = np.asarray(
+            catalog.get("_display_source_peak_x", ()), dtype=np.int32
+        )
+        weak_flags = np.asarray(catalog.get("_weak_flags", ()), dtype=bool)
+        valid = np.asarray(catalog.get("_psf_valid_flags", ()), dtype=bool)
+        saturated = np.asarray(
+            catalog.get("_psf_saturated_flags", ()), dtype=bool
+        )
+        source_area = np.asarray(
+            catalog.get("_display_source_halfmax_area_px", ()),
+            dtype=np.float32,
+        )
+        spatial_fwhm = np.asarray(
+            catalog.get("_stage9_spatial_fwhm_px", ()), dtype=np.float32
+        )
+        source_measurements = list(catalog.get("_psf_measurements", ()))
+        labels = np.asarray(catalog.get("_labels", ()), dtype=np.int32)
+        count = int(component_ids.size)
+        arrays = (
+            peak_y,
+            peak_x,
+            source_peak_y,
+            source_peak_x,
+            weak_flags,
+            valid,
+            saturated,
+            source_area,
+            spatial_fwhm,
+        )
+        if count <= 0 or any(array.size != count for array in arrays):
+            raise ValueError("frozen source-matched PSF arrays are incomplete")
+        for coordinate_name, coordinates_y, coordinates_x in (
+            (
+                "source",
+                catalog_source_peak_y,
+                catalog_source_peak_x,
+            ),
+            (
+                "display-source",
+                display_source_peak_y,
+                display_source_peak_x,
+            ),
+        ):
+            if coordinates_y.size != coordinates_x.size or (
+                coordinates_y.size not in {0, count}
+            ):
+                raise ValueError(
+                    f"frozen {coordinate_name} peak coordinates are incomplete"
+                )
+        if len(source_measurements) != count:
+            raise ValueError("frozen source half-max measurements are incomplete")
+        if labels.shape != spatial_shape:
+            raise ValueError("frozen component labels do not match the image")
+        if (
+            np.any(peak_y < 0)
+            or np.any(peak_x < 0)
+            or np.any(peak_y >= spatial_shape[0])
+            or np.any(peak_x >= spatial_shape[1])
+        ):
+            raise ValueError("frozen catalog coordinates are outside the image")
+
+        if "all" in normalized_groups:
+            selected_components = np.ones(count, dtype=bool)
+            target_scope = support.copy()
+        else:
+            selected_components = np.zeros(count, dtype=bool)
+            target_scope = np.zeros(spatial_shape, dtype=bool)
+            if "weak" in normalized_groups:
+                selected_components |= weak_flags
+                target_scope |= weak_support
+            if "bright" in normalized_groups:
+                selected_components |= ~weak_flags
+                target_scope |= bright_support
+            target_scope &= support
+        ordinary = (
+            selected_components
+            & valid
+            & ~saturated
+            & np.isfinite(source_area)
+            & (source_area > 0.0)
+        )
+        if not np.any(ordinary) or not np.any(target_scope):
+            raise ValueError("no frozen ordinary components match target groups")
+        if (
+            np.any(source_peak_y[ordinary] < 0)
+            or np.any(source_peak_x[ordinary] < 0)
+            or np.any(source_peak_y[ordinary] >= spatial_shape[0])
+            or np.any(source_peak_x[ordinary] >= spatial_shape[1])
+        ):
+            raise ValueError(
+                "frozen ordinary source coordinates are outside the image"
+            )
+
+        target_component_ids = np.unique(component_ids[ordinary])
+        target_core = np.isin(labels, target_component_ids)
+        if not np.any(target_core):
+            raise ValueError("frozen ordinary component labels are unavailable")
+        nearest_indices = scipy_ndimage.distance_transform_edt(
+            ~target_core,
+            return_distances=False,
+            return_indices=True,
+        )
+        assigned_labels = labels[
+            nearest_indices[0],
+            nearest_indices[1],
+        ]
+        target_scope &= np.isin(assigned_labels, target_component_ids)
+        if not np.any(target_scope):
+            raise ValueError("target support cannot be assigned to components")
+
+        scoped_flat = np.flatnonzero(target_scope.ravel())
+        scoped_labels = assigned_labels.ravel()[scoped_flat]
+        scoped_order = np.argsort(scoped_labels, kind="stable")
+        sorted_flat = scoped_flat[scoped_order]
+        sorted_labels = scoped_labels[scoped_order]
+        unique_labels, starts, sizes = np.unique(
+            sorted_labels,
+            return_index=True,
+            return_counts=True,
+        )
+        centroid_slices = {
+            int(label): (int(start), int(size))
+            for label, start, size in zip(unique_labels, starts, sizes)
+        }
+        centroid_limit_px = 0.05
+        centroid_guard_skipped_operation_count = 0
+
+        delivered_intensity = float(intensity)
+        if not math.isfinite(delivered_intensity) or delivered_intensity <= 0.0:
+            raise ValueError("Screen intensity is invalid")
+        weak_level = (
+            delivered_intensity
+            if weak_intensity is None
+            else max(delivered_intensity, float(weak_intensity))
+        )
+        intensity_map = np.full(
+            spatial_shape, delivered_intensity, dtype=np.float32
+        )
+        intensity_map[weak_support] = weak_level
+        intensity_map[bright_support] = delivered_intensity
+
+        parent_candidate = screen_blend(
+            base,
+            working_stars,
+            delivered_intensity,
+            alpha_mask=alpha,
+            weak_mask=weak_support,
+            bright_mask=bright_support,
+            weak_intensity=weak_level,
+        )
+        candidate = _normalized(np.asarray(parent_candidate)).copy()
+        star_rgb = _rgb_channels(working_stars)
+        base_rgb = _rgb_channels(base)
+        original_rgb = _rgb_channels(original)
+        candidate_rgb = _rgb_channels(candidate)
+        peak_original = _pixel_peak(original)
+        peak_base = _pixel_peak(base)
+        peak_stars = _pixel_peak(working_stars)
+        peak_candidate = _pixel_peak(candidate)
+        immutable_stars = np.array(working_stars, copy=True)
+        immutable_star_rgb = _rgb_channels(immutable_stars)
+        immutable_peak_stars = np.array(peak_stars, copy=True)
+        changed_scope = np.zeros(spatial_shape, dtype=bool)
+        protected_wing_scope = np.zeros(spatial_shape, dtype=bool)
+
+        # Freeze every catalog coordinate, plus every measurable display/source
+        # coordinate, before selecting a weak/bright subgroup.  The overlay
+        # disks can overlap, so subgroup-local peak guards are insufficient:
+        # pruning one component must not move an unselected or saturated
+        # component's immutable anchor.
+        frozen_catalog_peak_scope = np.zeros(spatial_shape, dtype=bool)
+        frozen_catalog_peak_scope[peak_y, peak_x] = True
+        frozen_source_peak_scope = np.zeros(spatial_shape, dtype=bool)
+        frozen_source_peak_counts: Dict[str, int] = {}
+        for coordinate_name, coordinates_y, coordinates_x in (
+            (
+                "source",
+                catalog_source_peak_y,
+                catalog_source_peak_x,
+            ),
+            (
+                "display_source",
+                display_source_peak_y,
+                display_source_peak_x,
+            ),
+        ):
+            if coordinates_y.size == 0:
+                frozen_source_peak_counts[coordinate_name] = 0
+                continue
+            in_bounds = (
+                valid
+                & (coordinates_y >= 0)
+                & (coordinates_x >= 0)
+                & (coordinates_y < spatial_shape[0])
+                & (coordinates_x < spatial_shape[1])
+            )
+            frozen_source_peak_scope[
+                coordinates_y[in_bounds], coordinates_x[in_bounds]
+            ] = True
+            frozen_source_peak_counts[coordinate_name] = int(
+                np.count_nonzero(in_bounds)
+            )
+        frozen_global_peak_scope = (
+            frozen_catalog_peak_scope | frozen_source_peak_scope
+        )
+
+        def component_centroid(
+            component_id: int,
+            plane: np.ndarray,
+        ) -> tuple[float, float] | None:
+            bounds = centroid_slices.get(int(component_id))
+            if bounds is None:
+                return None
+            start, size = bounds
+            flat_positions = sorted_flat[start : start + size]
+            weights = np.asarray(
+                np.asarray(plane).ravel()[flat_positions],
+                dtype=np.float64,
+            )
+            weight_sum = float(np.sum(weights))
+            if not math.isfinite(weight_sum) or weight_sum <= 1.0e-12:
+                return None
+            ys = flat_positions // spatial_shape[1]
+            xs = flat_positions % spatial_shape[1]
+            return (
+                float(np.sum(weights * ys) / weight_sum),
+                float(np.sum(weights * xs) / weight_sum),
+            )
+
+        frozen_centroids = {
+            int(component_id): component_centroid(
+                int(component_id),
+                immutable_peak_stars,
+            )
+            for component_id in target_component_ids
+        }
+
+        def component_centroid_drift(index: int) -> float:
+            component_id = int(component_ids[index])
+            before = frozen_centroids.get(component_id)
+            after = component_centroid(component_id, peak_stars)
+            if before is None or after is None:
+                return float("inf")
+            return float(math.hypot(after[0] - before[0], after[1] - before[1]))
+
+        def measurement_radii(index: int) -> tuple[int, int]:
+            geometry_fwhm = float(spatial_fwhm[index])
+            return (
+                stage9_scale_radius(
+                    2,
+                    catalog,
+                    fwhm_px=geometry_fwhm,
+                    rounding="nearest",
+                    minimum=1,
+                ),
+                stage9_scale_radius(
+                    6,
+                    catalog,
+                    fwhm_px=geometry_fwhm,
+                    rounding="nearest",
+                    minimum=1,
+                ),
+            )
+
+        def measure(index: int) -> Dict[str, Any]:
+            search_radius, patch_radius = measurement_radii(index)
+            return _measure_connected_halfmax_fwhm(
+                peak_candidate,
+                int(peak_y[index]),
+                int(peak_x[index]),
+                search_radius=search_radius,
+                patch_radius=patch_radius,
+            )
+
+        def connected_component(
+            plane: np.ndarray,
+            measurement: Mapping[str, Any],
+            patch_radius: int,
+        ) -> tuple[int, int, np.ndarray, float] | None:
+            center_y = int(measurement["center_y"])
+            center_x = int(measurement["center_x"])
+            y0 = max(0, center_y - patch_radius)
+            y1 = min(spatial_shape[0], center_y + patch_radius + 1)
+            x0 = max(0, center_x - patch_radius)
+            x1 = min(spatial_shape[1], center_x + patch_radius + 1)
+            halfmax = float(measurement["background"]) + 0.5 * float(
+                measurement["signal"]
+            )
+            labels, _label_count = scipy_ndimage.label(
+                plane[y0:y1, x0:x1] >= halfmax,
+                structure=np.ones((3, 3), dtype=np.uint8),
+            )
+            label_id = int(labels[center_y - y0, center_x - x0])
+            if label_id <= 0:
+                return None
+            return y0, x0, labels == label_id, halfmax
+
+        # Freeze the ``u`` denominator and <=0.45 wing identity in the
+        # immutable parent domain.  Recomputing this scope after attenuation
+        # would incorrectly classify a legitimately pruned shoulder as an
+        # original wing and reject the exact same transaction during audit.
+        frozen_component_peaks: Dict[int, float] = {}
+        for ordinary_index in np.flatnonzero(ordinary):
+            frozen_measurement = measure(int(ordinary_index))
+            if frozen_measurement.get("status") != "ok":
+                continue
+            _search_radius, patch_radius = measurement_radii(
+                int(ordinary_index)
+            )
+            frozen_component = connected_component(
+                peak_candidate,
+                frozen_measurement,
+                patch_radius,
+            )
+            if frozen_component is None:
+                continue
+            y0, x0, component_mask, _halfmax = frozen_component
+            component_y, component_x = np.nonzero(component_mask)
+            local_peak = float(
+                np.max(
+                    immutable_peak_stars[
+                        y0 + component_y,
+                        x0 + component_x,
+                    ]
+                )
+            )
+            if math.isfinite(local_peak) and local_peak > 1.0e-12:
+                frozen_component_peaks[
+                    int(component_ids[ordinary_index])
+                ] = local_peak
+        protected_wing_scope |= _freeze_stage9_assigned_halfmax_wings(
+            immutable_peak_stars,
+            sorted_flat,
+            centroid_slices,
+            frozen_component_peaks,
+            wing_ceiling=wing_ceiling,
+        )
+
+        # Freeze every measurable ordinary-star maximum before any edit.  The
+        # immutable set is global rather than limited to the currently selected
+        # weak/bright group, so overlapping support can never move a different
+        # catalog star's local maximum as a side effect.
+        frozen_local_peak_scope = np.zeros(spatial_shape, dtype=bool)
+        for ordinary_index in np.flatnonzero(valid & ~saturated):
+            frozen_measurement = measure(int(ordinary_index))
+            if frozen_measurement.get("status") != "ok":
+                continue
+            y = int(frozen_measurement["center_y"])
+            x = int(frozen_measurement["center_x"])
+            frozen_local_peak_scope[y, x] = True
+
+        def source_footprint(index: int) -> set[int]:
+            source_measurement = source_measurements[index]
+            if (
+                not isinstance(source_measurement, Mapping)
+                or source_measurement.get("status") != "ok"
+            ):
+                return set()
+            _search_radius, patch_radius = measurement_radii(index)
+            component = connected_component(
+                peak_original,
+                source_measurement,
+                patch_radius,
+            )
+            if component is None:
+                return set()
+            y0, x0, footprint, _halfmax = component
+            ys, xs = np.nonzero(footprint)
+            return set(
+                (
+                    (ys + y0).astype(np.int64) * spatial_shape[1]
+                    + (xs + x0).astype(np.int64)
+                ).tolist()
+            )
+
+        def set_pixel(
+            y: int,
+            x: int,
+            gain: float,
+        ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+            old_stars = star_rgb[:, y, x].copy()
+            old_candidate = candidate_rgb[:, y, x].copy()
+            new_stars = (old_stars * np.float32(gain)).astype(np.float32)
+            new_star_term = np.clip(
+                float(intensity_map[y, x]) * new_stars,
+                0.0,
+                1.0,
+            )
+            new_candidate = (
+                base_rgb[:, y, x]
+                + float(alpha[y, x])
+                * (1.0 - base_rgb[:, y, x])
+                * new_star_term
+            ).astype(np.float32)
+            star_rgb[:, y, x] = new_stars
+            candidate_rgb[:, y, x] = new_candidate
+            peak_stars[y, x] = float(np.max(new_stars))
+            peak_candidate[y, x] = float(np.max(new_candidate))
+            changed_scope[y, x] = bool(
+                np.any(new_stars != immutable_star_rgb[:, y, x])
+            )
+            return old_stars, old_candidate, new_stars, new_candidate
+
+        def restore_operations(operations: list[tuple[Any, ...]]) -> None:
+            for operation in reversed(operations):
+                y, x, old_stars, old_candidate = operation[:4]
+                star_rgb[:, y, x] = old_stars
+                candidate_rgb[:, y, x] = old_candidate
+                peak_stars[y, x] = float(np.max(old_stars))
+                peak_candidate[y, x] = float(np.max(old_candidate))
+                changed_scope[y, x] = bool(
+                    np.any(old_stars != immutable_star_rgb[:, y, x])
+                )
+
+        def prune_component(
+            index: int,
+            *,
+            allow_regressive: bool,
+        ) -> tuple[bool, list[tuple[Any, ...]]]:
+            nonlocal centroid_guard_skipped_operation_count
+            desired_area = max(
+                1,
+                int(
+                    math.floor(
+                        float(target_max) ** 2 * float(source_area[index])
+                    )
+                ),
+            )
+            frozen_source_footprint = source_footprint(index)
+            operations: list[tuple[Any, ...]] = []
+            blocked: set[tuple[int, int]] = set()
+            while True:
+                current = measure(index)
+                if current.get("status") != "ok":
+                    return False, operations
+                current_area = int(current["half_max_area"])
+                if current_area <= desired_area:
+                    return True, operations
+                _search_radius, patch_radius = measurement_radii(index)
+                component = connected_component(
+                    peak_candidate,
+                    current,
+                    patch_radius,
+                )
+                if component is None:
+                    return False, operations
+                y0, x0, component_mask, halfmax = component
+                boundary = component_mask & ~scipy_ndimage.binary_erosion(
+                    component_mask,
+                    structure=np.ones((3, 3), dtype=bool),
+                    border_value=0,
+                )
+                local_peak = float(
+                    frozen_component_peaks.get(
+                        int(component_ids[index]),
+                        0.0,
+                    )
+                )
+                if local_peak <= 1.0e-12:
+                    return False, operations
+                immutable_peaks = {
+                    (int(current["center_y"]), int(current["center_x"])),
+                    (int(peak_y[index]), int(peak_x[index])),
+                    (int(source_peak_y[index]), int(source_peak_x[index])),
+                }
+                threshold = float(halfmax) - max(
+                    2.0e-7,
+                    0.01 * float(current.get("noise_sigma", 1.0e-7)),
+                )
+                candidates: list[tuple[Any, ...]] = []
+                boundary_y, boundary_x = np.nonzero(boundary)
+                for local_y, local_x in zip(boundary_y, boundary_x):
+                    y = int(y0 + local_y)
+                    x = int(x0 + local_x)
+                    if (
+                        (y, x) in blocked
+                        or (y, x) in immutable_peaks
+                        or frozen_global_peak_scope[y, x]
+                        or frozen_local_peak_scope[y, x]
+                        or not target_scope[y, x]
+                        or not support[y, x]
+                        or float(alpha[y, x]) <= 0.0
+                        or int(assigned_labels[y, x])
+                        != int(component_ids[index])
+                    ):
+                        continue
+                    relative_peak = (
+                        float(immutable_peak_stars[y, x]) / local_peak
+                    )
+                    if relative_peak <= wing_ceiling + 1.0e-8:
+                        continue
+                    if (
+                        peak_base[y, x] >= threshold
+                        or peak_candidate[y, x] <= peak_base[y, x] + 1.0e-10
+                        or float(
+                            np.max(
+                                candidate_rgb[:, y, x]
+                                - original_rgb[:, y, x]
+                            )
+                        )
+                        <= 1.0e-10
+                    ):
+                        continue
+                    coefficient = (
+                        float(alpha[y, x])
+                        * (1.0 - base_rgb[:, y, x])
+                        * float(intensity_map[y, x])
+                        * star_rgb[:, y, x]
+                    )
+                    active = coefficient > 1.0e-12
+                    if not np.any(active):
+                        continue
+                    limits = (
+                        threshold - base_rgb[:, y, x][active]
+                    ) / coefficient[active]
+                    gain = float(np.clip(np.min(limits), 0.0, 1.0))
+                    if gain >= 1.0 - 1.0e-7:
+                        continue
+                    new_stars = star_rgb[:, y, x] * np.float32(gain)
+                    new_star_term = np.clip(
+                        float(intensity_map[y, x]) * new_stars,
+                        0.0,
+                        1.0,
+                    )
+                    new_candidate = (
+                        base_rgb[:, y, x]
+                        + float(alpha[y, x])
+                        * (1.0 - base_rgb[:, y, x])
+                        * new_star_term
+                    ).astype(np.float32)
+                    if float(np.max(new_candidate)) >= float(halfmax) - 1.0e-8:
+                        continue
+                    error_before = np.abs(
+                        candidate_rgb[:, y, x] - original_rgb[:, y, x]
+                    )
+                    error_after = np.abs(
+                        new_candidate - original_rgb[:, y, x]
+                    )
+                    improvement = float(
+                        np.sum(error_before) - np.sum(error_after)
+                    )
+                    if not allow_regressive and improvement <= 1.0e-10:
+                        continue
+                    output_delta = float(
+                        np.sum(
+                            np.abs(
+                                new_candidate - candidate_rgb[:, y, x]
+                            )
+                        )
+                    )
+                    inside_source = (
+                        y * spatial_shape[1] + x
+                    ) in frozen_source_footprint
+                    score = (
+                        1 if inside_source else 0,
+                        1 if improvement <= 1.0e-10 else 0,
+                        max(-improvement, 0.0) / max(output_delta, 1.0e-12),
+                        output_delta,
+                        -improvement,
+                        y,
+                        x,
+                    )
+                    candidates.append(
+                        (
+                            score,
+                            y,
+                            x,
+                            gain,
+                            improvement,
+                            error_before,
+                            error_after,
+                        )
+                    )
+                if not candidates:
+                    return False, operations
+                candidates.sort(key=lambda item: item[0])
+                advanced = False
+                for (
+                    _score,
+                    y,
+                    x,
+                    gain,
+                    improvement,
+                    error_before,
+                    error_after,
+                ) in candidates:
+                    old_stars, old_candidate, new_stars, new_candidate = (
+                        set_pixel(y, x, gain)
+                    )
+                    measured = measure(index)
+                    if (
+                        measured.get("status") == "ok"
+                        and int(measured["half_max_area"]) < current_area
+                        and component_centroid_drift(index)
+                        <= centroid_limit_px + 1.0e-12
+                    ):
+                        operations.append(
+                            (
+                                y,
+                                x,
+                                old_stars,
+                                old_candidate,
+                                new_stars,
+                                new_candidate,
+                                improvement,
+                                error_before,
+                                error_after,
+                            )
+                        )
+                        advanced = True
+                        blocked.clear()
+                        break
+                    if component_centroid_drift(index) > (
+                        centroid_limit_px + 1.0e-12
+                    ):
+                        centroid_guard_skipped_operation_count += 1
+                    star_rgb[:, y, x] = old_stars
+                    candidate_rgb[:, y, x] = old_candidate
+                    peak_stars[y, x] = float(np.max(old_stars))
+                    peak_candidate[y, x] = float(np.max(old_candidate))
+                    changed_scope[y, x] = bool(
+                        np.any(old_stars != immutable_star_rgb[:, y, x])
+                    )
+                    blocked.add((y, x))
+                if not advanced:
+                    return False, operations
+
+        strict_started = time.perf_counter()
+        strict_stats = {
+            "weak_closed": 0,
+            "weak_unclosed": 0,
+            "bright_closed": 0,
+            "bright_unclosed": 0,
+            "changed_pixel_operations": 0,
+        }
+        for index in np.flatnonzero(ordinary):
+            current = measure(int(index))
+            if current.get("status") != "ok":
+                continue
+            ratio = math.sqrt(
+                float(current["half_max_area"]) / float(source_area[index])
+            )
+            if ratio <= float(target_max):
+                continue
+            closed, operations = prune_component(
+                int(index), allow_regressive=False
+            )
+            group = "weak" if bool(weak_flags[index]) else "bright"
+            strict_stats[f"{group}_{'closed' if closed else 'unclosed'}"] += 1
+            strict_stats["changed_pixel_operations"] += len(operations)
+        strict_elapsed = time.perf_counter() - strict_started
+
+        proposal_started = time.perf_counter()
+        bright_indices: list[int] = []
+        bright_ratios: Dict[int, float] = {}
+        proposals: list[Dict[str, Any]] = []
+        bright_allowed = bool(
+            "all" in normalized_groups or "bright" in normalized_groups
+        )
+        if bright_allowed:
+            for index in np.flatnonzero(valid & ~saturated & ~weak_flags):
+                current = measure(int(index))
+                if current.get("status") != "ok":
+                    continue
+                ratio = math.sqrt(
+                    float(current["half_max_area"])
+                    / float(source_area[index])
+                )
+                bright_indices.append(int(index))
+                bright_ratios[int(index)] = ratio
+                if ratio <= float(target_max):
+                    continue
+                closed, operations = prune_component(
+                    int(index), allow_regressive=True
+                )
+                if closed:
+                    final_measurement = measure(int(index))
+                    final_ratio = math.sqrt(
+                        float(final_measurement["half_max_area"])
+                        / float(source_area[index])
+                    )
+                    proposals.append(
+                        {
+                            "index": int(index),
+                            "operations": operations,
+                            "pixel_count": len(operations),
+                            "positive_fidelity_cost": float(
+                                sum(
+                                    max(-float(operation[6]), 0.0)
+                                    for operation in operations
+                                )
+                            ),
+                            "net_fidelity_cost": float(
+                                sum(
+                                    -float(operation[6])
+                                    for operation in operations
+                                )
+                            ),
+                            "ratio_before": ratio,
+                            "ratio_after": final_ratio,
+                        }
+                    )
+                restore_operations(operations)
+
+        selected_proposals: list[Dict[str, Any]] = []
+        selected_proposal_pixels: set[tuple[int, int]] = set()
+        overlapping_bright_proposal_count = 0
+        strict_bright_median = None
+        if bright_indices:
+            ratios = np.asarray(
+                [bright_ratios[index] for index in bright_indices],
+                dtype=np.float64,
+            )
+            strict_bright_median = float(np.median(ratios))
+            if strict_bright_median > float(target_max):
+                proposals.sort(
+                    key=lambda proposal: (
+                        proposal["positive_fidelity_cost"],
+                        proposal["net_fidelity_cost"],
+                        proposal["pixel_count"],
+                        proposal["ratio_after"],
+                        proposal["index"],
+                    )
+                )
+                ratio_position = {
+                    index: position
+                    for position, index in enumerate(bright_indices)
+                }
+                for proposal in proposals:
+                    proposal_pixels = {
+                        (int(operation[0]), int(operation[1]))
+                        for operation in proposal["operations"]
+                    }
+                    if proposal_pixels & selected_proposal_pixels:
+                        overlapping_bright_proposal_count += 1
+                        continue
+                    ratios[ratio_position[proposal["index"]]] = proposal[
+                        "ratio_after"
+                    ]
+                    selected_proposals.append(proposal)
+                    selected_proposal_pixels |= proposal_pixels
+                    if float(np.median(ratios)) <= float(target_max):
+                        break
+                if float(np.median(ratios)) > float(target_max):
+                    raise ValueError(
+                        "minimum-cost bright proposals cannot close the subgroup"
+                    )
+                for proposal in selected_proposals:
+                    for operation in proposal["operations"]:
+                        y, x, _old_stars, _old_candidate, new_stars, new_candidate = (
+                            operation[:6]
+                        )
+                        star_rgb[:, y, x] = new_stars
+                        candidate_rgb[:, y, x] = new_candidate
+                        peak_stars[y, x] = float(np.max(new_stars))
+                        peak_candidate[y, x] = float(np.max(new_candidate))
+                        changed_scope[y, x] = bool(
+                            np.any(new_stars != immutable_star_rgb[:, y, x])
+                        )
+        proposal_elapsed = time.perf_counter() - proposal_started
+
+        if not np.any(changed_scope):
+            raise ValueError("reference-guided pruning made no pixel change")
+        changed_scope &= target_scope
+        restored = np.asarray(working_stars, dtype=np.float64) * source_scale
+        if np.issubdtype(source.dtype, np.integer):
+            info = np.iinfo(source.dtype)
+            restored = np.clip(np.rint(restored), info.min, info.max)
+        restored = restored.astype(source.dtype, copy=False)
+        restored = np.array(restored, copy=True)
+        expanded_changed = _expanded_spatial_mask(source, changed_scope)
+        np.copyto(
+            restored,
+            source,
+            where=np.broadcast_to(expanded_changed, source.shape) == 0,
+        )
+
+        final_candidate = screen_blend(
+            base,
+            restored,
+            delivered_intensity,
+            alpha_mask=alpha,
+            weak_mask=weak_support,
+            bright_mask=bright_support,
+            weak_intensity=weak_level,
+        )
+        closure = assess_stage9_psf_closure(final_candidate, catalog, cfg)
+        ratios = {
+            group: float(payload["fwhm_ratio_median"])
+            for group, payload in (closure.get("groups") or {}).items()
+            if isinstance(payload, Mapping)
+            and payload.get("fwhm_ratio_median") is not None
+        }
+        formal_groups = ("all", "weak", "bright")
+        missing_groups = [group for group in formal_groups if group not in ratios]
+        closure_formally_ok = bool(
+            closure.get("accepted") is True
+            and closure.get("status") == "ok"
+            and closure.get("available") is True
+            and not bool(closure.get("review_required", False))
+        )
+        within_target = bool(not missing_groups) and all(
+            float(target_min) <= ratios[group] <= float(target_max)
+            for group in formal_groups
+        )
+
+        parent_fidelity = assess_unscreen_reference_fidelity(
+            original,
+            base,
+            immutable_stars,
+            intensity=delivered_intensity,
+            support_mask=support,
+            alpha_mask=alpha,
+            weak_mask=weak_support,
+            bright_mask=bright_support,
+            weak_intensity=weak_level,
+        )
+        candidate_fidelity = assess_unscreen_reference_fidelity(
+            original,
+            base,
+            restored,
+            intensity=delivered_intensity,
+            support_mask=support,
+            alpha_mask=alpha,
+            weak_mask=weak_support,
+            bright_mask=bright_support,
+            weak_intensity=weak_level,
+        )
+        fidelity_ready = bool(
+            parent_fidelity.get("status") == "ok"
+            and candidate_fidelity.get("status") == "ok"
+        )
+        fidelity_nonregression = bool(
+            fidelity_ready
+            and float(candidate_fidelity["support_rgb_mae"])
+            <= float(parent_fidelity["support_rgb_mae"])
+            and float(candidate_fidelity["support_rgb_p95"])
+            <= float(parent_fidelity["support_rgb_p95"])
+        )
+
+        source_delta = np.abs(
+            np.asarray(restored, dtype=np.float64)
+            - np.asarray(source, dtype=np.float64)
+        )
+        if source_delta.ndim == 2:
+            spatial_delta = source_delta
+        elif source_delta.ndim == 3 and source_delta.shape[0] <= 4:
+            spatial_delta = np.max(source_delta[:3], axis=0)
+        elif source_delta.ndim == 3 and source_delta.shape[-1] <= 4:
+            spatial_delta = np.max(source_delta[..., :3], axis=-1)
+        else:
+            raise ValueError("unsupported star-layer layout for exact delta audit")
+        outside_change = (
+            float(np.max(spatial_delta[~support])) if np.any(~support) else 0.0
+        )
+        outside_target_change = (
+            float(np.max(spatial_delta[~target_scope]))
+            if np.any(~target_scope)
+            else 0.0
+        )
+        wing_change = (
+            float(np.max(spatial_delta[protected_wing_scope]))
+            if np.any(protected_wing_scope)
+            else 0.0
+        )
+        local_peak_change = (
+            float(np.max(spatial_delta[frozen_local_peak_scope]))
+            if np.any(frozen_local_peak_scope)
+            else 0.0
+        )
+        catalog_peak_change = float(
+            np.max(spatial_delta[frozen_catalog_peak_scope])
+        )
+        source_peak_change = float(
+            np.max(spatial_delta[frozen_source_peak_scope])
+            if np.any(frozen_source_peak_scope)
+            else 0.0
+        )
+        global_peak_anchor_change = float(
+            np.max(spatial_delta[frozen_global_peak_scope])
+        )
+        exact_preservation = bool(
+            outside_change == 0.0
+            and outside_target_change == 0.0
+            and wing_change == 0.0
+            and local_peak_change == 0.0
+            and catalog_peak_change == 0.0
+            and source_peak_change == 0.0
+            and global_peak_anchor_change == 0.0
+        )
+        final_peak_stars = _pixel_peak(_normalized(np.asarray(restored)))
+        changed_component_ids = np.unique(assigned_labels[changed_scope])
+        centroid_drifts: list[float] = []
+        centroid_unmeasurable_component_ids: list[int] = []
+        for component_id in changed_component_ids:
+            frozen_centroid = frozen_centroids.get(int(component_id))
+            final_centroid = component_centroid(
+                int(component_id),
+                final_peak_stars,
+            )
+            if frozen_centroid is None or final_centroid is None:
+                centroid_unmeasurable_component_ids.append(int(component_id))
+                continue
+            centroid_drifts.append(
+                float(
+                    math.hypot(
+                        final_centroid[0] - frozen_centroid[0],
+                        final_centroid[1] - frozen_centroid[1],
+                    )
+                )
+            )
+        centroid_max_drift = (
+            float(np.max(centroid_drifts)) if centroid_drifts else None
+        )
+        centroid_guard_passed = bool(
+            not centroid_unmeasurable_component_ids
+            and centroid_drifts
+            and centroid_max_drift is not None
+            and centroid_max_drift <= centroid_limit_px + 1.0e-12
+        )
+        accepted = bool(
+            closure_formally_ok
+            and within_target
+            and fidelity_nonregression
+            and exact_preservation
+            and centroid_guard_passed
+        )
+        report.update(
+            status="accepted" if accepted else "rejected",
+            accepted=accepted,
+            changed=bool(np.any(changed_scope)),
+            reason=(
+                None
+                if accepted
+                else "reference-guided pruning failed closure, fidelity, or identity"
+            ),
+            source_component_count=count,
+            eligible_component_count=int(np.count_nonzero(ordinary)),
+            strict_statistics=strict_stats,
+            bright_proposal_count=len(proposals),
+            overlapping_bright_proposal_count=(
+                overlapping_bright_proposal_count
+            ),
+            overlapping_bright_proposals_rejected=True,
+            selected_bright_component_count=len(selected_proposals),
+            selected_bright_pixel_count=int(
+                sum(proposal["pixel_count"] for proposal in selected_proposals)
+            ),
+            selected_bright_unique_pixel_count=int(
+                len(
+                    {
+                        (int(operation[0]), int(operation[1]))
+                        for proposal in selected_proposals
+                        for operation in proposal["operations"]
+                    }
+                )
+            ),
+            selected_bright_positive_fidelity_cost=float(
+                sum(
+                    proposal["positive_fidelity_cost"]
+                    for proposal in selected_proposals
+                )
+            ),
+            strict_bright_ratio_median=strict_bright_median,
+            changed_pixel_count=int(np.count_nonzero(changed_scope)),
+            fwhm_ratios=ratios,
+            psf_closure=closure,
+            psf_closure_formally_ok=closure_formally_ok,
+            missing_formal_groups=missing_groups,
+            within_soft_target=within_target,
+            parent_reference_fidelity=parent_fidelity,
+            candidate_reference_fidelity=candidate_fidelity,
+            reference_fidelity_nonregression=fidelity_nonregression,
+            outside_support_max_abs_change=outside_change,
+            outside_target_group_max_abs_change=outside_target_change,
+            protected_wing_max_abs_change=wing_change,
+            local_peak_max_abs_change=local_peak_change,
+            frozen_local_peak_count=int(
+                np.count_nonzero(frozen_local_peak_scope)
+            ),
+            catalog_peak_max_abs_change=catalog_peak_change,
+            source_peak_max_abs_change=source_peak_change,
+            global_peak_anchor_max_abs_change=global_peak_anchor_change,
+            frozen_catalog_peak_count=int(
+                np.count_nonzero(frozen_catalog_peak_scope)
+            ),
+            frozen_source_peak_count=int(
+                np.count_nonzero(frozen_source_peak_scope)
+            ),
+            frozen_source_peak_coordinate_counts=frozen_source_peak_counts,
+            frozen_global_peak_anchor_count=int(
+                np.count_nonzero(frozen_global_peak_scope)
+            ),
+            exact_source_pixel_preservation_verified=exact_preservation,
+            centroid_drift_limit_px=centroid_limit_px,
+            centroid_drift_max_px=centroid_max_drift,
+            centroid_guard_passed=centroid_guard_passed,
+            centroid_guard_skipped_operation_count=(
+                centroid_guard_skipped_operation_count
+            ),
+            centroid_changed_component_count=int(changed_component_ids.size),
+            centroid_unmeasurable_component_ids=(
+                centroid_unmeasurable_component_ids[:32]
+            ),
+            timings_seconds={
+                "strict_pass": strict_elapsed,
+                "bright_proposals": proposal_elapsed,
+                "total": time.perf_counter() - started,
+            },
+        )
+        if not accepted:
+            return None, report
+        return restored, report
+    except (IndexError, KeyError, TypeError, ValueError, FloatingPointError) as error:
+        report.update(
+            status="rejected",
+            accepted=False,
+            changed=False,
+            reason=str(error),
+            timings_seconds={"total": time.perf_counter() - started},
+        )
+        if "centroid_limit_px" in locals():
+            report["centroid_drift_limit_px"] = float(centroid_limit_px)
+        if "centroid_guard_skipped_operation_count" in locals():
+            report["centroid_guard_skipped_operation_count"] = int(
+                centroid_guard_skipped_operation_count
+            )
+        return None, report
 
 
 def _compact_starmask_support_weights(
@@ -7900,14 +9225,14 @@ def assess_stage9_psf_closure(
     ratio_min = _bounded(
         getattr(cfg, "stage9_psf_fwhm_ratio_min", 0.93),
         0.93,
-        0.50,
+        0.93,
         1.00,
     )
     ratio_max = _bounded(
         getattr(cfg, "stage9_psf_fwhm_ratio_max", 1.10),
         1.10,
         1.00,
-        1.50,
+        1.10,
     )
     uncertainty_floor = _bounded(
         getattr(

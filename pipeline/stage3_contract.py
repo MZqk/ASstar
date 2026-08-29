@@ -4,8 +4,16 @@ from __future__ import annotations
 from typing import Any, Dict
 
 
-STAGE3_ALGORITHM_CONTRACT_VERSION = "1.3.0"
-STAGE3_BACKGROUND_QUALITY_SCHEMA = "starun.stage3-background-quality.v5"
+STAGE3_ALGORITHM_CONTRACT_VERSION = "1.7.0"
+STAGE3_BACKGROUND_QUALITY_SCHEMA = "starun.stage3-background-quality.v9"
+STAGE3_NEUTRAL_AXIS_PROJECTION_SCHEMA = (
+    "starun.stage3-neutral-axis-projection.v1"
+)
+STAGE3_SPATIAL_OPPONENT_PROJECTION_SCHEMA = (
+    "starun.stage3-spatial-opponent-projection.v1"
+)
+STAGE3_SAMPLE_MASK_SCHEMA = "starun.stage3-sample-masks.v2"
+STAGE3_DENSE_STAR_SAMPLING_SCHEMA = "starun.stage3-dense-star-sampling.v1"
 
 STAGE3_SIGNIFICANCE_SIGMA = 3.0
 STAGE3_MIN_VALIDATION_PATCHES = 4
@@ -15,8 +23,15 @@ STAGE3_MIN_SPATIAL_GRID_CELLS = 8
 STAGE3_MIN_AXIS_SPAN_RATIO = 0.55
 STAGE3_MIN_USABLE_SKY_FRACTION = 0.50
 STAGE3_MAX_SOURCE_MASK_FRACTION = 0.50
+STAGE3_DENSE_STAR_FIELD_FRACTION_MIN = 0.15
+STAGE3_DENSE_STAR_SAMPLE_SUPPORT_MIN = 0.80
 STAGE3_RADIAL_BIC_DELTA_MIN = 6.0
 STAGE3_RADIAL_RESIDUAL_SPAN_RATIO_MAX = 0.40
+STAGE3_NEUTRAL_AXIS_CONDITION_MAX = 1.0e6
+STAGE3_NEUTRAL_AXIS_HEADROOM_FRACTION_MAX = 0.001
+STAGE3_NEUTRAL_AXIS_HEADROOM_MARGIN = 0.02
+STAGE3_SPATIAL_OPPONENT_CORRELATION_MIN = 0.70
+STAGE3_SPATIAL_OPPONENT_RMS_IMPROVEMENT_MIN = 0.15
 
 STAGE3_FINAL_DIRTY_WARNING_MIN = 0.35
 STAGE3_FINAL_GRADIENT_RETENTION_WARNING = 0.92
@@ -119,6 +134,50 @@ def stage3_static_contract_manifest() -> Dict[str, Any]:
             "minimum_usable_sky_fraction": STAGE3_MIN_USABLE_SKY_FRACTION,
             "maximum_source_mask_fraction": STAGE3_MAX_SOURCE_MASK_FRACTION,
         },
+        "dense_star_masked_sampling": {
+            "schema": STAGE3_DENSE_STAR_SAMPLING_SCHEMA,
+            "minimum_catalog_mask_fraction": (
+                STAGE3_DENSE_STAR_FIELD_FRACTION_MIN
+            ),
+            "minimum_unmasked_patch_support": (
+                STAGE3_DENSE_STAR_SAMPLE_SUPPORT_MIN
+            ),
+            "maximum_masked_point_source_fraction": (
+                1.0 - STAGE3_DENSE_STAR_SAMPLE_SUPPORT_MIN
+            ),
+            "siril_statistics": "masked_native_channel_bg_sample",
+            "siril_recalculate": False,
+        },
+        "conservative_sample_recovery": {
+            "minimum_regular_validation_samples": 4,
+            "minimum_regular_validation_quadrants": 3,
+            "minimum_regular_validation_grid_cells": 4,
+            "effective_gate_profile": "strict",
+            "model_complexity_limit": "polynomial_degree_1",
+            "external_backends_allowed": False,
+            "rgb_implementation": "siril_poly1_neutral_axis_projection",
+            "projection_schema": STAGE3_NEUTRAL_AXIS_PROJECTION_SCHEMA,
+            "luminance": "rec709",
+            "anchor": "geometric_center_zero_mean",
+            "opponent_channels": {
+                "schema": STAGE3_SPATIAL_OPPONENT_PROJECTION_SCHEMA,
+                "selection": "independent_heldout_gate",
+                "components": ["R-G", "B-G"],
+                "luminance_delta": "zero_rec709",
+                "minimum_direction_correlation": (
+                    STAGE3_SPATIAL_OPPONENT_CORRELATION_MIN
+                ),
+                "minimum_validation_rms_improvement": (
+                    STAGE3_SPATIAL_OPPONENT_RMS_IMPROVEMENT_MIN
+                ),
+                "failure_fallback": "accepted_neutral_axis_review_only",
+            },
+            "condition_number_max": STAGE3_NEUTRAL_AXIS_CONDITION_MAX,
+            "headroom_attenuated_fraction_max": (
+                STAGE3_NEUTRAL_AXIS_HEADROOM_FRACTION_MAX
+            ),
+            "headroom_margin": STAGE3_NEUTRAL_AXIS_HEADROOM_MARGIN,
+        },
         "radial_model_review": {
             "minimum_bic_delta": STAGE3_RADIAL_BIC_DELTA_MIN,
             "maximum_residual_span_ratio": (
@@ -152,7 +211,17 @@ __all__ = [
     "STAGE3_GATE_PROFILE_DEFAULT",
     "STAGE3_GATE_PROFILES",
     "STAGE3_DIRECTIONAL_PATTERN_PENALTY_WEIGHT",
+    "STAGE3_DENSE_STAR_FIELD_FRACTION_MIN",
+    "STAGE3_DENSE_STAR_SAMPLE_SUPPORT_MIN",
+    "STAGE3_DENSE_STAR_SAMPLING_SCHEMA",
     "STAGE3_MAX_SOURCE_MASK_FRACTION",
+    "STAGE3_NEUTRAL_AXIS_CONDITION_MAX",
+    "STAGE3_NEUTRAL_AXIS_HEADROOM_FRACTION_MAX",
+    "STAGE3_NEUTRAL_AXIS_HEADROOM_MARGIN",
+    "STAGE3_NEUTRAL_AXIS_PROJECTION_SCHEMA",
+    "STAGE3_SPATIAL_OPPONENT_CORRELATION_MIN",
+    "STAGE3_SPATIAL_OPPONENT_PROJECTION_SCHEMA",
+    "STAGE3_SPATIAL_OPPONENT_RMS_IMPROVEMENT_MIN",
     "STAGE3_MIN_AXIS_SPAN_RATIO",
     "STAGE3_MIN_SPATIAL_GRID_CELLS",
     "STAGE3_MIN_SPATIAL_QUADRANTS",
@@ -161,6 +230,7 @@ __all__ = [
     "STAGE3_MIN_TARGET_SKY_PLANE_SAMPLES",
     "STAGE3_RADIAL_BIC_DELTA_MIN",
     "STAGE3_RADIAL_RESIDUAL_SPAN_RATIO_MAX",
+    "STAGE3_SAMPLE_MASK_SCHEMA",
     "STAGE3_SIGNIFICANCE_SIGMA",
     "normalize_stage3_gate_profile",
     "stage3_gate_thresholds",

@@ -1835,6 +1835,7 @@ class StarunPostProcessor(
             stage_status="verified_resume",
             deconvolution_integrity_ok=True,
             denoise_integrity_ok=True,
+            formal_eligible=True,
             provenance=provenance,
         )
         if downstream_handoff.get("accepted") is not True:

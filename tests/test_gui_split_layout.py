@@ -57,9 +57,20 @@ def test_run_workspace_uses_sidebar_detail_and_tabbed_inspector(app) -> None:
             assert [
                 window.inspector_tabs.tabText(index)
                 for index in range(window.inspector_tabs.count())
-            ] == ["阶段", "任务"]
+            ] == ["概览", "阶段", "详情", "任务", "日志"]
             assert window.run_inspector.isAncestorOf(window.run_options_label)
             assert not window.run_sidebar.isAncestorOf(window.run_options_label)
+            assert (
+                window.inspector_log_view.document()
+                is window.log_view.document()
+            )
+
+            window._set_inspector_section("stages")
+            window._stage_items[4].click()
+            app.processEvents()
+            assert window._selected_inspector_stage == 4
+            assert window._current_inspector_section() == "details"
+            assert window.stage_detail_title_label.text().startswith("Stage 4 ")
 
             window.toggle_sidebar_action.setChecked(False)
             app.processEvents()
@@ -107,7 +118,7 @@ def test_splitter_widths_visibility_and_inspector_tab_restore(app) -> None:
         app.processEvents()
         saved_sidebar_width = window.run_splitter.sizes()[0]
         saved_inspector_width = window.run_splitter.sizes()[2]
-        window.inspector_tabs.setCurrentIndex(1)
+        window._set_inspector_section("task")
         window.toggle_sidebar_action.setChecked(False)
         window.close()
 
@@ -142,7 +153,11 @@ def test_splitter_widths_visibility_and_inspector_tab_restore(app) -> None:
             assert restored.toggle_sidebar_action.isChecked() is False
             assert restored.run_sidebar.isVisible() is False
             assert restored.toggle_inspector_action.isChecked() is True
-            assert restored.inspector_tabs.currentIndex() == 1
+            assert restored._current_inspector_section() == "task"
+            assert (
+                restored.settings.value("ui/runInspectorSection")
+                == "task"
+            )
             assert restored._run_sidebar_width == saved_sidebar_width
             assert restored._run_inspector_width == saved_inspector_width
 
@@ -152,6 +167,49 @@ def test_splitter_widths_visibility_and_inspector_tab_restore(app) -> None:
             assert restored.run_splitter.sizes()[0] == saved_sidebar_width
         finally:
             restored.close()
+
+
+@pytest.mark.parametrize(
+    ("legacy_tab", "expected_section"),
+    ((0, "stages"), (1, "task"), (7, "overview")),
+)
+def test_legacy_inspector_tab_migrates_to_named_section_once(
+    app,
+    legacy_tab: int,
+    expected_section: str,
+) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        settings = QSettings(
+            str(root / "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        settings.setValue("ui/runInspectorTab", legacy_tab)
+        settings.sync()
+
+        window = _window(root)
+        try:
+            assert window._current_inspector_section() == expected_section
+            assert (
+                window.settings.value("ui/runInspectorSection")
+                == expected_section
+            )
+
+            window._set_inspector_section("logs")
+            window.close()
+
+            restored = _window(root)
+            try:
+                assert restored._current_inspector_section() == "logs"
+                assert (
+                    restored.settings.value("ui/runInspectorSection")
+                    == "logs"
+                )
+            finally:
+                restored.close()
+        finally:
+            if window.isVisible():
+                window.close()
 
 
 def test_splitter_setting_parser_rejects_invalid_geometry() -> None:

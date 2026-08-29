@@ -185,6 +185,36 @@ class OutcomeSemanticsTests(unittest.TestCase):
             ],
         )
 
+    def test_v3_result_is_readable_but_forced_to_legacy_non_delivery(self) -> None:
+        normalized = normalize_pipeline_result(
+            {
+                "schema": "starun.pipeline-result.v3",
+                "status": "success",
+                "actual_steps": [{"stage": 1, "status": "ok"}],
+                "review_requirements": [],
+                "delivery_eligible": True,
+                "delivery_gates": {
+                    "schema": "starun.final-delivery-gates.v1",
+                    "legacy_delivery_contract": False,
+                    "formal_delivery_accepted": True,
+                },
+            }
+        )
+
+        self.assertEqual(normalized["schema"], "starun.pipeline-result.v2")
+        self.assertEqual(
+            normalized["source_schema"],
+            "starun.pipeline-result.v3",
+        )
+        self.assertTrue(normalized["legacy_schema_read_only"])
+        self.assertFalse(normalized["delivery_eligible"])
+        self.assertTrue(
+            normalized["delivery_gates"]["legacy_delivery_contract"]
+        )
+        self.assertFalse(
+            normalized["delivery_gates"]["formal_delivery_accepted"]
+        )
+
     def test_v1_run_state_normalizes_recovered_error(self) -> None:
         normalized = normalize_run_state(
             {

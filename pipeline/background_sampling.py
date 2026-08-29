@@ -1,20 +1,32 @@
 """Safe Stage 3 background samples and directional-pattern diagnostics."""
 from __future__ import annotations
 
+import hashlib
 import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from stage3_contract import (
+    STAGE3_DENSE_STAR_FIELD_FRACTION_MIN,
+    STAGE3_DENSE_STAR_SAMPLE_SUPPORT_MIN,
+    STAGE3_DENSE_STAR_SAMPLING_SCHEMA,
     STAGE3_MAX_SOURCE_MASK_FRACTION,
     STAGE3_MIN_AXIS_SPAN_RATIO,
     STAGE3_MIN_SPATIAL_GRID_CELLS,
     STAGE3_MIN_SPATIAL_QUADRANTS,
     STAGE3_MIN_USABLE_SKY_FRACTION,
     STAGE3_MIN_VALIDATION_PATCHES,
+    STAGE3_NEUTRAL_AXIS_CONDITION_MAX,
+    STAGE3_NEUTRAL_AXIS_HEADROOM_FRACTION_MAX,
+    STAGE3_NEUTRAL_AXIS_HEADROOM_MARGIN,
+    STAGE3_NEUTRAL_AXIS_PROJECTION_SCHEMA,
+    STAGE3_SPATIAL_OPPONENT_CORRELATION_MIN,
+    STAGE3_SPATIAL_OPPONENT_PROJECTION_SCHEMA,
+    STAGE3_SPATIAL_OPPONENT_RMS_IMPROVEMENT_MIN,
     STAGE3_RADIAL_BIC_DELTA_MIN,
     STAGE3_RADIAL_RESIDUAL_SPAN_RATIO_MAX,
+    STAGE3_SAMPLE_MASK_SCHEMA,
     STAGE3_SIGNIFICANCE_SIGMA,
     normalize_stage3_gate_profile,
     stage3_gate_thresholds,
@@ -68,6 +80,59 @@ def _as_luminance(image: Any) -> np.ndarray:
         0.0,
         1.0,
     )
+
+
+def _native_channels(image: Any) -> np.ndarray:
+    """Return native-value channels in CHW order without renormalization."""
+    source = np.asarray(image)
+    if source.size == 0:
+        raise ValueError("image buffer is empty")
+    if source.ndim == 2:
+        channels = source[None, :, :]
+    elif source.ndim == 3:
+        if source.shape[0] in (1, 3, 4) and source.shape[-1] not in (1, 3, 4):
+            channels = source[:3]
+        elif source.shape[-1] in (1, 3, 4):
+            channels = np.moveaxis(source[..., :3], -1, 0)
+        elif source.shape[0] >= 3:
+            channels = source[:3]
+        else:
+            raise ValueError(f"unsupported image shape: {source.shape}")
+    else:
+        raise ValueError(f"unsupported image ndim: {source.ndim}")
+    values = np.asarray(channels, dtype=np.float64)
+    if values.shape[0] not in (1, 3) or values.shape[1] < 2 or values.shape[2] < 2:
+        raise ValueError(f"unsupported channel layout: {source.shape}")
+    if int(np.count_nonzero(np.isfinite(values))) < 256:
+        raise ValueError("not enough finite channel pixels")
+    return values
+
+
+def _expand_analysis_mask(
+    mask: np.ndarray,
+    *,
+    height: int,
+    width: int,
+    stride: int,
+) -> np.ndarray:
+    """Project a bounded analysis mask back to native pixels deterministically."""
+    source = np.asarray(mask, dtype=bool)
+    y_index = np.clip(
+        np.rint(np.arange(height, dtype=np.float64) / max(1, stride)).astype(int),
+        0,
+        source.shape[0] - 1,
+    )
+    x_index = np.clip(
+        np.rint(np.arange(width, dtype=np.float64) / max(1, stride)).astype(int),
+        0,
+        source.shape[1] - 1,
+    )
+    return source[np.ix_(y_index, x_index)]
+
+
+def _mask_sha256(mask: np.ndarray) -> str:
+    packed = np.packbits(np.asarray(mask, dtype=np.uint8).reshape(-1))
+    return hashlib.sha256(packed.tobytes()).hexdigest()
 
 
 def _smooth3(values: np.ndarray, passes: int) -> np.ndarray:
@@ -565,11 +630,15 @@ def build_safe_background_samples(
     brightness_quantile_max: float = 0.70,
     texture_quantile_max: float = 0.55,
     candidate_refinement: bool = True,
+    preserve_regular_grid: bool = False,
+    masked_catalog_statistics: bool = False,
     refinement_max_steps: int = 8,
     shared_valid_mask: Optional[np.ndarray] = None,
     shared_saturation_map: Optional[np.ndarray] = None,
     shared_star_catalog: Optional[Sequence[Dict[str, Any]]] = None,
+    shared_star_catalog_sha256: Optional[str] = None,
     protection_policy: Optional[Dict[str, Any]] = None,
+    return_candidate_independent_support_mask: bool = False,
 ) -> Tuple[List[Tuple[float, float]], Dict[str, Any]]:
     """Select spatially distributed low-signal, low-texture Siril samples.
 
@@ -584,9 +653,19 @@ def build_safe_background_samples(
     brightness_quantile_max = _clamp(brightness_quantile_max, 0.50, 0.85)
     texture_quantile_max = _clamp(texture_quantile_max, 0.25, 0.75)
     candidate_refinement = bool(candidate_refinement)
+    preserve_regular_grid = bool(preserve_regular_grid)
+    masked_catalog_statistics = bool(masked_catalog_statistics)
+    return_candidate_independent_support_mask = bool(
+        return_candidate_independent_support_mask
+    )
     refinement_max_steps = max(0, min(12, int(refinement_max_steps)))
     try:
         luminance = _as_luminance(image)
+        native_channels = (
+            _native_channels(image)
+            if masked_catalog_statistics
+            else None
+        )
     except (TypeError, ValueError) as error:
         return [], {
             "status": "unavailable",
@@ -677,7 +756,8 @@ def build_safe_background_samples(
             "sample_count": 0,
         }
     mask_stride = max(1, int(mask_report.get("downsample_stride", 1) or 1))
-    combined_mask = source_mask | coverage_mask | derived_masks["dark_structure"]
+    noncatalog_mask = source_mask | coverage_mask | derived_masks["dark_structure"]
+    combined_mask = noncatalog_mask.copy()
     applied_layers = {
         "invalid_or_uncovered": coverage_mask,
         "image_stars_and_sources": derived_masks["compact_source"],
@@ -688,6 +768,7 @@ def build_safe_background_samples(
     if bool(protection_policy.get("protect_outer_halo", False)):
         applied_layers["outer_halo"] = derived_masks["outer_halo"]
         combined_mask |= derived_masks["outer_halo"]
+        noncatalog_mask |= derived_masks["outer_halo"]
 
     star_fraction = (
         float(np.mean(shared_star_mask))
@@ -698,8 +779,15 @@ def build_safe_background_samples(
         star_small = shared_star_mask[::mask_stride, ::mask_stride]
         star_small = star_small[: combined_mask.shape[0], : combined_mask.shape[1]]
         combined_mask[: star_small.shape[0], : star_small.shape[1]] |= star_small
+    strict_unmasked_sky_fraction = float(np.mean(~combined_mask))
+    nonstellar_sky_fraction = float(np.mean(~noncatalog_mask))
+    effective_usable_sky_fraction = (
+        nonstellar_sky_fraction
+        if masked_catalog_statistics
+        else strict_unmasked_sky_fraction
+    )
     mask_evidence = {
-        "schema_version": "starun.stage3-sample-masks.v1",
+        "schema_version": STAGE3_SAMPLE_MASK_SCHEMA,
         "method": "multiscale_quadratic_residual_plus_scene_support",
         "applied_to_sampling": True,
         "layers": {
@@ -722,13 +810,24 @@ def build_safe_background_samples(
                     "dark_structure": (
                         "coherent_negative_quadratic_residual_growth"
                     ),
+                    "outer_halo": (
+                        "low_threshold_connected_positive_residual_growth"
+                    ),
                 }[name],
                 "reason": None,
             }
             for name, mask in applied_layers.items()
         },
         "combined_excluded_fraction": float(np.mean(combined_mask)),
-        "usable_sky_fraction": float(np.mean(~combined_mask)),
+        "usable_sky_fraction": effective_usable_sky_fraction,
+        "strict_unmasked_sky_fraction": strict_unmasked_sky_fraction,
+        "nonstellar_sky_fraction": nonstellar_sky_fraction,
+        "effective_usable_sky_fraction": effective_usable_sky_fraction,
+        "effective_definition": (
+            "nonstellar_sky_with_catalog_points_masked_in_sample_statistics"
+            if masked_catalog_statistics
+            else "strict_zero_overlap_combined_mask"
+        ),
         "scene_support_stars": {
             "requested": True,
             "available": shared_star_mask is not None,
@@ -759,6 +858,115 @@ def build_safe_background_samples(
             "reason": "protect_outer_halo_not_requested",
         }
 
+    compact_native = None
+    hard_exclusion_native = None
+    masked_pixel_support = None
+    full_combined_exclusion = _expand_analysis_mask(
+        combined_mask,
+        height=height,
+        width=width,
+        stride=mask_stride,
+    )
+    candidate_independent_sky_support = ~full_combined_exclusion
+    if shared_valid is not None:
+        candidate_independent_sky_support &= shared_valid
+    if shared_saturated is not None:
+        candidate_independent_sky_support &= ~shared_saturated
+    if shared_star_mask is not None:
+        candidate_independent_sky_support &= ~shared_star_mask
+    masked_audit_layers_native: Dict[str, np.ndarray] = {}
+    if masked_catalog_statistics:
+        if shared_star_mask is None or shared_valid is None or shared_saturated is None:
+            return [], {
+                "status": "unavailable",
+                "error": "masked catalog statistics require valid, saturation and star evidence",
+                "sample_count": 0,
+                "mask_evidence": mask_evidence,
+            }
+        compact_native = _expand_analysis_mask(
+            derived_masks["compact_source"],
+            height=height,
+            width=width,
+            stride=mask_stride,
+        )
+        hard_small = (
+            coverage_mask
+            | derived_masks["extended_structure"]
+            | derived_masks["bright_core"]
+            | derived_masks["dark_structure"]
+        )
+        if bool(protection_policy.get("protect_outer_halo", False)):
+            hard_small |= derived_masks["outer_halo"]
+        hard_exclusion_native = _expand_analysis_mask(
+            hard_small,
+            height=height,
+            width=width,
+            stride=mask_stride,
+        )
+        masked_audit_layers_native = {
+            "shared_invalid": ~shared_valid,
+            "shared_saturated": shared_saturated,
+            "coverage": _expand_analysis_mask(
+                coverage_mask,
+                height=height,
+                width=width,
+                stride=mask_stride,
+            ),
+            "catalog_star": shared_star_mask,
+            "compact_source": compact_native,
+            "positive_structure_nebulosity": _expand_analysis_mask(
+                derived_masks["extended_structure"],
+                height=height,
+                width=width,
+                stride=mask_stride,
+            ),
+            "bright_core": _expand_analysis_mask(
+                derived_masks["bright_core"],
+                height=height,
+                width=width,
+                stride=mask_stride,
+            ),
+            "dark_structure": _expand_analysis_mask(
+                derived_masks["dark_structure"],
+                height=height,
+                width=width,
+                stride=mask_stride,
+            ),
+            "outer_halo": _expand_analysis_mask(
+                derived_masks["outer_halo"],
+                height=height,
+                width=width,
+                stride=mask_stride,
+            ),
+        }
+        masked_pixel_support = (
+            shared_valid
+            & ~shared_saturated
+            & ~hard_exclusion_native
+            & ~shared_star_mask
+            & ~compact_native
+        )
+        candidate_independent_sky_support = masked_pixel_support.copy()
+        mask_evidence["masked_catalog_statistics"] = {
+            "schema_version": STAGE3_DENSE_STAR_SAMPLING_SCHEMA,
+            "enabled": True,
+            "minimum_patch_support_fraction": (
+                STAGE3_DENSE_STAR_SAMPLE_SUPPORT_MIN
+            ),
+            "maximum_masked_point_source_fraction": (
+                1.0 - STAGE3_DENSE_STAR_SAMPLE_SUPPORT_MIN
+            ),
+            "support_mask_sha256": _mask_sha256(masked_pixel_support),
+            "catalog_mask_sha256": _mask_sha256(shared_star_mask),
+            "catalog_records_sha256": shared_star_catalog_sha256,
+            "catalog_radius_method": (
+                "scene_support_catalog_4x_fwhm"
+                if bool(protection_policy.get("protect_star_halo", False))
+                else "scene_support_catalog_2_5x_fwhm"
+            ),
+            "siril_recalculate": False,
+        }
+
     finite_values = luminance[np.isfinite(luminance)]
     low_limit = float(np.quantile(finite_values, 0.015))
     absolute_brightness_limit = float(np.quantile(finite_values, 0.90))
@@ -767,7 +975,13 @@ def build_safe_background_samples(
         1e-8,
     )
     aspect = width / max(height, 1)
-    candidate_grid_multiplier = 6 if (star_fraction or 0.0) >= 0.15 else 4
+    candidate_grid_multiplier = (
+        10
+        if masked_catalog_statistics
+        else 6
+        if (star_fraction or 0.0) >= STAGE3_DENSE_STAR_FIELD_FRACTION_MIN
+        else 4
+    )
     candidate_budget = target_count * candidate_grid_multiplier
     columns = max(8, int(round(math.sqrt(candidate_budget * aspect))))
     rows = max(6, int(math.ceil(candidate_budget / columns)))
@@ -800,12 +1014,61 @@ def build_safe_background_samples(
         finite_ratio = float(np.mean(np.isfinite(patch)))
         if finite_ratio < 0.999:
             return None
-        median = float(np.median(patch))
-        mad = float(np.median(np.abs(patch - median)))
-        p95 = float(np.quantile(patch, 0.95))
-        dx = np.abs(np.diff(patch, axis=1))
-        dy = np.abs(np.diff(patch, axis=0))
-        texture = float(0.5 * (np.median(dx) + np.median(dy)))
+        patch_support = None
+        channel_medians = None
+        native_luminance_mean = None
+        native_luminance_min = None
+        native_luminance_max = None
+        if masked_catalog_statistics:
+            assert masked_pixel_support is not None
+            assert native_channels is not None
+            patch_support = masked_pixel_support[
+                y - patch_radius : y + patch_radius + 1,
+                x - patch_radius : x + patch_radius + 1,
+            ]
+            supported = patch[patch_support]
+            if supported.size < 16:
+                return None
+            median = float(np.median(supported))
+            mad = float(np.median(np.abs(supported - median)))
+            p95 = float(np.quantile(supported, 0.95))
+            x_support = patch_support[:, 1:] & patch_support[:, :-1]
+            y_support = patch_support[1:, :] & patch_support[:-1, :]
+            dx_all = np.abs(np.diff(patch, axis=1))
+            dy_all = np.abs(np.diff(patch, axis=0))
+            dx = dx_all[x_support]
+            dy = dy_all[y_support]
+            if dx.size < 8 or dy.size < 8:
+                return None
+            texture = float(0.5 * (np.median(dx) + np.median(dy)))
+            native_patch = native_channels[
+                :,
+                y - patch_radius : y + patch_radius + 1,
+                x - patch_radius : x + patch_radius + 1,
+            ]
+            channel_medians = [
+                float(np.median(channel[patch_support]))
+                for channel in native_patch
+            ]
+            if native_patch.shape[0] == 1:
+                native_luminance = native_patch[0]
+            else:
+                native_luminance = (
+                    0.2126 * native_patch[0]
+                    + 0.7152 * native_patch[1]
+                    + 0.0722 * native_patch[2]
+                )
+            native_values = native_luminance[patch_support]
+            native_luminance_mean = float(np.mean(native_values))
+            native_luminance_min = float(np.min(native_values))
+            native_luminance_max = float(np.max(native_values))
+        else:
+            median = float(np.median(patch))
+            mad = float(np.median(np.abs(patch - median)))
+            p95 = float(np.quantile(patch, 0.95))
+            dx = np.abs(np.diff(patch, axis=1))
+            dy = np.abs(np.diff(patch, axis=0))
+            texture = float(0.5 * (np.median(dx) + np.median(dy)))
         mask_x = min(
             source_mask.shape[1] - 1,
             max(0, int(round(x / mask_stride))),
@@ -822,6 +1085,42 @@ def build_safe_background_samples(
         local_source_mask = source_mask[my0:my1, mx0:mx1]
         local_coverage_mask = coverage_mask[my0:my1, mx0:mx1]
         local_combined_mask = combined_mask[my0:my1, mx0:mx1]
+        native_slice = (
+            slice(y - patch_radius, y + patch_radius + 1),
+            slice(x - patch_radius, x + patch_radius + 1),
+        )
+        local_compact_native = (
+            compact_native[native_slice]
+            if compact_native is not None
+            else None
+        )
+        local_hard_native = (
+            hard_exclusion_native[native_slice]
+            if hard_exclusion_native is not None
+            else None
+        )
+        shared_star_patch = (
+            shared_star_mask[native_slice]
+            if shared_star_mask is not None
+            else None
+        )
+        point_source_mask = (
+            shared_star_patch | local_compact_native
+            if shared_star_patch is not None and local_compact_native is not None
+            else shared_star_patch
+        )
+        mask_overlap_fractions = (
+            {
+                name: float(np.mean(mask[native_slice]))
+                for name, mask in masked_audit_layers_native.items()
+            }
+            if masked_catalog_statistics
+            else None
+        )
+        if mask_overlap_fractions is not None:
+            mask_overlap_fractions["outer_halo_enforced"] = bool(
+                protection_policy.get("protect_outer_halo", False)
+            )
         return {
             "x": int(x),
             "y": int(y),
@@ -833,6 +1132,42 @@ def build_safe_background_samples(
             "source_mask_fraction": float(np.mean(local_source_mask)),
             "coverage_mask_fraction": float(np.mean(local_coverage_mask)),
             "combined_mask_fraction": float(np.mean(local_combined_mask)),
+            "hard_exclusion_fraction": (
+                float(np.mean(local_hard_native))
+                if local_hard_native is not None
+                else None
+            ),
+            "compact_source_fraction": (
+                float(np.mean(local_compact_native))
+                if local_compact_native is not None
+                else None
+            ),
+            "point_source_mask_fraction": (
+                float(np.mean(point_source_mask))
+                if point_source_mask is not None
+                else None
+            ),
+            "masked_support_fraction": (
+                float(np.mean(patch_support))
+                if patch_support is not None
+                else None
+            ),
+            "masked_support_count": (
+                int(np.count_nonzero(patch_support))
+                if patch_support is not None
+                else None
+            ),
+            "sample_size": int(2 * patch_radius + 1),
+            "channel_count": (
+                int(native_channels.shape[0])
+                if native_channels is not None
+                else None
+            ),
+            "channel_medians": channel_medians,
+            "native_luminance_mean": native_luminance_mean,
+            "native_luminance_min": native_luminance_min,
+            "native_luminance_max": native_luminance_max,
+            "mask_overlap_fractions": mask_overlap_fractions,
             "candidate_source": source,
             "shared_valid_fraction": (
                 float(np.mean(shared_valid[
@@ -851,11 +1186,18 @@ def build_safe_background_samples(
                 else None
             ),
             "shared_star_fraction": (
-                float(np.mean(shared_star_mask[
-                    y - patch_radius : y + patch_radius + 1,
-                    x - patch_radius : x + patch_radius + 1,
-                ]))
+                float(np.mean(shared_star_patch))
+                if shared_star_patch is not None
+                else None
+            ),
+            "shared_star_center": (
+                bool(shared_star_mask[y, x])
                 if shared_star_mask is not None
+                else None
+            ),
+            "compact_source_center": (
+                bool(compact_native[y, x])
+                if compact_native is not None
                 else None
             ),
         }
@@ -968,10 +1310,22 @@ def build_safe_background_samples(
             return False, "shared_invalid_region"
         if float(record.get("shared_saturated_fraction") or 0.0) > 0.0:
             return False, "shared_saturated"
-        if float(record.get("shared_star_fraction") or 0.0) > 0.0:
-            return False, "shared_catalog_star"
-        if record["combined_mask_fraction"] > 0.0:
-            return False, "exclusion_masked"
+        if masked_catalog_statistics:
+            if bool(record.get("shared_star_center")) or bool(
+                record.get("compact_source_center")
+            ):
+                return False, "masked_point_source_center"
+            if float(record.get("hard_exclusion_fraction") or 0.0) > 0.0:
+                return False, "exclusion_masked"
+            if float(record.get("masked_support_fraction") or 0.0) < (
+                STAGE3_DENSE_STAR_SAMPLE_SUPPORT_MIN
+            ):
+                return False, "masked_point_source_support_insufficient"
+        else:
+            if float(record.get("shared_star_fraction") or 0.0) > 0.0:
+                return False, "shared_catalog_star"
+            if record["combined_mask_fraction"] > 0.0:
+                return False, "exclusion_masked"
         if record["median"] <= low_limit:
             return False, "clipped_or_too_dark"
         if (
@@ -1096,6 +1450,8 @@ def build_safe_background_samples(
         "shared_invalid_region": 0,
         "shared_saturated": 0,
         "shared_catalog_star": 0,
+        "masked_point_source_center": 0,
+        "masked_point_source_support_insufficient": 0,
     }
     for record in candidates:
         accepted, rejection_reason = audit_candidate(record)
@@ -1140,18 +1496,68 @@ def build_safe_background_samples(
     selected: List[Dict[str, Any]] = []
     selected_keys = set()
     selected_grid_cells = set()
-    for cell in cell_order:
-        for record in candidates_by_cell[cell]:
+
+    def select_first_spaced(records: Sequence[Dict[str, Any]]) -> bool:
+        for record in records:
+            if len(selected) >= target_count:
+                return False
+            key = (record["x"], record["y"])
+            if key in selected_keys:
+                continue
             if any(
-                math.hypot(record["x"] - item["x"], record["y"] - item["y"])
+                math.hypot(
+                    record["x"] - item["x"],
+                    record["y"] - item["y"],
+                )
                 < minimum_spacing
                 for item in selected
             ):
                 continue
             selected.append(record)
-            selected_keys.add((record["x"], record["y"]))
-            selected_grid_cells.add(cell)
-            break
+            selected_keys.add(key)
+            selected_grid_cells.add(
+                (
+                    min(
+                        coverage_columns - 1,
+                        int(record["x"] * coverage_columns / max(width, 1)),
+                    ),
+                    min(
+                        coverage_rows - 1,
+                        int(record["y"] * coverage_rows / max(height, 1)),
+                    ),
+                )
+            )
+            return True
+        return False
+
+    # Conservative recovery must retain the regular-grid evidence that made
+    # the recovery eligible. Refinement may fill missing cells, but must not
+    # displace all regular points merely because local risk is lower. This is
+    # opt-in so ordinary Stage 3 and Stage 4 selection remain unchanged.
+    if preserve_regular_grid:
+        regular_by_cell: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+        for cell, records in candidates_by_cell.items():
+            regular_records = [
+                record
+                for record in records
+                if record.get("candidate_source") == "regular_grid"
+            ]
+            if regular_records:
+                regular_by_cell[cell] = regular_records
+        regular_cell_order = sorted(
+            regular_by_cell,
+            key=lambda key: (
+                len(regular_by_cell[key]),
+                regular_by_cell[key][0]["risk"],
+                key[1],
+                key[0],
+            ),
+        )
+        for cell in regular_cell_order:
+            select_first_spaced(regular_by_cell[cell])
+
+    for cell in cell_order:
+        select_first_spaced(candidates_by_cell[cell])
 
     for record in sorted(safe, key=lambda item: item["risk"]):
         if len(selected) >= target_count:
@@ -1159,26 +1565,7 @@ def build_safe_background_samples(
         key = (record["x"], record["y"])
         if key in selected_keys:
             continue
-        if any(
-            math.hypot(record["x"] - item["x"], record["y"] - item["y"])
-            < minimum_spacing
-            for item in selected
-        ):
-            continue
-        selected.append(record)
-        selected_keys.add(key)
-        selected_grid_cells.add(
-            (
-                min(
-                    coverage_columns - 1,
-                    int(record["x"] * coverage_columns / max(width, 1)),
-                ),
-                min(
-                    coverage_rows - 1,
-                    int(record["y"] * coverage_rows / max(height, 1)),
-                ),
-            )
-        )
+        select_first_spaced((record,))
 
     selected = sorted(selected[:target_count], key=lambda item: (item["y"], item["x"]))
     quadrants = {
@@ -1211,9 +1598,45 @@ def build_safe_background_samples(
         for item in selected
     ]
     selected_source_counts: Dict[str, int] = {}
+    selected_samples: List[Dict[str, Any]] = []
     for item in selected:
         source = str(item.get("candidate_source") or "unknown")
         selected_source_counts[source] = selected_source_counts.get(source, 0) + 1
+        sample_x = float(item["x"])
+        sample_y = float(height - 1 - item["y"])
+        selected_samples.append(
+            {
+                "point": [sample_x, sample_y],
+                "source": source,
+                "grid_cell": [
+                    min(
+                        coverage_columns - 1,
+                        int(item["x"] * coverage_columns / max(width, 1)),
+                    ),
+                    min(
+                        coverage_rows - 1,
+                        int(item["y"] * coverage_rows / max(height, 1)),
+                    ),
+                ],
+                "sample_size": item.get("sample_size"),
+                "masked_support_count": item.get("masked_support_count"),
+                "masked_support_fraction": item.get("masked_support_fraction"),
+                "shared_star_fraction": item.get("shared_star_fraction"),
+                "compact_source_fraction": item.get("compact_source_fraction"),
+                "point_source_mask_fraction": item.get(
+                    "point_source_mask_fraction"
+                ),
+                "hard_exclusion_fraction": item.get("hard_exclusion_fraction"),
+                "channel_count": item.get("channel_count"),
+                "channel_medians": item.get("channel_medians"),
+                "native_luminance_mean": item.get("native_luminance_mean"),
+                "native_luminance_min": item.get("native_luminance_min"),
+                "native_luminance_max": item.get("native_luminance_max"),
+                "mask_overlap_fractions": item.get(
+                    "mask_overlap_fractions"
+                ),
+            }
+        )
     report = {
         "status": "ready" if ready else "insufficient_safe_coverage",
         "coordinate_system": "siril_bottom_left",
@@ -1232,10 +1655,13 @@ def build_safe_background_samples(
             "scene_support_star_fraction": star_fraction,
         },
         "refinement": refinement_report,
+        "preserve_regular_grid": preserve_regular_grid,
+        "masked_catalog_statistics": masked_catalog_statistics,
         "patch_radius": patch_radius,
         "margin_pixels": margin,
         "minimum_spacing_pixels": minimum_spacing,
         "selected_candidate_sources": selected_source_counts,
+        "selected_samples": selected_samples,
         "coverage": {
             "quadrants": len(quadrants),
             "grid_cells": len(selected_grid_cells),
@@ -1260,14 +1686,84 @@ def build_safe_background_samples(
         },
         "rejection_counts": rejection_counts,
         "points": [[x, y] for x, y in points] if ready else [],
-        "safety_contract": [
-            "require zero overlap with the combined multiscale exclusion mask",
-            "reject clipped/bright/structured/star-contaminated patches",
-            "dark-patch proposals reuse thresholds frozen from the regular grid",
-            "refined proposals remain deterministic, deduplicated and spacing-audited",
-            "require broad spatial coverage before subsky -existing",
-        ],
+        "safety_contract": (
+            [
+                "require zero overlap with invalid, saturated and non-point-source structure masks",
+                "exclude catalog and compact point-source pixels from patch statistics",
+                "require at least 80 percent frozen pixel support per patch",
+                "reject patch centers inside catalog or compact point-source masks",
+                "dark-patch proposals reuse thresholds frozen from the regular grid",
+                "refined proposals remain deterministic, deduplicated and spacing-audited",
+                "require broad spatial coverage before subsky -existing",
+            ]
+            if masked_catalog_statistics
+            else [
+                "require zero overlap with the combined multiscale exclusion mask",
+                "reject clipped/bright/structured/star-contaminated patches",
+                "dark-patch proposals reuse thresholds frozen from the regular grid",
+                "refined proposals remain deterministic, deduplicated and spacing-audited",
+                "require broad spatial coverage before subsky -existing",
+            ]
+        ),
     }
+    if masked_catalog_statistics:
+        report["dense_star_masked_sampling"] = {
+            "schema_version": STAGE3_DENSE_STAR_SAMPLING_SCHEMA,
+            "status": "ready" if ready else "insufficient_safe_coverage",
+            "minimum_patch_support_fraction": (
+                STAGE3_DENSE_STAR_SAMPLE_SUPPORT_MIN
+            ),
+            "sample_statistics": "masked_native_channel_median",
+            "siril_recalculate": False,
+            "selected_support_fraction_min": (
+                min(
+                    float(item["masked_support_fraction"])
+                    for item in selected
+                )
+                if selected
+                else None
+            ),
+            "selected_support_fraction_median": (
+                float(
+                    np.median(
+                        [
+                            float(item["masked_support_fraction"])
+                            for item in selected
+                        ]
+                    )
+                )
+                if selected
+                else None
+            ),
+            "support_mask_sha256": (
+                (mask_evidence.get("masked_catalog_statistics") or {}).get(
+                    "support_mask_sha256"
+                )
+            ),
+            "catalog_mask_sha256": (
+                (mask_evidence.get("masked_catalog_statistics") or {}).get(
+                    "catalog_mask_sha256"
+                )
+            ),
+            "catalog_records_sha256": shared_star_catalog_sha256,
+        }
+        report["_masked_pixel_support_mask"] = masked_pixel_support
+    report["candidate_independent_sky_support"] = {
+        "schema_version": "starun.stage3-candidate-independent-sky-support.v1",
+        "status": "available",
+        "pixel_count": int(np.count_nonzero(candidate_independent_sky_support)),
+        "coverage": float(np.mean(candidate_independent_sky_support)),
+        "sha256": _mask_sha256(candidate_independent_sky_support),
+        "definition": (
+            "masked_catalog_nonstellar_full_resolution_sky"
+            if masked_catalog_statistics
+            else "full_resolution_multiscale_exclusion_safe_sky"
+        ),
+    }
+    if return_candidate_independent_support_mask:
+        report["_candidate_independent_sky_support_mask"] = (
+            candidate_independent_sky_support
+        )
     return (points if ready else []), report
 
 
@@ -1324,6 +1820,946 @@ def _native_luminance(
     if not math.isfinite(value_scale) or value_scale <= 0.0:
         raise ValueError("validation value scale is invalid")
     return values / value_scale, value_scale
+
+
+def _stage3_rgb_chw(image: Any) -> Tuple[np.ndarray, str, np.dtype]:
+    """Return a finite three-channel image and its reversible layout."""
+    source = np.asarray(image)
+    if source.ndim != 3:
+        raise ValueError("neutral-axis projection requires a three-channel image")
+    if source.shape[0] == 3 and source.shape[-1] != 3:
+        rgb = source
+        layout = "chw"
+    elif source.shape[-1] == 3:
+        rgb = np.moveaxis(source, -1, 0)
+        layout = "hwc"
+    else:
+        raise ValueError(f"unsupported RGB image shape: {source.shape}")
+    values = np.asarray(rgb, dtype=np.float64)
+    if values.shape[0] != 3 or values.shape[1] < 2 or values.shape[2] < 2:
+        raise ValueError(f"invalid RGB image shape: {source.shape}")
+    if not bool(np.all(np.isfinite(values))):
+        raise ValueError("RGB image contains non-finite pixels")
+    return values, layout, source.dtype
+
+
+def _restore_stage3_rgb_layout(
+    rgb: np.ndarray,
+    *,
+    layout: str,
+    dtype: np.dtype,
+) -> np.ndarray:
+    restored = rgb if layout == "chw" else np.moveaxis(rgb, 0, -1)
+    output_dtype = dtype if np.issubdtype(dtype, np.floating) else np.dtype(np.float32)
+    return np.asarray(restored, dtype=output_dtype)
+
+
+def _stage3_patch_mask(
+    points: Sequence[Tuple[float, float]],
+    *,
+    width: int,
+    height: int,
+    patch_radius: int,
+) -> np.ndarray:
+    mask = np.zeros((height, width), dtype=bool)
+    for raw_x, raw_y in points:
+        x = int(round(float(raw_x)))
+        y = int(round(height - 1 - float(raw_y)))
+        x0 = max(0, x - patch_radius)
+        x1 = min(width, x + patch_radius + 1)
+        y0 = max(0, y - patch_radius)
+        y1 = min(height, y + patch_radius + 1)
+        if x0 < x1 and y0 < y1:
+            mask[y0:y1, x0:x1] = True
+    return mask
+
+
+def project_stage3_neutral_axis_poly1(
+    baseline_image: Any,
+    siril_proposal_image: Any,
+    fit_points: Sequence[Tuple[float, float]],
+    validation_points: Sequence[Tuple[float, float]],
+    *,
+    patch_radius: int = 12,
+    minimum_fit: int = 8,
+    condition_number_max: float = STAGE3_NEUTRAL_AXIS_CONDITION_MAX,
+    headroom_fraction_max: float = (
+        STAGE3_NEUTRAL_AXIS_HEADROOM_FRACTION_MAX
+    ),
+    headroom_margin: float = STAGE3_NEUTRAL_AXIS_HEADROOM_MARGIN,
+) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+    """Project a Siril RGB Polynomial proposal onto the additive neutral axis.
+
+    Siril owns the degree-1 proposal. Only its Rec.709 slope is retained; the
+    per-channel correction and DC term are discarded. Validation points never
+    participate in the fit or anchor and are inspected only after construction.
+    """
+    report: Dict[str, Any] = {
+        "schema": STAGE3_NEUTRAL_AXIS_PROJECTION_SCHEMA,
+        "status": "rejected",
+        "accepted": False,
+        "reason_code": "stage3_neutral_axis_projection_unavailable",
+        "source_model": "siril_subsky_degree1_existing",
+        "luminance": "rec709",
+        "projection": "additive_rgb_neutral_axis",
+        "anchor": {
+            "type": "geometric_center_zero_mean",
+            "x": 0.5,
+            "y": 0.5,
+            "constant_term_applied": False,
+        },
+        "fit_count": len(fit_points),
+        "validation_count": len(validation_points),
+        "patch_radius": int(patch_radius),
+        "issues": [],
+    }
+
+    def reject(reason_code: str, issue: str) -> Tuple[None, Dict[str, Any]]:
+        report["reason_code"] = reason_code
+        report["issues"] = list(dict.fromkeys([*report["issues"], issue]))
+        return None, report
+
+    patch_radius = max(1, int(patch_radius))
+    minimum_fit = max(3, int(minimum_fit))
+    if len(fit_points) < minimum_fit:
+        return reject(
+            "stage3_neutral_axis_fit_samples_insufficient",
+            "neutral-axis projection has insufficient fit samples",
+        )
+    try:
+        baseline, layout, source_dtype = _stage3_rgb_chw(baseline_image)
+        proposal, proposal_layout, _proposal_dtype = _stage3_rgb_chw(
+            siril_proposal_image
+        )
+    except (TypeError, ValueError) as error:
+        return reject(
+            "stage3_neutral_axis_rgb_unavailable",
+            str(error),
+        )
+    if proposal_layout != layout or proposal.shape != baseline.shape:
+        return reject(
+            "stage3_neutral_axis_proposal_shape_mismatch",
+            "Siril proposal shape or layout differs from Stage 3 baseline",
+        )
+    if bool(np.array_equal(proposal, baseline)):
+        return reject(
+            "stage3_neutral_axis_proposal_unchanged",
+            "Siril Polynomial proposal did not change any pixels",
+        )
+
+    height, width = baseline.shape[1:]
+    rec709 = np.asarray((0.2126, 0.7152, 0.0722), dtype=np.float64)
+    delta_luminance = np.tensordot(
+        rec709,
+        proposal - baseline,
+        axes=(0, 0),
+    )
+    report["raw_proposal"] = {
+        "shape": list(proposal.shape),
+        "dtype": str(np.asarray(siril_proposal_image).dtype),
+        "finite": bool(np.all(np.isfinite(proposal))),
+        "changed_pixel_fraction": float(
+            np.mean(np.any(proposal != baseline, axis=0))
+        ),
+        "rec709_delta_min": float(np.min(delta_luminance)),
+        "rec709_delta_max": float(np.max(delta_luminance)),
+        "rec709_delta_median": float(np.median(delta_luminance)),
+    }
+    design_rows: List[List[float]] = []
+    patch_values: List[float] = []
+    for raw_x, raw_y in fit_points:
+        x = int(round(float(raw_x)))
+        y = int(round(height - 1 - float(raw_y)))
+        x0 = max(0, x - patch_radius)
+        x1 = min(width, x + patch_radius + 1)
+        y0 = max(0, y - patch_radius)
+        y1 = min(height, y + patch_radius + 1)
+        patch = delta_luminance[y0:y1, x0:x1]
+        if patch.size == 0 or not bool(np.all(np.isfinite(patch))):
+            return reject(
+                "stage3_neutral_axis_fit_patch_invalid",
+                "neutral-axis fit patch is empty or non-finite",
+            )
+        design_rows.append(
+            [
+                1.0,
+                float(raw_x) / max(width - 1, 1),
+                float(y) / max(height - 1, 1),
+            ]
+        )
+        patch_values.append(float(np.median(patch)))
+    design = np.asarray(design_rows, dtype=np.float64)
+    values = np.asarray(patch_values, dtype=np.float64)
+    try:
+        coefficients, _residuals, rank, singular_values = np.linalg.lstsq(
+            design,
+            values,
+            rcond=None,
+        )
+        condition_number = float(np.linalg.cond(design))
+    except np.linalg.LinAlgError as error:
+        return reject(
+            "stage3_neutral_axis_fit_failed",
+            f"neutral-axis degree-1 fit failed: {error}",
+        )
+    fitted_values = design @ coefficients
+    residual_rms = float(np.sqrt(np.mean((values - fitted_values) ** 2)))
+    report["model"] = {
+        "coordinate_system": "normalized_top_left",
+        "coefficients": [float(value) for value in coefficients],
+        "rank": int(rank),
+        "condition_number": condition_number,
+        "condition_number_max": float(condition_number_max),
+        "singular_values": [float(value) for value in singular_values],
+        "fit_patch_residual_rms": residual_rms,
+    }
+    if int(rank) != 3:
+        return reject(
+            "stage3_neutral_axis_fit_rank_failed",
+            f"neutral-axis fit rank is {int(rank)}, expected 3",
+        )
+    if not math.isfinite(condition_number) or condition_number > float(
+        condition_number_max
+    ):
+        return reject(
+            "stage3_neutral_axis_fit_condition_failed",
+            "neutral-axis fit condition number exceeds the fixed limit",
+        )
+
+    yy, xx = np.mgrid[:height, :width]
+    correction = (
+        float(coefficients[1]) * (xx / max(width - 1, 1) - 0.5)
+        + float(coefficients[2]) * (yy / max(height - 1, 1) - 0.5)
+    )
+    correction_abs_max = float(np.max(np.abs(correction)))
+    if not math.isfinite(correction_abs_max) or correction_abs_max <= 1e-12:
+        return reject(
+            "stage3_neutral_axis_correction_not_material",
+            "neutral-axis correction is non-finite or numerically unchanged",
+        )
+
+    channel_min = np.min(baseline, axis=0)
+    channel_max = np.max(baseline, axis=0)
+    alpha = np.ones_like(correction, dtype=np.float64)
+    margin_scale = max(0.0, min(1.0, 1.0 - float(headroom_margin)))
+    negative = correction < 0.0
+    positive = correction > 0.0
+    alpha[negative] = np.minimum(
+        1.0,
+        margin_scale
+        * np.maximum(channel_min[negative], 0.0)
+        / np.maximum(-correction[negative], 1e-15),
+    )
+    alpha[positive] = np.minimum(
+        1.0,
+        margin_scale
+        * np.maximum(1.0 - channel_max[positive], 0.0)
+        / np.maximum(correction[positive], 1e-15),
+    )
+    baseline_clipped = (channel_min <= 0.0) | (channel_max >= 1.0)
+    alpha[baseline_clipped] = 0.0
+    alpha = np.clip(alpha, 0.0, 1.0)
+    meaningful = np.abs(correction) > 1e-12
+    attenuated = meaningful & (alpha < 1.0 - 1e-12)
+    attenuated_fraction = float(np.mean(attenuated))
+    fit_mask = _stage3_patch_mask(
+        fit_points,
+        width=width,
+        height=height,
+        patch_radius=patch_radius,
+    )
+    validation_mask = _stage3_patch_mask(
+        validation_points,
+        width=width,
+        height=height,
+        patch_radius=patch_radius,
+    )
+    fit_attenuated = int(np.count_nonzero(attenuated & fit_mask))
+    validation_attenuated = int(
+        np.count_nonzero(attenuated & validation_mask)
+    )
+    report["headroom"] = {
+        "method": "continuous_common_axis_taper",
+        "margin": float(headroom_margin),
+        "attenuated_fraction": attenuated_fraction,
+        "attenuated_fraction_max": float(headroom_fraction_max),
+        "attenuated_pixel_count": int(np.count_nonzero(attenuated)),
+        "fit_patch_attenuated_pixel_count": fit_attenuated,
+        "validation_patch_attenuated_pixel_count": validation_attenuated,
+        "baseline_clipped_pixel_count": int(np.count_nonzero(baseline_clipped)),
+    }
+    if attenuated_fraction > float(headroom_fraction_max):
+        return reject(
+            "stage3_neutral_axis_headroom_fraction_exceeded",
+            "neutral-axis headroom attenuation exceeds 0.1 percent",
+        )
+    if fit_attenuated or validation_attenuated:
+        return reject(
+            "stage3_neutral_axis_sample_headroom_attenuated",
+            "neutral-axis headroom attenuation intersects fit or validation patches",
+        )
+
+    applied_correction = correction * alpha
+    candidate_rgb = baseline + applied_correction[None, :, :]
+    candidate = _restore_stage3_rgb_layout(
+        candidate_rgb,
+        layout=layout,
+        dtype=source_dtype,
+    )
+    persisted_rgb, _layout, persisted_dtype = _stage3_rgb_chw(candidate)
+    delta = persisted_rgb - baseline
+    dtype_epsilon = (
+        float(np.finfo(persisted_dtype).eps)
+        if np.issubdtype(persisted_dtype, np.floating)
+        else float(np.finfo(np.float32).eps)
+    )
+    value_scale = max(1.0, float(np.max(np.abs(baseline))))
+    opponent_tolerance = max(1e-7, 8.0 * dtype_epsilon * value_scale)
+    rg_drift = float(
+        np.max(
+            np.abs(
+                (persisted_rgb[0] - persisted_rgb[1])
+                - (baseline[0] - baseline[1])
+            )
+        )
+    )
+    bg_drift = float(
+        np.max(
+            np.abs(
+                (persisted_rgb[2] - persisted_rgb[1])
+                - (baseline[2] - baseline[1])
+            )
+        )
+    )
+    baseline_low = baseline <= 0.0
+    baseline_high = baseline >= 1.0
+    new_low_clip = int(np.count_nonzero((persisted_rgb <= 0.0) & ~baseline_low))
+    new_high_clip = int(np.count_nonzero((persisted_rgb >= 1.0) & ~baseline_high))
+    channel_mean_delta = np.mean(delta, axis=(1, 2))
+    report["correction"] = {
+        "requested_min": float(np.min(correction)),
+        "requested_max": float(np.max(correction)),
+        "applied_min": float(np.min(applied_correction)),
+        "applied_max": float(np.max(applied_correction)),
+        "geometric_center_value": 0.0,
+        "channel_mean_delta": [float(value) for value in channel_mean_delta],
+    }
+    report["invariants"] = {
+        "opponent_tolerance": opponent_tolerance,
+        "rg_max_abs_drift": rg_drift,
+        "bg_max_abs_drift": bg_drift,
+        "new_low_clip_count": new_low_clip,
+        "new_high_clip_count": new_high_clip,
+        "finite": bool(np.all(np.isfinite(persisted_rgb))),
+        "shape_preserved": persisted_rgb.shape == baseline.shape,
+        "pixels_changed": not bool(np.array_equal(persisted_rgb, baseline)),
+    }
+    invariant_issues: List[str] = []
+    if not report["invariants"]["finite"]:
+        invariant_issues.append("neutral-axis candidate contains non-finite pixels")
+    if not report["invariants"]["shape_preserved"]:
+        invariant_issues.append("neutral-axis candidate shape changed")
+    if not report["invariants"]["pixels_changed"]:
+        invariant_issues.append("neutral-axis candidate did not change pixels")
+    if rg_drift > opponent_tolerance or bg_drift > opponent_tolerance:
+        invariant_issues.append("neutral-axis opponent-channel drift exceeds tolerance")
+    if new_low_clip or new_high_clip:
+        invariant_issues.append("neutral-axis candidate introduced clipping")
+    if invariant_issues:
+        report["issues"] = invariant_issues
+        report["reason_code"] = "stage3_neutral_axis_invariant_failed"
+        return None, report
+    report.update(
+        status="ready",
+        accepted=True,
+        reason_code="stage3_neutral_axis_projection_ready",
+        issues=[],
+    )
+    return candidate, report
+
+
+def verify_stage3_neutral_axis_persistence(
+    baseline_image: Any,
+    candidate_image: Any,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Verify the neutral-axis invariants after Siril/FITS persistence."""
+    report: Dict[str, Any] = {
+        "status": "rejected",
+        "accepted": False,
+        "issues": [],
+    }
+    try:
+        baseline, baseline_layout, _baseline_dtype = _stage3_rgb_chw(
+            baseline_image
+        )
+        candidate, candidate_layout, candidate_dtype = _stage3_rgb_chw(
+            candidate_image
+        )
+    except (TypeError, ValueError) as error:
+        report["issues"] = [str(error)]
+        return False, report
+    if baseline_layout != candidate_layout or baseline.shape != candidate.shape:
+        report["issues"] = [
+            "persisted neutral-axis candidate shape or layout changed"
+        ]
+        return False, report
+
+    dtype_epsilon = (
+        float(np.finfo(candidate_dtype).eps)
+        if np.issubdtype(candidate_dtype, np.floating)
+        else float(np.finfo(np.float32).eps)
+    )
+    value_scale = max(1.0, float(np.max(np.abs(baseline))))
+    tolerance = max(1e-7, 8.0 * dtype_epsilon * value_scale)
+    rg_drift = float(
+        np.max(
+            np.abs(
+                (candidate[0] - candidate[1])
+                - (baseline[0] - baseline[1])
+            )
+        )
+    )
+    bg_drift = float(
+        np.max(
+            np.abs(
+                (candidate[2] - candidate[1])
+                - (baseline[2] - baseline[1])
+            )
+        )
+    )
+    baseline_low = baseline <= 0.0
+    baseline_high = baseline >= 1.0
+    new_low_clip = int(np.count_nonzero((candidate <= 0.0) & ~baseline_low))
+    new_high_clip = int(np.count_nonzero((candidate >= 1.0) & ~baseline_high))
+    finite = bool(np.all(np.isfinite(candidate)))
+    changed = not bool(np.array_equal(candidate, baseline))
+    issues: List[str] = []
+    if not finite:
+        issues.append("persisted neutral-axis candidate contains non-finite pixels")
+    if not changed:
+        issues.append("persisted neutral-axis candidate is unchanged")
+    if rg_drift > tolerance or bg_drift > tolerance:
+        issues.append("persisted opponent-channel drift exceeds tolerance")
+    if new_low_clip or new_high_clip:
+        issues.append("persisted neutral-axis candidate introduced clipping")
+    report.update(
+        opponent_tolerance=tolerance,
+        rg_max_abs_drift=rg_drift,
+        bg_max_abs_drift=bg_drift,
+        new_low_clip_count=new_low_clip,
+        new_high_clip_count=new_high_clip,
+        finite=finite,
+        shape_preserved=True,
+        pixels_changed=changed,
+        issues=issues,
+    )
+    if issues:
+        return False, report
+    report.update(status="accepted", accepted=True)
+    return True, report
+
+
+def _stage3_patch_medians(
+    plane: np.ndarray,
+    points: Sequence[Tuple[float, float]],
+    *,
+    patch_radius: int,
+    support_mask: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return normalized top-left coordinates and frozen patch medians."""
+    height, width = plane.shape
+    if support_mask is not None:
+        support = np.asarray(support_mask, dtype=bool)
+        if support.shape != plane.shape:
+            raise ValueError("Stage 3 spatial support mask shape mismatch")
+    else:
+        support = None
+    rows: List[List[float]] = []
+    medians: List[float] = []
+    for raw_x, raw_y in points:
+        x = int(round(float(raw_x)))
+        y = int(round(height - 1 - float(raw_y)))
+        x0 = max(0, x - patch_radius)
+        x1 = min(width, x + patch_radius + 1)
+        y0 = max(0, y - patch_radius)
+        y1 = min(height, y + patch_radius + 1)
+        patch = np.asarray(plane[y0:y1, x0:x1], dtype=np.float64)
+        if support is not None:
+            patch = patch[support[y0:y1, x0:x1]]
+        else:
+            patch = patch.reshape(-1)
+        finite = patch[np.isfinite(patch)]
+        if finite.size == 0:
+            raise ValueError("Stage 3 spatial opponent patch has no finite support")
+        rows.append(
+            [
+                1.0,
+                float(raw_x) / max(width - 1, 1),
+                float(y) / max(height - 1, 1),
+            ]
+        )
+        medians.append(float(np.median(finite)))
+    return np.asarray(rows, dtype=np.float64), np.asarray(medians, dtype=np.float64)
+
+
+def _stage3_plane_fit(
+    design: np.ndarray,
+    values: np.ndarray,
+) -> Dict[str, Any]:
+    coefficients, _residuals, rank, singular_values = np.linalg.lstsq(
+        design,
+        values,
+        rcond=None,
+    )
+    fitted = design @ coefficients
+    residual = values - fitted
+    residual_rms = float(np.sqrt(np.mean(np.square(residual))))
+    condition_number = float(np.linalg.cond(design))
+    dof = max(int(design.shape[0]) - 3, 1)
+    sigma2 = float(np.sum(np.square(residual)) / dof)
+    covariance = sigma2 * np.linalg.pinv(design.T @ design)
+    slope = np.asarray(coefficients[1:3], dtype=np.float64)
+    slope_variance = max(
+        float(np.trace(covariance[1:3, 1:3])),
+        1e-30,
+    )
+    significance = float(np.linalg.norm(slope) / math.sqrt(slope_variance))
+    return {
+        "coefficients": coefficients,
+        "rank": int(rank),
+        "condition_number": condition_number,
+        "singular_values": singular_values,
+        "residual_rms": residual_rms,
+        "slope_significance_sigma": significance,
+    }
+
+
+def _stage3_centered_plane_values(
+    design: np.ndarray,
+    coefficients: np.ndarray,
+) -> np.ndarray:
+    return (
+        float(coefficients[1]) * (design[:, 1] - 0.5)
+        + float(coefficients[2]) * (design[:, 2] - 0.5)
+    )
+
+
+def project_stage3_spatial_opponent_poly1(
+    baseline_image: Any,
+    neutral_image: Any,
+    siril_proposal_image: Any,
+    fit_points: Sequence[Tuple[float, float]],
+    validation_points: Sequence[Tuple[float, float]],
+    *,
+    patch_radius: int = 12,
+    minimum_fit: int = 8,
+    minimum_validation: int = 4,
+    condition_number_max: float = STAGE3_NEUTRAL_AXIS_CONDITION_MAX,
+    significance_sigma: float = STAGE3_SIGNIFICANCE_SIGMA,
+    correlation_min: float = STAGE3_SPATIAL_OPPONENT_CORRELATION_MIN,
+    rms_improvement_min: float = STAGE3_SPATIAL_OPPONENT_RMS_IMPROVEMENT_MIN,
+    headroom_fraction_max: float = STAGE3_NEUTRAL_AXIS_HEADROOM_FRACTION_MAX,
+    headroom_margin: float = STAGE3_NEUTRAL_AXIS_HEADROOM_MARGIN,
+    support_mask: Optional[np.ndarray] = None,
+) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+    """Project independently proven Siril opponent slopes at zero Rec.709 luma."""
+    report: Dict[str, Any] = {
+        "schema": STAGE3_SPATIAL_OPPONENT_PROJECTION_SCHEMA,
+        "status": "rejected",
+        "accepted": False,
+        "reason_code": "stage3_spatial_opponent_lineage_unverified",
+        "anchor": {
+            "type": "geometric_center_zero_mean",
+            "x": 0.5,
+            "y": 0.5,
+            "constant_term_applied": False,
+        },
+        "fit_count": len(fit_points),
+        "validation_count": len(validation_points),
+        "patch_radius": int(patch_radius),
+        "components": {},
+        "selected_components": [],
+        "unresolved_components": [],
+        "issues": [],
+    }
+
+    def reject(reason: str, issue: str) -> Tuple[None, Dict[str, Any]]:
+        report["reason_code"] = reason
+        report["issues"] = list(dict.fromkeys([*report["issues"], issue]))
+        return None, report
+
+    if len(fit_points) < max(3, int(minimum_fit)):
+        return reject(
+            "stage3_spatial_opponent_lineage_unverified",
+            "spatial opponent fit samples are insufficient",
+        )
+    if len(validation_points) < max(3, int(minimum_validation)):
+        return reject(
+            "stage3_spatial_opponent_lineage_unverified",
+            "spatial opponent validation samples are insufficient",
+        )
+    try:
+        baseline, layout, _baseline_dtype = _stage3_rgb_chw(baseline_image)
+        neutral, neutral_layout, neutral_dtype = _stage3_rgb_chw(neutral_image)
+        proposal, proposal_layout, _proposal_dtype = _stage3_rgb_chw(
+            siril_proposal_image
+        )
+    except (TypeError, ValueError) as error:
+        return reject("stage3_spatial_opponent_lineage_unverified", str(error))
+    if (
+        neutral_layout != layout
+        or proposal_layout != layout
+        or neutral.shape != baseline.shape
+        or proposal.shape != baseline.shape
+    ):
+        return reject(
+            "stage3_spatial_opponent_lineage_unverified",
+            "spatial opponent source shapes or layouts differ",
+        )
+
+    patch_radius = max(1, int(patch_radius))
+    opponent_planes = {
+        "R-G": (baseline[0] - baseline[1], (proposal[0] - proposal[1]) - (baseline[0] - baseline[1])),
+        "B-G": (baseline[2] - baseline[1], (proposal[2] - proposal[1]) - (baseline[2] - baseline[1])),
+    }
+    selected: Dict[str, np.ndarray] = {}
+    unresolved: List[str] = []
+    fit_design: Optional[np.ndarray] = None
+    validation_design: Optional[np.ndarray] = None
+    for name, (baseline_plane, proposal_delta) in opponent_planes.items():
+        try:
+            component_fit_design, baseline_fit = _stage3_patch_medians(
+                baseline_plane,
+                fit_points,
+                patch_radius=patch_radius,
+                support_mask=support_mask,
+            )
+            validation_design, baseline_validation = _stage3_patch_medians(
+                baseline_plane,
+                validation_points,
+                patch_radius=patch_radius,
+                support_mask=support_mask,
+            )
+            delta_fit_design, proposal_fit = _stage3_patch_medians(
+                proposal_delta,
+                fit_points,
+                patch_radius=patch_radius,
+                support_mask=support_mask,
+            )
+            if not np.array_equal(component_fit_design, delta_fit_design):
+                raise ValueError("spatial opponent fit coordinates changed")
+            baseline_model = _stage3_plane_fit(component_fit_design, baseline_fit)
+            proposal_model = _stage3_plane_fit(component_fit_design, proposal_fit)
+            validation_model = _stage3_plane_fit(validation_design, baseline_validation)
+        except (ValueError, np.linalg.LinAlgError) as error:
+            report["components"][name] = {
+                "status": "unverified",
+                "selected": False,
+                "reason": str(error),
+            }
+            unresolved.append(name)
+            continue
+        fit_design = component_fit_design
+        model_valid = bool(
+            baseline_model["rank"] == 3
+            and proposal_model["rank"] == 3
+            and validation_model["rank"] == 3
+            and math.isfinite(baseline_model["condition_number"])
+            and math.isfinite(proposal_model["condition_number"])
+            and baseline_model["condition_number"] <= float(condition_number_max)
+            and proposal_model["condition_number"] <= float(condition_number_max)
+            and math.isfinite(validation_model["condition_number"])
+            and validation_model["condition_number"] <= float(condition_number_max)
+        )
+        correction_validation = _stage3_centered_plane_values(
+            validation_design,
+            proposal_model["coefficients"],
+        )
+        validation_centered = baseline_validation - float(
+            np.median(baseline_validation)
+        )
+        removal = -correction_validation
+        if float(np.std(removal)) <= 1e-15 or float(np.std(validation_centered)) <= 1e-15:
+            correlation = 0.0
+        else:
+            correlation = float(np.corrcoef(removal, validation_centered)[0, 1])
+        after_validation = baseline_validation + correction_validation
+        before_rms = float(np.sqrt(np.mean(np.square(validation_centered))))
+        after_centered = after_validation - float(np.median(after_validation))
+        after_rms = float(np.sqrt(np.mean(np.square(after_centered))))
+        improvement = float((before_rms - after_rms) / max(before_rms, 1e-15))
+        after_model = _stage3_plane_fit(validation_design, after_validation)
+        before_slope = np.asarray(validation_model["coefficients"][1:3])
+        after_slope = np.asarray(after_model["coefficients"][1:3])
+        fit_slope_span = float(
+            abs(float(baseline_model["coefficients"][1]))
+            + abs(float(baseline_model["coefficients"][2]))
+        )
+        validation_slope_span = float(
+            abs(float(validation_model["coefficients"][1]))
+            + abs(float(validation_model["coefficients"][2]))
+        )
+        material_floor = max(
+            1e-7,
+            8.0
+            * float(np.finfo(neutral_dtype).eps)
+            * max(1.0, float(np.max(np.abs(baseline_plane)))),
+        )
+        reversed_direction = bool(
+            float(np.dot(before_slope, after_slope)) < 0.0
+            and float(after_model["slope_significance_sigma"])
+            > float(significance_sigma)
+        )
+        fit_significant = bool(
+            fit_slope_span > material_floor
+            and
+            float(baseline_model["slope_significance_sigma"])
+            >= float(significance_sigma)
+        )
+        component_selected = bool(
+            model_valid
+            and fit_significant
+            and math.isfinite(correlation)
+            and correlation >= float(correlation_min)
+            and improvement >= float(rms_improvement_min)
+            and not reversed_direction
+        )
+        validation_unresolved = bool(
+            not component_selected
+            and validation_slope_span > material_floor
+            and float(validation_model["slope_significance_sigma"])
+            >= float(significance_sigma)
+        )
+        if component_selected:
+            selected[name] = np.asarray(
+                proposal_model["coefficients"], dtype=np.float64
+            )
+        elif validation_unresolved:
+            unresolved.append(name)
+        report["components"][name] = {
+            "status": (
+                "selected"
+                if component_selected
+                else "unresolved"
+                if validation_unresolved
+                else "not_required"
+            ),
+            "selected": component_selected,
+            "model_valid": model_valid,
+            "fit_slope_significance_sigma": float(
+                baseline_model["slope_significance_sigma"]
+            ),
+            "fit_slope_span": fit_slope_span,
+            "validation_slope_significance_sigma": float(
+                validation_model["slope_significance_sigma"]
+            ),
+            "validation_slope_span": validation_slope_span,
+            "material_floor": material_floor,
+            "direction_correlation": correlation,
+            "validation_rms_before": before_rms,
+            "validation_rms_after": after_rms,
+            "validation_rms_improvement": improvement,
+            "direction_reversed_over_3sigma": reversed_direction,
+            "baseline_model": {
+                "coefficients": [float(value) for value in baseline_model["coefficients"]],
+                "rank": int(baseline_model["rank"]),
+                "condition_number": float(baseline_model["condition_number"]),
+            },
+            "proposal_model": {
+                "coefficients": [float(value) for value in proposal_model["coefficients"]],
+                "rank": int(proposal_model["rank"]),
+                "condition_number": float(proposal_model["condition_number"]),
+            },
+        }
+
+    report["selected_components"] = list(selected)
+    report["unresolved_components"] = list(dict.fromkeys(unresolved))
+    if not selected:
+        if unresolved:
+            return reject(
+                "stage3_spatial_opponent_lineage_unverified",
+                "significant held-out spatial opponent gradient remains unresolved",
+            )
+        report.update(
+            status="not_required",
+            accepted=True,
+            reason_code="stage3_spatial_opponent_not_required",
+            issues=[],
+        )
+        return np.asarray(neutral_image).copy(), report
+    assert fit_design is not None
+
+    height, width = baseline.shape[1:]
+    yy, xx = np.mgrid[:height, :width]
+    normalized_x = xx / max(width - 1, 1) - 0.5
+    normalized_y = yy / max(height - 1, 1) - 0.5
+    d_rg = np.zeros((height, width), dtype=np.float64)
+    d_bg = np.zeros((height, width), dtype=np.float64)
+    if "R-G" in selected:
+        d_rg = selected["R-G"][1] * normalized_x + selected["R-G"][2] * normalized_y
+    if "B-G" in selected:
+        d_bg = selected["B-G"][1] * normalized_x + selected["B-G"][2] * normalized_y
+    correction = np.empty_like(neutral, dtype=np.float64)
+    correction[1] = -0.2126 * d_rg - 0.0722 * d_bg
+    correction[0] = correction[1] + d_rg
+    correction[2] = correction[1] + d_bg
+
+    margin_scale = max(0.0, min(1.0, 1.0 - float(headroom_margin)))
+    alpha = np.ones((height, width), dtype=np.float64)
+    for channel in range(3):
+        channel_correction = correction[channel]
+        negative = channel_correction < 0.0
+        positive = channel_correction > 0.0
+        alpha[negative] = np.minimum(
+            alpha[negative],
+            margin_scale * np.maximum(neutral[channel][negative], 0.0)
+            / np.maximum(-channel_correction[negative], 1e-15),
+        )
+        alpha[positive] = np.minimum(
+            alpha[positive],
+            margin_scale * np.maximum(1.0 - neutral[channel][positive], 0.0)
+            / np.maximum(channel_correction[positive], 1e-15),
+        )
+    baseline_clipped = np.any((neutral <= 0.0) | (neutral >= 1.0), axis=0)
+    alpha[baseline_clipped] = 0.0
+    alpha = np.clip(alpha, 0.0, 1.0)
+    meaningful = np.max(np.abs(correction), axis=0) > 1e-12
+    attenuated = meaningful & (alpha < 1.0 - 1e-12)
+    fit_mask = _stage3_patch_mask(
+        fit_points, width=width, height=height, patch_radius=patch_radius
+    )
+    validation_mask = _stage3_patch_mask(
+        validation_points, width=width, height=height, patch_radius=patch_radius
+    )
+    attenuated_fraction = float(np.mean(attenuated))
+    fit_attenuated = int(np.count_nonzero(attenuated & fit_mask))
+    validation_attenuated = int(np.count_nonzero(attenuated & validation_mask))
+    report["headroom"] = {
+        "method": "continuous_common_vector_taper",
+        "margin": float(headroom_margin),
+        "attenuated_fraction": attenuated_fraction,
+        "attenuated_fraction_max": float(headroom_fraction_max),
+        "fit_patch_attenuated_pixel_count": fit_attenuated,
+        "validation_patch_attenuated_pixel_count": validation_attenuated,
+        "baseline_clipped_pixel_count": int(np.count_nonzero(baseline_clipped)),
+    }
+    if attenuated_fraction > float(headroom_fraction_max):
+        return reject(
+            "stage3_spatial_opponent_candidate_rejected",
+            "spatial opponent headroom attenuation exceeds 0.1 percent",
+        )
+    if fit_attenuated or validation_attenuated:
+        return reject(
+            "stage3_spatial_opponent_candidate_rejected",
+            "spatial opponent headroom attenuation intersects fit or validation patches",
+        )
+
+    candidate_rgb = neutral + correction * alpha[None, :, :]
+    candidate = _restore_stage3_rgb_layout(
+        candidate_rgb,
+        layout=layout,
+        dtype=neutral_dtype,
+    )
+    persisted, _persisted_layout, persisted_dtype = _stage3_rgb_chw(candidate)
+    dtype_epsilon = (
+        float(np.finfo(persisted_dtype).eps)
+        if np.issubdtype(persisted_dtype, np.floating)
+        else float(np.finfo(np.float32).eps)
+    )
+    tolerance = max(1e-7, 8.0 * dtype_epsilon * max(1.0, float(np.max(np.abs(neutral)))))
+    rec709 = np.asarray((0.2126, 0.7152, 0.0722), dtype=np.float64)
+    luma_drift = float(np.max(np.abs(np.tensordot(rec709, persisted - neutral, axes=(0, 0)))))
+    rg_drift = float(np.max(np.abs((persisted[0] - persisted[1]) - (neutral[0] - neutral[1]))))
+    bg_drift = float(np.max(np.abs((persisted[2] - persisted[1]) - (neutral[2] - neutral[1]))))
+    new_low = int(np.count_nonzero((persisted <= 0.0) & ~(neutral <= 0.0)))
+    new_high = int(np.count_nonzero((persisted >= 1.0) & ~(neutral >= 1.0)))
+    issues: List[str] = []
+    if not bool(np.all(np.isfinite(persisted))):
+        issues.append("spatial opponent candidate contains non-finite pixels")
+    if luma_drift > tolerance:
+        issues.append("spatial opponent candidate changed Rec.709 luminance")
+    if "R-G" not in selected and rg_drift > tolerance:
+        issues.append("unselected R-G component changed")
+    if "B-G" not in selected and bg_drift > tolerance:
+        issues.append("unselected B-G component changed")
+    if new_low or new_high:
+        issues.append("spatial opponent candidate introduced clipping")
+    report["invariants"] = {
+        "tolerance": tolerance,
+        "rec709_luma_max_abs_drift": luma_drift,
+        "rg_max_abs_delta": rg_drift,
+        "bg_max_abs_delta": bg_drift,
+        "new_low_clip_count": new_low,
+        "new_high_clip_count": new_high,
+        "finite": bool(np.all(np.isfinite(persisted))),
+    }
+    if issues:
+        return reject("stage3_spatial_opponent_candidate_rejected", " | ".join(issues))
+    report.update(
+        status="ready",
+        accepted=True,
+        reason_code="stage3_spatial_opponent_correction_applied",
+        issues=[],
+    )
+    return candidate, report
+
+
+def verify_stage3_spatial_opponent_persistence(
+    neutral_image: Any,
+    candidate_image: Any,
+    projection_report: Dict[str, Any],
+) -> Tuple[bool, Dict[str, Any]]:
+    """Verify zero-luma and unselected-component invariants after persistence."""
+    report: Dict[str, Any] = {"status": "rejected", "accepted": False, "issues": []}
+    try:
+        neutral, neutral_layout, _neutral_dtype = _stage3_rgb_chw(neutral_image)
+        candidate, candidate_layout, candidate_dtype = _stage3_rgb_chw(candidate_image)
+    except (TypeError, ValueError) as error:
+        report["issues"] = [str(error)]
+        return False, report
+    if neutral_layout != candidate_layout or neutral.shape != candidate.shape:
+        report["issues"] = ["persisted spatial opponent candidate shape changed"]
+        return False, report
+    dtype_epsilon = (
+        float(np.finfo(candidate_dtype).eps)
+        if np.issubdtype(candidate_dtype, np.floating)
+        else float(np.finfo(np.float32).eps)
+    )
+    tolerance = max(1e-7, 8.0 * dtype_epsilon * max(1.0, float(np.max(np.abs(neutral)))))
+    rec709 = np.asarray((0.2126, 0.7152, 0.0722), dtype=np.float64)
+    luma_drift = float(np.max(np.abs(np.tensordot(rec709, candidate - neutral, axes=(0, 0)))))
+    rg_drift = float(np.max(np.abs((candidate[0] - candidate[1]) - (neutral[0] - neutral[1]))))
+    bg_drift = float(np.max(np.abs((candidate[2] - candidate[1]) - (neutral[2] - neutral[1]))))
+    selected = set(projection_report.get("selected_components") or [])
+    new_low = int(np.count_nonzero((candidate <= 0.0) & ~(neutral <= 0.0)))
+    new_high = int(np.count_nonzero((candidate >= 1.0) & ~(neutral >= 1.0)))
+    issues: List[str] = []
+    if not bool(np.all(np.isfinite(candidate))):
+        issues.append("persisted spatial opponent candidate contains non-finite pixels")
+    if luma_drift > tolerance:
+        issues.append("persisted spatial opponent candidate changed Rec.709 luminance")
+    if "R-G" not in selected and rg_drift > tolerance:
+        issues.append("persisted unselected R-G component changed")
+    if "B-G" not in selected and bg_drift > tolerance:
+        issues.append("persisted unselected B-G component changed")
+    if new_low or new_high:
+        issues.append("persisted spatial opponent candidate introduced clipping")
+    report.update(
+        tolerance=tolerance,
+        rec709_luma_max_abs_drift=luma_drift,
+        rg_max_abs_delta=rg_drift,
+        bg_max_abs_delta=bg_drift,
+        new_low_clip_count=new_low,
+        new_high_clip_count=new_high,
+        selected_components=sorted(selected),
+        finite=bool(np.all(np.isfinite(candidate))),
+        pixels_changed=not bool(np.array_equal(candidate, neutral)),
+        issues=issues,
+    )
+    if issues:
+        return False, report
+    report.update(status="accepted", accepted=True)
+    return True, report
 
 
 def _sample_coverage(
@@ -1387,16 +2823,38 @@ def split_background_sample_points(
     points: List[Tuple[float, float]],
     image: Any,
     *,
+    point_sources: Optional[Sequence[str]] = None,
+    minimum_regular_validation: int = 0,
     validation_ratio: float = 0.25,
     minimum_total: int = 12,
     minimum_fit: int = 8,
     minimum_validation: int = 4,
 ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]], Dict[str, Any]]:
-    """Deterministically reserve spatially distributed samples for validation."""
+    """Deterministically reserve spatially distributed samples for validation.
+
+    ``point_sources`` is an optional list aligned with ``points``.  Stage 3's
+    conservative recovery uses it to keep a spatially independent regular-grid
+    subset in validation while older callers retain the coordinate-only split.
+    """
     source_points = [
         (float(point[0]), float(point[1]))
         for point in points
     ]
+    if point_sources is None:
+        normalized_sources = ["unknown"] * len(source_points)
+    elif len(point_sources) != len(source_points):
+        return [], [], {
+            "status": "unavailable",
+            "reason": "point provenance count does not match sample count",
+            "sample_count": len(source_points),
+            "provenance_count": len(point_sources),
+        }
+    else:
+        normalized_sources = [
+            str(source or "unknown").strip().lower()
+            for source in point_sources
+        ]
+    minimum_regular_validation = max(0, int(minimum_regular_validation))
     minimum_total = max(12, int(minimum_total))
     minimum_fit = max(8, int(minimum_fit))
     minimum_validation = max(4, int(minimum_validation))
@@ -1470,6 +2928,28 @@ def split_background_sample_points(
             "validation_target_count": validation_count,
         }
 
+    def source_counts(indexes: Sequence[int]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for index in indexes:
+            source = normalized_sources[index]
+            counts[source] = counts.get(source, 0) + 1
+        return counts
+
+    def regular_coverage(indexes: Sequence[int]) -> Dict[str, Any]:
+        regular_points = [
+            source_points[index]
+            for index in indexes
+            if normalized_sources[index] == "regular_grid"
+        ]
+        return {
+            "count": len(regular_points),
+            **_sample_coverage(
+                regular_points,
+                width=width,
+                height=height,
+            ),
+        }
+
     def build_selection(start: int) -> List[int]:
         chosen = [start]
         chosen_set = {start}
@@ -1492,6 +2972,7 @@ def split_background_sample_points(
                     height=height,
                 )
                 point = normalized[index]
+                regular = regular_coverage(trial_indexes)
                 minimum_distance = min(
                     math.hypot(
                         point[0] - normalized[other][0],
@@ -1500,6 +2981,21 @@ def split_background_sample_points(
                     for other in chosen
                 )
                 key = (
+                    min(
+                        int(regular["count"]),
+                        minimum_regular_validation,
+                    ),
+                    min(
+                        int(regular["quadrants"]),
+                        STAGE3_MIN_SPATIAL_QUADRANTS,
+                    ),
+                    min(
+                        int(regular["grid_cells"]),
+                        min(
+                            STAGE3_MIN_SPATIAL_GRID_CELLS,
+                            minimum_regular_validation,
+                        ),
+                    ),
                     min(
                         int(coverage["quadrants"]),
                         STAGE3_MIN_SPATIAL_QUADRANTS,
@@ -1561,8 +3057,38 @@ def split_background_sample_points(
             fit_coverage,
             minimum_cells=fit_minimum_cells,
         )
+        validation_regular = regular_coverage(chosen)
+        regular_ready = bool(
+            minimum_regular_validation <= 0
+            or (
+                int(validation_regular["count"])
+                >= minimum_regular_validation
+                and int(validation_regular["quadrants"])
+                >= STAGE3_MIN_SPATIAL_QUADRANTS
+                and int(validation_regular["grid_cells"])
+                >= min(
+                    STAGE3_MIN_SPATIAL_GRID_CELLS,
+                    minimum_regular_validation,
+                )
+            )
+        )
         selection_key = (
-            int(validation_ready and fit_ready),
+            int(validation_ready and fit_ready and regular_ready),
+            min(
+                int(validation_regular["count"]),
+                minimum_regular_validation,
+            ),
+            min(
+                int(validation_regular["quadrants"]),
+                STAGE3_MIN_SPATIAL_QUADRANTS,
+            ),
+            min(
+                int(validation_regular["grid_cells"]),
+                min(
+                    STAGE3_MIN_SPATIAL_GRID_CELLS,
+                    minimum_regular_validation,
+                ),
+            ),
             min(
                 int(validation_coverage["quadrants"]),
                 STAGE3_MIN_SPATIAL_QUADRANTS,
@@ -1618,6 +3144,21 @@ def split_background_sample_points(
         width=width,
         height=height,
     )
+    validation_regular_coverage = regular_coverage(best_selection)
+    regular_validation_ready = bool(
+        minimum_regular_validation <= 0
+        or (
+            int(validation_regular_coverage["count"])
+            >= minimum_regular_validation
+            and int(validation_regular_coverage["quadrants"])
+            >= STAGE3_MIN_SPATIAL_QUADRANTS
+            and int(validation_regular_coverage["grid_cells"])
+            >= min(
+                STAGE3_MIN_SPATIAL_GRID_CELLS,
+                minimum_regular_validation,
+            )
+        )
+    )
     ready = bool(
         len(fit_points) >= minimum_fit
         and len(validation_points) >= minimum_validation
@@ -1629,7 +3170,14 @@ def split_background_sample_points(
             validation_coverage,
             minimum_cells=validation_minimum_cells,
         )
+        and regular_validation_ready
     )
+    fit_indexes = [
+        index for index in range(len(source_points)) if index not in selected_set
+    ]
+    validation_indexes = [
+        index for index in range(len(source_points)) if index in selected_set
+    ]
     report = {
         "status": "ready" if ready else "insufficient_safe_coverage",
         "coordinate_system": "siril_bottom_left",
@@ -1642,8 +3190,13 @@ def split_background_sample_points(
         "minimum_validation": minimum_validation,
         "fit_minimum_grid_cells": fit_minimum_cells,
         "validation_minimum_grid_cells": validation_minimum_cells,
+        "minimum_regular_validation": minimum_regular_validation,
         "fit_coverage": fit_coverage,
         "validation_coverage": validation_coverage,
+        "validation_regular_coverage": validation_regular_coverage,
+        "regular_validation_ready": regular_validation_ready,
+        "fit_source_counts": source_counts(fit_indexes),
+        "validation_source_counts": source_counts(validation_indexes),
         "fit_points": [[x, y] for x, y in fit_points] if ready else [],
         "validation_points": (
             [[x, y] for x, y in validation_points]
@@ -1653,11 +3206,16 @@ def split_background_sample_points(
         "safety_contract": [
             "validation points never participate in Polynomial or RBF fitting",
             "fit and validation pools both require broad spatial coverage",
+            "recovery validation retains spatial regular-grid evidence",
             "split is deterministic for identical audited samples and image geometry",
         ],
     }
     if not ready:
-        report["reason"] = "fit or validation spatial coverage is insufficient"
+        report["reason"] = (
+            "regular-grid validation provenance is insufficient"
+            if not regular_validation_ready
+            else "fit or validation spatial coverage is insufficient"
+        )
         return [], [], report
     return fit_points, validation_points, report
 
@@ -1669,6 +3227,8 @@ def measure_background_validation(
     patch_radius: int = 12,
     minimum_count: int = 8,
     value_scale: Optional[float] = None,
+    support_mask: Optional[np.ndarray] = None,
+    minimum_support_fraction: float = STAGE3_DENSE_STAR_SAMPLE_SUPPORT_MIN,
 ) -> Dict[str, Any]:
     """Measure held-out patch medians without independently renormalizing images."""
     try:
@@ -1684,6 +3244,18 @@ def measure_background_validation(
             "expected_count": len(points),
         }
     height, width = luminance.shape
+    frozen_support = None
+    if support_mask is not None:
+        candidate_support = np.asarray(support_mask, dtype=bool)
+        if candidate_support.shape != (height, width):
+            return {
+                "status": "unavailable",
+                "reason": "validation support mask shape mismatch",
+                "sample_count": 0,
+                "expected_count": len(points),
+            }
+        frozen_support = candidate_support
+    minimum_support_fraction = _clamp(minimum_support_fraction, 0.50, 1.0)
     patch_radius = max(
         2,
         min(int(patch_radius), 24, max(2, min(height, width) // 12)),
@@ -1692,6 +3264,12 @@ def measure_background_validation(
     patch_mads: List[float] = []
     patch_uncertainties: List[float] = []
     uncertainty_details: List[Dict[str, Any]] = []
+    support_fractions: List[float] = []
+    absolute_minimum = math.inf
+    absolute_maximum = -math.inf
+    supported_pixel_count = 0
+    low_clip_count = 0
+    high_clip_count = 0
     for raw_x, raw_y in points:
         x = int(round(float(raw_x)))
         y = int(round(float(height - 1 - raw_y)))
@@ -1706,13 +3284,34 @@ def measure_background_validation(
             y - patch_radius : y + patch_radius + 1,
             x - patch_radius : x + patch_radius + 1,
         ]
-        finite = patch[np.isfinite(patch)]
-        if finite.size != patch.size:
-            continue
+        if frozen_support is not None:
+            patch_support = frozen_support[
+                y - patch_radius : y + patch_radius + 1,
+                x - patch_radius : x + patch_radius + 1,
+            ]
+            support_fraction = float(np.mean(patch_support))
+            if support_fraction < minimum_support_fraction:
+                continue
+            finite = patch[patch_support & np.isfinite(patch)]
+            if finite.size != int(np.count_nonzero(patch_support)):
+                continue
+            uncertainty_patch = np.where(patch_support, patch, np.nan)
+            support_fractions.append(support_fraction)
+        else:
+            finite = patch[np.isfinite(patch)]
+            if finite.size != patch.size:
+                continue
+            uncertainty_patch = patch
+            support_fractions.append(1.0)
         median = float(np.median(finite))
+        absolute_minimum = min(absolute_minimum, float(np.min(finite)))
+        absolute_maximum = max(absolute_maximum, float(np.max(finite)))
+        supported_pixel_count += int(finite.size)
+        low_clip_count += int(np.count_nonzero(finite <= 0.0))
+        high_clip_count += int(np.count_nonzero(finite >= 1.0))
         medians.append(median)
         patch_mads.append(float(np.median(np.abs(finite - median))))
-        uncertainty, detail = _patch_median_uncertainty(patch)
+        uncertainty, detail = _patch_median_uncertainty(uncertainty_patch)
         patch_uncertainties.append(uncertainty)
         uncertainty_details.append(detail)
 
@@ -1730,6 +3329,7 @@ def measure_background_validation(
             "expected_count": expected_count,
             "patch_radius": patch_radius,
             "value_scale": resolved_scale,
+            "masked_support": frozen_support is not None,
         }
     values = np.asarray(medians, dtype=np.float64)
     center = float(np.median(values))
@@ -1741,6 +3341,17 @@ def measure_background_validation(
         "expected_count": expected_count,
         "patch_radius": patch_radius,
         "value_scale": resolved_scale,
+        "masked_support": frozen_support is not None,
+        "minimum_support_fraction": (
+            minimum_support_fraction if frozen_support is not None else None
+        ),
+        "support_fraction_min": float(min(support_fractions)),
+        "support_fraction_median": float(np.median(support_fractions)),
+        "minimum": float(absolute_minimum),
+        "maximum": float(absolute_maximum),
+        "supported_pixel_count": int(supported_pixel_count),
+        "low_clip_count": int(low_clip_count),
+        "high_clip_count": int(high_clip_count),
         "median": center,
         "p10": p10,
         "p90": p90,
@@ -1767,11 +3378,223 @@ def measure_background_validation(
     }
 
 
+def assess_background_direction_reversal(
+    baseline_image: Any,
+    candidate_image: Any,
+    points: Sequence[Tuple[float, float]],
+    *,
+    patch_radius: int = 12,
+    significance_sigma: float = STAGE3_SIGNIFICANCE_SIGMA,
+    support_mask: Optional[np.ndarray] = None,
+    minimum_support_fraction: float = STAGE3_DENSE_STAR_SAMPLE_SUPPORT_MIN,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Reject a statistically significant held-out degree-1 gradient reversal."""
+
+    def fit_plane(
+        image: Any,
+        *,
+        value_scale: Optional[float],
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[float], Optional[str]]:
+        try:
+            luminance, resolved_scale = _native_luminance(
+                image,
+                value_scale=value_scale,
+            )
+        except (TypeError, ValueError) as error:
+            return None, value_scale, str(error)
+        height, width = luminance.shape
+        frozen_support = None
+        if support_mask is not None:
+            candidate_support = np.asarray(support_mask, dtype=bool)
+            if candidate_support.shape != (height, width):
+                return None, resolved_scale, "direction support mask shape mismatch"
+            frozen_support = candidate_support
+        radius = max(2, min(int(patch_radius), 24))
+        rows: List[List[float]] = []
+        values: List[float] = []
+        uncertainties: List[float] = []
+        for raw_x, raw_y in points:
+            x = int(round(float(raw_x)))
+            y = int(round(height - 1 - float(raw_y)))
+            if (
+                x - radius < 0
+                or x + radius >= width
+                or y - radius < 0
+                or y + radius >= height
+            ):
+                continue
+            patch = luminance[
+                y - radius : y + radius + 1,
+                x - radius : x + radius + 1,
+            ]
+            if frozen_support is not None:
+                patch_support = frozen_support[
+                    y - radius : y + radius + 1,
+                    x - radius : x + radius + 1,
+                ]
+                if float(np.mean(patch_support)) < _clamp(
+                    minimum_support_fraction,
+                    0.50,
+                    1.0,
+                ):
+                    continue
+                values_patch = patch[patch_support & np.isfinite(patch)]
+                if values_patch.size != int(np.count_nonzero(patch_support)):
+                    continue
+                uncertainty_patch = np.where(patch_support, patch, np.nan)
+            else:
+                if not bool(np.all(np.isfinite(patch))):
+                    continue
+                values_patch = patch.reshape(-1)
+                uncertainty_patch = patch
+            rows.append(
+                [
+                    1.0,
+                    float(raw_x) / max(width - 1, 1),
+                    float(y) / max(height - 1, 1),
+                ]
+            )
+            values.append(float(np.median(values_patch)))
+            uncertainty, _detail = _patch_median_uncertainty(
+                uncertainty_patch
+            )
+            uncertainties.append(float(uncertainty))
+        if len(rows) != len(points) or len(rows) < 4:
+            return None, resolved_scale, "held-out directional patches are incomplete"
+        design = np.asarray(rows, dtype=np.float64)
+        samples = np.asarray(values, dtype=np.float64)
+        try:
+            coefficients, _residuals, rank, _singular = np.linalg.lstsq(
+                design,
+                samples,
+                rcond=None,
+            )
+            if int(rank) != 3:
+                return None, resolved_scale, "held-out directional fit rank is invalid"
+            fitted = design @ coefficients
+            dof = max(1, len(samples) - 3)
+            residual_variance = float(
+                np.sum((samples - fitted) ** 2) / dof
+            )
+            patch_variance = float(np.median(uncertainties)) ** 2
+            covariance = max(residual_variance, patch_variance, 1e-24) * np.linalg.inv(
+                design.T @ design
+            )
+        except np.linalg.LinAlgError as error:
+            return None, resolved_scale, f"held-out directional fit failed: {error}"
+        slope = np.asarray(coefficients[1:3], dtype=np.float64)
+        slope_se = np.sqrt(np.maximum(np.diag(covariance)[1:3], 0.0))
+        return (
+            {
+                "coefficients": [float(value) for value in coefficients],
+                "gradient": [float(value) for value in slope],
+                "gradient_standard_error": [
+                    float(value) for value in slope_se
+                ],
+                "gradient_norm": float(np.linalg.norm(slope)),
+                "gradient_norm_standard_error": float(np.linalg.norm(slope_se)),
+                "residual_rms": float(math.sqrt(max(residual_variance, 0.0))),
+                "sample_count": len(samples),
+            },
+            resolved_scale,
+            None,
+        )
+
+    before, value_scale, before_error = fit_plane(
+        baseline_image,
+        value_scale=None,
+    )
+    after, _resolved_scale, after_error = fit_plane(
+        candidate_image,
+        value_scale=value_scale,
+    )
+    report: Dict[str, Any] = {
+        "status": "rejected",
+        "accepted": False,
+        "severity": "hard_rejected",
+        "significance_sigma": float(significance_sigma),
+        "uncertainty_method": "heldout_patch_plane_covariance",
+        "before": before,
+        "after": after,
+        "issues": [],
+    }
+    if before is None or after is None:
+        report["issues"] = [
+            before_error
+            or after_error
+            or "held-out directional evidence is unavailable"
+        ]
+        return False, report
+
+    before_gradient = np.asarray(before["gradient"], dtype=np.float64)
+    after_gradient = np.asarray(after["gradient"], dtype=np.float64)
+    before_se = np.asarray(
+        before["gradient_standard_error"],
+        dtype=np.float64,
+    )
+    after_se = np.asarray(
+        after["gradient_standard_error"],
+        dtype=np.float64,
+    )
+    component_reversals: List[str] = []
+    for name, before_value, after_value, before_error, after_error in zip(
+        ("x", "y"),
+        before_gradient,
+        after_gradient,
+        before_se,
+        after_se,
+    ):
+        if (
+            before_value * after_value < 0.0
+            and abs(before_value) > significance_sigma * before_error
+            and abs(after_value) > significance_sigma * after_error
+        ):
+            component_reversals.append(name)
+    dot_product = float(np.dot(before_gradient, after_gradient))
+    before_significant = bool(
+        float(before["gradient_norm"])
+        > significance_sigma * float(before["gradient_norm_standard_error"])
+    )
+    after_significant = bool(
+        float(after["gradient_norm"])
+        > significance_sigma * float(after["gradient_norm_standard_error"])
+    )
+    vector_reversed = bool(
+        dot_product < 0.0 and before_significant and after_significant
+    )
+    issues: List[str] = []
+    if component_reversals:
+        issues.append(
+            "held-out gradient component reversed beyond three-sigma: "
+            + ",".join(component_reversals)
+        )
+    if vector_reversed:
+        issues.append("held-out gradient vector reversed beyond three-sigma")
+    report.update(
+        dot_product=dot_product,
+        component_reversals=component_reversals,
+        vector_reversed=vector_reversed,
+        before_significant=before_significant,
+        after_significant=after_significant,
+        issues=issues,
+    )
+    if issues:
+        return False, report
+    report.update(
+        status="accepted",
+        accepted=True,
+        severity="normal",
+    )
+    return True, report
+
+
 def _sample_spatial_model_diagnostics(
     image: Any,
     points: List[Tuple[float, float]],
     *,
     patch_radius: int = 12,
+    support_mask: Optional[np.ndarray] = None,
+    minimum_support_fraction: float = STAGE3_DENSE_STAR_SAMPLE_SUPPORT_MIN,
 ) -> Dict[str, Any]:
     """Compare low-order directional and radial models on audited sky only."""
     try:
@@ -1783,6 +3606,16 @@ def _sample_spatial_model_diagnostics(
             "reason": str(error),
         }
     height, width = luminance.shape
+    frozen_support = None
+    if support_mask is not None:
+        candidate_support = np.asarray(support_mask, dtype=bool)
+        if candidate_support.shape != (height, width):
+            return {
+                "schema_version": STAGE3_BACKGROUND_VALIDATION_SCHEMA,
+                "status": "unavailable",
+                "reason": "spatial support mask shape mismatch",
+            }
+        frozen_support = candidate_support
     radius = max(2, min(int(patch_radius), 24))
     records: List[Tuple[float, float, float, float, float]] = []
     for raw_x, raw_y in points:
@@ -1796,12 +3629,31 @@ def _sample_spatial_model_diagnostics(
         ):
             continue
         patch = luminance[y - radius : y + radius + 1, x - radius : x + radius + 1]
-        finite = patch[np.isfinite(patch)]
-        if finite.size != patch.size:
-            continue
+        if frozen_support is not None:
+            patch_support = frozen_support[
+                y - radius : y + radius + 1,
+                x - radius : x + radius + 1,
+            ]
+            if float(np.mean(patch_support)) < _clamp(
+                minimum_support_fraction,
+                0.50,
+                1.0,
+            ):
+                continue
+            finite = patch[patch_support & np.isfinite(patch)]
+            if finite.size != int(np.count_nonzero(patch_support)):
+                continue
+            uncertainty_patch = np.where(patch_support, patch, np.nan)
+        else:
+            finite = patch[np.isfinite(patch)]
+            if finite.size != patch.size:
+                continue
+            uncertainty_patch = patch
         median = float(np.median(finite))
         mad = 1.4826 * float(np.median(np.abs(finite - median)))
-        median_uncertainty, _uncertainty_detail = _patch_median_uncertainty(patch)
+        median_uncertainty, _uncertainty_detail = _patch_median_uncertainty(
+            uncertainty_patch
+        )
         records.append(
             (
                 float(x) / max(width - 1, 1) - 0.5,
@@ -1904,6 +3756,7 @@ def assess_background_process(
     input_profile: Optional[Dict[str, Any]] = None,
     diffuse_context: Optional[Dict[str, Any]] = None,
     patch_radius: int = 12,
+    support_mask: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """Authorize Stage 3 from process evidence instead of project score gates."""
     profile = input_profile or {}
@@ -1936,6 +3789,7 @@ def assess_background_process(
         image,
         points,
         patch_radius=patch_radius,
+        support_mask=support_mask,
     )
     spatial_supported = bool(
         spatial.get("status") == "ready"

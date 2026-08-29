@@ -488,7 +488,7 @@ def prepare_task_queue(
 def stage4_online_spcc_timeout_evidence(
     run_root: Path,
 ) -> Optional[Dict[str, Any]]:
-    """Return auditable evidence for one timed-out online Gaia SPCC attempt."""
+    """Return auditable evidence for a terminal online Gaia SPCC failure."""
     report_path = Path(run_root) / "process" / "color_calibration_report.json"
     try:
         payload = json.loads(report_path.read_text(encoding="utf-8"))
@@ -514,6 +514,29 @@ def stage4_online_spcc_timeout_evidence(
                 "timeout_policy": attempt.get("timeout_policy"),
                 "error": attempt.get("error"),
             }
+    exhausted = [
+        attempt
+        for attempt in attempts
+        if isinstance(attempt, dict)
+        and str(attempt.get("label") or "").lower() == "catalog:gaia"
+        and str(attempt.get("spcc_readiness") or "").lower()
+        == "online_unverified"
+        and str(attempt.get("reason_code") or "").lower()
+        == "online_transient_exhausted"
+    ]
+    if exhausted:
+        terminal = exhausted[-1]
+        return {
+            "status": "online_transient_exhausted",
+            "label": "catalog:gaia",
+            "spcc_readiness": "online_unverified",
+            "attempt_count": len(attempts),
+            "timeout_sec": terminal.get("timeout_sec"),
+            "timeout_policy": terminal.get("timeout_policy"),
+            "failure_class": terminal.get("failure_class"),
+            "transient_evidence": terminal.get("transient_evidence"),
+            "error": terminal.get("error"),
+        }
     return None
 
 

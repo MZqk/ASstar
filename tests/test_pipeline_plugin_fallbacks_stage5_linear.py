@@ -878,7 +878,91 @@ class PipelinePluginFallbackStage5LinearTests(PipelinePluginFallbackTestBase):
         self.assertTrue(transaction["integrity_ok"])
         self.assertEqual(transaction["accepted_method"], "deterministic_multiscale")
         self.assertEqual(transaction["attempts"][0]["status"], "accepted")
+        multiscale = transaction["attempts"][0]
+        self.assertEqual(multiscale["strength_ladder"], [0.6, 0.72, 0.84])
+        self.assertEqual(len(multiscale["candidates"]), 3)
+        accepted_strengths = [
+            float(candidate["strength"])
+            for candidate in multiscale["candidates"]
+            if candidate.get("accepted")
+        ]
+        self.assertTrue(accepted_strengths)
+        self.assertEqual(
+            multiscale["selected_strength"],
+            min(accepted_strengths),
+        )
+        self.assertEqual(
+            processor.stage_json_reports["stage5_linear_report.json"]["denoise"]
+            ["quality_gate"]["noise_reduction_min"],
+            0.12,
+        )
+        self.assertEqual(
+            processor.stage_json_reports["stage5_linear_report.json"]["denoise"]
+            ["quality_gate"]["detail_retention_min"],
+            0.90,
+        )
         self.assertFalse(any(call[0] == "denoise" for call in processor.cmd_calls))
+
+    def test_stage5_task_config_cannot_weaken_locked_multiscale_gates(self):
+        processor = self._new_processor()
+        processor.cfg.stage5_multiscale_denoise_enabled = True
+        processor.cfg.stage5_multiscale_detail_retention_min = 0.10
+        processor.cfg.stage5_multiscale_noise_reduction_min = 0.01
+
+        stage5_linear_denoise(processor)
+
+        quality = processor.stage_json_reports["stage5_linear_report.json"][
+            "denoise"
+        ]["quality_gate"]
+        self.assertEqual(quality["detail_retention_min"], 0.90)
+        self.assertEqual(quality["noise_reduction_min"], 0.12)
+
+    def test_stage5_strength_config_cannot_shift_locked_ladder(self):
+        processor = self._new_processor()
+        processor.cfg.stage5_multiscale_denoise_enabled = True
+        processor.cfg.stage5_multiscale_denoise_strength = "tampered"
+
+        stage5_linear_denoise(processor)
+
+        transaction = processor.stage_json_reports[
+            "stage5_denoise_attempts.json"
+        ]
+        self.assertEqual(
+            transaction["attempts"][0]["strength_ladder"],
+            [0.60, 0.72, 0.84],
+        )
+
+    def test_stage5_unaccepted_frozen_context_prohibits_formal_denoise(self):
+        processor = self._new_processor()
+        processor.cfg.stage5_deconvolution_enabled = False
+        processor.cfg.stage5_multiscale_denoise_enabled = True
+        processor._stage5_test_spatial_lineage = {
+            "schema": "starun.stage3-spatial-background-lineage.v1",
+            "status": "unavailable",
+            "accepted": False,
+            "issues": ["test_lineage_rejected"],
+        }
+
+        stage5_linear_denoise(processor)
+
+        report = processor.stage_json_reports["stage5_linear_report.json"]
+        transaction = processor.stage_json_reports[
+            "stage5_denoise_attempts.json"
+        ]
+        self.assertFalse(report["denoise"]["frozen_context"]["accepted"])
+        self.assertEqual(
+            report["denoise"]["reason_code"],
+            "frozen_denoise_context_unverified",
+        )
+        self.assertEqual(report["components"]["denoise"]["status"], "prohibited")
+        self.assertFalse(
+            report["denoise"]["noise_model_report"]["consumed_by_denoiser"]
+        )
+        self.assertEqual(transaction["attempts"], [])
+        self.assertIn(
+            "frozen_denoise_context_unverified",
+            processor._stage_review_reasons(5),
+        )
 
     def test_stage5_builtin_consumes_denoise_mod_and_safety_max(self):
         processor = self._new_processor()
@@ -895,26 +979,24 @@ class PipelinePluginFallbackStage5LinearTests(PipelinePluginFallbackTestBase):
             "denoise_mod clamped by denoise_safety_max",
         )
 
-    def test_stage5_rejected_builtin_candidate_restores_shared_baseline(self):
+    def test_stage5_rejected_strength_ladder_is_review_only_and_exact_rollback(self):
         processor = self._new_processor()
         processor.cfg.stage5_multiscale_denoise_enabled = True
-        original_cmd = processor.cmd_with_check
-
-        def aggressive_builtin(*args: Any, quiet: bool = False) -> bool:
-            result = original_cmd(*args, quiet=quiet)
-            if args and args[0] == "denoise":
-                processor.image_pixels = np.full_like(
-                    processor.image_pixels,
-                    0.05,
-                )
-            return result
-
-        processor.cmd_with_check = aggressive_builtin
         rejected_multiscale = {
             "schema": "starun.multiscale-denoise-candidate.v1",
             "status": "rejected",
             "accepted": False,
             "issues": ["signal_detail_retention"],
+            "strength_ladder": [0.60, 0.72, 0.84],
+            "candidates": [
+                {
+                    "strength": strength,
+                    "status": "rejected",
+                    "accepted": False,
+                    "issues": ["signal_detail_retention"],
+                }
+                for strength in (0.60, 0.72, 0.84)
+            ],
             "transaction": {"pixels_mutated": False},
         }
         stage5_module = sys.modules["stages.stage5_linear_denoise"]
@@ -929,21 +1011,64 @@ class PipelinePluginFallbackStage5LinearTests(PipelinePluginFallbackTestBase):
         baseline = processor.saved_image_pixels["stage5_pre_denoise"]
         np.testing.assert_array_equal(processor.image_pixels, baseline)
         transaction = processor.stage_json_reports["stage5_denoise_attempts.json"]
-        builtin = next(
-            attempt
-            for attempt in transaction["attempts"]
-            if attempt.get("method") == "siril_builtin"
+        self.assertEqual(len(transaction["attempts"]), 1)
+        multiscale = transaction["attempts"][0]
+        self.assertEqual(multiscale["status"], "rejected")
+        self.assertTrue(multiscale["transaction"]["rollback_completed"])
+        self.assertTrue(multiscale["transaction"]["rollback"]["pixel_verified"])
+        self.assertFalse(
+            any(call[0] == "denoise" for call in processor.cmd_calls)
         )
-        self.assertEqual(builtin["status"], "rejected")
-        self.assertFalse(builtin["accepted"])
-        self.assertTrue(builtin["transaction"]["rollback_completed"])
-        self.assertIn(
-            "signal_detail_retention",
-            builtin["quality_gate"]["issues"],
-        )
+        report = processor.stage_json_reports["stage5_linear_report.json"]
         self.assertEqual(
-            processor.result_metadata[-1]["reason_code"],
+            report["denoise"]["reason_code"],
             "all_candidates_rejected_safe_passthrough",
+        )
+        self.assertFalse(report["downstream_handoff"]["formal_eligible"])
+        self.assertFalse(report["downstream_handoff"]["accepted"])
+        self.assertIn(
+            "multiscale_strength_ladder_rejected",
+            processor._stage_review_reasons(5),
+        )
+
+    def test_stage5_tampered_frozen_noise_model_is_review_only(self):
+        processor = self._new_processor()
+        processor.cfg.stage5_deconvolution_enabled = False
+        processor.cfg.stage5_multiscale_denoise_enabled = True
+        stage5_module = sys.modules["stages.stage5_linear_denoise"]
+        real_builder = stage5_module.build_noise_model_report
+
+        def tampered_builder(*args: Any, **kwargs: Any):
+            report = real_builder(*args, **kwargs)
+            if kwargs.get("source_checkpoint") == "stage5_pre_denoise.fit":
+                report["model_digest_sha256"] = "0" * 64
+            return report
+
+        with patch.object(
+            stage5_module,
+            "build_noise_model_report",
+            side_effect=tampered_builder,
+        ):
+            stage5_linear_denoise(processor)
+
+        report = processor.stage_json_reports["stage5_linear_report.json"]
+        transaction = processor.stage_json_reports[
+            "stage5_denoise_attempts.json"
+        ]
+        self.assertEqual(
+            report["denoise"]["reason_code"],
+            "frozen_noise_model_unverified",
+        )
+        self.assertEqual(transaction["attempts"], [])
+        self.assertFalse(report["downstream_handoff"]["accepted"])
+        self.assertFalse(report["downstream_handoff"]["formal_eligible"])
+        self.assertIn(
+            "noise_model_digest_sha256_mismatch",
+            report["denoise"]["frozen_context"]["issues"],
+        )
+        self.assertIn(
+            "frozen_noise_model_unverified",
+            processor._stage_review_reasons(5),
         )
 
     def test_stage5_partial_builtin_failure_rolls_back_before_next_backend(self):
@@ -994,10 +1119,13 @@ class PipelinePluginFallbackStage5LinearTests(PipelinePluginFallbackTestBase):
         self.assertFalse(any(call[0] == "denoise" for call in processor.cmd_calls))
         transaction = processor.stage_json_reports["stage5_denoise_attempts.json"]
         self.assertEqual(transaction["baseline"]["status"], "prohibited")
+        report = processor.stage_json_reports["stage5_linear_report.json"]
         self.assertEqual(
-            processor.result_metadata[-1]["reason_code"],
+            report["denoise"]["reason_code"],
             "immutable_baseline_unavailable",
         )
+        self.assertFalse(report["downstream_handoff"]["accepted"])
+        self.assertFalse(report["downstream_handoff"]["formal_eligible"])
 
     def test_stage5_rolls_back_when_background_chroma_gets_worse(self):
         processor = self._new_processor()
@@ -1241,6 +1369,16 @@ class PipelinePluginFallbackStage5LinearTests(PipelinePluginFallbackTestBase):
                 stage3_module,
                 "assess_single_background_validation",
                 return_value=(True, accepted_validation_gate),
+            ),
+            patch.object(
+                stage3_module,
+                "_stage3_write_spatial_background_lineage",
+                return_value={
+                    "status": "accepted",
+                    "accepted": True,
+                    "review_required": False,
+                    "issues": [],
+                },
             ),
         ):
             stage3_module.run_stage3_background_extraction(processor)

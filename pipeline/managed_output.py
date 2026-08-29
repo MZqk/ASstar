@@ -11,6 +11,11 @@ import numpy as np
 
 import display_rendition
 import stage9_quality
+from stage8_starless_finish import (
+    DECODED_PIXEL_SHA256_METHOD,
+    canonical_decoded_pixel_sha256,
+    pixel_sha256,
+)
 
 MANAGED_OUTPUT_SCHEMA = "starun.managed-output.v2"
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -194,6 +199,18 @@ def _read_managed_display_png(path: Path) -> np.ndarray:
 def read_managed_display_png(path: Path) -> np.ndarray:
     """Decode display RGB from a PNG written by this managed exporter."""
     return _read_managed_display_png(Path(path))
+
+
+def canonical_managed_derivative_pixels(image: Any) -> np.ndarray:
+    """Return the exact 16-bit top-down pixel domain used by managed exports."""
+
+    display_rgb = _as_display_rgb(image)
+    return (
+        np.rint(np.clip(display_rgb, 0.0, 1.0) * 65535.0)
+        .astype(np.uint16)
+        .astype(np.float32)
+        / np.float32(65535.0)
+    )
 
 
 def _box_blur_gray(gray: np.ndarray) -> np.ndarray:
@@ -635,6 +652,103 @@ def write_managed_edit_tiff(
     return target
 
 
+def _read_managed_edit_tiff(path: Path) -> np.ndarray:
+    """Decode pixels from the deterministic TIFF emitted above."""
+
+    payload = Path(path).read_bytes()
+    if len(payload) < 14 or payload[:2] != b"II":
+        raise ValueError("managed TIFF byte order is invalid")
+    magic, ifd_offset = struct.unpack_from("<HI", payload, 2)
+    if magic != 42 or ifd_offset < 8 or ifd_offset + 2 > len(payload):
+        raise ValueError("managed TIFF header is invalid")
+    entry_count = struct.unpack_from("<H", payload, ifd_offset)[0]
+    cursor = ifd_offset + 2
+    entries: dict[int, tuple[int, int, bytes]] = {}
+    for _ in range(entry_count):
+        if cursor + 12 > len(payload):
+            raise ValueError("managed TIFF IFD is truncated")
+        tag, value_type, count = struct.unpack_from("<HHI", payload, cursor)
+        entries[int(tag)] = (
+            int(value_type),
+            int(count),
+            payload[cursor + 8 : cursor + 12],
+        )
+        cursor += 12
+
+    def long_value(tag: int) -> int:
+        value_type, count, raw = entries[tag]
+        if value_type != 4 or count != 1:
+            raise ValueError(f"managed TIFF tag {tag} is invalid")
+        return int(struct.unpack("<I", raw)[0])
+
+    def short_value(tag: int) -> int:
+        value_type, count, raw = entries[tag]
+        if value_type != 3 or count != 1:
+            raise ValueError(f"managed TIFF tag {tag} is invalid")
+        return int(struct.unpack("<H", raw[:2])[0])
+
+    try:
+        width = long_value(256)
+        height = long_value(257)
+        pixel_offset = long_value(273)
+        pixel_length = long_value(279)
+        compression = short_value(259)
+        photometric = short_value(262)
+        samples = short_value(277)
+        planar = short_value(284)
+    except KeyError as error:
+        raise ValueError(f"managed TIFF tag missing: {error}") from error
+    expected_length = width * height * 3 * 2
+    if (
+        width <= 0
+        or height <= 0
+        or compression != 1
+        or photometric != 2
+        or samples != 3
+        or planar != 1
+        or pixel_length != expected_length
+        or pixel_offset + pixel_length > len(payload)
+    ):
+        raise ValueError("managed TIFF pixel layout is invalid")
+    pixels = np.frombuffer(
+        payload[pixel_offset : pixel_offset + pixel_length],
+        dtype="<u2",
+    ).reshape(height, width, 3)
+    return np.transpose(pixels.astype(np.float32) / 65535.0, (2, 0, 1))
+
+
+def read_managed_edit_tiff(path: Path) -> np.ndarray:
+    """Decode editable RGB from a TIFF written by this managed exporter."""
+
+    return _read_managed_edit_tiff(Path(path))
+
+
+def _managed_derivative_pixel_chain(
+    source_pixel_sha256: str,
+    expected: np.ndarray,
+    decoded: np.ndarray,
+) -> Dict[str, Any]:
+    expected_pixels = np.ascontiguousarray(expected, dtype=np.float32)
+    decoded_pixels = np.ascontiguousarray(decoded, dtype=np.float32)
+    expected_sha256 = pixel_sha256(expected_pixels)
+    decoded_sha256 = pixel_sha256(decoded_pixels)
+    return {
+        "schema": "starun.managed-output-pixel-chain.v1",
+        "accepted": bool(
+            expected_pixels.shape == decoded_pixels.shape
+            and np.array_equal(expected_pixels, decoded_pixels)
+            and expected_sha256 == decoded_sha256
+        ),
+        "source_pixel_sha256": source_pixel_sha256,
+        "source_pixel_sha256_method": DECODED_PIXEL_SHA256_METHOD,
+        "expected_pixel_sha256": expected_sha256,
+        "decoded_pixel_sha256": decoded_sha256,
+        "decoded_pixel_sha256_method": (
+            "canonical_uint16_top_down_float32_chw_v1"
+        ),
+    }
+
+
 def _sha256(path: Path) -> Optional[str]:
     if not path.is_file():
         return None
@@ -688,6 +802,9 @@ def export_managed_outputs(
     issues: list[str] = []
     display_visibility: Optional[Dict[str, Any]] = None
     display_transform: Optional[Dict[str, Any]] = None
+    source_display_rgb = _as_display_rgb(image)
+    source_bottom_up = np.flip(source_display_rgb, axis=1)
+    source_pixel_sha256 = canonical_decoded_pixel_sha256(source_bottom_up)
 
     if "png" in requested:
         display_path = root / f"{base_filename}_display_srgb.png"
@@ -696,7 +813,7 @@ def export_managed_outputs(
             # Never let a stale derivative from an earlier attempt satisfy the
             # current run after a failed visibility audit.
             display_path.unlink(missing_ok=True)
-            source_rgb = _as_display_rgb(image)
+            source_rgb = source_display_rgb.copy()
             input_visibility = audit_display_visibility(
                 source_rgb,
                 target_type=target_type,
@@ -742,8 +859,19 @@ def export_managed_outputs(
                     }
             _write_display_rgb_png(display_path, display_rgb)
             wrote_display = True
+            expected_display = canonical_managed_derivative_pixels(
+                np.flip(display_rgb, axis=1)
+            )
+            decoded_display = _read_managed_display_png(display_path)
+            display_pixel_chain = _managed_derivative_pixel_chain(
+                source_pixel_sha256,
+                expected_display,
+                decoded_display,
+            )
+            if display_pixel_chain["accepted"] is not True:
+                raise ValueError("managed display decoded pixel identity mismatch")
             final_visibility = audit_display_visibility(
-                _read_managed_display_png(display_path),
+                decoded_display,
                 target_type=target_type,
                 stars_required=stars_required,
                 star_reference=star_reference,
@@ -825,6 +953,8 @@ def export_managed_outputs(
                         "color_space": "sRGB IEC61966-2.1",
                         "profile_mechanism": "sRGB+gAMA+cHRM chunks",
                         "status": "written",
+                        "sha256": _sha256(display_path),
+                        "pixel_chain": display_pixel_chain,
                         "visibility": final_visibility,
                         "display_transform": display_transform,
                     }
@@ -857,6 +987,18 @@ def export_managed_outputs(
                     image,
                     icc_profile=profile,
                 )
+                expected_edit = canonical_managed_derivative_pixels(image)
+                decoded_edit = _read_managed_edit_tiff(edit_path)
+                edit_pixel_chain = _managed_derivative_pixel_chain(
+                    source_pixel_sha256,
+                    expected_edit,
+                    decoded_edit,
+                )
+                if edit_pixel_chain["accepted"] is not True:
+                    edit_path.unlink(missing_ok=True)
+                    raise ValueError(
+                        "managed editable decoded pixel identity mismatch"
+                    )
                 artifacts.append(
                     {
                         "role": "editable",
@@ -869,6 +1011,8 @@ def export_managed_outputs(
                         "icc_profile_source": profile_source,
                         "icc_profile_bytes": len(profile),
                         "status": "written",
+                        "sha256": _sha256(edit_path),
+                        "pixel_chain": edit_pixel_chain,
                     }
                 )
             except (OSError, RuntimeError, TypeError, ValueError) as error:
@@ -900,6 +1044,8 @@ def export_managed_outputs(
         "mode": "independent_managed_derivatives",
         "source_pixels": {
             "checkpoint": "stage10_final.fit",
+            "pixel_sha256": source_pixel_sha256,
+            "pixel_sha256_method": DECODED_PIXEL_SHA256_METHOD,
             "transform": "derivative_specific",
             "display_transform": display_transform,
             "editable_transform": "preserve_accepted_nonlinear_rendering",
@@ -926,9 +1072,11 @@ def export_managed_outputs(
 __all__ = [
     "MANAGED_OUTPUT_SCHEMA",
     "audit_display_visibility",
+    "canonical_managed_derivative_pixels",
     "export_managed_outputs",
     "find_srgb_icc_profile",
     "read_managed_display_png",
+    "read_managed_edit_tiff",
     "write_managed_display_png",
     "write_managed_edit_tiff",
 ]

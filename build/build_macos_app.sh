@@ -42,8 +42,14 @@ PIPELINE_REQUIRED_MODULES=(
   input_discovery.py
   task_workspace.py
   processing_parameters.py
+  final_artifact_identity.py
+  presentation_quality.py
+  spatial_background_lineage.py
   stage5_handoff.py
+  stage8_handoff.py
   stage8_color_rendition.py
+  stage8_starless_finish.py
+  star_halo_guard.py
   ui_preview.py
 )
 LOCAL_TEMPLATE="$PROJECT_ROOT/resources/config.1.4.ini.template"

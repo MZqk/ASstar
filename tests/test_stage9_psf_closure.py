@@ -350,6 +350,24 @@ class Stage9PsfClosureTests(unittest.TestCase):
             0.020,
         )
 
+    def test_config_cannot_relax_fixed_psf_ratio_hard_gates(self):
+        self.cfg.stage9_psf_fwhm_ratio_min = 0.10
+        self.cfg.stage9_psf_fwhm_ratio_max = 9.00
+
+        undersized = self._closure_with_measured_ratio(0.80)
+        oversized = self._closure_with_measured_ratio(1.20)
+
+        for result in (undersized, oversized):
+            self.assertFalse(result["accepted"], result)
+            self.assertEqual(
+                result["limits"]["stage9_psf_fwhm_ratio_min"],
+                0.93,
+            )
+            self.assertEqual(
+                result["limits"]["stage9_psf_fwhm_ratio_max"],
+                1.10,
+            )
+
     def test_small_weak_psf_accepts_one_halfmax_pixel_quantization_step(self):
         source = _gaussian_field(
             (128, 128),

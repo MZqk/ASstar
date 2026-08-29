@@ -345,6 +345,43 @@ class PipelineStageTests(unittest.TestCase):
         self.assertGreater(float(output[0, 5, 5]), float(trusted[0, 5, 5]))
         self.assertEqual(float(np.max(output[:, ~support])), 0.0)
 
+    def test_stage9_unscreen_amplitude_blend_interpolates_from_trusted_layer(self):
+        cfg = PipelineConfig(stage9_unscreen_reliable_support_min=0.50)
+        background = np.full((3, 12, 12), 0.55, dtype=np.float32)
+        trusted = np.zeros_like(background)
+        trusted[:, 4:8, 4:8] = np.asarray([0.20, 0.10, 0.05])[:, None, None]
+        raw_star = np.zeros_like(background)
+        raw_star[:, 4:8, 4:8] = np.asarray([0.60, 0.20, 0.50])[:, None, None]
+        original = stage9_quality.screen_blend(background, raw_star, 1.0)
+        support = np.zeros((12, 12), dtype=bool)
+        support[4:8, 4:8] = True
+
+        full, _ = stage9_quality.build_chroma_stable_unscreen_layer(
+            original,
+            background,
+            trusted,
+            support,
+            cfg,
+        )
+        blended, report = stage9_quality.build_chroma_stable_unscreen_layer(
+            original,
+            background,
+            trusted,
+            support,
+            cfg,
+            amplitude_blend=0.72,
+        )
+
+        self.assertIsNotNone(full)
+        self.assertIsNotNone(blended)
+        np.testing.assert_allclose(
+            blended,
+            trusted + 0.72 * (full - trusted),
+            atol=1e-7,
+        )
+        self.assertEqual(report["amplitude_blend"], 0.72)
+        self.assertEqual(float(np.max(blended[:, ~support])), 0.0)
+
     def test_stage9_unscreen_reliability_fails_closed(self):
         cfg = PipelineConfig(stage9_unscreen_reliable_support_min=0.80)
         background = np.full((3, 10, 10), 0.94, dtype=np.float32)
@@ -3491,8 +3528,12 @@ class PipelineStageSmokeTests(unittest.TestCase):
         ):
             stage5_linear_denoise.run_stage5_linear_denoise(self.pipeline)
 
-        self.assertEqual(self.pipeline.results[-1][1], "degraded")
+        self.assertEqual(self.pipeline.results[-1][1], "failed")
         self.assertTrue((self.process_dir / "stage5_linear.fit").exists())
+        self.assertFalse(self.pipeline._stage5_linear_handoff["accepted"])
+        self.assertFalse(
+            self.pipeline._stage5_linear_handoff["formal_eligible"]
+        )
 
     def test_stage7_stretching_smoke(self) -> None:
         self.pipeline._run_stage7_stretching_candidates = lambda: (
@@ -3522,6 +3563,7 @@ class PipelineStageSmokeTests(unittest.TestCase):
             stage_status="ok",
             deconvolution_integrity_ok=True,
             denoise_integrity_ok=True,
+            formal_eligible=True,
             input_lineage=input_lineage,
         )
 
@@ -3589,7 +3631,20 @@ class PipelineStageSmokeTests(unittest.TestCase):
 
         self.assertEqual(self.pipeline.results[-1][1], "degraded")
         self.assertEqual(self.pipeline._stage8_final_source, "stage8_input_starless")
-        self.assertEqual(self.pipeline._stage8_final_quality, "skipped")
+        self.assertEqual(
+            self.pipeline._stage8_final_quality,
+            "conservative_skipped",
+        )
+        self.assertFalse(self.pipeline._stage8_handoff["formal_eligible"])
+        self.assertTrue(self.pipeline._stage8_handoff["restricted_downstream"])
+        self.assertEqual(
+            self.pipeline._stage8_handoff["processing_route"],
+            "review_only",
+        )
+        self.assertIn(
+            "stage8_input_guard_skip",
+            self.pipeline._stage_review_reasons(8),
+        )
 
     def test_stage9_star_remixing_smoke(self) -> None:
         self.pipeline._stage9_bad_starless_reason = lambda: "poor starless"

@@ -15,6 +15,8 @@ import stage7_stretch_metrics
 import stage9_quality
 import syqon_starless
 import run_manifest
+import spatial_background_lineage
+from stage8_handoff import verify_stage8_handoff_integrity
 from stage7_pixel_domain import (
     STAGE7_FLOAT_DOMAIN_TOLERANCE,
     canonicalize_stage7_pixels_01,
@@ -24,11 +26,129 @@ from star_color_repair import (
     public_star_color_report,
     repair_star_layer_colors,
 )
+from stage8_starless_finish import (
+    DECODED_PIXEL_SHA256_METHOD,
+    FITS_DATA_SHA256_METHOD,
+    canonical_decoded_pixel_sha256,
+    persisted_fits_decoded_pixel_sha256,
+    pixel_sha256,
+)
 from sirilpy.exceptions import CommandError, SirilError
 
 
 def _clamp_float(value: float, lower: float, upper: float) -> float:
     return float(max(lower, min(upper, float(value))))
+
+
+_STAGE9_STARMASK_ANCHOR_FIELDS = (
+    "stage9_starmask_faint_target",
+    "stage9_starmask_mid_target",
+    "stage9_starmask_bright_target",
+    "stage9_starmask_peak_target",
+)
+_STAGE9_DEFAULT_STARMASK_TARGETS = {
+    "stage9_starmask_faint_target": 0.26,
+    "stage9_starmask_mid_target": 0.50,
+    "stage9_starmask_bright_target": 0.75,
+    "stage9_starmask_peak_target": 0.90,
+}
+_STAGE9_NARROWBAND_WIDEFIELD_STARMASK_TARGETS = {
+    "stage9_starmask_faint_target": 0.08,
+    "stage9_starmask_mid_target": 0.30,
+    "stage9_starmask_bright_target": 0.50,
+    "stage9_starmask_peak_target": 0.75,
+}
+_STAGE9_BRIGHT_COMPOSITE_STARMASK_TARGETS = {
+    "stage9_starmask_faint_target": 0.06,
+    "stage9_starmask_mid_target": 0.26,
+    "stage9_starmask_bright_target": 0.50,
+    "stage9_starmask_peak_target": 0.75,
+}
+
+
+def _stage9_effective_starmask_profile(pipeline) -> tuple[Any, Dict[str, Any]]:
+    """Return a target-profiled config without mutating signed task parameters."""
+    target_type = (
+        str(pipeline._active_target_type() or "").strip().lower()
+        if hasattr(pipeline, "_active_target_type")
+        else ""
+    )
+    channel_semantics = str(
+        getattr(pipeline, "_channel_semantics", "unknown") or "unknown"
+    ).strip().lower()
+    manual_fields = {
+        str(field)
+        for field in (
+            getattr(pipeline, "_task_manual_override_fields", ()) or ()
+        )
+    }
+    configured_targets = {
+        field: float(
+            getattr(
+                pipeline.cfg,
+                field,
+                _STAGE9_DEFAULT_STARMASK_TARGETS[field],
+            )
+        )
+        for field in _STAGE9_STARMASK_ANCHOR_FIELDS
+    }
+    overridden_fields = sorted(
+        manual_fields.intersection(_STAGE9_STARMASK_ANCHOR_FIELDS)
+    )
+    narrowband_widefield = bool(
+        target_type == "emission_nebula_widefield"
+        and channel_semantics == "narrowband_composite"
+        and not overridden_fields
+    )
+    bright_composite = bool(
+        target_type == "bright_emission_reflection_nebula"
+        and channel_semantics in {"broadband_rgb", "broadband_rgb_osc"}
+        and not overridden_fields
+    )
+    eligible = narrowband_widefield or bright_composite
+    effective_targets = dict(configured_targets)
+    if narrowband_widefield:
+        effective_targets.update(_STAGE9_NARROWBAND_WIDEFIELD_STARMASK_TARGETS)
+    elif bright_composite:
+        effective_targets.update(_STAGE9_BRIGHT_COMPOSITE_STARMASK_TARGETS)
+    profile_id = (
+        "narrowband_widefield_compact_flux_v1"
+        if narrowband_widefield
+        else "bright_composite_compact_flux_v1"
+        if bright_composite
+        else "configured_starmask_anchors"
+    )
+    reason_code = (
+        "stage9_narrowband_widefield_starmask_profile_active"
+        if narrowband_widefield
+        else "stage9_bright_composite_starmask_profile_active"
+        if bright_composite
+        else "stage9_starmask_anchor_manual_override"
+        if overridden_fields
+        else "stage9_starmask_target_profile_not_applicable"
+    )
+    report = {
+        "schema": "starun.stage9-starmask-target-profile.v1",
+        "status": "active" if eligible else "not_applicable",
+        "profile_id": profile_id,
+        "reason_code": reason_code,
+        "target_type": target_type or "unknown",
+        "channel_semantics": channel_semantics,
+        "configured_targets": configured_targets,
+        "effective_targets": effective_targets,
+        "manual_override_fields": overridden_fields,
+        "scientific_gates_unchanged": True,
+        "presentation_target_unchanged": [0.97, 1.05],
+        "formal_psf_gate_unchanged": [0.93, 1.10],
+    }
+    effective_cfg = copy.copy(pipeline.cfg)
+    for field, value in effective_targets.items():
+        setattr(effective_cfg, field, value)
+    pipeline._stage9_starmask_target_profile = dict(report)
+    writer = getattr(pipeline, "_write_stage_json", None)
+    if callable(writer):
+        writer("stage9_starmask_target_profile.json", report)
+    return effective_cfg, report
 
 
 def _stage9_signed_task_master_source(
@@ -97,6 +217,446 @@ def _stage9_upstream_handoff(pipeline, source_stem: str) -> Dict[str, Any]:
             "reason_code": "stage8_handoff_missing",
         }
     return handoff
+
+
+def _stage9_verify_stage8_handoff(
+    pipeline,
+    source_stem: str,
+    handoff: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Verify the exact persisted Stage8 Starless artifact before formal remix."""
+
+    schema = str(handoff.get("schema") or "")
+    report: Dict[str, Any] = {
+        "schema": "starun.stage9-stage8-handoff-verification.v1",
+        "status": "rejected",
+        "verified": False,
+        "review_only": True,
+        "handoff_schema": schema or None,
+        "source_stem": str(source_stem),
+        "issues": [],
+    }
+    if schema in {
+        "starun.stage8-handoff.v1",
+        "starun.stage8-handoff.v2",
+    }:
+        report["status"] = "legacy_stage8_handoff_review_only"
+        report["issues"] = ["legacy_delivery_contract"]
+        return report
+    if schema != "starun.stage8-handoff.v3":
+        report["issues"] = ["stage8_handoff_schema_unsupported"]
+        return report
+
+    issues: List[str] = []
+    integrity = verify_stage8_handoff_integrity(handoff)
+    if integrity.get("accepted") is not True:
+        issues.extend(str(item) for item in integrity.get("issues") or [])
+    report["handoff_integrity"] = integrity
+    declared_stem = str(handoff.get("source_stem") or "")
+    if declared_stem != str(source_stem):
+        issues.append("stage8_handoff_source_stem_mismatch")
+    artifact = handoff.get("source_artifact")
+    if not isinstance(artifact, Mapping):
+        issues.append("stage8_handoff_source_artifact_missing")
+        artifact = {}
+    expected_filename = f"{source_stem}.fit"
+    if str(artifact.get("artifact") or "") != expected_filename:
+        issues.append("stage8_handoff_artifact_filename_mismatch")
+    source_path = pipeline.process_dir / expected_filename
+    expected_sha256 = str(artifact.get("sha256") or "")
+    actual_sha256 = None
+    if not source_path.is_file():
+        issues.append("stage8_handoff_artifact_missing")
+    else:
+        actual_sha256 = run_manifest.sha256_file(source_path)
+        if not expected_sha256 or actual_sha256 != expected_sha256:
+            issues.append("stage8_handoff_sha256_mismatch")
+    expected_pixel_sha256 = str(artifact.get("pixel_sha256") or "")
+    expected_pixel_method = str(artifact.get("pixel_sha256_method") or "")
+    expected_fits_data_sha256 = str(
+        artifact.get("fits_data_sha256") or ""
+    )
+    expected_fits_data_method = str(
+        artifact.get("fits_data_sha256_method") or ""
+    )
+    expected_decoded_pixel_sha256 = str(
+        artifact.get("decoded_pixel_sha256") or ""
+    )
+    expected_decoded_pixel_method = str(
+        artifact.get("decoded_pixel_sha256_method") or ""
+    )
+    actual_fits_data_sha256 = None
+    actual_decoded_pixel_sha256 = None
+    fingerprint_reader = getattr(pipeline, "_fits_stage_fingerprint", None)
+    if callable(fingerprint_reader) and source_path.is_file():
+        try:
+            fingerprint = fingerprint_reader(source_path)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            fingerprint = None
+        if isinstance(fingerprint, Mapping):
+            actual_fits_data_sha256 = str(
+                fingerprint.get("data_sha256") or ""
+            ) or None
+    if source_path.is_file():
+        try:
+            actual_decoded_pixel_sha256 = (
+                persisted_fits_decoded_pixel_sha256(source_path)
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            actual_decoded_pixel_sha256 = None
+    if actual_fits_data_sha256 is None or actual_decoded_pixel_sha256 is None:
+        saved = getattr(pipeline, "saved_image_pixels", None)
+        if isinstance(saved, dict) and source_stem in saved:
+            try:
+                if actual_fits_data_sha256 is None:
+                    actual_fits_data_sha256 = pixel_sha256(
+                        saved[source_stem]
+                    )
+                if actual_decoded_pixel_sha256 is None:
+                    actual_decoded_pixel_sha256 = (
+                        canonical_decoded_pixel_sha256(saved[source_stem])
+                    )
+            except (TypeError, ValueError):
+                pass
+    if expected_pixel_method != FITS_DATA_SHA256_METHOD:
+        issues.append("stage8_handoff_pixel_identity_method_invalid")
+    if expected_fits_data_method != FITS_DATA_SHA256_METHOD:
+        issues.append("stage8_handoff_fits_data_identity_method_invalid")
+    if expected_decoded_pixel_method != DECODED_PIXEL_SHA256_METHOD:
+        issues.append("stage8_handoff_decoded_pixel_identity_method_invalid")
+    if not expected_pixel_sha256:
+        issues.append("stage8_handoff_pixel_identity_missing")
+    elif actual_fits_data_sha256 != expected_pixel_sha256:
+        issues.append("stage8_handoff_pixel_identity_mismatch")
+    if not expected_fits_data_sha256:
+        issues.append("stage8_handoff_fits_data_identity_missing")
+    elif actual_fits_data_sha256 != expected_fits_data_sha256:
+        issues.append("stage8_handoff_fits_data_identity_mismatch")
+    if expected_pixel_sha256 != expected_fits_data_sha256:
+        issues.append("stage8_handoff_pixel_fits_data_alias_mismatch")
+    if not expected_decoded_pixel_sha256:
+        issues.append("stage8_handoff_decoded_pixel_identity_missing")
+    elif actual_decoded_pixel_sha256 != expected_decoded_pixel_sha256:
+        issues.append("stage8_handoff_decoded_pixel_identity_mismatch")
+    if str(handoff.get("artifact_sha256") or "") != expected_sha256:
+        issues.append("stage8_handoff_top_level_artifact_sha256_mismatch")
+    if str(handoff.get("pixel_sha256") or "") != expected_pixel_sha256:
+        issues.append("stage8_handoff_top_level_pixel_sha256_mismatch")
+    if str(handoff.get("pixel_sha256_method") or "") != expected_pixel_method:
+        issues.append("stage8_handoff_top_level_pixel_method_mismatch")
+    if (
+        str(handoff.get("fits_data_sha256") or "")
+        != expected_fits_data_sha256
+    ):
+        issues.append("stage8_handoff_top_level_fits_data_sha256_mismatch")
+    if (
+        str(handoff.get("fits_data_sha256_method") or "")
+        != expected_fits_data_method
+    ):
+        issues.append("stage8_handoff_top_level_fits_data_method_mismatch")
+    if (
+        str(handoff.get("decoded_pixel_sha256") or "")
+        != expected_decoded_pixel_sha256
+    ):
+        issues.append("stage8_handoff_top_level_decoded_pixel_sha256_mismatch")
+    if (
+        str(handoff.get("decoded_pixel_sha256_method") or "")
+        != expected_decoded_pixel_method
+    ):
+        issues.append("stage8_handoff_top_level_decoded_pixel_method_mismatch")
+    processing_route = str(handoff.get("processing_route") or "")
+    allowed_routes = {
+        "structure_enhanced",
+        "safe_passthrough_color_only",
+        "star_preserve_secondary_nebulosity",
+    }
+    if processing_route not in allowed_routes:
+        issues.append("stage8_handoff_processing_route_invalid")
+    star_preserve_target = bool(
+        getattr(pipeline, "_star_preserve_target_bypass", False)
+    )
+    if star_preserve_target != (
+        processing_route == "star_preserve_secondary_nebulosity"
+    ):
+        issues.append("stage8_handoff_processing_route_target_mismatch")
+    if handoff.get("formal_eligible") is not True:
+        issues.append("stage8_handoff_not_formal_eligible")
+    if bool(handoff.get("restricted_downstream", False)):
+        issues.append("stage8_handoff_restricted")
+    if not bool(handoff.get("lineage_verified", False)):
+        issues.append("stage8_handoff_lineage_unverified")
+    lineage = handoff.get("lineage")
+    if not isinstance(lineage, Mapping):
+        issues.append("stage8_handoff_lineage_missing")
+        lineage = {}
+    output_artifact = lineage.get("output_artifact")
+    if (
+        str(lineage.get("output_stem") or "") != str(source_stem)
+        or not isinstance(output_artifact, Mapping)
+        or dict(output_artifact) != dict(artifact)
+    ):
+        issues.append("stage8_handoff_output_lineage_mismatch")
+    spatial_lineage = handoff.get("spatial_background_lineage")
+    if not isinstance(spatial_lineage, Mapping):
+        issues.append("stage8_spatial_background_lineage_missing")
+        spatial_lineage = {}
+    if (
+        spatial_lineage.get("accepted") is not True
+        or not str(spatial_lineage.get("support_sha256") or "")
+    ):
+        issues.append("stage8_spatial_background_lineage_unverified")
+    if processing_route == "safe_passthrough_color_only":
+        safe_record = handoff.get("safe_passthrough_color_only")
+        if not isinstance(safe_record, Mapping):
+            issues.append("stage8_safe_passthrough_evidence_missing")
+            safe_record = {}
+        preflight = safe_record.get("preflight")
+        if not isinstance(preflight, Mapping) or preflight.get("accepted") is not True:
+            issues.append("stage8_safe_passthrough_preflight_unverified")
+            preflight = {}
+        preflight_checks = preflight.get("checks")
+        if not isinstance(preflight_checks, Mapping):
+            preflight_checks = {}
+        required_preflight_checks = {
+            "exact_structure_rollback": lambda item: (
+                isinstance(item, Mapping) and item.get("accepted") is True
+            ),
+            "stage7_presentation_reference": lambda item: (
+                isinstance(item, Mapping) and item.get("accepted") is True
+            ),
+            "spatial_background": lambda item: (
+                isinstance(item, Mapping) and item.get("accepted") is True
+            ),
+            "subject_boundary_seam": lambda item: (
+                isinstance(item, Mapping) and item.get("accepted") is True
+            ),
+            "star_halo": lambda item: (
+                isinstance(item, Mapping) and item.get("accepted") is True
+            ),
+            "clipping": lambda item: (
+                isinstance(item, Mapping) and item.get("accepted") is True
+            ),
+        }
+        if not all(
+            validator(preflight_checks.get(name))
+            for name, validator in required_preflight_checks.items()
+        ):
+            issues.append("stage8_safe_passthrough_preflight_gate_unverified")
+        if str(preflight.get("source_mode") or "") == "limited_safe_passthrough":
+            limited_eligibility = safe_record.get("limited_eligibility")
+            eligibility_checks = (
+                limited_eligibility.get("checks")
+                if isinstance(limited_eligibility, Mapping)
+                else None
+            )
+            metric_checks = (
+                limited_eligibility.get("upstream_hard_metrics")
+                if isinstance(limited_eligibility, Mapping)
+                else None
+            )
+            if not (
+                isinstance(limited_eligibility, Mapping)
+                and limited_eligibility.get("accepted") is True
+                and not list(limited_eligibility.get("issues") or [])
+                and not list(
+                    limited_eligibility.get("review_requirements") or []
+                )
+                and isinstance(eligibility_checks, Mapping)
+                and eligibility_checks
+                and all(value is True for value in eligibility_checks.values())
+                and isinstance(metric_checks, Mapping)
+                and metric_checks
+                and all(
+                    isinstance(item, Mapping) and item.get("accepted") is True
+                    for item in metric_checks.values()
+                )
+                and dict(preflight.get("eligibility") or {})
+                == dict(limited_eligibility)
+            ):
+                issues.append(
+                    "stage8_limited_safe_passthrough_eligibility_unverified"
+                )
+
+        final_validation = safe_record.get("final_validation")
+        if (
+            not isinstance(final_validation, Mapping)
+            or final_validation.get("accepted") is not True
+        ):
+            issues.append("stage8_safe_passthrough_final_unverified")
+            final_validation = {}
+        final_checks = final_validation.get("checks")
+        if not isinstance(final_checks, Mapping):
+            final_checks = {}
+        quality_check = final_checks.get("background_seam_clip_presentation")
+        required_final_checks = (
+            isinstance(final_checks.get("color"), Mapping)
+            and final_checks["color"].get("accepted") is True,
+            isinstance(quality_check, Mapping)
+            and quality_check.get("status") == "ok",
+            isinstance(final_checks.get("spatial_background"), Mapping)
+            and final_checks["spatial_background"].get("accepted") is True,
+            isinstance(final_checks.get("star_halo"), Mapping)
+            and final_checks["star_halo"].get("accepted") is True,
+            isinstance(final_checks.get("artifact"), Mapping)
+            and final_checks["artifact"].get("accepted") is True,
+        )
+        if not all(required_final_checks):
+            issues.append("stage8_safe_passthrough_final_gate_unverified")
+
+        color_gate = handoff.get("color_gate")
+        final_color_identity = (
+            color_gate.get("final_pixel_identity")
+            if isinstance(color_gate, Mapping)
+            else None
+        )
+        if not (
+            safe_record.get("color_gate_verified") is True
+            and isinstance(color_gate, Mapping)
+            and color_gate.get("used_for_gate") is True
+            and str(color_gate.get("status") or "")
+            in {"accepted", "ok", "reported"}
+            and color_gate.get("guard_lineage_verified") is True
+            and isinstance(final_color_identity, Mapping)
+            and str(final_color_identity.get("sha256") or "")
+            == expected_sha256
+            and str(final_color_identity.get("pixel_sha256") or "")
+            == expected_pixel_sha256
+        ):
+            issues.append("stage8_safe_passthrough_color_gate_unverified")
+        halo_guard = handoff.get("star_halo_guard")
+        if not (
+            isinstance(halo_guard, Mapping)
+            and halo_guard.get("verified") is True
+            and str(halo_guard.get("status") or "") == "ok"
+        ):
+            issues.append("stage8_safe_passthrough_halo_guard_unverified")
+        if handoff.get("passthrough") is not True:
+            issues.append("stage8_safe_passthrough_flag_invalid")
+    elif processing_route == "star_preserve_secondary_nebulosity":
+        star_preserve_evidence = handoff.get(
+            "star_preserve_secondary_nebulosity"
+        )
+        if not (
+            isinstance(star_preserve_evidence, Mapping)
+            and star_preserve_evidence.get("accepted") is True
+            and star_preserve_evidence.get("eligible") is True
+            and str(star_preserve_evidence.get("status") or "") == "accepted"
+            and str(star_preserve_evidence.get("route") or "")
+            == "star_preserve_secondary_nebulosity"
+            and star_preserve_evidence.get("primary_policy_unchanged") is True
+            and star_preserve_evidence.get("stars_excluded_from_adjustment") is True
+            and not list(star_preserve_evidence.get("issues") or [])
+        ):
+            issues.append("stage8_star_preserve_route_evidence_unverified")
+    report.update(
+        status="verified" if not issues else "rejected",
+        verified=not issues,
+        review_only=bool(issues),
+        issues=issues,
+        processing_route=processing_route or None,
+        formal_eligible=handoff.get("formal_eligible") is True,
+        artifact={
+            "filename": expected_filename,
+            "expected_sha256": expected_sha256 or None,
+            "actual_sha256": actual_sha256,
+            "expected_pixel_sha256": expected_pixel_sha256 or None,
+            "actual_pixel_sha256": actual_fits_data_sha256,
+            "pixel_sha256_method": expected_pixel_method or None,
+            "expected_fits_data_sha256": expected_fits_data_sha256 or None,
+            "actual_fits_data_sha256": actual_fits_data_sha256,
+            "fits_data_sha256_method": expected_fits_data_method or None,
+            "expected_decoded_pixel_sha256": (
+                expected_decoded_pixel_sha256 or None
+            ),
+            "actual_decoded_pixel_sha256": actual_decoded_pixel_sha256,
+            "decoded_pixel_sha256_method": (
+                expected_decoded_pixel_method or None
+            ),
+        },
+    )
+    return report
+
+
+def _stage9_star_preserve_validation(
+    pipeline,
+    *,
+    source_stem: str,
+    output_stem: str,
+) -> Dict[str, Any]:
+    """Validate the no-remix star-preserve artifact and its sky lineage."""
+
+    report: Dict[str, Any] = {
+        "schema": "starun.stage9-persisted-star-preserve.v1",
+        "status": "rejected",
+        "accepted": False,
+        "mode": "stars_not_required",
+        "issues": [],
+    }
+    try:
+        source = pipeline._read_image_by_stem(source_stem)
+        output = pipeline._read_image_by_stem(output_stem)
+        if source is None or output is None:
+            raise ValueError("star_preserve_persisted_pixels_unavailable")
+        source_array = np.asarray(source)
+        output_array = np.asarray(output)
+        exact_pixels = bool(
+            source_array.shape == output_array.shape
+            and np.array_equal(source_array, output_array)
+        )
+        output_path = Path(pipeline.process_dir) / f"{output_stem}.fit"
+        container_sha = (
+            run_manifest.sha256_file(output_path)
+            if output_path.is_file()
+            else None
+        )
+        output_pixel_sha = pixel_sha256(output_array)
+        source_pixel_sha = pixel_sha256(source_array)
+
+        rgb = stage9_quality._normalized(output_array)
+        luma = stage9_quality._luminance(rgb)
+        residual = luma - stage9_quality._box_blur_gray(luma)
+        residual_median = float(np.median(residual))
+        residual_sigma = float(
+            1.4826 * np.median(np.abs(residual - residual_median))
+        )
+        star_threshold = residual_median + max(5.0 * residual_sigma, 0.002)
+        star_pixels = residual > star_threshold
+        star_presence = bool(np.count_nonzero(star_pixels) >= 8)
+        spatial = spatial_background_lineage.assess_final_spatial_background(
+            getattr(pipeline, "process_dir", None),
+            output_array,
+        )
+        checks = {
+            "exact_source_identity": exact_pixels,
+            "artifact_identity": bool(
+                container_sha and source_pixel_sha == output_pixel_sha
+            ),
+            "star_presence": star_presence,
+            "spatial_background": bool(spatial.get("accepted", False)),
+        }
+        report.update(
+            checks=checks,
+            artifact={
+                "file": output_path.name,
+                "container_sha256": container_sha,
+                "pixel_sha256": output_pixel_sha,
+                "source_pixel_sha256": source_pixel_sha,
+            },
+            star_presence={
+                "accepted": star_presence,
+                "threshold": star_threshold,
+                "residual_sigma": residual_sigma,
+                "pixel_count": int(np.count_nonzero(star_pixels)),
+            },
+            spatial_background=spatial,
+        )
+        report["issues"] = [name for name, accepted in checks.items() if not accepted]
+        report["accepted"] = not report["issues"]
+        report["status"] = "skipped" if report["accepted"] else "rejected"
+        return report
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        report["issues"] = [str(error)]
+        return report
 
 
 def _stage9_local_fallback(
@@ -1021,10 +1581,626 @@ def _persist_stage9_sep_crossmatch_evidence(
     return summary
 
 
+def _stage9_authenticated_sep_o_source_binding(
+    pipeline,
+    original: np.ndarray,
+) -> Dict[str, Any]:
+    """Bind matched-domain O pixels to the verified immutable Stage6 artifact."""
+
+    report: Dict[str, Any] = {
+        "schema": "starun.stage9-sep-o-source-binding.v1",
+        "status": "rejected",
+        "accepted": False,
+        "source_role": "O",
+        "source_name": "verified_stage6_input_in_stage7_matched_domain",
+    }
+    try:
+        matched_context = getattr(
+            pipeline,
+            "_stage9_matched_domain_context",
+            None,
+        )
+        if not isinstance(matched_context, Mapping) or (
+            matched_context.get("available") is not True
+        ):
+            raise ValueError("sep_o_authenticated_matched_domain_unavailable")
+        matched_report = matched_context.get("report")
+        if not isinstance(matched_report, Mapping):
+            raise ValueError("sep_o_authenticated_matched_report_unavailable")
+        pair_report = matched_report.get("pair_handoff")
+        if not isinstance(pair_report, Mapping) or (
+            pair_report.get("accepted") is not True
+        ):
+            raise ValueError("sep_o_authenticated_stage6_pair_unavailable")
+        paths = pair_report.get("paths")
+        source_path = Path(
+            str((paths or {}).get("stage6_input") or "")
+        ).resolve()
+        process_dir = Path(getattr(pipeline, "process_dir")).resolve()
+        relative_path = source_path.relative_to(process_dir)
+        if not source_path.is_file():
+            raise ValueError("sep_o_authenticated_source_artifact_missing")
+
+        pair_payload = getattr(pipeline, "_stage6_pair_handoff", None)
+        files = (
+            pair_payload.get("files")
+            if isinstance(pair_payload, Mapping)
+            else None
+        )
+        source_manifest = (
+            files.get("stage6_input")
+            if isinstance(files, Mapping)
+            else None
+        )
+        if not isinstance(source_manifest, Mapping):
+            raise ValueError("sep_o_authenticated_source_manifest_missing")
+        declared_artifact_sha256 = str(source_manifest.get("sha256") or "")
+        actual_artifact_sha256 = run_manifest.sha256_file(source_path)
+        if (
+            not declared_artifact_sha256
+            or actual_artifact_sha256 != declared_artifact_sha256
+        ):
+            raise ValueError("sep_o_authenticated_source_artifact_sha256_mismatch")
+
+        original_array = np.asarray(original)
+        if not np.issubdtype(original_array.dtype, np.number) or not np.all(
+            np.isfinite(original_array)
+        ):
+            raise ValueError("sep_o_authenticated_pixels_invalid")
+        source_shape = [int(value) for value in original_array.shape]
+        declared_shape = source_manifest.get("shape")
+        if isinstance(declared_shape, list) and [
+            int(value) for value in declared_shape
+        ] != source_shape:
+            raise ValueError("sep_o_authenticated_source_shape_mismatch")
+        source_artifact = {
+            "role": "stage6_input",
+            "artifact": str(relative_path),
+            "sha256": actual_artifact_sha256,
+        }
+        matched_transfer = dict(
+            matched_report.get("matched_domain_transfer") or {}
+        )
+        report.update(
+            status="ok",
+            accepted=True,
+            source_artifact=source_artifact,
+            source_shape=source_shape,
+            pixel_sha256=_stage9_pixel_hash(original_array),
+            coordinate_domain=(
+                stage9_quality._STAGE9_SEP_COORDINATE_DOMAIN
+            ),
+            matched_domain_transfer_sha256=(
+                run_manifest.canonical_payload_hash(matched_transfer)
+            ),
+        )
+        report["binding_sha256"] = run_manifest.canonical_payload_hash(
+            {
+                key: value
+                for key, value in report.items()
+                if key != "binding_sha256"
+            }
+        )
+    except (OSError, TypeError, ValueError) as error:
+        report["reason"] = str(error)
+    return report
+
+
+def _stage9_bind_sep_o_source_evidence(
+    pipeline,
+    original: np.ndarray,
+    sep_evidence: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Attach verified O artifact/pixel identity without trusting SEP fields."""
+
+    binding = _stage9_authenticated_sep_o_source_binding(pipeline, original)
+    sep_evidence["o_source_binding"] = copy.deepcopy(binding)
+    try:
+        if binding.get("accepted") is not True:
+            raise ValueError(
+                str(binding.get("reason") or "sep_o_source_binding_unavailable")
+            )
+        sources = sep_evidence.get("sources")
+        source_o = sources.get("O") if isinstance(sources, dict) else None
+        catalogs = sep_evidence.get("catalogs")
+        catalog_o = catalogs.get("O") if isinstance(catalogs, dict) else None
+        if not isinstance(source_o, dict) or not isinstance(catalog_o, dict):
+            raise ValueError("sep_o_source_evidence_missing")
+        expected_pixel_sha256 = str(binding["pixel_sha256"])
+        expected_shape = list(binding["source_shape"])
+        if (
+            str(source_o.get("source_name") or "")
+            != str(binding["source_name"])
+            or str(source_o.get("pixel_sha256") or "")
+            != expected_pixel_sha256
+            or list(source_o.get("source_shape") or []) != expected_shape
+            or str(catalog_o.get("pixel_sha256") or "")
+            != expected_pixel_sha256
+            or list(catalog_o.get("source_shape") or []) != expected_shape
+        ):
+            raise ValueError("sep_o_source_pixel_identity_mismatch")
+        for payload in (source_o, catalog_o):
+            payload["source_artifact"] = copy.deepcopy(
+                binding["source_artifact"]
+            )
+            payload["source_binding_sha256"] = str(
+                binding["binding_sha256"]
+            )
+        sep_evidence["o_source_binding"]["status"] = "bound"
+    except (KeyError, TypeError, ValueError) as error:
+        sep_evidence["o_source_binding"].update(
+            status="rejected",
+            accepted=False,
+            reason=str(error),
+        )
+    sep_evidence["report_sha256"] = stage9_quality._stage9_sep_payload_hash(
+        {
+            key: value
+            for key, value in sep_evidence.items()
+            if key != "report_sha256"
+        }
+    )
+    return dict(sep_evidence["o_source_binding"])
+
+
+def _stage9_normalize_sep_o_records(records: Any) -> List[Dict[str, Any]]:
+    """Return the exact canonical O-record representation used by SEP v1."""
+
+    if not isinstance(records, list) or not records:
+        raise ValueError("sep_o_catalog_records_missing")
+    normalized: List[Dict[str, Any]] = []
+    seen_coordinates: set[tuple[float, float]] = set()
+    for index, raw in enumerate(records, start=1):
+        if not isinstance(raw, Mapping):
+            raise ValueError("sep_o_catalog_record_invalid")
+        record_id = str(raw.get("id") or "")
+        if record_id != f"O{index:06d}":
+            raise ValueError("sep_o_catalog_record_id_sequence_mismatch")
+        floats = {
+            name: float(raw[name])
+            for name in (
+                "x",
+                "y",
+                "flux",
+                "peak",
+                "a",
+                "b",
+                "theta",
+                "fwhm_px",
+                "axis_ratio",
+            )
+        }
+        if not all(math.isfinite(value) for value in floats.values()):
+            raise ValueError("sep_o_catalog_record_nonfinite")
+        if (
+            floats["a"] <= 0.0
+            or floats["b"] <= 0.0
+            or floats["fwhm_px"] <= 0.0
+            or not 0.0 < floats["axis_ratio"] <= 1.0
+        ):
+            raise ValueError("sep_o_catalog_record_geometry_invalid")
+        coordinate = (floats["x"], floats["y"])
+        if coordinate in seen_coordinates:
+            raise ValueError("sep_o_catalog_coordinate_duplicate")
+        seen_coordinates.add(coordinate)
+        normalized.append(
+            {
+                "id": record_id,
+                "x": floats["x"],
+                "y": floats["y"],
+                "flux": floats["flux"],
+                "peak": floats["peak"],
+                "a": floats["a"],
+                "b": floats["b"],
+                "theta": floats["theta"],
+                "npix": int(raw["npix"]),
+                "flag": int(raw["flag"]),
+                "fwhm_px": floats["fwhm_px"],
+                "axis_ratio": floats["axis_ratio"],
+            }
+        )
+    return normalized
+
+
+def _stage9_build_same_source_sep_recovery(
+    pipeline,
+    *,
+    original: np.ndarray,
+    before: np.ndarray,
+    persisted: np.ndarray,
+    sep_evidence: Dict[str, Any],
+) -> tuple[Optional[np.ndarray], Dict[str, Any]]:
+    """Recover only real O-catalog sources bound to the frozen star catalog."""
+
+    report: Dict[str, Any] = {
+        "schema": "starun.stage9-sep-same-source-recovery.v1",
+        "status": "unavailable",
+        "accepted": False,
+        "changed": False,
+        "new_coordinate_count": 0,
+        "selected_o_ids": [],
+    }
+    try:
+        if list(sep_evidence.get("failed_gates") or []) != [
+            "source_recovery_ratio"
+        ]:
+            raise ValueError("sep_recovery_requires_unique_source_recovery_failure")
+        source_binding = _stage9_authenticated_sep_o_source_binding(
+            pipeline,
+            original,
+        )
+        if source_binding.get("accepted") is not True:
+            raise ValueError(
+                str(
+                    source_binding.get("reason")
+                    or "sep_o_source_binding_unavailable"
+                )
+            )
+        declared_binding = sep_evidence.get("o_source_binding")
+        if not isinstance(declared_binding, Mapping) or (
+            declared_binding.get("accepted") is not True
+        ):
+            raise ValueError("sep_o_source_binding_missing")
+        if (
+            str(declared_binding.get("binding_sha256") or "")
+            != str(source_binding.get("binding_sha256") or "")
+        ):
+            raise ValueError("sep_o_source_binding_mismatch")
+        sources = dict(sep_evidence.get("sources") or {})
+        source_o = dict(sources.get("O") or {})
+        catalogs = dict(sep_evidence.get("catalogs") or {})
+        o_catalog = dict(catalogs.get("O") or {})
+        expected_pixel_sha256 = str(source_binding["pixel_sha256"])
+        expected_artifact = dict(source_binding["source_artifact"])
+        expected_binding_sha256 = str(source_binding["binding_sha256"])
+        if (
+            str(source_o.get("source_name") or "")
+            != str(source_binding["source_name"])
+            or str(source_o.get("pixel_sha256") or "")
+            != expected_pixel_sha256
+            or str(o_catalog.get("pixel_sha256") or "")
+            != expected_pixel_sha256
+            or list(source_o.get("source_shape") or [])
+            != list(source_binding["source_shape"])
+            or list(o_catalog.get("source_shape") or [])
+            != list(source_binding["source_shape"])
+        ):
+            raise ValueError("sep_o_source_pixel_sha256_mismatch")
+        if (
+            dict(source_o.get("source_artifact") or {}) != expected_artifact
+            or dict(o_catalog.get("source_artifact") or {})
+            != expected_artifact
+            or str(source_o.get("source_binding_sha256") or "")
+            != expected_binding_sha256
+            or str(o_catalog.get("source_binding_sha256") or "")
+            != expected_binding_sha256
+        ):
+            raise ValueError("sep_o_source_artifact_mismatch")
+        if (
+            o_catalog.get("schema")
+            != stage9_quality._STAGE9_SEP_CATALOG_SCHEMA
+            or o_catalog.get("status") != "ok"
+            or o_catalog.get("source_role") != "O"
+            or o_catalog.get("coordinate_domain")
+            != stage9_quality._STAGE9_SEP_COORDINATE_DOMAIN
+        ):
+            raise ValueError("sep_o_catalog_contract_mismatch")
+        declared_records_sha256 = str(
+            o_catalog.get("records_sha256") or ""
+        )
+        if not stage9_quality._stage9_sep_valid_sha256(
+            declared_records_sha256
+        ):
+            raise ValueError("sep_o_catalog_records_digest_missing")
+        o_records = _stage9_normalize_sep_o_records(
+            o_catalog.get("records")
+        )
+        recomputed_records_sha256 = (
+            stage9_quality._stage9_sep_payload_hash(o_records)
+        )
+        if recomputed_records_sha256 != declared_records_sha256:
+            raise ValueError("sep_o_catalog_records_digest_mismatch")
+        if int(o_catalog.get("valid_count", -1)) != len(o_records):
+            raise ValueError("sep_o_catalog_valid_count_mismatch")
+        declared_report_sha256 = str(
+            sep_evidence.get("report_sha256") or ""
+        )
+        if not stage9_quality._stage9_sep_valid_sha256(
+            declared_report_sha256
+        ):
+            raise ValueError("sep_evidence_report_digest_missing")
+        recomputed_report_sha256 = stage9_quality._stage9_sep_payload_hash(
+            {
+                key: value
+                for key, value in sep_evidence.items()
+                if key != "report_sha256"
+            }
+        )
+        if recomputed_report_sha256 != declared_report_sha256:
+            raise ValueError("sep_evidence_report_digest_mismatch")
+        o_coordinate_payload = [
+            {"id": row["id"], "x": row["x"], "y": row["y"]}
+            for row in o_records
+        ]
+        o_coordinate_sha256 = stage9_quality._stage9_sep_payload_hash(
+            o_coordinate_payload
+        )
+        matched_o_ids = {
+            str(row.get("source_id") or "")
+            for row in (
+                ((sep_evidence.get("matches") or {}).get("O_C") or {}).get(
+                    "matches"
+                )
+                or []
+            )
+        }
+        if not matched_o_ids.issubset(
+            {str(row["id"]) for row in o_records}
+        ):
+            raise ValueError("sep_o_match_catalog_membership_mismatch")
+        catalog = getattr(pipeline, "_stage9_star_reference_catalog", None)
+        if not isinstance(catalog, dict) or catalog.get("status") != "ok":
+            raise ValueError("frozen_stage9_catalog_unavailable")
+        frozen_coordinate_snapshot = _stage9_catalog_coordinate_snapshot(
+            catalog
+        )
+        frozen_coordinate_sha256 = _stage9_catalog_coordinate_digest(
+            frozen_coordinate_snapshot
+        )
+        if frozen_coordinate_sha256 is None:
+            raise ValueError("frozen_stage9_catalog_identity_unavailable")
+        frozen_y = np.asarray(
+            catalog.get("_source_peak_y", catalog.get("_peak_y", ())),
+            dtype=np.float64,
+        )
+        frozen_x = np.asarray(
+            catalog.get("_source_peak_x", catalog.get("_peak_x", ())),
+            dtype=np.float64,
+        )
+        if frozen_y.size <= 0 or frozen_x.size != frozen_y.size:
+            raise ValueError("frozen_stage9_catalog_coordinates_unavailable")
+        match_radius = float(sep_evidence.get("match_radius_px") or 0.0)
+        if not math.isfinite(match_radius) or match_radius <= 0.0:
+            raise ValueError("sep_match_radius_unavailable")
+        source_array = np.asarray(original)
+        before_array = np.asarray(before)
+        persisted_array = np.asarray(persisted)
+        if not (
+            source_array.shape == before_array.shape == persisted_array.shape
+        ):
+            raise ValueError("sep_recovery_frame_shape_mismatch")
+        normalized = stage9_quality._normalized(persisted_array)
+        height, width = stage9_quality._luminance(normalized).shape
+        support = np.zeros((height, width), dtype=bool)
+        selected: List[Dict[str, Any]] = []
+        yy, xx = np.ogrid[:height, :width]
+        for record in o_records:
+            record_id = str(record.get("id") or "")
+            if not record_id or record_id in matched_o_ids:
+                continue
+            x = float(record["x"])
+            y = float(record["y"])
+            if not (0.0 <= x < width and 0.0 <= y < height):
+                raise ValueError("sep_o_catalog_coordinate_out_of_bounds")
+            distances = np.hypot(frozen_x - x, frozen_y - y)
+            frozen_index = int(np.argmin(distances))
+            frozen_distance = float(distances[frozen_index])
+            if frozen_distance > match_radius:
+                continue
+            radius = int(
+                np.clip(
+                    math.ceil(1.25 * float(record.get("fwhm_px") or 2.0)),
+                    2,
+                    8,
+                )
+            )
+            support |= (xx - x) ** 2 + (yy - y) ** 2 <= radius * radius
+            selected.append(
+                {
+                    "o_id": record_id,
+                    "o_x": x,
+                    "o_y": y,
+                    "o_fwhm_px": float(record.get("fwhm_px") or 0.0),
+                    "support_radius_px": radius,
+                    "frozen_catalog_index": frozen_index,
+                    "frozen_distance_px": frozen_distance,
+                }
+            )
+        if not selected or int(np.count_nonzero(support)) <= 0:
+            raise ValueError("no_authenticated_unmatched_o_sources")
+
+        source_layer = stage9_quality.unscreen_layer(
+            source_array,
+            before_array,
+        )
+        current_layer = stage9_quality.unscreen_layer(
+            persisted_array,
+            before_array,
+        )
+        merged_layer = np.maximum(
+            np.asarray(current_layer, dtype=np.float32),
+            0.90 * np.asarray(source_layer, dtype=np.float32),
+        )
+        candidate = stage9_quality.screen_blend(
+            before_array,
+            merged_layer,
+            1.0,
+            alpha_mask=support.astype(np.float32),
+        )
+        candidate_array = np.asarray(candidate)
+        if candidate_array.ndim == 2:
+            candidate_array[~support] = persisted_array[~support]
+        elif candidate_array.shape[0] in (1, 3, 4):
+            candidate_array[:, ~support] = persisted_array[:, ~support]
+        elif candidate_array.shape[-1] in (1, 3, 4):
+            candidate_array[~support, :] = persisted_array[~support, :]
+        else:
+            raise ValueError("unsupported_sep_recovery_pixel_layout")
+        delta = np.abs(
+            candidate_array.astype(np.float64)
+            - persisted_array.astype(np.float64)
+        )
+        if candidate_array.ndim == 2:
+            outside_max = float(np.max(delta[~support])) if np.any(~support) else 0.0
+        elif candidate_array.shape[0] in (1, 3, 4):
+            outside_max = (
+                float(np.max(delta[:, ~support])) if np.any(~support) else 0.0
+            )
+        else:
+            outside_max = (
+                float(np.max(delta[~support, :])) if np.any(~support) else 0.0
+            )
+        changed = bool(float(np.max(delta)) > 0.0)
+        observed_o_records = _stage9_normalize_sep_o_records(
+            (catalogs.get("O") or {}).get("records")
+        )
+        observed_o_coordinate_sha256 = stage9_quality._stage9_sep_payload_hash(
+            [
+                {"id": row["id"], "x": row["x"], "y": row["y"]}
+                for row in observed_o_records
+            ]
+        )
+        observed_frozen_sha256 = _stage9_catalog_coordinate_digest(
+            _stage9_catalog_coordinate_snapshot(catalog)
+        )
+        if (
+            observed_o_coordinate_sha256 != o_coordinate_sha256
+            or observed_frozen_sha256 != frozen_coordinate_sha256
+        ):
+            _stage9_restore_catalog_coordinates(
+                catalog,
+                frozen_coordinate_snapshot,
+            )
+            raise ValueError("sep_recovery_catalog_coordinates_changed")
+        report.update(
+            status="ready" if changed else "unchanged",
+            accepted=changed and outside_max == 0.0,
+            changed=changed,
+            membership_source="independent_sep_O_and_frozen_stage9_catalog",
+            o_catalog_records_sha256=declared_records_sha256,
+            o_catalog_records_sha256_recomputed=recomputed_records_sha256,
+            o_catalog_coordinate_sha256=o_coordinate_sha256,
+            frozen_coordinate_sha256=frozen_coordinate_sha256,
+            source_binding=source_binding,
+            selected_o_ids=[item["o_id"] for item in selected],
+            selected_sources=selected,
+            support_pixel_count=int(np.count_nonzero(support)),
+            outside_support_max_abs_change=outside_max,
+            new_coordinate_count=0,
+            source_layer_scale=0.90,
+        )
+        return (
+            np.array(candidate_array, copy=True)
+            if bool(report["accepted"])
+            else None,
+            report,
+        )
+    except (IndexError, KeyError, TypeError, ValueError, FloatingPointError) as error:
+        report["reason"] = str(error)
+        return None, report
+
+
+def _stage9_validate_persisted_sep_recovery_closure(
+    parent_quality: Dict[str, Any],
+    retry_validation: Dict[str, Any],
+    *,
+    candidate_pixel_sha256: str,
+) -> Dict[str, Any]:
+    """Close soft PSF, non-regression, and exact persisted identity gates."""
+
+    candidate_quality = retry_validation.get("reloaded_quality")
+    if not isinstance(candidate_quality, dict):
+        candidate_quality = {}
+    ratios = _stage9_psf_group_ratios(candidate_quality)
+    required_groups = ("all", "weak", "bright")
+    missing_groups = [group for group in required_groups if group not in ratios]
+    soft_target_accepted = bool(not missing_groups) and all(
+        0.97 <= ratios[group] <= 1.05 for group in required_groups
+    )
+    nonregression = _stage9_psf_contraction_nonregression(
+        parent_quality,
+        candidate_quality,
+    )
+    nonregression_accepted = bool(
+        nonregression.get("accepted") is True
+        and isinstance(nonregression.get("metrics"), Mapping)
+        and bool(nonregression.get("metrics"))
+    )
+    identity_hashes = {
+        "candidate": str(candidate_pixel_sha256 or ""),
+        "active": str(retry_validation.get("active_pixel_hash") or ""),
+        "persisted": str(
+            retry_validation.get("persisted_pixel_hash") or ""
+        ),
+        "restored": str(retry_validation.get("restored_pixel_hash") or ""),
+    }
+    well_formed_hashes = bool(
+        all(
+            len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+            for value in identity_hashes.values()
+        )
+    )
+    exact_pixel_identity = bool(
+        well_formed_hashes
+        and len(set(identity_hashes.values())) == 1
+        and retry_validation.get("pixels_match") is True
+        and retry_validation.get("restored_after_sep") is True
+        and retry_validation.get("shape_matches") is True
+    )
+    coordinate_contract = retry_validation.get("coordinate_contract")
+    coordinate_identity = bool(
+        isinstance(coordinate_contract, Mapping)
+        and coordinate_contract.get("validated") is True
+    )
+    retry_accepted = retry_validation.get("accepted") is True
+    accepted = bool(
+        retry_accepted
+        and soft_target_accepted
+        and nonregression_accepted
+        and exact_pixel_identity
+        and coordinate_identity
+    )
+    failures: List[str] = []
+    if not retry_accepted:
+        failures.append("full_gate_retry_failed")
+    if not soft_target_accepted:
+        failures.append("psf_soft_target_unclosed")
+    if not nonregression_accepted:
+        failures.append("parent_zero_tolerance_nonregression_failed")
+    if not exact_pixel_identity:
+        failures.append("persisted_pixel_identity_failed")
+    if not coordinate_identity:
+        failures.append("persisted_coordinate_identity_failed")
+    return {
+        "schema": "starun.stage9-sep-recovery-formal-closure.v1",
+        "status": "accepted" if accepted else "rejected",
+        "accepted": accepted,
+        "soft_psf_closure": {
+            "accepted": soft_target_accepted,
+            "target_min": 0.97,
+            "target_max": 1.05,
+            "required_groups": list(required_groups),
+            "missing_groups": missing_groups,
+            "ratios": ratios,
+        },
+        "parent_zero_tolerance_nonregression": nonregression,
+        "identity": {
+            "accepted": exact_pixel_identity and coordinate_identity,
+            "pixel_identity_accepted": exact_pixel_identity,
+            "coordinate_identity_accepted": coordinate_identity,
+            "pixel_sha256": identity_hashes,
+        },
+        "failures": failures,
+    }
+
+
 def _validate_stage9_persisted_output(
     pipeline,
     source_stem: str,
     selected_quality: Dict[str, Any],
+    *,
+    allow_sep_recovery: bool = True,
 ) -> Dict[str, Any]:
     """Reload the canonical FITS and repeat every formal Stage9 gate."""
     report: Dict[str, Any] = {
@@ -1176,11 +2352,129 @@ def _validate_stage9_persisted_output(
                 "C": "stage9_remixed",
             },
         )
+        _stage9_bind_sep_o_source_evidence(
+            pipeline,
+            original,
+            sep_evidence,
+        )
         sep_summary = _persist_stage9_sep_crossmatch_evidence(
             pipeline,
             sep_evidence,
         )
         sep_crossmatch_accepted = bool(sep_summary.get("accepted", False))
+
+        unique_source_recovery_failure = bool(
+            allow_sep_recovery
+            and sep_evidence.get("status") == "rejected"
+            and list(sep_evidence.get("failed_gates") or [])
+            == ["source_recovery_ratio"]
+            and shape_matches
+            and pixels_match
+            and quality_accepted
+            and visibility_groups_passed
+            and bool(
+                (catalog_visibility.get("coordinate_contract") or {}).get(
+                    "validated", False
+                )
+            )
+            and Path(pipeline.process_dir, "stage9_remixed.fit").is_file()
+        )
+        if unique_source_recovery_failure:
+            recovery_candidate, recovery_report = (
+                _stage9_build_same_source_sep_recovery(
+                    pipeline,
+                    original=original,
+                    before=before,
+                    persisted=persisted,
+                    sep_evidence=sep_evidence,
+                )
+            )
+            if recovery_candidate is not None and bool(
+                recovery_report.get("accepted", False)
+            ):
+                recovery_candidate_sha256 = _stage9_pixel_hash(
+                    np.asarray(recovery_candidate)
+                )
+                writer = getattr(pipeline, "_set_current_image_pixeldata", None)
+                if not callable(writer):
+                    raise RuntimeError("Stage9 SEP recovery pixel writer unavailable")
+                writer(
+                    recovery_candidate,
+                    label="Stage9 one-shot authenticated SEP source recovery",
+                )
+                recovery_saved = bool(
+                    pipeline._save_stage_output("stage9_remixed")
+                )
+                recovery_report["candidate_saved"] = recovery_saved
+                if recovery_saved:
+                    retry_validation = _validate_stage9_persisted_output(
+                        pipeline,
+                        source_stem,
+                        selected_quality,
+                        allow_sep_recovery=False,
+                    )
+                    recovery_report["full_gate_retry"] = {
+                        "status": retry_validation.get("status"),
+                        "accepted": bool(
+                            retry_validation.get("accepted", False)
+                        ),
+                        "failures": list(
+                            retry_validation.get("failures") or []
+                        ),
+                        "sep_crossmatch": retry_validation.get(
+                            "sep_crossmatch"
+                        ),
+                    }
+                    recovery_closure = (
+                        _stage9_validate_persisted_sep_recovery_closure(
+                            reloaded_quality,
+                            retry_validation,
+                            candidate_pixel_sha256=(
+                                recovery_candidate_sha256
+                            ),
+                        )
+                    )
+                    recovery_report["formal_closure"] = recovery_closure
+                    if bool(recovery_closure.get("accepted", False)):
+                        recovery_report["status"] = "accepted"
+                        retry_validation["same_source_sep_recovery"] = (
+                            recovery_report
+                        )
+                        pipeline._stage9_persisted_output_validation = (
+                            retry_validation
+                        )
+                        return retry_validation
+
+                # A failed one-shot attempt restores the exact persisted C;
+                # retry evidence remains diagnostic but cannot replace it.
+                writer(
+                    np.array(persisted, copy=True),
+                    label="Stage9 SEP recovery exact rollback",
+                )
+                rollback_saved = bool(
+                    pipeline._save_stage_output("stage9_remixed")
+                )
+                pipeline.cmd_with_check("load", "stage9_remixed")
+                rollback_pixels = getter(preview=False)
+                rollback_hash = (
+                    _stage9_pixel_hash(np.asarray(rollback_pixels))
+                    if rollback_pixels is not None
+                    else None
+                )
+                recovery_report["rollback"] = {
+                    "status": (
+                        "restored"
+                        if rollback_saved and rollback_hash == persisted_hash
+                        else "failed"
+                    ),
+                    "pixel_sha256": rollback_hash,
+                    "expected_pixel_sha256": persisted_hash,
+                }
+                _persist_stage9_sep_crossmatch_evidence(
+                    pipeline,
+                    sep_evidence,
+                )
+            report["same_source_sep_recovery"] = recovery_report
 
         # SEP may temporarily load B, but Stage9 must leave the persisted C
         # buffer active for Stage10 and for the exact-pixel delivery audit.
@@ -2015,7 +3309,7 @@ def _stage9_psf_recovery_target_min(pipeline, quality: Dict[str, Any]) -> float:
         0.50,
         1.00,
     )
-    return float(max(hard_min, min(configured, hard_max, 1.00)))
+    return float(max(hard_min, 0.97, min(configured, hard_max, 1.00)))
 
 
 def _stage9_psf_recovery_target_max(pipeline, quality: Dict[str, Any]) -> float:
@@ -2036,7 +3330,7 @@ def _stage9_psf_recovery_target_max(pipeline, quality: Dict[str, Any]) -> float:
         1.00,
         1.50,
     )
-    return float(max(1.00, min(configured, hard_max)))
+    return float(max(1.00, min(configured, hard_max, 1.05)))
 
 
 def _stage9_needs_progressive_psf_recovery(
@@ -3058,6 +4352,15 @@ def _write_stage9_quality_report(
                     "reason": "Stage9 star reference was not prepared",
                 },
             ),
+            "starmask_target_profile": getattr(
+                pipeline,
+                "_stage9_starmask_target_profile",
+                {
+                    "schema": "starun.stage9-starmask-target-profile.v1",
+                    "status": "not_run",
+                    "reason_code": "stage9_starmask_target_profile_not_run",
+                },
+            ),
             "objective": {
                 "reconstruction_target": (
                     "faithful_same_source_star_display_restoration"
@@ -3172,8 +4475,15 @@ def _write_stage9_quality_report(
                 "oversize_contraction": {
                     "trigger": "pure_fwhm_upper_limit_failure_only",
                     "target_groups": "failed_weak_bright_or_all_only",
-                    "operator": "component_local_rgb_shared_u_power",
-                    "operator_formula": "gain=u^(gamma-1)",
+                    "operator": (
+                        "component_local_rgb_shared_halfmax_shoulder_power"
+                    ),
+                    "operator_formula": (
+                        "u<=0.45 unchanged; u>0.45 maps to "
+                        "0.45+0.55*((u-0.45)/0.55)^gamma"
+                    ),
+                    "preserved_wing_ceiling_fraction": 0.45,
+                    "wing_pixels_immutable_by_construction": True,
                     "gamma_bounds": [1.0, 4.0],
                     "retry_budget_shared_with_targeted_recovery": True,
                     "candidate_rebuild_source": "immutable_parent_star_layer",
@@ -3602,6 +4912,9 @@ def _stage9_starmask_support_preflight(
 ) -> Dict[str, Any]:
     """Read starmask pixels and classify normal/strict support before remix."""
     try:
+        starmask_cfg, target_profile = _stage9_effective_starmask_profile(
+            pipeline
+        )
         spatial_scale = dict(
             getattr(pipeline, "_stage9_spatial_scale", {}) or {}
         )
@@ -3622,7 +4935,7 @@ def _stage9_starmask_support_preflight(
                 raise RuntimeError("plugin-stretched starmask pixels are unavailable")
         preflight = stage9_quality.assess_starmask_support_preflight(
             np.asarray(raw_pixels),
-            pipeline.cfg,
+            starmask_cfg,
             reference_catalog=getattr(
                 pipeline,
                 "_stage9_star_reference_catalog",
@@ -3634,7 +4947,20 @@ def _stage9_starmask_support_preflight(
             ),
         )
         public = stage9_quality.public_starmask_support_preflight(preflight)
+        public["target_profile"] = dict(target_profile)
         pipeline._stage9_starmask_support_preflight = public
+        if target_profile.get("status") == "active":
+            targets = target_profile["effective_targets"]
+            messages.append(
+                "Stage9 target-specific compact starmask profile active "
+                f"(profile={target_profile['profile_id']}, "
+                "faint/mid/bright/peak="
+                f"{targets['stage9_starmask_faint_target']:.2f}/"
+                f"{targets['stage9_starmask_mid_target']:.2f}/"
+                f"{targets['stage9_starmask_bright_target']:.2f}/"
+                f"{targets['stage9_starmask_peak_target']:.2f}); "
+                "PSF and presentation gates unchanged"
+            )
         if star_stretch_used:
             plugin_eligibility = dict(
                 public.get("plugin_formal_eligibility") or {}
@@ -3729,6 +5055,9 @@ def _stage9_starmask_support_preflight(
         pipeline._stage9_starmask_support_preflight = (
             stage9_quality.public_starmask_support_preflight(report)
         )
+        pipeline._stage9_starmask_support_preflight["target_profile"] = dict(
+            getattr(pipeline, "_stage9_starmask_target_profile", {}) or {}
+        )
         messages.append(f"Stage9 starmask support preflight failed: {error}")
         return report
 
@@ -3819,6 +5148,9 @@ def _prepare_stage9_starmask_for_pixel_remix(
         messages.append("Stage9 starmask uses plugin-stretched star layer for pixel remix")
         return stretched_name
     try:
+        starmask_cfg, target_profile = _stage9_effective_starmask_profile(
+            pipeline
+        )
         pipeline.cmd_with_check("load", starmask_name)
         calibration = {
             "status": "unavailable",
@@ -3836,7 +5168,7 @@ def _prepare_stage9_starmask_for_pixel_remix(
                 else:
                     calibration = stage9_quality.calibrate_starmask_asinh(
                         starmask_data,
-                        pipeline.cfg,
+                        starmask_cfg,
                         include_support_mask=True,
                         strict_support=strict_support,
                         support_retry_pixels=support_retry_pixels,
@@ -3846,6 +5178,7 @@ def _prepare_stage9_starmask_for_pixel_remix(
                             None,
                         ),
                     )
+                calibration["target_profile"] = dict(target_profile)
                 support_mask = calibration.get("_compact_support_mask")
                 calibration_advisories = list(
                     calibration.get("advisories") or []
@@ -4224,6 +5557,60 @@ def _stage9_unscreen_context_report(context: Dict[str, Any]) -> Dict[str, Any]:
     return _stage9_unscreen_unavailable("preparation returned no report")
 
 
+def _stage9_load_chroma_rescue_mask(
+    pipeline,
+    contract: Dict[str, Any],
+) -> np.ndarray:
+    """Load one SHA-bound Stage7 chroma mask without accepting path escapes."""
+
+    if not isinstance(contract, dict) or contract.get("schema") != (
+        stage7_stretch_metrics.STAGE7_CHROMA_RESCUE_MASK_SCHEMA
+    ):
+        raise ValueError("Stage7 chroma-rescue mask schema is invalid")
+    process_dir = getattr(pipeline, "process_dir", None)
+    if process_dir is None:
+        raise ValueError("Stage7 chroma-rescue process directory is unavailable")
+    filename = str(contract.get("file") or "")
+    if (
+        not filename
+        or Path(filename).name != filename
+        or not filename.endswith(".npz")
+    ):
+        raise ValueError("Stage7 chroma-rescue mask filename is invalid")
+    root = Path(process_dir).resolve()
+    path = (root / filename).resolve()
+    if path.parent != root or not path.is_file():
+        raise ValueError("Stage7 chroma-rescue mask artifact is unavailable")
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != str(contract.get("container_sha256") or ""):
+        raise ValueError("Stage7 chroma-rescue mask container SHA mismatch")
+    with np.load(path, allow_pickle=False) as archive:
+        if archive.files != ["chroma_keep"]:
+            raise ValueError("Stage7 chroma-rescue mask payload is invalid")
+        values = np.ascontiguousarray(
+            np.asarray(archive["chroma_keep"]),
+            dtype="<f4",
+        )
+    if (
+        values.ndim != 2
+        or [int(value) for value in values.shape]
+        != list(contract.get("shape") or [])
+        or str(values.dtype) != str(contract.get("dtype") or "")
+        or not np.all(np.isfinite(values))
+        or np.any(values < 0.0)
+        or np.any(values > 1.0)
+    ):
+        raise ValueError("Stage7 chroma-rescue mask array is invalid")
+    if stage7_stretch_metrics.stage7_float_array_sha256(values) != str(
+        contract.get("array_sha256") or ""
+    ):
+        raise ValueError("Stage7 chroma-rescue mask array SHA mismatch")
+    return values
+
+
 def _stage9_resolve_matched_domain_transfer(pipeline) -> Dict[str, Any]:
     """Resolve the selected Stage 7 transfer from runtime state or its report."""
 
@@ -4269,6 +5656,52 @@ def _stage9_resolve_matched_domain_transfer(pipeline) -> Dict[str, Any]:
         transfer_schema = str(transfer.get("schema") or "")
         active_transfer_schema = transfer_schema
         active_chain_contract = dict(transfer.get("chain_contract") or {})
+        if transfer_schema == (
+            stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V4
+        ):
+            try:
+                validated = (
+                    stage7_stretch_metrics.validate_adaptive_quantile_matched_domain_transfer(
+                        transfer
+                    )
+                )
+            except (KeyError, TypeError, ValueError, FloatingPointError) as error:
+                return {
+                    "status": "unavailable",
+                    "reason_code": "stage9_adaptive_quantile_transfer_invalid",
+                    "reason": (
+                        "adaptive-quantile matched-domain authentication failed: "
+                        f"{error}"
+                    ),
+                    "selected_candidate_id": selected_candidate_id,
+                }
+            return {
+                "status": "ready",
+                "schema": transfer_schema,
+                "method": "linked_piecewise_linear_quantile_curve",
+                "source": transfer_source,
+                "selected_candidate_id": selected_candidate_id,
+                "tone_candidate_id": str(
+                    transfer.get("tone_candidate_id") or ""
+                ),
+                "calibration": dict(
+                    (validated.get("calibration") or {}).get("calibration")
+                    or {}
+                ),
+                "curve_contract": dict(
+                    validated.get("curve_contract") or {}
+                ),
+                "source_binding": dict(
+                    validated.get("source_binding") or {}
+                ),
+                "winner_binding": dict(
+                    validated.get("winner_binding") or {}
+                ),
+                "chain_contract": dict(
+                    validated.get("chain_contract") or {}
+                ),
+                "fallback_to_linked_mtf_allowed": False,
+            }
         if transfer_schema not in {
             stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V1,
             stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V2,
@@ -4284,6 +5717,101 @@ def _stage9_resolve_matched_domain_transfer(pipeline) -> Dict[str, Any]:
                 ),
                 "reason": "Stage7 matched-domain transfer schema is invalid",
                 "selected_candidate_id": selected_candidate_id,
+            }
+        if method == (
+            stage7_stretch_metrics.STAGE7_BACKGROUND_CHROMA_RESCUE_METHOD
+        ):
+            if transfer_schema != (
+                stage7_stretch_metrics.STAGE7_MATCHED_DOMAIN_TRANSFER_SCHEMA_V3
+            ):
+                return {
+                    "status": "unavailable",
+                    "reason_code": "stage9_matched_domain_transfer_invalid",
+                    "reason": "background chroma rescue requires schema v3",
+                    "selected_candidate_id": selected_candidate_id,
+                }
+            tone_candidate_id = str(transfer.get("tone_candidate_id") or "")
+            parent_candidate_id = str(
+                transfer.get("parent_candidate_id") or ""
+            )
+            params = dict(transfer.get("params") or {})
+            rescue = dict(transfer.get("rescue") or {})
+            mask_contract = dict(rescue.get("mask_contract") or {})
+            active_anchor = (
+                dict(reference.get("active_anchor") or {})
+                if isinstance(reference, dict)
+                else {}
+            )
+            try:
+                rescue_strength = float(rescue["strength"])
+                if not math.isfinite(rescue_strength):
+                    raise ValueError("non-finite rescue strength")
+                if not (
+                    selected_candidate_id.startswith("chroma_rescue_")
+                    and tone_candidate_id == "cand_b"
+                    and parent_candidate_id == "cand_b"
+                    and isinstance(reference, dict)
+                    and reference.get("status") == "active"
+                    and str(active_anchor.get("candidate") or "") == "cand_b"
+                    and str(active_anchor.get("method") or "")
+                    == "closed_form_linked_mtf"
+                    and dict(active_anchor.get("params") or {}) == params
+                    and 0.10 <= rescue_strength <= 0.90
+                    and transfer.get("fallback_to_linked_mtf_allowed") is False
+                ):
+                    raise ValueError("winner/parent binding is invalid")
+                expected_steps = [
+                    {
+                        "index": 0,
+                        "method": "closed_form_linked_mtf",
+                        "params": params,
+                    },
+                    {
+                        "index": 1,
+                        "method": "frozen_background_chroma_rescue",
+                        "strength": rescue_strength,
+                        "mask_contract": mask_contract,
+                    },
+                ]
+                chain_contract = (
+                    stage7_stretch_metrics.validate_matched_domain_chain_contract(
+                        dict(transfer.get("chain_contract") or {}),
+                        expected_steps=expected_steps,
+                    )
+                )
+                chroma_keep = _stage9_load_chroma_rescue_mask(
+                    pipeline,
+                    mask_contract,
+                )
+            except (
+                KeyError,
+                OSError,
+                TypeError,
+                ValueError,
+                FloatingPointError,
+            ) as error:
+                return {
+                    "status": "unavailable",
+                    "reason_code": "stage9_matched_domain_transfer_invalid",
+                    "reason": (
+                        "background chroma rescue authentication failed: "
+                        f"{error}"
+                    ),
+                    "selected_candidate_id": selected_candidate_id,
+                }
+            return {
+                "status": "ready",
+                "schema": transfer_schema,
+                "method": method,
+                "source": transfer_source,
+                "selected_candidate_id": selected_candidate_id,
+                "tone_candidate_id": tone_candidate_id,
+                "parent_candidate_id": parent_candidate_id,
+                "params": params,
+                "rescue": rescue,
+                "chain_contract": chain_contract,
+                "fallback_to_linked_mtf_allowed": False,
+                "_chroma_keep_mask": chroma_keep,
             }
         if method == stage7_stretch_metrics.COMPOSITE_TONE_TRANSFER_METHOD:
             if transfer_schema != (
@@ -4580,6 +6108,9 @@ def _stage9_resolve_matched_domain_transfer(pipeline) -> Dict[str, Any]:
         "method": "closed_form_linked_mtf",
         "source": reference_source,
         "selected_candidate_id": selected_candidate_id or None,
+        "tone_candidate_id": (
+            str((transfer or {}).get("tone_candidate_id") or "") or None
+        ),
         "params": {
             "mtf_shadows": shadows,
             "mtf_midtones": midtones,
@@ -4612,6 +6143,11 @@ def _stage9_apply_matched_domain_transfer(
             image,
             dict(transfer.get("calibration") or {}),
         )
+    if method == "linked_piecewise_linear_quantile_curve":
+        return stage7_stretch_metrics.apply_adaptive_quantile_stretch(
+            image,
+            dict(transfer.get("calibration") or {}),
+        )
     if method == "closed_form_linked_mtf":
         params = dict(transfer.get("params") or {})
         return stage7_stretch_metrics.apply_linked_mtf(
@@ -4619,6 +6155,20 @@ def _stage9_apply_matched_domain_transfer(
             float(params["mtf_shadows"]),
             float(params["mtf_midtones"]),
             float(params.get("mtf_highlights", 1.0)),
+        )
+    if method == (
+        stage7_stretch_metrics.STAGE7_BACKGROUND_CHROMA_RESCUE_METHOD
+    ):
+        params = dict(transfer.get("params") or {})
+        linked = stage7_stretch_metrics.apply_linked_mtf(
+            image,
+            float(params["mtf_shadows"]),
+            float(params["mtf_midtones"]),
+            float(params.get("mtf_highlights", 1.0)),
+        )
+        return stage7_stretch_metrics.apply_frozen_background_chroma_rescue(
+            linked,
+            np.asarray(transfer.get("_chroma_keep_mask")),
         )
     raise ValueError(f"unsupported matched-domain transfer: {method}")
 
@@ -4901,7 +6451,7 @@ def _prepare_stage9_matched_domain_context(
                 "matched_domain_transfer": {
                     key: value
                     for key, value in matched_transfer.items()
-                    if key != "calibration"
+                    if key != "calibration" and not str(key).startswith("_")
                 },
                 "mtf_reference": (
                     {
@@ -4909,7 +6459,11 @@ def _prepare_stage9_matched_domain_context(
                         "method": transfer_method,
                         "params": dict(matched_transfer.get("params") or {}),
                     }
-                    if transfer_method == "closed_form_linked_mtf"
+                    if transfer_method
+                    in {
+                        "closed_form_linked_mtf",
+                        stage7_stretch_metrics.STAGE7_BACKGROUND_CHROMA_RESCUE_METHOD,
+                    }
                     else {
                         "status": "not_applicable",
                         "method": transfer_method,
@@ -5034,6 +6588,16 @@ def _prepare_stage9_unscreen_candidate(
         if support_source is None:
             raise RuntimeError("current compact star overlay support is unavailable")
         support = np.asarray(support_source, dtype=np.float32) > 1e-6
+        starmask_profile = dict(
+            getattr(pipeline, "_stage9_starmask_target_profile", {}) or {}
+        )
+        unscreen_amplitude_blend = (
+            0.55
+            if starmask_profile.get("status") == "active"
+            and starmask_profile.get("profile_id")
+            == "bright_composite_compact_flux_v1"
+            else 1.0
+        )
         stabilized, public_report = (
             stage9_quality.build_chroma_stable_unscreen_layer(
                 original_display,
@@ -5041,6 +6605,7 @@ def _prepare_stage9_unscreen_candidate(
                 trusted,
                 support,
                 pipeline.cfg,
+                amplitude_blend=unscreen_amplitude_blend,
             )
         )
         public_report.update(
@@ -5051,6 +6616,10 @@ def _prepare_stage9_unscreen_candidate(
                 "trusted_star_domain": trusted_domain,
                 "matched_domain": matched_report,
                 "mtf_reference": matched_report.get("mtf_reference") or {},
+                "target_profile_id": starmask_profile.get("profile_id"),
+                "target_profile_unscreen_amplitude_blend": (
+                    unscreen_amplitude_blend
+                ),
             }
         )
         if stabilized is None:
@@ -5076,6 +6645,24 @@ def _prepare_stage9_unscreen_candidate(
                 set_pixels(stabilized)
         if not pipeline._save_stage_output(output_name):
             raise RuntimeError("stabilized Unscreen star-layer save failed")
+        remix_base_stem = str(
+            getattr(pipeline, "_stage9_remix_base_stem", "") or ""
+        )
+        if not remix_base_stem:
+            raise RuntimeError("actual Stage8 remix-base stem is unavailable")
+        pipeline.cmd_with_check("load", remix_base_stem)
+        remix_base = get_pixels(preview=False)
+        if remix_base is None:
+            raise RuntimeError("actual Stage8 remix-base pixels are unavailable")
+        if np.asarray(remix_base).shape != original_display.shape:
+            raise RuntimeError(
+                "actual Stage8 remix-base shape does not match O: "
+                f"{np.asarray(remix_base).shape}!={original_display.shape}"
+            )
+        # The base is retained only as immutable in-memory evidence.  Restore
+        # the saved star layer before returning so the caller's transaction
+        # state remains unchanged.
+        pipeline.cmd_with_check("load", output_name)
         weak_mask = getattr(pipeline, "_stage9_last_weak_overlay_mask", None)
         bright_mask = getattr(pipeline, "_stage9_last_bright_overlay_mask", None)
         candidate_masks = dict(
@@ -5104,6 +6691,9 @@ def _prepare_stage9_unscreen_candidate(
             "report": public_report,
             "original_display": original_display,
             "starless_display": starless_display,
+            "remix_base": np.array(remix_base, copy=True),
+            "remix_base_stem": remix_base_stem,
+            "matched_domain_authenticated": True,
             **(
                 {
                     "source_autostretch_display": matched_context[
@@ -5131,6 +6721,18 @@ def _prepare_stage9_unscreen_candidate(
         TypeError,
         ValueError,
     ) as error:
+        try:
+            pipeline.cmd_with_check("load", output_name)
+        except (
+            AttributeError,
+            CommandError,
+            OSError,
+            RuntimeError,
+            SirilError,
+            TypeError,
+            ValueError,
+        ):
+            pass
         report = _stage9_unscreen_unavailable(str(error))
         report.update(
             pair_verification=pair_verification,
@@ -5397,6 +6999,11 @@ def _prepare_stage9_source_presence_candidate(
     return {
         **context,
         "report": report,
+        # Keep both context aliases bound to the exact same source-presence
+        # layer.  A prior contraction may have populated ``stars``; retaining
+        # that stale alias would make the post-presence closure contract the
+        # parent layer instead of the candidate that just passed the gates.
+        "stars": candidate,
         "unscreen_stars": candidate,
         "support_mask": support,
         "weak_mask": weak_mask,
@@ -5510,6 +7117,7 @@ def _prepare_stage9_selective_size_candidate(
     return {
         **context,
         "report": public_report,
+        "stars": selective,
         "unscreen_stars": selective,
         "support_mask": np.asarray(selective_support, dtype=bool),
         "weak_mask": weak_mask,
@@ -5648,6 +7256,7 @@ def _stage9_extend_rescue_with_source_presence(
     intensity: float,
     messages: List[str],
     remix_attempts: List[Dict[str, Any]],
+    review_candidate_registry: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     """Compete bounded source-wing strengths without relaxing hard gates."""
     accepted_context = dict(accepted_context)
@@ -5792,7 +7401,25 @@ def _stage9_extend_rescue_with_source_presence(
                 "PSF/highlight/structure gates after Unscreen rescue "
                 f"(feather_strength={feather_strength:.2f})"
             )
-            return quality, source_context
+            return _stage9_close_accepted_psf_soft_target(
+                pipeline,
+                source_stem=source_stem,
+                parent_quality=quality,
+                parent_context=source_context,
+                intensity=intensity,
+                support_mode=str(
+                    quality.get("support_mode")
+                    or source_context.get("support_mode")
+                    or "unknown"
+                ),
+                messages=messages,
+                remix_attempts=remix_attempts,
+                review_candidate_registry=(
+                    review_candidate_registry
+                    if review_candidate_registry is not None
+                    else []
+                ),
+            )
 
         messages.append(
             "Stage9 source-presence candidate rejected; retrying with lower "
@@ -6083,14 +7710,48 @@ def _stage9_reference_fidelity(
     intensity: float,
     state: Dict[str, Any],
 ) -> Dict[str, Any]:
+    original_display = context.get("original_display")
+    remix_base = context.get("remix_base")
+    matched_report = (
+        (context.get("report") or {}).get("matched_domain")
+        if isinstance(context.get("report"), Mapping)
+        else None
+    )
+    matched_domain_authenticated = bool(
+        context.get("matched_domain_authenticated", False)
+        or (
+            isinstance(matched_report, Mapping)
+            and matched_report.get("status") == "ready"
+            and matched_report.get("available") is True
+        )
+    )
+    if original_display is None or remix_base is None:
+        return {
+            "schema": "starun.stage9-reference-fidelity.v1",
+            "status": "unavailable",
+            "reason": (
+                "authenticated original_display and actual Stage8 remix_base "
+                "B are required"
+            ),
+            "reference_base_role": "actual_stage8_remix_base_B",
+            "matched_domain_authenticated": matched_domain_authenticated,
+        }
+    if not matched_domain_authenticated:
+        return {
+            "schema": "starun.stage9-reference-fidelity.v1",
+            "status": "unavailable",
+            "reason": "original_display matched-domain authentication is missing",
+            "reference_base_role": "actual_stage8_remix_base_B",
+            "matched_domain_authenticated": False,
+        }
     configured_weak_intensity = _clamp_float(
         getattr(pipeline.cfg, "stage9_weak_star_screen_intensity_min", 0.55),
         0.10,
         1.05,
     )
-    return stage9_quality.assess_unscreen_reference_fidelity(
-        context["original_display"],
-        context["starless_display"],
+    result = stage9_quality.assess_unscreen_reference_fidelity(
+        original_display,
+        remix_base,
         stars,
         intensity=float(intensity),
         support_mask=context["support_mask"],
@@ -6099,6 +7760,179 @@ def _stage9_reference_fidelity(
         bright_mask=state.get("bright_mask"),
         weak_intensity=max(float(intensity), configured_weak_intensity),
     )
+    result.update(
+        reference_original_role="authenticated_matched_domain_original_O",
+        reference_base_role="actual_stage8_remix_base_B",
+        reference_base_stem=str(context.get("remix_base_stem") or ""),
+        matched_domain_authenticated=True,
+        stage6_starless_used_as_base=False,
+    )
+    return result
+
+
+def _stage9_actual_base_fidelity_ready(report: Any) -> bool:
+    """Return whether fidelity is bound to authenticated O and actual Stage8 B."""
+    if not isinstance(report, Mapping):
+        return False
+    if (
+        report.get("status") != "ok"
+        or report.get("reference_base_role") != "actual_stage8_remix_base_B"
+        or report.get("matched_domain_authenticated") is not True
+        or report.get("stage6_starless_used_as_base") is not False
+        or report.get("reference_base_identity_verified") is not True
+    ):
+        return False
+    pixel_sha256_value = str(
+        report.get("reference_base_pixel_sha256") or ""
+    ).lower()
+    if not (
+        len(pixel_sha256_value) == 64
+        and all(character in "0123456789abcdef" for character in pixel_sha256_value)
+    ):
+        return False
+    try:
+        mae = float(report["support_rgb_mae"])
+        p95 = float(report["support_rgb_p95"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return bool(math.isfinite(mae) and math.isfinite(p95))
+
+
+def _stage9_actual_base_identity_report(
+    pipeline,
+    *,
+    source_stem: str,
+    pixel_sha256_value: str,
+) -> Dict[str, Any]:
+    """Bind in-memory B pixels to the locked FITS and verified Stage8 handoff."""
+
+    def valid_sha256(value: Any) -> bool:
+        text = str(value or "").lower()
+        return bool(
+            len(text) == 64
+            and all(character in "0123456789abcdef" for character in text)
+        )
+
+    identity = getattr(pipeline, "_stage9_remix_base_identity", None)
+    verifier = getattr(pipeline, "_stage9_verify_remix_base_identity", None)
+    if callable(verifier):
+        try:
+            identity = verifier(source_stem)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            identity = {
+                "status": "rejected",
+                "source_stem": source_stem,
+                "reason": str(error),
+            }
+    identity = dict(identity) if isinstance(identity, Mapping) else {}
+    checks: Dict[str, bool] = {
+        "pixel_sha256_well_formed": valid_sha256(pixel_sha256_value),
+        "locked_artifact_identity": bool(
+            identity.get("status") in {"locked", "verified"}
+            and str(identity.get("source_stem") or "") == str(source_stem)
+            and valid_sha256(identity.get("sha256"))
+        ),
+    }
+    identity_fits_data_sha = str(identity.get("fits_data_sha256") or "")
+    identity_decoded_pixel_sha = str(
+        identity.get("decoded_pixel_sha256") or ""
+    )
+    checks.update(
+        locked_fits_data_identity=bool(
+            valid_sha256(identity_fits_data_sha)
+            and identity.get("fits_data_sha256_method")
+            == FITS_DATA_SHA256_METHOD
+        ),
+        locked_decoded_pixel_identity=bool(
+            valid_sha256(identity_decoded_pixel_sha)
+            and identity.get("decoded_pixel_sha256_method")
+            == DECODED_PIXEL_SHA256_METHOD
+            and identity_decoded_pixel_sha == pixel_sha256_value
+        ),
+    )
+
+    handoff = getattr(
+        pipeline,
+        "_stage9_stage8_handoff_verification",
+        None,
+    )
+    handoff = dict(handoff) if isinstance(handoff, Mapping) else {}
+    artifact = handoff.get("artifact")
+    artifact = dict(artifact) if isinstance(artifact, Mapping) else {}
+    expected_pixel_sha = str(artifact.get("expected_pixel_sha256") or "")
+    actual_pixel_sha = str(artifact.get("actual_pixel_sha256") or "")
+    expected_fits_data_sha = str(
+        artifact.get("expected_fits_data_sha256") or ""
+    )
+    actual_fits_data_sha = str(
+        artifact.get("actual_fits_data_sha256") or ""
+    )
+    expected_decoded_pixel_sha = str(
+        artifact.get("expected_decoded_pixel_sha256") or ""
+    )
+    actual_decoded_pixel_sha = str(
+        artifact.get("actual_decoded_pixel_sha256") or ""
+    )
+    expected_container_sha = str(artifact.get("expected_sha256") or "")
+    actual_container_sha = str(artifact.get("actual_sha256") or "")
+    checks.update(
+        handoff_v3_verified=bool(
+            handoff.get("handoff_schema") == "starun.stage8-handoff.v3"
+            and handoff.get("verified") is True
+            and handoff.get("status") == "verified"
+        ),
+        handoff_expected_fits_pixel_identity=bool(
+            valid_sha256(expected_pixel_sha)
+            and expected_pixel_sha == identity_fits_data_sha
+        ),
+        handoff_actual_fits_pixel_identity=bool(
+            valid_sha256(actual_pixel_sha)
+            and actual_pixel_sha == identity_fits_data_sha
+        ),
+        handoff_expected_fits_data_identity=bool(
+            artifact.get("fits_data_sha256_method")
+            == FITS_DATA_SHA256_METHOD
+            and valid_sha256(expected_fits_data_sha)
+            and expected_fits_data_sha == identity_fits_data_sha
+        ),
+        handoff_actual_fits_data_identity=bool(
+            valid_sha256(actual_fits_data_sha)
+            and actual_fits_data_sha == identity_fits_data_sha
+        ),
+        handoff_expected_decoded_pixel_identity=bool(
+            artifact.get("decoded_pixel_sha256_method")
+            == DECODED_PIXEL_SHA256_METHOD
+            and valid_sha256(expected_decoded_pixel_sha)
+            and expected_decoded_pixel_sha == pixel_sha256_value
+        ),
+        handoff_actual_decoded_pixel_identity=bool(
+            valid_sha256(actual_decoded_pixel_sha)
+            and actual_decoded_pixel_sha == pixel_sha256_value
+        ),
+        handoff_expected_container_identity=bool(
+            valid_sha256(expected_container_sha)
+            and expected_container_sha == identity.get("sha256")
+        ),
+        handoff_actual_container_identity=bool(
+            valid_sha256(actual_container_sha)
+            and actual_container_sha == identity.get("sha256")
+        ),
+    )
+
+    accepted = bool(checks and all(checks.values()))
+    return {
+        "schema": "starun.stage9-actual-remix-base-identity.v1",
+        "status": "verified" if accepted else "rejected",
+        "accepted": accepted,
+        "source_stem": str(source_stem),
+        "pixel_sha256": str(pixel_sha256_value),
+        "pixel_sha256_method": DECODED_PIXEL_SHA256_METHOD,
+        "fits_data_sha256": identity_fits_data_sha or None,
+        "locked_container_sha256": identity.get("sha256"),
+        "checks": checks,
+        "locked_identity": identity,
+        "stage8_handoff": handoff,
+    }
 
 
 def _capture_stage9_candidate_state(pipeline) -> Dict[str, Any]:
@@ -6391,29 +8225,19 @@ def _stage9_psf_contraction_target_groups(
     pipeline,
     quality: Dict[str, Any],
 ) -> tuple[str, ...]:
-    """Return only the frozen ordinary-star groups above the hard PSF limit."""
+    """Return frozen ordinary-star groups above the 1.05 soft target."""
     ratios = _stage9_psf_group_ratios(quality)
     if not ratios:
         return ()
-    closure = quality.get("psf_closure") or {}
-    limits = closure.get("limits") or {}
-    try:
-        hard_max = float(
-            limits.get(
-                "stage9_psf_fwhm_ratio_max",
-                getattr(pipeline.cfg, "stage9_psf_fwhm_ratio_max", 1.10),
-            )
-        )
-    except (TypeError, ValueError):
-        hard_max = 1.10
+    target_max = _stage9_psf_recovery_target_max(pipeline, quality)
     groups = tuple(
         group
         for group in ("weak", "bright")
-        if group in ratios and ratios[group] > hard_max
+        if group in ratios and ratios[group] > target_max
     )
     if groups:
         return groups
-    if ratios.get("all", 0.0) > hard_max:
+    if ratios.get("all", 0.0) > target_max:
         return ("all",)
     return ()
 
@@ -6422,14 +8246,455 @@ def _stage9_is_psf_large_only_failure(
     pipeline,
     quality: Dict[str, Any],
 ) -> bool:
+    target_groups = _stage9_psf_contraction_target_groups(pipeline, quality)
+    if not target_groups:
+        return False
+    ratios = _stage9_psf_group_ratios(quality)
+    # A full Stage9 assessment can accept a half-max measurement only through
+    # its bounded pixel-quantization advisory.  That acceptance proves every
+    # scientific gate is already closed, but it does not waive the unified
+    # 0.97..1.05 presentation target.  Let the exact-rollback contraction
+    # transaction close that target even when the raw discrete ratio is above
+    # 1.10; an otherwise rejected hard failure still follows the strict path
+    # below and remains ineligible.
     if bool(quality.get("accepted", False)):
+        return True
+    closure = quality.get("psf_closure") or {}
+    limits = closure.get("limits") or {}
+    try:
+        fallback_hard_max = float(
+            limits.get(
+                "stage9_psf_fwhm_ratio_max",
+                getattr(pipeline.cfg, "stage9_psf_fwhm_ratio_max", 1.10),
+            )
+        )
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(fallback_hard_max):
+        return False
+    fallback_hard_max = min(fallback_hard_max, 1.10)
+    target_max = _stage9_psf_recovery_target_max(pipeline, quality)
+    for group_name, ratio in ratios.items():
+        group_report = (closure.get("groups") or {}).get(group_name) or {}
+        try:
+            hard_max = float(
+                group_report.get("ratio_max", fallback_hard_max)
+            )
+        except (TypeError, ValueError):
+            return False
+        hard_max = min(hard_max, fallback_hard_max)
+        if not math.isfinite(hard_max) or ratio > hard_max:
+            return False
+    if any(
+        group not in ratios
+        or not (target_max < ratios[group] <= fallback_hard_max)
+        for group in target_groups
+    ):
         return False
     if _stage9_psf_size_direction(quality) != "large":
         return False
-    if not _stage9_psf_contraction_target_groups(pipeline, quality):
-        return False
     issues = [str(item).lower() for item in quality.get("issues", [])]
     return bool(issues) and all("star_psf_fwhm" in issue for issue in issues)
+
+
+def _stage9_psf_contraction_nonregression(
+    parent_quality: Dict[str, Any],
+    candidate_quality: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Reject a soft-PSF improvement that degrades any other measured gate."""
+
+    parent_metrics = dict(parent_quality.get("metrics") or {})
+    candidate_metrics = dict(candidate_quality.get("metrics") or {})
+    high_metrics = (
+        "finite_ratio",
+        "weak_star_recovery_ratio",
+        "bright_star_recovery_ratio",
+        "star_recovery_ratio",
+        "star_positive_delta_window_recovery_ratio",
+        "star_wing_recovery_ratio",
+        "saturated_star_wing_recovery_ratio",
+        "catalog_star_visibility_ratio_all",
+        "catalog_star_visibility_ratio_weak",
+        "catalog_star_visibility_ratio_bright",
+        "catalog_star_visibility_visible_count_all",
+        "catalog_star_visibility_visible_count_weak",
+        "catalog_star_visibility_visible_count_bright",
+        "catalog_star_visibility_contrast_p50",
+        "catalog_star_visibility_contrast_p95",
+        "local_confirmed_star_support_ratio",
+    )
+    low_metrics = (
+        "highlight_clip_ratio_after",
+        "highlight_clip_growth",
+        "bright_pixel_ratio_after",
+        "bright_pixel_growth",
+        "background_mottling_growth",
+        "background_mottling_score_after",
+        "background_mottling_delta",
+        "background_lift",
+        "changed_pixel_ratio",
+        "chromatic_star_addition_ratio",
+        "star_support_ratio",
+        "unmatched_changed_ratio",
+        "darkening_ratio",
+        "residual_dark_hole_ratio",
+        "new_hollow_structure_count",
+        "new_hollow_structure_max_area",
+        "local_connected_component_max_area",
+        "local_nonstellar_shape_component_count",
+        "local_nonstellar_shape_component_max_area",
+        "local_single_pixel_component_ratio",
+        "local_cyan_blue_component_count",
+        "local_cyan_blue_component_max_area",
+        "local_cyan_blue_pixel_ratio",
+        "core_color_jump_component_count",
+        "core_color_jump_component_max_area",
+        "core_color_jump_pixel_ratio",
+        "local_color_risk_score",
+    )
+    exact_metrics = (
+        "catalog_star_visibility_reference_count_all",
+        "catalog_star_visibility_reference_count_weak",
+        "catalog_star_visibility_reference_count_bright",
+        "star_wing_reference_count",
+        "star_dark_hole_reference_count",
+    )
+    comparisons: Dict[str, Any] = {}
+    issues: List[str] = []
+
+    def finite(metrics: Mapping[str, Any], name: str) -> Optional[float]:
+        try:
+            value = float(metrics[name])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    for name in high_metrics:
+        parent_value = finite(parent_metrics, name)
+        candidate_value = finite(candidate_metrics, name)
+        if parent_value is None:
+            continue
+        accepted = bool(
+            candidate_value is not None and candidate_value >= parent_value
+        )
+        comparisons[name] = {
+            "direction": "higher_is_better",
+            "parent": parent_value,
+            "candidate": candidate_value,
+            "tolerance": 0.0,
+            "accepted": accepted,
+        }
+        if not accepted:
+            issues.append(f"psf_contraction_regressed:{name}")
+    for name in low_metrics:
+        parent_value = finite(parent_metrics, name)
+        candidate_value = finite(candidate_metrics, name)
+        if parent_value is None:
+            continue
+        accepted = bool(
+            candidate_value is not None and candidate_value <= parent_value
+        )
+        comparisons[name] = {
+            "direction": "lower_is_better",
+            "parent": parent_value,
+            "candidate": candidate_value,
+            "tolerance": 0.0,
+            "accepted": accepted,
+        }
+        if not accepted:
+            issues.append(f"psf_contraction_regressed:{name}")
+    for name in exact_metrics:
+        parent_value = finite(parent_metrics, name)
+        if parent_value is None:
+            continue
+        candidate_value = finite(candidate_metrics, name)
+        accepted = bool(
+            candidate_value is not None and candidate_value == parent_value
+        )
+        comparisons[name] = {
+            "direction": "must_equal",
+            "parent": parent_value,
+            "candidate": candidate_value,
+            "tolerance": 0.0,
+            "accepted": accepted,
+        }
+        if not accepted:
+            issues.append(f"psf_contraction_regressed:{name}")
+
+    def nested_finite(payload: Mapping[str, Any], path: tuple[str, ...]) -> Optional[float]:
+        current: Any = payload
+        for item in path:
+            if not isinstance(current, Mapping) or item not in current:
+                return None
+            current = current[item]
+        try:
+            value = float(current)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    nested_metrics = (
+        (
+            "star_color_median_chroma_error",
+            ("star_color_validation", "metrics", "median_chroma_error"),
+            "lower_is_better",
+        ),
+        (
+            "star_color_extreme_chroma_outlier_ratio",
+            (
+                "star_color_validation",
+                "metrics",
+                "extreme_chroma_outlier_ratio",
+            ),
+            "lower_is_better",
+        ),
+        (
+            "star_color_sample_count",
+            ("star_color_validation", "metrics", "sample_count"),
+            "must_equal",
+        ),
+        (
+            "bright_star_presence_recovery_ratio",
+            ("bright_star_presence", "recovery_ratio"),
+            "higher_is_better",
+        ),
+        (
+            "bright_star_presence_saturated_recovery_ratio",
+            ("bright_star_presence", "saturated_recovery_ratio"),
+            "higher_is_better",
+        ),
+        (
+            "reference_fidelity_support_rgb_mae",
+            ("reference_fidelity", "support_rgb_mae"),
+            "lower_is_better",
+        ),
+        (
+            "reference_fidelity_support_rgb_p95",
+            ("reference_fidelity", "support_rgb_p95"),
+            "lower_is_better",
+        ),
+    )
+    for name, path, direction in nested_metrics:
+        parent_value = nested_finite(parent_quality, path)
+        if parent_value is None:
+            continue
+        candidate_value = nested_finite(candidate_quality, path)
+        accepted = bool(
+            candidate_value is not None
+            and (
+                candidate_value >= parent_value
+                if direction == "higher_is_better"
+                else candidate_value == parent_value
+                if direction == "must_equal"
+                else candidate_value <= parent_value
+            )
+        )
+        comparisons[name] = {
+            "direction": direction,
+            "parent": parent_value,
+            "candidate": candidate_value,
+            "tolerance": 0.0,
+            "accepted": accepted,
+        }
+        if not accepted:
+            issues.append(f"psf_contraction_regressed:{name}")
+    return {
+        "schema": "starun.stage9-psf-contraction-nonregression.v1",
+        "accepted": not issues,
+        "issues": issues,
+        "metrics": comparisons,
+    }
+
+
+def _stage9_catalog_coordinate_snapshot(
+    catalog: Mapping[str, Any],
+) -> Dict[str, np.ndarray]:
+    """Freeze the coordinate-bearing catalog arrays used by local PSF work."""
+    snapshot: Dict[str, np.ndarray] = {}
+    for name in (
+        "_component_ids",
+        "_peak_y",
+        "_peak_x",
+        "_source_peak_y",
+        "_source_peak_x",
+        "_display_source_peak_y",
+        "_display_source_peak_x",
+    ):
+        if name in catalog:
+            snapshot[name] = np.array(catalog[name], copy=True)
+    return snapshot
+
+
+def _stage9_catalog_coordinate_digest(
+    snapshot: Mapping[str, np.ndarray],
+) -> str | None:
+    """Return a stable identity for a frozen Stage9 catalog coordinate set."""
+    if not snapshot or not {"_peak_y", "_peak_x"}.issubset(snapshot):
+        return None
+    digest = hashlib.sha256()
+    for name in sorted(snapshot):
+        array = np.ascontiguousarray(np.asarray(snapshot[name]))
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tuple(int(value) for value in array.shape)).encode("ascii"))
+        digest.update(str(array.dtype).encode("ascii"))
+        digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _stage9_restore_catalog_coordinates(
+    catalog: Dict[str, Any],
+    snapshot: Mapping[str, np.ndarray],
+) -> None:
+    """Restore exact frozen coordinates after a mutating candidate operator."""
+    coordinate_names = {
+        "_component_ids",
+        "_peak_y",
+        "_peak_x",
+        "_source_peak_y",
+        "_source_peak_x",
+        "_display_source_peak_y",
+        "_display_source_peak_x",
+    }
+    for name in coordinate_names - set(snapshot):
+        catalog.pop(name, None)
+    for name, values in snapshot.items():
+        catalog[name] = np.array(values, copy=True)
+
+
+def _stage9_psf_catalog_snapshot(
+    catalog: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Freeze every private array plus the full per-star PSF measurements."""
+    required = {
+        "_labels",
+        "_component_ids",
+        "_peak_y",
+        "_peak_x",
+        "_source_peak_y",
+        "_source_peak_x",
+        "_display_source_peak_y",
+        "_display_source_peak_x",
+        "_weak_flags",
+        "_psf_valid_flags",
+        "_psf_saturated_flags",
+        "_display_source_fwhm_px",
+        "_display_source_halfmax_area_px",
+        "_stage9_spatial_fwhm_px",
+        "_psf_measurements",
+    }
+    if not required.issubset(catalog):
+        return {}
+    snapshot: Dict[str, Any] = {
+        "__meta__": {
+            "status": str(catalog.get("status") or ""),
+            "source_matched": bool(catalog.get("source_matched", False)),
+            "psf_reference_status": str(
+                catalog.get("psf_reference_status") or ""
+            ),
+            "psf_sample_count": int(catalog.get("psf_sample_count", 0) or 0),
+        }
+    }
+    for name, value in catalog.items():
+        if str(name).startswith("_") and isinstance(value, np.ndarray):
+            snapshot[str(name)] = np.array(value, copy=True)
+    snapshot["_psf_measurements"] = copy.deepcopy(
+        catalog.get("_psf_measurements")
+    )
+    component_count = int(
+        np.asarray(snapshot.get("_component_ids", ())).size
+    )
+    measurements = snapshot.get("_psf_measurements")
+    if component_count <= 0 or not isinstance(measurements, list):
+        return {}
+    if len(measurements) != component_count:
+        return {}
+    for name in required - {"_labels", "_psf_measurements"}:
+        if np.asarray(snapshot.get(name, ())).size != component_count:
+            return {}
+    return snapshot
+
+
+def _stage9_psf_catalog_digest(
+    snapshot: Mapping[str, Any],
+) -> str | None:
+    """Hash the complete frozen PSF evidence used by boundary pruning."""
+    if not snapshot or "_psf_measurements" not in snapshot:
+        return None
+    digest = hashlib.sha256()
+
+    def update(value: Any) -> None:
+        if isinstance(value, np.ndarray):
+            array = np.ascontiguousarray(value)
+            digest.update(b"array\0")
+            digest.update(str(tuple(int(item) for item in array.shape)).encode())
+            digest.update(str(array.dtype).encode())
+            digest.update(array.tobytes(order="C"))
+        elif isinstance(value, Mapping):
+            digest.update(b"mapping\0")
+            for key in sorted(value, key=lambda item: str(item)):
+                digest.update(str(key).encode("utf-8"))
+                digest.update(b"\0")
+                update(value[key])
+        elif isinstance(value, (list, tuple)):
+            digest.update(b"sequence\0")
+            digest.update(str(len(value)).encode("ascii"))
+            for item in value:
+                update(item)
+        elif isinstance(value, np.generic):
+            update(value.item())
+        elif isinstance(value, float) and not math.isfinite(value):
+            digest.update(f"float:{value!r}".encode("ascii"))
+        else:
+            digest.update(
+                json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+        digest.update(b"\xff")
+
+    update(snapshot)
+    return digest.hexdigest()
+
+
+def _stage9_restore_psf_catalog(
+    catalog: Dict[str, Any],
+    snapshot: Mapping[str, Any],
+) -> None:
+    """Restore private PSF evidence after any transaction identity failure."""
+    meta = snapshot.get("__meta__")
+    if isinstance(meta, Mapping):
+        catalog["status"] = str(meta.get("status") or "")
+        catalog["source_matched"] = bool(
+            meta.get("source_matched", False)
+        )
+        catalog["psf_reference_status"] = str(
+            meta.get("psf_reference_status") or ""
+        )
+        catalog["psf_sample_count"] = int(
+            meta.get("psf_sample_count", 0) or 0
+        )
+    frozen_names = {
+        name
+        for name in snapshot
+        if str(name).startswith("_")
+    }
+    for name, value in list(catalog.items()):
+        if (
+            str(name).startswith("_")
+            and (isinstance(value, np.ndarray) or name == "_psf_measurements")
+            and name not in frozen_names
+        ):
+            catalog.pop(name, None)
+    for name in frozen_names:
+        value = snapshot[name]
+        catalog[name] = (
+            np.array(value, copy=True)
+            if isinstance(value, np.ndarray)
+            else copy.deepcopy(value)
+        )
 
 
 def _stage9_is_chroma_only_failure(quality: Dict[str, Any]) -> bool:
@@ -6506,11 +8771,17 @@ def _stage9_formal_candidate_score(
     quality: Dict[str, Any],
     *,
     support_mode: str,
+    soft_target_min: float = 0.97,
+    soft_target_max: float = 1.05,
 ) -> tuple[float, ...]:
     """Rank every formally accepted Screen/Unscreen candidate uniformly."""
     if not bool(quality.get("accepted", False)):
-        return (float("inf"),) * 9
+        return (float("inf"),) * 10
     ratios = tuple(_stage9_psf_group_ratios(quality).values())
+    soft_target_closed = bool(ratios) and all(
+        float(soft_target_min) <= value <= float(soft_target_max)
+        for value in ratios
+    )
     worst_psf = (
         max(abs(value - 1.0) for value in ratios) if ratios else float("inf")
     )
@@ -6558,6 +8829,7 @@ def _stage9_formal_candidate_score(
     return (
         1.0 if _stage9_psf_uncertainty_exemption_used(quality) else 0.0,
         visibility_deficit,
+        0.0 if soft_target_closed else 1.0,
         worst_psf,
         fidelity_mae,
         -min(recoveries),
@@ -6976,6 +9248,14 @@ def _stage9_targeted_soft_psf_recovery(
                     "score": _stage9_formal_candidate_score(
                         quality,
                         support_mode=support_mode,
+                        soft_target_min=_stage9_psf_recovery_target_min(
+                            pipeline,
+                            quality,
+                        ),
+                        soft_target_max=_stage9_psf_recovery_target_max(
+                            pipeline,
+                            quality,
+                        ),
                     ),
                 }
                 if best is None or record["score"] < best["score"]:
@@ -7064,6 +9344,22 @@ def _stage9_targeted_psf_contraction(
         or catalog.get("status") != "ok"
     ):
         return parent_quality, parent_context
+    catalog_coordinate_snapshot = _stage9_catalog_coordinate_snapshot(catalog)
+    catalog_coordinate_sha256 = _stage9_catalog_coordinate_digest(
+        catalog_coordinate_snapshot
+    )
+    if catalog_coordinate_sha256 is None:
+        parent_quality["psf_contraction_catalog_identity"] = {
+            "schema": "starun.stage9-psf-catalog-identity.v1",
+            "status": "rejected",
+            "accepted": False,
+            "reason": "frozen Stage9 catalog coordinates are unavailable",
+        }
+        messages.append(
+            "Stage9 skipped PSF contraction because frozen catalog coordinate "
+            "identity could not be established"
+        )
+        return parent_quality, parent_context
 
     parent_checkpoint = (
         f"stage9_candidate_{support_mode}_"
@@ -7076,10 +9372,159 @@ def _stage9_targeted_psf_contraction(
         )
         return parent_quality, parent_context
     parent_state = _capture_stage9_candidate_state(pipeline)
+    original_parent_context = parent_context
+    parent_context = dict(parent_context)
+
+    matched_context = getattr(pipeline, "_stage9_matched_domain_context", None)
+    if (
+        isinstance(matched_context, Mapping)
+        and matched_context.get("available") is True
+        and isinstance(matched_context.get("report"), Mapping)
+        and (matched_context.get("report") or {}).get("status") == "ready"
+        and matched_context.get("original_display") is not None
+    ):
+        parent_context["original_display"] = matched_context[
+            "original_display"
+        ]
+        if matched_context.get("starless_display") is not None:
+            parent_context["starless_display"] = matched_context[
+                "starless_display"
+            ]
+        parent_context["matched_domain_authenticated"] = True
+
+    if (
+        parent_context.get("remix_base") is None
+        and parent_context.get("original_display") is not None
+    ):
+        try:
+            get_pixels = getattr(pipeline.siril, "get_image_pixeldata", None)
+            if not callable(get_pixels):
+                raise RuntimeError("Siril pixel reader unavailable")
+            remix_base_stem = str(
+                getattr(pipeline, "_stage9_remix_base_stem", source_stem)
+                or source_stem
+            )
+            pipeline.cmd_with_check("load", remix_base_stem)
+            remix_base = get_pixels(preview=False)
+            if remix_base is None:
+                raise RuntimeError("actual Stage8 remix-base pixels unavailable")
+            if np.asarray(remix_base).shape != np.asarray(
+                parent_context["original_display"]
+            ).shape:
+                raise RuntimeError(
+                    "actual Stage8 remix-base shape does not match O"
+                )
+            parent_context["remix_base"] = np.array(remix_base, copy=True)
+            parent_context["remix_base_stem"] = remix_base_stem
+        except (
+            AttributeError,
+            CommandError,
+            RuntimeError,
+            SirilError,
+            TypeError,
+            ValueError,
+        ) as error:
+            messages.append(
+                "Stage9 could not bind PSF contraction to actual Stage8 B: "
+                f"{error}"
+            )
+        finally:
+            _restore_stage9_candidate_state(
+                pipeline,
+                parent_state,
+                checkpoint_stem=parent_checkpoint,
+            )
+
+    if all(
+        parent_context.get(name) is not None
+        for name in ("original_display", "remix_base")
+    ) and bool(parent_context.get("matched_domain_authenticated", False)):
+        parent_reference_fidelity = _stage9_reference_fidelity(
+            pipeline,
+            parent_context,
+            np.asarray(stars),
+            intensity,
+            {
+                "alpha_mask": support,
+                "weak_mask": weak_mask,
+                "bright_mask": bright_mask,
+            },
+        )
+        if parent_reference_fidelity.get("status") == "ok":
+            reference_base_pixel_sha256 = canonical_decoded_pixel_sha256(
+                np.asarray(parent_context["remix_base"])
+            )
+            reference_base_stem = str(
+                parent_context.get("remix_base_stem") or source_stem
+            )
+            reference_base_identity = _stage9_actual_base_identity_report(
+                pipeline,
+                source_stem=reference_base_stem,
+                pixel_sha256_value=reference_base_pixel_sha256,
+            )
+            parent_reference_fidelity.update(
+                reference_base_pixel_sha256=reference_base_pixel_sha256,
+                reference_base_stem=reference_base_stem,
+                reference_base_identity=reference_base_identity,
+                reference_base_identity_verified=bool(
+                    reference_base_identity.get("accepted", False)
+                ),
+            )
+    else:
+        parent_reference_fidelity = copy.deepcopy(
+            parent_quality.get("reference_fidelity") or {}
+        )
+    if not _stage9_actual_base_fidelity_ready(parent_reference_fidelity):
+        _restore_stage9_candidate_state(
+            pipeline,
+            parent_state,
+            checkpoint_stem=parent_checkpoint,
+        )
+        parent_quality["psf_contraction_reference_fidelity"] = {
+            "schema": "starun.stage9-psf-contraction-reference.v1",
+            "status": "rejected",
+            "accepted": False,
+            "reason": (
+                "authenticated same-domain parent fidelity against actual "
+                "Stage8 remix base B is unavailable"
+            ),
+            "reference_fidelity": parent_reference_fidelity,
+        }
+        messages.append(
+            "Stage9 rejected PSF contraction because parent O/B fidelity was "
+            "not bound to the actual Stage8 remix base"
+        )
+        return parent_quality, original_parent_context
+    parent_quality["reference_fidelity"] = parent_reference_fidelity
+
+    psf_catalog_snapshot: Dict[str, Any] = {}
+    psf_catalog_sha256: str | None = None
+    if bool(catalog.get("source_matched", False)):
+        psf_catalog_snapshot = _stage9_psf_catalog_snapshot(catalog)
+        psf_catalog_sha256 = _stage9_psf_catalog_digest(psf_catalog_snapshot)
+        if psf_catalog_sha256 is None:
+            _restore_stage9_candidate_state(
+                pipeline,
+                parent_state,
+                checkpoint_stem=parent_checkpoint,
+            )
+            parent_quality["psf_contraction_catalog_identity"] = {
+                "schema": "starun.stage9-psf-catalog-identity.v2",
+                "status": "rejected",
+                "accepted": False,
+                "reason": "complete frozen source-matched PSF evidence unavailable",
+            }
+            messages.append(
+                "Stage9 rejected source-matched PSF contraction because the "
+                "complete frozen PSF catalog could not be bound"
+            )
+            return parent_quality, original_parent_context
     immutable_parent_stars = np.array(stars, copy=True)
     low_gamma = 1.0
     high_gamma = 4.0
     target_ratio = 1.0
+    target_min = _stage9_psf_recovery_target_min(pipeline, parent_quality)
+    target_max = _stage9_psf_recovery_target_max(pipeline, parent_quality)
     best: Dict[str, Any] | None = None
     comparisons: List[Dict[str, Any]] = []
     parent_attempt = str(parent_quality.get("attempt") or "unknown")
@@ -7092,7 +9537,12 @@ def _stage9_targeted_psf_contraction(
     if not parent_target_values and "all" in parent_ratios:
         parent_target_values = [parent_ratios["all"]]
     if not parent_target_values:
-        return parent_quality, parent_context
+        _restore_stage9_candidate_state(
+            pipeline,
+            parent_state,
+            checkpoint_stem=parent_checkpoint,
+        )
+        return parent_quality, original_parent_context
     feedback_ratio = float(max(parent_target_values))
     requested_gamma = float(
         np.clip(
@@ -7102,7 +9552,561 @@ def _stage9_targeted_psf_contraction(
         )
     )
     if requested_gamma <= 1.0 + 1.0e-6:
-        return parent_quality, parent_context
+        _restore_stage9_candidate_state(
+            pipeline,
+            parent_state,
+            checkpoint_stem=parent_checkpoint,
+        )
+        return parent_quality, original_parent_context
+
+    boundary_candidate: np.ndarray | None = None
+    boundary_report: Dict[str, Any] = {
+        "schema": "starun.stage9-reference-guided-halfmax-pruning.v1",
+        "status": "unavailable",
+        "accepted": False,
+        "reason": "source-matched reference-guided prerequisites unavailable",
+    }
+    if (
+        psf_catalog_sha256 is not None
+        and parent_context.get("original_display") is not None
+        and parent_context.get("remix_base") is not None
+        and bool(parent_context.get("matched_domain_authenticated", False))
+        and weak_mask is not None
+        and bright_mask is not None
+    ):
+        boundary_candidate, boundary_report = (
+            stage9_quality.prune_star_layer_halfmax_boundaries(
+                immutable_parent_stars,
+                np.asarray(parent_context["remix_base"]),
+                np.asarray(parent_context["original_display"]),
+                catalog,
+                pipeline.cfg,
+                support_mask=np.asarray(support),
+                weak_mask=np.asarray(weak_mask),
+                bright_mask=np.asarray(bright_mask),
+                target_groups=target_groups,
+                intensity=float(intensity),
+                weak_intensity=max(
+                    float(intensity),
+                    _clamp_float(
+                        getattr(
+                            pipeline.cfg,
+                            "stage9_weak_star_screen_intensity_min",
+                            0.55,
+                        ),
+                        0.10,
+                        1.05,
+                    ),
+                ),
+                alpha_mask=np.asarray(support),
+                target_min=target_min,
+                target_max=target_max,
+            )
+        )
+
+        observed_psf_snapshot = _stage9_psf_catalog_snapshot(catalog)
+        observed_psf_sha256 = _stage9_psf_catalog_digest(
+            observed_psf_snapshot
+        )
+        observed_coordinate_sha256 = _stage9_catalog_coordinate_digest(
+            _stage9_catalog_coordinate_snapshot(catalog)
+        )
+        psf_identity_verified = bool(
+            observed_psf_sha256 == psf_catalog_sha256
+        )
+        coordinate_identity_verified = bool(
+            observed_coordinate_sha256 == catalog_coordinate_sha256
+        )
+        restored_identity = False
+        if not (psf_identity_verified and coordinate_identity_verified):
+            _stage9_restore_psf_catalog(catalog, psf_catalog_snapshot)
+            _stage9_restore_catalog_coordinates(
+                catalog,
+                catalog_coordinate_snapshot,
+            )
+            restored_identity = bool(
+                _stage9_psf_catalog_digest(
+                    _stage9_psf_catalog_snapshot(catalog)
+                )
+                == psf_catalog_sha256
+                and _stage9_catalog_coordinate_digest(
+                    _stage9_catalog_coordinate_snapshot(catalog)
+                )
+                == catalog_coordinate_sha256
+            )
+            boundary_candidate = None
+            boundary_report.update(
+                status="rejected",
+                accepted=False,
+                changed=False,
+                reason="frozen Stage9 PSF catalog identity changed",
+            )
+        catalog_identity = {
+            "schema": "starun.stage9-psf-catalog-identity.v2",
+            "status": (
+                "ok"
+                if psf_identity_verified and coordinate_identity_verified
+                else "rejected"
+            ),
+            "accepted": bool(
+                psf_identity_verified and coordinate_identity_verified
+            ),
+            "expected_coordinate_sha256": catalog_coordinate_sha256,
+            "actual_coordinate_sha256": observed_coordinate_sha256,
+            "expected_psf_catalog_sha256": psf_catalog_sha256,
+            "actual_psf_catalog_sha256": observed_psf_sha256,
+            "coordinate_arrays": sorted(catalog_coordinate_snapshot),
+            "complete_psf_evidence_bound": True,
+            "restored": restored_identity,
+        }
+        boundary_report["catalog_identity"] = catalog_identity
+
+        if (
+            not bool(catalog_identity.get("accepted", False))
+            and not bool(catalog_identity.get("restored", False))
+        ):
+            comparisons.append(
+                {
+                    "attempt": f"{parent_attempt}_psf_ref_boundary",
+                    "operator": "reference_guided_halfmax_boundary_pruning",
+                    "accepted": False,
+                    "transaction_eligible": False,
+                    "full_assessment_count": 0,
+                    "exact_nonregression_count": 0,
+                    "status": "rejected",
+                    "issues": [
+                        "psf_contraction_catalog_identity_restore_failed"
+                    ],
+                    "boundary_pruning": boundary_report,
+                    "catalog_coordinate_identity": catalog_identity,
+                }
+            )
+            _restore_stage9_candidate_state(
+                pipeline,
+                parent_state,
+                checkpoint_stem=parent_checkpoint,
+            )
+            parent_quality["psf_contraction_candidate_comparison"] = (
+                comparisons
+            )
+            parent_quality["psf_contraction_rollback"] = {
+                "performed": True,
+                "restored": "immutable_parent",
+                "selected": False,
+            }
+            messages.append(
+                "Stage9 stopped PSF contraction because the frozen catalog "
+                "could not be restored exactly"
+            )
+            return parent_quality, original_parent_context
+
+        attempt_name = f"{parent_attempt}_psf_ref_boundary"
+        output_name = f"starmask_{support_mode}_psf_ref_boundary"
+        if boundary_candidate is not None and bool(
+            boundary_report.get("accepted", False)
+        ):
+            saved = _save_stage9_candidate_star_layer(
+                pipeline,
+                source_starmask=parent_starmask,
+                output_name=output_name,
+                stars=np.asarray(boundary_candidate),
+                support_mask=np.asarray(support),
+                weak_mask=np.asarray(weak_mask),
+                bright_mask=np.asarray(bright_mask),
+                label=(
+                    "Stage9 matched-domain reference-guided halfmax "
+                    "boundary-pruned star layer"
+                ),
+            )
+            applied = bool(
+                saved
+                and pipeline._apply_previous_stage_star_remix(
+                    source_stem,
+                    output_name,
+                    intensity,
+                )
+            )
+            candidate_buffer_identity: Dict[str, Any] = {
+                "schema": "starun.stage9-candidate-buffer-identity.v1",
+                "status": "unavailable",
+                "accepted": False,
+                "pre_assessment_pixel_sha256": None,
+                "post_audit_pixel_sha256": None,
+            }
+            if applied:
+                try:
+                    get_pixels = getattr(
+                        pipeline.siril,
+                        "get_image_pixeldata",
+                        None,
+                    )
+                    if not callable(get_pixels):
+                        raise RuntimeError("Siril pixel reader unavailable")
+                    current_candidate = get_pixels(preview=False)
+                    if current_candidate is None:
+                        raise RuntimeError("candidate image buffer unavailable")
+                    candidate_buffer_identity[
+                        "pre_assessment_pixel_sha256"
+                    ] = pixel_sha256(np.asarray(current_candidate))
+                    candidate_buffer_identity["status"] = "frozen"
+                except (
+                    AttributeError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ) as error:
+                    candidate_buffer_identity["reason"] = str(error)
+            quality = (
+                _assess_stage9_candidate(
+                    pipeline,
+                    source_stem,
+                    attempt=attempt_name,
+                    formula="screen",
+                )
+                if applied
+                else {
+                    "attempt": attempt_name,
+                    "formula": "screen",
+                    "status": "failed",
+                    "accepted": False,
+                    "issues": [
+                        "reference-guided boundary-pruning remix execution failed"
+                    ],
+                    "metrics": {},
+                }
+            )
+            quality.update(
+                intensity=intensity,
+                starmask=output_name,
+                support_mode=support_mode,
+                support_starmask=parent_context.get(
+                    "support_starmask",
+                    parent_starmask,
+                ),
+                parent_attempt=parent_attempt,
+                base_source_stem=source_stem,
+                recovery_kind="reference_guided_halfmax_boundary_pruning",
+                recovery_strength=1.0,
+                recovery_target_groups=list(target_groups),
+                psf_boundary_pruning=boundary_report,
+                psf_contraction_catalog_identity=catalog_identity,
+                decomposition_method=(
+                    str(parent_quality.get("decomposition_method") or "screen")
+                    + "_reference_guided_halfmax_boundary_pruning"
+                ),
+            )
+            candidate_context = {
+                **parent_context,
+                "stars": boundary_candidate,
+                "unscreen_stars": boundary_candidate,
+                "starmask": output_name,
+                "psf_boundary_pruning": boundary_report,
+            }
+            quality["reference_fidelity"] = _stage9_reference_fidelity(
+                pipeline,
+                candidate_context,
+                np.asarray(boundary_candidate),
+                intensity,
+                {
+                    "alpha_mask": support,
+                    "weak_mask": weak_mask,
+                    "bright_mask": bright_mask,
+                },
+            )
+            if quality["reference_fidelity"].get("status") == "ok":
+                quality["reference_fidelity"].update(
+                    reference_base_pixel_sha256=parent_reference_fidelity.get(
+                        "reference_base_pixel_sha256"
+                    ),
+                    reference_base_identity=copy.deepcopy(
+                        parent_reference_fidelity.get(
+                            "reference_base_identity"
+                        )
+                    ),
+                    reference_base_identity_verified=bool(
+                        parent_reference_fidelity.get(
+                            "reference_base_identity_verified",
+                            False,
+                        )
+                    ),
+                )
+            parent_source_presence = parent_quality.get("source_presence")
+            if isinstance(parent_source_presence, Mapping):
+                quality["source_presence"] = copy.deepcopy(
+                    parent_source_presence
+                )
+                quality["bright_star_presence"] = (
+                    _stage9_observe_bright_star_presence(
+                        pipeline,
+                        source_stem=source_stem,
+                        star_layer_name=output_name,
+                        intensity=intensity,
+                        completion_report=(
+                            parent_source_presence.get(
+                                "stage5_bright_star_completion"
+                            )
+                        ),
+                    )
+                )
+            try:
+                reapplied = bool(
+                    candidate_buffer_identity.get(
+                        "pre_assessment_pixel_sha256"
+                    )
+                    and pipeline._apply_previous_stage_star_remix(
+                        source_stem,
+                        output_name,
+                        intensity,
+                    )
+                )
+                get_pixels = getattr(
+                    pipeline.siril,
+                    "get_image_pixeldata",
+                    None,
+                )
+                if not reapplied or not callable(get_pixels):
+                    raise RuntimeError(
+                        "candidate buffer could not be reapplied after audit"
+                    )
+                restored_candidate = get_pixels(preview=False)
+                if restored_candidate is None:
+                    raise RuntimeError(
+                        "reapplied candidate image buffer unavailable"
+                    )
+                post_audit_sha256 = pixel_sha256(
+                    np.asarray(restored_candidate)
+                )
+                candidate_buffer_identity[
+                    "post_audit_pixel_sha256"
+                ] = post_audit_sha256
+                candidate_buffer_identity["accepted"] = bool(
+                    post_audit_sha256
+                    == candidate_buffer_identity.get(
+                        "pre_assessment_pixel_sha256"
+                    )
+                )
+                candidate_buffer_identity["status"] = (
+                    "verified"
+                    if candidate_buffer_identity["accepted"]
+                    else "rejected"
+                )
+                if not candidate_buffer_identity["accepted"]:
+                    candidate_buffer_identity["reason"] = (
+                        "candidate pixel SHA changed after bright-star audit"
+                    )
+            except (
+                AttributeError,
+                CommandError,
+                RuntimeError,
+                SirilError,
+                TypeError,
+                ValueError,
+            ) as error:
+                candidate_buffer_identity.update(
+                    status="rejected",
+                    accepted=False,
+                    reason=str(error),
+                )
+            quality["candidate_buffer_identity"] = candidate_buffer_identity
+
+            post_psf_sha256 = _stage9_psf_catalog_digest(
+                _stage9_psf_catalog_snapshot(catalog)
+            )
+            post_coordinate_sha256 = _stage9_catalog_coordinate_digest(
+                _stage9_catalog_coordinate_snapshot(catalog)
+            )
+            post_catalog_verified = bool(
+                post_psf_sha256 == psf_catalog_sha256
+                and post_coordinate_sha256 == catalog_coordinate_sha256
+            )
+            post_catalog_restored = False
+            if not post_catalog_verified:
+                _stage9_restore_psf_catalog(catalog, psf_catalog_snapshot)
+                _stage9_restore_catalog_coordinates(
+                    catalog,
+                    catalog_coordinate_snapshot,
+                )
+                post_catalog_restored = bool(
+                    _stage9_psf_catalog_digest(
+                        _stage9_psf_catalog_snapshot(catalog)
+                    )
+                    == psf_catalog_sha256
+                    and _stage9_catalog_coordinate_digest(
+                        _stage9_catalog_coordinate_snapshot(catalog)
+                    )
+                    == catalog_coordinate_sha256
+                )
+            post_catalog_identity = {
+                "schema": "starun.stage9-psf-catalog-identity.v2",
+                "status": "ok" if post_catalog_verified else "rejected",
+                "accepted": post_catalog_verified,
+                "expected_coordinate_sha256": catalog_coordinate_sha256,
+                "actual_coordinate_sha256": post_coordinate_sha256,
+                "expected_psf_catalog_sha256": psf_catalog_sha256,
+                "actual_psf_catalog_sha256": post_psf_sha256,
+                "complete_psf_evidence_bound": True,
+                "restored": post_catalog_restored,
+                "audit_point": "after_full_assessment_and_bright_audit",
+            }
+            quality["post_assessment_catalog_identity"] = (
+                post_catalog_identity
+            )
+            parent_reason_codes = list(
+                parent_quality.get("reason_codes") or []
+            )
+            if parent_reason_codes:
+                quality["reason_codes"] = list(
+                    dict.fromkeys(
+                        [
+                            *parent_reason_codes,
+                            *list(quality.get("reason_codes") or []),
+                        ]
+                    )
+                )
+            nonregression = _stage9_psf_contraction_nonregression(
+                parent_quality,
+                quality,
+            )
+            quality["psf_contraction_nonregression"] = nonregression
+            _stage9_consider_review_candidate(
+                pipeline,
+                quality,
+                attempt_order=len(remix_attempts),
+                registry=review_candidate_registry,
+                messages=messages,
+            )
+            remix_attempts.append(copy.deepcopy(quality))
+            ratios = _stage9_psf_group_ratios(quality)
+            formal_group_names = ("all", "weak", "bright")
+            formal_groups_complete = all(
+                group in ratios for group in formal_group_names
+            )
+            formal_values = [
+                ratios[group]
+                for group in formal_group_names
+                if group in ratios
+            ]
+            within_soft_target = bool(formal_groups_complete) and all(
+                target_min <= value <= target_max
+                for value in formal_values
+            )
+            transaction_eligible = bool(
+                quality.get("accepted", False)
+                and boundary_report.get("accepted", False)
+                and nonregression.get("accepted", False)
+                and catalog_identity.get("accepted", False)
+                and post_catalog_identity.get("accepted", False)
+                and candidate_buffer_identity.get("accepted", False)
+                and _stage9_actual_base_fidelity_ready(
+                    quality.get("reference_fidelity")
+                )
+                and within_soft_target
+            )
+            comparison = {
+                "attempt": attempt_name,
+                "operator": "reference_guided_halfmax_boundary_pruning",
+                "target_groups": list(target_groups),
+                "accepted": bool(quality.get("accepted", False)),
+                "transaction_eligible": transaction_eligible,
+                "within_soft_target": within_soft_target,
+                "formal_groups_complete": formal_groups_complete,
+                "missing_formal_groups": [
+                    group for group in formal_group_names if group not in ratios
+                ],
+                "soft_target": {"min": target_min, "max": target_max},
+                "full_assessment_count": 1,
+                "exact_nonregression_count": 1,
+                "nonregression": nonregression,
+                "catalog_coordinate_identity": catalog_identity,
+                "post_assessment_catalog_identity": post_catalog_identity,
+                "candidate_buffer_identity": candidate_buffer_identity,
+                "status": str(quality.get("status") or "unknown"),
+                "issues": list(quality.get("issues") or []),
+                "fwhm_ratios": ratios,
+                "boundary_pruning": boundary_report,
+            }
+            comparisons.append(comparison)
+            quality["psf_contraction_candidate_comparison"] = copy.deepcopy(
+                comparisons
+            )
+            if (
+                not bool(candidate_buffer_identity.get("accepted", False))
+                or not bool(post_catalog_identity.get("accepted", False))
+            ):
+                _restore_stage9_candidate_state(
+                    pipeline,
+                    parent_state,
+                    checkpoint_stem=parent_checkpoint,
+                )
+                parent_quality[
+                    "psf_contraction_candidate_comparison"
+                ] = comparisons
+                parent_quality["psf_contraction_rollback"] = {
+                    "performed": True,
+                    "restored": "immutable_parent",
+                    "selected": False,
+                }
+                messages.append(
+                    "Stage9 rejected reference-guided pruning and restored "
+                    "the exact parent because candidate-buffer or post-audit "
+                    "catalog identity was not verified"
+                )
+                return parent_quality, original_parent_context
+            if transaction_eligible:
+                checkpoint = (
+                    f"stage9_candidate_{support_mode}_psf_ref_boundary"
+                )
+                if pipeline._save_stage_output(checkpoint):
+                    quality["psf_contraction_rollback"] = {
+                        "performed": False,
+                        "restored": "selected_candidate_checkpoint",
+                        "selected": True,
+                    }
+                    quality.setdefault("reason_codes", []).append(
+                        "stage9_reference_guided_halfmax_pruning_selected"
+                    )
+                    messages.append(
+                        "Stage9 selected matched-domain reference-guided "
+                        "halfmax boundary pruning after one full gate and "
+                        "exact non-regression assessment"
+                    )
+                    return quality, candidate_context
+                comparison["transaction_eligible"] = False
+                comparison.setdefault("issues", []).append(
+                    "reference-guided candidate checkpoint save failed"
+                )
+            _restore_stage9_candidate_state(
+                pipeline,
+                parent_state,
+                checkpoint_stem=parent_checkpoint,
+            )
+        else:
+            comparisons.append(
+                {
+                    "attempt": attempt_name,
+                    "operator": "reference_guided_halfmax_boundary_pruning",
+                    "accepted": False,
+                    "transaction_eligible": False,
+                    "full_assessment_count": 0,
+                    "exact_nonregression_count": 0,
+                    "status": str(
+                        boundary_report.get("status") or "unavailable"
+                    ),
+                    "issues": [
+                        str(
+                            boundary_report.get("reason")
+                            or "reference-guided pruning made no eligible candidate"
+                        )
+                    ],
+                    "boundary_pruning": boundary_report,
+                    "catalog_coordinate_identity": catalog_identity,
+                }
+            )
+            _restore_stage9_candidate_state(
+                pipeline,
+                parent_state,
+                checkpoint_stem=parent_checkpoint,
+            )
     gamma = requested_gamma
 
     for _retry in range(retry_max):
@@ -7121,9 +10125,91 @@ def _stage9_targeted_psf_contraction(
                 gamma=gamma,
             )
         )
+        observed_coordinate_snapshot = _stage9_catalog_coordinate_snapshot(
+            catalog
+        )
+        observed_coordinate_sha256 = _stage9_catalog_coordinate_digest(
+            observed_coordinate_snapshot
+        )
+        observed_psf_sha256 = (
+            _stage9_psf_catalog_digest(
+                _stage9_psf_catalog_snapshot(catalog)
+            )
+            if psf_catalog_sha256 is not None
+            else None
+        )
+        psf_identity_verified = bool(
+            psf_catalog_sha256 is None
+            or observed_psf_sha256 == psf_catalog_sha256
+        )
+        catalog_identity_verified = bool(
+            observed_coordinate_sha256 == catalog_coordinate_sha256
+            and psf_identity_verified
+        )
+        catalog_identity = {
+            "schema": "starun.stage9-psf-catalog-identity.v2",
+            "status": "ok" if catalog_identity_verified else "rejected",
+            "accepted": catalog_identity_verified,
+            "expected_coordinate_sha256": catalog_coordinate_sha256,
+            "actual_coordinate_sha256": observed_coordinate_sha256,
+            "expected_psf_catalog_sha256": psf_catalog_sha256,
+            "actual_psf_catalog_sha256": observed_psf_sha256,
+            "complete_psf_evidence_bound": bool(
+                psf_catalog_sha256 is not None
+            ),
+            "coordinate_arrays": sorted(catalog_coordinate_snapshot),
+            "restored": False,
+        }
+        if not catalog_identity_verified:
+            if psf_catalog_snapshot:
+                _stage9_restore_psf_catalog(
+                    catalog,
+                    psf_catalog_snapshot,
+                )
+            _stage9_restore_catalog_coordinates(
+                catalog,
+                catalog_coordinate_snapshot,
+            )
+            catalog_identity["restored"] = bool(
+                _stage9_catalog_coordinate_digest(
+                    _stage9_catalog_coordinate_snapshot(catalog)
+                )
+                == catalog_coordinate_sha256
+                and (
+                    psf_catalog_sha256 is None
+                    or _stage9_psf_catalog_digest(
+                        _stage9_psf_catalog_snapshot(catalog)
+                    )
+                    == psf_catalog_sha256
+                )
+            )
+        contraction_report["catalog_coordinate_identity"] = catalog_identity
         suffix = int(round(gamma * 1000.0))
         attempt_name = f"{parent_attempt}_psf_contract_{suffix:04d}"
         output_name = f"starmask_{support_mode}_psf_contract_{suffix:04d}"
+        if not catalog_identity_verified:
+            comparisons.append(
+                {
+                    "attempt": attempt_name,
+                    "gamma": gamma,
+                    "target_groups": list(target_groups),
+                    "accepted": False,
+                    "transaction_eligible": False,
+                    "status": "rejected",
+                    "issues": [
+                        (
+                            "psf_contraction_catalog_coordinates_changed"
+                            if observed_coordinate_sha256
+                            != catalog_coordinate_sha256
+                            else "psf_contraction_catalog_identity_changed"
+                        )
+                    ],
+                    "fwhm_ratios": {},
+                    "contraction": contraction_report,
+                    "catalog_coordinate_identity": catalog_identity,
+                }
+            )
+            break
         if contracted is None or not bool(
             contraction_report.get("changed", False)
         ):
@@ -7198,6 +10284,7 @@ def _stage9_targeted_psf_contraction(
             recovery_strength=gamma,
             recovery_target_groups=list(target_groups),
             psf_contraction=contraction_report,
+            psf_contraction_catalog_identity=catalog_identity,
             decomposition_method=(
                 str(parent_quality.get("decomposition_method") or "screen")
                 + "_component_psf_contraction"
@@ -7211,8 +10298,8 @@ def _stage9_targeted_psf_contraction(
             "psf_contraction": contraction_report,
         }
         if all(
-            key in parent_context
-            for key in ("original_display", "starless_display")
+            parent_context.get(key) is not None
+            for key in ("original_display", "remix_base")
         ):
             quality["reference_fidelity"] = _stage9_reference_fidelity(
                 pipeline,
@@ -7225,6 +10312,62 @@ def _stage9_targeted_psf_contraction(
                     "bright_mask": bright_mask,
                 },
             )
+            if quality["reference_fidelity"].get("status") == "ok":
+                quality["reference_fidelity"].update(
+                    reference_base_pixel_sha256=parent_reference_fidelity.get(
+                        "reference_base_pixel_sha256"
+                    ),
+                    reference_base_identity=copy.deepcopy(
+                        parent_reference_fidelity.get(
+                            "reference_base_identity"
+                        )
+                    ),
+                    reference_base_identity_verified=bool(
+                        parent_reference_fidelity.get(
+                            "reference_base_identity_verified",
+                            False,
+                        )
+                    ),
+                )
+        parent_source_presence = parent_quality.get("source_presence")
+        if isinstance(parent_source_presence, Mapping):
+            quality["source_presence"] = copy.deepcopy(parent_source_presence)
+            for evidence_name in (
+                "source_wing_candidate_comparison",
+                "source_wing_feather_strength",
+            ):
+                if evidence_name in parent_quality:
+                    quality[evidence_name] = copy.deepcopy(
+                        parent_quality[evidence_name]
+                    )
+            quality["bright_star_presence"] = (
+                _stage9_observe_bright_star_presence(
+                    pipeline,
+                    source_stem=source_stem,
+                    star_layer_name=output_name,
+                    intensity=intensity,
+                    completion_report=(
+                        parent_source_presence.get(
+                            "stage5_bright_star_completion"
+                        )
+                    ),
+                )
+            )
+        parent_reason_codes = list(parent_quality.get("reason_codes") or [])
+        if parent_reason_codes:
+            quality["reason_codes"] = list(
+                dict.fromkeys(
+                    [
+                        *parent_reason_codes,
+                        *list(quality.get("reason_codes") or []),
+                    ]
+                )
+            )
+        nonregression = _stage9_psf_contraction_nonregression(
+            parent_quality,
+            quality,
+        )
+        quality["psf_contraction_nonregression"] = nonregression
         _stage9_consider_review_candidate(
             pipeline,
             quality,
@@ -7234,6 +10377,32 @@ def _stage9_targeted_psf_contraction(
         )
         remix_attempts.append(copy.deepcopy(quality))
         ratios = _stage9_psf_group_ratios(quality)
+        target_values = [
+            ratios[group] for group in target_groups if group in ratios
+        ]
+        if not target_values and "all" in ratios:
+            target_values = [ratios["all"]]
+        formal_group_names = ("all", "weak", "bright")
+        formal_groups_complete = all(
+            group in ratios for group in formal_group_names
+        )
+        formal_values = [
+            ratios[group]
+            for group in formal_group_names
+            if group in ratios
+        ]
+        within_soft_target = bool(formal_groups_complete) and all(
+            target_min <= value <= target_max for value in formal_values
+        )
+        transaction_eligible = bool(
+            quality.get("accepted", False)
+            and nonregression.get("accepted", False)
+            and catalog_identity_verified
+            and _stage9_actual_base_fidelity_ready(
+                quality.get("reference_fidelity")
+            )
+            and within_soft_target
+        )
         comparison = {
             "attempt": attempt_name,
             "gamma": gamma,
@@ -7241,6 +10410,17 @@ def _stage9_targeted_psf_contraction(
             "feedback_target_ratio": target_ratio,
             "target_groups": list(target_groups),
             "accepted": bool(quality.get("accepted", False)),
+            "transaction_eligible": transaction_eligible,
+            "within_soft_target": within_soft_target,
+            "formal_groups_complete": formal_groups_complete,
+            "missing_formal_groups": [
+                group
+                for group in formal_group_names
+                if group not in ratios
+            ],
+            "soft_target": {"min": target_min, "max": target_max},
+            "nonregression": nonregression,
+            "catalog_coordinate_identity": catalog_identity,
             "status": str(quality.get("status") or "unknown"),
             "issues": list(quality.get("issues") or []),
             "fwhm_ratios": ratios,
@@ -7250,25 +10430,18 @@ def _stage9_targeted_psf_contraction(
         quality["psf_contraction_candidate_comparison"] = copy.deepcopy(
             comparisons
         )
-        if bool(quality.get("accepted", False)):
+        if transaction_eligible:
             checkpoint = (
                 f"stage9_candidate_{support_mode}_psf_contract_{suffix:04d}"
             )
-            target_values = [
-                ratios[group]
-                for group in target_groups
-                if group in ratios
-            ]
-            if not target_values and "all" in ratios:
-                target_values = [ratios["all"]]
             psf_error = (
-                max(abs(value - 1.0) for value in target_values)
-                if target_values
+                max(abs(value - 1.0) for value in formal_values)
+                if formal_values
                 else float("inf")
             )
             mean_error = (
-                float(np.mean([abs(value - 1.0) for value in target_values]))
-                if target_values
+                float(np.mean([abs(value - 1.0) for value in formal_values]))
+                if formal_values
                 else float("inf")
             )
             if pipeline._save_stage_output(checkpoint):
@@ -7283,6 +10456,14 @@ def _stage9_targeted_psf_contraction(
                         *_stage9_formal_candidate_score(
                             quality,
                             support_mode=support_mode,
+                            soft_target_min=_stage9_psf_recovery_target_min(
+                                pipeline,
+                                quality,
+                            ),
+                            soft_target_max=_stage9_psf_recovery_target_max(
+                                pipeline,
+                                quality,
+                            ),
                         ),
                         gamma,
                     ),
@@ -7290,11 +10471,6 @@ def _stage9_targeted_psf_contraction(
                 if best is None or record["score"] < best["score"]:
                     best = record
 
-        target_values = [
-            ratios[group] for group in target_groups if group in ratios
-        ]
-        if not target_values and "all" in ratios:
-            target_values = [ratios["all"]]
         if target_values:
             feedback_ratio = float(max(target_values))
             if feedback_ratio > target_ratio:
@@ -7350,7 +10526,7 @@ def _stage9_targeted_psf_contraction(
             "Stage9 PSF contraction candidates were rejected; restored the "
             f"exact immutable parent attempt={parent_attempt}"
         )
-        return parent_quality, parent_context
+        return parent_quality, original_parent_context
 
     _restore_stage9_candidate_state(
         pipeline,
@@ -7373,6 +10549,277 @@ def _stage9_targeted_psf_contraction(
         f"{float(selected_quality.get('recovery_strength', 1.0)):.4f})"
     )
     return selected_quality, best["context"]
+
+
+def _stage9_persist_post_targeting_evidence(
+    remix_attempts: List[Dict[str, Any]],
+    attempt_index: int,
+    quality: Mapping[str, Any],
+) -> None:
+    """Persist post-transaction evidence on the originating attempt record."""
+
+    if not (0 <= int(attempt_index) < len(remix_attempts)):
+        return
+    record = remix_attempts[int(attempt_index)]
+    if not isinstance(record, dict):
+        return
+    for field in (
+        "psf_contraction_reference_fidelity",
+        "psf_contraction_catalog_identity",
+        "psf_contraction_candidate_comparison",
+        "psf_contraction_rollback",
+        "psf_soft_target_closure",
+    ):
+        if field in quality:
+            record[field] = copy.deepcopy(quality[field])
+    record["post_targeting_result"] = {
+        "attempt": str(quality.get("attempt") or "unknown"),
+        "status": str(quality.get("status") or "unknown"),
+        "accepted": bool(quality.get("accepted", False)),
+    }
+
+
+def _stage9_close_accepted_psf_soft_target(
+    pipeline,
+    *,
+    source_stem: str,
+    parent_quality: Dict[str, Any],
+    parent_context: Dict[str, Any],
+    intensity: float,
+    support_mode: str,
+    messages: List[str],
+    remix_attempts: List[Dict[str, Any]],
+    review_candidate_registry: List[Dict[str, Any]],
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Close every formal PSF group or reject and restore the exact parent."""
+    parent_ratios = _stage9_psf_group_ratios(parent_quality)
+    target_min = _stage9_psf_recovery_target_min(pipeline, parent_quality)
+    target_max = _stage9_psf_recovery_target_max(pipeline, parent_quality)
+    formal_group_names = ("all", "weak", "bright")
+    missing_groups = [
+        group for group in formal_group_names if group not in parent_ratios
+    ]
+    parent_closed = bool(not missing_groups) and all(
+        target_min <= parent_ratios[group] <= target_max
+        for group in formal_group_names
+    )
+    oversized_groups = {
+        name: ratio
+        for name, ratio in parent_ratios.items()
+        if ratio > target_max
+    }
+    undersized_groups = {
+        name: ratio
+        for name, ratio in parent_ratios.items()
+        if ratio < target_min
+    }
+    report: Dict[str, Any] = {
+        "schema": "starun.stage9-psf-soft-target-closure.v1",
+        "status": "not_required",
+        "accepted": parent_closed,
+        "attempted": False,
+        "soft_target": {"min": target_min, "max": target_max},
+        "required_formal_groups": list(formal_group_names),
+        "missing_formal_groups": missing_groups,
+        "parent_attempt": str(parent_quality.get("attempt") or "unknown"),
+        "parent_ratios": parent_ratios,
+        "oversized_groups": oversized_groups,
+        "undersized_groups": undersized_groups,
+    }
+    if not bool(parent_quality.get("accepted", False)):
+        report["status"] = "parent_not_formally_accepted"
+        parent_quality["psf_soft_target_closure"] = report
+        return parent_quality, parent_context
+    if parent_closed:
+        parent_quality["psf_soft_target_closure"] = report
+        return parent_quality, parent_context
+
+    report["attempted"] = True
+    safe_support_mode = "".join(
+        character if character.isalnum() else "_"
+        for character in str(support_mode or "unknown")
+    ).strip("_") or "unknown"
+    parent_checkpoint = (
+        f"stage9_candidate_{safe_support_mode}_{len(remix_attempts):03d}_"
+        "psf_soft_target_parent"
+    )
+    parent_state = _capture_stage9_candidate_state(pipeline)
+    checkpoint_saved = bool(pipeline._save_stage_output(parent_checkpoint))
+    report["parent_transaction"] = {
+        "checkpoint": parent_checkpoint,
+        "checkpoint_saved": checkpoint_saved,
+        "state_captured": True,
+    }
+    selected_quality = parent_quality
+    selected_context = parent_context
+    contraction_error = None
+    if checkpoint_saved and oversized_groups:
+        try:
+            selected_quality, selected_context = (
+                _stage9_targeted_psf_contraction(
+                    pipeline,
+                    source_stem=source_stem,
+                    parent_quality=parent_quality,
+                    parent_context=parent_context,
+                    intensity=intensity,
+                    support_mode=support_mode,
+                    messages=messages,
+                    remix_attempts=remix_attempts,
+                    review_candidate_registry=review_candidate_registry,
+                )
+            )
+        except (
+            AttributeError,
+            CommandError,
+            RuntimeError,
+            SirilError,
+            TypeError,
+            ValueError,
+        ) as error:
+            contraction_error = str(error)
+    final_ratios = _stage9_psf_group_ratios(selected_quality)
+    final_missing_groups = [
+        group for group in formal_group_names if group not in final_ratios
+    ]
+    closed = bool(checkpoint_saved and not final_missing_groups) and all(
+        target_min <= final_ratios[group] <= target_max
+        for group in formal_group_names
+    )
+    rollback: Dict[str, Any] = {
+        "performed": False,
+        "status": "not_required",
+        "checkpoint": parent_checkpoint,
+        "state_restored": False,
+    }
+    if not closed and checkpoint_saved:
+        try:
+            _restore_stage9_candidate_state(
+                pipeline,
+                parent_state,
+                checkpoint_stem=parent_checkpoint,
+            )
+            rollback.update(
+                performed=True,
+                status="restored",
+                state_restored=True,
+                restored="exact_parent_checkpoint_and_state",
+            )
+        except (CommandError, RuntimeError, SirilError) as error:
+            rollback.update(
+                performed=True,
+                status="failed",
+                error=str(error),
+            )
+        selected_quality = parent_quality
+        selected_context = parent_context
+    elif not closed:
+        rollback.update(
+            status="parent_unchanged_checkpoint_unavailable",
+            restored="parent_was_not_modified",
+        )
+    report.update(
+        status=(
+            "closed"
+            if closed
+            else "rolled_back_unclosed"
+            if rollback.get("state_restored") is True
+            else "rejected_unclosed"
+        ),
+        accepted=closed,
+        selected_attempt=str(selected_quality.get("attempt") or "unknown"),
+        final_ratios=final_ratios,
+        final_missing_formal_groups=final_missing_groups,
+        rollback=rollback,
+        all_existing_gates_reapplied=True,
+        non_psf_nonregression_required=True,
+        catalog_coordinate_identity_required=True,
+    )
+    if contraction_error is not None:
+        report["contraction_error"] = contraction_error
+    selected_quality["psf_soft_target_closure"] = report
+    if not closed:
+        parent_quality["scientific_hard_gates_accepted_before_soft_target"] = (
+            True
+        )
+        parent_quality["accepted"] = False
+        parent_quality["status"] = "rejected"
+        parent_quality["formal_eligible"] = False
+        parent_quality["review_required"] = True
+        parent_quality.setdefault("issues", []).append(
+            "stage9_psf_soft_target_unclosed"
+        )
+        parent_quality.setdefault("reason_codes", []).append(
+            "STAGE9_PSF_SOFT_TARGET_UNCLOSED"
+        )
+        parent_quality["psf_soft_target_closure"] = report
+        messages.append(
+            "Stage9 PSF soft-target closure failed non-regression or identity "
+            "checks; restored the exact parent and rejected formal delivery"
+        )
+        return parent_quality, parent_context
+    return selected_quality, selected_context
+
+
+def _stage9_close_final_selected_psf_soft_target(
+    pipeline,
+    *,
+    source_stem: str,
+    selected_quality: Optional[Dict[str, Any]],
+    messages: List[str],
+    remix_attempts: List[Dict[str, Any]],
+    review_candidate_registry: List[Dict[str, Any]],
+) -> tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Apply the soft PSF transaction to the one final selected remix."""
+    if not isinstance(selected_quality, dict):
+        return selected_quality, {}
+
+    state = _capture_stage9_candidate_state(pipeline)
+    starmask = str(selected_quality.get("starmask") or "")
+    support_mode = str(selected_quality.get("support_mode") or "unknown")
+    context: Dict[str, Any] = {
+        "available": bool(
+            state.get("star_layer") is not None
+            and state.get("alpha_mask") is not None
+            and starmask
+        ),
+        "stars": state.get("star_layer"),
+        "unscreen_stars": state.get("star_layer"),
+        "support_mask": state.get("alpha_mask"),
+        "weak_mask": state.get("weak_mask"),
+        "bright_mask": state.get("bright_mask"),
+        "starmask": starmask,
+        "support_starmask": str(
+            selected_quality.get("support_starmask") or starmask
+        ),
+        "support_mode": support_mode,
+    }
+    matched_context = getattr(pipeline, "_stage9_matched_domain_context", None)
+    if isinstance(matched_context, dict) and bool(
+        matched_context.get("available", False)
+    ):
+        for name in (
+            "original_display",
+            "starless_display",
+            "source_autostretch_display",
+        ):
+            if matched_context.get(name) is not None:
+                context[name] = matched_context[name]
+
+    closed_quality, closed_context = _stage9_close_accepted_psf_soft_target(
+        pipeline,
+        source_stem=source_stem,
+        parent_quality=selected_quality,
+        parent_context=context,
+        intensity=float(selected_quality.get("intensity", 1.0) or 1.0),
+        support_mode=support_mode,
+        messages=messages,
+        remix_attempts=remix_attempts,
+        review_candidate_registry=review_candidate_registry,
+    )
+    closure = closed_quality.get("psf_soft_target_closure")
+    if isinstance(closure, dict):
+        closure["selection_scope"] = "final_selected_remix"
+    return closed_quality, closed_context
 
 
 def _stage9_targeted_unscreen_competition(
@@ -7482,6 +10929,7 @@ def _stage9_targeted_unscreen_competition(
             registry=review_candidate_registry,
             messages=messages,
         )
+        originating_attempt_index = len(remix_attempts)
         remix_attempts.append(copy.deepcopy(quality))
 
         targeted_attempt_start = len(remix_attempts)
@@ -7533,6 +10981,11 @@ def _stage9_targeted_unscreen_competition(
             review_candidate_registry=review_candidate_registry,
             retry_budget=targeted_attempt_budget,
         )
+        _stage9_persist_post_targeting_evidence(
+            remix_attempts,
+            originating_attempt_index,
+            quality,
+        )
         if bool(quality.get("accepted", False)):
             quality, context = _stage9_extend_rescue_with_source_presence(
                 pipeline,
@@ -7542,6 +10995,7 @@ def _stage9_targeted_unscreen_competition(
                 intensity=intensity,
                 messages=messages,
                 remix_attempts=remix_attempts,
+                review_candidate_registry=review_candidate_registry,
             )
         source_presence_selected = bool(
             str(quality.get("attempt") or "").startswith(
@@ -7616,6 +11070,14 @@ def _stage9_targeted_unscreen_competition(
             "score": _stage9_formal_candidate_score(
                 quality,
                 support_mode=support_mode,
+                soft_target_min=_stage9_psf_recovery_target_min(
+                    pipeline,
+                    quality,
+                ),
+                soft_target_max=_stage9_psf_recovery_target_max(
+                    pipeline,
+                    quality,
+                ),
             ),
             "context": context,
             "candidate_family": "unscreen",
@@ -7629,6 +11091,14 @@ def _stage9_targeted_unscreen_competition(
             key=lambda item: _stage9_formal_candidate_score(
                 item.get("quality") or {},
                 support_mode=str(item.get("support_mode") or "unknown"),
+                soft_target_min=_stage9_psf_recovery_target_min(
+                    pipeline,
+                    item.get("quality") or {},
+                ),
+                soft_target_max=_stage9_psf_recovery_target_max(
+                    pipeline,
+                    item.get("quality") or {},
+                ),
             ),
         )
         if formal_records
@@ -7684,6 +11154,7 @@ def _stage9_targeted_unscreen_competition(
                 intensity=float(selected_quality.get("intensity", 1.0) or 1.0),
                 messages=messages,
                 remix_attempts=remix_attempts,
+                review_candidate_registry=review_candidate_registry,
             )
         )
         if support_comparison is not None:
@@ -8566,6 +12037,11 @@ def run_stage9_star_remixing(pipeline) -> None:
         "executed_candidates": [],
         "selected_support_mode": None,
     }
+    pipeline._stage9_starmask_target_profile = {
+        "schema": "starun.stage9-starmask-target-profile.v1",
+        "status": "not_run",
+        "reason_code": "stage9_starmask_target_profile_not_run",
+    }
     pipeline._stage9_source_presence_report = {
         "schema": "starun.stage9-source-presence.v1",
         "status": "not_run",
@@ -8617,9 +12093,22 @@ def run_stage9_star_remixing(pipeline) -> None:
     pipeline._stage9_upstream_source_stem = source_stem
     pipeline._stage9_stage8_fallback_base_stem = source_stem
     upstream_handoff = _stage9_upstream_handoff(pipeline, source_stem)
+    handoff_verification = _stage9_verify_stage8_handoff(
+        pipeline,
+        source_stem,
+        upstream_handoff,
+    )
+    pipeline._stage9_stage8_handoff_verification = dict(
+        handoff_verification
+    )
+    pipeline._write_stage_json(
+        "stage9_stage8_handoff_verification.json",
+        handoff_verification,
+    )
     upstream_passthrough = bool(upstream_handoff.get("passthrough", False))
     upstream_restricted = bool(
         upstream_handoff.get("restricted_downstream", False)
+        or not handoff_verification.get("verified", False)
     )
     messages.append(
         "stage9_starless_source="
@@ -8690,6 +12179,7 @@ def run_stage9_star_remixing(pipeline) -> None:
                     else ""
                 ),
                 "upstream_handoff": upstream_handoff,
+                "stage8_handoff_verification": handoff_verification,
                 "stage9_fallback_used": stage9_fallback_used,
                 "stage9_fallback_reason": stage9_fallback_reason or None,
                 "candidate_recovery_used": bool(
@@ -8733,6 +12223,57 @@ def run_stage9_star_remixing(pipeline) -> None:
         if failure_action == "stop":
             return "failed"
         return "degraded" if saved else "failed"
+
+    if not bool(handoff_verification.get("verified", False)):
+        reason = str(
+            (handoff_verification.get("issues") or [
+                "stage8_handoff_lineage_unverified"
+            ])[0]
+        )
+        pipeline._require_review(
+            9,
+            reason,
+            {"handoff_verification": handoff_verification},
+        )
+        stage_saved, verified_source = _stage9_preserve_with_stars_review_output(
+            pipeline,
+            messages,
+            reason=reason,
+        )
+        report_mode = _stage9_required_stars_output_mode(stage_saved)
+        _write_stage9_quality_report(
+            pipeline,
+            [],
+            None,
+            source_stem=str(verified_source or source_stem),
+            mode=report_mode,
+        )
+        _append_stage9_review_bundle(
+            pipeline,
+            messages,
+            [],
+            None,
+            source_stem=str(verified_source or source_stem),
+            mode=report_mode,
+            stage_saved=stage_saved,
+        )
+        messages.append(
+            "Stage9 prohibited formal star remix because the Stage8 handoff "
+            f"could not be verified ({reason}); routed to trusted with-stars review"
+        )
+        elapsed = pipeline.log.stage_end(stage_label)
+        pipeline._record_stage(
+            stage_label,
+            decisive_failure_status(
+                stage_saved,
+                reason=reason,
+                source="stage8_handoff_verification",
+            ),
+            elapsed,
+            "；".join(messages),
+            **result_metadata(),
+        )
+        return
 
     if processing_mode == "preserve_with_stars":
         stage_saved, verified_source = _stage9_preserve_with_stars_review_output(
@@ -8840,8 +12381,9 @@ def run_stage9_star_remixing(pipeline) -> None:
     if bool(getattr(pipeline, "_star_preserve_target_bypass", False)):
         target_bypass_review_only = bool(
             upstream_restricted
-            or str(upstream_handoff.get("reason_code") or "")
-            == "stage7_stretch_not_accepted_target_bypass"
+            or upstream_handoff.get("formal_eligible") is not True
+            or str(upstream_handoff.get("processing_route") or "")
+            != "star_preserve_secondary_nebulosity"
         )
         if target_bypass_review_only:
             pipeline._require_review(
@@ -8852,18 +12394,53 @@ def run_stage9_star_remixing(pipeline) -> None:
         try:
             pipeline.cmd_with_check("load", source_stem)
             stage_saved = pipeline._save_stage_output("stage9_remixed")
-            pipeline._stage9_final_source = source_stem
-            pipeline._stage9_output_contains_stars = bool(stage_saved)
-            pipeline._stage9_bypassed_bad_starless = target_bypass_review_only
-            pipeline._stage9_stars_application_mode = (
-                "not_required_star_preserve_review"
-                if target_bypass_review_only
-                else "not_required_star_preserve"
+            persisted_validation = (
+                _stage9_star_preserve_validation(
+                    pipeline,
+                    source_stem=source_stem,
+                    output_stem="stage9_remixed",
+                )
+                if stage_saved and not target_bypass_review_only
+                else {
+                    "schema": "starun.stage9-persisted-star-preserve.v1",
+                    "status": "rejected",
+                    "accepted": False,
+                    "mode": "stars_not_required",
+                    "issues": [
+                        "stage8_star_preserve_handoff_review_only"
+                        if target_bypass_review_only
+                        else "stage9_remixed_save_failed"
+                    ],
+                }
             )
+            formal_skip = bool(persisted_validation.get("accepted", False))
+            pipeline._stage9_persisted_output_validation = persisted_validation
+            pipeline._write_stage_json(
+                "stage9_persisted_validation.json",
+                persisted_validation,
+            )
+            pipeline._stage9_final_source = (
+                "stage9_remixed" if stage_saved else ""
+            )
+            pipeline._stage9_stars_required = False
+            pipeline._stage9_stars_applied = False
+            pipeline._stage9_output_contains_stars = formal_skip
+            pipeline._stage9_bypassed_bad_starless = not formal_skip
+            pipeline._stage9_stars_application_mode = "stars_not_required"
+            pipeline._stage9_remix_formally_accepted = formal_skip
+            pipeline._stage9_output_withheld = not formal_skip
+            _update_stage9_star_delivery_contract(pipeline)
+            if not formal_skip:
+                target_bypass_review_only = True
+                pipeline._require_review(
+                    9,
+                    "star_preserve_persisted_validation_failed",
+                    {"persisted_validation": persisted_validation},
+                )
             report_mode = (
                 "star_preserve_target_bypass_review"
                 if target_bypass_review_only
-                else "star_preserve_target_bypass"
+                else "stars_not_required"
             )
             _write_stage9_quality_report(
                 pipeline,
@@ -8872,17 +12449,18 @@ def run_stage9_star_remixing(pipeline) -> None:
                 source_stem=source_stem,
                 mode=report_mode,
             )
-            _append_stage9_review_bundle(
-                pipeline,
-                messages,
-                [],
-                None,
-                source_stem=source_stem,
-                mode=report_mode,
-                stage_saved=stage_saved,
-            )
+            if target_bypass_review_only:
+                _append_stage9_review_bundle(
+                    pipeline,
+                    messages,
+                    [],
+                    None,
+                    source_stem=source_stem,
+                    mode=report_mode,
+                    stage_saved=bool(stage_saved),
+                )
             messages.append(
-                "star-preserve target bypassed starmask import and star remix "
+                "star-preserve target bypassed starmask import; stars_not_required "
                 f"(source={source_stem}, "
                 f"review_only={str(target_bypass_review_only).lower()})"
             )
@@ -9197,85 +12775,49 @@ def run_stage9_star_remixing(pipeline) -> None:
             }
             pipeline.log.warn(f"星点处理插件链失败，使用原始 starmask: {e}")
 
-    # 按工作流先在 Siril 侧做 Starless 二次细化，再进行星点合成
-    if upstream_restricted:
-        messages.append(
-            "Stage9 skipped starless secondary enhancement because the Stage8 "
-            "handoff is restricted"
+    try:
+        pipeline.cmd_with_check("load", source_stem)
+    except (CommandError, SirilError) as error:
+        reason = "stage9_verified_stage8_artifact_load_failed"
+        pipeline._require_review(
+            9,
+            reason,
+            {"source_stem": source_stem, "error": str(error)},
         )
-    else:
-        try:
-            pipeline.cmd_with_check("load", source_stem)
-            starless_refinement_steps = []
-            revela_label = pipeline._run_first_available_command(
-                "细节/结构增强2",
-                [
-                    ("VeraLux Revela", ("veralux_revela",)),
-                    ("Revela", ("revela",)),
-                ],
-            )
-            if revela_label:
-                starless_refinement_steps.append(revela_label)
-            if (
-                pipeline.cfg.optional_color_transform_enabled
-                and not bool(
-                    getattr(pipeline, "_stage8_artistic_palette_applied", False)
-                )
-            ):
-                vectra_label = pipeline._run_first_available_command(
-                    "调色2（可选）",
-                    [
-                        ("VeraLux Vectra", ("veralux_vectra",)),
-                        ("Vectra", ("vectra",)),
-                    ],
-                )
-                if vectra_label:
-                    starless_refinement_steps.append(vectra_label)
-            elif bool(
-                getattr(pipeline, "_stage8_artistic_palette_applied", False)
-            ):
-                messages.append(
-                    "Stage9 optional Vectra skipped: Stage8 dual-band palette already applied"
-                )
-            curves_label = pipeline._run_first_available_command(
-                "最终微调颜色",
-                [
-                    ("VeraLux Curves", ("veralux_curves",)),
-                    ("Curves", ("curves",)),
-                ],
-            )
-            if curves_label:
-                starless_refinement_steps.append(curves_label)
-            if starless_refinement_steps:
-                if not pipeline._save_stage_output("stage9_starless_base"):
-                    raise RuntimeError("Stage9 refined Starless base save failed")
-                source_stem = "stage9_starless_base"
-                messages.append(
-                    "Stage9 Starless secondary refinement saved to an independent "
-                    "base; Stage8 checkpoint retained unchanged "
-                    f"(steps={','.join(starless_refinement_steps)})"
-                )
-            else:
-                messages.append(
-                    "Stage9 Starless secondary refinement unavailable; retained "
-                    "the immutable Stage8 source"
-                )
-        except (CommandError, SirilError, RuntimeError) as e:
-            upstream_source = str(
-                getattr(pipeline, "_stage9_upstream_source_stem", source_stem)
-                or source_stem
-            )
-            try:
-                pipeline.cmd_with_check("load", upstream_source)
-            except (CommandError, SirilError) as restore_error:
-                messages.append(
-                    "Stage9 Starless refinement rollback failed: "
-                    f"{restore_error}"
-                )
-            source_stem = upstream_source
-            pipeline.log.warn(
-                f"Starless 二次细化失败，回滚并沿用 {source_stem}: {e}"
-            )
+        stage_saved, verified_source = _stage9_preserve_with_stars_review_output(
+            pipeline,
+            messages,
+            reason=reason,
+        )
+        report_mode = _stage9_required_stars_output_mode(stage_saved)
+        _write_stage9_quality_report(
+            pipeline,
+            [],
+            None,
+            source_stem=str(verified_source or source_stem),
+            mode=report_mode,
+        )
+        messages.append(
+            "Stage9 could not load the verified Stage8 Starless artifact; "
+            "formal remix was prohibited"
+        )
+        elapsed = pipeline.log.stage_end(stage_label)
+        pipeline._record_stage(
+            stage_label,
+            decisive_failure_status(
+                stage_saved,
+                reason=reason,
+                source="stage8_artifact_load",
+            ),
+            elapsed,
+            "；".join(messages),
+            **result_metadata(),
+        )
+        return
+    messages.append(
+        "Stage9 loaded the verified immutable Stage8 Starless artifact; "
+        "all Starless finish pixels are owned by Stage8"
+    )
 
     remix_scale = _clamp_float(
         getattr(pipeline, "_stage9_star_intensity_scale", 1.0),
@@ -9935,6 +13477,7 @@ def run_stage9_star_remixing(pipeline) -> None:
             registry=review_candidate_registry,
             messages=messages,
         )
+        originating_attempt_index = len(remix_attempts)
         remix_attempts.append(quality)
 
         if applied and targeted_recovery_enabled:
@@ -9992,6 +13535,11 @@ def run_stage9_star_remixing(pipeline) -> None:
                 remix_attempts=remix_attempts,
                 review_candidate_registry=review_candidate_registry,
                 retry_budget=targeted_attempt_budget,
+            )
+            _stage9_persist_post_targeting_evidence(
+                remix_attempts,
+                originating_attempt_index,
+                quality,
             )
             candidate_starmask = str(
                 parent_context.get("starmask")
@@ -10507,6 +14055,7 @@ def run_stage9_star_remixing(pipeline) -> None:
                             intensity=baseline_intensity,
                             messages=messages,
                             remix_attempts=remix_attempts,
+                            review_candidate_registry=review_candidate_registry,
                         )
                     )
                     unscreen_quality, unscreen_context = (
@@ -10518,6 +14067,23 @@ def run_stage9_star_remixing(pipeline) -> None:
                             intensity=baseline_intensity,
                             messages=messages,
                             remix_attempts=remix_attempts,
+                        )
+                    )
+                    unscreen_quality, unscreen_context = (
+                        _stage9_close_accepted_psf_soft_target(
+                            pipeline,
+                            source_stem=source_stem,
+                            parent_quality=unscreen_quality,
+                            parent_context=unscreen_context,
+                            intensity=baseline_intensity,
+                            support_mode=str(
+                                unscreen_quality.get("support_mode")
+                                or unscreen_context.get("support_mode")
+                                or "unknown"
+                            ),
+                            messages=messages,
+                            remix_attempts=remix_attempts,
+                            review_candidate_registry=review_candidate_registry,
                         )
                     )
                     if str(unscreen_quality.get("attempt") or "").startswith(
@@ -10786,6 +14352,7 @@ def run_stage9_star_remixing(pipeline) -> None:
                             intensity=candidate_intensity,
                             messages=messages,
                             remix_attempts=remix_attempts,
+                            review_candidate_registry=review_candidate_registry,
                         )
                     )
                     quality, unscreen_context = (
@@ -10797,6 +14364,23 @@ def run_stage9_star_remixing(pipeline) -> None:
                             intensity=candidate_intensity,
                             messages=messages,
                             remix_attempts=remix_attempts,
+                        )
+                    )
+                    quality, unscreen_context = (
+                        _stage9_close_accepted_psf_soft_target(
+                            pipeline,
+                            source_stem=source_stem,
+                            parent_quality=quality,
+                            parent_context=unscreen_context,
+                            intensity=candidate_intensity,
+                            support_mode=str(
+                                quality.get("support_mode")
+                                or unscreen_context.get("support_mode")
+                                or "unknown"
+                            ),
+                            messages=messages,
+                            remix_attempts=remix_attempts,
+                            review_candidate_registry=review_candidate_registry,
                         )
                     )
                     selected_remix = quality
@@ -10850,6 +14434,71 @@ def run_stage9_star_remixing(pipeline) -> None:
             "Unscreen rescue disabled by the active Stage9 failure action",
             reason_code="stage9_unscreen_candidate_rejected",
         )
+
+    # Candidate-specific recovery paths may finish in Screen, compact,
+    # intensity-feasibility, or Unscreen families.  Rebind the active frozen
+    # star layer only after that competition is over, then apply one common
+    # formal soft-target transaction to the actual final selection.
+    if isinstance(selected_remix, dict):
+        selected_remix, final_selected_context = (
+            _stage9_close_final_selected_psf_soft_target(
+                pipeline,
+                source_stem=source_stem,
+                selected_quality=selected_remix,
+                messages=messages,
+                remix_attempts=remix_attempts,
+                review_candidate_registry=review_candidate_registry,
+            )
+        )
+        final_closure = selected_remix.get("psf_soft_target_closure") or {}
+        matching_attempt_index = next(
+            (
+                index
+                for index, prior_attempt in enumerate(remix_attempts)
+                if prior_attempt.get("attempt")
+                == selected_remix.get("attempt")
+            ),
+            None,
+        )
+        if matching_attempt_index is None:
+            remix_attempts.append(copy.deepcopy(selected_remix))
+        else:
+            remix_attempts[matching_attempt_index] = copy.deepcopy(
+                selected_remix
+            )
+        pipeline._stage9_selected_remix_quality = dict(selected_remix)
+        if bool(selected_remix.get("accepted", False)) and bool(
+            final_closure.get("accepted", False)
+        ):
+            remix_starmask_name = str(
+                final_selected_context.get("starmask")
+                or selected_remix.get("starmask")
+                or remix_starmask_name
+            )
+            pipeline._stage9_star_layer_decomposition = str(
+                selected_remix.get("decomposition_method")
+                or pipeline._stage9_star_layer_decomposition
+            )
+            public_preflight["selected_support_mode"] = str(
+                selected_remix.get("support_mode") or ""
+            )
+            public_preflight["selected_attempt"] = str(
+                selected_remix.get("attempt") or ""
+            )
+            messages.append(
+                "Stage9 final selected remix passed the unified PSF soft-target "
+                f"closure (attempt={selected_remix.get('attempt')}, "
+                f"ratios={final_closure.get('final_ratios') or final_closure.get('parent_ratios')})"
+            )
+        else:
+            public_preflight["selected_support_mode"] = None
+            public_preflight["selected_attempt"] = None
+            pipeline._stage9_starmask_support_preflight = public_preflight
+            messages.append(
+                "Stage9 rejected the final selected remix because all formal "
+                "PSF groups could not be closed within 0.97..1.05"
+            )
+            selected_remix = None
 
     if (
         selected_remix is None

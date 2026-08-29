@@ -151,8 +151,8 @@ class PipelineConfig:
     denoise_safety_max: float = 0.55  # 降噪强度安全上限，防止细节被抹平
     stage5_multiscale_denoise_enabled: bool = True  # 启用噪声模型驱动的亮度/对立色度多尺度确定性候选
     stage5_multiscale_denoise_strength: float = 0.72  # 多尺度软阈值与回混强度，受质量门限制
-    stage5_multiscale_detail_retention_min: float = 0.82  # 主体高频细节最低保留比例
-    stage5_multiscale_noise_reduction_min: float = 0.05  # 非低噪输入所需最低背景噪声下降比例
+    stage5_multiscale_detail_retention_min: float = 0.90  # 主体高频细节最低保留比例；候选不得以抹平主体换取降噪
+    stage5_multiscale_noise_reduction_min: float = 0.12  # 非低噪输入所需最低背景噪声下降比例
     stage5_denoise_chroma_noise_growth_max: float = 1.05  # 所有 Stage5 降噪候选允许的背景色噪增长倍数
     stage5_deconvolution_mode: str = "auto"  # 阶段5显式模式：auto/graxpert_rl/rl/off；auto 仍由安全回退链决定
     stage5_deconvolution_enabled: bool = True  # Stage5 是否在线性降噪前执行 GraXpert/RL 反卷积
@@ -170,7 +170,7 @@ class PipelineConfig:
     stage5_deconv_chroma_ratio_growth_max: float = 1.35  # 色噪/背景比最大增长倍率
     stage5_deconv_dirty_delta_max: float = 0.06  # 脏背景评分最大绝对增量
     graxpert_object_model_path: str = ""  # 当前任务显式 GraXpert Object Deconvolution ONNX 文件；空值走离线自动发现
-    optional_color_transform_enabled: bool = False  # 显式授权宽带/Stage 9 可选调色插件；双窄带哈勃色由 Stage 8 独立开关控制
+    optional_color_transform_enabled: bool = False  # 显式授权 Stage 8 宽带 Vectra 独占颜色路线；Stage 9 不再读取
     workflow_plugin_probe_enabled: bool = False  # Probe broad workflow plugin commands only when explicitly enabled; stage8 has a narrow safe SASP probe
     stage4_processing_mode: str = "auto"  # 阶段4处理方式：auto 解析并校色；preserve 安全保留输入颜色
     stage4_failure_action: str = "auto_fallback"  # 决定性失败：auto_fallback/preserve_review/stop
@@ -256,6 +256,16 @@ class PipelineConfig:
     stage7_dual_stage_ghs_d_max: float = 12.0  # Dual-stage GHS 确定性搜索上界（ln(D+1) 语义）
     stage7_dual_stage_ghs_search_steps: int = 47  # Dual-stage GHS 固定网格采样数，运行时限幅 9–97
     stage7_conditional_lut_max_derivative: float = 5000.0  # 新增共享 LUT 的最大离散导数硬上限
+    stage7_subject_chroma_retention_nominal: float = 0.70  # 星云/星系冻结主体色度保留的正式目标
+    stage7_subject_chroma_retention_hard_min: float = 0.55  # 星云/星系冻结主体色度保留硬下限
+    stage7_non_background_chroma_retention_nominal: float = 0.45  # 非背景冻结区域色度保留的正式目标
+    stage7_non_background_chroma_retention_hard_min: float = 0.30  # 非背景冻结区域色度保留硬下限
+    stage7_star_preserve_chroma_retention_nominal: float = 0.35  # 保星目标冻结主体色度保留的正式目标
+    stage7_star_preserve_chroma_retention_hard_min: float = 0.23  # 保星目标冻结主体色度保留硬下限
+    stage7_low_chroma_source_saturation_max: float = 0.02  # 仅低于该源主体饱和度时可继续检查低色度 N/A
+    stage7_low_chroma_source_opponent_rms_max: float = 0.0001  # 同时低于该对立色 RMS 才允许低色度 N/A
+    stage7_visible_noise_score_max: float = 0.025  # 冻结天空显示域绝对可见噪声正式上限
+    stage7_visible_noise_score_hard_max: float = 0.0375  # 超过该值时候选硬拒；中间区仅 advisory
 
     # 阶段 8: 星云饱和度
     stage8_processing_mode: str = "auto"  # auto/limited/background_only/preserve，仅作为上限
@@ -283,6 +293,15 @@ class PipelineConfig:
     stage8_subject_boundary_luma_residual_max: float = 0.0035  # 大星系主体增强边界亮度高频残差 P95 上限
     stage8_subject_boundary_chroma_residual_max: float = 0.0020  # 大星系主体增强边界色度高频残差 P95 上限
     stage8_subject_boundary_residual_ratio_max: float = 1.60  # 大星系边界/盘内高频残差倍率上限
+    stage8_large_galaxy_structure_scale_max: float = 0.50  # 大型星系结构候选的内部 retained-delta 强度上限
+    stage8_large_galaxy_feather_radius_ratio: float = 0.004  # 大型星系主体蒙版羽化半径相对短边比例
+    stage8_emission_structure_scale_max: float = 0.45  # 发射/宽场星云结构候选的内部强度上限
+    stage8_emission_feather_radius_ratio: float = 0.008  # 发射/宽场星云主体蒙版羽化半径相对短边比例
+    stage8_bright_composite_structure_scale_max: float = 0.40  # M8 类复合亮星云结构候选的内部强度上限
+    stage8_bright_composite_feather_radius_ratio: float = 0.010  # M8 类复合亮星云主体蒙版羽化半径相对短边比例
+    stage8_frozen_sky_visible_noise_growth_max: float = 1.10  # Stage8 相对冻结天空的显示域可见噪声增长上限
+    stage8_palette_subject_saturation_input_ratio_min: float = 0.50  # 双窄带调色后主体饱和度相对输入的下限
+    stage8_palette_subject_saturation_absolute_min: float = 0.08  # 双窄带调色后主体饱和度绝对下限候选值
     stage8_limited_saturation_max: float = 0.05  # 亮星云 halo 中风险区受限候选的饱和度硬上限
     stage8_limited_core_exclusion_expand: int = 8  # 受限候选在亮核硬掩膜外追加扩张像素，曲线/饱和度/弱信号提升均不得进入
     stage8_limited_halo_texture_growth_max: float = 1.05  # 受限候选星周环带纹理相对增长上限
@@ -439,6 +458,17 @@ class PipelineConfig:
     stage10_large_galaxy_local_patch_variance_max: float = 0.00032  # 大型星系最终回星后允许的局部 patch 方差上限；其他目标仍使用 0.00022
     stage10_stage9_local_color_risk_strength: float = 1.0  # 按 Stage9 局部青蓝/核心突变风险比例压低正向最终饱和度
     stage10_managed_output_enabled: bool = True  # 独立生成带 sRGB/ICC 的 16-bit PNG/TIFF；永不重写 FITS 科学存档
+    stage10_presentation_color_p50_retention_min: float = 0.35  # 相对 Stage7 冻结表现参考的主体色度 P50 保留下限
+    stage10_presentation_color_p95_retention_min: float = 0.50  # 相对 Stage7 冻结表现参考的主体色度 P95 保留下限
+    stage10_presentation_opponent_energy_retention_min: float = 0.40  # 对立色能量保留下限
+    stage10_presentation_color_direction_correlation_min: float = 0.70  # 主体色彩方向相关下限
+    stage10_presentation_visibility_retention_min: float = 0.60  # 冻结主体可见度保留下限
+    stage10_presentation_microdetail_retention_min: float = 0.70  # 冻结主体微细节保留下限
+    stage10_presentation_microdetail_growth_max: float = 1.60  # 冻结主体微细节增长上限
+    stage10_presentation_galaxy_brightness_retention_min: float = 0.58  # 大星系主体亮度 P50 保留下限
+    stage10_presentation_generic_brightness_retention_min: float = 0.60  # 普通星云主体亮度 P50 保留下限
+    stage10_presentation_composite_brightness_retention_min: float = 0.45  # 复合亮星云主体亮度 P50 保留下限
+    stage10_presentation_star_preserve_brightness_retention_min: float = 0.20  # 保星目标主体亮度 P50 保留下限
     force_review_only_output: bool = False  # 显式启用时 Stage10 仅写 result_review*，不写正式结果名
 
     # Visual review evidence
@@ -485,7 +515,7 @@ class PipelineConfig:
     stage7_local_dark_separation_min: float = 0.001  # 暗云周围亮云与暗结构的最低局部亮度分离
     stage7_stretch_chroma_noise_score_max: float = 0.34  # Stage 7 正式拉伸候选的背景绝对色噪上限
     stage7_stretch_background_mottling_score_max: float = 0.45  # Stage 7 正式拉伸候选的背景斑驳上限
-    stage7_stretch_luma_noise_growth_max: float = 1.25  # Stage 7 冻结背景高频亮度噪声相对线性源的名义增长上限
+    stage7_stretch_luma_noise_growth_max: float = 1.25  # Stage 7 自动候选相对认证 tone-map 理论结果的额外高频亮度噪声上限；手动/旧任务保留 raw 语义
     stage7_stretch_chroma_load_growth_max: float = 1.37  # Stage 7 拉伸后综合色偏差相对背景亮度的最大放大倍数
     stage7_stretch_chroma_load_low_absolute_max: float = 0.05  # 绝对 chroma load 低于此值时豁免极低基线导致的相对增长失真
     stage7_stretch_chroma_load_low_absolute_tolerance: float = 0.0005  # 极低背景绝对 chroma load 门的数值抖动容差；仅与低绝对豁免组合使用

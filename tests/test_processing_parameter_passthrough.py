@@ -89,6 +89,7 @@ class ProcessingParameterPassthroughTests(unittest.TestCase):
             stage_status="ok",
             deconvolution_integrity_ok=True,
             denoise_integrity_ok=True,
+            formal_eligible=True,
             input_lineage=input_lineage,
         )
 
@@ -201,7 +202,7 @@ class ProcessingParameterPassthroughTests(unittest.TestCase):
         )
         self.assertTrue((self.pipeline.process_dir / "stage2_corrected.fit").is_file())
 
-    def test_stage3_user_preserve_keeps_diagnostics_and_writes_artifact(self) -> None:
+    def test_stage3_user_preserve_is_review_only_and_writes_artifact(self) -> None:
         self.pipeline.cfg.stage3_processing_mode = "preserve"
         self.pipeline._stage3_measure_features = lambda _label: ImageFeatures()
         self.pipeline._stage3_signal_preservation_metrics = lambda *_args: {}
@@ -229,11 +230,15 @@ class ProcessingParameterPassthroughTests(unittest.TestCase):
                 self.pipeline
             )
 
-        self.assertEqual(self.pipeline.results[-1][1], "ok")
+        self.assertEqual(self.pipeline.results[-1][1], "degraded")
         self.assertTrue((self.pipeline.process_dir / "stage3_bgremoved.fit").is_file())
         self.assertEqual(
             self.pipeline._stage3_background_decision["source"],
             "user_processing_parameters",
+        )
+        self.assertIn(
+            "stage3_passthrough_requires_verified_noop",
+            self.pipeline._stage_review_reasons(3),
         )
 
     def test_stage4_user_preserve_skips_solve_and_color_commands(self) -> None:
