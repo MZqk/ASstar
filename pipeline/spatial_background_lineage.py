@@ -19,6 +19,15 @@ LINEAGE_CHAIN_SCHEMA = "starun.stage3-spatial-background-lineage-chain.v1"
 STAGE7_SCHEMA = "starun.stage7-spatial-chroma-lineage.v1"
 STAGE7_REFERENCE_SCHEMA = "starun.stage7-spatial-background-reference.v1"
 STAGE7_REFERENCE_NAME = "stage7_spatial_background_reference.json"
+STAGE7_QUALITY_NAME = "stage7_stretch_quality.json"
+STAGE7_REFERENCE_REVIEW_ONLY = (
+    "stage7_spatial_background_reference_unavailable_due_to_review_only"
+)
+STAGE7_REFERENCE_MISSING = "stage7_spatial_background_reference_missing"
+STAGE7_REFERENCE_READ_FAILED = (
+    "stage7_spatial_background_reference_read_failed"
+)
+STAGE7_REFERENCE_INVALID = "stage7_spatial_background_reference_invalid"
 FINAL_SCHEMA = "starun.final-spatial-background-gradient.v2"
 SIGNIFICANCE_SIGMA = 3.0
 GROWTH_MAX = 1.25
@@ -667,16 +676,35 @@ def load_stage7_display_reference(process_dir: Optional[Path]) -> Dict[str, Any]
         "schema": STAGE7_REFERENCE_SCHEMA,
         "status": "unavailable",
         "accepted": False,
+        "reason_code": None,
         "issues": [],
     }
     if process_dir is None:
-        report["issues"] = ["process directory is unavailable"]
+        report["issues"] = [STAGE7_REFERENCE_READ_FAILED]
         return report
     root = Path(process_dir)
+    reference_path = root / STAGE7_REFERENCE_NAME
+    if not reference_path.is_file():
+        reason_code = STAGE7_REFERENCE_MISSING
+        quality_path = root / STAGE7_QUALITY_NAME
+        if quality_path.is_file():
+            try:
+                quality = json.loads(quality_path.read_text(encoding="utf-8"))
+                if (
+                    quality.get("formal_accepted") is False
+                    and str(quality.get("delivery_class") or "")
+                    == "review_only"
+                    and str(quality.get("status") or "")
+                    in {"review_only", "failed"}
+                ):
+                    reason_code = STAGE7_REFERENCE_REVIEW_ONLY
+            except (OSError, TypeError, json.JSONDecodeError):
+                reason_code = STAGE7_REFERENCE_MISSING
+        report["reason_code"] = reason_code
+        report["issues"] = [reason_code]
+        return report
     try:
-        payload = json.loads(
-            (root / STAGE7_REFERENCE_NAME).read_text(encoding="utf-8")
-        )
+        payload = json.loads(reference_path.read_text(encoding="utf-8"))
         if payload.get("schema") != STAGE7_REFERENCE_SCHEMA:
             raise ValueError("Stage7 spatial reference schema mismatch")
         if payload.get("status") != "accepted" or payload.get("accepted") is not True:
@@ -714,8 +742,14 @@ def load_stage7_display_reference(process_dir: Optional[Path]) -> Dict[str, Any]
         payload = dict(payload)
         payload["status"] = "accepted"
         payload["accepted"] = True
+        payload["reason_code"] = None
         return payload
-    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+    except (OSError, TypeError, json.JSONDecodeError):
+        report["reason_code"] = STAGE7_REFERENCE_READ_FAILED
+        report["issues"] = [STAGE7_REFERENCE_READ_FAILED]
+        return report
+    except ValueError as error:
+        report["reason_code"] = STAGE7_REFERENCE_INVALID
         report["issues"] = [str(error)]
         return report
 

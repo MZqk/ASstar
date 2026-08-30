@@ -1871,6 +1871,38 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
             "stage7_stretch_not_accepted",
             processor._stage_review_reasons(7),
         )
+        message = processor.results[-1][3]
+        self.assertIn("stage6_star_separation_state=accepted", message)
+        self.assertIn("stage7_stretch_state=rejected", message)
+        self.assertIn("evaluated but none accepted", message)
+        self.assertNotIn("star_separation_state=rejected", message)
+        report = processor.stage_json_reports["stage7_stretch_quality.json"]
+        self.assertEqual(report["upstream_star_separation_state"], "accepted")
+        self.assertEqual(report["stage7_stretch_state"], "rejected")
+        self.assertEqual(
+            report["starless_candidate_execution"],
+            "evaluated_not_accepted",
+        )
+
+    def test_stage7_tool_failure_reports_upstream_failure_and_skips_stretch(self):
+        processor = self._new_processor()
+        processor._star_separation_state = (
+            pipeline_module.StarSeparationState.TOOL_FAILED.value
+        )
+        processor._run_stage7_stretching_candidates = lambda: self.fail(
+            "Stage7 candidates must not run after a Stage6 tool failure"
+        )
+
+        pipeline_module.run_stage7_stretching(processor)
+
+        message = processor.results[-1][3]
+        self.assertIn("stage6_star_separation_state=tool_failed", message)
+        self.assertIn("stage7_stretch_state=skipped", message)
+        self.assertIn("starless-only stretch candidates skipped", message)
+        report = processor.stage_json_reports["stage7_stretch_quality.json"]
+        self.assertEqual(report["upstream_star_separation_state"], "tool_failed")
+        self.assertEqual(report["stage7_stretch_state"], "skipped")
+        self.assertEqual(report["delivery_class"], "review_only")
 
     def test_stage7_all_core_unsafe_candidates_revoke_pair_and_use_with_stars_review(self):
         processor = self._new_processor()
@@ -1957,7 +1989,10 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
             "stage7_review_with_stars",
         )
         self.assertNotIn(("autostretch", "-linked"), processor.cmd_calls)
-        self.assertIn("starless-only stretch candidates skipped", processor.results[-1][3])
+        self.assertIn(
+            "starless-only stretch candidates evaluated but none accepted",
+            processor.results[-1][3],
+        )
 
     def test_stage7_chroma_rescue_only_allows_exclusive_chroma_rejection(self):
         processor = pipeline_module.StarunPostProcessor()

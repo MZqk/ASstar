@@ -67,6 +67,8 @@ Stage 7 的 Stage 6 linked preview 仍只是屏幕显示参考。默认 `stage7_
 
 Stage 7 自动候选的亮度噪声门使用 `starun.stage7-luma-noise-growth.v2`：从同一线性源重放已认证 LUT/MTF/composite 有序链，`stage7_stretch_luma_noise_growth_max=1.25` 只约束实际候选相对理论 tone-map 的 `excess_growth`。`raw_growth/expected_growth` 仅作诊断；自动链无法验证时 fail-closed，手动与旧任务才保留 raw 语义。Stage 3 若发布冻结空间背景 lineage，Stage 7 还会在同一 support 上比较理论重放与实际候选的归一化 `R-G/B-G` 一阶平面；新增 3σ 分量或超过 1.25× 的额外坡度增长会拒绝候选，Stage 7 不执行色彩修补。正式接受后另发布 `stage7_spatial_background_reference.json`，绑定 support、候选像素、认证变换摘要和理论显示域三分量指标，供 Stage 10 同域验签。
 
+Stage 7 的报告分别记录 `upstream_star_separation_state` 与 `stage7_stretch_state`：Stage 6 去星已接受但拉伸候选全部拒绝时，前者保持 `accepted`，后者为 `rejected`，并进入含星 review fallback；只有 Stage 6 自身拒绝或工具失败时才把拉伸记为 `skipped`。Stage 10 若因此没有正式空间背景参考，使用 `stage7_spatial_background_reference_unavailable_due_to_review_only`，不再把预期缺失显示为原始文件系统异常；正式链缺失仍以 `stage7_spatial_background_reference_missing` fail-closed。
+
 Stage 6 拒绝 Starless pair 或工具失败时，Stage 7–9 的含星复核 FITS 保持验签来源逐像素不变，不提前执行 autostretch。Stage 10 冻结唯一 observer-only linked 显示合同，并把同一映射同时用于 Stage 5 星表参考、最终复核候选和 PNG；线性大星系在映射前若因动态范围压缩而暂不可见，只有可信含星 lineage 和至少 16 个验签目录星成立时才允许建立映射，映射后仍须通过主体与星表门。审计通过也只生成 `result_review*`，不会提升为正式交付或改写可信 FITS。
 
 Stage 4 的网络端点、Gaia 能力和 `spcc_list` 预检只提供审计证据，不会替代一次真实 Siril 命令；只有显式关闭联网/Stage 4、输入不适用或同应用会话已经发生真实 SPCC 超时，才会跳过相应尝试。SPCC/PCC 成功后，旧色偏、亮核、增益、窄带信号保留和精度指标仍写入报告，但仅为 `advisory_only`，不改写、回滚或切换成功候选；准备失败、命令失败/超时、候选缺失或不可读、尺寸变化、非有限像素及写回/保存验证失败才触发下一路由。

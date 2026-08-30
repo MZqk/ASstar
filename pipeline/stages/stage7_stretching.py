@@ -94,12 +94,25 @@ def _run_with_stars_review_stretch(
     *,
     source_stem: str | None = None,
     reason_code: str | None = None,
+    upstream_separation_state: str | None = None,
+    candidates_evaluated: bool = False,
 ) -> None:
     """Create a conservative review image without invoking starless-only logic."""
     stage_label = PipelineStage.STRETCHING.label
+    upstream_state = str(upstream_separation_state or separation_state)
+    stretch_state = "rejected" if candidates_evaluated else "skipped"
+    candidate_execution = (
+        "evaluated_not_accepted" if candidates_evaluated else "skipped"
+    )
     messages: List[str] = [
-        f"star_separation_state={separation_state}",
-        "starless-only stretch candidates skipped",
+        f"stage6_star_separation_state={upstream_state}",
+        f"stage7_stretch_state={stretch_state}",
+        (
+            "starless-only stretch candidates evaluated but none accepted; "
+            "with-stars review fallback activated"
+            if candidates_evaluated
+            else "starless-only stretch candidates skipped"
+        ),
     ]
     source_stem = str(
         source_stem
@@ -240,6 +253,9 @@ def _run_with_stars_review_stretch(
             "review_required": True,
             "input": f"{source_stem}.fit",
             "source_stem": source_stem,
+            "upstream_star_separation_state": upstream_state,
+            "stage7_stretch_state": stretch_state,
+            "starless_candidate_execution": candidate_execution,
             "shared_scene_support": shared_scene_support_summary,
             "review_output": "stage7_review_with_stars" if saved else None,
             "attempts": copy.deepcopy(
@@ -305,6 +321,9 @@ def _run_with_stars_review_stretch(
         details={
             "source_stem": source_stem,
             "review_output": "stage7_review_with_stars" if saved else None,
+            "upstream_star_separation_state": upstream_state,
+            "stage7_stretch_state": stretch_state,
+            "starless_candidate_execution": candidate_execution,
             "background_color_review_gate": background_color_review_gate,
         },
         review_reasons=pipeline._stage_review_reasons(7),
@@ -401,6 +420,7 @@ def run_stage7_stretching(pipeline) -> None:
             StarSeparationState.REJECTED.value,
             source_stem="stage6_input",
             reason_code="stage4_bright_core_color_integrity_unresolved",
+            upstream_separation_state=separation_state,
         )
         return
     if separation_state in {
@@ -418,6 +438,7 @@ def run_stage7_stretching(pipeline) -> None:
                 if bright_core_review_only
                 else None
             ),
+            upstream_separation_state=separation_state,
         )
         return
     pipeline._stage7_stretch_source = (
@@ -492,6 +513,8 @@ def run_stage7_stretching(pipeline) -> None:
             StarSeparationState.REJECTED.value,
             source_stem="stage6_input",
             reason_code="stage7_bright_core_integrity_rejected",
+            upstream_separation_state=separation_state,
+            candidates_evaluated=True,
         )
         return
 
@@ -546,6 +569,8 @@ def run_stage7_stretching(pipeline) -> None:
                 if target_bypass_review
                 else "stage7_stretch_not_accepted"
             ),
+            upstream_separation_state=separation_state,
+            candidates_evaluated=True,
         )
         return
 

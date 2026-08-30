@@ -658,8 +658,10 @@ class GuiRuntimeModesTests(unittest.TestCase):
             _append_event=events.append,
         )
 
-        main_window_module.StarunGui._apply_stage4_spcc_operational_cache_policy(
-            proxy
+        notice = (
+            main_window_module.StarunGui._apply_stage4_spcc_operational_cache_policy(
+                proxy
+            )
         )
 
         decision = manifest["decisions"]["stage4_color_calibration"]
@@ -675,6 +677,44 @@ class GuiRuntimeModesTests(unittest.TestCase):
         self.assertEqual(decision["route"], "physical_pcc_only")
         self.assertEqual(writes, [True])
         self.assertTrue(any("不再重复等待 SPCC" in item for item in events))
+        self.assertEqual(notice["status"], "operational_timeout_cached")
+        self.assertFalse(notice["expected_stage4_improvement"])
+        self.assertEqual(notice["fallback_route"], "physical_pcc_only")
+
+    def test_bootstrap_warns_for_cached_spcc_then_continues_pipeline(self):
+        calls = []
+        notices = []
+        work_dir = Path("/tmp/starun-spcc-cache-warning")
+        proxy = SimpleNamespace(
+            _current_work_dir=work_dir,
+            _cleanup_bootstrap_worker=lambda: calls.append("cleanup"),
+            _apply_stage4_spcc_operational_cache_policy=lambda: {
+                "status": "operational_timeout_cached",
+                "expected_stage4_improvement": False,
+                "fallback_route": "physical_pcc_only",
+            },
+            _show_run_banner=lambda tone, message, **kwargs: calls.append(
+                ("banner", tone, message, kwargs)
+            ),
+            preview_notice_label=SimpleNamespace(setText=notices.append),
+            _append_event=lambda message: calls.append(("event", message)),
+            _update_run_state=lambda **_kwargs: calls.append("state"),
+            _start_pipeline=lambda path, _estimate: calls.append(("start", path)),
+        )
+
+        main_window_module.StarunGui._on_bootstrap_succeeded(proxy, {})
+
+        banner = next(
+            item
+            for item in calls
+            if isinstance(item, tuple) and item[0] == "banner"
+        )
+        self.assertEqual(banner[1], "warning")
+        self.assertIn("Stage 4", banner[2])
+        self.assertIn("预期不会改善", banner[2])
+        self.assertTrue(banner[3]["show_log"])
+        self.assertIn("预期不会改善", notices[0])
+        self.assertLess(calls.index(banner), calls.index(("start", work_dir)))
 
     def test_bootstrap_success_applies_spcc_cache_before_pipeline_start(self):
         calls = []

@@ -10317,7 +10317,21 @@ class StarunGui(QMainWindow):
             return
         payload = result if isinstance(result, dict) else {}
         disk_estimate = payload.get("disk_estimate")
-        self._apply_stage4_spcc_operational_cache_policy()
+        spcc_cache_notice = self._apply_stage4_spcc_operational_cache_policy()
+        if (
+            isinstance(spcc_cache_notice, Mapping)
+            and spcc_cache_notice.get("status")
+            == "operational_timeout_cached"
+        ):
+            notice = (
+                "在线 Gaia SPCC 超时缓存仍有效；本次不会再次执行在线 SPCC，"
+                "Stage 4 与本轮正式交付资格预期不会改善。流水线仍会继续生成 "
+                "PCC/local fallback 审阅结果；若目标是改善 Stage 4，请等待服务"
+                "恢复后重启应用。"
+            )
+            self._show_run_banner("warning", notice, show_log=True)
+            self.preview_notice_label.setText(notice)
+            self._append_event("SPCC 缓存运行提示：" + notice)
         self._append_event("运行环境准备完成，正在启动处理…")
         self._update_run_state(
             phase="pipeline_starting",
@@ -10327,7 +10341,9 @@ class StarunGui(QMainWindow):
         )
         self._start_pipeline(work_dir, disk_estimate)
 
-    def _apply_stage4_spcc_operational_cache_policy(self) -> None:
+    def _apply_stage4_spcc_operational_cache_policy(
+        self,
+    ) -> dict[str, object] | None:
         """Apply session SPCC evidence after network capability preflight."""
 
         capability_manifest = getattr(
@@ -10364,12 +10380,35 @@ class StarunGui(QMainWindow):
                 "命中本应用会话的在线 Gaia SPCC 失败能力缓存；"
                 "本任务直接进入 PCC/local fallback，不再重复等待 SPCC。"
             )
+            decision = capability_manifest.get("decisions")
+            stage4_decision = (
+                decision.get("stage4_color_calibration")
+                if isinstance(decision, Mapping)
+                else None
+            )
+            cache_record = (
+                stage4_decision.get("spcc_operational_cache")
+                if isinstance(stage4_decision, Mapping)
+                else None
+            )
+            cache_status = (
+                str(cache_record.get("status") or "operational_timeout_cached")
+                if isinstance(cache_record, Mapping)
+                else "operational_timeout_cached"
+            )
+            return {
+                "status": cache_status,
+                "cache_key": cache_key,
+                "fallback_route": "physical_pcc_only",
+                "expected_stage4_improvement": False,
+            }
         elif self._spcc_online_circuit_open:
             self._pending_runtime_overrides[SPCC_ONLINE_CIRCUIT_ENV] = "1"
             self._append_event(
                 "本批次在线 Gaia SPCC 超时熔断已开启；"
                 "本任务跳过在线 SPCC，仍保留 localgaia/PCC 降级。"
             )
+        return None
 
     def _on_bootstrap_failed(self, title: str, detail: str) -> None:
         self._cleanup_bootstrap_worker()

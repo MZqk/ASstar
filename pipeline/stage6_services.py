@@ -8950,6 +8950,21 @@ class Stage6ServiceMixin:
                 "delivery_class": (
                     "formal" if best_attempt is not None else "review_only"
                 ),
+                "upstream_star_separation_state": str(
+                    getattr(
+                        self,
+                        "_star_separation_state",
+                        StarSeparationState.ACCEPTED.value,
+                    )
+                ),
+                "stage7_stretch_state": (
+                    "accepted" if best_attempt is not None else "rejected"
+                ),
+                "starless_candidate_execution": (
+                    "evaluated_accepted"
+                    if best_attempt is not None
+                    else "evaluated_not_accepted"
+                ),
                 "stage7_bright_core_integrity_rejected": bool(
                     self._stage7_destructive_core_rejected
                 ),

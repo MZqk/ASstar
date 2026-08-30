@@ -400,6 +400,73 @@ class SpatialBackgroundLineageTests(unittest.TestCase):
                 "pixel SHA mismatch",
                 " ".join(report["stage7_display_reference"]["issues"]),
             )
+            self.assertEqual(
+                report["stage7_display_reference"]["reason_code"],
+                lineage.STAGE7_REFERENCE_INVALID,
+            )
+
+    def test_missing_stage7_reference_classifies_review_only_route(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            reference = self._image()
+            self._write_lineage(root, reference)
+            (root / lineage.STAGE7_REFERENCE_NAME).unlink()
+            (root / lineage.STAGE7_QUALITY_NAME).write_text(
+                json.dumps(
+                    {
+                        "status": "review_only",
+                        "formal_accepted": False,
+                        "delivery_class": "review_only",
+                        "reason_code": "stage7_stretch_not_accepted",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = lineage.assess_final_spatial_background(root, reference)
+
+            self.assertFalse(report["accepted"])
+            self.assertEqual(
+                report["stage7_display_reference"]["reason_code"],
+                lineage.STAGE7_REFERENCE_REVIEW_ONLY,
+            )
+            self.assertEqual(
+                report["issues"],
+                [lineage.STAGE7_REFERENCE_REVIEW_ONLY],
+            )
+
+    def test_missing_formal_stage7_reference_remains_hard_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            reference = self._image()
+            self._write_lineage(root, reference)
+            (root / lineage.STAGE7_REFERENCE_NAME).unlink()
+            (root / lineage.STAGE7_QUALITY_NAME).write_text(
+                json.dumps(
+                    {
+                        "formal_accepted": True,
+                        "delivery_class": "formal",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = lineage.assess_final_spatial_background(root, reference)
+
+            self.assertFalse(report["accepted"])
+            self.assertEqual(report["issues"], [lineage.STAGE7_REFERENCE_MISSING])
+
+    def test_invalid_stage7_reference_uses_structured_read_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            reference = self._image()
+            self._write_lineage(root, reference)
+            (root / lineage.STAGE7_REFERENCE_NAME).write_text("{", encoding="utf-8")
+
+            report = lineage.assess_final_spatial_background(root, reference)
+
+            self.assertFalse(report["accepted"])
+            self.assertEqual(report["issues"], [lineage.STAGE7_REFERENCE_READ_FAILED])
 
 
 if __name__ == "__main__":

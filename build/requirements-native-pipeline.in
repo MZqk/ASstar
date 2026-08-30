@@ -1,0 +1,4 @@
+# Build-only dependency used to translate selected pure-Python pipeline modules.
+# It is not installed into SirilPythonSeed or shipped as a runtime dependency.
+Cython==3.3.0
+

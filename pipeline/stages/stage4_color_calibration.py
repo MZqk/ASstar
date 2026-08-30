@@ -1579,6 +1579,9 @@ def _stage4_run_spcc(
             status="skipped",
             error="online SPCC operational timeout is cached for this app session",
             reason_code="operational_timeout_cached",
+            expected_stage4_improvement=False,
+            fallback_route="physical_pcc_only",
+            recommended_action="refresh_operational_capability_before_retry",
             operational_cache={
                 "status": "operational_timeout_cached",
                 "scope": "application_session",
@@ -1587,7 +1590,9 @@ def _stage4_run_spcc(
         )
         return (
             False,
-            "SPCC skipped: operational timeout cached for this app session",
+            "SPCC skipped: operational timeout cached for this app session; "
+            "Stage4 color calibration is not expected to improve in this run; "
+            "continuing with PCC/local fallback review output only",
             [attempt],
         )
 

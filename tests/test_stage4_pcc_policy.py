@@ -846,6 +846,13 @@ class Stage4PccPolicyTests(unittest.TestCase):
         self.assertIn("operational timeout cached", detail)
         self.assertEqual(attempts[0]["status"], "skipped")
         self.assertEqual(attempts[0]["reason_code"], "operational_timeout_cached")
+        self.assertFalse(attempts[0]["expected_stage4_improvement"])
+        self.assertEqual(attempts[0]["fallback_route"], "physical_pcc_only")
+        self.assertEqual(
+            attempts[0]["recommended_action"],
+            "refresh_operational_capability_before_retry",
+        )
+        self.assertIn("not expected to improve", detail)
         self.assertEqual(
             attempts[0]["operational_cache"]["cache_key"],
             "spcc-online-test",
