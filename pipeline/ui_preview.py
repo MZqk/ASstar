@@ -290,6 +290,8 @@ def write_display_preview(
     apply_stretch: bool = True,
     max_side: int = DEFAULT_PREVIEW_MAX_SIDE,
     display_contract: dict[str, Any] | None = None,
+    artifact_root: Path | None = None,
+    pixel_coordinate_domain: str = display_rendition.PIXEL_DOMAIN_BOTTOM_UP,
 ) -> Path:
     """Write a display preview; optional stretch is linked and observer-only."""
 
@@ -297,8 +299,22 @@ def write_display_preview(
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(target.name + ".tmp")
     try:
-        rgb = _rgb_raw_float(image, max_side=max(64, int(max_side)))
-        if display_contract is not None:
+        if (
+            display_contract is not None
+            and display_contract.get("schema") == display_rendition.V3_SCHEMA
+        ):
+            rendered = display_rendition.apply_linked_review_contract(
+                image,
+                display_contract,
+                artifact_root=artifact_root,
+                pixel_coordinate_domain=pixel_coordinate_domain,
+            )
+            rgb = _rgb_raw_float(rendered, max_side=max(64, int(max_side)))
+        else:
+            rgb = _rgb_raw_float(image, max_side=max(64, int(max_side)))
+        if display_contract is not None and display_contract.get("schema") != (
+            display_rendition.V3_SCHEMA
+        ):
             rgb = display_rendition.apply_linked_review_contract(
                 rgb,
                 display_contract,
@@ -346,6 +362,8 @@ def write_display_fits_preview(
     apply_stretch: bool = True,
     max_side: int = DEFAULT_PREVIEW_MAX_SIDE,
     display_contract: dict[str, Any] | None = None,
+    artifact_root: Path | None = None,
+    pixel_coordinate_domain: str = display_rendition.PIXEL_DOMAIN_BOTTOM_UP,
 ) -> Path:
     """Write the first readable FITS as a labeled display-only preview."""
 
@@ -367,6 +385,8 @@ def write_display_fits_preview(
                 apply_stretch=apply_stretch,
                 max_side=max_side,
                 display_contract=display_contract,
+                artifact_root=artifact_root,
+                pixel_coordinate_domain=pixel_coordinate_domain,
             )
             return source
         except (OSError, RuntimeError, TypeError, ValueError) as exc:

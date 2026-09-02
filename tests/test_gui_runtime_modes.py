@@ -20,6 +20,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from gui import native_pipeline_runtime as native_runtime
+from tests.test_native_pipeline_runtime import (
+    fake_codesign_metadata,
+    fake_unsigned_macho_sha256,
+    make_test_native_payload,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GUI_MODULE_PATH = REPO_ROOT / "gui" / "starun_gui_app.py"
@@ -125,9 +132,60 @@ bootstrap_module = sys.modules[gui_module.BootstrapWorker.__module__]
 pipeline_worker_module = sys.modules[gui_module.PipelineWorker.__module__]
 common_module = sys.modules["common"]
 main_window_module = sys.modules[gui_module.StarunGui.__module__]
+worker_native_runtime_module = sys.modules[
+    pipeline_worker_module.stage_native_runtime_payload.__module__
+]
 
 
 class GuiRuntimeModesTests(unittest.TestCase):
+    def setUp(self) -> None:
+        for module in {native_runtime, worker_native_runtime_module}:
+            codesign = patch.object(
+                module,
+                "_codesign_metadata",
+                side_effect=fake_codesign_metadata,
+                create=True,
+            )
+            unsigned = patch.object(
+                module,
+                "unsigned_macho_sha256",
+                side_effect=fake_unsigned_macho_sha256,
+                create=True,
+            )
+            codesign.start()
+            unsigned.start()
+            self.addCleanup(codesign.stop)
+            self.addCleanup(unsigned.stop)
+
+    def _native_pipeline_worker_fixture(
+        self,
+        root: Path,
+        *,
+        with_native_payload: bool = True,
+    ):
+        work_dir = root / "work"
+        work_dir.mkdir()
+        config_template = root / "config.ini"
+        config_template.write_text("[core]\nextension=.fit\n", encoding="utf-8")
+        pipeline_dir = root / "pipeline"
+        pipeline_path = pipeline_dir / "starun.py"
+        pipeline_dir.mkdir()
+        pipeline_path.write_text("# mock\n", encoding="utf-8")
+        if with_native_payload:
+            make_test_native_payload(pipeline_dir)
+        worker = gui_module.PipelineWorker(
+            work_dir=work_dir,
+            config_template=config_template,
+            pipeline_path=pipeline_path,
+            siril_plugin_dir=root / "plugins",
+            resources=root / "resources",
+            runtime_home=root / "runtime_home",
+            siril_candidates=[],
+        )
+        temp_dir = root / "temp"
+        temp_dir.mkdir()
+        return worker, pipeline_dir, temp_dir
+
     def test_runtime_env_allowlist_keeps_acceleration_and_quality_gates(self):
         self.assertIn("STARUN_GRAXPERT_GPU", common_module.RUNTIME_ENV_ALLOWED_KEYS)
         for key in (
@@ -580,19 +638,84 @@ class GuiRuntimeModesTests(unittest.TestCase):
             _ensure_runtime_requirements_ready=lambda: calls.append("install"),
         )
 
-        result = gui_module.StarunGui._bootstrap_runtime(
-            proxy,
-            Path("/tmp/work"),
-            gui_module.INPUT_MODE_AUTO,
-            threading.Event(),
-            progress.append,
-        )
+        with patch.object(
+            gui_module.StarunGui,
+            "_verify_native_pipeline_runtime",
+            autospec=True,
+            side_effect=lambda _self: calls.append("native_probe") or True,
+        ):
+            result = gui_module.StarunGui._bootstrap_runtime(
+                proxy,
+                Path("/tmp/work"),
+                gui_module.INPUT_MODE_AUTO,
+                threading.Event(),
+                progress.append,
+            )
 
         self.assertTrue(result["bootstrap_cache_hit"])
         self.assertNotIn("install", calls)
         self.assertLess(calls.index("work_disk"), calls.index("seed"))
         self.assertLess(calls.index("runtime_disk"), calls.index("seed"))
+        self.assertLess(calls.index("seed"), calls.index("native_probe"))
+        self.assertLess(calls.index("native_probe"), calls.index("plugins"))
         self.assertTrue(any("跳过重复安装" in item for item in progress))
+
+    def test_native_pipeline_runtime_uses_actual_runtime_probe(self):
+        native_capability = {
+            "status": "available",
+            "available": True,
+            "mode": "native",
+            "import_probe": {"status": "pending", "available": None},
+        }
+        manifest = {
+            "capabilities": {
+                "native_pipeline": native_capability,
+                "pipeline": {
+                    "status": "available",
+                    "available": True,
+                    "native_runtime": native_capability,
+                },
+            }
+        }
+        runtime_python = Path("/runtime/venv/bin/python3.12")
+        pipeline_path = Path("/Applications/Starun.app/Contents/Resources/pipeline/starun.py")
+        events = []
+        proxy = SimpleNamespace(
+            _runtime_capability_manifest=manifest,
+            _runtime_venv_python_bin=lambda: runtime_python,
+            pipeline_path=pipeline_path,
+            runtime_capabilities_path=None,
+            _append_event=events.append,
+        )
+        probe_result = {
+            "python_version": "3.12.9",
+            "arch": "arm64",
+            "soabi": "cpython-312-darwin",
+            "modules": {
+                name: f"{name}{native_runtime.NATIVE_EXTENSION_SUFFIX}"
+                for name in native_runtime.NATIVE_MODULES
+            },
+        }
+
+        with (
+            patch.object(
+                main_window_module,
+                "probe_native_imports",
+                return_value=probe_result,
+            ) as probe,
+            patch.object(
+                main_window_module,
+                "refresh_blocking_errors",
+                return_value=[],
+            ),
+        ):
+            verified = gui_module.StarunGui._verify_native_pipeline_runtime(proxy)
+
+        self.assertTrue(verified)
+        probe.assert_called_once_with(runtime_python, pipeline_path.parent)
+        self.assertEqual(native_capability["import_probe"]["status"], "available")
+        self.assertTrue(native_capability["import_probe"]["available"])
+        self.assertTrue(any("实际 Siril CPython 3.12" in event for event in events))
 
     def test_session_spcc_cache_is_applied_after_capability_preflight(self):
         manifest = {
@@ -2068,6 +2191,140 @@ class GuiRuntimeModesTests(unittest.TestCase):
                 ).read_text(),
                 catalog.read_text(),
             )
+
+    def test_pipeline_worker_stages_verified_native_runtime_payload(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worker, _pipeline_dir, temp_dir = self._native_pipeline_worker_fixture(
+                root
+            )
+
+            worker._prepare_runtime_files(temp_dir)
+
+            native_runtime.validate_native_runtime_payload(temp_dir)
+            for name in native_runtime.NATIVE_MODULES:
+                self.assertTrue(
+                    (temp_dir / f"{name}{native_runtime.NATIVE_EXTENSION_SUFFIX}").is_file()
+                )
+                self.assertFalse((temp_dir / f"{name}.py").exists())
+                self.assertFalse((temp_dir / f"{name}.pyc").exists())
+
+    def test_pipeline_worker_reprobes_staged_payload_before_popen(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worker, _pipeline_dir, temp_dir = self._native_pipeline_worker_fixture(
+                root
+            )
+            run_ssf, run_ini, _run_py = worker._prepare_runtime_files(temp_dir)
+            expected = json.loads(
+                (
+                    temp_dir / native_runtime.NATIVE_RUNTIME_MANIFEST_NAME
+                ).read_text(encoding="utf-8")
+            )["manifest_payload_sha256"]
+            make_test_native_payload(temp_dir, marker="swapped-after-stage")
+            runtime_python = worker._siril_venv_dir() / "bin" / "python3.12"
+            runtime_python.parent.mkdir(parents=True)
+            runtime_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            runtime_python.chmod(0o755)
+
+            def validate_probe(python, pipeline_root, **kwargs):
+                self.assertEqual(Path(python), runtime_python)
+                self.assertEqual(Path(pipeline_root), temp_dir)
+                self.assertEqual(
+                    kwargs.get("expected_manifest_payload_sha256"),
+                    expected,
+                )
+                return worker_native_runtime_module.validate_native_runtime_payload(
+                    pipeline_root,
+                    expected_manifest_payload_sha256=expected,
+                )
+
+            with (
+                patch.object(
+                    pipeline_worker_module,
+                    "probe_native_imports",
+                    side_effect=validate_probe,
+                    create=True,
+                ) as probe,
+                patch.object(
+                    pipeline_worker_module.subprocess,
+                    "Popen",
+                    side_effect=AssertionError("Popen must follow native probe"),
+                ) as popen,
+            ):
+                result = worker._run_once(
+                    Path("/mock/siril-cli"),
+                    run_ssf,
+                    run_ini,
+                )
+
+            self.assertEqual(result, (False, -1))
+            self.assertTrue(worker._run_had_fatal_errors)
+            probe.assert_called_once()
+            popen.assert_not_called()
+
+    def test_pipeline_worker_rejects_invalid_native_payload_before_copy(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worker, pipeline_dir, temp_dir = self._native_pipeline_worker_fixture(
+                root
+            )
+            binary = pipeline_dir / (
+                native_runtime.NATIVE_MODULES[0]
+                + native_runtime.NATIVE_EXTENSION_SUFFIX
+            )
+            binary.write_bytes(binary.read_bytes() + b"tampered")
+
+            with self.assertRaises(
+                pipeline_worker_module.NativePipelineValidationError
+            ):
+                worker._prepare_runtime_files(temp_dir)
+
+            self.assertEqual(list(temp_dir.glob("*.so")), [])
+
+    def test_pipeline_worker_propagates_post_copy_native_validation_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worker, _pipeline_dir, temp_dir = self._native_pipeline_worker_fixture(
+                root
+            )
+
+            with (
+                patch.object(
+                    pipeline_worker_module,
+                    "stage_native_runtime_payload",
+                    side_effect=pipeline_worker_module.NativePipelineValidationError(
+                        "post-copy native validation failed"
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    pipeline_worker_module.NativePipelineValidationError,
+                    "post-copy native validation failed",
+                ),
+            ):
+                worker._prepare_runtime_files(temp_dir)
+
+    def test_frozen_pipeline_worker_rejects_missing_native_manifest(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worker, pipeline_dir, temp_dir = self._native_pipeline_worker_fixture(
+                root,
+                with_native_payload=False,
+            )
+            for name in native_runtime.NATIVE_MODULES:
+                (pipeline_dir / f"{name}.py").write_text(
+                    "# forbidden formal fallback\n",
+                    encoding="utf-8",
+                )
+
+            with (
+                patch.object(pipeline_worker_module, "is_frozen", return_value=True),
+                self.assertRaisesRegex(
+                    pipeline_worker_module.NativePipelineValidationError,
+                    "禁止回退",
+                ),
+            ):
+                worker._prepare_runtime_files(temp_dir)
 
     def test_pipeline_worker_uses_lightweight_plugin_overlay_for_large_resources(self):
         with tempfile.TemporaryDirectory() as td:

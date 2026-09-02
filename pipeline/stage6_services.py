@@ -2052,6 +2052,86 @@ class Stage6ServiceMixin:
         color_vector_gate = self._stage7_color_vector_gate(
             color_vector_reference
         )
+        with_stars_protection_gate: Dict[str, Any] = {
+            "status": "not_applicable",
+            "accepted": True,
+            "regions": {},
+            "issues": [],
+        }
+        if str(getattr(self, "_stage7_candidate_domain", "") or "") == "with_stars":
+            region_issues: List[str] = []
+            region_reports: Dict[str, Any] = {}
+            try:
+                source_rgb = _to_rgb_float_fullres(baseline_image_data)
+                candidate_rgb = _to_rgb_float_fullres(candidate_image_data)
+                spatial_shape = tuple(int(value) for value in source_rgb.shape[1:])
+                star_mask = (
+                    np.asarray(frozen_background_masks.get("star_mask"), dtype=np.float32)
+                    if isinstance(frozen_background_masks, dict)
+                    and frozen_background_masks.get("star_mask") is not None
+                    else None
+                )
+                halo_mask = (
+                    np.asarray(
+                        frozen_background_masks.get("star_halo_guard_mask"),
+                        dtype=np.float32,
+                    )
+                    if isinstance(frozen_background_masks, dict)
+                    and frozen_background_masks.get("star_halo_guard_mask") is not None
+                    else None
+                )
+                if (
+                    star_mask is None
+                    or halo_mask is None
+                    or tuple(star_mask.shape) != spatial_shape
+                    or tuple(halo_mask.shape) != spatial_shape
+                ):
+                    raise ValueError("frozen 3.5x/5x FWHM catalog masks unavailable")
+                regions = {
+                    "star": np.clip(star_mask, 0.0, 1.0),
+                    "halo": np.clip(halo_mask - star_mask, 0.0, 1.0),
+                }
+                for region_name, region_weight in regions.items():
+                    if int(np.count_nonzero(region_weight > 0.05)) < 64:
+                        region_issues.append(
+                            f"with_stars_{region_name}_support_insufficient"
+                        )
+                        continue
+                    report = stage7_stretch_metrics.assess_rec709_vector_color_reference(
+                        source_rgb * region_weight[None, :, :],
+                        candidate_rgb * region_weight[None, :, :],
+                    )
+                    gate = self._stage7_color_vector_gate(report)
+                    region_reports[region_name] = {
+                        "reference": report,
+                        "gate": gate,
+                    }
+                    if report.get("status") != "available":
+                        region_issues.append(
+                            f"with_stars_{region_name}_color_unavailable"
+                        )
+                    elif not bool(gate.get("accepted", False)):
+                        region_issues.extend(
+                            f"with_stars_{region_name}_{item}"
+                            for item in (gate.get("issues") or [])
+                        )
+                with_stars_protection_gate = {
+                    "status": "accepted" if not region_issues else "rejected",
+                    "accepted": not region_issues,
+                    "star_radius_fwhm": 3.5,
+                    "halo_radius_fwhm": 5.0,
+                    "regions": region_reports,
+                    "issues": list(dict.fromkeys(region_issues)),
+                }
+            except (TypeError, ValueError, IndexError) as error:
+                with_stars_protection_gate = {
+                    "status": "rejected",
+                    "accepted": False,
+                    "star_radius_fwhm": 3.5,
+                    "halo_radius_fwhm": 5.0,
+                    "regions": region_reports,
+                    "issues": [f"with_stars_protection_unavailable: {error}"],
+                }
         transform_loss = dict(transform_loss)
         transform_loss.update(
             role="technical_quality_gate",
@@ -2076,6 +2156,13 @@ class Stage6ServiceMixin:
                 *issues,
                 *list(color_vector_gate.get("issues") or []),
             ]
+        if not bool(with_stars_protection_gate.get("accepted", True)):
+            quality_ok = False
+            issues = [
+                *issues,
+                *list(with_stars_protection_gate.get("issues") or []),
+            ]
+        quality_gates["with_stars_protection"] = with_stars_protection_gate
         advisories.extend(transform_loss_gate.get("advisories") or [])
         advisories.extend(color_vector_gate.get("advisories") or [])
         quality_gates["transform_loss"] = transform_loss_gate
@@ -5907,6 +5994,10 @@ class Stage6ServiceMixin:
         star_separation_state: str = "",
         baseline_image_data: Optional[np.ndarray] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        with_stars_candidate_domain = bool(
+            str(getattr(self, "_stage7_candidate_domain", "") or "")
+            == "with_stars"
+        )
         stats = self._stage7_baseline_background_stats(baseline_quality, baseline_adaptive)
         bg_median = float(stats.get("bg_median", 0.0) or 0.0)
         bg_std = float(stats.get("bg_std", 0.0) or 0.0)
@@ -5945,6 +6036,10 @@ class Stage6ServiceMixin:
         manual_parameter_mode = bool(
             configured_parameter_mode == "manual" or manual_stretch_fields
         )
+        if with_stars_candidate_domain:
+            manual_stretch_fields = set()
+            explicit_manual_stretch_fields = set()
+            manual_parameter_mode = False
         if manual_parameter_mode and not manual_stretch_fields:
             manual_stretch_fields = {
                 "asinh_stretch",
@@ -6217,8 +6312,24 @@ class Stage6ServiceMixin:
                 "adaptive_replacement_disabled": True,
                 "target_contracts": target_contracts,
             }
+        if with_stars_candidate_domain and not cand_b_calibration:
+            try:
+                fallback_source_p50 = float(pixel_stats.get("p50", 0.0) or 0.0)
+                if not math.isfinite(fallback_source_p50) or fallback_source_p50 <= 0.0:
+                    raise ValueError("source P50 is unavailable")
+                fallback_preview_p50 = float(
+                    (preview_pixel_stats or {}).get("p50", 0.18) or 0.18
+                )
+                cand_b_calibration = {
+                    "calibration_method": "with_stars_source_distribution",
+                    "source_background": fallback_source_p50,
+                    "preview_p50": fallback_preview_p50,
+                    "target_p50": min(0.22, max(0.15, fallback_preview_p50 * 0.85)),
+                }
+            except (TypeError, ValueError):
+                cand_b_calibration = {}
         if (
-            starless_recomposition_planned
+            (starless_recomposition_planned or with_stars_candidate_domain)
             and cand_b_calibration
             and not manual_stretch_fields
         ):
@@ -6272,10 +6383,14 @@ class Stage6ServiceMixin:
                     0.50,
                     1.00,
                 )
-                effective_preview_ratio = _clamp_float(
-                    preview_ratio * linked_profile_multiplier,
-                    0.40,
-                    0.90,
+                effective_preview_ratio = (
+                    0.95
+                    if with_stars_candidate_domain
+                    else _clamp_float(
+                        preview_ratio * linked_profile_multiplier,
+                        0.40,
+                        0.90,
+                    )
                 )
                 target_p50 = _clamp_float(
                     max(
@@ -6415,10 +6530,15 @@ class Stage6ServiceMixin:
         display90_eligible = bool(
             display90_requested
             and not manual_parameter_mode
-            and starless_recomposition_planned
-            and str(source_stem or "") == "stage6_starless"
-            and str(star_separation_state or "")
-            == StarSeparationState.ACCEPTED.value
+            and (
+                with_stars_candidate_domain
+                or (
+                    starless_recomposition_planned
+                    and str(source_stem or "") == "stage6_starless"
+                    and str(star_separation_state or "")
+                    == StarSeparationState.ACCEPTED.value
+                )
+            )
             and baseline_image_data is not None
         )
         display90_calibration: Dict[str, Any] = {
@@ -6444,8 +6564,10 @@ class Stage6ServiceMixin:
             "tiers": [],
         }
         if display90_eligible:
-            requested_strength = float(
-                getattr(self.cfg, "stage7_display90_strength", 0.90)
+            requested_strength = (
+                0.90
+                if with_stars_candidate_domain
+                else float(getattr(self.cfg, "stage7_display90_strength", 0.90))
             )
             high_strength = _clamp_float(
                 requested_strength,
@@ -6463,8 +6585,18 @@ class Stage6ServiceMixin:
                     "mid",
                 ),
             ]
-            if str(target_stretch.get("name") or "").strip().lower() == (
-                "galaxy_core_halo_balance"
+            if (
+                str(target_stretch.get("name") or "").strip().lower()
+                == "galaxy_core_halo_balance"
+                or (
+                    with_stars_candidate_domain
+                    and str(
+                        self._active_target_type()
+                        if hasattr(self, "_active_target_type")
+                        else ""
+                    ).strip().lower()
+                    in {"galaxy", "large_galaxy", "small_galaxy"}
+                )
             ):
                 strength_ladder.append(
                     (
@@ -6534,9 +6666,16 @@ class Stage6ServiceMixin:
                     calibration["eligibility"] = {
                         "policy_requested": True,
                         "automatic_parameter_mode": True,
-                        "starless_recomposition_planned": True,
-                        "source_stem": "stage6_starless",
-                        "star_separation_state": StarSeparationState.ACCEPTED.value,
+                        "starless_recomposition_planned": bool(
+                            starless_recomposition_planned
+                        ),
+                        "candidate_domain": (
+                            "with_stars"
+                            if with_stars_candidate_domain
+                            else "starless"
+                        ),
+                        "source_stem": str(source_stem or ""),
+                        "star_separation_state": str(star_separation_state or ""),
                         "baseline_pixels_available": True,
                     }
                     calibration["requested_strength"] = requested_strength
@@ -6698,6 +6837,10 @@ class Stage6ServiceMixin:
     def _run_stage7_stretching_candidates(
         self,
     ) -> Tuple[bool, bool, List[str], str]:
+        candidate_domain = str(
+            getattr(self, "_stage7_candidate_domain", "starless") or "starless"
+        ).strip().lower()
+        with_stars_candidate_domain = candidate_domain == "with_stars"
         self._stage7_matched_domain_transfer = None
         self._stage7_stretch_validated_rescue = False
         self._stage7_stretch_forced_delivery = False
@@ -6911,6 +7054,16 @@ class Stage6ServiceMixin:
                 shared_scene_runtime,
                 spatial_shape,
             )
+            catalog_star_weight = scene_support.catalog_aperture_mask(
+                shared_scene_runtime,
+                spatial_shape,
+                radius_scale=3.5,
+            )
+            catalog_halo_weight = scene_support.catalog_aperture_mask(
+                shared_scene_runtime,
+                spatial_shape,
+                radius_scale=5.0,
+            )
             if valid_weight is not None:
                 frozen_background_masks["background_mask"] = (
                     np.asarray(
@@ -6933,7 +7086,12 @@ class Stage6ServiceMixin:
                 )
             protected_layers = [
                 value
-                for value in (saturation_weight, catalog_weight)
+                for value in (
+                    saturation_weight,
+                    catalog_halo_weight
+                    if with_stars_candidate_domain
+                    else catalog_weight,
+                )
                 if value is not None
             ]
             if protected_layers:
@@ -6941,6 +7099,24 @@ class Stage6ServiceMixin:
                     np.maximum.reduce(protected_layers), 0.0, 1.0
                 ).astype(np.float32, copy=False)
                 frozen_background_masks["background_mask"] *= 1.0 - protected
+            if with_stars_candidate_domain:
+                if catalog_star_weight is None or catalog_halo_weight is None:
+                    messages.append(
+                        "stage7 with-stars catalog masks unavailable; candidates "
+                        "will fail closed through the frozen protection contract"
+                    )
+                else:
+                    frozen_background_masks["star_mask"] = np.asarray(
+                        catalog_star_weight,
+                        dtype=np.float32,
+                    )
+                    frozen_background_masks["star_halo_guard_mask"] = np.asarray(
+                        catalog_halo_weight,
+                        dtype=np.float32,
+                    )
+                    frozen_background_masks["subject_mask"] *= (
+                        1.0 - np.asarray(catalog_halo_weight, dtype=np.float32)
+                    )
             frozen_background_sampling["shared_scene_support"] = (
                 shared_scene_support_summary
             )
@@ -7075,8 +7251,17 @@ class Stage6ServiceMixin:
             "background chroma rescue are conditional; positive chroma is Stage8-owned"
         )
         messages.append(
-            "stage7 Starless structure gate="
-            + ("starmask_rank_local" if starmask_image_data is not None else "generic_fallback")
+            "stage7 candidate_domain="
+            f"{candidate_domain}; structure_gate="
+            + (
+                "catalog_star_and_halo"
+                if with_stars_candidate_domain
+                else (
+                    "starmask_rank_local"
+                    if starmask_image_data is not None
+                    else "generic_fallback"
+                )
+            )
         )
         if self.process_dir:
             for pattern in (
@@ -7354,10 +7539,14 @@ class Stage6ServiceMixin:
                 f"mode={stretch_adaptation.get('mode')}, "
                 f"bg_median={float(stretch_adaptation.get('bg_median', 0.0) or 0.0):.4f}"
             )
-        candidate_policy = str(
-            getattr(self.cfg, "stage7_candidate_policy", "auto_display90")
-            or "auto_display90"
-        ).strip().lower()
+        candidate_policy = (
+            "auto_display90"
+            if with_stars_candidate_domain
+            else str(
+                getattr(self.cfg, "stage7_candidate_policy", "auto_display90")
+                or "auto_display90"
+            ).strip().lower()
+        )
         candidate_list = _stage7_candidates_for_policy(
             candidate_list,
             candidate_policy,
@@ -7368,7 +7557,7 @@ class Stage6ServiceMixin:
         ).strip().lower()
         if rendition_intent not in {"vivid_safe", "balanced", "conservative"}:
             rendition_intent = "vivid_safe"
-        if candidate_policy == "auto_display90":
+        if candidate_policy == "auto_display90" and not with_stars_candidate_domain:
             if rendition_intent == "balanced":
                 candidate_list = [
                     candidate
@@ -7389,7 +7578,12 @@ class Stage6ServiceMixin:
                 ]
         stretch_adaptation["candidate_policy"] = candidate_policy
         stretch_adaptation["rendition_intent"] = rendition_intent
-        stretch_adaptation["delivery_mode"] = "starless"
+        stretch_adaptation["delivery_mode"] = (
+            "with_stars_review_only"
+            if with_stars_candidate_domain
+            else "starless"
+        )
+        stretch_adaptation["candidate_domain"] = candidate_domain
         stretch_adaptation["enabled_candidates"] = [
             str(candidate.get("name")) for candidate in candidate_list
         ]
@@ -7424,7 +7618,11 @@ class Stage6ServiceMixin:
                 )
             except (TypeError, ValueError):
                 feedback_retry_max = 1
-            feedback_retry_max = max(0, min(feedback_retry_max, 1))
+            feedback_retry_max = (
+                0
+                if with_stars_candidate_domain
+                else max(0, min(feedback_retry_max, 1))
+            )
             for retry_index in range(1, feedback_retry_max + 1):
                 if bool(retry_attempt.get("allowed_as_final", False)):
                     break
@@ -7484,6 +7682,8 @@ class Stage6ServiceMixin:
             )
         ]
         if (
+            not with_stars_candidate_domain
+            and
             str(
                 getattr(self.cfg, "stage7_processing_mode", "auto") or "auto"
             ).strip().lower()
@@ -7613,6 +7813,8 @@ class Stage6ServiceMixin:
         )
 
         if (
+            not with_stars_candidate_domain
+            and
             best_attempt is None
             and failure_action == "auto_fallback"
         ):
@@ -7655,6 +7857,8 @@ class Stage6ServiceMixin:
                 )
 
         if (
+            not with_stars_candidate_domain
+            and
             best_attempt is None
             and failure_action == "auto_fallback"
         ):
@@ -8582,7 +8786,8 @@ class Stage6ServiceMixin:
         best_attempt = deterministic_best_attempt
         forced_attempt: Optional[Dict[str, Any]] = None
         forced_delivery_enabled = bool(
-            getattr(self.cfg, "stage7_forced_delivery_enabled", True)
+            not with_stars_candidate_domain
+            and getattr(self.cfg, "stage7_forced_delivery_enabled", True)
         )
         if (
             best_attempt is None
@@ -8903,10 +9108,28 @@ class Stage6ServiceMixin:
             "review_source": self._stage7_review_source,
             "background_color_review_gate": background_color_review_gate,
             "strict_bright_core_evidence": strict_core_evidence,
-            "delivery_mode": "starless",
-            "formal_accepted": bool(best_attempt is not None),
+            "candidate_domain": candidate_domain,
+            "candidate_execution": (
+                "evaluated_accepted"
+                if best_attempt is not None
+                else "evaluated_not_accepted"
+            ),
+            "source_binding": copy.deepcopy(self._stage7_source_binding),
+            "stage5_source_binding": copy.deepcopy(
+                getattr(self, "_stage7_stage5_source_binding", {}) or {}
+            ),
+            "delivery_mode": (
+                "with_stars_review_only"
+                if with_stars_candidate_domain
+                else "starless"
+            ),
+            "formal_accepted": bool(
+                best_attempt is not None and not with_stars_candidate_domain
+            ),
             "delivery_class": (
-                "formal" if best_attempt is not None else "review_only"
+                "formal"
+                if best_attempt is not None and not with_stars_candidate_domain
+                else "review_only"
             ),
             "stage7_bright_core_integrity_rejected": bool(
                 self._stage7_destructive_core_rejected
@@ -8930,6 +9153,16 @@ class Stage6ServiceMixin:
                 "rendition_intent": rendition_intent,
                 "failure_action": failure_action,
                 "input": f"{source_stem}.fit",
+                "candidate_domain": candidate_domain,
+                "candidate_execution": (
+                    "evaluated_accepted"
+                    if best_attempt is not None
+                    else "evaluated_not_accepted"
+                ),
+                "source_binding": copy.deepcopy(self._stage7_source_binding),
+                "stage5_source_binding": copy.deepcopy(
+                    getattr(self, "_stage7_stage5_source_binding", {}) or {}
+                ),
                 "preview": {
                     "name": "preview_ref",
                     "file": "stage7_preview_ref.fit" if preview_saved else None,
@@ -8945,10 +9178,18 @@ class Stage6ServiceMixin:
                 "shared_scene_support": shared_scene_support_summary,
                 "background_color_review_gate": background_color_review_gate,
                 "strict_bright_core_evidence": strict_core_evidence,
-                "delivery_mode": "starless",
-                "formal_accepted": bool(best_attempt is not None),
+                "delivery_mode": (
+                    "with_stars_review_only"
+                    if with_stars_candidate_domain
+                    else "starless"
+                ),
+                "formal_accepted": bool(
+                    best_attempt is not None and not with_stars_candidate_domain
+                ),
                 "delivery_class": (
-                    "formal" if best_attempt is not None else "review_only"
+                    "formal"
+                    if best_attempt is not None and not with_stars_candidate_domain
+                    else "review_only"
                 ),
                 "upstream_star_separation_state": str(
                     getattr(
@@ -8998,6 +9239,16 @@ class Stage6ServiceMixin:
                 "rendition_intent": rendition_intent,
                 "failure_action": failure_action,
                 "input": f"{source_stem}.fit",
+                "candidate_domain": candidate_domain,
+                "candidate_execution": (
+                    "evaluated_accepted"
+                    if best_attempt is not None
+                    else "evaluated_not_accepted"
+                ),
+                "source_binding": copy.deepcopy(self._stage7_source_binding),
+                "stage5_source_binding": copy.deepcopy(
+                    getattr(self, "_stage7_stage5_source_binding", {}) or {}
+                ),
                 "stretch_adaptation": stretch_adaptation,
                 "closed_form_mtf_reference": closed_form_mtf_reference,
                 "matched_domain_transfer": matched_domain_transfer,

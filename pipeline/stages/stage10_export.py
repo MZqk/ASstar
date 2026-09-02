@@ -1549,12 +1549,38 @@ def _stage10_star_visibility_reference(
         source_reference_pixels = np.asarray(source_pixels)
         audit_domain = "native_stage5_linear_domain"
         display_contract_name = None
+        selected_with_stars_review = bool(
+            str(
+                getattr(pipeline, "_stage7_candidate_domain", "") or ""
+            )
+            == "with_stars"
+            and bool(
+                str(
+                    getattr(pipeline, "_stage7_stretch_selected", "") or ""
+                )
+            )
+            and str(
+                getattr(pipeline, "_stage7_review_source", "") or ""
+            )
+            == "stage7_review_with_stars"
+        )
+        if selected_with_stars_review:
+            # The catalog geometry remains the immutable Stage 5 reference,
+            # while visibility must be measured in the hard-gated nonlinear
+            # with-stars domain that Stage 8/9/10 only pass through.
+            source_reference_pixels = np.asarray(final_pixels)
+            audit_domain = "selected_with_stars_review_domain"
         if display_contract is not None:
             if not display_rendition.validate_review_contract(display_contract):
                 raise RuntimeError("review display contract is invalid")
+            reference_contract = (
+                dict(display_contract.get("tone_contract") or {})
+                if display_contract.get("schema") == display_rendition.V3_SCHEMA
+                else display_contract
+            )
             source_reference_pixels = display_rendition.apply_review_contract(
                 source_reference_pixels,
-                display_contract,
+                reference_contract,
             )
             audit_domain = "shared_review_display_contract"
             display_contract_name = str(display_contract.get("name") or "") or None
@@ -1668,6 +1694,12 @@ def _stage10_star_visibility_reference(
             source_shape=list(source_shape),
             audit_domain=audit_domain,
             display_contract=display_contract_name,
+            catalog_geometry_source="stage5_input_linear.fit",
+            visibility_reference_source=(
+                "selected_with_stars_review_candidate"
+                if selected_with_stars_review
+                else "stage5_input_linear.fit"
+            ),
         )
         resolution.pop("reason", None)
         return catalog, resolution
@@ -3444,6 +3476,13 @@ def run_stage10_export(pipeline) -> None:
                     ),
                     source_stem="stage10_final",
                     input_visibility=review_input_visibility,
+                    subject_chroma_plan=dict(
+                        getattr(pipeline, "_review_subject_chroma_plan", {}) or {}
+                    ),
+                    artifact_root=pipeline.work_dir,
+                    pixel_coordinate_domain=(
+                        display_rendition.PIXEL_DOMAIN_BOTTOM_UP
+                    ),
                 )
                 if (
                     not display_rendition.validate_review_contract(
@@ -3478,6 +3517,36 @@ def run_stage10_export(pipeline) -> None:
                             input_visibility=review_input_visibility,
                         )
                     )
+                    subject_chroma_plan = dict(
+                        getattr(pipeline, "_review_subject_chroma_plan", {}) or {}
+                    )
+                    if subject_chroma_plan.get("accepted", False):
+                        try:
+                            review_display_contract = (
+                                display_rendition.build_subject_chroma_review_contract(
+                                    managed_pixels,
+                                    tone_contract=review_display_contract,
+                                    mask_artifact=dict(
+                                        subject_chroma_plan.get("mask_artifact") or {}
+                                    ),
+                                    chroma_evidence=dict(
+                                        subject_chroma_plan.get("evidence") or {}
+                                    ),
+                                    effective_saturation_budget=float(
+                                        subject_chroma_plan.get(
+                                            "effective_saturation_budget",
+                                            0.0,
+                                        )
+                                        or 0.0
+                                    ),
+                                    artifact_root=pipeline.work_dir,
+                                    pixel_coordinate_domain=(
+                                        display_rendition.PIXEL_DOMAIN_BOTTOM_UP
+                                    ),
+                                )
+                            )
+                        except (OSError, RuntimeError, TypeError, ValueError):
+                            pass
                     review_display_contract["selection_evidence"] = {
                         "mode": "trusted_catalog_underexposed_linear_review",
                         "catalog_source": preliminary_resolution.get(
@@ -3495,6 +3564,10 @@ def run_stage10_export(pipeline) -> None:
                 star_audit_pixels = display_rendition.apply_review_contract(
                     managed_pixels,
                     review_display_contract,
+                    artifact_root=pipeline.work_dir,
+                    pixel_coordinate_domain=(
+                        display_rendition.PIXEL_DOMAIN_BOTTOM_UP
+                    ),
                 )
                 star_audit_domain = "shared_review_display_contract"
             except (RuntimeError, TypeError, ValueError) as error:
@@ -3631,6 +3704,13 @@ def run_stage10_export(pipeline) -> None:
                     reason=contract_reason,
                     source_stem="stage10_final",
                     input_visibility=input_visibility,
+                    subject_chroma_plan=dict(
+                        getattr(pipeline, "_review_subject_chroma_plan", {}) or {}
+                    ),
+                    artifact_root=pipeline.work_dir,
+                    pixel_coordinate_domain=(
+                        display_rendition.PIXEL_DOMAIN_BOTTOM_UP
+                    ),
                 )
             except (RuntimeError, TypeError, ValueError) as error:
                 frozen_contract = display_rendition.unavailable_contract(
@@ -3845,6 +3925,10 @@ def run_stage10_export(pipeline) -> None:
                 review_pixels = display_rendition.apply_review_contract(
                     managed_pixels,
                     review_display_contract,
+                    artifact_root=pipeline.work_dir,
+                    pixel_coordinate_domain=(
+                        display_rendition.PIXEL_DOMAIN_BOTTOM_UP
+                    ),
                 )
                 visibility = audit_display_visibility(
                     review_pixels,

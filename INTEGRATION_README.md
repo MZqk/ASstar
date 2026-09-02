@@ -16,8 +16,11 @@ Starun 仅接受 `STARUN_*` runtime 环境变量，且使用 `starun.*` 任务/s
 | `gui/starun_gui_app.py` | GUI 入口 |
 | `gui/starun_gui_dev.py` | 系统 Siril + 现有 seed 的免打包开发入口 |
 | `gui/main_window.py` / `gui/pipeline_worker.py` | PySide6 GUI、preflight、Siril worker |
+| `gui/native_pipeline_runtime.py` | CPython 3.12 arm64 原生 pipeline 清单、复制和实际导入的 fail-closed 契约 |
 | `gui/ui_theme.py` / `gui/ui_platform.py` | 语义设计令牌、浅深色主题、系统字体与平台策略 |
 | `build/build_macos_app.sh` | macOS App 打包 |
+| `build/build_native_pipeline.sh` / `build/manage_native_pipeline_bundle.py` | 5 个原生模块的构建 provenance、App 嵌入、签名后 runtime 清单与验证 |
+| `build/package_macos_dmg.sh` | 已构建 App 的本地 ad-hoc DMG，或 Developer ID + notarization 发行候选封装 |
 | `resources/siril_plugins/` | 可选 Siril/SASP 插件缓存 |
 | `resources/siril_spcc_database/` | 固定版本、带清单与 SHA-256 的最小 SPCC 传感器/滤镜/白参考种子；不含 Gaia 星表 |
 | `resources/config.1.4.ini.template` | Siril 配置模板 |
@@ -42,8 +45,8 @@ Inputs:
 
 Notes:
 - `build/.venv` 只包含 `build/requirements-gui-build.lock` 锁定的 GUI 冻结依赖。脚本优先使用该环境，也可用 `--build-python` 显式覆盖；无论构建环境是否含重型科学库，PyInstaller 都排除仅由 Siril CP312 runtime 使用的模块，并在嵌入资源前验证 PySide6/numpy/astropy 存在且重型模块没有泄漏。
-- CPython 3.12 arm64 原生 pipeline PoC 使用独立的 `build/requirements-native-pipeline.lock`。以 `build/.venv/bin/python -m venv build/native/venv` 创建独立构建环境，再用 `build/native/venv/bin/python -m pip install --require-hashes -r build/requirements-native-pipeline.lock` 安装 Cython，最后执行 `./build/build_native_pipeline.sh`；默认从现有 `release/Starun.app` 解析 Siril seed CPython 3.12，并输出到 `dist/native-pipeline-cp312-arm64/`。当前范围固定为 `stage3_contract / background_sampling / stage4_auto_reference / local_adjustments / stage9_quality`，构建会验证 thin arm64、PyInit 符号、绝对链接、签名、CP312 实际导入和固定 fixture 的源码/原生数值等价。该目录仅是 `technical_poc`，不替换 App、不代表 DMG 或公开发行已就绪。
-- PyInstaller 在 `release/.starun_build.*` 临时目录中完成构建；只有资源校验与深度签名全部通过后才替换同名 `.app`，构建中断不会把半成品发布到 `release/`。
+- CPython 3.12 arm64 原生 pipeline 构建使用独立的 `build/requirements-native-pipeline.lock`。以 `build/.venv/bin/python -m venv build/native/venv` 创建独立构建环境，再用 `build/native/venv/bin/python -m pip install --require-hashes -r build/requirements-native-pipeline.lock` 安装 Cython，最后执行 `./build/build_native_pipeline.sh`；默认从现有 `release/Starun.app` 解析 Siril seed CPython 3.12，并输出到 `dist/native-pipeline-cp312-arm64/`。该目录是待嵌入的 build payload，不是 App、DMG 或公开发行结果。
+- PyInstaller 在 `release/.starun_build.*` 临时目录中完成构建；只有资源校验与 App 构建阶段验签全部通过后才替换同名 `.app`，构建中断不会把半成品发布到 `release/`。App seal 与 DMG distribution 是下文所述的两个独立阶段。
 - PyInstaller 强制使用 `arm64` 目标；构建后写入并校验 `LSMinimumSystemVersion=14.0`，同时用 `lipo` 拒绝非纯 `arm64` 主程序。
 - Bundle 元数据固定为 `CFBundleIdentifier=StarunC`、`CFBundleShortVersionString=0.1`、`CFBundleVersion=1`；GUI runtime 指纹读取为 `0.1 (1)`，版本变化时不复用旧依赖缓存。
 - 构建下载依赖时使用 `requirements.lock` 和 `resources/siril_plugins/requirements.lock`，并强制校验 pip-tools 生成的 SHA256。
@@ -52,8 +55,71 @@ Notes:
 - `resources/siril_plugins/cosmic_clarity/` 保留 CosmicClarity Native/classic wrapper 共用的最小模型集：`deep_denoise_{mono,color}_AI4.pth` 与 `deep_{sharp_stellar,nonstellar_sharp_conditional_psf}_AI4.pth`。
 - `resources/siril_plugins/bin/CosmicClarity` 是 bundled standalone classic wrapper，兼容 Siril classic 插件的 `input/`、`output/` 目录协议。
 - 默认 `--bundle-profile full` 生成单体 Full Offline App。`--bundle-profile core` 将完整 `siril_plugins` 输出到相邻的 `<AppName>-OfflineResources/`，App 启动时自动发现；可用 `--offline-resource-pack-dir` 自定义输出位置。
-- 可选参数：`--app-name`、`--output-dir`、`--build-python`、`--gui-entry`、`--pipeline-src`、`--config-template`、`--siril-src`、`--codesign-identity`、`--bundle-profile`、`--offline-resource-pack-dir`。
-- `--codesign-identity` 默认仍为 `-`（ad-hoc，适合本地验证）。公开升级发行应使用固定 Developer ID Application 身份；完整公证仍需另行配置 hardened runtime、timestamp 和 notarization。
+- 可选参数：`--app-name`、`--output-dir`、`--build-python`、`--native-build-python`、`--native-source-archive`、`--gui-entry`、`--pipeline-src`、`--config-template`、`--siril-src`、`--codesign-identity`、`--bundle-profile`、`--offline-resource-pack-dir`。
+- `--codesign-identity` 默认仍为 `-`（ad-hoc，适合 App 本地验证）。最终 DMG 的签名、公证和 stapling 由 `build/package_macos_dmg.sh` 统一收口；不得把 App 构建阶段的 ad-hoc 或单次深度验签解释为公开发行。
+
+### Native CPython App runtime
+
+正式 frozen App 的唯一原生 pipeline 根目录是：
+
+```text
+<App>.app/Contents/Resources/pipeline/
+  native-pipeline-build-manifest.json
+  native-pipeline-runtime-manifest.json
+  stage3_contract.cpython-312-darwin.so
+  background_sampling.cpython-312-darwin.so
+  stage4_auto_reference.cpython-312-darwin.so
+  local_adjustments.cpython-312-darwin.so
+  stage9_quality.cpython-312-darwin.so
+```
+
+- `native-pipeline-build-manifest.json` 保存构建来源和源码哈希 provenance；`native-pipeline-runtime-manifest.json`（`starun.native-pipeline-runtime.v1`）是 App runtime 的唯一权威清单，并以 SHA-256 绑定前者和签名后的 5 个 Mach-O 文件。runtime 清单必须在 5 个 `.so` 完成最终内层签名后生成，因为签名会改变二进制字节和 SHA-256。它记录的是 outer App 签名和 Apple 公证之前的 App seal 状态，因此不会在签名后回写 `release_eligible=true`；最终发行状态由 DMG 同目录的 `.release.json` sidecar 表达。
+- 原生模块集合固定为 `stage3_contract / background_sampling / stage4_auto_reference / local_adjustments / stage9_quality`，目标固定为 CPython `3.12`、SOABI `cpython-312-darwin`、thin `arm64` 和后缀 `.cpython-312-darwin.so`。清单不得自行缩小模块集合，路径只能是 pipeline 根下的单层文件名，不接受绝对路径、`..` 或符号链接。
+- 正式 App 中不得存在这 5 个模块的同名 `.py`、`.pyc` 或 `__pycache__` bytecode，也不得存在清单外的额外 `.so`。清单缺失、哈希/大小/ABI/精确 inventory 不符、源码回退残留，或实际 CPython 导入没有从该目录的 `.so` 解析时均 fail-closed；不得静默退回 Python 源码。
+- Worker 在执行 `pyscript` 前先验证 App 内 payload，再把两个清单和 5 个 `.so` 复制到本轮临时 pipeline 根，复制后固定原始 manifest identity，并在 `Popen` 前对这份最终临时副本重新验签、去签名后核对 Mach-O 血缘，再使用隔离 runtime 的真实 Siril CPython 3.12 导入全部模块。`runtime-capabilities.json` 记录 native/source 模式和 import probe；runtime venv 依赖缓存命中也不能跳过 native import probe。
+- `gui/starun_gui_dev.py` 创建的显式开发资源覆盖层可以在没有 runtime manifest 时使用完整的 5 个源码模块；这只是开发 source mode。frozen App 始终要求 native mode，开发覆盖层不得被当作正式 App 或 DMG 验证证据。
+- 此边界用于提高静态扫描和低成本复制门槛，并发现构建、封装或普通运行中的意外替换；不把“同一 macOS 用户已可在进程运行期间持续改写临时 `run_ssf/starun.py/.so`”当作安全边界。完全覆盖该更强威胁模型需要由 Siril 实际启动的 CPython 子进程按文件描述符复核并加载扩展，同时把 orchestrator 放入不可变执行根，必须另做真实 Stage 1–10 回归，不能只靠启动前 probe 宣称完成。
+
+### DMG signing and notarization
+
+`build/build_macos_app.sh` 负责 App seal，`build/package_macos_dmg.sh` 只接受一个已经按目标模式签好的 App，并在隔离 staging 中完成 distribution。完整顺序为：
+
+1. App builder 验证 native build manifest、5 个源码哈希、CPython 3.12 ABI 和待嵌入二进制 inventory；嵌入 `.so`，删除 5 个同名源码/bytecode 回退，并生成只在 seal 前存在的一次性 receipt，绑定 build manifest、嵌入字节与去签名后的 Mach-O 血缘。
+2. App builder 先把 Siril/Python 内部 Mach-O、framework 与 bundle 按目标身份由内到外重签，并对两个 CPython launcher 精确复核 `allow-unsigned-executable-memory=true` 和 `disable-library-validation=true`；随后签 5 个原生 `.so`、helper 和其余嵌套代码。Developer ID 路径的全部内层代码必须与 outer App 使用同一 Team ID、hardened runtime 和 timestamp；ad-hoc 路径只形成本地签名。
+3. App builder 必须以嵌入阶段捕获的 receipt hash 完成 seal；在 `.so` 字节冻结后生成 `native-pipeline-runtime-manifest.json`，记录 post-sign SHA-256、去签名后的 Mach-O SHA-256、CDHash、Team ID/签名模式和 build-manifest 引用，然后删除 receipt；随后不得再次改写或深度重签这些 `.so`。
+4. App builder 最后签 outer App；runtime manifest 生成后不得再使用会重签内层代码的 `codesign --deep --force`。发布前逐个验证 `.so`、用 App 内实际 CPython 3.12 完成 import probe，再执行 outer App 的 `codesign --verify --deep --strict`。
+5. DMG packager 验证输入和 staging App 的 bundle symlink 全部保持在 App 内、App/全部内层 Team、hardened runtime、Python entitlements、5 个 `.so` 均为 thin arm64，并以真实 CPython import。正式路径先用 ZIP 提交 App 公证，等待 Accepted、staple 并通过 Gatekeeper，再创建和签名 DMG。
+6. 正式路径继续提交 DMG 公证、等待 Accepted、staple 并通过 Gatekeeper；本地路径明确跳过这些 Apple 门槛。两条路径都只读挂载最终 DMG，从挂载卷内重做 App 签名、Python entitlement 和原生 import 验证。
+7. 所有验证结束后才计算最终 DMG SHA，并把 DMG、`.sha256`、`.release.json` 作为同一组事务发布。sidecar 绑定 runtime manifest SHA/payload hash、App/DMG Team/CDHash、notary submission ID、staple/Gatekeeper 结果和最终 DMG SHA；任何未解决的源码 provenance blocker 都会保留 `release_eligible=false`。sidecar 的 self-hash 只用于发现本地记录损坏，不是独立的外部真实性签名；下载资格系统若脱离同批 DMG 单独信任它，必须再使用 detached CMS 或服务端受信签名。
+
+本地签名链回归：
+
+```bash
+./build/package_macos_dmg.sh \
+  --app release/Starun.app \
+  --output release/Starun-local-arm64.dmg \
+  --local-adhoc
+```
+
+`--local-adhoc` 与发行参数互斥，不执行 Apple notarization，产物只可用于本机验证，不能标记为公开发行或可公证交付。
+
+Developer ID 发行候选：
+
+```bash
+SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+
+./build/build_macos_app.sh \
+  --output-dir release \
+  --codesign-identity "$SIGNING_IDENTITY"
+
+./build/package_macos_dmg.sh \
+  --app release/Starun.app \
+  --output release/Starun-0.1-arm64.dmg \
+  --codesign-identity "$SIGNING_IDENTITY" \
+  --notary-profile "starun-notary"
+```
+
+`--codesign-identity` 与 `--notary-profile` 必须成对提供；profile 应预先通过 `notarytool store-credentials` 保存到 Keychain，命令行不接收明文 Apple 凭据。只有 Developer ID 签名、App/DMG 验签、notary Accepted、stapling 全部成功，并且 `.release.json` 不再保留源码 provenance blocker 时，才会记录 `release_eligible=true`；这仍不替代版本、许可证、真实功能回归和最终人工发布审核。
 
 ## Runtime
 
@@ -69,8 +135,8 @@ Notes:
 - 每轮注入 Siril CPU 上限 `floor(logical_cpu * 0.8)`，最小 1。
 - 每轮确保 `~/.local/share/siril-scripts/`，校验并同步最小 SPCC 元数据种子。元数据预检与 `spcc_list` 结果只记能力证据；若运行时仍不能确定传感器或滤镜，SPCC 以 `command_preparation_failed` 结束并从不可变基线转 PCC，绝不复用 Siril GUI 历史状态。该种子覆盖 Seestar S30/S30 Pro/S50 与 DWARF 2/3/mini 所需的官方 Siril 传感器响应、UV/IR/Seestar LP/DWARF mini Astro 滤镜和白参考曲线，不含 Gaia XP 光谱。
 - 完全离线的 platesolve/PCC 使用 runtime 下大小精确匹配受支持版本的 `siril_cat_healpix8_astro.dat`；离线 SPCC 使用独立的 `siril_cat1_healpix8_xpsamp/`，预检要求编号 `0–47` 的 48 个有效分块全部存在。Worker 将两条路径写入临时 Siril config，并分别注入 `STARUN_GAIA_ASTRO_CATALOG` / `STARUN_GAIA_PHOTO_CATALOG`。GUI 下载器目前只安装约 1.52 GB 的 astrometric/PCC 目录；项目、App 与离线资源包均不得携带任一 Gaia 目录。显式离线时有 astrometric、无 XP 走 PCC-only；无 astrometric 时按 `stage4_offline_fallback_mode` 路由到 `auto_local_reference` 或 `preserve_input`。在线模式下端点探测结果只作 advisory，Stage 4 仍执行真实命令尝试。Siril、配置模板或流水线资源缺失仍然阻断。
-- Worker 运行时复制 Stage 1-10 pipeline、`pipeline/configs/` 目标目录/策略和小型插件脚本到临时目录；`downloads`、`syqon_starless`、`cosmic_clarity` 使用指向 App/离线资源包的只读符号链接，不再产生约 1.7 GB 的临时副本。
-- Worker 同步复制 `pipeline/stages/` 和共享 helper 模块；阶段实现不应依赖仓库外相对路径。
+- Worker 运行时复制 Stage 1-10 pipeline、`pipeline/configs/` 目标目录/策略和小型插件脚本到临时目录；正式 App 按上面的 Native CPython App runtime 契约复制并复验 5 个 `.so`，不会复制其同名源码回退。`downloads`、`syqon_starless`、`cosmic_clarity` 使用指向 App/离线资源包的只读符号链接，不再产生约 1.7 GB 的临时副本。
+- Worker 同步复制 `pipeline/stages/` 和未原生化的共享 helper 模块；阶段实现不应依赖仓库外相对路径。
 - GUI worker 将每轮 Siril 放入独立进程组：默认连续 900 秒无输出时记录最后命令、进程状态和本轮产物后终止整组；检测到本轮新 PNG 后，若连续 120 秒无输出且仍未退出，则按“导出成功、收尾异常”结束。GUI/任务日志将 Siril 与插件逐百分比输出压缩为约 10% 一档，并把重复的 ICCProfile HDU 跳过提示、Stage 5 NL-Bayes 已确认会继续执行的 `src fits` 初始化诊断各归并为一条 INFO；阶段变化、进度重启、完成行和其他非进度输出仍完整保留。原始输出仍逐行参与 watchdog 活跃度判断，已归并的无害诊断不会挤占崩溃诊断的最近有效输出缓冲区。
 - GUI 先在主线程完成资源布局、模板/流水线语法与完整性、Gaia 本地目录、工作目录和输入的快速 preflight；再由 `BootstrapWorker` 实际执行 Siril `--version`、探测网络端点并分别预估系统运行时卷与工作目录卷，同卷时合并需求判断。最终 `runtime-capabilities.json.decisions.stage4_color_calibration` 使用 `starun.stage4-color-capability-decision.v2` 和 `attempt_policy=attempt_then_fallback` 冻结来源与 advisory 能力证据，并通过任务专用 `STARUN_RUNTIME_CAPABILITIES_MANIFEST` 传给流水线；读取端兼容 v1。在线预检不可达不得预先关闭 SPCC/PCC 或开启熔断，只有真实 SPCC 超时可写应用会话缓存。工作目录预估以输入 FITS 实际大小为基准，按完整叠加流程 `44` 份、Stage 2 续跑 `40` 份、线性续跑 `28` 份的阶段/临时产物峰值计算，Light 模式另加预处理 sequence 预算，最后增加 `max(1 GiB, 15%)` 余量。检查通过后才执行 runtime seed、插件检查和离线依赖准备。SyQon/CosmicClarity 模型通过环境变量直接指向 App/离线资源包，并清理与 bundled 文件同尺寸的旧受管副本。准备阶段的“停止”会终止当前下载/安装子进程组。runtime venv 内的 `.starun_runtime_ready.json` 使用依赖锁 SHA-256、Siril Python ABI 和 App 版本作为指纹，命中时跳过重复 `pip install`。
 - GUI 使用稳定工具栏、任务输入/预览工作区、两阶段概览和固定状态栏作为主框架，并以显式 `empty / task / run` 状态切换内容区。首次启动或保存输入失效时进入拖放空状态；有效输入直接进入任务设置并重新检测。输入可为明确母版文件、递归 Light 目录或产品任务目录；主界面只显示由契约生成的唯一 Stage 1-10 计划，不再显示手动阶段选择器。快速 preflight 通过后立即进入只读运行视图，完成、失败和停止也保持该视图，只有显式“返回任务设置”才退出。窗口默认 `1280×800`、最小 `980×680`；主窗口以防抖方式分别保存正常矩形和最大化状态，启动时不恢复最小化/全屏幕，显示器移除后按当前 `availableGeometry` 校正。运行页使用可调宽的任务摘要侧边栏、主预览和检查器三栏：侧边栏保持一至两行的轻量任务信息，完整 Stage 2–9 冻结配置移入检查器“任务”页，阶段状态位于“阶段”页；两侧栏只响应用户的工具栏/显示菜单命令，不再因窗口低于 1100 px 自动消失。历史记录不再占用第四个主工作区状态，而由可恢复位置/尺寸的非模态单实例辅助窗口承载；搜索和筛选保留在该窗口内，处理期间允许只读浏览，但打开详情与删除锁定。文件/目录拖放、最近输入和 `QSettings` 持久化保留；窗口位置/尺寸、Task/Run 分隔宽度、两侧栏显示状态、检查器页、高级设置、全宽参数 sheet、专家参数可见性与日志展开状态会恢复。`PreferencesRole` / `Command-,` 打开相对主窗口放置、固定尺寸、非模态、单实例且不参与启动恢复的应用设置窗口，只维护联网、保留中间文件、完成后断点收敛、输出、正式/复核和计算设备等持久默认值；任务运行时窗口可查看但控件锁定。工具栏“任务选项”与“处理参数…”保留当前任务语义，通用配置之后始终显示全任务“默认 / 放松 3× / 无限 10×”门禁档位，Stage 2–9 再以下方单开手风琴显示；无限档位只在本任务内强制复核，不改写持久输出用途。建议参数始终可见，专家参数按执行策略、算法参数、过程门禁、质量验收、回退与失败分组；显式登记的数值门禁在跟随档位时只读显示派生有效值，取消跟随后才恢复原专家范围编辑，全局专家按钮只控制可见性且不清空值。档位与阶段字段只写入当前任务内存状态和签名 `run-manifest.json`，不进入 `QSettings`；切换输入时恢复默认档位并清空阶段覆盖，同一批次共享冻结快照，重新运行从验签清单恢复。恢复点会禁用已经完成的阶段。每项同时设置 tooltip 与 accessibility description，未知字段在 preflight 拒绝，专家合法越界值在共享注册表中安全限幅并留痕，档位派生值则只按显式物理域截断；新任务只写 v7 当前字段，历史 v4/v5/v6 仅在验签后兼容读取并执行明确迁移，Stage 10 门禁不属于 Stage 2–9 参数契约。保留中间文件与联网仍为快捷开关：前者默认关闭，后者默认开启。旧参数、旧 QSettings 键和已删除入口不会恢复。主控件设置 label buddy、辅助功能名称/说明、状态播报和显式 Tab 顺序。
@@ -176,8 +242,8 @@ Pipeline 细节以 `pipeline/starun_workflow.md` 为准；这里仅保留集成�
 - Stage 10 正常导出必须保留 TIFF/PNG/FITS fallback 名称，包括续跑模式的 `_linear` fallbacks；全模板因 `STACKCNT` 等字段不完整而不可用时，应先用 `OBJECT / EXPTIME / DATE-OBS` 生成可识别的安全字面名称，身份信息不足时才使用通用 fallback。若 Stage 2 视场或 Stage 3 背景要求复核、Stage 4 色彩要求复核、target-bypass 的 Stage 7 未验收、`stage9_psf_review_required=true`、最终源不是 Stage 9 记录的首选源或无法确认、`stage10_final.fit`/最终质量门不可用或报告契约不一致、最终质量报告要求保守重跑，或 `stars_required=true`、`stars_applied=false` 但 `output_contains_stars=true`，则只写 `result_review*`，不得覆盖普通 `result_processed/result_final`。若 `stars_required=true` 且 `output_contains_stars=false`，Stage 10 必须在写任何正式或复核交付前以 `required_stars_output_withheld` 失败。
 - Stage 10 实际启动末端降噪前必须冻结输入，并仅从 Stage 9 验证星表重建有界星点保护 mask；mask 不可用/超覆盖时安全跳过。所有后端成功结果统一回混硬星核与羽化边界，回混失败恢复冻结输入；统一强度来自 `stage10_final_denoise_strength`，不得在调用点另写固定强度。无 headless 强度参数的交互式 SCUNet GUI 脚本不得进入自动回退链。
 - Stage 7 正式候选发布 `stage7_spatial_background_reference.json / starun.stage7-spatial-background-reference.v1`，绑定 Stage 3 support SHA、候选像素 SHA、认证 tone 链摘要及理论显示域指标。Stage 10 最终质量报告使用 `starun.final-quality.v4` 和 `starun.final-spatial-background-gradient.v2`：最终亮度或归一化 `R-G/B-G` 一阶平面相对同一 Stage 7 理论显示域参考新达到 3σ，或斜率增长超过 1.25× 时，使用 `final_spatial_background_gradient_unresolved` 禁止正式交付；认证参考本身的显著性仅作诊断，逐像素不变的来源不会被重复否决。Stage 3 线性指标只作诊断。Stage 7 已明确 review-only 时缺少正式参考记录 `stage7_spatial_background_reference_unavailable_due_to_review_only`；正式链缺失记录 `stage7_spatial_background_reference_missing`，读取失败记录 `stage7_spatial_background_reference_read_failed`，验签失败记录 `stage7_spatial_background_reference_invalid`。这些情况都 fail-closed，且不触发隐藏色彩修复。
-- 已进入 review-only 且 Stage 9 验签为含星的路径，Stage 10 在星表审计前冻结 observer-only display contract，并对 Stage 5 签名参考与复核候选重放同一映射；通过既有 0.002/16 点/可见率门后只生成 `result_review*`，原始 FITS 不改写。线性大星系若在映射前因动态范围压缩而被主体代理标为 `unmappable`，必须先验签可信含星 lineage 与至少 16 个 Stage 5/9 目录星，才允许建立 bounded linked mapping，并在映射后重跑主体和星表门。普通紧致峰不能替代星表，合同、SHA、尺寸或同域审计失败仍 withheld。`stage10_pre_export_visibility.json` 与 catalog resolution 使用 v2 并明确记录审计域和交付范围。
-- Stage 6 拒绝 Starless pair 或工具失败后，Stage 7–9 的含星 review-only 检查点必须逐像素保持验签来源，不得在可信 FITS 上提前执行 `autostretch -linked`。唯一 linked 显示映射只用于 Stage 10 的 PNG 与同显示域星表审计，避免参考星表仍在线性域而候选已在非线性域的契约错配。
+- 已进入 review-only 且 Stage 9 验签为含星的路径，Stage 10 在星表审计前冻结 observer-only display contract。Stage 6 为 `rejected/tool_failed` 时，Stage 7 必须重新验签不可变 `stage5_linear.fit`，每个候选从该源独立加载并只评估 Asinh、linked MTF、Display70/82/90（大/小星系另有 D86）；3.5×FWHM 星点区、5×FWHM halo 区及现有背景/裁切/噪声/核心硬门全部通过才保存 `stage7_review_with_stars.fit`，否则逐像素回退 Stage 5。即使选中仍固定 `formal_accepted=false / delivery_class=review_only`，Stage 8/9 只透传、Stage 10 只生成 `result_review*`。Stage 5 handoff、候选 source binding、目录 SHA、尺寸或同域审计失败仍 withheld；普通紧致峰不能替代星表。
+- Review 显示继续兼容 v1/v2；符合 `galaxy + broadband RGB/OSC + physical SPCC/PCC accepted`、两个 Stage 8 色度开关和正预算的任务，可构建 `starun.display-rendition-contract.v3 / tone_then_subject_chroma_v1`。冻结 `process/display_rendition_masks.npz` 必须绑定安全相对路径、文件/数组 SHA、形状及 bottom-up 坐标域；重放接口必须显式传 artifact root 与坐标域。弱色证据要求 2048 支持像素、4 网格/3 象限、2/4/6 低频相关 `>=0.90`、主体/背景能量比 `>=1.50`、SNR `>=5`。色度只在 tone 后放大主体低频 `RGB-Y`，受 `nebula_saturation` 预算、P50/P95 `0.12/0.30`、背景/核心/星点/halo 恒等、亮度误差 `1e-6`、零新增裁切与 `0.995` headroom 门约束。构建门失败降级 v2 tone-only；冻结 v3 路径、符号链接、SHA、数组、形状或坐标验签失败时拒绝 PNG。FITS、科学 TIFF、Siril 缓冲不应用该色度。
 - Stage 10 的受管理导出只新增 `*_display_srgb.png` 与 `*_edit_srgb.tif`，不补写或重写 Siril 原产物。`audit_display_visibility`、managed output 与对应报告使用 v2，可携带显式源星目录及 `siril_pixel_buffer_bottom_up`/`display_array_top_down` 坐标域。PNG 除必须带 sRGB 声明外，还会先检查源显示亮度，必要时只对 display 衍生图执行 linked 可见度映射；在导出前像素和解码后的实际 PNG 上分别复核目录星、亮度与宽延展主体。通用 `compact_peak_count` 仅作诊断，不能满足 `stars_required`；目录不可用或任一目录可见度审计失败时，即使任务已因 Stage 3 等原因进入复核，也不得发布无星 `result_review*`。TIFF 必须内嵌有效 ICC，否则该衍生文件 fail-closed。`managed_output_report.json` 与 `output_color_manifest.json` 分别记录映射前/成品像素、写入和容器复核，FITS 在导出前后以 SHA-256 验证不变。
 - Stage 3 的 `verified_noop` 只在完整真天空/方向梯度/图样噪声/像素/目标保真/绝对背景门通过、且全部候选仅因改善低于 `3σ` 不确定度而拒绝时成立；它与实际校正都发布 `starun.stage3-spatial-background-lineage.v2`，绑定 run、正式 route、输入/输出 artifact 与解码像素 SHA、support、拟合/验证点、参考平面和 chain digest。v1 只读且固定 `legacy_nonformal`。Stage 5 只消费验签后的冻结天空、主体结构和多尺度噪声证据，冻结模型必须以 schema、尺度、mask/input SHA 与 digest 验签并实际驱动滤波；按 `0.60/0.72/0.84` 选择最弱合格候选，正式门固定为噪声下降 `>=0.12`、细节保留 `>=0.90`，全拒时精确回滚且 handoff `formal_eligible=false`。
 - Stage 7 色度和绝对可见噪声必须从 Stage 6 冻结 ROI/linked preview 计算；一般目标主体 nominal/hard 为 `0.70/0.55`、非背景 `0.45/0.30`，star-preserve 主体为 `0.35/0.23`。显示域天空噪声 `<=0.025` 正式通过、`0.025–0.0375` advisory、再高硬拒。正式 winner 另发布内部 `stage7_presentation_reference.fit/json` 并双 SHA 绑定。
@@ -185,7 +251,7 @@ Pipeline 细节以 `pipeline/starun_workflow.md` 为准；这里仅保留集成�
 - Stage 10 只对正式 Stage 9 来源执行末端降噪，不对 review-only 来源承担低频背景扣除。最终背景质量只消费 `stage10_background_support.json / starun.stage10-authenticated-background-support.v1`，由 Stage 3 v2 support 与 Stage 6/7 冻结 mask 交集生成，禁止从最终候选重选暗像素。`presentation_quality_report.json / starun.presentation-quality.v1` 以 Stage 7 冻结表现参考复核色彩 P50/P95、opponent energy、方向相关、可见度、目标 profile 亮度、微细节和 `0.97–1.05` 星点表现软目标；科学 PSF 硬门仍为 `0.93–1.10`。`final_artifact_identity_report.json / starun.final-artifact-identity.v1` 重新解码 Stage 10、正式 FITS 与请求的 managed PNG/TIFF，验证正式名称、文件 SHA 和量化后像素链。`pipeline-result.json.delivery_gates / starun.final-delivery-gates.v1` 只有科学门、表现门、无 review requirement、正式 artifact 身份四项同时通过才设置 `formal_delivery_accepted=true` 与 `delivery_eligible=true`。GUI 下载资格只读取该字段；已签名的历史 `pipeline-result` v1/v2/v3 均可读取，其中 v3 固定为 `legacy_schema_read_only`，任何历史结果缺少新双门字段时均标记 `legacy_delivery_contract` 且不可下载。
 - `script/five_target_reference_qa.py` 位于生产 Stage 1–10 之外，只做外部参照注册、测量和报告/联图生成。SIFT 注册先取双向 Lowe-ratio 互认匹配以排除星密场的一向同形误配，互认点不足才使用单向稀疏回退；两路均须通过相同的最少匹配/内点、`>=0.30` 内点比例、重投影 P95 和视场重叠硬门。manifest 必须完整覆盖五个锁定目标/profile，baseline/optimized/reference 路径与 SHA 互异；baseline 验签所属历史 run，optimized 验签新 run 的 `pipeline-result.json`、正式 artifact SHA、`delivery_eligible` 与科学/表现双门。人工检查逐项绑定 optimized SHA，并要求全分辨率复核；工具执行前后复核三类输入 SHA 不变。报告固定输出 `external_reference_used=true`、`production_feedback=false`、`production_pixels_written=false`，目录必须位于各生产 run 和参照输入树之外，结果不得反向修改生产像素、阶段门、`delivery_gates` 或 GUI 下载资格。
 - Runtime plugin 路径必须保持离线可用：SyQon、SASP、CosmicClarity 资源来自 bundled/local cache；缺失时应作为 preflight/runtime 问题处理，不应要求 pipeline 内联网下载。
-- `final_artifact_identity_report.json` 对源绑定的观察专用 `linked_visibility_v2` 从冻结源精确重放黑白点、目标中值、gamma 与 RGB 共同比例映射，并比较 managed PNG 的解码 SHA；参数、来源或像素篡改均 fail-closed。
+- `final_artifact_identity_report.json` 对源绑定的 v1/v2 tone 或 v3 `tone_then_subject_chroma_v1` 从冻结源精确重放；v3 额外验签 artifact root、坐标域、mask 文件/数组身份与冻结色度指标，再比较 managed PNG 的解码 SHA。参数、来源、掩膜或像素篡改均 fail-closed。
 - 检查点压缩后的第二次结果清单复验允许 `process/stage10_final.fit` 已被清理，但只能以唯一正式科学 FITS 作为 `compacted_scientific_archive_anchor`：文件 SHA 必须匹配输出清单，解码像素 SHA 必须精确匹配 `managed_output_report.json` 中冻结且声明 `checkpoint=stage10_final.fit` 的源身份。随后所有 managed 角色继续按该同一像素源重放；缺失、多锚点或 source/report/output 任一不一致均 fail closed。
 
 - 压缩底座的 `large_galaxy` Display 候选在现有 v2 合同内使用有界亮度分位数锚点；诊断写入 `quantile_tone_curve`，逐像素统一 RGB 增益、65536 点 LUT 摘要和 SHA-256 重建验签不变。
@@ -214,7 +280,9 @@ Stage 9 formal candidate score 先比较 `soft_target_closed`，再比较 visibi
 | Deterministic B/C/D engines | `python3 -m unittest tests.test_device_geometry tests.test_noise_model tests.test_narrowband_normalization tests.test_star_color_repair tests.test_local_adjustments tests.test_managed_output tests.test_output_color` |
 | GUI/preflight | `python3 -m unittest tests.test_runtime_capabilities tests.test_gui_runtime_modes`; 缺 Siril/config/完整 pipeline/FITS/result_linear 的错误清晰；App Bundle 边界、48 个 XP 分块、网络/本地二选一、每 run 预检前日志与状态隔离、Stop 行为均保持安全 |
 | Dev launcher | `python3 -m unittest tests.test_gui_dev_launcher tests.test_pipeline_dev_launcher tests.test_manual_core_pipeline_smoke`; 检查显式 Siril/seed 校验、临时资源覆盖、无 GUI 核心入口和结果清单校验 |
-| Build / Cocoa launch | `bash -n build/build_macos_app.sh && bash -n script/build_and_run.sh`; `./script/build_and_run.sh --verify`；PyInstaller 边界检查通过；`dist/Starun.app` 仍嵌入 Siril、pipeline、config、CP312 wheels 与模型；`codesign --verify --deep --strict` 通过 |
+| Native App runtime | `python3 -m pytest -q tests/test_native_pipeline_runtime.py tests/test_runtime_capabilities.py tests/test_gui_runtime_modes.py`；检查固定 5 模块、post-sign manifest、无源码/bytecode 回退、pre/post-copy 哈希、真实 CP312 `.so` import，以及 formal App required / dev overlay source mode 边界 |
+| Build / Cocoa launch | `bash -n build/build_macos_app.sh && bash -n script/build_and_run.sh && bash -n build/package_macos_dmg.sh`; `./script/build_and_run.sh --verify`；PyInstaller 边界检查通过；`dist/Starun.app` 仍嵌入 Siril、native pipeline、config、CP312 wheels 与模型；逐个 `.so` 和 outer App 的 `codesign --verify --strict` 通过 |
+| DMG signing/notarization | 分别执行 `build/package_macos_dmg.sh --local-adhoc` 本地路径与 Developer ID + notary profile 发行路径；核对 DMG 签名、`notarytool` Accepted、stapling、Gatekeeper，以及失败时不发布。ad-hoc 结果只记本地验证，不计公开发行 |
 | Plugins | cache 完整性、缺失补齐/阻断、offline wheels 安装 |
 | Toggles | `Debug`、`checkpoint_mode`、联网和处理模式映射到预期 env/Siril flags |
 | Coverage | `python3 -m pytest -q -rs --cov=gui --cov=pipeline --cov-branch --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=65` |

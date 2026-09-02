@@ -8,6 +8,8 @@ set -euo pipefail
 # Usage:
 #   ./build_macos_app.sh [--app-name NAME] [--output-dir DIR]
 #                        [--build-python /path/to/python]
+#                        [--native-build-python /path/to/python3]
+#                        [--native-source-archive /path/to/source.tar.gz]
 #                        [--gui-entry /path/to/starun_gui_app.py]
 #                        [--pipeline-src /path/to/starun.py]
 #                        [--config-template /path/to/config.1.4.ini.template]
@@ -20,15 +22,22 @@ set -euo pipefail
 APP_NAME="Starun"
 BUILD_PYTHON=""
 BUILD_PYTHON_OVERRIDE=""
+NATIVE_BUILD_PYTHON=""
+NATIVE_SOURCE_ARCHIVE=""
 APP_BUNDLE_ID="StarunC"
 APP_SHORT_VERSION="0.1"
 APP_BUILD_VERSION="1"
 MACOS_MIN_VERSION="14.0"
 REQUIRED_APP_ARCH="arm64"
 CODESIGN_IDENTITY="-"
+SIGNING_MODE="ad_hoc"
+SIGNING_TEAM=""
+CODESIGN_ARGS=()
+NATIVE_EMBED_RECEIPT_SHA=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+NATIVE_BUILD_PYTHON="$SCRIPT_DIR/native/venv/bin/python3"
 PACKAGES_DIR="$PROJECT_ROOT/packages"
 OUTPUT_DIR="$PROJECT_ROOT/release"
 GUI_ENTRY="$PROJECT_ROOT/gui/starun_gui_app.py"
@@ -36,7 +45,6 @@ APP_LOGO_PNG="$PROJECT_ROOT/gui/Starun.png"
 PIPELINE_SRC="$PROJECT_ROOT/pipeline/starun.py"
 PIPELINE_REQUIRED_MODULES=(
   stage2_crop_detector.py
-  stage3_contract.py
   stage_contracts.py
   task_plan.py
   input_discovery.py
@@ -52,6 +60,17 @@ PIPELINE_REQUIRED_MODULES=(
   star_halo_guard.py
   ui_preview.py
 )
+NATIVE_PIPELINE_MODULES=(
+  stage3_contract
+  background_sampling
+  stage4_auto_reference
+  local_adjustments
+  stage9_quality
+)
+NATIVE_PIPELINE_BUILD_SCRIPT="$PROJECT_ROOT/build/build_native_pipeline.sh"
+NATIVE_PIPELINE_BUNDLE_TOOL="$PROJECT_ROOT/build/manage_native_pipeline_bundle.py"
+NATIVE_PIPELINE_OUTPUT="$PROJECT_ROOT/dist/native-pipeline-cp312-arm64"
+SIRIL_PYTHON_ENTITLEMENTS="$SCRIPT_DIR/siril_python_runtime.entitlements.plist"
 LOCAL_TEMPLATE="$PROJECT_ROOT/resources/config.1.4.ini.template"
 CONFIG_TEMPLATE_IN="$LOCAL_TEMPLATE"
 DEFAULT_ENV_SRC="$PROJECT_ROOT/resources/default.env"
@@ -128,6 +147,8 @@ usage() {
 Usage:
   $(basename "$0") [--app-name NAME] [--output-dir DIR]
                    [--build-python PATH]
+                   [--native-build-python PATH]
+                   [--native-source-archive PATH]
                    [--gui-entry PATH] [--pipeline-src PATH]
                    [--config-template PATH]
                    [--siril-src /path/to/Siril.app]
@@ -153,6 +174,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --build-python)
       BUILD_PYTHON_OVERRIDE="$2"
+      shift 2
+      ;;
+    --native-build-python)
+      NATIVE_BUILD_PYTHON="$2"
+      shift 2
+      ;;
+    --native-source-archive)
+      NATIVE_SOURCE_ARCHIVE="$2"
       shift 2
       ;;
     --help|-h)
@@ -198,6 +227,8 @@ done
 # Expand explicit "~/" for user provided path arguments.
 OUTPUT_DIR="${OUTPUT_DIR/#\~/$HOME}"
 BUILD_PYTHON_OVERRIDE="${BUILD_PYTHON_OVERRIDE/#\~/$HOME}"
+NATIVE_BUILD_PYTHON="${NATIVE_BUILD_PYTHON/#\~/$HOME}"
+NATIVE_SOURCE_ARCHIVE="${NATIVE_SOURCE_ARCHIVE/#\~/$HOME}"
 GUI_ENTRY="${GUI_ENTRY/#\~/$HOME}"
 PIPELINE_SRC="${PIPELINE_SRC/#\~/$HOME}"
 CONFIG_TEMPLATE_IN="${CONFIG_TEMPLATE_IN/#\~/$HOME}"
@@ -226,6 +257,102 @@ log() {
   echo "$*"
 }
 
+configure_codesign_mode() {
+  if [[ "$CODESIGN_IDENTITY" == "-" ]]; then
+    SIGNING_MODE="ad_hoc"
+    SIGNING_TEAM=""
+    CODESIGN_ARGS=(--force --sign -)
+    return
+  fi
+
+  [[ "$CODESIGN_IDENTITY" == "Developer ID Application:"* ]] \
+    || die "Public signing requires a Developer ID Application identity"
+  if ! /usr/bin/security find-identity -v -p codesigning \
+    | /usr/bin/grep -F -- "$CODESIGN_IDENTITY" >/dev/null; then
+    die "Developer ID signing identity is not installed: $CODESIGN_IDENTITY"
+  fi
+  if [[ "$CODESIGN_IDENTITY" =~ \(([A-Z0-9]{10})\)$ ]]; then
+    SIGNING_TEAM="${BASH_REMATCH[1]}"
+  else
+    die "Developer ID identity must end with its 10-character Team ID"
+  fi
+  SIGNING_MODE="developer_id"
+  CODESIGN_ARGS=(
+    --force
+    --options runtime
+    --timestamp
+    --sign "$CODESIGN_IDENTITY"
+  )
+}
+
+sign_code_path() {
+  local code_path="$1"
+  /usr/bin/codesign "${CODESIGN_ARGS[@]}" "$code_path"
+}
+
+sign_nested_app_code() {
+  local app_path="$1"
+  local siril_root="$app_path/Contents/Resources/Siril.app"
+  local code_path=""
+  local file_kind=""
+
+  log "[SIGN] Signing nested Mach-O code from the inside out ($SIGNING_MODE)..."
+  while IFS= read -r -d '' code_path; do
+    case "$code_path" in
+      "$siril_root"|"$siril_root"/*) continue ;;
+    esac
+    file_kind="$(/usr/bin/file -b "$code_path")"
+    if ! printf '%s\n' "$file_kind" \
+      | /usr/bin/grep -Eq 'Mach-O.*(executable|dynamically linked shared library|bundle)'; then
+      continue
+    fi
+    sign_code_path "$code_path"
+    /usr/bin/codesign --verify --strict "$code_path"
+  done < <(/usr/bin/find "$app_path/Contents" -type f -print0)
+
+  while IFS= read -r -d '' code_path; do
+    case "$code_path" in
+      "$app_path"|"$siril_root"|"$siril_root"/*) continue ;;
+    esac
+    sign_code_path "$code_path"
+    /usr/bin/codesign --verify --strict "$code_path"
+  done < <(
+    /usr/bin/find "$app_path/Contents" -depth -type d \
+      \( -name '*.framework' -o -name '*.bundle' -o -name '*.xpc' \
+         -o -name '*.appex' -o -name '*.app' \) -print0
+  )
+}
+
+verify_native_module_shape() {
+  local pipeline_root="$1"
+  local module=""
+  local binary=""
+  local dependencies=""
+
+  for module in "${NATIVE_PIPELINE_MODULES[@]}"; do
+    binary="$pipeline_root/$module.cpython-312-darwin.so"
+    require_file "$binary" "[VERIFY] Native pipeline module"
+    [[ ! -e "$pipeline_root/$module.py" && ! -L "$pipeline_root/$module.py" ]] \
+      || die "[VERIFY] Matching native source fallback is forbidden: $module.py"
+    [[ ! -e "$pipeline_root/$module.pyc" && ! -L "$pipeline_root/$module.pyc" ]] \
+      || die "[VERIFY] Matching native bytecode fallback is forbidden: $module.pyc"
+    [[ "$(/usr/bin/lipo -archs "$binary")" == "arm64" ]] \
+      || die "[VERIFY] Native module is not thin arm64: $binary"
+    dependencies="$(/usr/bin/otool -L "$binary")"
+    while read -r dependency _remainder; do
+      [[ -n "$dependency" ]] || continue
+      case "$dependency" in
+        /usr/lib/*|/System/Library/*) ;;
+        *) die "[VERIFY] Native module has non-system dependency: $dependency" ;;
+      esac
+    done < <(printf '%s\n' "$dependencies" | /usr/bin/sed -n '2,$p')
+    if /usr/bin/otool -l "$binary" | /usr/bin/grep -q 'cmd LC_RPATH'; then
+      die "[VERIFY] Native module contains LC_RPATH: $binary"
+    fi
+    /usr/bin/codesign --verify --strict "$binary"
+  done
+}
+
 prune_generated_plugin_runtime() {
   local plugin_root="$1"
   local generated_runtime="$plugin_root/cosmic_clarity_runtime"
@@ -249,24 +376,35 @@ prune_generated_plugin_runtime() {
 
 verify_bundle_symlinks() {
   local bundle_root="$1"
-  local link_path=""
-  local link_target=""
-  local invalid=0
+  "$BUILD_PYTHON" - "$bundle_root" <<'PY' || die "App bundle contains invalid symbolic links"
+import os
+import sys
+from pathlib import Path
 
-  while IFS= read -r -d '' link_path; do
-    link_target="$(readlink "$link_path")"
-    if [[ "$link_target" == /* ]]; then
-      echo "[VERIFY] Absolute symlink is not allowed in the app bundle: $link_path -> $link_target" >&2
-      invalid=1
-      continue
-    fi
-    if [[ ! -e "$link_path" ]]; then
-      echo "[VERIFY] Broken symlink in the app bundle: $link_path -> $link_target" >&2
-      invalid=1
-    fi
-  done < <(find "$bundle_root" -type l -print0)
-
-  [[ "$invalid" -eq 0 ]] || die "App bundle contains invalid symbolic links"
+root = Path(sys.argv[1])
+if root.is_symlink() or not root.is_dir():
+    raise SystemExit(f"[VERIFY] App bundle root is missing or is a symlink: {root}")
+resolved_root = root.resolve(strict=True)
+invalid: list[str] = []
+for directory, dirnames, filenames in os.walk(root, followlinks=False):
+    for name in (*dirnames, *filenames):
+        link = Path(directory) / name
+        if not link.is_symlink():
+            continue
+        target = os.readlink(link)
+        if Path(target).is_absolute():
+            invalid.append(f"absolute symlink: {link} -> {target}")
+            continue
+        try:
+            resolved = link.resolve(strict=True)
+            resolved.relative_to(resolved_root)
+        except (FileNotFoundError, RuntimeError, ValueError):
+            invalid.append(f"broken or escaping symlink: {link} -> {target}")
+if invalid:
+    for message in invalid:
+        print(f"[VERIFY] {message}", file=sys.stderr)
+    raise SystemExit(1)
+PY
 }
 
 remove_old_build_outputs() {
@@ -949,31 +1087,90 @@ copy_siril_from_app() {
   log "[SIRIL] Embedded Siril from app path: $src_app"
 }
 
+verify_siril_python_entitlements() {
+  local launcher="$1"
+  local entitlement_path=""
+  local value=""
+
+  for entitlement_path in \
+    'com\.apple\.security\.cs\.allow-unsigned-executable-memory' \
+    'com\.apple\.security\.cs\.disable-library-validation'; do
+    if ! value="$(
+      /usr/bin/codesign -d --entitlements :- "$launcher" 2>/dev/null \
+        | /usr/bin/plutil -extract "$entitlement_path" raw -o - - 2>/dev/null
+    )"; then
+      die "[SIRIL] Python launcher entitlement is missing or unreadable: $entitlement_path launcher=$launcher"
+    fi
+    [[ "$value" == "true" ]] \
+      || die "[SIRIL] Python launcher entitlement must be boolean true: $entitlement_path launcher=$launcher"
+  done
+}
+
 fix_siril_python_runtime() {
   local siril_app="$1"
   local py_framework="$siril_app/Contents/Frameworks/Python.framework"
   local py_bin="$py_framework/Versions/3.12/bin/python3.12"
+  local py_app_bin="$py_framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python"
+  local launcher=""
+  local code_path=""
+  local file_kind=""
 
   log "[SIRIL] Clearing quarantine/xattrs on embedded Siril.app..."
   /usr/bin/xattr -cr "$siril_app" >/dev/null 2>&1 || true
 
-  if [[ -d "$py_framework" ]]; then
-    log "[SIRIL] Re-signing embedded Siril Python.framework runtime files..."
-    while IFS= read -r -d '' signed_file; do
-      /usr/bin/codesign --force --sign "$CODESIGN_IDENTITY" "$signed_file"
-    done < <(/usr/bin/find "$py_framework" -type f \( -perm -111 -o -name "*.dylib" -o -name "*.so" -o -name "Python" \) -print0)
-
-    /usr/bin/codesign --force --deep --sign "$CODESIGN_IDENTITY" "$py_framework"
-
-    if [[ -x "$py_bin" ]]; then
-      if ! "$py_bin" -V >/dev/null 2>&1; then
-        die "[SIRIL] Embedded Siril Python runtime check failed after re-signing: $py_bin"
-      fi
-      log "[SIRIL] Embedded Siril Python runtime check passed: $py_bin"
-    fi
+  require_dir "$py_framework" "[SIRIL] Embedded Python.framework"
+  require_executable "$py_bin" "[SIRIL] Embedded Python launcher"
+  require_executable "$py_app_bin" "[SIRIL] Embedded Python.app launcher"
+  if ! /usr/bin/codesign --verify --deep --strict "$siril_app"; then
+    die "[SIRIL] Upstream Siril signature is invalid; refusing to erase its Python entitlements"
   fi
 
-  /usr/bin/codesign --force --deep --sign "$CODESIGN_IDENTITY" "$siril_app"
+  for launcher in "$py_bin" "$py_app_bin"; do
+    # Python.app deliberately links Contents/lib back into Python.framework;
+    # verify the launcher code while the enclosing Siril.app deep verification
+    # remains responsible for the upstream bundle/resource seal.
+    if ! /usr/bin/codesign --verify --strict --ignore-resources "$launcher"; then
+      die "[SIRIL] Upstream Python launcher signature is invalid: $launcher"
+    fi
+    verify_siril_python_entitlements "$launcher"
+  done
+
+  log "[SIRIL] Re-signing embedded Siril inside out ($SIGNING_MODE)..."
+  while IFS= read -r -d '' code_path; do
+    file_kind="$(/usr/bin/file -b "$code_path")"
+    if ! printf '%s\n' "$file_kind" \
+      | /usr/bin/grep -Eq 'Mach-O.*(executable|dynamically linked shared library|bundle)'; then
+      continue
+    fi
+    sign_code_path "$code_path"
+  done < <(/usr/bin/find "$siril_app/Contents" -type f -print0)
+
+  /usr/bin/codesign "${CODESIGN_ARGS[@]}" \
+    --entitlements "$SIRIL_PYTHON_ENTITLEMENTS" "$py_bin"
+  while IFS= read -r -d '' code_path; do
+    if [[ "$code_path" == "$py_framework/Versions/3.12/Resources/Python.app" ]]; then
+      /usr/bin/codesign "${CODESIGN_ARGS[@]}" \
+        --entitlements "$SIRIL_PYTHON_ENTITLEMENTS" "$code_path"
+    else
+      sign_code_path "$code_path"
+    fi
+  done < <(
+    /usr/bin/find "$siril_app/Contents" -depth -type d \
+      \( -name '*.framework' -o -name '*.bundle' -o -name '*.xpc' \
+         -o -name '*.appex' -o -name '*.app' \) -print0
+  )
+  sign_code_path "$siril_app"
+
+  /usr/bin/codesign --verify --deep --strict "$siril_app"
+  for launcher in "$py_bin" "$py_app_bin"; do
+    /usr/bin/codesign --verify --strict --ignore-resources "$launcher"
+    verify_siril_python_entitlements "$launcher"
+  done
+
+  if ! "$py_bin" -V >/dev/null 2>&1; then
+    die "[SIRIL] Embedded Siril Python runtime check failed: $py_bin"
+  fi
+  log "[SIRIL] Embedded Siril/Python signatures and launcher entitlements verified."
 }
 
 embed_siril_offline_python_seed() {
@@ -1066,6 +1263,7 @@ embed_siril_spcc_database_seed() {
 }
 
 require_apple_silicon_host
+configure_codesign_mode
 require_exists "$PROJECT_ROOT" "Project root"
 require_exists "$GUI_ENTRY" "GUI entry"
 require_file "$APP_LOGO_PNG" "App logo PNG"
@@ -1081,6 +1279,13 @@ require_file "$SIRIL_SPCC_DATABASE_SEED_SRC/manifest.json" "Siril SPCC seed mani
 require_file "$SIRIL_SPCC_DATABASE_SEED_SRC/SHA256SUMS" "Siril SPCC seed checksums"
 require_dir "$PACKAGES_DIR" "Packages directory"
 require_file "$GUI_BUILD_REQUIREMENTS" "GUI build requirements lock"
+require_executable "$NATIVE_PIPELINE_BUILD_SCRIPT" "Native pipeline build script"
+require_file "$NATIVE_PIPELINE_BUNDLE_TOOL" "Native pipeline bundle tool"
+require_executable "$NATIVE_BUILD_PYTHON" "Native pipeline build Python"
+require_file "$SIRIL_PYTHON_ENTITLEMENTS" "Siril Python runtime entitlements"
+if [[ -n "$NATIVE_SOURCE_ARCHIVE" ]]; then
+  require_file "$NATIVE_SOURCE_ARCHIVE" "Native pipeline source archive"
+fi
 if [[ -n "$SIRIL_SRC_APP" ]]; then
   require_dir "$SIRIL_SRC_APP" "Siril app source"
 else
@@ -1138,6 +1343,8 @@ mkdir -p "$PYINSTALLER_CONFIG_DIR"
 log "[BUILD] Using Python: $BUILD_PYTHON"
 log "[BUILD] GUI entry: $GUI_ENTRY"
 log "[BUILD] Pipeline script: $PIPELINE_SRC"
+log "[BUILD] Native pipeline build Python: $NATIVE_BUILD_PYTHON"
+log "[BUILD] App signing mode: $SIGNING_MODE"
 log "[BUILD] PyInstaller config dir: $PYINSTALLER_CONFIG_DIR"
 
 PYINSTALLER_EXCLUDE_ARGS=()
@@ -1230,6 +1437,36 @@ fi
 fix_siril_python_runtime "$APP_RESOURCES/Siril.app"
 embed_siril_offline_python_seed "$APP_RESOURCES"
 embed_siril_spcc_database_seed "$APP_RESOURCES"
+
+NATIVE_TARGET_PYTHON="$APP_RESOURCES/SirilPythonSeed/venv/bin/python3.12"
+NATIVE_BUILD_ARGS=(
+  --build-python "$NATIVE_BUILD_PYTHON"
+  --target-python "$NATIVE_TARGET_PYTHON"
+  --pipeline-src-dir "$PIPELINE_SRC_DIR"
+  --output-dir "$NATIVE_PIPELINE_OUTPUT"
+  --codesign-identity -
+)
+if [[ -n "$NATIVE_SOURCE_ARCHIVE" ]]; then
+  NATIVE_BUILD_ARGS+=(--source-archive "$NATIVE_SOURCE_ARCHIVE")
+fi
+log "[NATIVE] Building CPython 3.12 arm64 pipeline payload from current source..."
+"$NATIVE_PIPELINE_BUILD_SCRIPT" "${NATIVE_BUILD_ARGS[@]}"
+NATIVE_EMBED_OUTPUT="$(
+  "$BUILD_PYTHON" "$NATIVE_PIPELINE_BUNDLE_TOOL" embed \
+    --payload-dir "$NATIVE_PIPELINE_OUTPUT/pipeline" \
+    --source-dir "$PIPELINE_SRC_DIR" \
+    --destination-dir "$APP_RESOURCES/pipeline" \
+    --project-root "$PROJECT_ROOT"
+)"
+printf '%s\n' "$NATIVE_EMBED_OUTPUT"
+NATIVE_EMBED_RECEIPT_SHA="$(
+  printf '%s\n' "$NATIVE_EMBED_OUTPUT" \
+    | /usr/bin/sed -n 's/^native_embed_receipt=//p' \
+    | /usr/bin/sed -n '1p'
+)"
+[[ "$NATIVE_EMBED_RECEIPT_SHA" =~ ^[0-9a-f]{64}$ ]] \
+  || die "[NATIVE] Embed receipt identity is missing or invalid"
+verify_native_module_shape "$APP_RESOURCES/pipeline"
 
 if [[ -f "$DEFAULT_ENV_SRC" ]]; then
   cp "$DEFAULT_ENV_SRC" "$APP_RESOURCES/default.env"
@@ -1390,11 +1627,37 @@ else
   require_dir "$OFFLINE_RESOURCE_PACK_DIR/siril_plugins/cosmic_clarity" "[VERIFY] Core offline resource CosmicClarity models"
 fi
 
-log "[BUILD] Applying deep signing with identity: $CODESIGN_IDENTITY"
+log "[SIGN] Applying inside-out signing with identity: $CODESIGN_IDENTITY"
 /usr/bin/xattr -cr "$APP_PATH" >/dev/null 2>&1 || true
 verify_bundle_symlinks "$APP_PATH"
-codesign --force --deep --sign "$CODESIGN_IDENTITY" "$APP_PATH"
-codesign --verify --deep --strict "$APP_PATH"
+sign_nested_app_code "$APP_PATH"
+verify_native_module_shape "$APP_RESOURCES/pipeline"
+
+NATIVE_SEAL_ARGS=(
+  --pipeline-dir "$APP_RESOURCES/pipeline"
+  --target-python "$NATIVE_TARGET_PYTHON"
+  --app-bundle-id "$APP_BUNDLE_ID"
+  --app-version "$APP_SHORT_VERSION"
+  --signing-mode "$SIGNING_MODE"
+  --expected-receipt-sha256 "$NATIVE_EMBED_RECEIPT_SHA"
+)
+if [[ "$SIGNING_MODE" == "developer_id" ]]; then
+  NATIVE_SEAL_ARGS+=(--expected-team-identifier "$SIGNING_TEAM")
+fi
+"$BUILD_PYTHON" "$NATIVE_PIPELINE_BUNDLE_TOOL" seal "${NATIVE_SEAL_ARGS[@]}"
+"$BUILD_PYTHON" "$NATIVE_PIPELINE_BUNDLE_TOOL" verify \
+  --pipeline-dir "$APP_RESOURCES/pipeline" \
+  --target-python "$NATIVE_TARGET_PYTHON"
+
+# The runtime manifest binds the already-signed .so bytes.  Only the outer App
+# is signed after this point; another --deep signing pass would invalidate it.
+sign_code_path "$APP_PATH"
+/usr/bin/codesign --verify --deep --strict "$APP_PATH"
+/usr/bin/codesign --verify --deep --strict "$APP_RESOURCES/Siril.app"
+verify_native_module_shape "$APP_RESOURCES/pipeline"
+"$BUILD_PYTHON" "$NATIVE_PIPELINE_BUNDLE_TOOL" verify \
+  --pipeline-dir "$APP_RESOURCES/pipeline" \
+  --target-python "$NATIVE_TARGET_PYTHON"
 
 log "[BUILD] Publishing verified app bundle..."
 PREVIOUS_APP_PATH="$OUTPUT_DIR/.${APP_NAME}.previous.$$"
@@ -1417,6 +1680,10 @@ if ! codesign --verify --deep --strict "$FINAL_APP_PATH"; then
   fi
   die "Published app signature verification failed: $FINAL_APP_PATH"
 fi
+FINAL_APP_RESOURCES="$FINAL_APP_PATH/Contents/Resources"
+"$BUILD_PYTHON" "$NATIVE_PIPELINE_BUNDLE_TOOL" verify \
+  --pipeline-dir "$FINAL_APP_RESOURCES/pipeline" \
+  --target-python "$FINAL_APP_RESOURCES/SirilPythonSeed/venv/bin/python3.12"
 if [[ -e "$PREVIOUS_APP_PATH" ]]; then
   rm -rf "$PREVIOUS_APP_PATH"
 fi
@@ -1425,6 +1692,12 @@ APP_PATH="$FINAL_APP_PATH"
 echo
 log "Build complete."
 log "App path: $APP_PATH"
+log "Native runtime: $APP_PATH/Contents/Resources/pipeline"
+if [[ "$SIGNING_MODE" == "ad_hoc" ]]; then
+  log "Distribution status: internal only (ad-hoc; Developer ID/notarization still required)"
+else
+  log "Distribution status: Developer ID candidate; package and notarize with build/package_macos_dmg.sh"
+fi
 if [[ "$BUNDLE_PROFILE" == "core" ]]; then
   log "Offline resource pack: $OFFLINE_RESOURCE_PACK_DIR"
 fi

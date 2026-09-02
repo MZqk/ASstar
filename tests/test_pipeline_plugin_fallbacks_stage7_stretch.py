@@ -5,6 +5,30 @@ import stage8_color_rendition
 
 
 class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
+    @staticmethod
+    def _freeze_current_stage5_handoff(processor):
+        handoff_module = sys.modules["stage5_handoff"]
+        processor.saved_image_pixels["stage4_color"] = processor.image_pixels.copy()
+        processor.saved_image_pixels["stage5_input_linear"] = processor.image_pixels.copy()
+        processor.saved_image_pixels["stage5_linear"] = processor.image_pixels.copy()
+        (processor.process_dir / "stage4_color.fit").write_bytes(b"stage4")
+        (processor.process_dir / "stage5_input_linear.fit").write_bytes(b"stage5-input")
+        (processor.process_dir / "stage5_linear.fit").write_bytes(b"stage5-linear")
+        input_lineage = handoff_module.freeze_stage5_input_lineage(
+            processor,
+            upstream_loaded=True,
+            baseline_saved=True,
+        )
+        return handoff_module.freeze_stage5_handoff(
+            processor,
+            origin=handoff_module.CURRENT_RUN_ORIGIN,
+            stage_status="ok",
+            deconvolution_integrity_ok=True,
+            denoise_integrity_ok=True,
+            formal_eligible=True,
+            input_lineage=input_lineage,
+        )
+
     def test_stage8_galaxy_chroma_factor_is_budget_bounded(self):
         factor = stage8_color_rendition.target_aware_chroma_factor(
             "galaxy_core_halo_balance",
@@ -346,6 +370,51 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
         self.assertAlmostEqual(candidates[1]["params"]["asinh_stretch"], 2.2)
         self.assertAlmostEqual(candidates[1]["params"]["asinh_offset"], 0.0005)
         self.assertLessEqual(candidates[1]["params"]["ghs_stretchamount"], 1.01)
+
+    def test_stage7_with_stars_candidate_domain_uses_fixed_automatic_ladder(self):
+        processor = self._new_processor()
+        processor._stage7_candidate_domain = "with_stars"
+        processor._active_target_type = lambda: "small_galaxy"
+        processor.cfg.stage7_processing_mode = "manual"
+        processor._task_manual_override_fields = {"asinh_stretch"}
+        processor._stage7_baseline_background_stats = types.MethodType(
+            pipeline_module.StarunPostProcessor._stage7_baseline_background_stats,
+            processor,
+        )
+        yy, xx = np.mgrid[:96, :128]
+        luma = 0.004 + 0.20 * np.exp(
+            -0.5 * (((xx - 64) / 26) ** 2 + ((yy - 48) / 20) ** 2)
+        )
+        source = np.repeat(luma[None, :, :], 3, axis=0).astype(np.float32)
+        candidates, adaptation = (
+            pipeline_module.StarunPostProcessor._stage7_compact_stretch_candidates(
+                processor,
+                pipeline_module.QualityMetrics(bg_median=0.004),
+                {"bg_std": 0.0004},
+                {"p01": 0.004, "p50": 0.010, "p99": 0.18, "max": 0.21},
+                {"p50": 0.20, "p99": 0.85},
+                starless_recomposition_planned=False,
+                source_stem="stage5_linear",
+                star_separation_state="rejected",
+                baseline_image_data=source,
+            )
+        )
+
+        by_name = {candidate["name"]: candidate for candidate in candidates}
+        self.assertEqual(
+            set(by_name),
+            {
+                "cand_a",
+                "cand_b",
+                "cand_display70",
+                "cand_display82",
+                "cand_display86",
+                "cand_display90",
+            },
+        )
+        self.assertEqual(by_name["cand_a"]["method"], "asinh")
+        self.assertEqual(by_name["cand_b"]["method"], "linked_mtf")
+        self.assertEqual(adaptation["parameter_mode"], "auto")
 
     def test_stage7_preview_target_attainment_enforces_brightness_band(self):
         stage6_services = sys.modules["stage6_services"]
@@ -1707,6 +1776,7 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
 
     def test_stage7_legacy_hdr_eligibility_is_forced_to_review_only(self):
         processor = self._new_processor()
+        self._freeze_current_stage5_handoff(processor)
         processor._stage6_galaxy_roi_diagnostics = {
             "status": "ready",
             "available": True,
@@ -1725,8 +1795,11 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
             "rejected_pair_id": "m42-pair",
         }
 
-        processor._run_stage7_stretching_candidates = lambda: self.fail(
-            "formal with-stars HDR candidates must be unreachable"
+        processor._run_stage7_stretching_candidates = lambda: (
+            False,
+            False,
+            ["all with-stars candidates rejected"],
+            "",
         )
 
         pipeline_module.run_stage7_stretching(processor)
@@ -1753,9 +1826,10 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
             report["reason_code"],
             "bright_core_starless_rejected_after_recovery",
         )
-        self.assertEqual(report["source_stem"], "stage6_input")
+        self.assertEqual(report["source_stem"], "stage5_linear")
         self.assertEqual(report["review_output"], "stage7_review_with_stars")
-        self.assertEqual(report["attempts"], [])
+        self.assertEqual(report["candidate_domain"], "with_stars")
+        self.assertEqual(report["candidate_execution"], "evaluated_not_accepted")
         self.assertIsNone(report["selected"])
         self.assertEqual(report["galaxy_roi"]["status"], "ready")
         self.assertEqual(
@@ -1779,6 +1853,7 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
 
     def test_stage7_legacy_hdr_status_stays_review_only(self):
         processor = self._new_processor()
+        self._freeze_current_stage5_handoff(processor)
         processor._star_separation_state = (
             pipeline_module.StarSeparationState.REJECTED.value
         )
@@ -1886,23 +1961,113 @@ class PipelinePluginFallbackStage7StretchTests(PipelinePluginFallbackTestBase):
 
     def test_stage7_tool_failure_reports_upstream_failure_and_skips_stretch(self):
         processor = self._new_processor()
+        self._freeze_current_stage5_handoff(processor)
         processor._star_separation_state = (
             pipeline_module.StarSeparationState.TOOL_FAILED.value
         )
-        processor._run_stage7_stretching_candidates = lambda: self.fail(
-            "Stage7 candidates must not run after a Stage6 tool failure"
+        processor._run_stage7_stretching_candidates = lambda: (
+            False,
+            False,
+            ["all with-stars candidates rejected"],
+            "",
         )
 
         pipeline_module.run_stage7_stretching(processor)
 
         message = processor.results[-1][3]
         self.assertIn("stage6_star_separation_state=tool_failed", message)
-        self.assertIn("stage7_stretch_state=skipped", message)
-        self.assertIn("starless-only stretch candidates skipped", message)
+        self.assertIn("stage7_stretch_state=rejected", message)
+        self.assertIn("evaluated but none accepted", message)
         report = processor.stage_json_reports["stage7_stretch_quality.json"]
         self.assertEqual(report["upstream_star_separation_state"], "tool_failed")
-        self.assertEqual(report["stage7_stretch_state"], "skipped")
+        self.assertEqual(report["stage7_stretch_state"], "rejected")
         self.assertEqual(report["delivery_class"], "review_only")
+
+    def test_stage7_rejected_selects_hard_gated_with_stars_review_candidate(self):
+        processor = self._new_processor()
+        self._freeze_current_stage5_handoff(processor)
+        processor._star_separation_state = (
+            pipeline_module.StarSeparationState.REJECTED.value
+        )
+        selected_pixels = np.clip(processor.image_pixels * 2.0, 0.0, 0.9)
+        processor.saved_image_pixels["stage7_cand_b"] = selected_pixels.copy()
+
+        def select_candidate():
+            processor._stage7_stretch_candidates = [
+                {
+                    "name": "cand_b",
+                    "stem": "stage7_cand_b",
+                    "file": "stage7_cand_b.fit",
+                    "status": "ok",
+                    "allowed_as_final": True,
+                }
+            ]
+            processor._stage7_stretch_selected = "cand_b"
+            return True, False, ["cand_b passed every hard gate"], "linked_mtf"
+
+        processor._run_stage7_stretching_candidates = select_candidate
+
+        pipeline_module.run_stage7_stretching(processor)
+
+        self.assertFalse(processor._stage7_stretch_accepted)
+        self.assertIsNone(processor._stage7_stretch_output)
+        np.testing.assert_array_equal(
+            processor.saved_image_pixels["stage7_review_with_stars"],
+            selected_pixels,
+        )
+        report = processor.stage_json_reports["stage7_stretch_quality.json"]
+        self.assertEqual(report["candidate_domain"], "with_stars")
+        self.assertEqual(report["candidate_execution"], "evaluated_accepted")
+        self.assertEqual(report["selected"]["name"], "cand_b")
+        self.assertFalse(report["formal_accepted"])
+        self.assertEqual(report["delivery_class"], "review_only")
+        self.assertTrue(processor._stage_review_reasons(7))
+
+    def test_stage7_rejected_refuses_candidates_after_stage5_sha_tamper(self):
+        processor = self._new_processor()
+        self._freeze_current_stage5_handoff(processor)
+        processor._star_separation_state = (
+            pipeline_module.StarSeparationState.REJECTED.value
+        )
+        processor.saved_image_pixels["stage6_passthrough"] = (
+            processor.image_pixels.copy()
+        )
+        (processor.process_dir / "stage5_linear.fit").write_bytes(b"tampered")
+        processor._run_stage7_stretching_candidates = lambda: self.fail(
+            "tampered Stage5 bytes must prevent candidate evaluation"
+        )
+
+        pipeline_module.run_stage7_stretching(processor)
+
+        report = processor.stage_json_reports["stage7_stretch_quality.json"]
+        self.assertEqual(report["candidate_execution"], "skipped")
+        self.assertEqual(report["reason_code"], "stage7_stage5_handoff_unverified")
+        self.assertFalse(report["stage5_source_binding"]["accepted"])
+        self.assertIsNone(report["selected"])
+
+    def test_stage7_rejected_mono_source_keeps_stage5_passthrough(self):
+        processor = self._new_processor()
+        self._freeze_current_stage5_handoff(processor)
+        processor._channel_semantics = "mono"
+        processor._star_separation_state = (
+            pipeline_module.StarSeparationState.REJECTED.value
+        )
+        processor._run_stage7_stretching_candidates = lambda: self.fail(
+            "mono source must not enter the RGB with-stars candidate search"
+        )
+
+        pipeline_module.run_stage7_stretching(processor)
+
+        report = processor.stage_json_reports["stage7_stretch_quality.json"]
+        self.assertEqual(report["candidate_execution"], "skipped")
+        self.assertEqual(
+            report["reason_code"],
+            "stage7_with_stars_rgb_source_unavailable",
+        )
+        np.testing.assert_array_equal(
+            processor.saved_image_pixels["stage7_review_with_stars"],
+            processor.saved_image_pixels["stage5_linear"],
+        )
 
     def test_stage7_all_core_unsafe_candidates_revoke_pair_and_use_with_stars_review(self):
         processor = self._new_processor()

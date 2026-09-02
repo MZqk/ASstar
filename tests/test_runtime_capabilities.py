@@ -10,7 +10,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from gui import common
+from gui import native_pipeline_runtime as native_runtime
 from gui import runtime_capabilities as capabilities
+from tests.test_native_pipeline_runtime import (
+    fake_codesign_metadata,
+    fake_unsigned_macho_sha256,
+    make_test_native_payload,
+)
 
 
 class _Response:
@@ -26,8 +32,33 @@ class _Response:
 
 
 class RuntimeCapabilitiesTests(unittest.TestCase):
-    def _make_bundle_layout(self, root: Path) -> dict[str, Path]:
-        resources = root / "Installed Starun.app" / "Contents" / "Resources"
+    def setUp(self) -> None:
+        self._codesign_patcher = patch.object(
+            native_runtime,
+            "_codesign_metadata",
+            side_effect=fake_codesign_metadata,
+        )
+        self._unsigned_macho_patcher = patch.object(
+            native_runtime,
+            "unsigned_macho_sha256",
+            side_effect=fake_unsigned_macho_sha256,
+        )
+        self._codesign_patcher.start()
+        self._unsigned_macho_patcher.start()
+        self.addCleanup(self._unsigned_macho_patcher.stop)
+        self.addCleanup(self._codesign_patcher.stop)
+
+    def _make_bundle_layout(
+        self,
+        root: Path,
+        *,
+        formal_app: bool = True,
+    ) -> dict[str, Path]:
+        resources = (
+            root / "Installed Starun.app" / "Contents" / "Resources"
+            if formal_app
+            else root / "development-overlay"
+        )
         resources.mkdir(parents=True)
 
         siril = resources / "Siril.app" / "Contents" / "MacOS" / "siril-cli"
@@ -48,6 +79,14 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
                 path.write_text("# runtime component\n", encoding="utf-8")
             else:
                 path.mkdir(parents=True, exist_ok=True)
+        if formal_app:
+            make_test_native_payload(pipeline.parent)
+        else:
+            for name in native_runtime.NATIVE_MODULES:
+                (pipeline.parent / f"{name}.py").write_text(
+                    "# development source module\n",
+                    encoding="utf-8",
+                )
 
         plugins = resources / "siril_plugins"
         plugins.mkdir()
@@ -144,6 +183,60 @@ class RuntimeCapabilitiesTests(unittest.TestCase):
             self.assertTrue(
                 any("流水线资源" in error for error in manifest["blocking_errors"])
             )
+
+    def test_formal_app_requires_a_valid_native_pipeline(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            layout = self._make_bundle_layout(Path(td))
+            ready = self._manifest(layout, network_enabled=True)
+            native = ready["capabilities"]["native_pipeline"]
+            self.assertTrue(native["required"])
+            self.assertTrue(native["available"])
+            self.assertEqual(native["mode"], "native")
+
+            (layout["pipeline"].parent / native_runtime.NATIVE_RUNTIME_MANIFEST_NAME).unlink()
+            missing = self._manifest(layout, network_enabled=True)
+            missing_native = missing["capabilities"]["native_pipeline"]
+            self.assertFalse(missing_native["available"])
+            self.assertEqual(missing_native["mode"], "native_missing")
+            self.assertFalse(missing["capabilities"]["pipeline"]["available"])
+            self.assertTrue(
+                any("原生流水线不可用" in error for error in missing["blocking_errors"])
+            )
+
+    def test_development_overlay_allows_complete_source_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            layout = self._make_bundle_layout(
+                Path(td),
+                formal_app=False,
+            )
+
+            manifest = self._manifest(layout, network_enabled=True)
+
+            native = manifest["capabilities"]["native_pipeline"]
+            self.assertFalse(native["required"])
+            self.assertTrue(native["available"])
+            self.assertEqual(native["mode"], "source")
+            self.assertTrue(manifest["capabilities"]["pipeline"]["available"])
+            self.assertEqual(manifest["blocking_errors"], [])
+
+    def test_invalid_development_manifest_does_not_fallback_to_source(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            layout = self._make_bundle_layout(
+                Path(td),
+                formal_app=False,
+            )
+            (layout["pipeline"].parent / native_runtime.NATIVE_RUNTIME_MANIFEST_NAME).write_text(
+                "{}\n",
+                encoding="utf-8",
+            )
+
+            manifest = self._manifest(layout, network_enabled=True)
+
+            native = manifest["capabilities"]["native_pipeline"]
+            self.assertFalse(native["available"])
+            self.assertEqual(native["mode"], "native_invalid")
+            self.assertFalse(manifest["capabilities"]["pipeline"]["available"])
+            self.assertTrue(manifest["blocking_errors"])
 
     def test_new_pipeline_modules_are_required_by_build_and_preflight(self) -> None:
         required_modules = (

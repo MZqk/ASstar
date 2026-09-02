@@ -286,6 +286,17 @@ except ImportError:
     )
 
 try:
+    from .native_pipeline_runtime import (
+        NativePipelineValidationError,
+        probe_native_imports,
+    )
+except ImportError:
+    from native_pipeline_runtime import (  # type: ignore[no-redef]
+        NativePipelineValidationError,
+        probe_native_imports,
+    )
+
+try:
     from .preview_widgets import LatestPreviewCanvas
     from .preview_worker import InitialPreviewWorker, preview_cache_path
 except ImportError:
@@ -9085,6 +9096,76 @@ class StarunGui(QMainWindow):
                 return candidate
         return venv_dir / "python3.12"
 
+    def _verify_native_pipeline_runtime(self) -> bool:
+        """Probe signed native modules with the actual per-user Siril CPython."""
+
+        manifest = getattr(self, "_runtime_capability_manifest", None)
+        if not isinstance(manifest, dict):
+            return False
+        capabilities = manifest.get("capabilities")
+        if not isinstance(capabilities, dict):
+            return False
+        native = capabilities.get("native_pipeline")
+        if not isinstance(native, dict) or native.get("mode") == "source":
+            return False
+        if native.get("mode") != "native":
+            raise NativePipelineValidationError(
+                str(native.get("error") or "原生流水线静态预检未通过")
+            )
+
+        try:
+            result = probe_native_imports(
+                self._runtime_venv_python_bin(),
+                Path(self.pipeline_path).parent,
+            )
+        except NativePipelineValidationError as error:
+            native.update(
+                status="unavailable",
+                available=False,
+                import_probe={
+                    "status": "failed",
+                    "available": False,
+                    "error": str(error),
+                    "checked_at": runtime_utc_now(),
+                },
+                error=str(error),
+            )
+            pipeline = capabilities.get("pipeline")
+            if isinstance(pipeline, dict):
+                pipeline.update(
+                    status="unavailable",
+                    available=False,
+                    native_runtime=native,
+                    error=str(error),
+                )
+            refresh_blocking_errors(manifest)
+            StarunGui._write_runtime_capability_manifest(self)
+            raise
+
+        native.update(
+            status="available",
+            available=True,
+            import_probe={
+                "status": "available",
+                "available": True,
+                "python_version": result["python_version"],
+                "arch": result["arch"],
+                "soabi": result["soabi"],
+                "modules": result["modules"],
+                "checked_at": runtime_utc_now(),
+            },
+            error=None,
+        )
+        pipeline = capabilities.get("pipeline")
+        if isinstance(pipeline, dict):
+            pipeline["native_runtime"] = native
+        refresh_blocking_errors(manifest)
+        StarunGui._write_runtime_capability_manifest(self)
+        self._append_event(
+            "已使用实际 Siril CPython 3.12 验证 5 个 arm64 原生流水线模块。"
+        )
+        return True
+
     def _runtime_python_env(self) -> dict[str, str]:
         runtime_env = scrub_python_env(os.environ.copy())
         runtime_env["HOME"] = str(self.runtime_home)
@@ -9918,6 +9999,16 @@ class StarunGui(QMainWindow):
                 raise BootstrapError(
                     "Siril Python Seed 准备失败",
                     f"准备离线 Siril Python seed 失败：\n{exc}",
+                ) from exc
+
+            self._check_bootstrap_cancelled()
+            try:
+                StarunGui._verify_native_pipeline_runtime(self)
+            except NativePipelineValidationError as exc:
+                raise BootstrapError(
+                    "原生流水线验证失败",
+                    "App 内置 CPython 3.12 arm64 原生模块未通过实际导入验证：\n"
+                    f"{exc}",
                 ) from exc
 
             progress("正在检查离线插件资源…")

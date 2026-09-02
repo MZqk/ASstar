@@ -443,6 +443,295 @@ class LinkedReviewRenditionTests(unittest.TestCase):
                 any("display_png_failed" in issue for issue in report["issues"])
             )
 
+class SubjectChromaReviewContractV3Tests(unittest.TestCase):
+    @staticmethod
+    def _source_and_masks() -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        height = width = 128
+        yy, xx = np.mgrid[:height, :width]
+        subject = (
+            ((xx - width / 2.0) / 42.0) ** 2
+            + ((yy - height / 2.0) / 36.0) ** 2
+            <= 1.0
+        )
+        core = (
+            ((xx - width / 2.0) / 8.0) ** 2
+            + ((yy - height / 2.0) / 7.0) ** 2
+            <= 1.0
+        )
+        star = (xx - 36) ** 2 + (yy - 43) ** 2 <= 4**2
+        halo = (xx - 36) ** 2 + (yy - 43) ** 2 <= 8**2
+        background = ~subject
+        luma = 0.120 + 0.120 * np.exp(
+            -0.5
+            * (
+                ((xx - width / 2.0) / 30.0) ** 2
+                + ((yy - height / 2.0) / 26.0) ** 2
+            )
+        )
+        coherent = np.where(subject, 0.00065, 0.00002 * np.sin(xx / 9.0))
+        source = np.stack(
+            (luma + coherent, luma - 0.25 * coherent, luma - coherent)
+        ).astype(np.float32)
+        masks = {
+            "subject_mask": subject.astype(np.float32),
+            "background_mask": background.astype(np.float32),
+            "core_mask": core.astype(np.float32),
+            "star_mask": star.astype(np.float32),
+            "star_halo_guard_mask": halo.astype(np.float32),
+            "shared_valid_mask": np.ones((height, width), dtype=np.uint8),
+        }
+        return source, masks
+
+    def _contract(self, root: Path) -> tuple[np.ndarray, dict, dict[str, np.ndarray]]:
+        source, masks = self._source_and_masks()
+        artifact = display_rendition.persist_display_rendition_masks(root, masks)
+        evidence = display_rendition.assess_weak_subject_chroma_source(source, masks)
+        self.assertTrue(evidence["accepted"], evidence)
+        tone = display_rendition.build_preserve_review_contract(
+            source,
+            reason="stage6_rejected",
+            source_stem="stage10_final",
+        )
+        contract = display_rendition.build_subject_chroma_review_contract(
+            source,
+            tone_contract=tone,
+            mask_artifact=artifact,
+            chroma_evidence=evidence,
+            effective_saturation_budget=0.40,
+            artifact_root=root,
+            pixel_coordinate_domain=display_rendition.PIXEL_DOMAIN_BOTTOM_UP,
+        )
+        return source, contract, masks
+
+    def test_v3_replay_is_deterministic_and_protects_frozen_regions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, contract, masks = self._contract(root)
+            first = display_rendition.apply_review_contract(
+                source,
+                contract,
+                artifact_root=root,
+                pixel_coordinate_domain=display_rendition.PIXEL_DOMAIN_BOTTOM_UP,
+            )
+            second = display_rendition.apply_review_contract(
+                source,
+                json.loads(json.dumps(contract)),
+                artifact_root=root,
+                pixel_coordinate_domain=display_rendition.PIXEL_DOMAIN_BOTTOM_UP,
+            )
+            np.testing.assert_array_equal(first, second)
+            protected = (
+                (masks["background_mask"] >= 0.80)
+                | (masks["core_mask"] >= 0.50)
+                | (masks["star_mask"] >= 0.05)
+                | (masks["star_halo_guard_mask"] >= 0.05)
+            )
+            np.testing.assert_allclose(
+                first[:, protected],
+                source[:, protected],
+                rtol=0.0,
+                atol=2e-7,
+            )
+            self.assertLessEqual(float(np.max(first)), 0.9950001)
+
+    def test_v3_top_down_replay_matches_bottom_up(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, contract, _masks = self._contract(root)
+            bottom_up = display_rendition.apply_review_contract(
+                source,
+                contract,
+                artifact_root=root,
+                pixel_coordinate_domain=display_rendition.PIXEL_DOMAIN_BOTTOM_UP,
+            )
+            top_down = display_rendition.apply_review_contract(
+                np.flip(source, axis=1),
+                contract,
+                artifact_root=root,
+                pixel_coordinate_domain=display_rendition.PIXEL_DOMAIN_TOP_DOWN,
+            )
+            np.testing.assert_allclose(
+                np.flip(bottom_up, axis=1),
+                top_down,
+                rtol=0.0,
+                atol=2e-8,
+            )
+
+    def test_v3_replay_rejects_mask_sha_and_path_tampering(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, contract, _masks = self._contract(root)
+            for key, value in (
+                ("file_sha256", "0" * 64),
+                ("relative_path", "../escape.npz"),
+            ):
+                tampered = json.loads(json.dumps(contract))
+                tampered["mask_artifact"][key] = value
+                with self.assertRaises(ValueError):
+                    display_rendition.apply_review_contract(
+                        source,
+                        tampered,
+                        artifact_root=root,
+                        pixel_coordinate_domain=(
+                            display_rendition.PIXEL_DOMAIN_BOTTOM_UP
+                        ),
+                    )
+
+    def test_v3_replay_rejects_symlink_array_and_shape_tampering(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, contract, _masks = self._contract(root)
+            artifact_path = root / contract["mask_artifact"]["relative_path"]
+
+            real_path = artifact_path.with_name("display_rendition_masks-real.npz")
+            artifact_path.rename(real_path)
+            artifact_path.symlink_to(real_path.name)
+            with self.assertRaises(ValueError):
+                display_rendition.apply_review_contract(
+                    source,
+                    contract,
+                    artifact_root=root,
+                    pixel_coordinate_domain=display_rendition.PIXEL_DOMAIN_BOTTOM_UP,
+                )
+
+            artifact_path.unlink()
+            real_path.rename(artifact_path)
+            with np.load(artifact_path, allow_pickle=False) as payload:
+                arrays = {name: np.array(payload[name], copy=True) for name in payload.files}
+            arrays["subject_mask"][0, 0] = 1.0 - arrays["subject_mask"][0, 0]
+            np.savez_compressed(artifact_path, **arrays)
+            array_tampered = json.loads(json.dumps(contract))
+            array_tampered["mask_artifact"]["file_sha256"] = (
+                display_rendition._sha256_file(artifact_path)
+            )
+            with self.assertRaises(ValueError):
+                display_rendition.apply_review_contract(
+                    source,
+                    array_tampered,
+                    artifact_root=root,
+                    pixel_coordinate_domain=display_rendition.PIXEL_DOMAIN_BOTTOM_UP,
+                )
+
+            shape_tampered = json.loads(json.dumps(array_tampered))
+            shape_tampered["mask_artifact"]["shape"] = [127, 128]
+            with self.assertRaises(ValueError):
+                display_rendition.apply_review_contract(
+                    source,
+                    shape_tampered,
+                    artifact_root=root,
+                    pixel_coordinate_domain=display_rendition.PIXEL_DOMAIN_BOTTOM_UP,
+                )
+
+    def test_random_color_noise_and_background_bias_fail_source_gate(self):
+        source, masks = self._source_and_masks()
+        rng = np.random.default_rng(20260830)
+        noisy = np.array(source, copy=True)
+        noisy[0] += rng.normal(0.0, 0.006, size=source.shape[1:]).astype(np.float32)
+        noisy[2] += rng.normal(0.0, 0.006, size=source.shape[1:]).astype(np.float32)
+        noise_evidence = display_rendition.assess_weak_subject_chroma_source(
+            noisy, masks
+        )
+        self.assertFalse(noise_evidence["accepted"], noise_evidence)
+
+        background_biased = np.array(source, copy=True)
+        background = masks["background_mask"] > 0.5
+        yy, xx = np.mgrid[: source.shape[1], : source.shape[2]]
+        background_bias = 0.008 * (np.sin(xx / 18.0) + np.cos(yy / 21.0))
+        background_biased[0, background] += background_bias[background]
+        background_biased[2, background] -= background_bias[background]
+        bias_evidence = display_rendition.assess_weak_subject_chroma_source(
+            background_biased, masks
+        )
+        self.assertFalse(bias_evidence["accepted"], bias_evidence)
+
+    def test_v3_budget_is_monotonic_and_respects_saturation_caps(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, masks = self._source_and_masks()
+            artifact = display_rendition.persist_display_rendition_masks(root, masks)
+            evidence = display_rendition.assess_weak_subject_chroma_source(source, masks)
+            tone = display_rendition.build_preserve_review_contract(
+                source,
+                reason="stage6_rejected",
+                source_stem="stage10_final",
+            )
+            p50_values = []
+            for budget in (0.10, 0.30, 0.65):
+                contract = display_rendition.build_subject_chroma_review_contract(
+                    source,
+                    tone_contract=tone,
+                    mask_artifact=artifact,
+                    chroma_evidence=evidence,
+                    effective_saturation_budget=budget,
+                    artifact_root=root,
+                    pixel_coordinate_domain=display_rendition.PIXEL_DOMAIN_BOTTOM_UP,
+                )
+                chroma = contract["subject_chroma"]
+                before = chroma["subject_saturation_before"]
+                after = chroma["subject_saturation_after"]
+                self.assertLessEqual(after["p50"], 0.12 + 1e-8)
+                self.assertLessEqual(after["p95"], 0.30 + 1e-8)
+                self.assertLessEqual(
+                    after["p50"] - before["p50"],
+                    0.10 * budget / 0.65 + 1e-8,
+                )
+                p50_values.append(after["p50"])
+            self.assertEqual(p50_values, sorted(p50_values))
+
+    def test_v3_managed_png_pixel_chain_matches_frozen_replay(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, contract, _masks = self._contract(root)
+            report = export_managed_outputs(
+                source,
+                work_dir=root,
+                base_filename="result_review",
+                output_format="png",
+                target_type="small_galaxy",
+                stars_required=False,
+                display_contract=contract,
+            )
+            self.assertTrue(report["ready"], report)
+            artifact = next(
+                item for item in report["artifacts"] if item["role"] == "display"
+            )
+            self.assertTrue(artifact["pixel_chain"]["accepted"])
+            self.assertEqual(
+                artifact["pixel_chain"]["expected_pixel_sha256"],
+                artifact["pixel_chain"]["decoded_pixel_sha256"],
+            )
+
+    def test_v3_zero_budget_falls_back_to_unchanged_v2_tone(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, masks = self._source_and_masks()
+            artifact = display_rendition.persist_display_rendition_masks(root, masks)
+            evidence = display_rendition.assess_weak_subject_chroma_source(source, masks)
+            tone = display_rendition.build_preserve_review_contract(
+                source,
+                reason="stage6_rejected",
+                source_stem="stage10_final",
+            )
+            contract = display_rendition.build_review_contract(
+                source,
+                reason="stage6_rejected",
+                source_stem="stage10_final",
+                input_visibility={"exposure_state": "acceptable"},
+                subject_chroma_plan={
+                    "accepted": True,
+                    "mask_artifact": artifact,
+                    "evidence": evidence,
+                    "effective_saturation_budget": 0.0,
+                },
+                artifact_root=root,
+            )
+            self.assertEqual(contract["schema"], display_rendition.SCHEMA)
+            self.assertEqual(contract["mode"], "preserve")
+            np.testing.assert_array_equal(
+                display_rendition.apply_review_contract(source, contract),
+                display_rendition.apply_review_contract(source, tone),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

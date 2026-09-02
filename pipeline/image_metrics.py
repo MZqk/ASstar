@@ -7,8 +7,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from models import ImageFeatures, QualityMetrics
-from stage3_contract import STAGE3_MIN_TARGET_SKY_PLANE_SAMPLES
+try:
+    from .models import ImageFeatures, QualityMetrics
+    from .stage3_contract import STAGE3_MIN_TARGET_SKY_PLANE_SAMPLES
+except ImportError:
+    from models import ImageFeatures, QualityMetrics
+    from stage3_contract import STAGE3_MIN_TARGET_SKY_PLANE_SAMPLES
 
 
 def _clamp_float(value: float, lower: float, upper: float) -> float:

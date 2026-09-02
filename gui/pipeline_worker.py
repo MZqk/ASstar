@@ -32,6 +32,21 @@ except ImportError:
     from constants import FITS_SUFFIXES  # type: ignore[no-redef]
     from disk_preflight import format_bytes, safe_file_size  # type: ignore[no-redef]
 
+try:
+    from .native_pipeline_runtime import (
+        NATIVE_RUNTIME_MANIFEST_NAME,
+        NativePipelineValidationError,
+        probe_native_imports,
+        stage_native_runtime_payload,
+    )
+except ImportError:
+    from native_pipeline_runtime import (  # type: ignore[no-redef]
+        NATIVE_RUNTIME_MANIFEST_NAME,
+        NativePipelineValidationError,
+        probe_native_imports,
+        stage_native_runtime_payload,
+    )
+
 
 BOOTSTRAP_TIMEOUT_ENV = "STARUN_BOOTSTRAP_TIMEOUT_SEC"
 DEFAULT_BOOTSTRAP_TIMEOUT_SEC = 300
@@ -265,6 +280,8 @@ class PipelineWorker(QThread):
         self._export_tail_timeout_sec = DEFAULT_EXPORT_TAIL_TIMEOUT_SEC
         self._progress_log_state: dict[str, tuple[float, int]] = {}
         self._native_log_notice_keys: set[str] = set()
+        self._prepared_native_runtime_dir: Path | None = None
+        self._prepared_native_manifest_hash: str | None = None
         self._spcc_seed_warning_emitted = False
 
     def stop(self) -> None:
@@ -838,11 +855,28 @@ class PipelineWorker(QThread):
         run_py = temp_dir / self.pipeline_path.name
         pipeline_dir = self.pipeline_path.parent
         cpu_limit = compute_siril_cpu_limit()
+        self._prepared_native_runtime_dir = None
+        self._prepared_native_manifest_hash = None
 
         if not self.pipeline_path.exists():
             raise FileNotFoundError(f"未找到流水线脚本：{self.pipeline_path}")
         for py_file in pipeline_dir.glob("*.py"):
             shutil.copy2(py_file, temp_dir / py_file.name)
+        native_manifest = pipeline_dir / NATIVE_RUNTIME_MANIFEST_NAME
+        if native_manifest.exists() or native_manifest.is_symlink():
+            staged_manifest = stage_native_runtime_payload(pipeline_dir, temp_dir)
+            self._prepared_native_runtime_dir = temp_dir
+            self._prepared_native_manifest_hash = str(
+                staged_manifest["manifest_payload_sha256"]
+            )
+            self._append_event(
+                "CPython 3.12 arm64 原生流水线已校验并写入本轮运行目录。"
+            )
+        elif is_frozen():
+            raise NativePipelineValidationError(
+                "正式 App 缺少 CPython 3.12 arm64 原生流水线运行清单；"
+                "禁止回退到同名源码模块。"
+            )
         stages_dir = pipeline_dir / "stages"
         if stages_dir.exists() and stages_dir.is_dir():
             shutil.copytree(stages_dir, temp_dir / "stages", dirs_exist_ok=True)
@@ -1579,6 +1613,33 @@ class PipelineWorker(QThread):
                 )
         for warning in self._runtime_env_warnings:
             self._append_event(f"运行环境配置警告: {warning}")
+
+        if (
+            self._prepared_native_runtime_dir is not None
+            and self._prepared_native_manifest_hash is not None
+        ):
+            runtime_python = proc_env.get("SIRIL_PYTHON_CLI", "")
+            if not runtime_python:
+                self._append_event(
+                    "启动前原生流水线复核失败：未解析到 Siril CPython 3.12。"
+                )
+                self._run_had_fatal_errors = True
+                return False, -1
+            try:
+                probe_native_imports(
+                    Path(runtime_python),
+                    self._prepared_native_runtime_dir,
+                    expected_manifest_payload_sha256=(
+                        self._prepared_native_manifest_hash
+                    ),
+                )
+            except NativePipelineValidationError as error:
+                self._append_event(f"启动前原生流水线复核失败：{error}")
+                self._run_had_fatal_errors = True
+                return False, -1
+            self._append_event(
+                "已在启动 Siril 前复核本轮临时目录中的原生模块。"
+            )
 
         try:
             self._proc = subprocess.Popen(

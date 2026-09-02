@@ -20,6 +20,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping, MutableMapping, Sequence
 
+try:
+    from .native_pipeline_runtime import inspect_native_pipeline
+except ImportError:
+    from native_pipeline_runtime import inspect_native_pipeline  # type: ignore[no-redef]
+
 
 RUNTIME_CAPABILITIES_SCHEMA = "starun.runtime-capabilities.v1"
 RUNTIME_CAPABILITIES_NAME = "runtime-capabilities.json"
@@ -60,7 +65,6 @@ PIPELINE_REQUIRED_PATHS = (
     "stages/stage2_view_correction.py",
     "stages/stage3_background_extraction.py",
     "stages/stage4_color_calibration.py",
-    "stage4_auto_reference.py",
     "stage4_evidence.py",
     "scene_support.py",
     "final_artifact_identity.py",
@@ -273,6 +277,10 @@ def _inspect_pipeline(
         except (OSError, SyntaxError, ValueError) as error:
             syntax_error = str(error)
     pipeline_root = path.parent
+    native_pipeline = inspect_native_pipeline(
+        pipeline_root,
+        required=enforce_resource_boundary,
+    )
     missing_paths = [
         relative
         for relative in PIPELINE_REQUIRED_PATHS
@@ -284,6 +292,7 @@ def _inspect_pipeline(
         and readable
         and syntax_valid
         and not missing_paths
+        and native_pipeline["available"]
         and (within_resources or not enforce_resource_boundary)
     )
     return {
@@ -296,8 +305,9 @@ def _inspect_pipeline(
         "readable": readable,
         "syntax_valid": syntax_valid,
         "missing_required_paths": missing_paths,
+        "native_runtime": native_pipeline,
         "within_resources_root": within_resources,
-        "error": syntax_error or None,
+        "error": syntax_error or native_pipeline.get("error") or None,
     }
 
 
@@ -457,6 +467,11 @@ def build_runtime_capabilities(
         enforce_resource_boundary=enforce_boundary,
     )
     configured = configured_network_endpoints() if endpoints is None else endpoints
+    pipeline = _inspect_pipeline(
+        pipeline_path,
+        resources_root=resources,
+        enforce_resource_boundary=enforce_boundary,
+    )
     manifest: dict[str, object] = {
         "schema": RUNTIME_CAPABILITIES_SCHEMA,
         "generated_at": utc_now(),
@@ -483,11 +498,8 @@ def build_runtime_capabilities(
                 resources_root=resources,
                 enforce_resource_boundary=enforce_boundary,
             ),
-            "pipeline": _inspect_pipeline(
-                pipeline_path,
-                resources_root=resources,
-                enforce_resource_boundary=enforce_boundary,
-            ),
+            "pipeline": pipeline,
+            "native_pipeline": pipeline["native_runtime"],
             "gaia_astro": astro,
             "gaia_xp": xp,
             "network_endpoints": _network_capability(
@@ -877,6 +889,17 @@ def refresh_blocking_errors(manifest: MutableMapping[str, object]) -> list[str]:
                 detail = "；" + str(pipeline["error"])
         errors.append(f"流水线资源缺失、不可读或语法无效：{path}{detail}")
 
+    native_pipeline = capabilities.get("native_pipeline")
+    if not isinstance(native_pipeline, Mapping) or not native_pipeline.get(
+        "available"
+    ):
+        detail = (
+            str(native_pipeline.get("error") or "未知原因")
+            if isinstance(native_pipeline, Mapping)
+            else "能力记录缺失"
+        )
+        errors.append(f"CPython 3.12 arm64 原生流水线不可用：{detail}")
+
     network = capabilities.get("network_endpoints")
     decision = _stage4_color_decision(manifest, capabilities)
     decisions = manifest.get("decisions")
@@ -1066,6 +1089,7 @@ def capability_summary_lines(manifest: Mapping[str, object]) -> list[str]:
         "siril": "Siril",
         "config_template": "配置模板",
         "pipeline": "流水线",
+        "native_pipeline": "原生流水线",
         "gaia_astro": "Gaia astro",
         "gaia_xp": "Gaia XP",
         "network_endpoints": "网络端点",
@@ -1075,6 +1099,7 @@ def capability_summary_lines(manifest: Mapping[str, object]) -> list[str]:
         "siril",
         "config_template",
         "pipeline",
+        "native_pipeline",
         "gaia_astro",
         "gaia_xp",
         "network_endpoints",

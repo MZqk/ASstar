@@ -831,6 +831,10 @@ def export_managed_outputs(
                 display_rgb = display_rendition.apply_review_contract(
                     source_rgb,
                     display_contract,
+                    artifact_root=root,
+                    pixel_coordinate_domain=(
+                        display_rendition.PIXEL_DOMAIN_TOP_DOWN
+                    ),
                 )
                 display_transform = dict(display_contract)
             else:

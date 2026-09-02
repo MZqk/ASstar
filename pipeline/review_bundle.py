@@ -183,6 +183,7 @@ def create_image_review_bundle(
     candidates: Optional[list[Mapping[str, Any]]] = None,
     selected_candidate: Optional[str] = None,
     display_contract: Optional[Dict[str, Any]] = None,
+    artifact_root: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Write a review bundle from two already-loaded pixel arrays."""
     display_contract_diagnostic = (
@@ -195,6 +196,17 @@ def create_image_review_bundle(
         )
         else None
     )
+    if (
+        active_display_contract is not None
+        and active_display_contract.get("schema") == display_rendition.V3_SCHEMA
+    ):
+        after_data = display_rendition.apply_review_contract(
+            after_data,
+            active_display_contract,
+            artifact_root=artifact_root,
+            pixel_coordinate_domain=display_rendition.PIXEL_DOMAIN_BOTTOM_UP,
+        )
+        active_display_contract = None
     output_dir.mkdir(parents=True, exist_ok=True)
     before_rgb, after_rgb = _aligned_previews(before_data, after_data)
     difference = after_rgb - before_rgb
@@ -500,6 +512,10 @@ def create_stage_review_bundle(
                     )
                 )
                 else None
+            ),
+            artifact_root=Path(
+                getattr(pipeline, "work_dir", None)
+                or Path(pipeline.process_dir).parent
             ),
         )
     finally:

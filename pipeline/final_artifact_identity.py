@@ -157,10 +157,15 @@ def _managed_artifact_verification(
                 dict(display_transform)
             ):
                 raise ValueError("display rendition contract is invalid")
+            mapping_contract = (
+                display_transform.get("tone_contract")
+                if display_transform.get("schema") == display_rendition.V3_SCHEMA
+                else display_transform
+            )
             if (
                 display_transform.get("observer_only") is not True
                 or (
-                    display_transform.get("rgb_mapping") or {}
+                    (mapping_contract or {}).get("rgb_mapping") or {}
                 ).get("source_pixels_changed") is not False
                 or str(display_transform.get("source_stem") or "")
                 != "stage10_final"
@@ -173,6 +178,10 @@ def _managed_artifact_verification(
             rendered_display = display_rendition.apply_review_contract(
                 source_display,
                 dict(display_transform),
+                artifact_root=work_dir,
+                pixel_coordinate_domain=(
+                    display_rendition.PIXEL_DOMAIN_TOP_DOWN
+                ),
             )
             expected_display = (
                 managed_output.canonical_managed_derivative_pixels(

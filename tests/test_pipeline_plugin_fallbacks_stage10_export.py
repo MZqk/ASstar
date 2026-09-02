@@ -246,6 +246,93 @@ class PipelinePluginFallbackStage10ExportTests(PipelinePluginFallbackTestBase):
         )
         self.assertTrue(audit["checks"]["star_visibility"]["passed"], audit)
 
+    def test_stage10_selected_with_stars_uses_stage5_geometry_in_review_domain(self):
+        processor = self._new_processor()
+        self._stage10_final_input(processor)
+        processor._stage7_candidate_domain = "with_stars"
+        processor._stage7_stretch_selected = "cand_b"
+        processor._stage7_review_source = "stage7_review_with_stars"
+        processor._stage9_star_reference_catalog = {
+            "status": "degraded",
+            "source_matched": False,
+            "reference_degraded": True,
+        }
+        (processor.process_dir / "stage5_input_linear.fit").write_bytes(b"mock")
+        coordinates = tuple(
+            (y, x)
+            for y in (10, 28, 46, 64)
+            for x in (12, 40, 68, 96)
+        )
+        processor._stage5_star_reference_report = {
+            "schema": "starun.stage5-star-reference.v1",
+            "status": "available",
+            "fixed_before_deconvolution": True,
+            "source_checkpoint": "stage5_input_linear.fit",
+            "stars": [
+                {
+                    "geometry_valid": True,
+                    "x": x,
+                    "y": y,
+                    "fwhm_geometry": 2.8,
+                    "amplitude": 0.10 + index * 0.01,
+                }
+                for index, (y, x) in enumerate(coordinates)
+            ],
+        }
+        linear = np.full((3, 80, 112), 0.003, dtype=np.float32)
+        selected = np.full((3, 80, 112), 0.20, dtype=np.float32)
+        for index, (y, x) in enumerate(coordinates):
+            linear[:, y, x] += np.float32(0.0005 + index * 0.00002)
+            selected[:, y, x] += np.float32(0.01 + index * 0.002)
+        processor.image_pixels = linear
+        processor.siril.get_image_pixeldata = (
+            lambda preview=False: processor.image_pixels.copy()
+        )
+        contract = (
+            stage10_export_module.display_rendition.build_preserve_review_contract(
+                selected,
+                reason="selected_with_stars_review",
+                source_stem="stage10_final",
+            )
+        )
+
+        catalog, resolution = (
+            stage10_export_module._stage10_star_visibility_reference(
+                processor,
+                selected,
+                restore_stem="stage10_final",
+                display_contract=contract,
+            )
+        )
+        audit = stage10_export_module.audit_display_visibility(
+            selected,
+            target_type="large_galaxy",
+            stars_required=True,
+            star_reference=catalog,
+            pixel_coordinate_domain="siril_pixel_buffer_bottom_up",
+            star_visibility_config=processor.cfg,
+        )
+
+        self.assertIsNotNone(catalog)
+        self.assertEqual(resolution["status"], "ready")
+        self.assertEqual(
+            resolution["catalog_geometry_source"],
+            "stage5_input_linear.fit",
+        )
+        self.assertEqual(
+            resolution["visibility_reference_source"],
+            "selected_with_stars_review_candidate",
+        )
+        self.assertEqual(
+            resolution["audit_domain"],
+            "shared_review_display_contract",
+        )
+        self.assertGreaterEqual(
+            catalog["catalog_visibility_reference_count"],
+            16,
+        )
+        self.assertTrue(audit["checks"]["star_visibility"]["passed"], audit)
+
     def test_stage10_trusted_with_stars_fallback_exports_review_only(self):
         processor = self._new_processor()
         self._stage10_final_input(processor)

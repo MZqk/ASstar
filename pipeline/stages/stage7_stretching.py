@@ -5,13 +5,97 @@ from typing import Any, Dict, List
 
 import numpy as np
 
+from color_quality_metrics import physical_broadband_anchor_accepted
 import display_rendition
 from managed_output import audit_display_visibility
 from models import PipelineStage, StarSeparationState
 import scene_support
+import stage5_handoff
 from sirilpy.exceptions import CommandError, SirilError
 import stage7_stretch_metrics
 import syqon_starless
+
+
+def _freeze_review_subject_chroma_plan(pipeline) -> Dict[str, Any]:
+    """Freeze the observer-only weak-colour evidence and replay masks."""
+
+    target_type = str(
+        pipeline._active_target_type()
+        if hasattr(pipeline, "_active_target_type")
+        else ""
+    ).strip().lower()
+    try:
+        budget = float(getattr(pipeline.cfg, "nebula_saturation", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        budget = 0.0
+    budget = float(np.clip(budget, 0.0, 0.65))
+    eligibility = {
+        "galaxy_target": target_type
+        in {"galaxy", "large_galaxy", "small_galaxy"},
+        "physical_broadband_anchor": physical_broadband_anchor_accepted(
+            getattr(pipeline, "channel_profile", {}) or {},
+            getattr(pipeline, "color_calibration_report", {}) or {},
+        ),
+        "target_aware_chroma_enabled": bool(
+            getattr(pipeline.cfg, "stage8_target_aware_chroma_enabled", True)
+        ),
+        "nebula_saturation_enabled": bool(
+            getattr(pipeline.cfg, "stage8_nebula_saturation_enabled", True)
+        ),
+        "positive_budget": budget > 0.0,
+    }
+    plan: Dict[str, Any] = {
+        "schema": "starun.review-subject-chroma-plan.v1",
+        "status": "ineligible",
+        "accepted": False,
+        "target_type": target_type,
+        "eligibility": eligibility,
+        "effective_saturation_budget": budget,
+        "mask_artifact": {},
+        "evidence": {},
+    }
+    if not all(eligibility.values()):
+        plan["issues"] = [name for name, accepted in eligibility.items() if not accepted]
+        pipeline._review_subject_chroma_plan = plan
+        pipeline._write_stage_json("display_subject_chroma_plan.json", plan)
+        return plan
+    try:
+        source = pipeline._read_image_by_stem(stage5_handoff.STAGE5_SOURCE_STEM)
+        if source is None:
+            raise ValueError("stage5_linear pixels unavailable")
+        artifact_root = Path(
+            getattr(pipeline, "work_dir", None)
+            or Path(pipeline.process_dir).parent
+        )
+        masks = dict(getattr(pipeline, "_stage7_frozen_rendition_masks", {}) or {})
+        mask_artifact = display_rendition.persist_display_rendition_masks(
+            artifact_root,
+            masks,
+        )
+        evidence = display_rendition.assess_weak_subject_chroma_source(
+            source,
+            masks,
+        )
+        plan.update(
+            status="accepted" if evidence.get("accepted") else "rejected",
+            accepted=bool(evidence.get("accepted", False)),
+            mask_artifact=mask_artifact,
+            evidence=evidence,
+            source_binding=copy.deepcopy(
+                getattr(pipeline, "_stage7_stage5_source_binding", {}) or {}
+            ),
+        )
+        if not plan["accepted"]:
+            plan["issues"] = list(evidence.get("issues") or [])
+    except (OSError, RuntimeError, TypeError, ValueError, FloatingPointError) as error:
+        plan.update(
+            status="rejected",
+            accepted=False,
+            issues=[str(error)],
+        )
+    pipeline._review_subject_chroma_plan = plan
+    pipeline._write_stage_json("display_subject_chroma_plan.json", plan)
+    return plan
 
 
 def _bind_stage7_formal_presentation_reference(
@@ -96,22 +180,48 @@ def _run_with_stars_review_stretch(
     reason_code: str | None = None,
     upstream_separation_state: str | None = None,
     candidates_evaluated: bool = False,
+    selected_candidate_stem: str | None = None,
 ) -> None:
     """Create a conservative review image without invoking starless-only logic."""
     stage_label = PipelineStage.STRETCHING.label
     upstream_state = str(upstream_separation_state or separation_state)
-    stretch_state = "rejected" if candidates_evaluated else "skipped"
+    selected_candidate = str(
+        getattr(pipeline, "_stage7_stretch_selected", "") or ""
+    )
+    candidate_domain = str(
+        getattr(pipeline, "_stage7_candidate_domain", "starless") or "starless"
+    )
+    candidate_selected = bool(selected_candidate_stem and selected_candidate)
+    stretch_state = (
+        "review_candidate_selected"
+        if candidate_selected
+        else "rejected"
+        if candidates_evaluated
+        else "skipped"
+    )
     candidate_execution = (
-        "evaluated_not_accepted" if candidates_evaluated else "skipped"
+        "evaluated_accepted"
+        if candidate_selected
+        else "evaluated_not_accepted"
+        if candidates_evaluated
+        else "skipped"
     )
     messages: List[str] = [
         f"stage6_star_separation_state={upstream_state}",
         f"stage7_stretch_state={stretch_state}",
         (
-            "starless-only stretch candidates evaluated but none accepted; "
-            "with-stars review fallback activated"
+            "with-stars stretch candidate passed every hard gate and was "
+            "selected for review-only use"
+            if candidate_selected
+            else (
+                "stretch candidates evaluated but none accepted; immutable "
+                "with-stars review fallback activated"
+                if candidate_domain == "with_stars"
+                else "starless-only stretch candidates evaluated but none accepted; "
+                "with-stars review fallback activated"
+            )
             if candidates_evaluated
-            else "starless-only stretch candidates skipped"
+            else "stretch candidates skipped"
         ),
     ]
     source_stem = str(
@@ -152,11 +262,14 @@ def _run_with_stars_review_stretch(
                     )
     saved = False
     try:
-        pipeline.cmd_with_check("load", source_stem)
+        pipeline.cmd_with_check(
+            "load",
+            str(selected_candidate_stem or source_stem),
+        )
         messages.append(
-            "trusted with-stars review FITS preserved without Siril autostretch; "
-            "the linked observer mapping is frozen separately for previews and "
-            "the Stage10 catalog audit"
+            "hard-gated nonlinear with-stars candidate saved as review-only FITS"
+            if candidate_selected
+            else "immutable Stage5 with-stars pixels preserved as the review fallback"
         )
         saved = pipeline._save_stage_output("stage7_review_with_stars")
         if saved:
@@ -181,6 +294,16 @@ def _run_with_stars_review_stretch(
                     reason=review_reason,
                     source_stem="stage7_review_with_stars",
                     input_visibility=visibility,
+                    subject_chroma_plan=dict(
+                        getattr(pipeline, "_review_subject_chroma_plan", {}) or {}
+                    ),
+                    artifact_root=(
+                        getattr(pipeline, "work_dir", None)
+                        or Path(pipeline.process_dir).parent
+                    ),
+                    pixel_coordinate_domain=(
+                        display_rendition.PIXEL_DOMAIN_BOTTOM_UP
+                    ),
                 )
             except (
                 AttributeError,
@@ -253,6 +376,14 @@ def _run_with_stars_review_stretch(
             "review_required": True,
             "input": f"{source_stem}.fit",
             "source_stem": source_stem,
+            "candidate_domain": "with_stars",
+            "candidate_execution": candidate_execution,
+            "source_binding": copy.deepcopy(
+                getattr(pipeline, "_stage7_source_binding", {}) or {}
+            ),
+            "stage5_source_binding": copy.deepcopy(
+                getattr(pipeline, "_stage7_stage5_source_binding", {}) or {}
+            ),
             "upstream_star_separation_state": upstream_state,
             "stage7_stretch_state": stretch_state,
             "starless_candidate_execution": candidate_execution,
@@ -264,7 +395,18 @@ def _run_with_stars_review_stretch(
             "candidates": copy.deepcopy(
                 getattr(pipeline, "_stage7_stretch_candidates", []) or []
             ),
-            "selected": None,
+            "selected": (
+                {
+                    "name": selected_candidate,
+                    "source_stem": str(selected_candidate_stem),
+                    "source_file": f"{selected_candidate_stem}.fit",
+                    "file": "stage7_review_with_stars.fit",
+                    "formal_accepted": False,
+                    "delivery_class": "review_only",
+                }
+                if candidate_selected
+                else None
+            ),
             "review_evidence": copy.deepcopy(
                 getattr(pipeline, "_stage7_review_evidence", None)
             ),
@@ -324,9 +466,121 @@ def _run_with_stars_review_stretch(
             "upstream_star_separation_state": upstream_state,
             "stage7_stretch_state": stretch_state,
             "starless_candidate_execution": candidate_execution,
+            "candidate_domain": "with_stars",
+            "candidate_execution": candidate_execution,
+            "stage5_source_binding": copy.deepcopy(
+                getattr(pipeline, "_stage7_stage5_source_binding", {}) or {}
+            ),
             "background_color_review_gate": background_color_review_gate,
         },
         review_reasons=pipeline._stage_review_reasons(7),
+    )
+
+
+def _run_rejected_stage6_with_stars_candidates(
+    pipeline,
+    separation_state: str,
+    *,
+    reason_code: str | None = None,
+) -> None:
+    """Evaluate immutable Stage 5 with-stars candidates, then remain review-only."""
+
+    try:
+        verified_handoff = stage5_handoff.verify_stage5_handoff(pipeline)
+    except stage5_handoff.Stage5HandoffError as error:
+        pipeline._stage7_candidate_domain = "with_stars"
+        pipeline._stage7_stage5_source_binding = {
+            "status": "rejected",
+            "accepted": False,
+            "reason_code": error.reason_code,
+            "detail": error.detail,
+        }
+        pipeline._review_subject_chroma_plan = {
+            "schema": "starun.review-subject-chroma-plan.v1",
+            "status": "rejected",
+            "accepted": False,
+            "issues": ["stage5_handoff_unverified"],
+        }
+        pipeline._stage7_stretch_candidates = []
+        pipeline._stage7_stretch_selected = None
+        _run_with_stars_review_stretch(
+            pipeline,
+            separation_state,
+            source_stem=str(
+                getattr(pipeline, "_stage6_passthrough_source", None)
+                or "stage6_passthrough"
+            ),
+            reason_code="stage7_stage5_handoff_unverified",
+            upstream_separation_state=separation_state,
+            candidates_evaluated=False,
+        )
+        return
+
+    pipeline._stage7_candidate_domain = "with_stars"
+    pipeline._stage7_stage5_source_binding = stage5_handoff.public_handoff(
+        verified_handoff
+    )
+    channel_semantics = str(
+        getattr(pipeline, "_channel_semantics", "unknown") or "unknown"
+    ).strip().lower()
+    stage5_pixels = pipeline._read_image_by_stem(stage5_handoff.STAGE5_SOURCE_STEM)
+    stage5_array = np.asarray(stage5_pixels) if stage5_pixels is not None else None
+    stage5_is_rgb = bool(
+        stage5_array is not None
+        and stage5_array.ndim == 3
+        and (stage5_array.shape[0] == 3 or stage5_array.shape[-1] == 3)
+        and channel_semantics != "mono"
+    )
+    if not stage5_is_rgb:
+        pipeline._stage7_stretch_candidates = []
+        pipeline._stage7_stretch_selected = None
+        pipeline._review_subject_chroma_plan = {
+            "schema": "starun.review-subject-chroma-plan.v1",
+            "status": "ineligible",
+            "accepted": False,
+            "issues": ["with_stars_rgb_source_unavailable"],
+        }
+        _run_with_stars_review_stretch(
+            pipeline,
+            separation_state,
+            source_stem=stage5_handoff.STAGE5_SOURCE_STEM,
+            reason_code="stage7_with_stars_rgb_source_unavailable",
+            upstream_separation_state=separation_state,
+            candidates_evaluated=False,
+        )
+        return
+    pipeline._stage7_stretch_source = stage5_handoff.STAGE5_SOURCE_STEM
+    stretched, _degraded, stretch_messages, _stretch_method = (
+        pipeline._run_stage7_stretching_candidates()
+    )
+    for message in stretch_messages:
+        pipeline.log.info(f"[Stage7 with-stars] {message}")
+    selected_stem = None
+    if stretched:
+        selected_name = str(
+            getattr(pipeline, "_stage7_stretch_selected", "") or ""
+        )
+        for attempt in getattr(pipeline, "_stage7_stretch_candidates", []) or []:
+            if (
+                str(attempt.get("name") or "") == selected_name
+                and bool(attempt.get("allowed_as_final", False))
+                and attempt.get("stem")
+            ):
+                selected_stem = str(attempt["stem"])
+                break
+    pipeline._stage7_stretch_accepted = False
+    pipeline._stage7_stretch_output = None
+    pipeline._stage7_stretch_forced_delivery = False
+    pipeline._stage7_forced_delivery_reasons = []
+    _freeze_review_subject_chroma_plan(pipeline)
+    _run_with_stars_review_stretch(
+        pipeline,
+        separation_state,
+        source_stem=stage5_handoff.STAGE5_SOURCE_STEM,
+        reason_code=reason_code or f"star_separation_{separation_state}",
+        upstream_separation_state=separation_state,
+        candidates_evaluated=True,
+        selected_candidate_stem=selected_stem,
     )
 
 
@@ -427,18 +681,14 @@ def run_stage7_stretching(pipeline) -> None:
         StarSeparationState.REJECTED.value,
         StarSeparationState.TOOL_FAILED.value,
     }:
-        _run_with_stars_review_stretch(
+        _run_rejected_stage6_with_stars_candidates(
             pipeline,
             separation_state,
-            source_stem=(
-                "stage6_input" if bright_core_review_only else None
-            ),
             reason_code=(
                 "bright_core_starless_rejected_after_recovery"
                 if bright_core_review_only
                 else None
             ),
-            upstream_separation_state=separation_state,
         )
         return
     pipeline._stage7_stretch_source = (

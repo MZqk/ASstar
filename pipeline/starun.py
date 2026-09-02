@@ -32,6 +32,7 @@ import time
 import zipfile
 
 import cosmic_clarity
+import display_rendition
 import plugin_runner
 import review_bundle
 import run_manifest
@@ -1742,6 +1743,10 @@ class StarunPostProcessor(
                     and bool(self._review_display_route)
                     and isinstance(self._display_rendition_contract, dict)
                     else None
+                ),
+                artifact_root=self.work_dir,
+                pixel_coordinate_domain=(
+                    display_rendition.PIXEL_DOMAIN_BOTTOM_UP
                 ),
             )
             self._emit_preview_event(stage, title, "ready", str(preview_path))

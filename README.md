@@ -43,7 +43,7 @@ Stage 10 末端降噪只处理正式合格的 Stage 9 来源，并复用已验�
 
 M8 类 `bright_composite_compact_flux_v1` 除实际四锚曲线 `0.06/0.26/0.50/0.75` 外，还会在可信 Screen 峰值与认证 Unscreen 峰值之间使用固定 `0.55` 振幅插值。该处理不新增坐标、不扩大支持掩膜且保持可信 starmask 的 RGB 比例，用于直接生成介于过小 Screen 和过大完整 Unscreen 之间的物理候选；其他 profile 的 Unscreen 幅度保持 `1.0`，全部原质量门不变。
 
-观察专用 `linked_visibility_v2` 若参与 managed PNG，`final_artifact_identity_report.json` 会从冻结源精确重放黑白点、目标中值、gamma 与 RGB 共同比例映射并比较解码 SHA；参数或像素篡改均 fail-closed。
+观察专用 v1/v2 tone 或 v3 `tone_then_subject_chroma_v1` 若参与 managed PNG，`final_artifact_identity_report.json` 会从冻结源精确重放；v3 还必须验签 artifact root、坐标域及 mask 文件/数组身份，再比较解码 SHA。参数、掩膜或像素篡改均 fail-closed。
 
 Stage 9 的像素几何以 `4.0 px` FWHM 为缩放锚点：半径、窗口和匹配距离按 FWHM 比例缩放，面积门按比例平方缩放。尺度优先来自同域显示 FWHM，其次为 Stage 5 冻结星表和原始 starmask 半高测量；后两种来源要求复核，三者都不足 4 星时会在首次回混前安全停止，不采用固定像素回退值。
 
@@ -67,9 +67,9 @@ Stage 7 的 Stage 6 linked preview 仍只是屏幕显示参考。默认 `stage7_
 
 Stage 7 自动候选的亮度噪声门使用 `starun.stage7-luma-noise-growth.v2`：从同一线性源重放已认证 LUT/MTF/composite 有序链，`stage7_stretch_luma_noise_growth_max=1.25` 只约束实际候选相对理论 tone-map 的 `excess_growth`。`raw_growth/expected_growth` 仅作诊断；自动链无法验证时 fail-closed，手动与旧任务才保留 raw 语义。Stage 3 若发布冻结空间背景 lineage，Stage 7 还会在同一 support 上比较理论重放与实际候选的归一化 `R-G/B-G` 一阶平面；新增 3σ 分量或超过 1.25× 的额外坡度增长会拒绝候选，Stage 7 不执行色彩修补。正式接受后另发布 `stage7_spatial_background_reference.json`，绑定 support、候选像素、认证变换摘要和理论显示域三分量指标，供 Stage 10 同域验签。
 
-Stage 7 的报告分别记录 `upstream_star_separation_state` 与 `stage7_stretch_state`：Stage 6 去星已接受但拉伸候选全部拒绝时，前者保持 `accepted`，后者为 `rejected`，并进入含星 review fallback；只有 Stage 6 自身拒绝或工具失败时才把拉伸记为 `skipped`。Stage 10 若因此没有正式空间背景参考，使用 `stage7_spatial_background_reference_unavailable_due_to_review_only`，不再把预期缺失显示为原始文件系统异常；正式链缺失仍以 `stage7_spatial_background_reference_missing` fail-closed。
+Stage 7 的报告分别记录 `upstream_star_separation_state` 与 `stage7_stretch_state`：Stage 6 去星已接受但拉伸候选全部拒绝时，前者保持 `accepted`，后者为 `rejected`，并进入含星 review fallback；Stage 6 自身为 `rejected/tool_failed` 时，Stage 7 重新验签不可变 `stage5_linear.fit`，从该同一源分别评估 Asinh、linked MTF、Display70/82/90，大/小星系再评估 D86。每个候选都重新加载 Stage 5，使用冻结星表的 `3.5×FWHM` 星点区和 `5×FWHM` halo 区执行星径增长、星色、halo、核心及原有背景/裁切/噪声门；硬门通过时保存 `stage7_review_with_stars.fit`，全部失败则逐像素回退 Stage 5。该路由固定 `formal_accepted=false / delivery_class=review_only / _stage7_stretch_accepted=false`，禁用 Starless 局部变换、回星与 forced-delivery 升级。Stage 10 若因此没有正式空间背景参考，使用 `stage7_spatial_background_reference_unavailable_due_to_review_only`，不再把预期缺失显示为原始文件系统异常；正式链缺失仍以 `stage7_spatial_background_reference_missing` fail-closed。
 
-Stage 6 拒绝 Starless pair 或工具失败时，Stage 7–9 的含星复核 FITS 保持验签来源逐像素不变，不提前执行 autostretch。Stage 10 冻结唯一 observer-only linked 显示合同，并把同一映射同时用于 Stage 5 星表参考、最终复核候选和 PNG；线性大星系在映射前若因动态范围压缩而暂不可见，只有可信含星 lineage 和至少 16 个验签目录星成立时才允许建立映射，映射后仍须通过主体与星表门。审计通过也只生成 `result_review*`，不会提升为正式交付或改写可信 FITS。
+Stage 6 拒绝 Starless pair 或工具失败时，Stage 8/9 只逐像素透传 Stage 7 选中的含星 tone 候选；`result_linear.fit` 仍与 Stage 5 完全一致，`result_review_final.fit` 与普通 review TIFF 可包含该 tone，但不含观察增色。仅对物理 SPCC/PCC 已接受的 broadband RGB/OSC 星系，在两个 Stage 8 色度开关都开启且有效预算大于零时，Stage 7 从 Stage 5 冻结主体、背景、核心、星点、halo 与有效区到验签 NPZ，并要求弱色支持至少 2048 像素、覆盖 4 网格/3 象限、2/4/6 次低频色向相关均 `>=0.90`、主体/背景 opponent 能量比均 `>=1.50`、聚合 SNR 均 `>=5`。通过后由 `starun.display-rendition-contract.v3 / tone_then_subject_chroma_v1` 在 tone mapping 后只放大主体低频 `RGB-Y`；因子与 P50 增量受复用色度预算约束，主体饱和度硬限 P50 `0.12`、P95 `0.30`，背景、核心、星点、halo 逐像素保护，亮度误差 `<=1e-6` 且不得新增裁切。v3 只用于 UI、review PNG 与 `*_display_srgb.png`；FITS、科学 TIFF 和 Siril 缓冲保持不变。构建期门失败降级为原 v2 tone-only，冻结 v3 的路径、符号链接、SHA、数组摘要、形状或坐标域重放验签失败则拒绝发布 PNG。审计通过仍只生成 `result_review*`，不会提升正式交付。
 
 Stage 4 的网络端点、Gaia 能力和 `spcc_list` 预检只提供审计证据，不会替代一次真实 Siril 命令；只有显式关闭联网/Stage 4、输入不适用或同应用会话已经发生真实 SPCC 超时，才会跳过相应尝试。SPCC/PCC 成功后，旧色偏、亮核、增益、窄带信号保留和精度指标仍写入报告，但仅为 `advisory_only`，不改写、回滚或切换成功候选；准备失败、命令失败/超时、候选缺失或不可读、尺寸变化、非有限像素及写回/保存验证失败才触发下一路由。
 
@@ -242,6 +242,11 @@ Torch、ONNX Runtime、SciPy 等模块；`siril_plugins/downloads`、模型、Si
 脚本和 `SirilPythonSeed` 仍完整保留。需要使用其他等价环境时可传
 `--build-python /path/to/python`，构建后的依赖边界检查仍会拒绝重复收集。
 
+正式 App 会在 `Contents/Resources/pipeline/` 内使用 5 个 CPython 3.12
+arm64 原生模块；这些模块在 App 和每轮临时 runtime 中都不保留同名
+`.py/.pyc` 回退。原生模块清单、逐文件校验和、实际 CPython 导入探测及
+开发源码模式的边界，以 `INTEGRATION_README.md` 为单一事实源。
+
 Required package:
 - `packages/siril-1.4.4-arm64-3.dmg`（内置 Siril CPython 3.12 runtime）
 
@@ -255,14 +260,42 @@ Default output: `release/Starun.app`
 `CFBundleIdentifier=StarunC`、`CFBundleShortVersionString=0.1`、
 `CFBundleVersion=1`，运行时依赖缓存会使用 `0.1 (1)` 作为 App 版本指纹。
 
-公开发行时建议传入固定签名身份：
+需要把已经构建好的 App 封装为仅供本机验证的 DMG 时，显式选择本地
+ad-hoc 模式：
 
 ```bash
-./build/build_macos_app.sh \
-  --codesign-identity "Developer ID Application: Your Name (TEAMID)"
+./build/package_macos_dmg.sh \
+  --app release/Starun.app \
+  --output release/Starun-local-arm64.dmg \
+  --local-adhoc
 ```
 
-默认 ad-hoc 签名只适合本地验证。公证所需的 hardened runtime、timestamp 和 notarization 仍需单独配置。
+`--local-adhoc` 只用于本机安装与签名链回归：它没有 Developer ID、Apple
+公证或公开分发资格。脚本会同时输出 `.sha256` 和 `.release.json`；本地 sidecar
+固定记录 `release_eligible=false`。
+
+公开发行候选必须先用固定 Developer ID Application 身份构建 App，再用同一
+身份封装 DMG，并提供已预先存入 Keychain 的 `notarytool` profile：
+
+```bash
+SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+
+./build/build_macos_app.sh \
+  --output-dir release \
+  --codesign-identity "$SIGNING_IDENTITY"
+
+./build/package_macos_dmg.sh \
+  --app release/Starun.app \
+  --output release/Starun-0.1-arm64.dmg \
+  --codesign-identity "$SIGNING_IDENTITY" \
+  --notary-profile "starun-notary"
+```
+
+完整的内层原生模块到外层 App、DMG、公证与 stapling 顺序见
+`INTEGRATION_README.md`；App 或 DMG 仅通过 ad-hoc `codesign --verify` 不等于
+公开发行完成。最终 `.release.json` 绑定 runtime manifest、App/DMG 签名、
+notary submission、staple、挂载复核与 DMG SHA；仍存在源码 provenance blocker
+时，即使 Apple 公证通过也不会标为可公开发行。
 
 默认构建仍为 Full Offline。也可把大型 wheels/模型拆为相邻的离线资源包：
 

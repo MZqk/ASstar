@@ -6,8 +6,12 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
-from image_metrics import _box_blur_gray, _to_rgb_float_fullres
-from stage7_pixel_domain import canonicalize_stage7_pixels_01
+try:
+    from .image_metrics import _box_blur_gray, _to_rgb_float_fullres
+    from .stage7_pixel_domain import canonicalize_stage7_pixels_01
+except ImportError:
+    from image_metrics import _box_blur_gray, _to_rgb_float_fullres
+    from stage7_pixel_domain import canonicalize_stage7_pixels_01
 
 
 STAGE8_SUBJECT_CHROMA_SCHEMA = "starun.stage8-subject-chroma.v1"
@@ -93,6 +97,37 @@ def subject_saturation_median(
     return value if math.isfinite(value) else None
 
 
+def subject_saturation_distribution(
+    image: np.ndarray,
+    masks: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Measure the protected subject saturation budget on one display image."""
+
+    canonical, _provenance = canonicalize_stage7_pixels_01(image)
+    rgb = _to_rgb_float_fullres(canonical)
+    shape = tuple(int(value) for value in rgb.shape[1:])
+    subject = _subject_weight(masks, shape) > 0.05
+    for name, threshold in (
+        ("background_mask", 0.80),
+        ("core_mask", 0.50),
+        ("star_mask", 0.05),
+        ("star_halo_guard_mask", 0.05),
+    ):
+        value = _mask(masks, name, shape)
+        if value is not None:
+            subject &= value < threshold
+    count = int(np.count_nonzero(subject))
+    if count < 64:
+        return {"status": "unavailable", "support_count": count}
+    saturation = _saturation_proxy(rgb)[subject]
+    return {
+        "status": "available",
+        "support_count": count,
+        "p50": float(np.percentile(saturation, 50.0)),
+        "p95": float(np.percentile(saturation, 95.0)),
+    }
+
+
 def target_aware_chroma_factor(
     profile_name: str,
     *,
@@ -176,6 +211,7 @@ def apply_subject_chroma_rendition(
     background = _mask(masks, "background_mask", shape)
     core_weight = _mask(masks, "core_mask", shape)
     star_weight = _mask(masks, "star_mask", shape)
+    halo_weight = _mask(masks, "star_halo_guard_mask", shape)
     non_background_smoothing_passes = 0
     non_background_opening_passes = 0
     non_background_star_exclusion_applied = False
@@ -232,6 +268,8 @@ def apply_subject_chroma_rendition(
         if star_protection_applied:
             subject_weight *= 1.0 - 0.90 * star_weight
         subject_weight[star_weight >= 0.05] = 0.0
+    if halo_weight is not None:
+        subject_weight[halo_weight >= 0.05] = 0.0
 
     subject_support = subject_weight > 0.05
     if int(np.count_nonzero(subject_support)) < 64:
@@ -303,6 +341,7 @@ def apply_subject_chroma_rendition(
     )
     core_support = core_weight >= 0.50 if core_weight is not None else None
     star_support = star_weight >= 0.05 if star_weight is not None else None
+    halo_support = halo_weight >= 0.05 if halo_weight is not None else None
     return rendered, {
         "schema": STAGE8_SUBJECT_CHROMA_SCHEMA,
         "mode": "frozen_subject_broad_chroma",
@@ -327,6 +366,7 @@ def apply_subject_chroma_rendition(
         "chroma_smoothing_passes": int(chroma_smoothing_passes),
         "core_protection_applied": core_weight is not None,
         "star_protection_applied": star_protection_applied,
+        "halo_protection_applied": halo_weight is not None,
         "star_protection_skipped_for_starless_expansion": bool(
             star_weight is not None and expand_faint_signal
         ),
@@ -352,6 +392,11 @@ def apply_subject_chroma_rendition(
         "star_max_abs_change": (
             float(np.max(delta_abs[star_support]))
             if star_support is not None and np.any(star_support)
+            else 0.0
+        ),
+        "halo_max_abs_change": (
+            float(np.max(delta_abs[halo_support]))
+            if halo_support is not None and np.any(halo_support)
             else 0.0
         ),
         "subject_saturation_median_before": (
@@ -388,6 +433,7 @@ def assess_subject_chroma_candidate(metadata: Dict[str, Any]) -> Dict[str, Any]:
         "background_max_abs_change_max": 2e-7,
         "core_max_abs_change_max": 2e-7,
         "star_max_abs_change_max": 2e-7,
+        "halo_max_abs_change_max": 2e-7,
         "subject_saturation_median_gain_min_exclusive": 1e-6,
     }
     issues = []
@@ -399,6 +445,7 @@ def assess_subject_chroma_candidate(metadata: Dict[str, Any]) -> Dict[str, Any]:
         "background_max_abs_change",
         "core_max_abs_change",
         "star_max_abs_change",
+        "halo_max_abs_change",
         "subject_saturation_median_gain",
     )
     for field in finite_fields:
@@ -419,6 +466,7 @@ def assess_subject_chroma_candidate(metadata: Dict[str, Any]) -> Dict[str, Any]:
         "background_max_abs_change",
         "core_max_abs_change",
         "star_max_abs_change",
+        "halo_max_abs_change",
     ):
         try:
             if float(metadata[field]) > float(limits[f"{field}_max"]) + 1e-12:
@@ -443,5 +491,6 @@ __all__ = [
     "apply_subject_chroma_rendition",
     "assess_subject_chroma_candidate",
     "subject_saturation_median",
+    "subject_saturation_distribution",
     "target_aware_chroma_factor",
 ]
